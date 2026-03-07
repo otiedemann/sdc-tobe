@@ -1,1 +1,14 @@
-Generiere und Detektiere Aruco Marker
+Generiere Aruco Marker und schreibe JPEG "GenerateAruco.py"
+Lade JPEG und Detektiere Aruco Marker "ArucoDetektion.py"
+
+How To
+------
+
+1) Beide *.py Dateien lokal kopieren
+
+2) Lokale Pfade in beiden *.py an eigenes Laufwerk anpassen z.B.:
+    INPUT_DIR  = r"C:\Users\Dell\Documents\Python_MER\Drohne\ArucoMarker"
+    IMAGE_NAME = "aruco_scene.jpeg"
+
+3) Run GenerateAruco.py
+3) Run ArucoDetektion.py
