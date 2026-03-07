@@ -1167,6 +1167,46 @@ buildArena();
 spawnDrones(3,3);
 document.getElementById('status').textContent = '3D engine loaded. Initializing scene...';
 
+// External C2 bridge (postMessage)
+const externalWaypoints = new Map();
+function gridToWorld(x, y) {
+  const wx = -arena.x/2 + 0.5 + x;
+  const wz = -arena.y/2 + 0.5 + y;
+  return new THREE.Vector3(wx, 0.9, wz);
+}
+
+function applyExternalTargets(list) {
+  redTargets = [];
+  blueTargets = [];
+  for (const t of (list || [])) {
+    const p = gridToWorld(Number(t.x), Number(t.y));
+    if ((t.color || 'red') === 'blue') blueTargets.push(new THREE.Vector3(p.x, 0.25, p.z));
+    else redTargets.push(new THREE.Vector3(p.x, 0.25, p.z));
+  }
+  while (redTargets.length < 3) redTargets.push(new THREE.Vector3(-arena.x/2 + 2 + redTargets.length, 0.25, -1 + redTargets.length));
+  while (blueTargets.length < 3) blueTargets.push(new THREE.Vector3(arena.x/2 - 2 - blueTargets.length, 0.25, 1 - blueTargets.length));
+  drawTargets();
+}
+
+window.addEventListener('message', (ev) => {
+  const m = ev.data || {};
+  if (m.source !== 'c2') return;
+  if (m.kind === 'spawn') {
+    ui.teamSel.value = m.team || 'red';
+    ui.modeSel.value = m.mode || 'swarm';
+    ui.droneCount.value = String(Math.max(2, Math.min(5, Number(m.droneCount || 3))));
+    ui.enemyDroneCount.value = String(Math.max(2, Math.min(5, Number(m.enemyDroneCount || 3))));
+    spawnDrones(Number(ui.droneCount.value), Number(ui.enemyDroneCount.value));
+  }
+  if (m.kind === 'targets') {
+    applyExternalTargets(m.targets || []);
+  }
+  if (m.kind === 'goto') {
+    const wp = gridToWorld(Number(m.x), Number(m.y));
+    externalWaypoints.set(m.droneId, wp);
+  }
+});
+
 let simTime = 0;
 let last = performance.now();
 function animate(now){
@@ -1181,6 +1221,25 @@ function animate(now){
   } else {
     const usedCode = applyCodeController(dt);
     if (!usedCode) swarmUpdate(dt);
+  }
+
+  // apply external C2 waypoints for my team drones
+  const myTeam = ui.teamSel.value;
+  for (const d of drones) {
+    if (d.team !== myTeam) continue;
+    const wp = externalWaypoints.get(`team-drone-${d.id.slice(1)}`) || externalWaypoints.get(d.id);
+    if (!wp) continue;
+    const dir = wp.clone().sub(d.mesh.position);
+    dir.y = 0;
+    if (dir.length() < 0.25) { externalWaypoints.delete(`team-drone-${d.id.slice(1)}`); externalWaypoints.delete(d.id); }
+    else {
+      dir.normalize().multiplyScalar(Math.max(0.9, Number(ui.speed.value)));
+      d.vel.lerp(new THREE.Vector3(dir.x, (0.9 - d.mesh.position.y) * 1.2, dir.z), 0.2);
+      d.mesh.position.addScaledVector(d.vel, dt);
+      if (Math.hypot(d.vel.x, d.vel.z) > 1e-5) d.yaw = Math.atan2(d.vel.x, d.vel.z);
+      d.mesh.rotation.y = d.yaw;
+      clampDrone(d);
+    }
   }
 
   enemyBotUpdate(dt);

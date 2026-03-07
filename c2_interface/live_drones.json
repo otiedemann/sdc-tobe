@@ -1,0 +1,9 @@
+{
+  "drones": [
+    {"drone_id": "team-drone-1", "host": "192.168.10.1"},
+    {"drone_id": "team-drone-2", "host": "192.168.10.1"},
+    {"drone_id": "team-drone-3", "host": "192.168.10.1"},
+    {"drone_id": "team-drone-4", "host": "192.168.10.1"},
+    {"drone_id": "team-drone-5", "host": "192.168.10.1"}
+  ]
+}

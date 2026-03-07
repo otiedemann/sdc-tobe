@@ -1,0 +1,71 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>SDC C2 Interface</title>
+    <link rel="stylesheet" href="/static/styles.css" />
+  </head>
+  <body>
+    <header>
+      <h1>SDC Command & Control</h1>
+      <div class="legend">
+        <span class="red">Red home</span>
+        <span class="neutral">Neutral</span>
+        <span class="blue">Blue home</span>
+      </div>
+    </header>
+
+    <main>
+      <section>
+        <h2>Arena (20x10, 1m cells)</h2>
+        <div class="controls">
+          <label>
+            Mode:
+            <select id="modeSelect">
+              <option value="live">Live</option>
+              <option value="simulator">Simulator</option>
+            </select>
+          </label>
+          <label>
+            Team drones:
+            <select id="droneCountSelect">
+              <option value="2">2</option>
+              <option value="3">3</option>
+              <option value="4">4</option>
+              <option value="5">5</option>
+            </select>
+          </label>
+          <button id="applySystem">Apply</button>
+          <button id="connectLive">Connect Live Drones</button>
+          <label>
+            Target color:
+            <select id="targetColorSelect">
+              <option value="red">Red</option>
+              <option value="blue">Blue</option>
+            </select>
+          </label>
+          <button id="targetMode">Set targets (max 6)</button>
+        </div>
+        <p>Select drone, then click a grid cell to send it. In target mode, clicks set/remove target cells.</p>
+        <label>
+          Active drone:
+          <select id="droneSelect"></select>
+        </label>
+        <div id="arenaWrap" class="arena-wrap">
+          <div id="grid" class="grid"></div>
+          <div id="droneOverlay" class="drone-overlay"></div>
+        </div>
+        <div id="targetList" class="target-list"></div>
+        <div id="simEmbed"></div>
+      </section>
+
+      <section>
+        <h2>Drone Video + Controls</h2>
+        <div id="cards" class="cards"></div>
+      </section>
+    </main>
+
+    <script src="/static/app.js"></script>
+  </body>
+</html>
