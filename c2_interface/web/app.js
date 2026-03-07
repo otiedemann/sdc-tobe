@@ -24,9 +24,11 @@ async function api(path, options = {}) {
 }
 
 function postSimCommand(cmd) {
-  const frame = simEmbedEl.querySelector('iframe');
-  if (!frame?.contentWindow) return;
-  frame.contentWindow.postMessage({ source: 'c2', ...cmd }, '*');
+  const frames = simEmbedEl.querySelectorAll('iframe');
+  frames.forEach(frame => {
+    if (!frame?.contentWindow) return;
+    frame.contentWindow.postMessage({ source: 'c2', ...cmd }, '*');
+  });
 }
 
 function targetMap() {
@@ -70,9 +72,14 @@ function render() {
     : 'none');
 
   cardsEl.innerHTML = activeDrones.map(d => {
-    const video = d.video_url
-      ? `<img src="${d.video_url}?t=${Date.now()}" class="video" alt="${d.drone_id} video" />`
-      : `<div class="video">No video URL configured</div>`;
+    let video = `<div class="video">No video URL configured</div>`;
+    if (state.system.mode === 'simulator' && simUrl) {
+      const idx = Number((d.drone_id.split('-').pop() || '1'));
+      const fpvUrl = `${simUrl}${simUrl.includes('?') ? '&' : '?'}panel=fpv&embed=1&team=red&drone=${idx}&cam=fpv`;
+      video = `<iframe src="${fpvUrl}" class="video" style="border:0;min-height:180px"></iframe>`;
+    } else if (d.video_url) {
+      video = `<img src="${d.video_url}?t=${Date.now()}" class="video" alt="${d.drone_id} video" />`;
+    }
     return `
       <div class="card">
         <strong>${d.drone_id}</strong> — ${d.status}<br/>
@@ -96,9 +103,21 @@ function render() {
     } catch {}
   }
 
-  simEmbedEl.innerHTML = state.system.mode === 'simulator' && simUrl
-    ? `<h3>Simulator (auto-connected)</h3><iframe id="simFrame" src="${simUrl}"></iframe>`
-    : '';
+  if (state.system.mode === 'simulator' && simUrl) {
+    const settingsUrl = `${simUrl}${simUrl.includes('?') ? '&' : '?'}panel=settings&embed=1&team=red`;
+    const modelUrl = `${simUrl}${simUrl.includes('?') ? '&' : '?'}panel=model&embed=1&team=red`;
+    const liveUrl = `${simUrl}${simUrl.includes('?') ? '&' : '?'}panel=fpv&embed=1&team=red&drone=1&cam=fpv`;
+    simEmbedEl.innerHTML = `
+      <h3>Simulator (auto-connected)</h3>
+      <div class="sim-grid">
+        <iframe class="sim-frame" src="${settingsUrl}"></iframe>
+        <iframe class="sim-frame" src="${liveUrl}"></iframe>
+        <iframe class="sim-frame full" src="${modelUrl}"></iframe>
+      </div>
+    `;
+  } else {
+    simEmbedEl.innerHTML = '';
+  }
 
   if (state.system.mode === 'simulator') {
     setTimeout(() => {

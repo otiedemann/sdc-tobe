@@ -158,6 +158,12 @@ import * as THREE from './vendor/three.module.js';
 import { OrbitControls } from './vendor/OrbitControls.js';
 
 const errEl = document.getElementById('error');
+const uiRoot = document.getElementById('ui');
+const q = new URLSearchParams(window.location.search);
+const panel = q.get('panel') || 'full'; // full|settings|model|fpv
+const forceTeam = q.get('team');
+const forceDrone = q.get('drone');
+const forceCam = q.get('cam');
 
 const scene = new THREE.Scene();
 scene.background = new THREE.Color(0x0e1116);
@@ -181,6 +187,18 @@ renderer.setPixelRatio(devicePixelRatio);
 renderer.autoClear = false;
 renderer.setScissorTest(true);
 document.body.appendChild(renderer.domElement);
+
+if (panel === 'model' || panel === 'fpv') {
+  uiRoot.style.display = 'none';
+}
+if (panel === 'settings') {
+  renderer.domElement.style.display = 'none';
+  document.body.style.overflow = 'auto';
+  uiRoot.style.position = 'relative';
+  uiRoot.style.top = '0';
+  uiRoot.style.left = '0';
+  uiRoot.style.width = 'auto';
+}
 
 const controls = new OrbitControls(camera, renderer.domElement);
 controls.target.set(0, 1.5, 0);
@@ -248,6 +266,8 @@ const ui = {
 
 const keys = new Set();
 let selected = 0;
+if (forceTeam === 'red' || forceTeam === 'blue') ui.teamSel.value = forceTeam;
+if (forceCam) ui.camMode.value = forceCam;
 
 const defaultSwarmCode = `// Winning-oriented enemy-target sweep
 // Team-aware: attack enemy targets only, hover 2s, then next target
@@ -935,7 +955,12 @@ function spawnDrones(myCount, enemyCount) {
 
   selected = 0;
   ui.selectedDrone.innerHTML = drones.map((d,idx)=>`<option value='${idx}'>${d.id} (${d.team})</option>`).join('');
-  ui.selectedDrone.value = '0';
+  if (forceDrone) {
+    const wantId = `${(ui.teamSel.value || 'red').toUpperCase().slice(0,1)}${Number(forceDrone)}`;
+    const idx = drones.findIndex(d => d.id === wantId);
+    if (idx >= 0) selected = idx;
+  }
+  ui.selectedDrone.value = String(selected);
 }
 
 function clampDrone(d) {
@@ -1261,25 +1286,36 @@ function animate(now){
   const w = window.innerWidth;
   const h = window.innerHeight;
 
-  // Main view
-  renderer.setViewport(0, 0, w, h);
-  renderer.setScissor(0, 0, w, h);
-  renderer.clear(true, true, true);
-  renderer.render(scene, camera);
+  if (panel === 'settings') {
+    // no 3D drawing needed in settings-only panel
+  } else if (panel === 'fpv') {
+    droneCam.aspect = w / h;
+    droneCam.updateProjectionMatrix();
+    renderer.setViewport(0, 0, w, h);
+    renderer.setScissor(0, 0, w, h);
+    renderer.clear(true, true, true);
+    renderer.render(scene, droneCam);
+  } else {
+    // Main view
+    renderer.setViewport(0, 0, w, h);
+    renderer.setScissor(0, 0, w, h);
+    renderer.clear(true, true, true);
+    renderer.render(scene, camera);
 
-  // Inset drone front camera (virtual 3D viewport)
-  const insetW = Math.floor(w * 0.30);
-  const insetH = Math.floor(h * 0.30);
-  const pad = 14;
-  const x = w - insetW - pad;
-  const y = pad;
-  droneCam.aspect = insetW / insetH;
-  droneCam.updateProjectionMatrix();
+    // Inset drone front camera (virtual 3D viewport)
+    const insetW = Math.floor(w * 0.30);
+    const insetH = Math.floor(h * 0.30);
+    const pad = 14;
+    const x = w - insetW - pad;
+    const y = pad;
+    droneCam.aspect = insetW / insetH;
+    droneCam.updateProjectionMatrix();
 
-  renderer.clearDepth();
-  renderer.setViewport(x, y, insetW, insetH);
-  renderer.setScissor(x, y, insetW, insetH);
-  renderer.render(scene, droneCam);
+    renderer.clearDepth();
+    renderer.setViewport(x, y, insetW, insetH);
+    renderer.setScissor(x, y, insetW, insetH);
+    renderer.render(scene, droneCam);
+  }
 
   requestAnimationFrame(animate);
 }
