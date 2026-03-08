@@ -1,0 +1,13 @@
+{
+  "mission_success": true,
+  "completion_time_s": 16.0,
+  "near_collisions": 117,
+  "link_loss_events": 26,
+  "avg_battery_pct": 94.37,
+  "events_logged": 16,
+  "final_states": {
+    "D1": "LAND",
+    "D2": "LAND",
+    "D3": "LAND"
+  }
+}

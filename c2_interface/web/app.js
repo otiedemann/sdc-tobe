@@ -1,5 +1,6 @@
 let state = { arena: null, drones: [], system: { mode: 'live', drone_count: 2 }, targets: [] };
 let targetEditMode = false;
+const simDronePos = new Map();
 
 const gridEl = document.getElementById('grid');
 const droneSelect = document.getElementById('droneSelect');
@@ -24,7 +25,7 @@ async function api(path, options = {}) {
 }
 
 function postSimCommand(cmd) {
-  const frames = simEmbedEl.querySelectorAll('iframe');
+  const frames = document.querySelectorAll('iframe[data-sim-frame="1"]');
   frames.forEach(frame => {
     if (!frame?.contentWindow) return;
     frame.contentWindow.postMessage({ source: 'c2', ...cmd }, '*');
@@ -39,6 +40,15 @@ function targetMap() {
 
 function render() {
   if (!state.arena) return;
+
+  // Overlay simulator-reported positions onto C2 state for accurate map alignment.
+  if (simDronePos.size) {
+    state.drones = state.drones.map((d) => {
+      const p = simDronePos.get(d.drone_id);
+      if (!p) return d;
+      return { ...d, position: { x: p.x, y: p.y } };
+    });
+  }
 
   modeSelect.value = state.system.mode;
   droneCountSelect.value = String(state.system.drone_count);
@@ -71,12 +81,23 @@ function render() {
     ? state.targets.map((t, i) => `#${i+1} (${t.x},${t.y}) <b style="color:${t.color === 'red' ? '#f87171' : '#60a5fa'}">${t.color}</b>`).join(' | ')
     : 'none');
 
+  let simUrl = state.system.simulator_url;
+  if (simUrl) {
+    try {
+      const u = new URL(simUrl, window.location.origin);
+      if (u.hostname === 'localhost' || u.hostname === '127.0.0.1') {
+        u.hostname = window.location.hostname;
+      }
+      simUrl = u.pathname + u.search + u.hash;
+    } catch {}
+  }
+
   cardsEl.innerHTML = activeDrones.map(d => {
     let video = `<div class="video">No video URL configured</div>`;
     if (state.system.mode === 'simulator' && simUrl) {
       const idx = Number((d.drone_id.split('-').pop() || '1'));
       const fpvUrl = `${simUrl}${simUrl.includes('?') ? '&' : '?'}panel=fpv&embed=1&team=red&drone=${idx}&cam=fpv`;
-      video = `<iframe src="${fpvUrl}" class="video" style="border:0;min-height:180px"></iframe>`;
+      video = `<iframe data-sim-frame="1" src="${fpvUrl}" class="video" style="border:0;min-height:180px"></iframe>`;
     } else if (d.video_url) {
       video = `<img src="${d.video_url}?t=${Date.now()}" class="video" alt="${d.drone_id} video" />`;
     }
@@ -92,27 +113,14 @@ function render() {
     `;
   }).join('');
 
-  let simUrl = state.system.simulator_url;
-  if (simUrl) {
-    try {
-      const u = new URL(simUrl);
-      if (u.hostname === 'localhost' || u.hostname === '127.0.0.1') {
-        u.hostname = window.location.hostname;
-        simUrl = u.toString();
-      }
-    } catch {}
-  }
-
   if (state.system.mode === 'simulator' && simUrl) {
     const settingsUrl = `${simUrl}${simUrl.includes('?') ? '&' : '?'}panel=settings&embed=1&team=red`;
     const modelUrl = `${simUrl}${simUrl.includes('?') ? '&' : '?'}panel=model&embed=1&team=red`;
-    const liveUrl = `${simUrl}${simUrl.includes('?') ? '&' : '?'}panel=fpv&embed=1&team=red&drone=1&cam=fpv`;
     simEmbedEl.innerHTML = `
       <h3>Simulator (auto-connected)</h3>
       <div class="sim-grid">
-        <iframe class="sim-frame" src="${settingsUrl}"></iframe>
-        <iframe class="sim-frame" src="${liveUrl}"></iframe>
-        <iframe class="sim-frame full" src="${modelUrl}"></iframe>
+        <iframe data-sim-frame="1" class="sim-frame" src="${settingsUrl}"></iframe>
+        <iframe data-sim-frame="1" class="sim-frame full" src="${modelUrl}"></iframe>
       </div>
     `;
   } else {
@@ -180,6 +188,16 @@ cardsEl.addEventListener('click', async (e) => {
 async function bootstrap() {
   state = await api('/api/state');
   render();
+
+  window.addEventListener('message', (ev) => {
+    const m = ev.data || {};
+    if (m.source !== 'sim' || m.kind !== 'state' || !Array.isArray(m.drones)) return;
+    for (const d of m.drones) {
+      if (!d?.drone_id || !d?.grid) continue;
+      simDronePos.set(d.drone_id, { x: Number(d.grid.x), y: Number(d.grid.y) });
+    }
+    render();
+  });
 
   const wsProto = location.protocol === 'https:' ? 'wss' : 'ws';
   const ws = new WebSocket(`${wsProto}://${location.host}/ws`);
