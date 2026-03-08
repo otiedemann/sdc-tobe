@@ -25,6 +25,13 @@ class AruCoPositioning:
         # Coordinate system: X-right, Y-up, Z-forward (from marker 0)
         self.marker_positions = self._initialize_marker_positions()
 
+        self.view_angle_x = 50.0
+        self.view_angle_y = 210.0
+
+        # Mouse button state for continuous rotation
+        self.mouse_button_pressed = None
+        self.last_rotation_time = 0
+
     def _initialize_marker_positions(self):
         """
         Define 3D positions of all ArUco markers based on SDC26 regulations
@@ -34,41 +41,94 @@ class AruCoPositioning:
         positions = {}
 
         # Marker 0 at origin (back wall center)
-        positions[0] = np.array([0.0, 3.0, 0.0])  # Center height
+        positions[0] = np.array([0.0, 3.0, 0.0])
 
-        # Back wall pillars (Z=0)
-        positions[18] = np.array([-5.0, 4.0, 0.0])  # Left pillar, upper (4m)
-        positions[17] = np.array([-5.0, 2.0, 0.0])  # Left pillar, lower (2m)
-        positions[20] = np.array([-1.67, 4.0, 0.0])
-        positions[19] = np.array([-1.67, 2.0, 0.0])
-        positions[22] = np.array([1.67, 4.0, 0.0])
-        positions[21] = np.array([1.67, 2.0, 0.0])
-        positions[24] = np.array([5.0, 4.0, 0.0])  # Right pillar, upper
-        positions[23] = np.array([5.0, 2.0, 0.0])  # Right pillar, lower
+        # Left side pillars (X=10m)
+        positions[1] = np.array([10.0, 2.0, 6.667])
+        positions[2] = np.array([10.0, 4.0, 6.667])
+        positions[3] = np.array([10.0, 2.0, 3.333])
+        positions[4] = np.array([10.0, 4.0, 3.333])
 
-        # Front wall pillars (Z=20m)
-        positions[12] = np.array([-5.0, 4.0, 20.0])
-        positions[11] = np.array([-5.0, 2.0, 20.0])
-        positions[10] = np.array([-1.67, 4.0, 20.0])
-        positions[9] = np.array([-1.67, 2.0, 20.0])
-        positions[8] = np.array([1.67, 4.0, 20.0])
-        positions[7] = np.array([1.67, 2.0, 20.0])
-        positions[6] = np.array([5.0, 4.0, 20.0])
-        positions[5] = np.array([5.0, 2.0, 20.0])
+        # Back wall pillars (Z=0m)
+        positions[5] = np.array([6.0, 2.0, 0.0])
+        positions[6] = np.array([6.0, 4.0, 0.0])
+        positions[7] = np.array([2.0, 2.0, 0.0])
+        positions[8] = np.array([2.0, 4.0, 0.0])
+        positions[9] = np.array([-2.0, 2.0, 0.0])
+        positions[10] = np.array([-2.0, 4.0, 0.0])
+        positions[11] = np.array([-6.0, 2.0, 0.0])
+        positions[12] = np.array([-6.0, 4.0, 0.0])
 
-        # Left side pillars (X=-5m)
-        positions[16] = np.array([-5.0, 4.0, 6.67])
-        positions[15] = np.array([-5.0, 2.0, 6.67])
-        positions[14] = np.array([-5.0, 4.0, 13.33])
-        positions[13] = np.array([-5.0, 2.0, 13.33])
+        # Right side pillars (X=-10m)
+        positions[13] = np.array([-10.0, 2.0, 3.333])
+        positions[14] = np.array([-10.0, 4.0, 3.333])
+        positions[15] = np.array([-10.0, 2.0, 6.667])
+        positions[16] = np.array([-10.0, 4.0, 6.667])
 
-        # Right side pillars (X=5m)
-        positions[2] = np.array([5.0, 4.0, 6.67])
-        positions[1] = np.array([5.0, 2.0, 6.67])
-        positions[4] = np.array([5.0, 4.0, 13.33])
-        positions[3] = np.array([5.0, 2.0, 13.33])
+        # Front wall pillars (Z=10m)
+        positions[17] = np.array([6.0, 2.0, 10.0])
+        positions[18] = np.array([6.0, 4.0, 10.0])
+        positions[19] = np.array([2.0, 2.0, 10.0])
+        positions[20] = np.array([2.0, 4.0, 10.0])
+        positions[21] = np.array([-2.0, 2.0, 10.0])
+        positions[22] = np.array([-2.0, 4.0, 10.0])
+        positions[23] = np.array([-6.0, 2.0, 10.0])
+        positions[24] = np.array([-6.0, 4.0, 10.0])
 
         return positions
+
+    def _get_marker_orientation(self, marker_id):
+        """
+        Get the rotation matrix for marker's orientation in world frame
+        Markers face into the arena from their respective walls
+
+        Args:
+            marker_id: ID of the marker
+
+        Returns:
+            3x3 rotation matrix for marker orientation in world coordinates
+        """
+        # Get marker position to determine which wall it's on
+        if marker_id not in self.marker_positions:
+            return np.eye(3)
+
+        pos = self.marker_positions[marker_id]
+        x, y, z = pos[0], pos[1], pos[2]
+
+        # Back wall (Z=0) - markers face +Z (into arena)
+        if abs(z - 0.0) < 0.1:  # Z ≈ 0
+            # Marker X-axis points right, Y up, Z forward (into arena)
+            return np.eye(3)
+
+        # Front wall (Z=10m) - markers face -Z (into arena)
+        elif abs(z - 10.0) < 0.1:  # Z ≈ 10
+            # Rotate 180° around Y axis - X flips, Z flips
+            return np.array([
+                [-1, 0, 0],
+                [0, 1, 0],
+                [0, 0, -1]
+            ])
+
+        # Left wall (X=-10m) - markers face +X (into arena)
+        elif abs(x - (-10.0)) < 0.1:  # X ≈ -10
+            # Rotate 90° around Y axis (counterclockwise when looking down)
+            return np.array([
+                [0, 0, 1],
+                [0, 1, 0],
+                [-1, 0, 0]
+            ])
+
+        # Right wall (X=+10m) - markers face -X (into arena)
+        elif abs(x - 10.0) < 0.1:  # X ≈ 10
+            # Rotate -90° around Y axis (clockwise when looking down)
+            return np.array([
+                [0, 0, -1],
+                [0, 1, 0],
+                [1, 0, 0]
+            ])
+
+        # Default to identity if unknown position
+        return np.eye(3)
 
     def detect_markers(self, frame):
         """
@@ -104,37 +164,71 @@ class AruCoPositioning:
             return None, None, None
 
         # Estimate pose for each marker
-        rvecs, tvecs, _ = aruco.estimatePoseSingleMarkers(
-            corners, self.marker_size, self.camera_matrix, self.dist_coeffs
-        )
+        rvecs = []
+        tvecs = []
+        for corner in corners:
+            _, rvec, tvec = cv2.solvePnP(
+                np.array([
+                    [-self.marker_size / 2, self.marker_size / 2, 0],
+                    [self.marker_size / 2, self.marker_size / 2, 0],
+                    [self.marker_size / 2, -self.marker_size / 2, 0],
+                    [-self.marker_size / 2, -self.marker_size / 2, 0]
+                ], dtype=np.float32),
+                corner.reshape(-1, 2),
+                self.camera_matrix,
+                self.dist_coeffs,
+                flags=cv2.SOLVEPNP_IPPE_SQUARE
+            )
+            rvecs.append(rvec)
+            tvecs.append(tvec)
 
         # Use first detected marker with known position
         for i, marker_id in enumerate(ids.flatten()):
             if marker_id in self.marker_positions:
                 # Get marker pose in camera frame
                 rvec = rvecs[i]
-                tvec = tvecs[i]
+                tvec = tvecs[i].reshape(3)
 
                 # Convert rotation vector to matrix
-                R_marker_to_cam, _ = cv2.Rodrigues(rvec)
+                R_marker_cam, _ = cv2.Rodrigues(rvec)
 
-                # Camera position in marker frame
-                cam_pos_marker = -R_marker_to_cam.T @ tvec.T
+                # Get camera position in marker's local frame
+                R_cam_marker = R_marker_cam.T
+                t_cam_marker = -R_cam_marker @ tvec
 
-                # Transform to world coordinates
+                # Get marker's world position and orientation
                 marker_world_pos = self.marker_positions[marker_id]
+                R_marker_world = self._get_marker_orientation(marker_id)
+
+                # Transform camera position to world frame
+                camera_position = marker_world_pos + R_marker_world @ t_cam_marker
+
+                # Get marker position for wall-specific corrections
+                marker_pos = self.marker_positions[marker_id]
+
+                # Fix X-axis for front and back wall markers
+                # OpenCV ArUco X-axis convention requires correction
+                if abs(marker_pos[2] - 10.0) < 0.1:  # Front wall marker (Z=10m)
+                    # Compensate for X-axis inversion due to 180° rotation
+                    camera_position[0] = 2 * marker_world_pos[0] - camera_position[0]
+                elif abs(marker_pos[2] - 0.0) < 0.1:  # Back wall marker (Z=0m)
+                    # Back wall also needs X-axis correction
+                    camera_position[0] = 2 * marker_world_pos[0] - camera_position[0]
 
                 # Camera orientation in world frame
-                R_cam_to_world = R_marker_to_cam.T
+                R_cam_world = R_marker_world @ R_cam_marker
 
-                # Camera position in world frame
-                camera_position = marker_world_pos + R_cam_to_world @ cam_pos_marker.flatten()
-
-                # Camera direction (negative Z-axis in camera frame, transformed to world)
-                camera_direction = R_cam_to_world @ np.array([0, 0, -1])
+                # Camera direction: camera looks along positive Z in OpenCV camera frame
+                camera_direction = R_cam_world @ np.array([0, 0, 1])
                 camera_direction = camera_direction / np.linalg.norm(camera_direction)
 
-                return camera_position, R_cam_to_world, camera_direction
+                # Fix direction X-axis for front and back wall markers
+                if abs(marker_pos[2] - 10.0) < 0.1:  # Front wall marker
+                    camera_direction[0] = -camera_direction[0]
+                elif abs(marker_pos[2] - 0.0) < 0.1:  # Back wall marker
+                    camera_direction[0] = -camera_direction[0]
+
+                return camera_position, R_cam_world, camera_direction
 
         return None, None, None
 
@@ -147,13 +241,219 @@ class AruCoPositioning:
     def draw_axes(self, frame, corners, ids):
         """Draw 3D axes on detected markers"""
         if ids is not None:
-            rvecs, tvecs, _ = aruco.estimatePoseSingleMarkers(
-                corners, self.marker_size, self.camera_matrix, self.dist_coeffs
-            )
-            for i in range(len(ids)):
+            for corner in corners:
+                _, rvec, tvec = cv2.solvePnP(
+                    np.array([
+                        [-self.marker_size / 2, self.marker_size / 2, 0],
+                        [self.marker_size / 2, self.marker_size / 2, 0],
+                        [self.marker_size / 2, -self.marker_size / 2, 0],
+                        [-self.marker_size / 2, -self.marker_size / 2, 0]
+                    ], dtype=np.float32),
+                    corner.reshape(-1, 2),
+                    self.camera_matrix,
+                    self.dist_coeffs,
+                    flags=cv2.SOLVEPNP_IPPE_SQUARE
+                )
                 cv2.drawFrameAxes(frame, self.camera_matrix, self.dist_coeffs,
-                                  rvecs[i], tvecs[i], self.marker_size * 0.5)
+                                  rvec, tvec, self.marker_size * 0.5)
         return frame
+
+    def project_3d_to_2d(self, point_3d, view_matrix, scale=20):
+        """
+        Project 3D point to 2D for visualization using simple orthographic projection
+
+        Args:
+            point_3d: 3D point (x, y, z)
+            view_matrix: Rotation matrix for view angle
+            scale: Scale factor for display
+
+        Returns:
+            2D point (x, y) on screen
+        """
+        # Apply view rotation - this rotates the 3D point including Z depth
+        rotated = view_matrix @ point_3d
+        # Orthographic projection: use rotated X and Y for screen position
+        # (Z is depth and affects which objects are in front, but not position in ortho projection)
+        x = int(rotated[0] * scale + 400)
+        y = int(400 - rotated[2] * scale)  # Use Z for vertical (depth goes into screen)
+        return (x, y)
+
+    def create_3d_visualization(self, position, direction):
+        """
+        Create lightweight 3D wireframe visualization using OpenCV only
+
+        Args:
+            position: Camera position (x, y, z)
+            direction: Camera direction vector
+
+        Returns:
+            Image of the 3D visualization
+        """
+        # Create blank image
+        img = np.ones((800, 800, 3), dtype=np.uint8) * 255
+
+        # View angle rotation matrix (adjustable with cursor keys)
+        angle_x = np.radians(self.view_angle_x)
+        angle_y = np.radians(self.view_angle_y)
+
+        Rx = np.array([
+            [1, 0, 0],
+            [0, np.cos(angle_x), -np.sin(angle_x)],
+            [0, np.sin(angle_x), np.cos(angle_x)]
+        ])
+
+        Ry = np.array([
+            [np.cos(angle_y), 0, np.sin(angle_y)],
+            [0, 1, 0],
+            [-np.sin(angle_y), 0, np.cos(angle_y)]
+        ])
+
+        view_matrix = Rx @ Ry
+
+        # Define arena corners (20m x 10m x 6m)
+        # Coordinates: (X, Y, Z) where Y is height
+        corners = np.array([
+            [-10, 0, 0], [10, 0, 0], [10, 0, 10], [-10, 0, 10],  # Bottom
+            [-10, 6, 0], [10, 6, 0], [10, 6, 10], [-10, 6, 10],  # Top
+        ])
+
+        # Draw arena edges
+        edges = [
+            # Bottom rectangle
+            (0, 1), (1, 2), (2, 3), (3, 0),
+            # Top rectangle
+            (4, 5), (5, 6), (6, 7), (7, 4),
+            # Vertical edges
+            (0, 4), (1, 5), (2, 6), (3, 7)
+        ]
+
+        for start_idx, end_idx in edges:
+            pt1 = self.project_3d_to_2d(corners[start_idx], view_matrix)
+            pt2 = self.project_3d_to_2d(corners[end_idx], view_matrix)
+            cv2.line(img, pt1, pt2, (200, 200, 200), 1)
+
+        # Draw coordinate system axes at real origin (0, 0, 0)
+        origin = np.array([0.0, 0.0, 0.0])
+        axis_length = 3.0
+
+        # X-axis (red)
+        x_axis = np.array([axis_length, 0.0, 0.0])
+        origin_pt = self.project_3d_to_2d(origin, view_matrix)
+        x_pt = self.project_3d_to_2d(x_axis, view_matrix)
+        cv2.arrowedLine(img, origin_pt, x_pt, (0, 0, 255), 3, tipLength=0.2)
+        cv2.putText(img, 'X', x_pt, cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+
+        # Y-axis (green)
+        y_axis = np.array([0.0, axis_length, 0.0])
+        y_pt = self.project_3d_to_2d(y_axis, view_matrix)
+        cv2.arrowedLine(img, origin_pt, y_pt, (0, 255, 0), 3, tipLength=0.2)
+        cv2.putText(img, 'Y', y_pt, cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+
+        # Z-axis (blue)
+        z_axis = np.array([0.0, 0.0, axis_length])
+        z_pt = self.project_3d_to_2d(z_axis, view_matrix)
+        cv2.arrowedLine(img, origin_pt, z_pt, (255, 0, 0), 3, tipLength=0.2)
+        cv2.putText(img, 'Z', z_pt, cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 0, 0), 2)
+
+        # Draw markers
+        for marker_id, marker_pos in self.marker_positions.items():
+            pt = self.project_3d_to_2d(marker_pos, view_matrix)
+            cv2.circle(img, pt, 3, (255, 100, 0), -1)
+            cv2.putText(img, str(marker_id), (pt[0] + 5, pt[1] - 5),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.3, (255, 100, 0), 1)
+
+            # Draw orientation arrow for each marker
+            R_marker = self._get_marker_orientation(marker_id)
+            # Marker's forward direction (facing into arena) is along its +Z axis
+            marker_forward = R_marker @ np.array([0, 0, 1.0])
+            arrow_end = marker_pos + marker_forward
+            arrow_pt = self.project_3d_to_2d(arrow_end, view_matrix)
+            cv2.arrowedLine(img, pt, arrow_pt, (150, 150, 0), 1, tipLength=0.3)
+
+        # Draw camera position and direction
+        if position is not None:
+            cam_pt = self.project_3d_to_2d(position, view_matrix)
+            cv2.circle(img, cam_pt, 8, (0, 0, 255), -1)
+            cv2.putText(img, 'Camera', (cam_pt[0] + 10, cam_pt[1]),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
+
+            # Draw direction arrow
+            if direction is not None:
+                arrow_end = position + direction * 2.0
+                arrow_pt = self.project_3d_to_2d(arrow_end, view_matrix)
+                cv2.arrowedLine(img, cam_pt, arrow_pt, (0, 0, 255), 2, tipLength=0.3)
+
+                # Display position text
+                pos_text = f"Pos: ({position[0]:.1f}, {position[1]:.1f}, {position[2]:.1f})m"
+                cv2.putText(img, pos_text, (10, 30),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 2)
+
+        # Add title and legend
+        cv2.putText(img, 'SDC26 Arena - 3D View', (10, 780),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 0), 2)
+        cv2.putText(img, 'Blue: Markers | Red: Camera', (10, 760),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (100, 100, 100), 1)
+
+        # Display view angles
+        view_text = f"View: X={self.view_angle_x:.1f}° Y={self.view_angle_y:.1f}°"
+        cv2.putText(img, view_text, (10, 740),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (100, 100, 100), 1)
+
+        # Draw control buttons
+        button_y = 20
+        button_width = 60
+        button_height = 30
+
+        # Up button
+        cv2.rectangle(img, (680, button_y), (680 + button_width, button_y + button_height), (200, 200, 200), -1)
+        cv2.rectangle(img, (680, button_y), (680 + button_width, button_y + button_height), (100, 100, 100), 2)
+        cv2.putText(img, 'UP', (690, button_y + 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 2)
+
+        # Down button
+        cv2.rectangle(img, (680, button_y + 80), (680 + button_width, button_y + 80 + button_height), (200, 200, 200),
+                      -1)
+        cv2.rectangle(img, (680, button_y + 80), (680 + button_width, button_y + 80 + button_height), (100, 100, 100),
+                      2)
+        cv2.putText(img, 'DOWN', (685, button_y + 100), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 0, 0), 2)
+
+        # Left button
+        cv2.rectangle(img, (610, button_y + 40), (610 + button_width, button_y + 40 + button_height), (200, 200, 200),
+                      -1)
+        cv2.rectangle(img, (610, button_y + 40), (610 + button_width, button_y + 40 + button_height), (100, 100, 100),
+                      2)
+        cv2.putText(img, 'LEFT', (615, button_y + 60), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 0, 0), 2)
+
+        # Right button
+        cv2.rectangle(img, (750, button_y + 40), (750 + button_width, button_y + 40 + button_height), (200, 200, 200),
+                      -1)
+        cv2.rectangle(img, (750, button_y + 40), (750 + button_width, button_y + 40 + button_height), (100, 100, 100),
+                      2)
+        cv2.putText(img, 'RIGHT', (753, button_y + 60), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 0, 0), 2)
+
+        return img
+
+
+def mouse_callback(event, x, y, flags, param):
+    """Handle mouse clicks and hold on the 3D view buttons"""
+    aruco_pos = param
+    button_y = 20
+    button_width = 60
+    button_height = 30
+
+    if event == cv2.EVENT_LBUTTONDOWN:
+        # Check which button was pressed and store it
+        if 680 <= x <= 740 and button_y <= y <= button_y + button_height:
+            aruco_pos.mouse_button_pressed = 'up'
+        elif 680 <= x <= 740 and button_y + 80 <= y <= button_y + 80 + button_height:
+            aruco_pos.mouse_button_pressed = 'down'
+        elif 610 <= x <= 670 and button_y + 40 <= y <= button_y + 40 + button_height:
+            aruco_pos.mouse_button_pressed = 'left'
+        elif 750 <= x <= 810 and button_y + 40 <= y <= button_y + 40 + button_height:
+            aruco_pos.mouse_button_pressed = 'right'
+
+    elif event == cv2.EVENT_LBUTTONUP:
+        # Release button
+        aruco_pos.mouse_button_pressed = None
 
 
 def main():
@@ -203,7 +503,12 @@ def main():
 
     print("=" * 50)
     print("Press 'q' to quit")
+    print("Click buttons on 3D view to rotate")
     print("=" * 50)
+
+    # Set up mouse callback for the 3D view window
+    cv2.namedWindow('3D Arena View')
+    cv2.setMouseCallback('3D Arena View', mouse_callback, aruco_pos)
 
     while True:
         ret, frame = cap.read()
@@ -236,12 +541,45 @@ def main():
             cv2.putText(frame, "No markers detected", (10, 30),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
 
-        # Show frame
+        # Handle continuous rotation if button is held
+        import time
+        current_time = time.time()
+        if aruco_pos.mouse_button_pressed is not None:
+            # Rotate every 50ms for smooth continuous rotation
+            if current_time - aruco_pos.last_rotation_time > 0.05:
+                if aruco_pos.mouse_button_pressed == 'up':
+                    aruco_pos.view_angle_x += 2
+                elif aruco_pos.mouse_button_pressed == 'down':
+                    aruco_pos.view_angle_x -= 2
+                elif aruco_pos.mouse_button_pressed == 'left':
+                    aruco_pos.view_angle_y -= 2
+                elif aruco_pos.mouse_button_pressed == 'right':
+                    aruco_pos.view_angle_y += 2
+                aruco_pos.last_rotation_time = current_time
+
+        # Create and display 3D visualization
+        viz_3d = aruco_pos.create_3d_visualization(position, direction)
+
+        # Show frame and 3D visualization
         cv2.imshow('ArUco Positioning - SDC26', frame)
+        cv2.imshow('3D Arena View', viz_3d)
+
+        # Handle keyboard input (don't mask with 0xFF for arrow keys on Windows)
+        key = cv2.waitKey(1)
 
         # Exit on 'q'
-        if cv2.waitKey(1) & 0xFF == ord('q'):
+        if key == ord('q'):
             break
+        # Arrow keys to adjust view angle
+        # Windows uses different codes than Linux
+        elif key == 2490368 or key == 82:  # Up arrow (Windows/Linux)
+            aruco_pos.view_angle_x += 5
+        elif key == 2621440 or key == 84:  # Down arrow (Windows/Linux)
+            aruco_pos.view_angle_x -= 5
+        elif key == 2424832 or key == 81:  # Left arrow (Windows/Linux)
+            aruco_pos.view_angle_y -= 5
+        elif key == 2555904 or key == 83:  # Right arrow (Windows/Linux)
+            aruco_pos.view_angle_y += 5
 
     cap.release()
     cv2.destroyAllWindows()

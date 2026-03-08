@@ -2,7 +2,7 @@ import cv2
 
 # IP-Adresse deiner Handy-App (z.B. IP Webcam oder DroidCam)
 # Hier deine Handy-IP eintragen (z.B. "http://192.168.1.50:8080/video")
-url = ("http://192.168.178.99:8080/video")
+url = 1
 
 
 def main():
