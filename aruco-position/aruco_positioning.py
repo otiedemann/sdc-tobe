@@ -66,14 +66,14 @@ class AruCoPositioning:
         positions[16] = np.array([-10.0, 4.0, 6.667])
 
         # Front wall pillars (Z=10m)
-        positions[17] = np.array([6.0, 2.0, 10.0])
-        positions[18] = np.array([6.0, 4.0, 10.0])
-        positions[19] = np.array([2.0, 2.0, 10.0])
-        positions[20] = np.array([2.0, 4.0, 10.0])
-        positions[21] = np.array([-2.0, 2.0, 10.0])
-        positions[22] = np.array([-2.0, 4.0, 10.0])
-        positions[23] = np.array([-6.0, 2.0, 10.0])
-        positions[24] = np.array([-6.0, 4.0, 10.0])
+        positions[17] = np.array([-6.0, 2.0, 10.0])
+        positions[18] = np.array([-6.0, 4.0, 10.0])
+        positions[19] = np.array([-2.0, 2.0, 10.0])
+        positions[20] = np.array([-2.0, 4.0, 10.0])
+        positions[21] = np.array([2.0, 2.0, 10.0])
+        positions[22] = np.array([2.0, 4.0, 10.0])
+        positions[23] = np.array([6.0, 2.0, 10.0])
+        positions[24] = np.array([6.0, 4.0, 10.0])
 
         return positions
 
