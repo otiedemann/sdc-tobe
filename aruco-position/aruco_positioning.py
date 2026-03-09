@@ -170,6 +170,51 @@ class AruCoPositioning:
         wall_type = self.marker_wall_type[marker_id]
         return self._wall_rotations.get(wall_type, np.eye(3))
 
+    def _calculate_marker_weight(self, corner, distance):
+        """
+        Calculate weight for a marker based on detection quality
+        Higher weight = more reliable measurement
+
+        Args:
+            corner: Detected marker corners (4 points)
+            distance: Distance from camera to marker
+
+        Returns:
+            float: Weight value (0-1), higher is better
+        """
+        # Factor 1: Marker size in image (larger = closer = more reliable)
+        # Calculate area of detected marker in pixels
+        pts = corner.reshape(4, 2)
+        # Simple area approximation using cross product
+        v1 = pts[1] - pts[0]
+        v2 = pts[3] - pts[0]
+        area = abs(np.cross(v1, v2))
+
+        # Normalize area (typical range: 100-10000 pixels²)
+        area_weight = np.clip(area / 5000.0, 0.1, 1.0)
+
+        # Factor 2: Distance (closer markers are more accurate)
+        # Weight decreases with distance, using exponential decay
+        distance_weight = np.exp(-distance / 10.0)  # 10m decay constant
+
+        # Factor 3: Corner sharpness (how square/well-defined is the marker)
+        # Check if corners form a roughly square shape
+        edge_lengths = [
+            np.linalg.norm(pts[1] - pts[0]),
+            np.linalg.norm(pts[2] - pts[1]),
+            np.linalg.norm(pts[3] - pts[2]),
+            np.linalg.norm(pts[0] - pts[3])
+        ]
+        avg_edge = np.mean(edge_lengths)
+        edge_variance = np.std(edge_lengths) / (avg_edge + 1e-6)
+        # Lower variance = more square = better
+        shape_weight = np.exp(-edge_variance * 5.0)
+
+        # Combine factors (all weighted equally)
+        total_weight = area_weight * distance_weight * shape_weight
+
+        return total_weight
+
     def detect_markers(self, frame):
         """
         Detect ArUco markers in frame
@@ -218,12 +263,13 @@ class AruCoPositioning:
             )
             self._cached_poses[marker_id] = (rvec, tvec)
 
-        # Multi-marker fusion: collect all position and direction estimates
+        # Multi-marker fusion with weighting: collect all position and direction estimates
         positions = []
         directions = []
         rotation_matrices = []
+        weights = []
 
-        for marker_id in ids.flatten():
+        for i, marker_id in enumerate(ids.flatten()):
             if marker_id in self.marker_positions:
                 # Get cached marker pose in camera frame
                 rvec, tvec = self._cached_poses[marker_id]
@@ -263,17 +309,33 @@ class AruCoPositioning:
                 if wall_type in ('front', 'back'):
                     camera_direction[0] = -camera_direction[0]
 
+                # Calculate weight based on detection quality
+                distance = np.linalg.norm(tvec)
+                corner = corners[i]
+                weight = self._calculate_marker_weight(corner, distance)
+
                 positions.append(camera_position)
                 directions.append(camera_direction)
                 rotation_matrices.append(R_cam_world)
+                weights.append(weight)
 
         if len(positions) == 0:
             return None, None, None
 
-        # Fuse multiple marker estimates by averaging
-        raw_position = np.mean(positions, axis=0)
-        raw_direction = np.mean(directions, axis=0)
-        # Re-normalize direction after averaging
+        # Weighted fusion of multiple marker estimates
+        weights = np.array(weights)
+        weights = weights / (np.sum(weights) + 1e-6)  # Normalize weights
+
+        # Weighted average of positions
+        raw_position = np.zeros(3)
+        for pos, w in zip(positions, weights):
+            raw_position += pos * w
+
+        # Weighted average of directions
+        raw_direction = np.zeros(3)
+        for dir_vec, w in zip(directions, weights):
+            raw_direction += dir_vec * w
+        # Re-normalize direction after weighted averaging
         raw_direction = raw_direction / np.linalg.norm(raw_direction)
 
         # Apply temporal filtering
