@@ -5,6 +5,31 @@ import numpy as np
 from cv2 import aruco
 
 
+class ExponentialMovingAverage:
+    """Exponential moving average filter for smoothing noisy data"""
+
+    def __init__(self, alpha=0.3):
+        """
+        Args:
+            alpha: Smoothing factor (0-1). Lower = more smoothing, higher = more responsive
+                   0.1-0.3 recommended for position tracking
+        """
+        self.alpha = alpha
+        self.value = None
+
+    def update(self, new_value):
+        """Update filter with new measurement"""
+        if self.value is None:
+            self.value = new_value
+        else:
+            self.value = self.alpha * new_value + (1 - self.alpha) * self.value
+        return self.value
+
+    def reset(self):
+        """Reset filter state"""
+        self.value = None
+
+
 class AruCoPositioning:
     # Pre-computed marker 3D points (class constant)
     MARKER_3D_POINTS = np.array([
@@ -61,6 +86,10 @@ class AruCoPositioning:
 
         # Cache for pose estimation results
         self._cached_poses = {}
+
+        # Temporal filters for position and direction (alpha=0.2 for smooth tracking)
+        self.position_filter = ExponentialMovingAverage(alpha=0.2)
+        self.direction_filter = ExponentialMovingAverage(alpha=0.2)
 
         # Mouse button state for continuous rotation
         self.mouse_button_pressed = None
@@ -159,19 +188,21 @@ class AruCoPositioning:
 
     def estimate_pose(self, corners, ids):
         """
-        Estimate camera pose from detected markers
+        Estimate camera pose from detected markers using multi-marker fusion
 
         Args:
             corners: Detected marker corners
             ids: Detected marker IDs
 
         Returns:
-            position: Camera position in world coordinates (x, y, z)
+            position: Camera position in world coordinates (x, y, z) - filtered
             rotation: Camera rotation matrix
-            camera_direction: Unit vector of camera viewing direction
+            camera_direction: Unit vector of camera viewing direction - filtered
         """
         if ids is None or len(ids) == 0:
             self._cached_poses.clear()
+            self.position_filter.reset()
+            self.direction_filter.reset()
             return None, None, None
 
         # Estimate pose for each marker and cache results
@@ -187,7 +218,11 @@ class AruCoPositioning:
             )
             self._cached_poses[marker_id] = (rvec, tvec)
 
-        # Use first detected marker with known position
+        # Multi-marker fusion: collect all position and direction estimates
+        positions = []
+        directions = []
+        rotation_matrices = []
+
         for marker_id in ids.flatten():
             if marker_id in self.marker_positions:
                 # Get cached marker pose in camera frame
@@ -228,9 +263,29 @@ class AruCoPositioning:
                 if wall_type in ('front', 'back'):
                     camera_direction[0] = -camera_direction[0]
 
-                return camera_position, R_cam_world, camera_direction
+                positions.append(camera_position)
+                directions.append(camera_direction)
+                rotation_matrices.append(R_cam_world)
 
-        return None, None, None
+        if len(positions) == 0:
+            return None, None, None
+
+        # Fuse multiple marker estimates by averaging
+        raw_position = np.mean(positions, axis=0)
+        raw_direction = np.mean(directions, axis=0)
+        # Re-normalize direction after averaging
+        raw_direction = raw_direction / np.linalg.norm(raw_direction)
+
+        # Apply temporal filtering
+        filtered_position = self.position_filter.update(raw_position)
+        filtered_direction = self.direction_filter.update(raw_direction)
+        # Re-normalize filtered direction
+        filtered_direction = filtered_direction / np.linalg.norm(filtered_direction)
+
+        # Use rotation from first marker (could be improved with rotation averaging)
+        R_cam_world = rotation_matrices[0]
+
+        return filtered_position, R_cam_world, filtered_direction
 
     def draw_markers(self, frame, corners, ids):
         """Draw detected markers on frame"""
