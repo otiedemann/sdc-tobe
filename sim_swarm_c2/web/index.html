@@ -1,0 +1,167 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Swarm Sim Viewer</title>
+  <style>
+    body { font-family: Arial, sans-serif; margin: 16px; background:#111; color:#eee; }
+    .row { display:flex; gap:16px; align-items:center; flex-wrap:wrap; }
+    canvas { background:#1b1b1b; border:1px solid #444; }
+    .panel { background:#1a1f2a; border:1px solid #2d3550; padding:10px; border-radius:8px; }
+    select, button, input { background:#222; color:#eee; border:1px solid #555; padding:6px; border-radius:6px; }
+    .small { color:#aaa; font-size: 12px; }
+    table { border-collapse: collapse; width: 100%; }
+    th, td { border-bottom:1px solid #333; padding:4px 6px; text-align:left; font-size: 13px; }
+    .ok { color:#7ddc7d; }
+    .bad { color:#ff8a8a; }
+  </style>
+</head>
+<body>
+  <h2>Swarm Simulation Viewer</h2>
+  <div class="row panel">
+    <label>Scenario:
+      <select id="scenario">
+        <option value="baseline">baseline</option>
+        <option value="degraded_link">degraded_link</option>
+        <option value="dropout">dropout</option>
+      </select>
+    </label>
+    <button id="loadBtn">Load</button>
+    <button id="playBtn">Play</button>
+    <button id="pauseBtn">Pause</button>
+    <label>Speed <input id="speed" type="range" min="1" max="30" value="8" /></label>
+    <span id="time">t=0.0s</span>
+  </div>
+
+  <div class="row" style="margin-top:12px; align-items:flex-start;">
+    <canvas id="sim" width="900" height="520"></canvas>
+    <div style="width:420px; display:flex; flex-direction:column; gap:12px;">
+      <div class="panel">
+        <h3 style="margin-top:0">Result</h3>
+        <pre id="result" style="white-space:pre-wrap"></pre>
+      </div>
+      <div class="panel">
+        <h3 style="margin-top:0">Drone States</h3>
+        <table id="stateTable">
+          <thead><tr><th>ID</th><th>State</th><th>Battery</th><th>Link</th><th>Pos</th></tr></thead>
+          <tbody></tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+
+  <p class="small">Tip: run scenarios first so JSON files exist in <code>sim_swarm/out</code>.</p>
+
+<script>
+const canvas = document.getElementById('sim');
+const ctx = canvas.getContext('2d');
+const resultEl = document.getElementById('result');
+const tableBody = document.querySelector('#stateTable tbody');
+const timeEl = document.getElementById('time');
+
+let timeline = [];
+let result = null;
+let frame = 0;
+let timer = null;
+let world = { width:12, height:8, home:{x:1,y:1}, target:{x:10,y:6} };
+
+function toCanvas(x,y){
+  const pad=30;
+  const sx=(canvas.width-2*pad)/world.width;
+  const sy=(canvas.height-2*pad)/world.height;
+  return { x: pad + x*sx, y: canvas.height - (pad + y*sy) };
+}
+
+function colorByState(state){
+  if(state==='LAND') return '#7ddc7d';
+  if(state==='DROPOUT') return '#ff5f5f';
+  if(state==='RETURN') return '#ffd166';
+  if(state==='TRACK') return '#8ecae6';
+  return '#cdb4db';
+}
+
+function draw(){
+  ctx.clearRect(0,0,canvas.width,canvas.height);
+  ctx.fillStyle='#0f1420';
+  ctx.fillRect(0,0,canvas.width,canvas.height);
+
+  // world border
+  const p0=toCanvas(0,0), p1=toCanvas(world.width,world.height);
+  ctx.strokeStyle='#446'; ctx.lineWidth=2;
+  ctx.strokeRect(p0.x,p1.y,p1.x-p0.x,p0.y-p1.y);
+
+  // home
+  let c=toCanvas(world.home.x,world.home.y);
+  ctx.fillStyle='#4cc9f0';
+  ctx.beginPath(); ctx.arc(c.x,c.y,8,0,Math.PI*2); ctx.fill();
+  ctx.fillStyle='#9be7ff'; ctx.fillText('HOME', c.x+10, c.y-10);
+
+  // target
+  c=toCanvas(world.target.x,world.target.y);
+  ctx.fillStyle='#ef476f';
+  ctx.beginPath(); ctx.arc(c.x,c.y,9,0,Math.PI*2); ctx.fill();
+  ctx.fillStyle='#ff8ba3'; ctx.fillText('TARGET', c.x+12, c.y-10);
+
+  if(!timeline.length) return;
+  const step = timeline[Math.min(frame, timeline.length-1)];
+  timeEl.textContent = `t=${step.t.toFixed(1)}s`;
+
+  // drone drawing
+  for(const d of step.drones){
+    const p=toCanvas(d.x,d.y);
+    ctx.fillStyle=colorByState(d.state);
+    ctx.beginPath(); ctx.arc(p.x,p.y,7,0,Math.PI*2); ctx.fill();
+    ctx.fillStyle='#ddd'; ctx.fillText(`${d.id}`, p.x+9, p.y+4);
+    if(!d.link){
+      ctx.strokeStyle='#ff595e'; ctx.lineWidth=2;
+      ctx.beginPath(); ctx.moveTo(p.x-8,p.y-8); ctx.lineTo(p.x+8,p.y+8); ctx.stroke();
+    }
+  }
+
+  tableBody.innerHTML='';
+  for(const d of step.drones){
+    const tr=document.createElement('tr');
+    tr.innerHTML = `<td>${d.id}</td><td>${d.state}</td><td>${d.bat}%</td><td class='${d.link?'ok':'bad'}'>${d.link?'OK':'LOSS'}</td><td>(${d.x}, ${d.y})</td>`;
+    tableBody.appendChild(tr);
+  }
+}
+
+async function loadScenario(){
+  const sc = document.getElementById('scenario').value;
+  const [resRaw, tlRaw] = await Promise.all([
+    fetch(`../out/${sc}_result.json`).then(r=>r.json()),
+    fetch(`../out/${sc}_timeline.json`).then(r=>r.json())
+  ]);
+  result = resRaw;
+  timeline = tlRaw;
+  frame = 0;
+  resultEl.textContent = JSON.stringify(result, null, 2);
+  draw();
+}
+
+function play(){
+  if(timer) return;
+  timer = setInterval(()=>{
+    if(!timeline.length) return;
+    frame += 1;
+    if(frame >= timeline.length){ frame = timeline.length-1; pause(); }
+    draw();
+  }, 1000 / Number(document.getElementById('speed').value));
+}
+
+function pause(){
+  if(timer){ clearInterval(timer); timer=null; }
+}
+
+document.getElementById('loadBtn').onclick=loadScenario;
+document.getElementById('playBtn').onclick=play;
+document.getElementById('pauseBtn').onclick=pause;
+document.getElementById('speed').oninput=()=>{ if(timer){ pause(); play(); }};
+
+loadScenario().catch(err=>{
+  resultEl.textContent = 'Could not load scenario JSON.\nRun the simulator first:\npython3 sim_swarm/run.py --scenario baseline\n\n' + err;
+});
+</script>
+</body>
+</html>

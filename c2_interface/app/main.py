@@ -26,11 +26,13 @@ from .state import StateStore
 
 BASE_DIR = Path(__file__).resolve().parents[1]
 WEB_DIR = BASE_DIR / "web"
-SIM_DIR = BASE_DIR.parent / "sim_swarm"
+SIM_DIR = BASE_DIR.parent / "sim_swarm_c2"
 LIVE_CFG = BASE_DIR / "live_drones.json"
 
 app = FastAPI(title="SDC Command & Control")
 app.mount("/static", StaticFiles(directory=str(WEB_DIR)), name="static")
+# Serve simulator assets from the same host/port as C2 to avoid cross-host disconnect issues.
+app.mount("/simviewer", StaticFiles(directory=str(SIM_DIR), html=True), name="simviewer")
 
 arena = ArenaGrid()
 store = StateStore()
@@ -69,7 +71,7 @@ hub = WsHub()
 
 
 def simulator_url() -> str | None:
-    return "http://localhost:8765/web3d/" if system_mode == "simulator" else None
+    return "/simviewer/web3d/" if system_mode == "simulator" else None
 
 
 def load_live_configs(count: int) -> list[LiveDroneConfig]:
@@ -189,7 +191,7 @@ async def set_system(cfg: SystemConfigCommand) -> dict:
     system_mode = cfg.mode
     team_drone_count = cfg.drone_count
     if system_mode == "simulator":
-        start_simulator()
+        # Simulator is now served via /simviewer on the same C2 host/port.
         live_manager.disconnect_all()
     else:
         stop_simulator()
