@@ -1,8 +1,19 @@
+import time
+
 import cv2
+import numpy as np
 from cv2 import aruco
 
 
 class AruCoPositioning:
+    # Pre-computed marker 3D points (class constant)
+    MARKER_3D_POINTS = np.array([
+        [-0.25, 0.25, 0],  # marker_size/2 = 0.5/2 = 0.25
+        [0.25, 0.25, 0],
+        [0.25, -0.25, 0],
+        [-0.25, -0.25, 0]
+    ], dtype=np.float32)
+
     def __init__(self, camera_matrix, dist_coeffs, marker_size=0.5):
         """
         Initialize ArUco positioning system for SDC26
@@ -20,13 +31,36 @@ class AruCoPositioning:
         self.aruco_dict = aruco.getPredefinedDictionary(aruco.DICT_4X4_50)
         self.aruco_params = aruco.DetectorParameters()
 
+        # Cache the detector to avoid recreation every frame
+        self.detector = aruco.ArucoDetector(self.aruco_dict, self.aruco_params)
+
         # Marker positions in world coordinates (based on Figure 3 and 4)
         # Origin (marker 0) is at back wall center
         # Coordinate system: X-right, Y-up, Z-forward (from marker 0)
         self.marker_positions = self._initialize_marker_positions()
 
+        # Pre-compute wall orientation matrices
+        self._wall_rotations = {
+            'back': np.eye(3),  # Z=0
+            'front': np.array([[-1, 0, 0], [0, 1, 0], [0, 0, -1]]),  # Z=10
+            'left': np.array([[0, 0, 1], [0, 1, 0], [-1, 0, 0]]),  # X=-10
+            'right': np.array([[0, 0, -1], [0, 1, 0], [1, 0, 0]])  # X=10
+        }
+
+        # Cache wall type for each marker
+        self.marker_wall_type = {}
+        for marker_id, pos in self.marker_positions.items():
+            self.marker_wall_type[marker_id] = self._determine_wall_type(pos)
+
         self.view_angle_x = 50.0
         self.view_angle_y = 210.0
+
+        # Cache for view matrix
+        self._cached_view_matrix = None
+        self._cached_angles = (None, None)
+
+        # Cache for pose estimation results
+        self._cached_poses = {}
 
         # Mouse button state for continuous rotation
         self.mouse_button_pressed = None
@@ -77,6 +111,19 @@ class AruCoPositioning:
 
         return positions
 
+    def _determine_wall_type(self, pos):
+        """Determine which wall a marker is on based on its position"""
+        x, z = pos[0], pos[2]
+        if abs(z - 0.0) < 0.1:
+            return 'back'
+        elif abs(z - 10.0) < 0.1:
+            return 'front'
+        elif abs(x - (-10.0)) < 0.1:
+            return 'left'
+        elif abs(x - 10.0) < 0.1:
+            return 'right'
+        return None
+
     def _get_marker_orientation(self, marker_id):
         """
         Get the rotation matrix for marker's orientation in world frame
@@ -88,47 +135,11 @@ class AruCoPositioning:
         Returns:
             3x3 rotation matrix for marker orientation in world coordinates
         """
-        # Get marker position to determine which wall it's on
-        if marker_id not in self.marker_positions:
+        if marker_id not in self.marker_wall_type:
             return np.eye(3)
 
-        pos = self.marker_positions[marker_id]
-        x, y, z = pos[0], pos[1], pos[2]
-
-        # Back wall (Z=0) - markers face +Z (into arena)
-        if abs(z - 0.0) < 0.1:  # Z ≈ 0
-            # Marker X-axis points right, Y up, Z forward (into arena)
-            return np.eye(3)
-
-        # Front wall (Z=10m) - markers face -Z (into arena)
-        elif abs(z - 10.0) < 0.1:  # Z ≈ 10
-            # Rotate 180° around Y axis - X flips, Z flips
-            return np.array([
-                [-1, 0, 0],
-                [0, 1, 0],
-                [0, 0, -1]
-            ])
-
-        # Left wall (X=-10m) - markers face +X (into arena)
-        elif abs(x - (-10.0)) < 0.1:  # X ≈ -10
-            # Rotate 90° around Y axis (counterclockwise when looking down)
-            return np.array([
-                [0, 0, 1],
-                [0, 1, 0],
-                [-1, 0, 0]
-            ])
-
-        # Right wall (X=+10m) - markers face -X (into arena)
-        elif abs(x - 10.0) < 0.1:  # X ≈ 10
-            # Rotate -90° around Y axis (clockwise when looking down)
-            return np.array([
-                [0, 0, -1],
-                [0, 1, 0],
-                [1, 0, 0]
-            ])
-
-        # Default to identity if unknown position
-        return np.eye(3)
+        wall_type = self.marker_wall_type[marker_id]
+        return self._wall_rotations.get(wall_type, np.eye(3))
 
     def detect_markers(self, frame):
         """
@@ -143,8 +154,7 @@ class AruCoPositioning:
             rejected: Rejected candidates
         """
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        detector = aruco.ArucoDetector(self.aruco_dict, self.aruco_params)
-        corners, ids, rejected = detector.detectMarkers(gray)
+        corners, ids, rejected = self.detector.detectMarkers(gray)
         return corners, ids, rejected
 
     def estimate_pose(self, corners, ids):
@@ -161,33 +171,28 @@ class AruCoPositioning:
             camera_direction: Unit vector of camera viewing direction
         """
         if ids is None or len(ids) == 0:
+            self._cached_poses.clear()
             return None, None, None
 
-        # Estimate pose for each marker
-        rvecs = []
-        tvecs = []
-        for corner in corners:
+        # Estimate pose for each marker and cache results
+        self._cached_poses.clear()
+        for i, corner in enumerate(corners):
+            marker_id = ids.flatten()[i]
             _, rvec, tvec = cv2.solvePnP(
-                np.array([
-                    [-self.marker_size / 2, self.marker_size / 2, 0],
-                    [self.marker_size / 2, self.marker_size / 2, 0],
-                    [self.marker_size / 2, -self.marker_size / 2, 0],
-                    [-self.marker_size / 2, -self.marker_size / 2, 0]
-                ], dtype=np.float32),
+                self.MARKER_3D_POINTS,
                 corner.reshape(-1, 2),
                 self.camera_matrix,
                 self.dist_coeffs,
                 flags=cv2.SOLVEPNP_IPPE_SQUARE
             )
-            rvecs.append(rvec)
-            tvecs.append(tvec)
+            self._cached_poses[marker_id] = (rvec, tvec)
 
         # Use first detected marker with known position
-        for i, marker_id in enumerate(ids.flatten()):
+        for marker_id in ids.flatten():
             if marker_id in self.marker_positions:
-                # Get marker pose in camera frame
-                rvec = rvecs[i]
-                tvec = tvecs[i].reshape(3)
+                # Get cached marker pose in camera frame
+                rvec, tvec = self._cached_poses[marker_id]
+                tvec = tvec.reshape(3)
 
                 # Convert rotation vector to matrix
                 R_marker_cam, _ = cv2.Rodrigues(rvec)
@@ -203,29 +208,24 @@ class AruCoPositioning:
                 # Transform camera position to world frame
                 camera_position = marker_world_pos + R_marker_world @ t_cam_marker
 
-                # Get marker position for wall-specific corrections
-                marker_pos = self.marker_positions[marker_id]
+                # Get wall type for corrections
+                wall_type = self.marker_wall_type.get(marker_id)
 
                 # Fix X-axis for front and back wall markers
                 # OpenCV ArUco X-axis convention requires correction
-                if abs(marker_pos[2] - 10.0) < 0.1:  # Front wall marker (Z=10m)
-                    # Compensate for X-axis inversion due to 180° rotation
-                    camera_position[0] = 2 * marker_world_pos[0] - camera_position[0]
-                elif abs(marker_pos[2] - 0.0) < 0.1:  # Back wall marker (Z=0m)
-                    # Back wall also needs X-axis correction
+                if wall_type in ('front', 'back'):
+                    # Compensate for X-axis inversion due to rotation
                     camera_position[0] = 2 * marker_world_pos[0] - camera_position[0]
 
                 # Camera orientation in world frame
                 R_cam_world = R_marker_world @ R_cam_marker
 
                 # Camera direction: camera looks along positive Z in OpenCV camera frame
+                # Direction vector from rotation matrix is already normalized
                 camera_direction = R_cam_world @ np.array([0, 0, 1])
-                camera_direction = camera_direction / np.linalg.norm(camera_direction)
 
                 # Fix direction X-axis for front and back wall markers
-                if abs(marker_pos[2] - 10.0) < 0.1:  # Front wall marker
-                    camera_direction[0] = -camera_direction[0]
-                elif abs(marker_pos[2] - 0.0) < 0.1:  # Back wall marker
+                if wall_type in ('front', 'back'):
                     camera_direction[0] = -camera_direction[0]
 
                 return camera_position, R_cam_world, camera_direction
@@ -239,23 +239,13 @@ class AruCoPositioning:
         return frame
 
     def draw_axes(self, frame, corners, ids):
-        """Draw 3D axes on detected markers"""
+        """Draw 3D axes on detected markers using cached pose data"""
         if ids is not None:
-            for corner in corners:
-                _, rvec, tvec = cv2.solvePnP(
-                    np.array([
-                        [-self.marker_size / 2, self.marker_size / 2, 0],
-                        [self.marker_size / 2, self.marker_size / 2, 0],
-                        [self.marker_size / 2, -self.marker_size / 2, 0],
-                        [-self.marker_size / 2, -self.marker_size / 2, 0]
-                    ], dtype=np.float32),
-                    corner.reshape(-1, 2),
-                    self.camera_matrix,
-                    self.dist_coeffs,
-                    flags=cv2.SOLVEPNP_IPPE_SQUARE
-                )
-                cv2.drawFrameAxes(frame, self.camera_matrix, self.dist_coeffs,
-                                  rvec, tvec, self.marker_size * 0.5)
+            for marker_id in ids.flatten():
+                if marker_id in self._cached_poses:
+                    rvec, tvec = self._cached_poses[marker_id]
+                    cv2.drawFrameAxes(frame, self.camera_matrix, self.dist_coeffs,
+                                      rvec, tvec, self.marker_size * 0.5)
         return frame
 
     def project_3d_to_2d(self, point_3d, view_matrix, scale=20):
@@ -278,6 +268,31 @@ class AruCoPositioning:
         y = int(400 - rotated[2] * scale)  # Use Z for vertical (depth goes into screen)
         return (x, y)
 
+    def _get_view_matrix(self):
+        """Get or compute cached view matrix based on current angles"""
+        current_angles = (self.view_angle_x, self.view_angle_y)
+        if self._cached_angles != current_angles:
+            # Recompute view matrix
+            angle_x = np.radians(self.view_angle_x)
+            angle_y = np.radians(self.view_angle_y)
+
+            Rx = np.array([
+                [1, 0, 0],
+                [0, np.cos(angle_x), -np.sin(angle_x)],
+                [0, np.sin(angle_x), np.cos(angle_x)]
+            ])
+
+            Ry = np.array([
+                [np.cos(angle_y), 0, np.sin(angle_y)],
+                [0, 1, 0],
+                [-np.sin(angle_y), 0, np.cos(angle_y)]
+            ])
+
+            self._cached_view_matrix = Rx @ Ry
+            self._cached_angles = current_angles
+
+        return self._cached_view_matrix
+
     def create_3d_visualization(self, position, direction):
         """
         Create lightweight 3D wireframe visualization using OpenCV only
@@ -292,23 +307,8 @@ class AruCoPositioning:
         # Create blank image
         img = np.ones((800, 800, 3), dtype=np.uint8) * 255
 
-        # View angle rotation matrix (adjustable with cursor keys)
-        angle_x = np.radians(self.view_angle_x)
-        angle_y = np.radians(self.view_angle_y)
-
-        Rx = np.array([
-            [1, 0, 0],
-            [0, np.cos(angle_x), -np.sin(angle_x)],
-            [0, np.sin(angle_x), np.cos(angle_x)]
-        ])
-
-        Ry = np.array([
-            [np.cos(angle_y), 0, np.sin(angle_y)],
-            [0, 1, 0],
-            [-np.sin(angle_y), 0, np.cos(angle_y)]
-        ])
-
-        view_matrix = Rx @ Ry
+        # Get cached view matrix
+        view_matrix = self._get_view_matrix()
 
         # Define arena corners (20m x 10m x 6m)
         # Coordinates: (X, Y, Z) where Y is height
@@ -374,8 +374,6 @@ class AruCoPositioning:
         if position is not None:
             cam_pt = self.project_3d_to_2d(position, view_matrix)
             cv2.circle(img, cam_pt, 8, (0, 0, 255), -1)
-            cv2.putText(img, 'Camera', (cam_pt[0] + 10, cam_pt[1]),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
 
             # Draw direction arrow
             if direction is not None:
@@ -395,7 +393,7 @@ class AruCoPositioning:
                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, (100, 100, 100), 1)
 
         # Display view angles
-        view_text = f"View: X={self.view_angle_x:.1f}° Y={self.view_angle_y:.1f}°"
+        view_text = f"View: X={self.view_angle_x:.1f}deg Y={self.view_angle_y:.1f}deg"
         cv2.putText(img, view_text, (10, 740),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, (100, 100, 100), 1)
 
@@ -462,6 +460,9 @@ def main():
 
     print("ArUco Positioning System - SDC26")
     print("=" * 50)
+
+    # For optimized printing
+    last_print_pos = None
 
     # Load or use default calibration
     if len(sys.argv) > 1 and sys.argv[1] == '--load-calibration':
@@ -536,13 +537,17 @@ def main():
             cv2.putText(frame, dir_text, (10, 60), cv2.FONT_HERSHEY_SIMPLEX,
                         0.6, (0, 255, 0), 2)
 
-            print(f"\r{pos_text} | {dir_text}", end="")
+            # Only print if position changed significantly (>1cm) to reduce terminal overhead
+            current_pos = (round(position[0], 2), round(position[1], 2), round(position[2], 2))
+            if last_print_pos != current_pos:
+                print(f"\r{pos_text} | {dir_text}", end="", flush=True)
+                last_print_pos = current_pos
         else:
             cv2.putText(frame, "No markers detected", (10, 30),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
+            last_print_pos = None
 
         # Handle continuous rotation if button is held
-        import time
         current_time = time.time()
         if aruco_pos.mouse_button_pressed is not None:
             # Rotate every 50ms for smooth continuous rotation
@@ -584,16 +589,6 @@ def main():
     cap.release()
     cv2.destroyAllWindows()
 
-
-import numpy as np
-
-# Load calibration
-data = np.load('camera_calibration.npz')
-camera_matrix = data['camera_matrix']
-dist_coeffs = data['dist_coeffs']
-
-# Use in aruco_positioning.py
-aruco_pos = AruCoPositioning(camera_matrix, dist_coeffs)
 
 if __name__ == "__main__":
     main()
