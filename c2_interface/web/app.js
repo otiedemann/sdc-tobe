@@ -1,6 +1,13 @@
 let state = { arena: null, drones: [], system: { mode: 'live', drone_count: 2 }, targets: [] };
 let targetEditMode = false;
 const simDronePos = new Map();
+let simFramesKey = '';
+let simSpawnKey = '';
+let simTargetsKey = '';
+let cardsRenderKey = '';
+let droneSelectKey = '';
+let currentDroneId = '';
+const SIM_BUILD_TAG = '20260308-2108';
 
 const gridEl = document.getElementById('grid');
 const droneSelect = document.getElementById('droneSelect');
@@ -14,6 +21,22 @@ const connectLiveBtn = document.getElementById('connectLive');
 const droneOverlay = document.getElementById('droneOverlay');
 const targetColorSelect = document.getElementById('targetColorSelect');
 const targetListEl = document.getElementById('targetList');
+
+function randomHomeTargets() {
+  const targets = [];
+  const pickUnique = (xmin, xmax, ymin, ymax, color) => {
+    while (targets.length < (color === 'red' ? 3 : 6)) {
+      const x = Math.floor(Math.random() * (xmax - xmin + 1)) + xmin;
+      const y = Math.floor(Math.random() * (ymax - ymin + 1)) + ymin;
+      if (targets.some(t => t.x === x && t.y === y)) continue;
+      targets.push({ x, y, color });
+    }
+  };
+  // 20x10 grid: red home in left half, blue home in right half.
+  pickUnique(0, 6, 0, 9, 'red');
+  pickUnique(13, 19, 0, 9, 'blue');
+  return targets;
+}
 
 async function api(path, options = {}) {
   const res = await fetch(path, {
@@ -55,10 +78,18 @@ function render() {
   targetModeBtn.textContent = targetEditMode ? 'Target mode ON (click cells)' : 'Set targets (max 6)';
   connectLiveBtn.disabled = state.system.mode !== 'live';
 
-  const selected = droneSelect.value;
   const activeDrones = state.drones.filter(d => d.status !== 'offline');
-  droneSelect.innerHTML = activeDrones.map(d => `<option value="${d.drone_id}">${d.drone_id} (${d.status})</option>`).join('');
-  if (selected) droneSelect.value = selected;
+  const nextSelectKey = activeDrones.map(d => `${d.drone_id}:${d.status}`).join('|');
+  if (nextSelectKey !== droneSelectKey) {
+    const prev = currentDroneId || droneSelect.value;
+    droneSelect.innerHTML = activeDrones.map(d => `<option value="${d.drone_id}">${d.drone_id} (${d.status})</option>`).join('');
+    const fallback = activeDrones[0]?.drone_id || '';
+    currentDroneId = activeDrones.some(d => d.drone_id === prev) ? prev : fallback;
+    if (currentDroneId) droneSelect.value = currentDroneId;
+    droneSelectKey = nextSelectKey;
+  } else if (currentDroneId) {
+    droneSelect.value = currentDroneId;
+  }
 
   const occupied = new Map(activeDrones.map(d => [`${d.position.x},${d.position.y}`, d.drone_id]));
   const tmap = targetMap();
@@ -74,7 +105,8 @@ function render() {
   droneOverlay.innerHTML = activeDrones.map((d) => {
     const left = d.position.x * 30 + 1;
     const top = d.position.y * 30 + 1;
-    return `<div class="drone-icon" style="left:${left}px;top:${top}px" title="${d.drone_id}">🚁</div>`;
+    const num = (d.drone_id.split('-').pop() || '?');
+    return `<div class="drone-icon" style="left:${left}px;top:${top}px" title="${d.drone_id}">🚁${num}</div>`;
   }).join('');
 
   targetListEl.innerHTML = `<strong>Targets:</strong> ` + (state.targets?.length
@@ -92,46 +124,111 @@ function render() {
     } catch {}
   }
 
-  cardsEl.innerHTML = activeDrones.map(d => {
-    let video = `<div class="video">No video URL configured</div>`;
-    if (state.system.mode === 'simulator' && simUrl) {
-      const idx = Number((d.drone_id.split('-').pop() || '1'));
-      const fpvUrl = `${simUrl}${simUrl.includes('?') ? '&' : '?'}panel=fpv&embed=1&team=red&drone=${idx}&cam=fpv`;
-      video = `<iframe data-sim-frame="1" src="${fpvUrl}" class="video" style="border:0;min-height:180px"></iframe>`;
-    } else if (d.video_url) {
-      video = `<img src="${d.video_url}?t=${Date.now()}" class="video" alt="${d.drone_id} video" />`;
-    }
-    return `
-      <div class="card">
-        <strong>${d.drone_id}</strong> — ${d.status}<br/>
-        Pos: (${d.position.x}, ${d.position.y}) | Home: (${d.home.x}, ${d.home.y})
-        ${video}
-        <div class="actions">
-          <button data-target="${d.drone_id}" class="spot">Target in sight</button>
+  const nextCardsKey = JSON.stringify({
+    mode: state.system.mode,
+    simUrl,
+    drones: activeDrones.map(d => d.drone_id),
+  });
+  if (nextCardsKey !== cardsRenderKey) {
+    cardsEl.innerHTML = activeDrones.map(d => {
+      let video = `<div class="video-preview"><div class="video-meta">960 × 720</div><div class="video">No video URL configured</div></div>`;
+      if (state.system.mode === 'simulator' && simUrl) {
+        const idx = Number((d.drone_id.split('-').pop() || '1'));
+        const fpvUrl = `${simUrl}${simUrl.includes('?') ? '&' : '?'}panel=fpv&embed=1&team=red&drone=${idx}&cam=fpv&v=${SIM_BUILD_TAG}`;
+        video = `<div class="video-preview"><div class="video-meta">960 × 720</div><iframe data-sim-frame="1" src="${fpvUrl}" class="video" style="border:0"></iframe></div>`;
+      } else if (d.video_url) {
+        video = `<div class="video-preview"><div class="video-meta">960 × 720</div><img src="${d.video_url}?t=${Date.now()}" class="video" alt="${d.drone_id} video" /></div>`;
+      }
+      return `
+        <div class="card" data-drone-card="${d.drone_id}">
+          <strong>${d.drone_id}</strong> — <span data-drone-status="${d.drone_id}">${d.status}</span><br/>
+          <span data-drone-pos="${d.drone_id}">Pos: (${d.position.x}, ${d.position.y}) | Home: (${d.home.x}, ${d.home.y})</span>
+          ${video}
+          <div class="actions">
+            <button data-target="${d.drone_id}" class="spot">Target in sight</button>
+          </div>
         </div>
-      </div>
-    `;
-  }).join('');
+      `;
+    }).join('');
+    cardsRenderKey = nextCardsKey;
+  } else {
+    activeDrones.forEach((d) => {
+      const s = cardsEl.querySelector(`[data-drone-status="${d.drone_id}"]`);
+      if (s) s.textContent = d.status;
+      const p = cardsEl.querySelector(`[data-drone-pos="${d.drone_id}"]`);
+      if (p) p.textContent = `Pos: (${d.position.x}, ${d.position.y}) | Home: (${d.home.x}, ${d.home.y})`;
+    });
+  }
 
   if (state.system.mode === 'simulator' && simUrl) {
-    const settingsUrl = `${simUrl}${simUrl.includes('?') ? '&' : '?'}panel=settings&embed=1&team=red`;
-    const modelUrl = `${simUrl}${simUrl.includes('?') ? '&' : '?'}panel=model&embed=1&team=red`;
-    simEmbedEl.innerHTML = `
-      <h3>Simulator (auto-connected)</h3>
-      <div class="sim-grid">
-        <iframe data-sim-frame="1" class="sim-frame" src="${settingsUrl}"></iframe>
-        <iframe data-sim-frame="1" class="sim-frame full" src="${modelUrl}"></iframe>
-      </div>
-    `;
+    const modelUrl = `${simUrl}${simUrl.includes('?') ? '&' : '?'}panel=model&embed=1&team=red&v=${SIM_BUILD_TAG}`;
+    const framesKey = `${modelUrl}`;
+    if (framesKey !== simFramesKey) {
+      simEmbedEl.innerHTML = `
+        <h3>Simulator (auto-connected)</h3>
+        <div class="sim-controls">
+          <button id="simRandomTargetsBtn" type="button">Place targets at random</button>
+          <div class="speed-wrap">
+            <label for="simSpeedRange">Drone speed</label>
+            <input id="simSpeedRange" type="range" min="0.6" max="4" step="0.1" value="1.2" />
+            <span id="simSpeedVal">1.2</span>
+          </div>
+        </div>
+        <div class="sim-grid">
+          <iframe data-sim-frame="1" class="sim-frame full" src="${modelUrl}"></iframe>
+        </div>
+      `;
+
+      const rndBtn = document.getElementById('simRandomTargetsBtn');
+      const speedRange = document.getElementById('simSpeedRange');
+      const speedVal = document.getElementById('simSpeedVal');
+      if (rndBtn) {
+        rndBtn.addEventListener('click', async () => {
+          const targets = randomHomeTargets();
+          await api('/api/targets', { method: 'POST', body: JSON.stringify({ targets }) });
+          postSimCommand({ kind: 'targets_random_home' });
+          postSimCommand({ kind: 'targets', targets });
+        });
+      }
+      if (speedRange && speedVal) {
+        const pushSpeed = () => {
+          speedVal.textContent = Number(speedRange.value).toFixed(1);
+          postSimCommand({ kind: 'set_speed', speed: Number(speedRange.value) });
+        };
+        speedRange.addEventListener('input', pushSpeed);
+        setTimeout(pushSpeed, 150);
+      }
+
+      simFramesKey = framesKey;
+      simSpawnKey = '';
+      simTargetsKey = '';
+    }
   } else {
     simEmbedEl.innerHTML = '';
+    simFramesKey = '';
+    simSpawnKey = '';
+    simTargetsKey = '';
   }
 
   if (state.system.mode === 'simulator') {
+    const spawnKey = `${state.system.drone_count}|red|c2`;
+    const targetsKey = JSON.stringify(state.targets || []);
     setTimeout(() => {
-      postSimCommand({ kind: 'spawn', droneCount: Number(state.system.drone_count), enemyDroneCount: Number(state.system.drone_count), team: 'red', mode: 'swarm' });
-      postSimCommand({ kind: 'targets', targets: state.targets || [] });
-    }, 300);
+      if (spawnKey !== simSpawnKey) {
+        postSimCommand({ kind: 'spawn', droneCount: Number(state.system.drone_count), enemyDroneCount: 0, team: 'red', mode: 'c2' });
+        postSimCommand({
+          kind: 'sync_state',
+          drones: (state.drones || [])
+            .filter(d => d.status !== 'offline')
+            .map(d => ({ drone_id: d.drone_id, x: d.position.x, y: d.position.y }))
+        });
+        simSpawnKey = spawnKey;
+      }
+      if (targetsKey !== simTargetsKey) {
+        postSimCommand({ kind: 'targets', targets: state.targets || [] });
+        simTargetsKey = targetsKey;
+      }
+    }, 120);
   }
 }
 
@@ -145,6 +242,10 @@ applySystemBtn.addEventListener('click', async () => {
 targetModeBtn.addEventListener('click', () => {
   targetEditMode = !targetEditMode;
   render();
+});
+
+droneSelect.addEventListener('change', () => {
+  currentDroneId = droneSelect.value;
 });
 
 connectLiveBtn.addEventListener('click', async () => {
@@ -171,11 +272,17 @@ gridEl.addEventListener('click', async (e) => {
     return;
   }
 
-  const droneId = droneSelect.value;
+  const droneId = currentDroneId || droneSelect.value;
   if (!droneId) return alert('No drone selected');
 
-  await api(`/api/drones/${droneId}/goto`, { method: 'POST', body: JSON.stringify({ x, y }) });
+  // Apply reroute immediately in simulator so course changes are responsive.
   if (state.system.mode === 'simulator') postSimCommand({ kind: 'goto', droneId, x, y });
+
+  try {
+    await api(`/api/drones/${droneId}/goto`, { method: 'POST', body: JSON.stringify({ x, y }) });
+  } catch (err) {
+    alert(`Failed to send goto: ${err.message || err}`);
+  }
 });
 
 cardsEl.addEventListener('click', async (e) => {
@@ -196,6 +303,8 @@ async function bootstrap() {
       if (!d?.drone_id || !d?.grid) continue;
       simDronePos.set(d.drone_id, { x: Number(d.grid.x), y: Number(d.grid.y) });
     }
+    // Mirror model-frame world state into FPV frames so feeds stay aligned with main simulator.
+    postSimCommand({ kind: 'sync_world', drones: m.drones });
     render();
   });
 

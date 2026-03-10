@@ -794,8 +794,7 @@ function updateTargetCaptures(dt) {
         if (v >= needHover) {
           setTargetOwner(t, capTeam);
           hoverTimers.set(key, 0);
-          returnToZone.add(d.id);
-          if (capTeam === ui.teamSel.value) appendDroneLog(`[${simTime.toFixed(2)}s] ${d.id} captured ${t.id} for ${capTeam}; return-home`);
+          if (capTeam === ui.teamSel.value) appendDroneLog(`[${simTime.toFixed(2)}s] ${d.id} captured ${t.id} for ${capTeam}`);
         }
         break;
       }
@@ -1112,7 +1111,7 @@ function updateStatus() {
   const redOwned = targetUnits.filter(t=>t.owner==='red').length;
   text += `score ownership -> blue:${blueOwned} red:${redOwned}\n`;
   text += `returning drones: ${Array.from(returnToZone).length}\n`;
-  text += `auto swarm: both teams active simultaneously\n`;
+  text += `control: C2 waypoints (team drones), enemy swarm disabled\n`;
   for (const d of drones) {
     const p = d.mesh.position;
     text += `${d.id}: pos(${p.x.toFixed(2)},${p.y.toFixed(2)},${p.z.toFixed(2)}) bat=${d.battery.toFixed(1)}%\n`;
@@ -1222,8 +1221,14 @@ function applyExternalTargets(list) {
     if ((t.color || 'red') === 'blue') blueTargets.push(new THREE.Vector3(p.x, 0.25, p.z));
     else redTargets.push(new THREE.Vector3(p.x, 0.25, p.z));
   }
-  while (redTargets.length < 3) redTargets.push(new THREE.Vector3(-arena.x/2 + 2 + redTargets.length, 0.25, -1 + redTargets.length));
-  while (blueTargets.length < 3) blueTargets.push(new THREE.Vector3(arena.x/2 - 2 - blueTargets.length, 0.25, 1 - blueTargets.length));
+  // Ensure 3 targets per home zone, randomized (no fixed fallback positions).
+  const redHome = getHomeZone('red');
+  const blueHome = getHomeZone('blue');
+  const marginX = 0.8;
+  const marginZ = 0.8;
+  const rr = (a,b) => a + Math.random()*(b-a);
+  while (redTargets.length < 3) redTargets.push(new THREE.Vector3(rr(redHome.xmin + marginX, redHome.xmax - marginX), 0.25, rr(redHome.zmin + marginZ, redHome.zmax - marginZ)));
+  while (blueTargets.length < 3) blueTargets.push(new THREE.Vector3(rr(blueHome.xmin + marginX, blueHome.xmax - marginX), 0.25, rr(blueHome.zmin + marginZ, blueHome.zmax - marginZ)));
   drawTargets();
 }
 
@@ -1233,9 +1238,11 @@ window.addEventListener('message', (ev) => {
   if (m.kind === 'spawn') {
     ui.teamSel.value = m.team || 'red';
     ui.modeSel.value = 'swarm';
-    ui.droneCount.value = String(Math.max(2, Math.min(5, Number(m.droneCount || 3))));
-    ui.enemyDroneCount.value = String(Math.max(2, Math.min(5, Number(m.enemyDroneCount || 3))));
-    spawnDrones(Number(ui.droneCount.value), Number(ui.enemyDroneCount.value));
+    const myCount = Math.max(1, Math.min(5, Number(m.droneCount || 3)));
+    const enemyCount = Math.max(0, Math.min(5, Number(m.enemyDroneCount || 0)));
+    ui.droneCount.value = String(myCount);
+    ui.enemyDroneCount.value = String(enemyCount);
+    spawnDrones(myCount, enemyCount);
   }
   if (m.kind === 'targets') {
     applyExternalTargets(m.targets || []);
@@ -1244,6 +1251,41 @@ window.addEventListener('message', (ev) => {
     const wp = gridToWorld(Number(m.x), Number(m.y));
     externalWaypoints.set(m.droneId, wp);
   }
+  if (m.kind === 'targets_random_home') {
+    generateTargets();
+    drawTargets();
+  }
+  if (m.kind === 'set_speed') {
+    const s = Math.max(0.2, Math.min(8, Number(m.speed || 1.2)));
+    ui.speed.value = String(s);
+  }
+  if (m.kind === 'sync_state') {
+    const myTeam = ui.teamSel.value;
+    for (const sd of (m.drones || [])) {
+      const idx = Number(String(sd.drone_id || '').split('-').pop());
+      if (!Number.isFinite(idx) || idx < 1) continue;
+      const simDrone = (teamDrones[myTeam] || [])[idx - 1];
+      if (!simDrone) continue;
+      const p = gridToWorld(Number(sd.x), Number(sd.y));
+      simDrone.mesh.position.set(p.x, 0.9, p.z);
+      simDrone.vel.set(0, 0, 0);
+      simDrone.yaw = myTeam === 'red' ? 0 : Math.PI;
+      simDrone.mesh.rotation.y = simDrone.yaw;
+    }
+  }
+  if (m.kind === 'sync_world') {
+    const myTeam = ui.teamSel.value;
+    for (const sd of (m.drones || [])) {
+      const idx = Number(String(sd.drone_id || '').split('-').pop());
+      if (!Number.isFinite(idx) || idx < 1) continue;
+      const simDrone = (teamDrones[myTeam] || [])[idx - 1];
+      if (!simDrone || !sd.world) continue;
+      simDrone.mesh.position.set(Number(sd.world.x), Number(sd.world.y), Number(sd.world.z));
+      simDrone.vel.set(0, 0, 0);
+      if (Number.isFinite(Number(sd.world.yaw))) simDrone.yaw = Number(sd.world.yaw);
+      simDrone.mesh.rotation.y = simDrone.yaw;
+    }
+  }
 });
 
 let simTime = 0;
@@ -1251,6 +1293,7 @@ let last = performance.now();
 let lastStatePost = 0;
 
 function postStateToC2(nowMs) {
+  if (panel !== 'model') return;
   if (nowMs - lastStatePost < 180) return;
   lastStatePost = nowMs;
   const myTeam = ui.teamSel.value;
@@ -1262,7 +1305,7 @@ function postStateToC2(nowMs) {
       const g = worldToGrid(d.mesh.position);
       return {
         drone_id: gid,
-        world: { x: d.mesh.position.x, y: d.mesh.position.y, z: d.mesh.position.z },
+        world: { x: d.mesh.position.x, y: d.mesh.position.y, z: d.mesh.position.z, yaw: d.yaw },
         grid: g,
       };
     });
@@ -1286,7 +1329,10 @@ function animate(now){
   for (const d of drones) {
     if (d.team !== myTeam) continue;
     const wp = externalWaypoints.get(`team-drone-${d.id.slice(1)}`) || externalWaypoints.get(d.id);
-    if (!wp) continue;
+    if (!wp) {
+      d.vel.set(0, 0, 0);
+      continue;
+    }
     const dir = wp.clone().sub(d.mesh.position);
     dir.y = 0;
     if (dir.length() < 0.25) { externalWaypoints.delete(`team-drone-${d.id.slice(1)}`); externalWaypoints.delete(d.id); }
@@ -1300,7 +1346,7 @@ function animate(now){
     }
   }
 
-  enemyBotUpdate(dt);
+  // Auto-Swarm removed in C2-connected simulator mode.
   updateTargetCaptures(dt);
 
   const selectedObj = drones[selected];
