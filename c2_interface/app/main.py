@@ -109,7 +109,15 @@ async def ensure_team_drones(count: int) -> None:
         else:
             video_url = None
         if existing:
-            await store.update_drone(drone_id, home=home, video_url=video_url)
+            await store.update_drone(
+                drone_id,
+                position=home,
+                home=home,
+                status="idle",
+                target_cell=None,
+                target_seen=False,
+                video_url=video_url,
+            )
         else:
             await store.upsert_drone(
                 DroneState(drone_id=drone_id, position=home, home=home, video_url=video_url)

@@ -3,10 +3,11 @@ let targetEditMode = false;
 const simDronePos = new Map();
 let simFramesKey = '';
 let simSpawnKey = '';
-let simTargetsKey = '';
 let cardsRenderKey = '';
 let droneSelectKey = '';
 let currentDroneId = '';
+let systemConfigDirty = false;
+let gridActionInFlight = false;
 const SIM_BUILD_TAG = '20260308-2108';
 
 const gridEl = document.getElementById('grid');
@@ -73,8 +74,10 @@ function render() {
     });
   }
 
-  modeSelect.value = state.system.mode;
-  droneCountSelect.value = String(state.system.drone_count);
+  if (!systemConfigDirty) {
+    modeSelect.value = state.system.mode;
+    droneCountSelect.value = String(state.system.drone_count);
+  }
   targetModeBtn.textContent = targetEditMode ? 'Target mode ON (click cells)' : 'Set targets (max 6)';
   connectLiveBtn.disabled = state.system.mode !== 'live';
 
@@ -184,10 +187,8 @@ function render() {
       const speedVal = document.getElementById('simSpeedVal');
       if (rndBtn) {
         rndBtn.addEventListener('click', async () => {
-          const targets = randomHomeTargets();
-          await api('/api/targets', { method: 'POST', body: JSON.stringify({ targets }) });
+          // Simulator-only randomization: do NOT overwrite manual C2 target planning layer.
           postSimCommand({ kind: 'targets_random_home' });
-          postSimCommand({ kind: 'targets', targets });
         });
       }
       if (speedRange && speedVal) {
@@ -201,20 +202,19 @@ function render() {
 
       simFramesKey = framesKey;
       simSpawnKey = '';
-      simTargetsKey = '';
     }
   } else {
     simEmbedEl.innerHTML = '';
     simFramesKey = '';
     simSpawnKey = '';
-    simTargetsKey = '';
+    simDronePos.clear();
   }
 
   if (state.system.mode === 'simulator') {
     const spawnKey = `${state.system.drone_count}|red|c2`;
-    const targetsKey = JSON.stringify(state.targets || []);
     setTimeout(() => {
       if (spawnKey !== simSpawnKey) {
+        simDronePos.clear();
         postSimCommand({ kind: 'spawn', droneCount: Number(state.system.drone_count), enemyDroneCount: 0, team: 'red', mode: 'c2' });
         postSimCommand({
           kind: 'sync_state',
@@ -224,20 +224,27 @@ function render() {
         });
         simSpawnKey = spawnKey;
       }
-      if (targetsKey !== simTargetsKey) {
-        postSimCommand({ kind: 'targets', targets: state.targets || [] });
-        simTargetsKey = targetsKey;
-      }
     }, 120);
   }
 }
 
-applySystemBtn.addEventListener('click', async () => {
-  await api('/api/system', {
-    method: 'POST',
-    body: JSON.stringify({ mode: modeSelect.value, drone_count: Number(droneCountSelect.value) }),
-  });
-});
+async function applySystemConfig() {
+  const desiredMode = modeSelect.value;
+  const desiredCount = Number(droneCountSelect.value);
+  try {
+    await api('/api/system', {
+      method: 'POST',
+      body: JSON.stringify({ mode: desiredMode, drone_count: desiredCount }),
+    });
+    systemConfigDirty = false;
+  } catch (err) {
+    alert(`Failed to apply system config: ${err.message || err}`);
+  }
+}
+
+applySystemBtn.addEventListener('click', applySystemConfig);
+modeSelect.addEventListener('change', () => { systemConfigDirty = true; });
+droneCountSelect.addEventListener('change', () => { systemConfigDirty = true; });
 
 targetModeBtn.addEventListener('click', () => {
   targetEditMode = !targetEditMode;
@@ -254,34 +261,59 @@ connectLiveBtn.addEventListener('click', async () => {
 });
 
 gridEl.addEventListener('click', async (e) => {
+  let x, y;
   const el = e.target.closest('.cell');
-  if (!el) return;
-  const x = Number(el.dataset.x);
-  const y = Number(el.dataset.y);
-
-  if (targetEditMode) {
-    const targets = [...(state.targets || [])];
-    const idx = targets.findIndex(t => t.x === x && t.y === y);
-    if (idx >= 0) targets.splice(idx, 1);
-    else {
-      if (targets.length >= 6) return alert('Maximum 6 targets');
-      targets.push({ x, y, color: targetColorSelect.value });
-    }
-    await api('/api/targets', { method: 'POST', body: JSON.stringify({ targets }) });
-    if (state.system.mode === 'simulator') postSimCommand({ kind: 'targets', targets });
-    return;
+  if (el) {
+    x = Number(el.dataset.x);
+    y = Number(el.dataset.y);
+  } else {
+    // Also accept clicks on the grid gaps between cells.
+    const rect = gridEl.getBoundingClientRect();
+    const gx = Math.floor(((e.clientX - rect.left) / Math.max(1, rect.width)) * 20);
+    const gy = Math.floor(((e.clientY - rect.top) / Math.max(1, rect.height)) * 10);
+    x = Math.max(0, Math.min(19, gx));
+    y = Math.max(0, Math.min(9, gy));
   }
+  if (gridActionInFlight) return;
 
-  const droneId = currentDroneId || droneSelect.value;
-  if (!droneId) return alert('No drone selected');
-
-  // Apply reroute immediately in simulator so course changes are responsive.
-  if (state.system.mode === 'simulator') postSimCommand({ kind: 'goto', droneId, x, y });
-
+  gridActionInFlight = true;
   try {
-    await api(`/api/drones/${droneId}/goto`, { method: 'POST', body: JSON.stringify({ x, y }) });
-  } catch (err) {
-    alert(`Failed to send goto: ${err.message || err}`);
+    if (targetEditMode) {
+      const prevTargets = [...(state.targets || [])];
+      const targets = [...prevTargets];
+      const idx = targets.findIndex(t => t.x === x && t.y === y);
+      if (idx >= 0) targets.splice(idx, 1);
+      else {
+        if (targets.length >= 6) return alert('Maximum 6 targets');
+        targets.push({ x, y, color: targetColorSelect.value });
+      }
+      // optimistic update for snappy, single-click behavior
+      state.targets = targets;
+      render();
+      try {
+        await api('/api/targets', { method: 'POST', body: JSON.stringify({ targets }) });
+      } catch (err) {
+        state.targets = prevTargets;
+        render();
+        alert(`Failed to update targets: ${err.message || err}`);
+      }
+      return;
+    }
+
+    const droneId = currentDroneId || droneSelect.value;
+    if (!droneId) return alert('No drone selected');
+
+    // Apply reroute immediately in simulator so course changes are responsive.
+    if (state.system.mode === 'simulator') postSimCommand({ kind: 'goto', droneId, x, y });
+
+    try {
+      await api(`/api/drones/${droneId}/goto`, { method: 'POST', body: JSON.stringify({ x, y }) });
+    } catch (err) {
+      alert(`Failed to send goto: ${err.message || err}`);
+    }
+  } finally {
+    // tiny release delay avoids duplicate multi-click bursts while websocket rerenders
+    setTimeout(() => { gridActionInFlight = false; }, 120);
   }
 });
 
@@ -299,10 +331,13 @@ async function bootstrap() {
   window.addEventListener('message', (ev) => {
     const m = ev.data || {};
     if (m.source !== 'sim' || m.kind !== 'state' || !Array.isArray(m.drones)) return;
+    const nextPos = new Map();
     for (const d of m.drones) {
       if (!d?.drone_id || !d?.grid) continue;
-      simDronePos.set(d.drone_id, { x: Number(d.grid.x), y: Number(d.grid.y) });
+      nextPos.set(d.drone_id, { x: Number(d.grid.x), y: Number(d.grid.y) });
     }
+    simDronePos.clear();
+    for (const [k, v] of nextPos.entries()) simDronePos.set(k, v);
     // Mirror model-frame world state into FPV frames so feeds stay aligned with main simulator.
     postSimCommand({ kind: 'sync_world', drones: m.drones });
     render();
