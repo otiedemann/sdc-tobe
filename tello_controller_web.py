@@ -16,7 +16,7 @@ from flask import Flask, Response, jsonify, request
 RC_HZ = 20
 STICK = 60
 JPEG_QUALITY = 80
-SWAP_CHANNELS = Truee  # set True if colors look wrong
+SWAP_CHANNELS = True  # set True if colors look wrong
 HTTP_HOST = "127.0.0.1"
 HTTP_PORT = 8080
 
@@ -32,6 +32,19 @@ flying = False
 
 last_jpeg = b""
 last_jpeg_lock = threading.Lock()
+
+telemetry = {
+    "battery": None,
+    "temperature": None,
+    "height_cm": None,
+    "tof_cm": None,
+    "barometer_cm": None,
+    "flight_time_s": None,
+    "wifi_snr": None,
+    "flying": False,
+    "updated_at": 0.0,
+}
+telemetry_lock = threading.Lock()
 
 
 # ----- Key handling -----
@@ -130,6 +143,10 @@ HTML = """
         <button id=\"land\">Land (L)</button>
       </div>
       <div class=\"small\" style=\"margin-top:8px;\">Keyboard in browser: W/A/S/D R/F Q/E, T, L, Space stop</div>
+      <div class=\"panel\" style=\"margin-top:10px;\">
+        <div><b>Telemetry</b></div>
+        <div id=\"telemetry\" class=\"small\" style=\"white-space:pre-wrap; margin-top:6px;\">loading...</div>
+      </div>
     </div>
   </div>
 <script>
@@ -164,6 +181,26 @@ window.addEventListener('keyup', (e)=>{
     keyUp(k === ' ' ? 'space' : k);
   }
 });
+
+async function refreshTelemetry(){
+  try {
+    const r = await fetch('/api/telemetry');
+    const t = await r.json();
+    document.getElementById('telemetry').textContent =
+      `battery: ${t.battery ?? '-'} %\n` +
+      `temperature: ${t.temperature ?? '-'} °C\n` +
+      `height: ${t.height_cm ?? '-'} cm\n` +
+      `tof: ${t.tof_cm ?? '-'} cm\n` +
+      `barometer: ${t.barometer_cm ?? '-'} cm\n` +
+      `flight time: ${t.flight_time_s ?? '-'} s\n` +
+      `wifi snr: ${t.wifi_snr ?? '-'}\n` +
+      `flying: ${t.flying}`;
+  } catch {
+    document.getElementById('telemetry').textContent = 'telemetry unavailable';
+  }
+}
+setInterval(refreshTelemetry, 1000);
+refreshTelemetry();
 </script>
 </body>
 </html>
@@ -187,6 +224,12 @@ def api_key_up():
     data = request.get_json(silent=True) or {}
     remove_key(data.get("key", ""))
     return jsonify(ok=True)
+
+
+@app.get("/api/telemetry")
+def api_telemetry():
+    with telemetry_lock:
+        return jsonify(telemetry)
 
 
 @app.get("/video")
@@ -217,6 +260,28 @@ def video_loop(frame_read):
             with last_jpeg_lock:
                 last_jpeg = jpg.tobytes()
         time.sleep(0.02)
+
+
+def _safe(callable_fn):
+    try:
+        return callable_fn()
+    except Exception:
+        return None
+
+
+def telemetry_loop(tello: Tello):
+    while running:
+        with telemetry_lock:
+            telemetry["battery"] = _safe(tello.get_battery)
+            telemetry["temperature"] = _safe(tello.get_temperature)
+            telemetry["height_cm"] = _safe(tello.get_height)
+            telemetry["tof_cm"] = _safe(tello.get_distance_tof)
+            telemetry["barometer_cm"] = _safe(tello.get_barometer)
+            telemetry["flight_time_s"] = _safe(tello.get_flight_time)
+            telemetry["wifi_snr"] = _safe(tello.query_wifi_signal_noise_ratio)
+            telemetry["flying"] = flying
+            telemetry["updated_at"] = time.time()
+        time.sleep(1.0)
 
 
 def rc_loop(tello: Tello):
@@ -294,6 +359,7 @@ def main():
 
     threading.Thread(target=terminal_key_reader, daemon=True).start()
     threading.Thread(target=video_loop, args=(frame_read,), daemon=True).start()
+    threading.Thread(target=telemetry_loop, args=(tello,), daemon=True).start()
     threading.Thread(target=rc_loop, args=(tello,), daemon=True).start()
 
     print("Controls:")
