@@ -16,7 +16,7 @@ from flask import Flask, Response, jsonify, request
 RC_HZ = 20
 STICK = 60
 JPEG_QUALITY = 80
-SWAP_CHANNELS = False  # set True if colors look wrong
+SWAP_CHANNELS = Truee  # set True if colors look wrong
 HTTP_HOST = "127.0.0.1"
 HTTP_PORT = 8080
 

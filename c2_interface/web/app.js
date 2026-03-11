@@ -260,7 +260,9 @@ connectLiveBtn.addEventListener('click', async () => {
   alert('Live connect result: ' + JSON.stringify(res.result));
 });
 
-gridEl.addEventListener('click', async (e) => {
+async function handleGridAction(e) {
+  e.preventDefault();
+
   let x, y;
   const el = e.target.closest('.cell');
   if (el) {
@@ -313,9 +315,11 @@ gridEl.addEventListener('click', async (e) => {
     }
   } finally {
     // tiny release delay avoids duplicate multi-click bursts while websocket rerenders
-    setTimeout(() => { gridActionInFlight = false; }, 120);
+    setTimeout(() => { gridActionInFlight = false; }, 80);
   }
-});
+}
+
+gridEl.addEventListener('pointerdown', handleGridAction);
 
 cardsEl.addEventListener('click', async (e) => {
   const btn = e.target.closest('button.spot');
