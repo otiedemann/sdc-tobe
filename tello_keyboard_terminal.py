@@ -4,12 +4,12 @@ import tty
 import termios
 import select
 import threading
+import logging
 
 from djitellopy import Tello
 
 RC_HZ = 20
 STICK = 60
-PRINT_HZ = 2
 
 pressed = set()
 lock = threading.Lock()
@@ -52,14 +52,13 @@ def has_key(k: str) -> bool:
 
 
 def main():
-    print("Connecting to Tello...")
+    logging.getLogger("djitellopy").setLevel(logging.CRITICAL)
+
     t = Tello()
     t.connect()
-    print("Battery:", t.get_battery())
 
     running = [True]
     flying = False
-    last_print = 0.0
 
     reader = threading.Thread(target=key_reader, args=(running,), daemon=True)
     reader.start()
@@ -75,13 +74,10 @@ def main():
             if consume_key("t") and not flying:
                 t.takeoff()
                 flying = True
-                print("Takeoff")
             if consume_key("l") and flying:
                 t.land()
                 flying = False
-                print("Land")
             if consume_key("esc"):
-                print("Quit")
                 running[0] = False
                 break
 
@@ -100,11 +96,6 @@ def main():
             except Exception:
                 pass
 
-            now = time.time()
-            if now - last_print >= 1.0 / PRINT_HZ:
-                last_print = now
-                print(f"RC lr={lr:4d} fb={fb:4d} ud={ud:4d} yaw={yaw:4d}")
-
             time.sleep(1.0 / RC_HZ)
 
     finally:
@@ -122,7 +113,6 @@ def main():
             t.end()
         except Exception:
             pass
-        print("Exited cleanly.")
 
 
 if __name__ == "__main__":
