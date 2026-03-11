@@ -262,26 +262,48 @@ def video_loop(frame_read):
         time.sleep(0.02)
 
 
-def _safe(callable_fn):
+def _as_int(v):
     try:
-        return callable_fn()
+        return int(float(v))
     except Exception:
         return None
 
 
 def telemetry_loop(tello: Tello):
+    """
+    Read telemetry from SDK state cache (UDP state stream), not from command queries.
+    This avoids command-channel contention/timeouts that can freeze controls.
+    """
     while running:
+        st = {}
+        try:
+            st = tello.get_current_state() or {}
+        except Exception:
+            st = {}
+
+        temp = None
+        tl = _as_int(st.get("templ"))
+        th = _as_int(st.get("temph"))
+        if tl is not None and th is not None:
+            temp = int((tl + th) / 2)
+        elif tl is not None:
+            temp = tl
+        elif th is not None:
+            temp = th
+
         with telemetry_lock:
-            telemetry["battery"] = _safe(tello.get_battery)
-            telemetry["temperature"] = _safe(tello.get_temperature)
-            telemetry["height_cm"] = _safe(tello.get_height)
-            telemetry["tof_cm"] = _safe(tello.get_distance_tof)
-            telemetry["barometer_cm"] = _safe(tello.get_barometer)
-            telemetry["flight_time_s"] = _safe(tello.get_flight_time)
-            telemetry["wifi_snr"] = _safe(tello.query_wifi_signal_noise_ratio)
+            telemetry["battery"] = _as_int(st.get("bat"))
+            telemetry["temperature"] = temp
+            telemetry["height_cm"] = _as_int(st.get("h"))
+            telemetry["tof_cm"] = _as_int(st.get("tof"))
+            telemetry["barometer_cm"] = _as_int(st.get("baro"))
+            telemetry["flight_time_s"] = _as_int(st.get("time"))
+            # Not reliably supported on all firmware; keep nullable.
+            telemetry["wifi_snr"] = _as_int(st.get("wifi"))
             telemetry["flying"] = flying
             telemetry["updated_at"] = time.time()
-        time.sleep(1.0)
+
+        time.sleep(0.5)
 
 
 def rc_loop(tello: Tello):
