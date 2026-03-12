@@ -19,6 +19,8 @@ JPEG_QUALITY = 80
 SWAP_CHANNELS = True  # set True if colors look wrong
 HTTP_HOST = "127.0.0.1"
 HTTP_PORT = 8080
+RECONNECT_AFTER_S = 3.0
+RECONNECT_RETRY_S = 2.0
 
 # ----- Global state -----
 app = Flask(__name__)
@@ -33,6 +35,13 @@ flying = False
 last_jpeg = b""
 last_jpeg_lock = threading.Lock()
 
+frame_reader = None
+frame_lock = threading.Lock()
+
+last_state_seen = 0.0
+conn_state = {"connected": False, "last_reconnect": 0.0}
+conn_lock = threading.Lock()
+
 telemetry = {
     "battery": None,
     "temperature": None,
@@ -42,6 +51,7 @@ telemetry = {
     "flight_time_s": None,
     "wifi_snr": None,
     "flying": False,
+    "connected": False,
     "updated_at": 0.0,
 }
 telemetry_lock = threading.Lock()
@@ -194,7 +204,8 @@ async function refreshTelemetry(){
       `barometer: ${t.barometer_cm ?? '-'} cm\n` +
       `flight time: ${t.flight_time_s ?? '-'} s\n` +
       `wifi snr: ${t.wifi_snr ?? '-'}\n` +
-      `flying: ${t.flying}`;
+      `flying: ${t.flying}\n` +
+      `connected: ${t.connected}`;
   } catch {
     document.getElementById('telemetry').textContent = 'telemetry unavailable';
   }
@@ -247,10 +258,16 @@ def video_feed():
 
 
 # ----- Drone threads -----
-def video_loop(frame_read):
+def video_loop():
     global last_jpeg
     while running:
-        frame = frame_read.frame
+        with frame_lock:
+            fr = frame_reader
+        if fr is None:
+            time.sleep(0.05)
+            continue
+
+        frame = fr.frame
         if frame is None:
             time.sleep(0.02)
             continue
@@ -274,12 +291,18 @@ def telemetry_loop(tello: Tello):
     Read telemetry from SDK state cache (UDP state stream), not from command queries.
     This avoids command-channel contention/timeouts that can freeze controls.
     """
+    global last_state_seen
     while running:
         st = {}
         try:
             st = tello.get_current_state() or {}
         except Exception:
             st = {}
+
+        if st:
+            last_state_seen = time.time()
+            with conn_lock:
+                conn_state["connected"] = True
 
         temp = None
         tl = _as_int(st.get("templ"))
@@ -291,6 +314,9 @@ def telemetry_loop(tello: Tello):
         elif th is not None:
             temp = th
 
+        with conn_lock:
+            connected_now = conn_state["connected"]
+
         with telemetry_lock:
             telemetry["battery"] = _as_int(st.get("bat"))
             telemetry["temperature"] = temp
@@ -301,7 +327,38 @@ def telemetry_loop(tello: Tello):
             # Not reliably supported on all firmware; keep nullable.
             telemetry["wifi_snr"] = _as_int(st.get("wifi"))
             telemetry["flying"] = flying
+            telemetry["connected"] = connected_now
             telemetry["updated_at"] = time.time()
+
+        time.sleep(0.5)
+
+
+def reconnect_loop(tello: Tello):
+    global frame_reader, last_state_seen
+    while running:
+        now = time.time()
+        stale = (now - last_state_seen) if last_state_seen else 9999
+
+        with conn_lock:
+            connected_now = conn_state["connected"]
+            last_try = conn_state["last_reconnect"]
+
+        if stale > RECONNECT_AFTER_S and (now - last_try) >= RECONNECT_RETRY_S:
+            with conn_lock:
+                conn_state["last_reconnect"] = now
+                conn_state["connected"] = False
+
+            try:
+                tello.connect()
+                tello.streamon()
+                fr = tello.get_frame_read()
+                with frame_lock:
+                    frame_reader = fr
+                last_state_seen = time.time()
+                with conn_lock:
+                    conn_state["connected"] = True
+            except Exception:
+                pass
 
         time.sleep(0.5)
 
@@ -344,7 +401,8 @@ def rc_loop(tello: Tello):
         try:
             tello.send_rc_control(lr, fb, ud, yaw)
         except Exception:
-            pass
+            with conn_lock:
+                conn_state["connected"] = False
 
         dt = time.time() - t0
         if dt < period:
@@ -370,19 +428,25 @@ def shutdown(tello: Tello):
 
 
 def main():
+    global frame_reader, last_state_seen
     logging.getLogger("djitellopy").setLevel(logging.CRITICAL)
     logging.getLogger("werkzeug").setLevel(logging.ERROR)
 
     tello = Tello()
     tello.connect()
     tello.streamon()
-    frame_read = tello.get_frame_read()
+    with frame_lock:
+        frame_reader = tello.get_frame_read()
+    last_state_seen = time.time()
+    with conn_lock:
+        conn_state["connected"] = True
 
     atexit.register(lambda: shutdown(tello))
 
     threading.Thread(target=terminal_key_reader, daemon=True).start()
-    threading.Thread(target=video_loop, args=(frame_read,), daemon=True).start()
+    threading.Thread(target=video_loop, daemon=True).start()
     threading.Thread(target=telemetry_loop, args=(tello,), daemon=True).start()
+    threading.Thread(target=reconnect_loop, args=(tello,), daemon=True).start()
     threading.Thread(target=rc_loop, args=(tello,), daemon=True).start()
 
     print(f"http://{HTTP_HOST}:{HTTP_PORT}")
