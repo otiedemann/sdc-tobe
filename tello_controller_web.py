@@ -371,6 +371,7 @@ def shutdown(tello: Tello):
 
 def main():
     logging.getLogger("djitellopy").setLevel(logging.CRITICAL)
+    logging.getLogger("werkzeug").setLevel(logging.ERROR)
 
     tello = Tello()
     tello.connect()
@@ -384,11 +385,9 @@ def main():
     threading.Thread(target=telemetry_loop, args=(tello,), daemon=True).start()
     threading.Thread(target=rc_loop, args=(tello,), daemon=True).start()
 
-    print("Controls:")
-    print("  Terminal: t takeoff, l land, esc quit, w/a/s/d r/f q/e movement")
-    print("  Browser : open http://127.0.0.1:8080 and use keys/buttons")
+    print(f"http://{HTTP_HOST}:{HTTP_PORT}")
 
-    app.run(host=HTTP_HOST, port=HTTP_PORT, threaded=True)
+    app.run(host=HTTP_HOST, port=HTTP_PORT, threaded=True, use_reloader=False)
 
 
 if __name__ == "__main__":
