@@ -94,6 +94,9 @@ class AruCoPositioning:
         # Track which markers were used in last position calculation
         self.last_used_markers = set()
 
+        # Separate filters for target markers (more aggressive smoothing)
+        self.target_marker_filters = {}  # Dict of {marker_id: ExponentialMovingAverage}
+
         # Mouse button state for continuous rotation
         self.mouse_button_pressed = None
         self.last_rotation_time = 0
@@ -406,26 +409,68 @@ class AruCoPositioning:
         primary_wall_type = reference_wall_types[0] if reference_wall_types else None
 
         # Calculate world positions for target markers (ID >= 30)
-        for marker_id, marker_data in target_marker_positions.items():
-            # Get target marker position in camera frame (tvec from solvePnP)
-            # tvec represents the target marker's position in the camera coordinate system
-            marker_pos_cam = marker_data['camera_frame']
+        # Calculate from each reference marker independently and average
+        for target_id, marker_data in target_marker_positions.items():
+            target_pos_estimates = []
+            target_estimate_weights = []
 
-            # Transform target marker position from camera frame to world coordinates
-            # R_cam_world transforms vectors from camera frame to world frame
-            # World position = Camera world position + Rotation * Camera frame vector
-            marker_world_pos = filtered_position + R_cam_world @ marker_pos_cam
-            # Make a copy to avoid modifying shared array references
-            marker_world_pos = marker_world_pos.copy()
+            # Get target marker position in camera frame
+            rvec_target, tvec_target = self._cached_poses[target_id]
+            tvec_target = tvec_target.reshape(3)
+            R_target_cam, _ = cv2.Rodrigues(rvec_target)
 
-            # Apply X-axis correction if primary reference marker was on front/back wall
-            # This matches the correction applied to camera position calculation
-            if primary_wall_type in ('front', 'back'):
-                # Invert X coordinate
-                marker_world_pos[0] = 2 * filtered_position[0] - marker_world_pos[0]
+            # Calculate target position from each reference marker
+            for i, ref_marker_id in enumerate(used_marker_ids):
+                if ref_marker_id not in self.marker_positions:
+                    continue
 
-            # Update with world coordinates
-            target_marker_positions[marker_id] = marker_world_pos
+                # Get reference marker info
+                ref_world_pos = self.marker_positions[ref_marker_id]
+                R_ref_world = self._get_marker_orientation(ref_marker_id)
+                ref_wall_type = self.marker_wall_type.get(ref_marker_id)
+
+                # Get reference marker position in camera frame
+                rvec_ref, tvec_ref = self._cached_poses[ref_marker_id]
+                tvec_ref = tvec_ref.reshape(3)
+                R_ref_cam, _ = cv2.Rodrigues(rvec_ref)
+
+                # Key insight: both reference and target are in camera frame
+                # Transform both to reference marker's local frame, then to world
+
+                # Inverse transformation from camera to reference marker frame
+                R_cam_ref = R_ref_cam.T
+
+                # Camera position in reference marker frame
+                t_cam_ref = -R_cam_ref @ tvec_ref
+
+                # Target position in camera frame, transform to reference marker frame
+                t_target_ref = R_cam_ref @ tvec_target + t_cam_ref
+
+                # Now transform from reference marker frame to world frame
+                target_world = ref_world_pos + R_ref_world @ t_target_ref
+
+                # Apply X-axis correction for front/back wall markers
+                if ref_wall_type in ('front', 'back'):
+                    target_world[0] = 2 * ref_world_pos[0] - target_world[0]
+
+                target_pos_estimates.append(target_world)
+                target_estimate_weights.append(weights[i])
+
+            # Weighted average of estimates
+            if len(target_pos_estimates) > 0:
+                target_estimate_weights = np.array(target_estimate_weights)
+                target_estimate_weights = target_estimate_weights / (np.sum(target_estimate_weights) + 1e-6)
+
+                raw_target_world = np.zeros(3)
+                for pos, w in zip(target_pos_estimates, target_estimate_weights):
+                    raw_target_world += pos * w
+
+                # Apply aggressive filtering (alpha=0.1 for smooth tracking)
+                if target_id not in self.target_marker_filters:
+                    self.target_marker_filters[target_id] = ExponentialMovingAverage(alpha=0.1)
+
+                filtered_target_pos = self.target_marker_filters[target_id].update(raw_target_world)
+                target_marker_positions[target_id] = filtered_target_pos
 
         return filtered_position, R_cam_world, filtered_direction, target_marker_positions
 
