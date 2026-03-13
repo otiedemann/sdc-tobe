@@ -91,6 +91,9 @@ class AruCoPositioning:
         self.position_filter = ExponentialMovingAverage(alpha=0.2)
         self.direction_filter = ExponentialMovingAverage(alpha=0.2)
 
+        # Track which markers were used in last position calculation
+        self.last_used_markers = set()
+
         # Mouse button state for continuous rotation
         self.mouse_button_pressed = None
         self.last_rotation_time = 0
@@ -271,6 +274,7 @@ class AruCoPositioning:
         weights = []
         target_marker_positions = {}
         reference_wall_types = []  # Track wall types for corrections
+        used_marker_ids = []  # Track which reference markers were used
 
         for i, marker_id in enumerate(ids.flatten()):
             if marker_id in self.marker_positions:
@@ -322,6 +326,7 @@ class AruCoPositioning:
                 rotation_matrices.append(R_cam_world)
                 weights.append(weight)
                 reference_wall_types.append(wall_type)
+                used_marker_ids.append(marker_id)
             elif marker_id >= 30:
                 # Calculate position for target markers (ID >= 30)
                 # Get cached marker pose in camera frame
@@ -344,7 +349,22 @@ class AruCoPositioning:
 
         if len(positions) == 0:
             # Clear target marker positions since we can't calculate world positions without reference markers
+            self.last_used_markers = set()
             return None, None, None, {}
+
+        # Use only the best markers if we have too many (reduces noise from poor detections)
+        if len(positions) > 4:
+            # Sort by weight and keep only top 4
+            indices = np.argsort(weights)[-4:]
+            positions = [positions[i] for i in indices]
+            directions = [directions[i] for i in indices]
+            rotation_matrices = [rotation_matrices[i] for i in indices]
+            reference_wall_types = [reference_wall_types[i] for i in indices]
+            weights = [weights[i] for i in indices]
+            used_marker_ids = [used_marker_ids[i] for i in indices]
+
+        # Store which markers were used in this calculation
+        self.last_used_markers = set(used_marker_ids)
 
         # Weighted fusion of multiple marker estimates
         weights = np.array(weights)
@@ -366,7 +386,20 @@ class AruCoPositioning:
         filtered_position = self.position_filter.update(raw_position)
         filtered_direction = self.direction_filter.update(raw_direction)
         # Re-normalize filtered direction
-        filtered_direction = filtered_direction / np.linalg.norm(filtered_direction)
+        direction_norm = np.linalg.norm(filtered_direction)
+        if direction_norm > 0:
+            filtered_direction = filtered_direction / direction_norm
+        else:
+            # Fallback to raw direction if filtered is invalid
+            filtered_direction = raw_direction
+
+        # Check for NaN values in filtered position
+        if np.any(np.isnan(filtered_position)) or np.any(np.isnan(filtered_direction)):
+            # Reset filters and use raw values
+            self.position_filter.reset()
+            self.direction_filter.reset()
+            filtered_position = raw_position
+            filtered_direction = raw_direction / np.linalg.norm(raw_direction)
 
         # Use rotation from first marker (could be improved with rotation averaging)
         R_cam_world = rotation_matrices[0]
@@ -525,17 +558,29 @@ class AruCoPositioning:
         # Draw markers
         for marker_id, marker_pos in self.marker_positions.items():
             pt = self.project_3d_to_2d(marker_pos, view_matrix)
-            cv2.circle(img, pt, 3, (255, 100, 0), -1)
-            cv2.putText(img, str(marker_id), (pt[0] + 5, pt[1] - 5),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.3, (255, 100, 0), 1)
 
-            # Draw orientation arrow for each marker
-            R_marker = self._get_marker_orientation(marker_id)
-            # Marker's forward direction (facing into arena) is along its +Z axis
-            marker_forward = R_marker @ np.array([0, 0, 1.0])
-            arrow_end = marker_pos + marker_forward
-            arrow_pt = self.project_3d_to_2d(arrow_end, view_matrix)
-            cv2.arrowedLine(img, pt, arrow_pt, (150, 150, 0), 1, tipLength=0.3)
+            # Check if this marker was used in the last calculation
+            if marker_id in self.last_used_markers:
+                # Used markers: draw larger with green outline
+                cv2.circle(img, pt, 6, (0, 255, 0), 2)  # Green outline
+                cv2.circle(img, pt, 4, (255, 100, 0), -1)  # Orange fill
+                text_color = (0, 200, 0)  # Bright green text
+            else:
+                # Unused markers: draw smaller in gray
+                cv2.circle(img, pt, 3, (150, 150, 150), -1)
+                text_color = (120, 120, 120)  # Gray text
+
+            cv2.putText(img, str(marker_id), (pt[0] + 5, pt[1] - 5),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.3, text_color, 1)
+
+            # Draw orientation arrow for used markers only
+            if marker_id in self.last_used_markers:
+                R_marker = self._get_marker_orientation(marker_id)
+                # Marker's forward direction (facing into arena) is along its +Z axis
+                marker_forward = R_marker @ np.array([0, 0, 1.0])
+                arrow_end = marker_pos + marker_forward
+                arrow_pt = self.project_3d_to_2d(arrow_end, view_matrix)
+                cv2.arrowedLine(img, pt, arrow_pt, (0, 200, 0), 2, tipLength=0.3)
 
         # Draw target markers (ID >= 30) in magenta/purple
         for marker_id, marker_pos in target_marker_positions.items():
@@ -563,8 +608,8 @@ class AruCoPositioning:
         # Add title and legend
         cv2.putText(img, 'SDC26 Arena - 3D View', (10, 780),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 0), 2)
-        cv2.putText(img, 'Blue: Markers | Magenta: Targets | Red: Camera', (10, 760),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (100, 100, 100), 1)
+        cv2.putText(img, 'Green: Used | Gray: Unused | Magenta: Targets | Red: Camera', (10, 760),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (100, 100, 100), 1)
 
         # Display view angles
         view_text = f"View: X={self.view_angle_x:.1f}deg Y={self.view_angle_y:.1f}deg"
