@@ -28,6 +28,10 @@ pressed_lock = threading.Lock()
 running = True
 flying = False
 
+rc_override = None
+rc_override_until = 0.0
+rc_lock = threading.Lock()
+
 last_state_seen = 0.0
 conn_state = {"connected": False, "last_reconnect": 0.0}
 conn_lock = threading.Lock()
@@ -45,6 +49,8 @@ telemetry = {
     "updated_at": 0.0,
 }
 telemetry_lock = threading.Lock()
+
+TELLO = None
 
 
 def normalize_key(k: str) -> str:
@@ -218,6 +224,58 @@ def api_telemetry():
         return jsonify(telemetry)
 
 
+@app.post("/api/takeoff")
+def api_takeoff():
+    global flying
+    if TELLO is None:
+        return jsonify(ok=False, error="controller not ready"), 503
+    try:
+        if not flying:
+            TELLO.takeoff()
+            flying = True
+        return jsonify(ok=True, flying=flying)
+    except Exception as e:
+        return jsonify(ok=False, error=str(e)), 500
+
+
+@app.post("/api/land")
+def api_land():
+    global flying
+    if TELLO is None:
+        return jsonify(ok=False, error="controller not ready"), 503
+    try:
+        if flying:
+            TELLO.land()
+            flying = False
+        return jsonify(ok=True, flying=flying)
+    except Exception as e:
+        return jsonify(ok=False, error=str(e)), 500
+
+
+@app.post("/api/rc")
+def api_rc():
+    global rc_override, rc_override_until
+    data = request.get_json(silent=True) or {}
+
+    def clamp(v):
+        try:
+            return max(-100, min(100, int(v)))
+        except Exception:
+            return 0
+
+    lr = clamp(data.get("lr", 0))
+    fb = clamp(data.get("fb", 0))
+    ud = clamp(data.get("ud", 0))
+    yaw = clamp(data.get("yaw", 0))
+    dur_ms = max(50, min(2000, int(data.get("duration_ms", 250))))
+
+    with rc_lock:
+        rc_override = (lr, fb, ud, yaw)
+        rc_override_until = time.time() + (dur_ms / 1000.0)
+
+    return jsonify(ok=True, rc={"lr": lr, "fb": fb, "ud": ud, "yaw": yaw}, duration_ms=dur_ms)
+
+
 def _as_int(v):
     try:
         return int(float(v))
@@ -294,7 +352,7 @@ def reconnect_loop(tello: Tello):
 
 
 def rc_loop(tello: Tello):
-    global running, flying
+    global running, flying, rc_override
     period = 1.0 / RC_HZ
     while running:
         t0 = time.time()
@@ -326,6 +384,13 @@ def rc_loop(tello: Tello):
         if has_key("space") or has_key("x"):
             lr = fb = ud = yaw = 0
 
+        now = time.time()
+        with rc_lock:
+            if rc_override is not None and now < rc_override_until:
+                lr, fb, ud, yaw = rc_override
+            elif rc_override is not None and now >= rc_override_until:
+                rc_override = None
+
         try:
             tello.send_rc_control(lr, fb, ud, yaw)
         except Exception:
@@ -356,11 +421,12 @@ def shutdown(tello: Tello):
 
 
 def main():
-    global last_state_seen
+    global last_state_seen, TELLO
     logging.getLogger("djitellopy").setLevel(logging.CRITICAL)
     logging.getLogger("werkzeug").setLevel(logging.ERROR)
 
     tello = Tello()
+    TELLO = tello
     tello.connect()
     # keep stream enabled so external relay can forward UDP 11111 without local decode
     tello.streamon()
