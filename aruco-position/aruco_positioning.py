@@ -699,7 +699,7 @@ def main():
         frame = aruco_pos.draw_axes(frame, corners, ids)
 
         # Estimate pose
-        position, rotation, direction, marker_positions_30plus = aruco_pos.estimate_pose(corners, ids)
+        position, rotation, direction, target_marker_positions = aruco_pos.estimate_pose(corners, ids)
 
         # Display information
         if position is not None:
@@ -714,20 +714,20 @@ def main():
             # Only print if position changed significantly (>1cm) to reduce terminal overhead
             current_pos = (round(position[0], 2), round(position[1], 2), round(position[2], 2))
             if last_print_pos != current_pos:
-                marker_30_info = ""
-                if marker_positions_30plus:
-                    marker_30_info = " | Markers >=30: " + ", ".join(
+                target_info = ""
+                if target_marker_positions:
+                    target_info = " | Targets: " + ", ".join(
                         f"ID{mid}({pos[0]:.1f},{pos[1]:.1f},{pos[2]:.1f})"
-                        for mid, pos in marker_positions_30plus.items()
+                        for mid, pos in target_marker_positions.items()
                     )
-                print(f"\r{pos_text} | {dir_text}{marker_30_info}", end="", flush=True)
+                print(f"\r{pos_text} | {dir_text}{target_info}", end="", flush=True)
                 last_print_pos = current_pos
 
-        # Display markers with ID >= 30 on frame
-        if marker_positions_30plus:
+        # Display target markers (ID >= 30) on frame
+        if target_marker_positions:
             y_offset = 90
-            for marker_id, pos in marker_positions_30plus.items():
-                marker_text = f"Marker {marker_id}: X={pos[0]:.2f}m Y={pos[1]:.2f}m Z={pos[2]:.2f}m"
+            for marker_id, pos in target_marker_positions.items():
+                marker_text = f"Target {marker_id}: X={pos[0]:.2f}m Y={pos[1]:.2f}m Z={pos[2]:.2f}m"
                 cv2.putText(frame, marker_text, (10, y_offset), cv2.FONT_HERSHEY_SIMPLEX,
                             0.5, (255, 0, 255), 2)
                 y_offset += 25
@@ -753,7 +753,7 @@ def main():
                 aruco_pos.last_rotation_time = current_time
 
         # Create and display 3D visualization
-        viz_3d = aruco_pos.create_3d_visualization(position, direction, marker_positions_30plus)
+        viz_3d = aruco_pos.create_3d_visualization(position, direction, target_marker_positions)
 
         # Show frame and 3D visualization
         cv2.imshow('ArUco Positioning - SDC26', frame)
