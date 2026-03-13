@@ -243,12 +243,13 @@ class AruCoPositioning:
             position: Camera position in world coordinates (x, y, z) - filtered
             rotation: Camera rotation matrix
             camera_direction: Unit vector of camera viewing direction - filtered
+            target_marker_positions: Dict of {marker_id: position} for target markers (ID >= 30)
         """
         if ids is None or len(ids) == 0:
             self._cached_poses.clear()
             self.position_filter.reset()
             self.direction_filter.reset()
-            return None, None, None
+            return None, None, None, {}
 
         # Estimate pose for each marker and cache results
         self._cached_poses.clear()
@@ -268,6 +269,8 @@ class AruCoPositioning:
         directions = []
         rotation_matrices = []
         weights = []
+        target_marker_positions = {}
+        reference_wall_types = []  # Track wall types for corrections
 
         for i, marker_id in enumerate(ids.flatten()):
             if marker_id in self.marker_positions:
@@ -318,9 +321,30 @@ class AruCoPositioning:
                 directions.append(camera_direction)
                 rotation_matrices.append(R_cam_world)
                 weights.append(weight)
+                reference_wall_types.append(wall_type)
+            elif marker_id >= 30:
+                # Calculate position for target markers (ID >= 30)
+                # Get cached marker pose in camera frame
+                rvec, tvec = self._cached_poses[marker_id]
+                tvec = tvec.reshape(3)
+
+                # Convert rotation vector to matrix
+                R_marker_cam, _ = cv2.Rodrigues(rvec)
+
+                # Get target marker position in camera frame
+                marker_pos_cam = tvec
+
+                # If we have a valid camera position from known markers,
+                # transform target marker position to world coordinates
+                # This will be done after camera position is calculated
+                target_marker_positions[marker_id] = {
+                    'camera_frame': marker_pos_cam,
+                    'R_marker_cam': R_marker_cam
+                }
 
         if len(positions) == 0:
-            return None, None, None
+            # Clear target marker positions since we can't calculate world positions without reference markers
+            return None, None, None, {}
 
         # Weighted fusion of multiple marker estimates
         weights = np.array(weights)
@@ -346,8 +370,31 @@ class AruCoPositioning:
 
         # Use rotation from first marker (could be improved with rotation averaging)
         R_cam_world = rotation_matrices[0]
+        primary_wall_type = reference_wall_types[0] if reference_wall_types else None
 
-        return filtered_position, R_cam_world, filtered_direction
+        # Calculate world positions for target markers (ID >= 30)
+        for marker_id, marker_data in target_marker_positions.items():
+            # Get target marker position in camera frame (tvec from solvePnP)
+            # tvec represents the target marker's position in the camera coordinate system
+            marker_pos_cam = marker_data['camera_frame']
+
+            # Transform target marker position from camera frame to world coordinates
+            # R_cam_world transforms vectors from camera frame to world frame
+            # World position = Camera world position + Rotation * Camera frame vector
+            marker_world_pos = filtered_position + R_cam_world @ marker_pos_cam
+            # Make a copy to avoid modifying shared array references
+            marker_world_pos = marker_world_pos.copy()
+
+            # Apply X-axis correction if primary reference marker was on front/back wall
+            # This matches the correction applied to camera position calculation
+            if primary_wall_type in ('front', 'back'):
+                # Invert X coordinate
+                marker_world_pos[0] = 2 * filtered_position[0] - marker_world_pos[0]
+
+            # Update with world coordinates
+            target_marker_positions[marker_id] = marker_world_pos
+
+        return filtered_position, R_cam_world, filtered_direction, target_marker_positions
 
     def draw_markers(self, frame, corners, ids):
         """Draw detected markers on frame"""
@@ -410,17 +457,20 @@ class AruCoPositioning:
 
         return self._cached_view_matrix
 
-    def create_3d_visualization(self, position, direction):
+    def create_3d_visualization(self, position, direction, target_marker_positions=None):
         """
         Create lightweight 3D wireframe visualization using OpenCV only
 
         Args:
             position: Camera position (x, y, z)
             direction: Camera direction vector
+            target_marker_positions: Dict of positions for target markers (ID >= 30)
 
         Returns:
             Image of the 3D visualization
         """
+        if target_marker_positions is None:
+            target_marker_positions = {}
         # Create blank image
         img = np.ones((800, 800, 3), dtype=np.uint8) * 255
 
@@ -487,6 +537,13 @@ class AruCoPositioning:
             arrow_pt = self.project_3d_to_2d(arrow_end, view_matrix)
             cv2.arrowedLine(img, pt, arrow_pt, (150, 150, 0), 1, tipLength=0.3)
 
+        # Draw target markers (ID >= 30) in magenta/purple
+        for marker_id, marker_pos in target_marker_positions.items():
+            pt = self.project_3d_to_2d(marker_pos, view_matrix)
+            cv2.circle(img, pt, 5, (255, 0, 255), -1)  # Magenta color
+            cv2.putText(img, str(marker_id), (pt[0] + 7, pt[1] - 7),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 0, 255), 2)
+
         # Draw camera position and direction
         if position is not None:
             cam_pt = self.project_3d_to_2d(position, view_matrix)
@@ -506,7 +563,7 @@ class AruCoPositioning:
         # Add title and legend
         cv2.putText(img, 'SDC26 Arena - 3D View', (10, 780),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 0), 2)
-        cv2.putText(img, 'Blue: Markers | Red: Camera', (10, 760),
+        cv2.putText(img, 'Blue: Markers | Magenta: Targets | Red: Camera', (10, 760),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, (100, 100, 100), 1)
 
         # Display view angles
@@ -642,7 +699,7 @@ def main():
         frame = aruco_pos.draw_axes(frame, corners, ids)
 
         # Estimate pose
-        position, rotation, direction = aruco_pos.estimate_pose(corners, ids)
+        position, rotation, direction, marker_positions_30plus = aruco_pos.estimate_pose(corners, ids)
 
         # Display information
         if position is not None:
@@ -657,9 +714,25 @@ def main():
             # Only print if position changed significantly (>1cm) to reduce terminal overhead
             current_pos = (round(position[0], 2), round(position[1], 2), round(position[2], 2))
             if last_print_pos != current_pos:
-                print(f"\r{pos_text} | {dir_text}", end="", flush=True)
+                marker_30_info = ""
+                if marker_positions_30plus:
+                    marker_30_info = " | Markers >=30: " + ", ".join(
+                        f"ID{mid}({pos[0]:.1f},{pos[1]:.1f},{pos[2]:.1f})"
+                        for mid, pos in marker_positions_30plus.items()
+                    )
+                print(f"\r{pos_text} | {dir_text}{marker_30_info}", end="", flush=True)
                 last_print_pos = current_pos
-        else:
+
+        # Display markers with ID >= 30 on frame
+        if marker_positions_30plus:
+            y_offset = 90
+            for marker_id, pos in marker_positions_30plus.items():
+                marker_text = f"Marker {marker_id}: X={pos[0]:.2f}m Y={pos[1]:.2f}m Z={pos[2]:.2f}m"
+                cv2.putText(frame, marker_text, (10, y_offset), cv2.FONT_HERSHEY_SIMPLEX,
+                            0.5, (255, 0, 255), 2)
+                y_offset += 25
+
+        if position is None:
             cv2.putText(frame, "No markers detected", (10, 30),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
             last_print_pos = None
@@ -680,7 +753,7 @@ def main():
                 aruco_pos.last_rotation_time = current_time
 
         # Create and display 3D visualization
-        viz_3d = aruco_pos.create_3d_visualization(position, direction)
+        viz_3d = aruco_pos.create_3d_visualization(position, direction, marker_positions_30plus)
 
         # Show frame and 3D visualization
         cv2.imshow('ArUco Positioning - SDC26', frame)
