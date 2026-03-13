@@ -56,6 +56,8 @@ telemetry = {
 }
 telemetry_lock = threading.Lock()
 
+TELLO = None
+
 
 # ----- Key handling -----
 def normalize_key(k: str) -> str:
@@ -243,6 +245,12 @@ def api_telemetry():
         return jsonify(telemetry)
 
 
+@app.post("/api/recover")
+def api_recover():
+    ok, msg = recover_drone()
+    return jsonify(ok=ok, message=msg)
+
+
 @app.get("/video")
 def video_feed():
     def gen():
@@ -333,6 +341,46 @@ def telemetry_loop(tello: Tello):
         time.sleep(0.5)
 
 
+def recover_drone():
+    global frame_reader, flying, last_state_seen
+    if TELLO is None:
+        return False, "controller not ready"
+    t = TELLO
+    try:
+        try:
+            t.send_rc_control(0, 0, 0, 0)
+        except Exception:
+            pass
+        try:
+            t.land()
+        except Exception:
+            pass
+        try:
+            t.streamoff()
+        except Exception:
+            pass
+        try:
+            t.end()
+        except Exception:
+            pass
+
+        time.sleep(1.0)
+        t.connect()
+        t.streamon()
+        with frame_lock:
+            frame_reader = t.get_frame_read()
+        flying = False
+        last_state_seen = time.time()
+        with conn_lock:
+            conn_state["connected"] = True
+            conn_state["last_reconnect"] = time.time()
+        return True, "recovered"
+    except Exception as e:
+        with conn_lock:
+            conn_state["connected"] = False
+        return False, str(e)
+
+
 def reconnect_loop(tello: Tello):
     global frame_reader, last_state_seen
     while running:
@@ -371,8 +419,11 @@ def rc_loop(tello: Tello):
 
         # one-shot actions from terminal keys
         if consume_term_key("t") and not flying:
-            tello.takeoff()
-            flying = True
+            try:
+                tello.takeoff()
+                flying = True
+            except Exception:
+                recover_drone()
         if consume_term_key("l") and flying:
             tello.land()
             flying = False
@@ -382,8 +433,11 @@ def rc_loop(tello: Tello):
 
         # one-shot actions from web keys
         if has_key("t") and not flying:
-            tello.takeoff()
-            flying = True
+            try:
+                tello.takeoff()
+                flying = True
+            except Exception:
+                recover_drone()
             remove_key("t")
         if has_key("l") and flying:
             tello.land()
@@ -428,11 +482,12 @@ def shutdown(tello: Tello):
 
 
 def main():
-    global frame_reader, last_state_seen
+    global frame_reader, last_state_seen, TELLO
     logging.getLogger("djitellopy").setLevel(logging.CRITICAL)
     logging.getLogger("werkzeug").setLevel(logging.ERROR)
 
     tello = Tello()
+    TELLO = tello
     tello.connect()
     tello.streamon()
     with frame_lock:

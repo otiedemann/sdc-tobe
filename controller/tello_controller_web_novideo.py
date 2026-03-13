@@ -234,8 +234,9 @@ def api_takeoff():
             TELLO.takeoff()
             flying = True
         return jsonify(ok=True, flying=flying)
-    except Exception as e:
-        return jsonify(ok=False, error=str(e)), 500
+    except Exception:
+        ok, msg = recover_drone()
+        return jsonify(ok=False, error="takeoff_failed", recovered=ok, message=msg), 500
 
 
 @app.post("/api/land")
@@ -248,8 +249,9 @@ def api_land():
             TELLO.land()
             flying = False
         return jsonify(ok=True, flying=flying)
-    except Exception as e:
-        return jsonify(ok=False, error=str(e)), 500
+    except Exception:
+        ok, msg = recover_drone()
+        return jsonify(ok=False, error="land_failed", recovered=ok, message=msg), 500
 
 
 @app.post("/api/rc")
@@ -274,6 +276,12 @@ def api_rc():
         rc_override_until = time.time() + (dur_ms / 1000.0)
 
     return jsonify(ok=True, rc={"lr": lr, "fb": fb, "ud": ud, "yaw": yaw}, duration_ms=dur_ms)
+
+
+@app.post("/api/recover")
+def api_recover():
+    ok, msg = recover_drone()
+    return jsonify(ok=ok, message=msg)
 
 
 def _as_int(v):
@@ -325,6 +333,44 @@ def telemetry_loop(tello: Tello):
         time.sleep(0.5)
 
 
+def recover_drone():
+    global flying, last_state_seen
+    if TELLO is None:
+        return False, "controller not ready"
+    t = TELLO
+    try:
+        try:
+            t.send_rc_control(0, 0, 0, 0)
+        except Exception:
+            pass
+        try:
+            t.land()
+        except Exception:
+            pass
+        try:
+            t.streamoff()
+        except Exception:
+            pass
+        try:
+            t.end()
+        except Exception:
+            pass
+
+        time.sleep(1.0)
+        t.connect()
+        t.streamon()
+        flying = False
+        last_state_seen = time.time()
+        with conn_lock:
+            conn_state["connected"] = True
+            conn_state["last_reconnect"] = time.time()
+        return True, "recovered"
+    except Exception as e:
+        with conn_lock:
+            conn_state["connected"] = False
+        return False, str(e)
+
+
 def reconnect_loop(tello: Tello):
     global last_state_seen
     while running:
@@ -358,8 +404,11 @@ def rc_loop(tello: Tello):
         t0 = time.time()
 
         if consume_term_key("t") and not flying:
-            tello.takeoff()
-            flying = True
+            try:
+                tello.takeoff()
+                flying = True
+            except Exception:
+                recover_drone()
         if consume_term_key("l") and flying:
             tello.land()
             flying = False
@@ -368,8 +417,11 @@ def rc_loop(tello: Tello):
             break
 
         if has_key("t") and not flying:
-            tello.takeoff()
-            flying = True
+            try:
+                tello.takeoff()
+                flying = True
+            except Exception:
+                recover_drone()
             remove_key("t")
         if has_key("l") and flying:
             tello.land()
