@@ -50,6 +50,15 @@ telemetry = {
     "barometer_cm": None,
     "flight_time_s": None,
     "wifi_snr": None,
+    "pitch": None,
+    "roll": None,
+    "yaw": None,
+    "vgx": None,
+    "vgy": None,
+    "vgz": None,
+    "agx": None,
+    "agy": None,
+    "agz": None,
     "flying": False,
     "connected": False,
     "updated_at": 0.0,
@@ -150,9 +159,16 @@ HTML = """
         <button data-k=\"a\">A</button><button data-k=\"x\">STOP</button><button data-k=\"d\">D</button>
         <button data-k=\"r\">R</button><button data-k=\"s\">S</button><button data-k=\"f\">F</button>
       </div>
-      <div style=\"margin-top:8px; display:flex; gap:8px;\">
+      <div style=\"margin-top:8px; display:flex; gap:8px; flex-wrap:wrap;\">
         <button id=\"takeoff\">Takeoff (T)</button>
         <button id=\"land\">Land (L)</button>
+        <button id=\"recover\">Recover</button>
+      </div>
+      <div style=\"margin-top:8px; display:flex; gap:8px; flex-wrap:wrap;\">
+        <button id=\"flip_l\">Flip L</button>
+        <button id=\"flip_r\">Flip R</button>
+        <button id=\"flip_f\">Flip F</button>
+        <button id=\"flip_b\">Flip B</button>
       </div>
       <div class=\"small\" style=\"margin-top:8px;\">Keyboard in browser: W/A/S/D R/F Q/E, T, L, Space stop</div>
       <div class=\"panel\" style=\"margin-top:10px;\">
@@ -175,8 +191,13 @@ holdButtons.forEach(btn=>{
   btn.addEventListener('pointerleave',e=>{ btn.classList.remove('active'); keyUp(k); });
 });
 
-document.getElementById('takeoff').onclick = ()=>keyDown('t');
-document.getElementById('land').onclick = ()=>keyDown('l');
+document.getElementById('takeoff').onclick = ()=>fetch('/api/takeoff',{method:'POST'});
+document.getElementById('land').onclick = ()=>fetch('/api/land',{method:'POST'});
+document.getElementById('recover').onclick = ()=>fetch('/api/recover',{method:'POST'});
+document.getElementById('flip_l').onclick = ()=>fetch('/api/flip',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({dir:'l'})});
+document.getElementById('flip_r').onclick = ()=>fetch('/api/flip',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({dir:'r'})});
+document.getElementById('flip_f').onclick = ()=>fetch('/api/flip',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({dir:'f'})});
+document.getElementById('flip_b').onclick = ()=>fetch('/api/flip',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({dir:'b'})});
 
 const map = new Set(['w','a','s','d','q','e','r','f','t','l','x',' ']);
 window.addEventListener('keydown', (e)=>{
@@ -206,6 +227,9 @@ async function refreshTelemetry(){
       `barometer: ${t.barometer_cm ?? '-'} cm\n` +
       `flight time: ${t.flight_time_s ?? '-'} s\n` +
       `wifi snr: ${t.wifi_snr ?? '-'}\n` +
+      `attitude p/r/y: ${t.pitch ?? '-'} / ${t.roll ?? '-'} / ${t.yaw ?? '-'}\n` +
+      `velocity xyz: ${t.vgx ?? '-'} / ${t.vgy ?? '-'} / ${t.vgz ?? '-'}\n` +
+      `accel xyz: ${t.agx ?? '-'} / ${t.agy ?? '-'} / ${t.agz ?? '-'}\n` +
       `flying: ${t.flying}\n` +
       `connected: ${t.connected}`;
   } catch {
@@ -237,6 +261,49 @@ def api_key_up():
     data = request.get_json(silent=True) or {}
     remove_key(data.get("key", ""))
     return jsonify(ok=True)
+
+
+@app.post("/api/takeoff")
+def api_takeoff():
+    global flying
+    if TELLO is None:
+        return jsonify(ok=False, error="controller not ready"), 503
+    try:
+        if not flying:
+            TELLO.takeoff()
+            flying = True
+        return jsonify(ok=True, flying=flying)
+    except Exception as e:
+        return jsonify(ok=False, error=str(e)), 500
+
+
+@app.post("/api/land")
+def api_land():
+    global flying
+    if TELLO is None:
+        return jsonify(ok=False, error="controller not ready"), 503
+    try:
+        if flying:
+            TELLO.land()
+            flying = False
+        return jsonify(ok=True, flying=flying)
+    except Exception as e:
+        return jsonify(ok=False, error=str(e)), 500
+
+
+@app.post("/api/flip")
+def api_flip():
+    if TELLO is None:
+        return jsonify(ok=False, error="controller not ready"), 503
+    data = request.get_json(silent=True) or {}
+    direction = str(data.get("dir", "")).lower()
+    if direction not in {"l", "r", "f", "b"}:
+        return jsonify(ok=False, error="dir must be one of l|r|f|b"), 400
+    try:
+        TELLO.flip(direction)
+        return jsonify(ok=True, dir=direction)
+    except Exception as e:
+        return jsonify(ok=False, error=str(e)), 500
 
 
 @app.get("/api/telemetry")
@@ -334,6 +401,15 @@ def telemetry_loop(tello: Tello):
             telemetry["flight_time_s"] = _as_int(st.get("time"))
             # Not reliably supported on all firmware; keep nullable.
             telemetry["wifi_snr"] = _as_int(st.get("wifi"))
+            telemetry["pitch"] = _as_int(st.get("pitch"))
+            telemetry["roll"] = _as_int(st.get("roll"))
+            telemetry["yaw"] = _as_int(st.get("yaw"))
+            telemetry["vgx"] = _as_int(st.get("vgx"))
+            telemetry["vgy"] = _as_int(st.get("vgy"))
+            telemetry["vgz"] = _as_int(st.get("vgz"))
+            telemetry["agx"] = _as_int(st.get("agx"))
+            telemetry["agy"] = _as_int(st.get("agy"))
+            telemetry["agz"] = _as_int(st.get("agz"))
             telemetry["flying"] = flying
             telemetry["connected"] = connected_now
             telemetry["updated_at"] = time.time()
