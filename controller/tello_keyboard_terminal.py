@@ -51,6 +51,35 @@ def has_key(k: str) -> bool:
         return k in pressed
 
 
+def recover_drone(t: Tello):
+    try:
+        try:
+            t.send_rc_control(0, 0, 0, 0)
+        except Exception:
+            pass
+        try:
+            t.land()
+        except Exception:
+            pass
+        try:
+            t.streamoff()
+        except Exception:
+            pass
+        try:
+            t.end()
+        except Exception:
+            pass
+        time.sleep(1.0)
+        t.connect()
+        try:
+            t.streamon()
+        except Exception:
+            pass
+        return True
+    except Exception:
+        return False
+
+
 def main():
     logging.getLogger("djitellopy").setLevel(logging.CRITICAL)
 
@@ -64,7 +93,7 @@ def main():
     reader.start()
 
     print("Controls (Terminal must be focused):")
-    print("  t takeoff | l land | x stop rc | ESC quit")
+    print("  t takeoff | l land | p recover | x stop rc | ESC quit")
     print("  Hold movement keys by repeating taps quickly:")
     print("  w/s forward/back, a/d left/right, r/f up/down, q/e yaw")
 
@@ -72,11 +101,19 @@ def main():
         while running[0]:
             # one-shot keys
             if consume_key("t") and not flying:
-                t.takeoff()
-                flying = True
+                try:
+                    t.takeoff()
+                    flying = True
+                except Exception:
+                    recover_drone(t)
+                    flying = False
             if consume_key("l") and flying:
                 t.land()
                 flying = False
+            if consume_key("p"):
+                ok = recover_drone(t)
+                if ok:
+                    flying = False
             if consume_key("esc"):
                 running[0] = False
                 break
