@@ -1,0 +1,430 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>SDC26 - Dash & Debug</title>
+    <style>
+        body {
+            margin: 0;
+            overflow: hidden;
+            background-color: #111;
+            color: white;
+            font-family: sans-serif;
+        }
+
+        #ui {
+            position: absolute;
+            top: 10px;
+            left: 10px;
+            background: rgba(0, 0, 0, 0.8);
+            padding: 15px;
+            border-radius: 8px;
+            z-index: 10;
+            width: 250px;
+        }
+
+        #debug-container {
+            position: absolute;
+            bottom: 10px;
+            right: 10px;
+            border: 2px solid #444;
+            background: black;
+            display: none;
+        }
+
+        #debug-video {
+            width: 320px;
+            height: 240px;
+            display: block;
+            background: #222;
+        }
+
+        .btn {
+            background: #444;
+            color: white;
+            border: none;
+            padding: 8px 15px;
+            cursor: pointer;
+            border-radius: 4px;
+            margin-top: 10px;
+            width: 100%;
+        }
+
+        .btn-active {
+            background: #d32f2f;
+        }
+
+        .label {
+            font-size: 0.8em;
+            color: #aaa;
+            margin-top: 5px;
+        }
+
+        .node-row {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin: 4px 0;
+            gap: 8px;
+        }
+
+        .node-ip {
+            font-size: 0.9em;
+        }
+
+        .node-actions {
+            display: flex;
+            gap: 6px;
+        }
+
+        .reset-btn {
+            background: #5a2a2a;
+            color: #fff;
+            border: 1px solid #884444;
+            border-radius: 4px;
+            padding: 2px 8px;
+            cursor: pointer;
+            font-size: 0.75em;
+        }
+
+        .reset-btn:hover {
+            background: #7a3333;
+        }
+
+        .dbg-btn {
+            background: #2f3f6b;
+            color: #fff;
+            border: 1px solid #4a5f96;
+            border-radius: 4px;
+            padding: 2px 8px;
+            cursor: pointer;
+            font-size: 0.75em;
+        }
+
+        .dbg-btn.on {
+            background: #355d2f;
+            border-color: #4f9a45;
+        }
+    </style>
+</head>
+<body>
+<div id="ui">
+    <h3>SDC26 Arena</h3>
+    <div id="status">🔴 Disconnected</div>
+    <button id="debug-btn" class="btn">Debug: AUS</button>
+    <div id="node-list" style="margin-top:15px;"></div>
+</div>
+
+<div id="debug-container">
+    <img id="debug-video" src="" alt="Warte auf Signal...">
+    <div style="padding: 5px; font-size: 10px; text-align: center;">LIVE DEBUG STREAM</div>
+</div>
+
+<script async src="https://unpkg.com/es-module-shims@1.6.3/dist/es-module-shims.js"></script>
+<script type="importmap">
+     { "imports": { "three": "https://unpkg.com/three@0.150.1/build/three.module.js", "three/addons/": "https://unpkg.com/three@0.150.1/examples/jsm/" } }
+</script>
+
+<script type="module">
+    import * as THREE from 'three';
+    import {OrbitControls} from 'three/addons/controls/OrbitControls.js';
+
+    const scene = new THREE.Scene();
+    const camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.1, 1000);
+    const renderer = new THREE.WebGLRenderer({antialias: true});
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    document.body.appendChild(renderer.domElement);
+
+    const controls = new OrbitControls(camera, renderer.domElement);
+    camera.position.set(15, 10, 15);
+    controls.update();
+
+    // Arena Visuals
+    // Box: X [-10..10], Y [-3..3], Z [0..10]  => center at (0,0,5)
+    const arenaLine = new THREE.LineSegments(
+        new THREE.EdgesGeometry(new THREE.BoxGeometry(20, 6, 10)),
+        new THREE.LineBasicMaterial({color: 0x666666})
+    );
+    arenaLine.position.set(0, 0, 5);
+    scene.add(arenaLine);
+
+    // Floor grid aligned EXACTLY to arena footprint:
+    // X in [-10..10], Z in [0..10], Y = -3
+    function createRectGrid(xMin, xMax, zMin, zMax, step, y, color = 0x2c2c2c) {
+        const points = [];
+        // lines parallel to X (vary Z)
+        for (let z = zMin; z <= zMax + 1e-9; z += step) {
+            points.push(new THREE.Vector3(xMin, y, z), new THREE.Vector3(xMax, y, z));
+        }
+        // lines parallel to Z (vary X)
+        for (let x = xMin; x <= xMax + 1e-9; x += step) {
+            points.push(new THREE.Vector3(x, y, zMin), new THREE.Vector3(x, y, zMax));
+        }
+        const geom = new THREE.BufferGeometry().setFromPoints(points);
+        const mat = new THREE.LineBasicMaterial({color});
+        return new THREE.LineSegments(geom, mat);
+    }
+
+    const floorGrid = createRectGrid(-10, 10, 0, 10, 1, -3, 0x303030);
+    scene.add(floorGrid);
+
+    // Back-wall grid at Z=0 (X in [-10..10], Y in [-3..3])
+    function createBackWallGrid(xMin, xMax, yMin, yMax, step, z, color = 0x2e2e2e) {
+        const points = [];
+        // horizontal lines (vary Y)
+        for (let y = yMin; y <= yMax + 1e-9; y += step) {
+            points.push(new THREE.Vector3(xMin, y, z), new THREE.Vector3(xMax, y, z));
+        }
+        // vertical lines (vary X)
+        for (let x = xMin; x <= xMax + 1e-9; x += step) {
+            points.push(new THREE.Vector3(x, yMin, z), new THREE.Vector3(x, yMax, z));
+        }
+        const geom = new THREE.BufferGeometry().setFromPoints(points);
+        const mat = new THREE.LineBasicMaterial({color});
+        return new THREE.LineSegments(geom, mat);
+    }
+
+    const backWallGrid = createBackWallGrid(-10, 10, -3, 3, 1, 0, 0x2a2a2a);
+    scene.add(backWallGrid);
+
+    // Visual mapping: mirror X so dashboard matches arena convention used by node outputs
+    const toViz = (x, y, z) => new THREE.Vector3(-x, y, z);
+
+    // Origin axis arrows at (0,0,0)
+    const origin = new THREE.Vector3(0, 0, 0);
+    const axisLen = 2.5;
+    scene.add(new THREE.ArrowHelper(new THREE.Vector3(-1, 0, 0), origin, axisLen, 0xff3333)); // X (mirrored view)
+    scene.add(new THREE.ArrowHelper(new THREE.Vector3(0, 1, 0), origin, axisLen, 0x33ff33)); // Y
+    scene.add(new THREE.ArrowHelper(new THREE.Vector3(0, 0, 1), origin, axisLen, 0x3366ff)); // Z
+
+    function createTextSprite(text, color = "#ffffff") {
+        const canvas = document.createElement('canvas');
+        canvas.width = 128;
+        canvas.height = 64;
+        const ctx = canvas.getContext('2d');
+        ctx.clearRect(0, 0, canvas.width, canvas.height);
+        ctx.font = 'bold 42px sans-serif';
+        ctx.fillStyle = color;
+        ctx.textAlign = 'center';
+        ctx.textBaseline = 'middle';
+        ctx.fillText(text, canvas.width / 2, canvas.height / 2);
+
+        const texture = new THREE.CanvasTexture(canvas);
+        texture.needsUpdate = true;
+        const material = new THREE.SpriteMaterial({map: texture, transparent: true});
+        const sprite = new THREE.Sprite(material);
+        sprite.scale.set(1.2, 0.6, 1);
+        return sprite;
+    }
+
+    const xLabel = createTextSprite('X', '#ff6666');
+    xLabel.position.set(-(axisLen + 0.35), 0, 0);
+    scene.add(xLabel);
+
+    const yLabel = createTextSprite('Y', '#66ff66');
+    yLabel.position.set(0, axisLen + 0.35, 0);
+    scene.add(yLabel);
+
+    const zLabel = createTextSprite('Z', '#6699ff');
+    zLabel.position.set(0, 0, axisLen + 0.35);
+    scene.add(zLabel);
+
+    const nodes = {}, targets = {};
+    const nodeDebugState = {}; // per-node UI state
+    let selectedDebugIp = null; // only show image of this node
+    let debugActive = false;
+
+    // WebSocket Setup
+    const ws = new WebSocket(`ws://${window.location.hostname}:8000/ws`);
+
+    function resetNode(ip) {
+        // Optimistic local cleanup (instant UI reset)
+        if (nodes[ip]) {
+            scene.remove(nodes[ip]);
+            delete nodes[ip];
+        }
+        Object.keys(targets).forEach(k => {
+            if (k.startsWith(ip + "_")) {
+                scene.remove(targets[k]);
+                delete targets[k];
+            }
+        });
+        delete nodeDebugState[ip];
+        if (selectedDebugIp === ip) {
+            selectedDebugIp = null;
+            debugImg.src = "";
+        }
+
+        if (ws.readyState === WebSocket.OPEN) {
+            ws.send(JSON.stringify({resetNode: ip}));
+        }
+    }
+
+    const statusEl = document.getElementById('status');
+    const nodeListEl = document.getElementById('node-list');
+    const debugBtn = document.getElementById('debug-btn');
+    const debugImg = document.getElementById('debug-video');
+    const debugContainer = document.getElementById('debug-container');
+
+    // Global button now toggles all currently connected nodes
+    debugBtn.onclick = () => {
+        const nextState = !debugActive;
+        Object.keys(nodes).forEach(ip => {
+            nodeDebugState[ip] = nextState;
+            if (ws.readyState === WebSocket.OPEN) {
+                ws.send(JSON.stringify({debugNode: ip, debug: nextState}));
+            }
+        });
+        if (!nextState) {
+            selectedDebugIp = null;
+            debugImg.src = "";
+        }
+    };
+
+    function toggleNodeDebug(ip) {
+        const next = !Boolean(nodeDebugState[ip]);
+        nodeDebugState[ip] = next;
+        if (ws.readyState === WebSocket.OPEN) {
+            ws.send(JSON.stringify({debugNode: ip, debug: next}));
+        }
+        // If turning on, select this node's stream for display
+        if (next) {
+            selectedDebugIp = ip;
+        } else if (selectedDebugIp === ip) {
+            selectedDebugIp = null;
+            debugImg.src = "";
+        }
+    }
+
+    ws.onopen = () => statusEl.innerText = "🟢 Connected";
+    ws.onclose = () => statusEl.innerText = "🔴 Disconnected";
+
+    ws.onmessage = (event) => {
+        const data = JSON.parse(event.data);
+        let anyNodeDebug = false;
+
+        const ips = Object.keys(data);
+        if (ips.length === 0) {
+            nodeListEl.innerHTML = `<div class="label">Keine Pi-Nodes verbunden</div>`;
+        } else {
+            nodeListEl.innerHTML = `<div class="label">Nodes:</div>` + ips.map(ip => {
+                const dbgOn = Boolean(nodeDebugState[ip]);
+                const isSelected = selectedDebugIp === ip;
+                return `
+                    <div class="node-row">
+                        <span class="node-ip">${ip} ${isSelected ? '🎥' : ''}</span>
+                        <span class="node-actions">
+                            <button class="dbg-btn ${dbgOn ? 'on' : ''}" data-ip="${ip}">${dbgOn ? 'Debug ON' : 'Debug OFF'}</button>
+                            <button class="reset-btn" data-ip="${ip}">Reset</button>
+                        </span>
+                    </div>
+                `
+            }).join('');
+
+            nodeListEl.querySelectorAll('.reset-btn').forEach(btn => {
+                btn.onclick = () => resetNode(btn.dataset.ip);
+            });
+            nodeListEl.querySelectorAll('.dbg-btn').forEach(btn => {
+                btn.onclick = () => toggleNodeDebug(btn.dataset.ip);
+            });
+        }
+
+        const activeIps = new Set(Object.keys(data));
+
+        // Remove stale nodes/targets that are no longer present on server
+        Object.keys(nodes).forEach(ip => {
+            if (!activeIps.has(ip)) {
+                scene.remove(nodes[ip]);
+                delete nodes[ip];
+                Object.keys(targets).forEach(k => {
+                    if (k.startsWith(ip + "_")) {
+                        scene.remove(targets[k]);
+                        delete targets[k];
+                    }
+                });
+            }
+        });
+
+        for (const [ip, nodeData] of Object.entries(data)) {
+            // Sync internal debug state with what the node actually reports
+            if (nodeData.debug !== undefined) {
+                nodeDebugState[ip] = Boolean(nodeData.debug);
+                anyNodeDebug = anyNodeDebug || nodeData.debug;
+                if (nodeData.debug && !selectedDebugIp) {
+                    selectedDebugIp = ip;
+                }
+                if (!nodeData.debug && selectedDebugIp === ip) {
+                    selectedDebugIp = null;
+                }
+            }
+
+            // Node (Pi) Marker
+            if (!nodes[ip]) {
+                nodes[ip] = new THREE.Group();
+                nodes[ip].add(new THREE.Mesh(new THREE.SphereGeometry(0.3), new THREE.MeshBasicMaterial({color: 0x00ff00})));
+                nodes[ip].add(new THREE.ArrowHelper(new THREE.Vector3(0, 0, 1), new THREE.Vector3(0, 0, 0), 1, 0x00ff00));
+                scene.add(nodes[ip]);
+            }
+
+            if (nodeData.cam) {
+                nodes[ip].position.copy(toViz(nodeData.cam[0], nodeData.cam[1], nodeData.cam[2]));
+                if (nodeData.dir) {
+                    const d = new THREE.Vector3(-nodeData.dir[0], nodeData.dir[1], nodeData.dir[2]).normalize();
+                    nodes[ip].children[1].setDirection(d);
+                }
+            }
+
+            // Video Stream Update: show only selected node image
+            if (selectedDebugIp === ip && nodeData.debug && nodeData.img) {
+                debugImg.src = "data:image/jpeg;base64," + nodeData.img;
+            }
+
+            // Target (Drones) update
+            const currentTargetKeys = new Set(Object.keys(nodeData.targets || {}).map(tid => `${ip}_${tid}`));
+
+            // remove stale targets for this ip
+            Object.keys(targets).forEach(k => {
+                if (k.startsWith(ip + "_") && !currentTargetKeys.has(k)) {
+                    scene.remove(targets[k]);
+                    delete targets[k];
+                }
+            });
+
+            for (const [tid, tPos] of Object.entries(nodeData.targets || {})) {
+                const key = `${ip}_${tid}`;
+                if (!targets[key]) {
+                    targets[key] = new THREE.Mesh(new THREE.SphereGeometry(0.25), new THREE.MeshBasicMaterial({color: 0xff00ff}));
+                    scene.add(targets[key]);
+                }
+                targets[key].position.copy(toViz(tPos[0], tPos[1], tPos[2]));
+            }
+        }
+
+        // Global UI Sync based on nodes' feedback
+        if (anyNodeDebug !== debugActive) {
+            debugActive = anyNodeDebug;
+        }
+
+        debugBtn.innerText = debugActive ? "Debug: EIN" : "Debug: AUS";
+        debugBtn.className = debugActive ? "btn btn-active" : "btn";
+        debugContainer.style.display = (debugActive && selectedDebugIp) ? "block" : "none";
+        if (!(debugActive && selectedDebugIp)) debugImg.src = "";
+    };
+
+    function animate() {
+        requestAnimationFrame(animate);
+        controls.update();
+        renderer.render(scene, camera);
+    }
+
+    animate();
+
+    window.addEventListener('resize', () => {
+        camera.aspect = window.innerWidth / window.innerHeight;
+        camera.updateProjectionMatrix();
+        renderer.setSize(window.innerWidth, window.innerHeight);
+    });
+</script>
+</body>
+</html>
