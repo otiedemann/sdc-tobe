@@ -188,13 +188,13 @@
     const backWallGrid = createBackWallGrid(-10, 10, -3, 3, 1, 0, 0x2a2a2a);
     scene.add(backWallGrid);
 
-    // Visual mapping: mirror X so dashboard matches arena convention used by node outputs
-    const toViz = (x, y, z) => new THREE.Vector3(-x, y, z);
+    // Visual mapping: identity (expects node output already in arena world frame)
+    const toViz = (x, y, z) => new THREE.Vector3(x, y, z);
 
     // Origin axis arrows at (0,0,0)
     const origin = new THREE.Vector3(0, 0, 0);
     const axisLen = 2.5;
-    scene.add(new THREE.ArrowHelper(new THREE.Vector3(-1, 0, 0), origin, axisLen, 0xff3333)); // X (mirrored view)
+    scene.add(new THREE.ArrowHelper(new THREE.Vector3(1, 0, 0), origin, axisLen, 0xff3333)); // X
     scene.add(new THREE.ArrowHelper(new THREE.Vector3(0, 1, 0), origin, axisLen, 0x33ff33)); // Y
     scene.add(new THREE.ArrowHelper(new THREE.Vector3(0, 0, 1), origin, axisLen, 0x3366ff)); // Z
 
@@ -219,7 +219,7 @@
     }
 
     const xLabel = createTextSprite('X', '#ff6666');
-    xLabel.position.set(-(axisLen + 0.35), 0, 0);
+    xLabel.position.set(axisLen + 0.35, 0, 0);
     scene.add(xLabel);
 
     const yLabel = createTextSprite('Y', '#66ff66');
@@ -370,7 +370,7 @@
             if (nodeData.cam) {
                 nodes[ip].position.copy(toViz(nodeData.cam[0], nodeData.cam[1], nodeData.cam[2]));
                 if (nodeData.dir) {
-                    const d = new THREE.Vector3(-nodeData.dir[0], nodeData.dir[1], nodeData.dir[2]).normalize();
+                    const d = new THREE.Vector3(nodeData.dir[0], nodeData.dir[1], nodeData.dir[2]).normalize();
                     nodes[ip].children[1].setDirection(d);
                 }
             }

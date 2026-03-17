@@ -18,11 +18,10 @@ CAMERA_SOURCE = 0
 HEARTBEAT_INTERVAL = 1.0  # Sekunden: Status senden auch ohne Marker
 
 # Pose robustness settings
-MIN_REF_WEIGHT = 0.04  # Ignore very weak refs, but keep detection usable
+MIN_REF_WEIGHT = 0.00  # Ignore very weak refs, but keep detection usable
 MIN_REF_COUNT = 1  # Allow single-marker pose as fallback
 POSE_HOLD_SEC = 0.8  # Hold last valid pose briefly when refs drop out
 OUTLIER_POS_THRESH = 2.5  # meters: looser outlier reject for real-world noise
-
 
 def has_gui():
     system = platform.system().lower()
@@ -104,7 +103,8 @@ class HeadlessAruCoPositioning:
             'left': np.array([[0, 0, 1], [0, 1, 0], [-1, 0, 0]]),
             'right': np.array([[0, 0, -1], [0, 1, 0], [1, 0, 0]])
         }
-        self.marker_wall_type = {mid: self._determine_wall_type(pos) for mid, pos in self.marker_positions.items()}
+        # IMPORTANT: Explicit wall mapping by marker ID (robust against axis/coordinate refactors)
+        self.marker_wall_type = self._initialize_marker_wall_types()
         self.kf_pos = [KalmanFilter1D() for _ in range(3)]
         self.direction_filter = ExponentialMovingAverage(alpha=0.2)
         self.target_filters = {}
@@ -157,31 +157,43 @@ class HeadlessAruCoPositioning:
 
     def _initialize_marker_positions(self):
         pos = {0: np.array([0.0, 0.0, 0.0])}
-        pos[5], pos[6] = np.array([6.0, -1.0, 0.0]), np.array([6.0, 1.0, 0.0])
-        pos[7], pos[8] = np.array([2.0, -1.0, 0.0]), np.array([2.0, 1.0, 0.0])
-        pos[9], pos[10] = np.array([-2.0, -1.0, 0.0]), np.array([-2.0, 1.0, 0.0])
-        pos[11], pos[12] = np.array([-6.0, -1.0, 0.0]), np.array([-6.0, 1.0, 0.0])
-        pos[1], pos[2] = np.array([10.0, -1.0, 6.667]), np.array([10.0, 1.0, 6.667])
-        pos[3], pos[4] = np.array([10.0, -1.0, 3.333]), np.array([10.0, 1.0, 3.333])
-        pos[13], pos[14] = np.array([-10.0, -1.0, 3.333]), np.array([-10.0, 1.0, 3.333])
-        pos[15], pos[16] = np.array([-10.0, -1.0, 6.667]), np.array([-10.0, 1.0, 6.667])
-        pos[17], pos[18] = np.array([-6.0, -1.0, 10.0]), np.array([-6.0, 1.0, 10.0])
-        pos[19], pos[20] = np.array([-2.0, -1.0, 10.0]), np.array([-2.0, 1.0, 10.0])
-        pos[21], pos[22] = np.array([2.0, -1.0, 10.0]), np.array([2.0, 1.0, 10.0])
-        pos[23], pos[24] = np.array([6.0, -1.0, 10.0]), np.array([6.0, 1.0, 10.0])
+        pos[1], pos[2] = np.array([-10.0, -1.0, 6.667]), np.array([-10.0, 1.0, 6.667])
+        pos[3], pos[4] = np.array([-10.0, -1.0, 3.333]), np.array([-10.0, 1.0, 3.333])
+        pos[5], pos[6] = np.array([-6.0, -1.0, 0.0]), np.array([-6.0, 1.0, 0.0])
+        pos[7], pos[8] = np.array([-2.0, -1.0, 0.0]), np.array([-2.0, 1.0, 0.0])
+        pos[9], pos[10] = np.array([2.0, -1.0, 0.0]), np.array([2.0, 1.0, 0.0])
+        pos[11], pos[12] = np.array([6.0, -1.0, 0.0]), np.array([6.0, 1.0, 0.0])
+        pos[13], pos[14] = np.array([10.0, -1.0, 3.333]), np.array([10.0, 1.0, 3.333])
+        pos[15], pos[16] = np.array([10.0, -1.0, 6.667]), np.array([10.0, 1.0, 6.667])
+        pos[17], pos[18] = np.array([6.0, -1.0, 10.0]), np.array([6.0, 1.0, 10.0])
+        pos[19], pos[20] = np.array([2.0, -1.0, 10.0]), np.array([2.0, 1.0, 10.0])
+        pos[21], pos[22] = np.array([-2.0, -1.0, 10.0]), np.array([-2.0, 1.0, 10.0])
+        pos[23], pos[24] = np.array([-6.0, -1.0, 10.0]), np.array([-6.0, 1.0, 10.0])
         return pos
 
-    def _determine_wall_type(self, pos):
-        x, z = pos[0], pos[2]
-        if abs(z - 0.0) < 0.1:
-            return 'back'
-        elif abs(z - 10.0) < 0.1:
-            return 'front'
-        elif abs(x - (-10.0)) < 0.1:
-            return 'left'
-        elif abs(x - 10.0) < 0.1:
-            return 'right'
-        return None
+    def _initialize_marker_wall_types(self):
+        """
+        Wall mapping by marker ID (SDC layout specific):
+        - back: 0, 5..12
+        - front: 17..24
+        - right: 1..4
+        - left: 13..16
+
+        NOTE: This is intentionally ID-based (not coordinate-threshold-based),
+        so coordinate sign/axis changes won't break orientation assignment.
+        """
+        mapping = {}
+
+        for mid in [0, 5, 6, 7, 8, 9, 10, 11, 12]:
+            mapping[mid] = 'back'
+        for mid in [17, 18, 19, 20, 21, 22, 23, 24]:
+            mapping[mid] = 'front'
+        for mid in [1, 2, 3, 4]:
+            mapping[mid] = 'left'
+        for mid in [13, 14, 15, 16]:
+            mapping[mid] = 'right'
+
+        return mapping
 
     def _get_marker_orientation(self, mid):
         return self._wall_rotations.get(self.marker_wall_type.get(mid), np.eye(3))
@@ -263,29 +275,43 @@ class HeadlessAruCoPositioning:
         for idx in ref_indices:
             mid = int(ids.flatten()[idx])
             rvec, tvec = cached_poses[mid]
+
+            # solvePnP result:
+            # X_cam = R_m_c * X_marker + t_m_c
+            # where R_m_c maps marker-frame -> camera-frame
             R_m_c, _ = cv2.Rodrigues(rvec)
+            t_m_c = tvec.reshape(3)
+
+            # Fixed marker transform in world (must stay unchanged by request)
             R_m_w = self._get_marker_orientation(mid)
-            c_pos_w = self.marker_positions[mid] + R_m_w @ (-R_m_c.T @ tvec)
-            wall = self.marker_wall_type.get(mid)
+            t_m_w = self.marker_positions[mid]
 
-            # Empirical correction for front/back markers in this arena convention
-            if wall in ('front', 'back'):
-                c_pos_w[0] = 2 * self.marker_positions[mid][0] - c_pos_w[0]
+            # Camera origin in marker frame: C_m = -R_m_c^T * t_m_c
+            C_m = -R_m_c.T @ t_m_c
 
-            # OpenCV solvePnP gives marker->camera rotation (R_m_c).
-            # camera->world = marker->world @ camera->marker = R_m_w @ R_m_c.T
+            # Camera position in world frame: C_w = R_m_w * C_m + t_m_w
+            c_pos_w = (R_m_w @ C_m) + t_m_w
+
+            # Camera rotation in world frame:
+            # R_c_m = R_m_c^T (camera -> marker)
+            # R_c_w = R_m_w * R_c_m (camera -> world)
             R_c_w = R_m_w @ R_m_c.T
-            c_dir_w = R_c_w @ np.array([0, 0, 1])
-            if wall in ('front', 'back'):
-                c_dir_w[0] = -c_dir_w[0]
-            w = self._calculate_marker_weight(corners[idx], np.linalg.norm(tvec), rvec=rvec, tvec=tvec)
-            # hard quality gate to avoid wrong-ID / weak detections polluting camera pose
+
+            # Camera forward direction = +Z axis of camera frame mapped to world
+            c_dir_w = R_c_w @ np.array([0.0, 0.0, 1.0])
+            c_dir_norm = np.linalg.norm(c_dir_w)
+            if c_dir_norm > 1e-9:
+                c_dir_w = c_dir_w / c_dir_norm
+
+            # keep existing quality weighting logic
+            w = self._calculate_marker_weight(corners[idx], np.linalg.norm(t_m_c), rvec=rvec, tvec=t_m_c)
             if w < MIN_REF_WEIGHT:
                 continue
-            cam_positions.append(c_pos_w);
-            cam_dirs.append(c_dir_w);
-            rot_mats.append(R_c_w);
-            weights.append(w);
+
+            cam_positions.append(c_pos_w)
+            cam_dirs.append(c_dir_w)
+            rot_mats.append(R_c_w)
+            weights.append(w)
             ref_marker_ids.append(mid)
 
         # If too few high-quality refs remain, hold recent pose instead of producing bad estimates
@@ -324,7 +350,15 @@ class HeadlessAruCoPositioning:
         raw_pos = sum(p * w for p, w in zip(cam_positions, w_arr))
         raw_dir = sum(d * w for d, w in zip(cam_dirs, w_arr))
         f_pos = np.array([self.kf_pos[j].update(raw_pos[j]) for j in range(3)])
-        f_dir = self.direction_filter.update(raw_dir / (np.linalg.norm(raw_dir) + 1e-6))
+
+        raw_dir_norm = np.linalg.norm(raw_dir)
+        if raw_dir_norm > 1e-9:
+            raw_dir = raw_dir / raw_dir_norm
+
+        f_dir = self.direction_filter.update(raw_dir)
+        f_dir_norm = np.linalg.norm(f_dir)
+        if f_dir_norm > 1e-9:
+            f_dir = f_dir / f_dir_norm
         # Use per-reference target projection and weighted fusion (more robust)
         targets = {}
         w_ref = np.array(weights, dtype=float)
