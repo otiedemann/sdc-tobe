@@ -22,6 +22,7 @@ MIN_REF_WEIGHT = 0.00  # Ignore very weak refs, but keep detection usable
 MIN_REF_COUNT = 1  # Allow single-marker pose as fallback
 POSE_HOLD_SEC = 0.8  # Hold last valid pose briefly when refs drop out
 OUTLIER_POS_THRESH = 2.5  # meters: looser outlier reject for real-world noise
+TARGET_Y_OFFSET = 0.0  # add constant offset to target Y output (e.g. +3.0 for absolute arena height)
 
 def has_gui():
     system = platform.system().lower()
@@ -378,6 +379,9 @@ class HeadlessAruCoPositioning:
             for est, w in zip(target_estimates, w_ref):
                 t_w += est * w
 
+            # Apply configurable Y-offset (useful after origin shift to marker 0)
+            t_w[1] += TARGET_Y_OFFSET
+
             if tid not in self.target_filters:
                 self.target_filters[tid] = ExponentialMovingAverage(alpha=0.15)
             targets[str(tid)] = self.target_filters[tid].update(t_w).tolist()
@@ -427,6 +431,7 @@ def main():
     min_ref_count = MIN_REF_COUNT
     outlier_pos_thresh = OUTLIER_POS_THRESH
     pose_hold_sec = POSE_HOLD_SEC
+    target_y_offset = TARGET_Y_OFFSET
 
     if '--min-ref-weight' in sys.argv:
         try:
@@ -452,11 +457,18 @@ def main():
         except:
             print("⚠️ Invalid --pose-hold value, using default.")
 
+    if '--target-y-offset' in sys.argv:
+        try:
+            target_y_offset = float(sys.argv[sys.argv.index('--target-y-offset') + 1])
+        except:
+            print("⚠️ Invalid --target-y-offset value, using default.")
+
     # Apply runtime tuning globally (used inside process_frame)
     globals()["MIN_REF_WEIGHT"] = min_ref_weight
     globals()["MIN_REF_COUNT"] = max(1, min_ref_count)
     globals()["OUTLIER_POS_THRESH"] = max(0.1, outlier_pos_thresh)
     globals()["POSE_HOLD_SEC"] = max(0.0, pose_hold_sec)
+    globals()["TARGET_Y_OFFSET"] = target_y_offset
 
     preview_requested = ('--preview' in sys.argv)
     gui_enabled = preview_requested and has_gui() and ('--force-headless' not in sys.argv)
@@ -478,7 +490,7 @@ def main():
     print(f"📝 Verbose Mode: {'ON' if verbose_mode else 'OFF'}")
     print(f"🔎 Detect Profile: {detect_profile}")
     print(
-        f"⚙️ min_ref_weight={MIN_REF_WEIGHT} min_ref_count={MIN_REF_COUNT} outlier={OUTLIER_POS_THRESH} pose_hold={POSE_HOLD_SEC}")
+        f"⚙️ min_ref_weight={MIN_REF_WEIGHT} min_ref_count={MIN_REF_COUNT} outlier={OUTLIER_POS_THRESH} pose_hold={POSE_HOLD_SEC} target_y_offset={TARGET_Y_OFFSET}")
     print(f"🖥️ Preview Requested: {'YES' if preview_requested else 'NO'}")
     print(f"🖥️ GUI Overlay: {'ON' if gui_enabled else 'OFF'}")
 
