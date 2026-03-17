@@ -9,6 +9,7 @@ HTTP_PORT = 8090
 TIMEOUT = 2.0
 
 app = Flask(__name__)
+last_api_status = None
 
 HTML = """
 <!doctype html>
@@ -182,10 +183,18 @@ def proxy_recover():
 
 @app.get("/proxy/telemetry")
 def proxy_telemetry():
+    global last_api_status
     try:
         r = pi_get("/api/telemetry")
+        ok = r.status_code < 500
+        if ok != last_api_status:
+            print("[REMOTE UI] Connected to Pi API" if ok else "[REMOTE UI] Pi API error")
+            last_api_status = ok
         return (r.text, r.status_code, {"Content-Type": r.headers.get("Content-Type", "application/json")})
     except Exception as e:
+        if last_api_status is not False:
+            print("[REMOTE UI] Disconnected from Pi API")
+            last_api_status = False
         return jsonify(ok=False, error=str(e)), 502
 
 

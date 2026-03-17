@@ -33,6 +33,7 @@ pressed_lock = threading.Lock()
 last_state_seen = 0.0
 conn_state = {"connected": False, "last_reconnect": 0.0}
 conn_lock = threading.Lock()
+last_conn_print = None
 
 rc_override = None
 rc_override_until = 0.0
@@ -224,13 +225,17 @@ def telemetry_loop(tello: Tello):
 
 
 def reconnect_loop(tello: Tello):
-    global last_state_seen
+    global last_state_seen, last_conn_print
     while running:
         now = time.time()
         stale = (now - last_state_seen) if last_state_seen else 9999
         with conn_lock:
             last_try = conn_state["last_reconnect"]
             connected_now = conn_state["connected"]
+
+        if connected_now != last_conn_print:
+            print("[PI API] Drone connected" if connected_now else "[PI API] Drone disconnected (retrying...)")
+            last_conn_print = connected_now
 
         should_retry = (not connected_now and (now - last_try) >= CONNECT_RETRY_S) or (
             stale > RECONNECT_AFTER_S and (now - last_try) >= RECONNECT_RETRY_S
