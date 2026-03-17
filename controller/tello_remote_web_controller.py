@@ -3,7 +3,7 @@ import requests
 from flask import Flask, Response, jsonify, request
 
 # Runs on remote PC. Proxies to Pi API server.
-PI_BASE = os.getenv("PI_API_BASE", "http://192.168.1.50:8080").rstrip("/")
+PI_BASE = os.getenv("PI_API_BASE", "http://192.168.179.62:8080").rstrip("/")
 HTTP_HOST = "0.0.0.0"
 HTTP_PORT = 8090
 TIMEOUT = 2.0
