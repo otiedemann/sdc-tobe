@@ -210,3 +210,4 @@ __marimo__/
 /.idea/
 /source/
 /aruco-position/S10e/
+/controller/tello_wifi_config.json

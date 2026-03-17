@@ -1,8 +1,10 @@
 import atexit
 import json
 import logging
+import subprocess
 import threading
 import time
+from pathlib import Path
 from typing import Set
 
 from djitellopy import Tello
@@ -15,6 +17,9 @@ RC_HZ = 20
 STICK = 60
 RECONNECT_AFTER_S = 3.0
 RECONNECT_RETRY_S = 2.0
+CONNECT_RETRY_S = 2.0
+WIFI_RETRY_S = 3.0
+WIFI_CFG_PATH = Path(__file__).with_name("tello_wifi_config.json")
 
 app = Flask(__name__)
 
@@ -55,6 +60,49 @@ telemetry = {
     "updated_at": 0.0,
 }
 telemetry_lock = threading.Lock()
+
+
+def load_wifi_config():
+    try:
+        data = json.loads(WIFI_CFG_PATH.read_text())
+        ssid = str(data.get("ssid", "")).strip()
+        password = str(data.get("password", "")).strip()
+        if not ssid or not password:
+            return None
+        return {"ssid": ssid, "password": password}
+    except Exception:
+        return None
+
+
+def _run(cmd):
+    return subprocess.run(cmd, capture_output=True, text=True)
+
+
+def wifi_connected_to(ssid: str) -> bool:
+    r = _run(["nmcli", "-t", "-f", "ACTIVE,SSID", "dev", "wifi"])
+    if r.returncode != 0:
+        return False
+    for line in r.stdout.splitlines():
+        if line.startswith("yes:") and line[4:] == ssid:
+            return True
+    return False
+
+
+def wifi_connect_loop():
+    while running:
+        cfg = load_wifi_config()
+        if not cfg:
+            time.sleep(WIFI_RETRY_S)
+            continue
+
+        ssid = cfg["ssid"]
+        password = cfg["password"]
+        if wifi_connected_to(ssid):
+            time.sleep(WIFI_RETRY_S)
+            continue
+
+        _run(["nmcli", "dev", "wifi", "connect", ssid, "password", password])
+        time.sleep(WIFI_RETRY_S)
 
 
 def normalize_key(k: str) -> str:
@@ -182,8 +230,13 @@ def reconnect_loop(tello: Tello):
         stale = (now - last_state_seen) if last_state_seen else 9999
         with conn_lock:
             last_try = conn_state["last_reconnect"]
+            connected_now = conn_state["connected"]
 
-        if stale > RECONNECT_AFTER_S and (now - last_try) >= RECONNECT_RETRY_S:
+        should_retry = (not connected_now and (now - last_try) >= CONNECT_RETRY_S) or (
+            stale > RECONNECT_AFTER_S and (now - last_try) >= RECONNECT_RETRY_S
+        )
+
+        if should_retry:
             with conn_lock:
                 conn_state["last_reconnect"] = now
                 conn_state["connected"] = False
@@ -386,19 +439,20 @@ def main():
 
     t = Tello()
     TELLO = t
-    t.connect()
-    t.streamon()  # keep stream active for optional UDP forwarding via socat
-    last_state_seen = time.time()
+    # Do not fail startup when drone is absent. Background reconnect loop will keep trying.
+    last_state_seen = 0.0
     with conn_lock:
-        conn_state["connected"] = True
+        conn_state["connected"] = False
+        conn_state["last_reconnect"] = 0.0
 
     atexit.register(shutdown)
 
+    threading.Thread(target=wifi_connect_loop, daemon=True).start()
     threading.Thread(target=telemetry_loop, args=(t,), daemon=True).start()
     threading.Thread(target=reconnect_loop, args=(t,), daemon=True).start()
     threading.Thread(target=rc_loop, args=(t,), daemon=True).start()
 
-    print(f"http://{HTTP_HOST}:{HTTP_PORT}")
+    print(f"http://{HTTP_HOST}:{HTTP_PORT} (waiting for Tello; auto-reconnect enabled)")
     app.run(host=HTTP_HOST, port=HTTP_PORT, threaded=True, use_reloader=False)
 
 
