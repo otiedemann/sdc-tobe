@@ -571,9 +571,11 @@ def proxy_telemetry():
 
 
 def main():
-    print(f"Remote UI: http://{HTTP_HOST}:{HTTP_PORT}")
-    print(f"PI_API_BASE={PI_BASE}")
-    print(f"timeouts: cmd={TIMEOUT_CMD}s status={TIMEOUT_STATUS}s")
+    print("[REMOTE UI] Starting server...")
+    print(f"[REMOTE UI] URL: http://{HTTP_HOST}:{HTTP_PORT}")
+    print(f"[REMOTE UI] PI_API_BASE={PI_BASE}")
+    print(f"[REMOTE UI] timeouts: cmd={TIMEOUT_CMD}s status={TIMEOUT_STATUS}s")
+    print("[REMOTE UI] Ready (waiting for browser requests)")
     app.run(host=HTTP_HOST, port=HTTP_PORT, threaded=True, use_reloader=False)
 
 
