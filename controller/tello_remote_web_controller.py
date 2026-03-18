@@ -31,6 +31,7 @@ HTML = """
 <body>
   <h2>Tello Remote Web Controller</h2>
   <div class=\"small\">Pi API: <span id=\"pi\"></span></div>
+  <div class=\"small\">API status: <span id=\"api_status\">checking...</span></div>
   <div class=\"row\" style=\"margin-top:10px;\">
     <div class=\"panel\">
       <div class=\"grid\" id=\"grid\">
@@ -146,9 +147,13 @@ document.addEventListener('visibilitychange', ()=>{
 });
 
 async function refreshTelemetry(){
+  const apiEl = document.getElementById('api_status');
   try {
     const r = await fetch('/proxy/telemetry');
+    if (!r.ok) throw new Error('api_error');
     const t = await r.json();
+    apiEl.textContent = 'connected';
+    apiEl.style.color = '#22c55e';
     document.getElementById('telemetry').textContent =
       `battery: ${t.battery ?? '-'} %\n` +
       `temperature: ${t.temperature ?? '-'} °C\n` +
@@ -163,6 +168,8 @@ async function refreshTelemetry(){
       `flying: ${t.flying}\n` +
       `connected: ${t.connected}`;
   } catch {
+    apiEl.textContent = 'disconnected';
+    apiEl.style.color = '#ef4444';
     document.getElementById('telemetry').textContent = 'telemetry unavailable';
   }
 }
