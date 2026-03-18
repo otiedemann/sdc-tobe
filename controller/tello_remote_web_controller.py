@@ -256,8 +256,20 @@ async function refreshTelemetry(){
     const r = await fetch('/proxy/telemetry');
     if (!r.ok) throw new Error('api_error');
     const t = await r.json();
-    apiEl.textContent = 'connected';
-    apiEl.style.color = '#22c55e';
+
+    const live = Boolean(t.connected) && Boolean(t.state_fresh);
+    apiEl.textContent = live ? 'connected' : 'disconnected';
+    apiEl.style.color = live ? '#22c55e' : '#ef4444';
+
+    if (!live) {
+      setMeter('battery_bar', 'battery_val', null);
+      document.getElementById('telemetry').textContent =
+        `no live drone telemetry\n` +
+        `api reachable: yes\n` +
+        `drone connected: ${t.connected}\n` +
+        `state age: ${t.state_age_s ?? '-'} s`;
+      return;
+    }
 
     const battery = (typeof t.battery === 'number') ? t.battery : null;
     setMeter('battery_bar', 'battery_val', battery, '%');
@@ -277,6 +289,7 @@ async function refreshTelemetry(){
       `sdk version: ${t.sdk_version ?? '-'}\n` +
       `serial number: ${t.serial_number ?? '-'}\n` +
       `mission pad mid/x/y/z/mpry: ${t.mid ?? '-'} / ${t.pad_x ?? '-'} / ${t.pad_y ?? '-'} / ${t.pad_z ?? '-'} / ${t.pad_mpry ?? '-'}\n` +
+      `state age: ${t.state_age_s ?? '-'} s\n` +
       `flying: ${t.flying}\n` +
       `connected: ${t.connected}`;
   } catch {

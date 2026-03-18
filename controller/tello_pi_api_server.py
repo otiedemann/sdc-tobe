@@ -785,8 +785,13 @@ def api_safe_takeoff_set():
 
 @app.get("/api/telemetry")
 def api_telemetry():
+    now = time.time()
+    age = (now - last_state_seen) if last_state_seen else 9999.0
     with telemetry_lock:
-        return jsonify(telemetry)
+        payload = dict(telemetry)
+    payload["state_age_s"] = round(age, 3)
+    payload["state_fresh"] = age <= 2.0
+    return jsonify(payload)
 
 
 @app.get("/api/logging/telemetry")
