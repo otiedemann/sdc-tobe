@@ -6,7 +6,7 @@ import subprocess
 import threading
 import time
 from pathlib import Path
-from typing import Set
+from typing import Dict, Set
 
 from djitellopy import Tello
 from flask import Flask, Response, jsonify, request, send_file
@@ -21,6 +21,7 @@ RECONNECT_RETRY_S = 2.0
 CONNECT_RETRY_S = 2.0
 WIFI_RETRY_S = 3.0
 TELEMETRY_HZ = float(os.getenv("TELEMETRY_HZ", "2.0"))
+KEY_STALE_S = float(os.getenv("KEY_STALE_S", "1.0"))
 WIFI_CFG_PATH = Path(__file__).with_name("tello_wifi_config.json")
 TELLO_HOST = "192.168.10.1"
 TELEMETRY_LOG_DEFAULT = False
@@ -135,6 +136,7 @@ def add_key(k: str):
         return
     with pressed_lock:
         pressed_web.add(k)
+        key_last_seen[k] = time.time()
 
 
 def remove_key(k: str):
@@ -143,10 +145,27 @@ def remove_key(k: str):
         return
     with pressed_lock:
         pressed_web.discard(k)
+        key_last_seen.pop(k, None)
+
+
+def reap_stale_keys(now: float):
+    timeout = KEY_STALE_S if KEY_STALE_S > 0 else 1.0
+    with pressed_lock:
+        stale = [k for k, ts in key_last_seen.items() if (now - ts) > timeout]
+        for k in stale:
+            pressed_web.discard(k)
+            key_last_seen.pop(k, None)
 
 
 def has_key(k: str) -> bool:
+    k = normalize_key(k)
+    timeout = KEY_STALE_S if KEY_STALE_S > 0 else 1.0
     with pressed_lock:
+        ts = key_last_seen.get(k)
+        if ts is not None and (time.time() - ts) > timeout:
+            pressed_web.discard(k)
+            key_last_seen.pop(k, None)
+            return False
         return k in pressed_web
 
 
