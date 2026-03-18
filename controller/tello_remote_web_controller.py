@@ -70,10 +70,6 @@ HTML = """
           <div class=\"meter-label\">Battery SoC: <span id=\"battery_val\">-</span></div>
           <div class=\"meter-track\"><div id=\"battery_bar\" class=\"meter-fill\"></div></div>
         </div>
-        <div class=\"meter\">
-          <div class=\"meter-label\">Wi‑Fi SNR: <span id=\"wifi_val\">-</span></div>
-          <div class=\"meter-track\"><div id=\"wifi_bar\" class=\"meter-fill\"></div></div>
-        </div>
       </div>
       <div id=\"telemetry\" class=\"small\" style=\"white-space:pre-wrap; margin-top:10px;\">loading...</div>
     </div>
@@ -206,10 +202,7 @@ async function refreshTelemetry(){
     apiEl.style.color = '#22c55e';
 
     const battery = (typeof t.battery === 'number') ? t.battery : null;
-    const wifiRaw = (typeof t.wifi_snr === 'number') ? t.wifi_snr : null;
-    const wifiPct = (wifiRaw == null) ? null : Math.max(0, Math.min(100, ((wifiRaw + 100) / 100) * 100));
     setMeter('battery_bar', 'battery_val', battery, '%');
-    setMeter('wifi_bar', 'wifi_val', wifiPct, '%');
 
     document.getElementById('telemetry').textContent =
       `battery: ${t.battery ?? '-'} %\n` +
@@ -218,7 +211,6 @@ async function refreshTelemetry(){
       `tof: ${t.tof_cm ?? '-'} cm\n` +
       `barometer: ${t.barometer_cm ?? '-'} cm\n` +
       `flight time: ${t.flight_time_s ?? '-'} s\n` +
-      `wifi snr: ${t.wifi_snr ?? '-'}\n` +
       `attitude p/r/y: ${t.pitch ?? '-'} / ${t.roll ?? '-'} / ${t.yaw ?? '-'}\n` +
       `velocity xyz: ${t.vgx ?? '-'} / ${t.vgy ?? '-'} / ${t.vgz ?? '-'}\n` +
       `accel xyz: ${t.agx ?? '-'} / ${t.agy ?? '-'} / ${t.agz ?? '-'}\n` +
@@ -228,7 +220,6 @@ async function refreshTelemetry(){
     apiEl.textContent = 'disconnected';
     apiEl.style.color = '#ef4444';
     setMeter('battery_bar', 'battery_val', null);
-    setMeter('wifi_bar', 'wifi_val', null);
     document.getElementById('telemetry').textContent = 'telemetry unavailable';
   }
 }

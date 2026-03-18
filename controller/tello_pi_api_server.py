@@ -55,7 +55,6 @@ telemetry = {
     "tof_cm": None,
     "barometer_cm": None,
     "flight_time_s": None,
-    "wifi_snr": None,
     "pitch": None,
     "roll": None,
     "yaw": None,
