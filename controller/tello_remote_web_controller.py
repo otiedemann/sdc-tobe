@@ -1,7 +1,10 @@
+import json
 import os
 import time
+from pathlib import Path
+
 import requests
-from flask import Flask, Response, jsonify, request
+from flask import Flask, Response, jsonify, request, send_file
 
 # Runs on remote PC. Proxies to Pi API server.
 PI_BASE = os.getenv("PI_API_BASE", "http://192.168.179.62:8080").rstrip("/")
@@ -70,6 +73,8 @@ HTML = """
       </div>
       <div style=\"margin-top:8px; display:flex; gap:8px; flex-wrap:wrap;\">
         <button id=\"toggle_cmd_log\">Command Logging: OFF</button>
+        <button id=\"download_cmd_log\">Download Command Log</button>
+        <button id=\"clear_cmd_log\">Clear Command Log</button>
       </div>
       <div class=\"adv\">
         <div class=\"small\" style=\"margin-bottom:6px;\">Advanced SDK controls</div>
@@ -211,6 +216,16 @@ document.getElementById('toggle_cmd_log').onclick = async ()=>{
     const s = await r.json();
     await post('/proxy/logging/commands', {enabled: !Boolean(s.enabled)});
     refreshCommandLogStatus();
+  } catch {}
+};
+
+document.getElementById('download_cmd_log').onclick = ()=>{
+  window.open('/proxy/logging/commands/download', '_blank');
+};
+
+document.getElementById('clear_cmd_log').onclick = async ()=>{
+  try {
+    await post('/proxy/logging/commands/clear', {});
   } catch {}
 };
 
@@ -363,6 +378,14 @@ def log_command(event: str, payload: dict | None = None):
         command_log_last[key] = now
 
         ts = time.strftime("%Y-%m-%d %H:%M:%S")
+        entry = {
+            "ts": ts,
+            "event": event,
+            "payload": payload or {},
+        }
+        command_log_path.parent.mkdir(parents=True, exist_ok=True)
+        with command_log_path.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
         print(f"[REMOTE CMD] {ts} {event} payload={payload or {}}")
     except Exception:
         # Logging must never break control flow.
@@ -506,19 +529,44 @@ def proxy_safe_takeoff_set():
 
 @app.get("/proxy/logging/commands")
 def proxy_command_log_status():
-    return jsonify(enabled=command_log_enabled)
+    return jsonify(enabled=command_log_enabled, path=str(command_log_path))
 
 
 @app.post("/proxy/logging/commands")
 def proxy_command_log_config():
-    global command_log_enabled
+    global command_log_enabled, command_log_path
     data = request.get_json(silent=True) or {}
     enabled = data.get("enabled")
-    if not isinstance(enabled, bool):
+    path = data.get("path")
+    if enabled is not None and not isinstance(enabled, bool):
         return jsonify(ok=False, error="enabled must be boolean"), 400
-    command_log_enabled = enabled
-    print(f"[REMOTE CMD] command logging {'enabled' if enabled else 'disabled'}")
-    return jsonify(ok=True, enabled=command_log_enabled)
+    if path is not None and (not isinstance(path, str) or not path.strip()):
+        return jsonify(ok=False, error="path must be non-empty string"), 400
+    if isinstance(enabled, bool):
+        command_log_enabled = enabled
+    if isinstance(path, str) and path.strip():
+        command_log_path = Path(path.strip())
+    print(f"[REMOTE CMD] command logging {'enabled' if command_log_enabled else 'disabled'}")
+    return jsonify(ok=True, enabled=command_log_enabled, path=str(command_log_path))
+
+
+@app.get("/proxy/logging/commands/download")
+def proxy_command_log_download():
+    p = command_log_path
+    if not p.exists():
+        return jsonify(ok=False, error="command log file not found", path=str(p)), 404
+    return send_file(p, as_attachment=True, download_name=p.name, mimetype="application/x-ndjson")
+
+
+@app.post("/proxy/logging/commands/clear")
+def proxy_command_log_clear():
+    p = command_log_path
+    try:
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text("", encoding="utf-8")
+        return jsonify(ok=True, cleared=True, path=str(p))
+    except Exception as e:
+        return jsonify(ok=False, error=str(e), path=str(p)), 500
 
 
 @app.get("/proxy/logging/telemetry")
@@ -581,5 +629,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-main()
-n()
