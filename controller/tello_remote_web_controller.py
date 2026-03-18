@@ -26,6 +26,11 @@ HTML = """
     button { height:52px; border-radius:8px; border:1px solid #475569; background:#1e293b; color:#e2e8f0; font-weight:700; cursor:pointer; }
     button:active, .active { background:#0ea5e9; color:#001018; }
     .small { color:#94a3b8; font-size:12px; }
+    .status-wrap { margin-top:8px; display:flex; gap:16px; flex-wrap:wrap; align-items:center; }
+    .meter { min-width:220px; }
+    .meter-label { font-size:12px; color:#94a3b8; margin-bottom:4px; }
+    .meter-track { height:12px; border-radius:999px; background:#1f2937; border:1px solid #334155; overflow:hidden; }
+    .meter-fill { height:100%; width:0%; background:#22c55e; transition:width .2s ease, background .2s ease; }
   </style>
 </head>
 <body>
@@ -60,7 +65,17 @@ HTML = """
 
     <div class=\"panel\">
       <div><b>Telemetry</b></div>
-      <div id=\"telemetry\" class=\"small\" style=\"white-space:pre-wrap; margin-top:6px;\">loading...</div>
+      <div class=\"status-wrap\">
+        <div class=\"meter\">
+          <div class=\"meter-label\">Battery SoC: <span id=\"battery_val\">-</span></div>
+          <div class=\"meter-track\"><div id=\"battery_bar\" class=\"meter-fill\"></div></div>
+        </div>
+        <div class=\"meter\">
+          <div class=\"meter-label\">Wi‑Fi SNR: <span id=\"wifi_val\">-</span></div>
+          <div class=\"meter-track\"><div id=\"wifi_bar\" class=\"meter-fill\"></div></div>
+        </div>
+      </div>
+      <div id=\"telemetry\" class=\"small\" style=\"white-space:pre-wrap; margin-top:10px;\">loading...</div>
     </div>
   </div>
 <script>
@@ -146,6 +161,26 @@ document.addEventListener('visibilitychange', ()=>{
   if (document.hidden) releaseAllKeys();
 });
 
+function meterColor(v){
+  if (v >= 70) return '#22c55e';
+  if (v >= 35) return '#f59e0b';
+  return '#ef4444';
+}
+function setMeter(idBar, idVal, value, suffix=''){
+  const bar = document.getElementById(idBar);
+  const val = document.getElementById(idVal);
+  if (value == null || Number.isNaN(Number(value))) {
+    bar.style.width = '0%';
+    bar.style.background = '#64748b';
+    val.textContent = '-';
+    return;
+  }
+  const v = Math.max(0, Math.min(100, Number(value)));
+  bar.style.width = `${v}%`;
+  bar.style.background = meterColor(v);
+  val.textContent = `${Math.round(v)}${suffix}`;
+}
+
 async function refreshTelemetry(){
   const apiEl = document.getElementById('api_status');
   try {
@@ -154,6 +189,13 @@ async function refreshTelemetry(){
     const t = await r.json();
     apiEl.textContent = 'connected';
     apiEl.style.color = '#22c55e';
+
+    const battery = (typeof t.battery === 'number') ? t.battery : null;
+    const wifiRaw = (typeof t.wifi_snr === 'number') ? t.wifi_snr : null;
+    const wifiPct = (wifiRaw == null) ? null : Math.max(0, Math.min(100, ((wifiRaw + 100) / 100) * 100));
+    setMeter('battery_bar', 'battery_val', battery, '%');
+    setMeter('wifi_bar', 'wifi_val', wifiPct, '%');
+
     document.getElementById('telemetry').textContent =
       `battery: ${t.battery ?? '-'} %\n` +
       `temperature: ${t.temperature ?? '-'} °C\n` +
@@ -170,6 +212,8 @@ async function refreshTelemetry(){
   } catch {
     apiEl.textContent = 'disconnected';
     apiEl.style.color = '#ef4444';
+    setMeter('battery_bar', 'battery_val', null);
+    setMeter('wifi_bar', 'wifi_val', null);
     document.getElementById('telemetry').textContent = 'telemetry unavailable';
   }
 }
