@@ -11,6 +11,7 @@ TIMEOUT = 2.0
 
 app = Flask(__name__)
 command_log_enabled = os.getenv("REMOTE_COMMAND_LOG", "0") in {"1", "true", "True"}
+command_log_last: dict[str, float] = {}
 
 HTML = """
 <!doctype html>
@@ -346,8 +347,25 @@ refreshCommandLogStatus();
 def log_command(event: str, payload: dict | None = None):
     if not command_log_enabled:
         return
-    ts = time.strftime("%Y-%m-%d %H:%M:%S")
-    print(f"[REMOTE CMD] {ts} {event} payload={payload or {}}")
+    try:
+        # High-frequency keepalive events can starve command handling if logged each packet.
+        now = time.time()
+        key = event
+        throttle_s = 0.0
+        if event in {"key_down", "key_up"}:
+            k = str((payload or {}).get("key", ""))
+            key = f"{event}:{k}"
+            throttle_s = 0.5
+        last = command_log_last.get(key, 0.0)
+        if throttle_s > 0 and (now - last) < throttle_s:
+            return
+        command_log_last[key] = now
+
+        ts = time.strftime("%Y-%m-%d %H:%M:%S")
+        print(f"[REMOTE CMD] {ts} {event} payload={payload or {}}")
+    except Exception:
+        # Logging must never break control flow.
+        pass
 
 
 def pi_post(path: str, body: dict | None = None):
