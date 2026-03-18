@@ -20,6 +20,7 @@ RECONNECT_RETRY_S = 2.0
 CONNECT_RETRY_S = 2.0
 WIFI_RETRY_S = 3.0
 WIFI_CFG_PATH = Path(__file__).with_name("tello_wifi_config.json")
+TELLO_HOST = "192.168.10.1"
 
 app = Flask(__name__)
 
@@ -143,27 +144,31 @@ def _as_int(v):
 
 
 def recover_drone():
-    global flying, last_state_seen
-    if TELLO is None:
+    global flying, last_state_seen, TELLO
+    old = TELLO
+    if old is None:
         return False, "controller not ready"
-    t = TELLO
     try:
         try:
-            t.send_rc_control(0, 0, 0, 0)
+            old.send_rc_control(0, 0, 0, 0)
         except Exception:
             pass
         try:
-            t.land()
+            old.land()
         except Exception:
             pass
         try:
-            t.streamoff()
+            old.streamoff()
         except Exception:
             pass
         try:
-            t.end()
+            old.end()
         except Exception:
             pass
+
+        # Recreate SDK object (critical after crash/disconnect states)
+        t = Tello(host=TELLO_HOST)
+        TELLO = t
         time.sleep(1.0)
         t.connect()
         t.streamon()
@@ -179,14 +184,16 @@ def recover_drone():
         return False, str(e)
 
 
-def telemetry_loop(tello: Tello):
+def telemetry_loop():
     global last_state_seen
     while running:
+        t = TELLO
         st = {}
-        try:
-            st = tello.get_current_state() or {}
-        except Exception:
-            st = {}
+        if t is not None:
+            try:
+                st = t.get_current_state() or {}
+            except Exception:
+                st = {}
 
         if st:
             last_state_seen = time.time()
@@ -224,8 +231,8 @@ def telemetry_loop(tello: Tello):
         time.sleep(0.5)
 
 
-def reconnect_loop(tello: Tello):
-    global last_state_seen, last_conn_print
+def reconnect_loop():
+    global last_state_seen, last_conn_print, TELLO
     while running:
         now = time.time()
         stale = (now - last_state_seen) if last_state_seen else 9999
@@ -246,8 +253,10 @@ def reconnect_loop(tello: Tello):
                 conn_state["last_reconnect"] = now
                 conn_state["connected"] = False
             try:
-                tello.connect()
-                tello.streamon()  # keep stream alive for external UDP forward
+                if TELLO is None:
+                    TELLO = Tello(host=TELLO_HOST)
+                TELLO.connect()
+                TELLO.streamon()  # keep stream alive for external UDP forward
                 last_state_seen = time.time()
                 with conn_lock:
                     conn_state["connected"] = True
@@ -256,23 +265,26 @@ def reconnect_loop(tello: Tello):
         time.sleep(0.5)
 
 
-def rc_loop(tello: Tello):
+def rc_loop():
     global running, flying, rc_override
     period = 1.0 / RC_HZ
     while running:
         t0 = time.time()
+        t = TELLO
 
         if has_key("t") and not flying:
             try:
-                tello.takeoff()
-                flying = True
+                if t is not None:
+                    t.takeoff()
+                    flying = True
             except Exception:
                 recover_drone()
             remove_key("t")
 
         if has_key("l") and flying:
             try:
-                tello.land()
+                if t is not None:
+                    t.land()
             except Exception:
                 pass
             flying = False
@@ -294,7 +306,8 @@ def rc_loop(tello: Tello):
                 rc_override = None
 
         try:
-            tello.send_rc_control(lr, fb, ud, yaw)
+            if t is not None:
+                t.send_rc_control(lr, fb, ud, yaw)
         except Exception:
             with conn_lock:
                 conn_state["connected"] = False
@@ -442,8 +455,7 @@ def main():
     logging.getLogger("djitellopy").setLevel(logging.CRITICAL)
     logging.getLogger("werkzeug").setLevel(logging.ERROR)
 
-    t = Tello()
-    TELLO = t
+    TELLO = Tello(host=TELLO_HOST)
     # Do not fail startup when drone is absent. Background reconnect loop will keep trying.
     last_state_seen = 0.0
     with conn_lock:
@@ -453,9 +465,9 @@ def main():
     atexit.register(shutdown)
 
     threading.Thread(target=wifi_connect_loop, daemon=True).start()
-    threading.Thread(target=telemetry_loop, args=(t,), daemon=True).start()
-    threading.Thread(target=reconnect_loop, args=(t,), daemon=True).start()
-    threading.Thread(target=rc_loop, args=(t,), daemon=True).start()
+    threading.Thread(target=telemetry_loop, daemon=True).start()
+    threading.Thread(target=reconnect_loop, daemon=True).start()
+    threading.Thread(target=rc_loop, daemon=True).start()
 
     print(f"http://{HTTP_HOST}:{HTTP_PORT} (waiting for Tello; auto-reconnect enabled)")
     app.run(host=HTTP_HOST, port=HTTP_PORT, threaded=True, use_reloader=False)
