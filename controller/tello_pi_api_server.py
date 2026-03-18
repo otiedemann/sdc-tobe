@@ -29,6 +29,8 @@ WIFI_CFG_PATH = Path(__file__).with_name("tello_wifi_config.json")
 TELLO_HOST = "192.168.10.1"
 TELEMETRY_LOG_DEFAULT = False
 TELEMETRY_LOG_PATH_DEFAULT = Path(__file__).with_name("telemetry_log.jsonl")
+COMMAND_LOG_ENABLED = os.getenv("API_COMMAND_LOG", "1") in {"1", "true", "True"}
+COMMAND_LOG_PATH = Path(os.getenv("API_COMMAND_LOG_PATH", str(Path(__file__).with_name("api_command_log.jsonl"))))
 
 app = Flask(__name__)
 
@@ -73,6 +75,7 @@ telemetry_lock = threading.Lock()
 telemetry_log_enabled = TELEMETRY_LOG_DEFAULT
 telemetry_log_path = TELEMETRY_LOG_PATH_DEFAULT
 telemetry_log_lock = threading.Lock()
+command_log_lock = threading.Lock()
 
 command_lock = threading.Lock()
 discrete_until = 0.0
@@ -195,6 +198,23 @@ def append_telemetry_log(payload: dict):
         p.parent.mkdir(parents=True, exist_ok=True)
         with p.open("a", encoding="utf-8") as f:
             f.write(json.dumps(payload, ensure_ascii=False) + "\n")
+    except Exception:
+        pass
+
+
+def append_command_log(event: str, payload: dict | None = None):
+    if not COMMAND_LOG_ENABLED:
+        return
+    try:
+        entry = {
+            "ts": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "event": event,
+            "payload": payload or {},
+        }
+        with command_log_lock:
+            COMMAND_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+            with COMMAND_LOG_PATH.open("a", encoding="utf-8") as f:
+                f.write(json.dumps(entry, ensure_ascii=False) + "\n")
     except Exception:
         pass
 
@@ -509,6 +529,21 @@ def shutdown():
             pass
     try:
         t.end()
+    except Exception:
+        pass
+
+
+@app.before_request
+def _log_incoming_api_command():
+    try:
+        if request.method != "POST":
+            return
+        if not request.path.startswith("/api/"):
+            return
+        if request.path.startswith("/api/logging/"):
+            return
+        payload = request.get_json(silent=True) or {}
+        append_command_log(request.path, payload)
     except Exception:
         pass
 
@@ -850,6 +885,30 @@ def api_telemetry():
     resp.headers["Pragma"] = "no-cache"
     resp.headers["Expires"] = "0"
     return resp
+
+
+@app.get("/api/logging/commands")
+def api_command_log_status():
+    return jsonify(enabled=COMMAND_LOG_ENABLED, path=str(COMMAND_LOG_PATH))
+
+
+@app.get("/api/logging/commands/download")
+def api_command_log_download():
+    p = COMMAND_LOG_PATH
+    if not p.exists():
+        return jsonify(ok=False, error="command log file not found", path=str(p)), 404
+    return send_file(p, as_attachment=True, download_name=p.name, mimetype="application/x-ndjson")
+
+
+@app.post("/api/logging/commands/clear")
+def api_command_log_clear():
+    p = COMMAND_LOG_PATH
+    try:
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text("", encoding="utf-8")
+        return jsonify(ok=True, cleared=True, path=str(p))
+    except Exception as e:
+        return jsonify(ok=False, error=str(e), path=str(p)), 500
 
 
 @app.get("/api/logging/telemetry")

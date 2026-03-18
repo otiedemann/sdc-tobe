@@ -16,6 +16,10 @@ Use JSON for POST requests:
 
 All env vars are optional.
 
+- `API_COMMAND_LOG` (bool-ish, default: `1`)
+  - Enable command logging on the API server for incoming `/api/*` POST control requests.
+- `API_COMMAND_LOG_PATH` (path, default: `controller/api_command_log.jsonl`)
+  - Command log file path on the API server host.
 - `TELEMETRY_HZ` (float, default: `2.0`)
   - Telemetry polling/logging loop rate in Hz.
   - Example: `TELEMETRY_HZ=5` for 5 Hz.
@@ -197,7 +201,20 @@ data: { ...telemetry json... }
 
 ---
 
-## 7) Telemetry Logging
+## 7) API Command Logging
+
+### `GET /api/logging/commands`
+Command logging status/path on API server.
+
+### `GET /api/logging/commands/download`
+Download API-server command log (`jsonl`).
+
+### `POST /api/logging/commands/clear`
+Clear API-server command log file.
+
+---
+
+## 8) Telemetry Logging
 
 ### `GET /api/logging/telemetry`
 Read telemetry logging config.
