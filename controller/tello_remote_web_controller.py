@@ -41,6 +41,7 @@ HTML = """
   <h2>Tello Remote Web Controller</h2>
   <div class=\"small\">Pi API: <span id=\"pi\"></span></div>
   <div class=\"small\">API status: <span id=\"api_status\">checking...</span></div>
+  <div class=\"small\">Drone telemetry status: <span id=\"drone_status\">checking...</span></div>
   <div class=\"row\" style=\"margin-top:10px;\">
     <div class=\"panel\">
       <div class=\"grid\" id=\"grid\">
@@ -253,14 +254,18 @@ function setMeter(idBar, idVal, value, suffix=''){
 
 async function refreshTelemetry(){
   const apiEl = document.getElementById('api_status');
+  const droneEl = document.getElementById('drone_status');
   try {
     const r = await fetch('/proxy/telemetry');
     if (!r.ok) throw new Error('api_error');
     const t = await r.json();
 
+    apiEl.textContent = 'connected';
+    apiEl.style.color = '#22c55e';
+
     const live = Boolean(t.connected) && Boolean(t.state_fresh);
-    apiEl.textContent = live ? 'connected' : 'disconnected';
-    apiEl.style.color = live ? '#22c55e' : '#ef4444';
+    droneEl.textContent = live ? 'live' : 'no live telemetry';
+    droneEl.style.color = live ? '#22c55e' : '#f59e0b';
 
     if (!live) {
       setMeter('battery_bar', 'battery_val', null);
@@ -296,6 +301,9 @@ async function refreshTelemetry(){
   } catch {
     apiEl.textContent = 'disconnected';
     apiEl.style.color = '#ef4444';
+    const droneEl = document.getElementById('drone_status');
+    droneEl.textContent = 'unknown';
+    droneEl.style.color = '#ef4444';
     setMeter('battery_bar', 'battery_val', null);
     document.getElementById('telemetry').textContent = 'telemetry unavailable';
   }
