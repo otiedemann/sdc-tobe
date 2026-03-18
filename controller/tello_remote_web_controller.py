@@ -52,6 +52,7 @@ HTML = """
       <div style=\"margin-top:8px; display:flex; gap:8px; flex-wrap:wrap;\">
         <button id=\"toggle_log\">Enable Telemetry Log</button>
         <button id=\"download_log\">Download Telemetry Log</button>
+        <button id=\"clear_log\">Clear Telemetry Log</button>
       </div>
       <div class=\"small\" style=\"margin-top:8px;\">Keyboard in browser: W/A/S/D R/F Q/E, T, L, Space stop</div>
     </div>
@@ -229,6 +230,12 @@ def proxy_log_download():
         "Content-Disposition": r.headers.get("Content-Disposition", "attachment; filename=telemetry_log.jsonl"),
     }
     return (r.content, r.status_code, headers)
+
+
+@app.post("/proxy/logging/telemetry/clear")
+def proxy_log_clear():
+    r = pi_post("/api/logging/telemetry/clear")
+    return (r.text, r.status_code, {"Content-Type": r.headers.get("Content-Type", "application/json")})
 
 
 @app.get("/proxy/telemetry")

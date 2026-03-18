@@ -562,6 +562,18 @@ def api_telemetry_log_download():
     return send_file(p, as_attachment=True, download_name=p.name, mimetype="application/x-ndjson")
 
 
+@app.post("/api/logging/telemetry/clear")
+def api_telemetry_log_clear():
+    with telemetry_log_lock:
+        p = telemetry_log_path
+    try:
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text("", encoding="utf-8")
+        return jsonify(ok=True, cleared=True, path=str(p))
+    except Exception as e:
+        return jsonify(ok=False, error=str(e), path=str(p)), 500
+
+
 @app.get("/api/telemetry/stream")
 def api_telemetry_stream():
     def gen():
