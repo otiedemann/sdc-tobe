@@ -368,12 +368,12 @@ def log_command(event: str, payload: dict | None = None):
         pass
 
 
-def pi_post(path: str, body: dict | None = None):
-    return requests.post(f"{PI_BASE}{path}", json=body or {}, timeout=TIMEOUT)
+def pi_post(path: str, body: dict | None = None, timeout: float | None = None):
+    return requests.post(f"{PI_BASE}{path}", json=body or {}, timeout=TIMEOUT_CMD if timeout is None else timeout)
 
 
-def pi_get(path: str):
-    return requests.get(f"{PI_BASE}{path}", timeout=TIMEOUT)
+def pi_get(path: str, timeout: float | None = None):
+    return requests.get(f"{PI_BASE}{path}", timeout=TIMEOUT_CMD if timeout is None else timeout)
 
 
 @app.get("/")
@@ -522,8 +522,11 @@ def proxy_command_log_config():
 
 @app.get("/proxy/logging/telemetry")
 def proxy_log_status():
-    r = pi_get("/api/logging/telemetry")
-    return (r.text, r.status_code, {"Content-Type": r.headers.get("Content-Type", "application/json")})
+    try:
+        r = pi_get("/api/logging/telemetry", timeout=TIMEOUT_STATUS)
+        return (r.text, r.status_code, {"Content-Type": r.headers.get("Content-Type", "application/json")})
+    except Exception as e:
+        return jsonify(ok=False, error=str(e)), 502
 
 
 @app.post("/proxy/logging/telemetry")
@@ -554,7 +557,7 @@ def proxy_log_clear():
 @app.get("/proxy/telemetry")
 def proxy_telemetry():
     try:
-        r = pi_get("/api/telemetry")
+        r = pi_get("/api/telemetry", timeout=TIMEOUT_STATUS)
         return (r.text, r.status_code, {"Content-Type": r.headers.get("Content-Type", "application/json")})
     except Exception as e:
         return jsonify(ok=False, error=str(e)), 502
@@ -563,6 +566,7 @@ def proxy_telemetry():
 def main():
     print(f"Remote UI: http://{HTTP_HOST}:{HTTP_PORT}")
     print(f"PI_API_BASE={PI_BASE}")
+    print(f"timeouts: cmd={TIMEOUT_CMD}s status={TIMEOUT_STATUS}s")
     app.run(host=HTTP_HOST, port=HTTP_PORT, threaded=True, use_reloader=False)
 
 
