@@ -543,6 +543,167 @@ def api_flip():
         return jsonify(ok=False, error=str(e)), 500
 
 
+@app.post("/api/emergency")
+def api_emergency():
+    global flying
+    if TELLO is None:
+        return jsonify(ok=False, error="controller not ready"), 503
+    try:
+        with command_lock:
+            TELLO.emergency()
+        flying = False
+        return jsonify(ok=True)
+    except Exception as e:
+        return jsonify(ok=False, error=str(e)), 500
+
+
+@app.post("/api/speed")
+def api_speed():
+    if TELLO is None:
+        return jsonify(ok=False, error="controller not ready"), 503
+    data = request.get_json(silent=True) or {}
+    try:
+        speed = int(data.get("speed", 30))
+        speed = max(10, min(100, speed))
+        with command_lock:
+            TELLO.set_speed(speed)
+        return jsonify(ok=True, speed=speed)
+    except Exception as e:
+        return jsonify(ok=False, error=str(e)), 500
+
+
+@app.post("/api/move")
+def api_move():
+    if TELLO is None:
+        return jsonify(ok=False, error="controller not ready"), 503
+    data = request.get_json(silent=True) or {}
+    direction = str(data.get("dir", "")).lower()
+    if direction not in {"up", "down", "left", "right", "forward", "back"}:
+        return jsonify(ok=False, error="dir must be one of up|down|left|right|forward|back"), 400
+    try:
+        dist_cm = int(data.get("cm", 20))
+        dist_cm = max(20, min(500, dist_cm))
+        start_discrete_window(1.0)
+        with command_lock:
+            TELLO.send_rc_control(0, 0, 0, 0)
+            fn = {
+                "up": TELLO.move_up,
+                "down": TELLO.move_down,
+                "left": TELLO.move_left,
+                "right": TELLO.move_right,
+                "forward": TELLO.move_forward,
+                "back": TELLO.move_back,
+            }[direction]
+            fn(dist_cm)
+        return jsonify(ok=True, dir=direction, cm=dist_cm)
+    except Exception as e:
+        return jsonify(ok=False, error=str(e)), 500
+
+
+@app.post("/api/rotate")
+def api_rotate():
+    if TELLO is None:
+        return jsonify(ok=False, error="controller not ready"), 503
+    data = request.get_json(silent=True) or {}
+    direction = str(data.get("dir", "")).lower()
+    if direction not in {"cw", "ccw"}:
+        return jsonify(ok=False, error="dir must be one of cw|ccw"), 400
+    try:
+        degrees = int(data.get("deg", 45))
+        degrees = max(1, min(360, degrees))
+        start_discrete_window(1.0)
+        with command_lock:
+            TELLO.send_rc_control(0, 0, 0, 0)
+            if direction == "cw":
+                TELLO.rotate_clockwise(degrees)
+            else:
+                TELLO.rotate_counter_clockwise(degrees)
+        return jsonify(ok=True, dir=direction, deg=degrees)
+    except Exception as e:
+        return jsonify(ok=False, error=str(e)), 500
+
+
+@app.post("/api/go")
+def api_go():
+    if TELLO is None:
+        return jsonify(ok=False, error="controller not ready"), 503
+    data = request.get_json(silent=True) or {}
+    try:
+        x = int(data.get("x", 0))
+        y = int(data.get("y", 0))
+        z = int(data.get("z", 0))
+        speed = int(data.get("speed", 20))
+        speed = max(10, min(100, speed))
+        start_discrete_window(1.5)
+        with command_lock:
+            TELLO.send_rc_control(0, 0, 0, 0)
+            TELLO.go_xyz_speed(x, y, z, speed)
+        return jsonify(ok=True, x=x, y=y, z=z, speed=speed)
+    except Exception as e:
+        return jsonify(ok=False, error=str(e)), 500
+
+
+@app.post("/api/curve")
+def api_curve():
+    if TELLO is None:
+        return jsonify(ok=False, error="controller not ready"), 503
+    data = request.get_json(silent=True) or {}
+    try:
+        x1 = int(data.get("x1", 20))
+        y1 = int(data.get("y1", 0))
+        z1 = int(data.get("z1", 0))
+        x2 = int(data.get("x2", 40))
+        y2 = int(data.get("y2", 0))
+        z2 = int(data.get("z2", 0))
+        speed = int(data.get("speed", 20))
+        speed = max(10, min(60, speed))
+        start_discrete_window(1.5)
+        with command_lock:
+            TELLO.send_rc_control(0, 0, 0, 0)
+            TELLO.curve_xyz_speed(x1, y1, z1, x2, y2, z2, speed)
+        return jsonify(ok=True, x1=x1, y1=y1, z1=z1, x2=x2, y2=y2, z2=z2, speed=speed)
+    except Exception as e:
+        return jsonify(ok=False, error=str(e)), 500
+
+
+@app.post("/api/stream")
+def api_stream():
+    if TELLO is None:
+        return jsonify(ok=False, error="controller not ready"), 503
+    data = request.get_json(silent=True) or {}
+    action = str(data.get("action", "on")).lower()
+    try:
+        with command_lock:
+            if action == "on":
+                TELLO.streamon()
+            elif action == "off":
+                TELLO.streamoff()
+            else:
+                return jsonify(ok=False, error="action must be on|off"), 400
+        return jsonify(ok=True, action=action)
+    except Exception as e:
+        return jsonify(ok=False, error=str(e)), 500
+
+
+@app.post("/api/sdk")
+def api_sdk_passthrough():
+    """Raw SDK passthrough for advanced commands not explicitly mapped above."""
+    if TELLO is None:
+        return jsonify(ok=False, error="controller not ready"), 503
+    data = request.get_json(silent=True) or {}
+    command = str(data.get("command", "")).strip()
+    if not command:
+        return jsonify(ok=False, error="command required"), 400
+    try:
+        start_discrete_window(0.8)
+        with command_lock:
+            TELLO.send_rc_control(0, 0, 0, 0)
+            resp = TELLO.send_command_with_return(command)
+        return jsonify(ok=True, command=command, response=resp)
+    except Exception as e:
+        return jsonify(ok=False, error=str(e), command=command), 500
+
+
 @app.post("/api/rc")
 def api_rc():
     global rc_override, rc_override_until

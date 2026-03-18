@@ -31,6 +31,9 @@ HTML = """
     .meter-label { font-size:12px; color:#94a3b8; margin-bottom:4px; }
     .meter-track { height:12px; border-radius:999px; background:#1f2937; border:1px solid #334155; overflow:hidden; }
     .meter-fill { height:100%; width:0%; background:#22c55e; transition:width .2s ease, background .2s ease; }
+    .adv { margin-top:8px; border-top:1px solid #334155; padding-top:8px; }
+    .adv-grid { display:grid; grid-template-columns:repeat(3,minmax(100px,1fr)); gap:8px; }
+    .adv input { height:36px; border-radius:8px; border:1px solid #475569; background:#0f172a; color:#e2e8f0; padding:0 8px; }
   </style>
 </head>
 <body>
@@ -63,6 +66,28 @@ HTML = """
       </div>
       <div style=\"margin-top:8px; display:flex; gap:8px; flex-wrap:wrap;\">
         <button id=\"toggle_cmd_log\">Command Logging: OFF</button>
+      </div>
+      <div class=\"adv\">
+        <div class=\"small\" style=\"margin-bottom:6px;\">Advanced SDK controls</div>
+        <div class=\"adv-grid\">
+          <button id=\"emergency\">EMERGENCY</button>
+          <button id=\"rotate_cw\">Rotate CW 45°</button>
+          <button id=\"rotate_ccw\">Rotate CCW 45°</button>
+          <button id=\"move_up\">Up 30cm</button>
+          <button id=\"move_down\">Down 30cm</button>
+          <button id=\"move_fwd\">Forward 30cm</button>
+          <button id=\"move_back\">Back 30cm</button>
+          <button id=\"move_left\">Left 30cm</button>
+          <button id=\"move_right\">Right 30cm</button>
+          <button id=\"stream_on\">Stream ON</button>
+          <button id=\"stream_off\">Stream OFF</button>
+          <button id=\"set_speed\">Set Speed</button>
+        </div>
+        <div class=\"row\" style=\"margin-top:8px;\">
+          <input id=\"speed_val\" type=\"number\" min=\"10\" max=\"100\" value=\"30\" placeholder=\"speed 10..100\" />
+          <input id=\"sdk_cmd\" type=\"text\" placeholder=\"raw sdk cmd (e.g. speed? or battery?)\" style=\"min-width:320px;flex:1;\" />
+          <button id=\"sdk_send\">Send SDK Command</button>
+        </div>
       </div>
       <div class=\"small\" style=\"margin-top:8px;\">Keyboard in browser: W/A/S/D R/F Q/E, T, L, Space stop</div>
     </div>
@@ -154,6 +179,26 @@ document.getElementById('clear_log').onclick = async ()=>{
   try {
     await post('/proxy/logging/telemetry/clear', {});
   } catch {}
+};
+
+document.getElementById('emergency').onclick = ()=>post('/proxy/emergency',{});
+document.getElementById('rotate_cw').onclick = ()=>post('/proxy/rotate',{dir:'cw',deg:45});
+document.getElementById('rotate_ccw').onclick = ()=>post('/proxy/rotate',{dir:'ccw',deg:45});
+document.getElementById('move_up').onclick = ()=>post('/proxy/move',{dir:'up',cm:30});
+document.getElementById('move_down').onclick = ()=>post('/proxy/move',{dir:'down',cm:30});
+document.getElementById('move_fwd').onclick = ()=>post('/proxy/move',{dir:'forward',cm:30});
+document.getElementById('move_back').onclick = ()=>post('/proxy/move',{dir:'back',cm:30});
+document.getElementById('move_left').onclick = ()=>post('/proxy/move',{dir:'left',cm:30});
+document.getElementById('move_right').onclick = ()=>post('/proxy/move',{dir:'right',cm:30});
+document.getElementById('stream_on').onclick = ()=>post('/proxy/stream',{action:'on'});
+document.getElementById('stream_off').onclick = ()=>post('/proxy/stream',{action:'off'});
+document.getElementById('set_speed').onclick = ()=>{
+  const v = Number(document.getElementById('speed_val').value || 30);
+  post('/proxy/speed',{speed:v});
+};
+document.getElementById('sdk_send').onclick = ()=>{
+  const cmd = document.getElementById('sdk_cmd').value || '';
+  if (cmd.trim()) post('/proxy/sdk',{command:cmd.trim()});
 };
 
 document.getElementById('toggle_cmd_log').onclick = async ()=>{
@@ -294,6 +339,7 @@ def index():
 @app.post("/proxy/key_down")
 def proxy_key_down():
     data = request.get_json(silent=True) or {}
+    log_command("key_down", data)
     r = pi_post("/api/key_down", data)
     return (r.text, r.status_code, {"Content-Type": r.headers.get("Content-Type", "application/json")})
 
@@ -301,6 +347,7 @@ def proxy_key_down():
 @app.post("/proxy/key_up")
 def proxy_key_up():
     data = request.get_json(silent=True) or {}
+    log_command("key_up", data)
     r = pi_post("/api/key_up", data)
     return (r.text, r.status_code, {"Content-Type": r.headers.get("Content-Type", "application/json")})
 
@@ -314,6 +361,7 @@ def proxy_takeoff():
 
 @app.post("/proxy/land")
 def proxy_land():
+    log_command("land")
     r = pi_post("/api/land")
     return (r.text, r.status_code, {"Content-Type": r.headers.get("Content-Type", "application/json")})
 
@@ -328,7 +376,71 @@ def proxy_flip():
 
 @app.post("/proxy/recover")
 def proxy_recover():
+    log_command("recover")
     r = pi_post("/api/recover")
+    return (r.text, r.status_code, {"Content-Type": r.headers.get("Content-Type", "application/json")})
+
+
+@app.post("/proxy/emergency")
+def proxy_emergency():
+    log_command("emergency")
+    r = pi_post("/api/emergency")
+    return (r.text, r.status_code, {"Content-Type": r.headers.get("Content-Type", "application/json")})
+
+
+@app.post("/proxy/speed")
+def proxy_speed():
+    data = request.get_json(silent=True) or {}
+    log_command("speed", data)
+    r = pi_post("/api/speed", data)
+    return (r.text, r.status_code, {"Content-Type": r.headers.get("Content-Type", "application/json")})
+
+
+@app.post("/proxy/move")
+def proxy_move():
+    data = request.get_json(silent=True) or {}
+    log_command("move", data)
+    r = pi_post("/api/move", data)
+    return (r.text, r.status_code, {"Content-Type": r.headers.get("Content-Type", "application/json")})
+
+
+@app.post("/proxy/rotate")
+def proxy_rotate():
+    data = request.get_json(silent=True) or {}
+    log_command("rotate", data)
+    r = pi_post("/api/rotate", data)
+    return (r.text, r.status_code, {"Content-Type": r.headers.get("Content-Type", "application/json")})
+
+
+@app.post("/proxy/go")
+def proxy_go():
+    data = request.get_json(silent=True) or {}
+    log_command("go", data)
+    r = pi_post("/api/go", data)
+    return (r.text, r.status_code, {"Content-Type": r.headers.get("Content-Type", "application/json")})
+
+
+@app.post("/proxy/curve")
+def proxy_curve():
+    data = request.get_json(silent=True) or {}
+    log_command("curve", data)
+    r = pi_post("/api/curve", data)
+    return (r.text, r.status_code, {"Content-Type": r.headers.get("Content-Type", "application/json")})
+
+
+@app.post("/proxy/stream")
+def proxy_stream():
+    data = request.get_json(silent=True) or {}
+    log_command("stream", data)
+    r = pi_post("/api/stream", data)
+    return (r.text, r.status_code, {"Content-Type": r.headers.get("Content-Type", "application/json")})
+
+
+@app.post("/proxy/sdk")
+def proxy_sdk():
+    data = request.get_json(silent=True) or {}
+    log_command("sdk", data)
+    r = pi_post("/api/sdk", data)
     return (r.text, r.status_code, {"Content-Type": r.headers.get("Content-Type", "application/json")})
 
 
@@ -341,6 +453,7 @@ def proxy_safe_takeoff_get():
 @app.post("/proxy/safety/takeoff")
 def proxy_safe_takeoff_set():
     data = request.get_json(silent=True) or {}
+    log_command("safe_takeoff_set", data)
     r = pi_post("/api/safety/takeoff", data)
     return (r.text, r.status_code, {"Content-Type": r.headers.get("Content-Type", "application/json")})
 
@@ -371,6 +484,7 @@ def proxy_log_status():
 @app.post("/proxy/logging/telemetry")
 def proxy_log_config():
     data = request.get_json(silent=True) or {}
+    log_command("telemetry_log_set", data)
     r = pi_post("/api/logging/telemetry", data)
     return (r.text, r.status_code, {"Content-Type": r.headers.get("Content-Type", "application/json")})
 

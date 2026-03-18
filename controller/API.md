@@ -228,7 +228,73 @@ Truncate/clear telemetry log file.
 
 ---
 
-## 8) Quick `curl` Examples
+## 8) Advanced SDK Control Endpoints
+
+### `POST /api/emergency`
+Immediate motor stop (dangerous; emergency use only).
+
+### `POST /api/speed`
+Set drone speed.
+
+Body:
+```json
+{ "speed": 30 }
+```
+
+### `POST /api/move`
+Discrete move command.
+
+Body:
+```json
+{ "dir": "forward", "cm": 30 }
+```
+`dir`: `up|down|left|right|forward|back`
+
+### `POST /api/rotate`
+Discrete rotation command.
+
+Body:
+```json
+{ "dir": "cw", "deg": 45 }
+```
+`dir`: `cw|ccw`
+
+### `POST /api/go`
+Go XYZ speed command.
+
+Body:
+```json
+{ "x": 50, "y": 0, "z": 0, "speed": 20 }
+```
+
+### `POST /api/curve`
+Curve XYZ speed command.
+
+Body:
+```json
+{ "x1": 20, "y1": 0, "z1": 0, "x2": 40, "y2": 10, "z2": 0, "speed": 20 }
+```
+
+### `POST /api/stream`
+Control video stream state.
+
+Body:
+```json
+{ "action": "on" }
+```
+`action`: `on|off`
+
+### `POST /api/sdk`
+Raw SDK passthrough for advanced commands.
+
+Body:
+```json
+{ "command": "battery?" }
+```
+
+---
+
+## 9) Quick `curl` Examples
 
 ```bash
 # takeoff
