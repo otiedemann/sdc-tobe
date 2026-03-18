@@ -19,6 +19,7 @@ STICK = 60
 RECONNECT_AFTER_S = 3.0
 RECONNECT_RETRY_S = 2.0
 CONNECT_RETRY_S = 2.0
+VERIFY_RETRY_S = 2.5
 WIFI_RETRY_S = 3.0
 TELEMETRY_HZ = float(os.getenv("TELEMETRY_HZ", "2.0"))
 KEY_STALE_S = float(os.getenv("KEY_STALE_S", "1.0"))
@@ -40,7 +41,7 @@ key_last_seen: Dict[str, float] = {}
 pressed_lock = threading.Lock()
 
 last_state_seen = 0.0
-conn_state = {"connected": False, "last_reconnect": 0.0}
+conn_state = {"connected": False, "last_reconnect": 0.0, "last_verify": 0.0}
 conn_lock = threading.Lock()
 last_conn_print = None
 
@@ -248,9 +249,10 @@ def recover_drone():
         flying = False
         last_state_seen = 0.0
         with conn_lock:
-            # Mark disconnected until state packets are actually received.
+            # Mark disconnected until state packets/verification are actually received.
             conn_state["connected"] = False
             conn_state["last_reconnect"] = time.time()
+            conn_state["last_verify"] = 0.0
         return True, "recovered_waiting_state"
     except Exception as e:
         with conn_lock:
@@ -287,8 +289,6 @@ def telemetry_loop():
 
         if st:
             last_state_seen = time.time()
-            with conn_lock:
-                conn_state["connected"] = True
 
         tl = _as_int(st.get("templ"))
         th = _as_int(st.get("temph"))
@@ -354,6 +354,7 @@ def reconnect_loop():
 
         with conn_lock:
             last_try = conn_state["last_reconnect"]
+            last_verify = conn_state["last_verify"]
             connected_now = conn_state["connected"]
 
         # Force disconnected when host is unreachable (prevents stale "connected" state).
@@ -365,6 +366,21 @@ def reconnect_loop():
         if connected_now != last_conn_print:
             print("[PI API] Drone connected" if connected_now else "[PI API] Drone disconnected (retrying...)")
             last_conn_print = connected_now
+
+        # Periodically verify connection with a real SDK round-trip command.
+        if connected_now and reachable and (now - last_verify) >= VERIFY_RETRY_S:
+            ok_verify = False
+            try:
+                with command_lock:
+                    resp = str(TELLO.send_command_with_return("battery?")).strip() if TELLO is not None else ""
+                ok_verify = resp.isdigit()
+            except Exception:
+                ok_verify = False
+            with conn_lock:
+                conn_state["last_verify"] = now
+                if not ok_verify:
+                    conn_state["connected"] = False
+                    connected_now = False
 
         should_retry = reachable and (
             (not connected_now and (now - last_try) >= CONNECT_RETRY_S) or
@@ -381,10 +397,17 @@ def reconnect_loop():
                 TELLO.connect()
                 TELLO.streamon()  # keep stream alive for external UDP forward
                 refresh_drone_info_cache(TELLO)
-                # Wait for telemetry loop to confirm real state packets before marking connected.
+                # Confirm with SDK round-trip before marking connected.
+                ok_verify = False
+                try:
+                    resp = str(TELLO.send_command_with_return("battery?")).strip()
+                    ok_verify = resp.isdigit()
+                except Exception:
+                    ok_verify = False
                 last_state_seen = 0.0
                 with conn_lock:
-                    conn_state["connected"] = False
+                    conn_state["connected"] = ok_verify
+                    conn_state["last_verify"] = now
             except Exception:
                 pass
         time.sleep(0.8)
@@ -893,6 +916,7 @@ def main():
     with conn_lock:
         conn_state["connected"] = False
         conn_state["last_reconnect"] = 0.0
+        conn_state["last_verify"] = 0.0
 
     atexit.register(shutdown)
 
