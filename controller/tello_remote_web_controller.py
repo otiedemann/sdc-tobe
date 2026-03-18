@@ -49,6 +49,9 @@ HTML = """
         <button id=\"flip_f\">Flip F</button>
         <button id=\"flip_b\">Flip B</button>
       </div>
+      <div style=\"margin-top:8px; display:flex; gap:8px; flex-wrap:wrap;\">
+        <button id=\"toggle_log\">Enable Telemetry Log</button>
+      </div>
       <div class=\"small\" style=\"margin-top:8px;\">Keyboard in browser: W/A/S/D R/F Q/E, T, L, Space stop</div>
     </div>
 
@@ -83,6 +86,16 @@ document.getElementById('flip_l').onclick = ()=>post('/proxy/flip',{dir:'l'});
 document.getElementById('flip_r').onclick = ()=>post('/proxy/flip',{dir:'r'});
 document.getElementById('flip_f').onclick = ()=>post('/proxy/flip',{dir:'f'});
 document.getElementById('flip_b').onclick = ()=>post('/proxy/flip',{dir:'b'});
+
+document.getElementById('toggle_log').onclick = async ()=>{
+  try {
+    const s = await fetch('/proxy/logging/telemetry');
+    const cur = await s.json();
+    const nextEnabled = !Boolean(cur.enabled);
+    await post('/proxy/logging/telemetry',{enabled: nextEnabled});
+    document.getElementById('toggle_log').textContent = nextEnabled ? 'Disable Telemetry Log' : 'Enable Telemetry Log';
+  } catch {}
+};
 
 const map = new Set(['w','a','s','d','q','e','r','f','t','l','x',' ']);
 window.addEventListener('keydown', (e)=>{
@@ -121,8 +134,17 @@ async function refreshTelemetry(){
     document.getElementById('telemetry').textContent = 'telemetry unavailable';
   }
 }
+async function refreshLogStatus(){
+  try {
+    const r = await fetch('/proxy/logging/telemetry');
+    const s = await r.json();
+    document.getElementById('toggle_log').textContent = s.enabled ? 'Disable Telemetry Log' : 'Enable Telemetry Log';
+  } catch {}
+}
 setInterval(refreshTelemetry, 700);
+setInterval(refreshLogStatus, 2000);
 refreshTelemetry();
+refreshLogStatus();
 </script>
 </body>
 </html>
@@ -178,6 +200,19 @@ def proxy_flip():
 @app.post("/proxy/recover")
 def proxy_recover():
     r = pi_post("/api/recover")
+    return (r.text, r.status_code, {"Content-Type": r.headers.get("Content-Type", "application/json")})
+
+
+@app.get("/proxy/logging/telemetry")
+def proxy_log_status():
+    r = pi_get("/api/logging/telemetry")
+    return (r.text, r.status_code, {"Content-Type": r.headers.get("Content-Type", "application/json")})
+
+
+@app.post("/proxy/logging/telemetry")
+def proxy_log_config():
+    data = request.get_json(silent=True) or {}
+    r = pi_post("/api/logging/telemetry", data)
     return (r.text, r.status_code, {"Content-Type": r.headers.get("Content-Type", "application/json")})
 
 

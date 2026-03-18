@@ -21,6 +21,8 @@ CONNECT_RETRY_S = 2.0
 WIFI_RETRY_S = 3.0
 WIFI_CFG_PATH = Path(__file__).with_name("tello_wifi_config.json")
 TELLO_HOST = "192.168.10.1"
+TELEMETRY_LOG_DEFAULT = False
+TELEMETRY_LOG_PATH_DEFAULT = Path(__file__).with_name("telemetry_log.jsonl")
 
 app = Flask(__name__)
 
@@ -62,6 +64,13 @@ telemetry = {
     "updated_at": 0.0,
 }
 telemetry_lock = threading.Lock()
+telemetry_log_enabled = TELEMETRY_LOG_DEFAULT
+telemetry_log_path = TELEMETRY_LOG_PATH_DEFAULT
+telemetry_log_lock = threading.Lock()
+
+command_lock = threading.Lock()
+discrete_until = 0.0
+takeoff_cooldown_until = 0.0
 
 
 def load_wifi_config():
@@ -143,35 +152,58 @@ def _as_int(v):
         return None
 
 
+def append_telemetry_log(payload: dict):
+    global telemetry_log_enabled, telemetry_log_path
+    with telemetry_log_lock:
+        if not telemetry_log_enabled:
+            return
+        p = telemetry_log_path
+    try:
+        p.parent.mkdir(parents=True, exist_ok=True)
+        with p.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(payload, ensure_ascii=False) + "\n")
+    except Exception:
+        pass
+
+
+def start_discrete_window(seconds: float):
+    global discrete_until
+    with command_lock:
+        discrete_until = max(discrete_until, time.time() + max(0.0, seconds))
+
+
 def recover_drone():
     global flying, last_state_seen, TELLO
     old = TELLO
     if old is None:
         return False, "controller not ready"
+    start_discrete_window(2.0)
     try:
-        try:
-            old.send_rc_control(0, 0, 0, 0)
-        except Exception:
-            pass
-        try:
-            old.land()
-        except Exception:
-            pass
-        try:
-            old.streamoff()
-        except Exception:
-            pass
-        try:
-            old.end()
-        except Exception:
-            pass
+        with command_lock:
+            try:
+                old.send_rc_control(0, 0, 0, 0)
+            except Exception:
+                pass
+            try:
+                old.land()
+            except Exception:
+                pass
+            try:
+                old.streamoff()
+            except Exception:
+                pass
+            try:
+                old.end()
+            except Exception:
+                pass
 
-        # Recreate SDK object (critical after crash/disconnect states)
-        t = Tello(host=TELLO_HOST)
-        TELLO = t
-        time.sleep(1.0)
-        t.connect()
-        t.streamon()
+            # Recreate SDK object (critical after crash/disconnect states)
+            t = Tello(host=TELLO_HOST)
+            TELLO = t
+            time.sleep(1.0)
+            t.connect()
+            t.streamon()
+
         flying = False
         last_state_seen = time.time()
         with conn_lock:
@@ -227,7 +259,9 @@ def telemetry_loop():
             telemetry["flying"] = flying
             telemetry["connected"] = connected_now
             telemetry["updated_at"] = time.time()
+            snapshot = dict(telemetry)
 
+        append_telemetry_log(snapshot)
         time.sleep(0.5)
 
 
@@ -266,7 +300,7 @@ def reconnect_loop():
 
 
 def rc_loop():
-    global running, flying, rc_override
+    global running, flying, rc_override, takeoff_cooldown_until
     period = 1.0 / RC_HZ
     while running:
         t0 = time.time()
@@ -275,8 +309,12 @@ def rc_loop():
         if has_key("t") and not flying:
             try:
                 if t is not None:
-                    t.takeoff()
+                    start_discrete_window(3.0)
+                    with command_lock:
+                        t.send_rc_control(0, 0, 0, 0)
+                        t.takeoff()
                     flying = True
+                    takeoff_cooldown_until = time.time() + 3.0
             except Exception:
                 recover_drone()
             remove_key("t")
@@ -284,7 +322,10 @@ def rc_loop():
         if has_key("l") and flying:
             try:
                 if t is not None:
-                    t.land()
+                    start_discrete_window(1.5)
+                    with command_lock:
+                        t.send_rc_control(0, 0, 0, 0)
+                        t.land()
             except Exception:
                 pass
             flying = False
@@ -305,9 +346,15 @@ def rc_loop():
             elif rc_override is not None and now >= rc_override_until:
                 rc_override = None
 
+        with command_lock:
+            in_discrete = now < discrete_until
+
         try:
             if t is not None:
-                t.send_rc_control(lr, fb, ud, yaw)
+                if in_discrete:
+                    t.send_rc_control(0, 0, 0, 0)
+                else:
+                    t.send_rc_control(lr, fb, ud, yaw)
         except Exception:
             with conn_lock:
                 conn_state["connected"] = False
@@ -359,13 +406,17 @@ def api_key_up():
 
 @app.post("/api/takeoff")
 def api_takeoff():
-    global flying
+    global flying, takeoff_cooldown_until
     if TELLO is None:
         return jsonify(ok=False, error="controller not ready"), 503
     try:
         if not flying:
-            TELLO.takeoff()
+            start_discrete_window(3.0)
+            with command_lock:
+                TELLO.send_rc_control(0, 0, 0, 0)
+                TELLO.takeoff()
             flying = True
+            takeoff_cooldown_until = time.time() + 3.0
         return jsonify(ok=True, flying=flying)
     except Exception:
         ok, msg = recover_drone()
@@ -379,7 +430,10 @@ def api_land():
         return jsonify(ok=False, error="controller not ready"), 503
     try:
         if flying:
-            TELLO.land()
+            start_discrete_window(1.5)
+            with command_lock:
+                TELLO.send_rc_control(0, 0, 0, 0)
+                TELLO.land()
             flying = False
         return jsonify(ok=True, flying=flying)
     except Exception:
@@ -395,8 +449,34 @@ def api_flip():
     direction = str(data.get("dir", "")).lower()
     if direction not in {"l", "r", "f", "b"}:
         return jsonify(ok=False, error="dir must be one of l|r|f|b"), 400
+
+    now = time.time()
+    if now < takeoff_cooldown_until:
+        return jsonify(ok=False, error="flip_blocked_takeoff_cooldown"), 409
+
+    with telemetry_lock:
+        bat = telemetry.get("battery")
+        vgx = abs(int(telemetry.get("vgx") or 0))
+        vgy = abs(int(telemetry.get("vgy") or 0))
+        is_flying = bool(telemetry.get("flying"))
+
+    if not is_flying:
+        return jsonify(ok=False, error="flip_requires_flying"), 409
+    if bat is not None and bat < 50:
+        return jsonify(ok=False, error="flip_requires_battery_50_plus", battery=bat), 409
+    if vgx > 20 or vgy > 20:
+        return jsonify(ok=False, error="flip_requires_low_horizontal_speed", vgx=vgx, vgy=vgy), 409
+
     try:
-        TELLO.flip(direction)
+        start_discrete_window(1.2)
+        with command_lock:
+            TELLO.send_rc_control(0, 0, 0, 0)
+            time.sleep(0.25)
+            try:
+                TELLO.flip(direction)
+            except Exception:
+                time.sleep(0.25)
+                TELLO.flip(direction)
         return jsonify(ok=True, dir=direction)
     except Exception as e:
         return jsonify(ok=False, error=str(e)), 500
@@ -436,6 +516,26 @@ def api_recover():
 def api_telemetry():
     with telemetry_lock:
         return jsonify(telemetry)
+
+
+@app.get("/api/logging/telemetry")
+def api_telemetry_log_status():
+    with telemetry_log_lock:
+        return jsonify(enabled=telemetry_log_enabled, path=str(telemetry_log_path))
+
+
+@app.post("/api/logging/telemetry")
+def api_telemetry_log_config():
+    global telemetry_log_enabled, telemetry_log_path
+    data = request.get_json(silent=True) or {}
+    enabled = data.get("enabled")
+    path = data.get("path")
+    with telemetry_log_lock:
+        if isinstance(enabled, bool):
+            telemetry_log_enabled = enabled
+        if isinstance(path, str) and path.strip():
+            telemetry_log_path = Path(path.strip())
+        return jsonify(enabled=telemetry_log_enabled, path=str(telemetry_log_path))
 
 
 @app.get("/api/telemetry/stream")
