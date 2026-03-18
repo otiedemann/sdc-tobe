@@ -269,9 +269,14 @@ async function refreshTelemetry(){
       `tof: ${t.tof_cm ?? '-'} cm\n` +
       `barometer: ${t.barometer_cm ?? '-'} cm\n` +
       `flight time: ${t.flight_time_s ?? '-'} s\n` +
+      `speed: ${t.speed ?? '-'}\n` +
+      `wifi snr: ${t.wifi_snr ?? '-'}\n` +
       `attitude p/r/y: ${t.pitch ?? '-'} / ${t.roll ?? '-'} / ${t.yaw ?? '-'}\n` +
       `velocity xyz: ${t.vgx ?? '-'} / ${t.vgy ?? '-'} / ${t.vgz ?? '-'}\n` +
       `accel xyz: ${t.agx ?? '-'} / ${t.agy ?? '-'} / ${t.agz ?? '-'}\n` +
+      `sdk version: ${t.sdk_version ?? '-'}\n` +
+      `serial number: ${t.serial_number ?? '-'}\n` +
+      `mission pad mid/x/y/z/mpry: ${t.mid ?? '-'} / ${t.pad_x ?? '-'} / ${t.pad_y ?? '-'} / ${t.pad_z ?? '-'} / ${t.pad_mpry ?? '-'}\n` +
       `flying: ${t.flying}\n` +
       `connected: ${t.connected}`;
   } catch {

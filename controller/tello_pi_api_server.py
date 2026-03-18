@@ -77,6 +77,8 @@ command_lock = threading.Lock()
 discrete_until = 0.0
 takeoff_cooldown_until = 0.0
 safe_takeoff_enabled = SAFE_TAKEOFF_DEFAULT
+sdk_version_value = None
+serial_number_value = None
 
 
 def load_wifi_config():
@@ -233,6 +235,7 @@ def recover_drone():
             time.sleep(1.0)
             t.connect()
             t.streamon()
+            refresh_drone_info_cache(t)
 
         # Clear any latent control inputs after crash/recover.
         with pressed_lock:
@@ -253,6 +256,22 @@ def recover_drone():
         with conn_lock:
             conn_state["connected"] = False
         return False, str(e)
+
+
+def refresh_drone_info_cache(t):
+    global sdk_version_value, serial_number_value
+    if t is None:
+        return
+    try:
+        if sdk_version_value is None:
+            sdk_version_value = str(t.send_command_with_return("sdk?")).strip()
+    except Exception:
+        pass
+    try:
+        if serial_number_value is None:
+            serial_number_value = str(t.send_command_with_return("sn?")).strip()
+    except Exception:
+        pass
 
 
 def telemetry_loop():
@@ -296,13 +315,26 @@ def telemetry_loop():
                 ("agx", "agx"),
                 ("agy", "agy"),
                 ("agz", "agz"),
+                ("mid", "mid"),
+                ("pad_x", "x"),
+                ("pad_y", "y"),
+                ("pad_z", "z"),
             ):
                 v = _as_int(st.get(src))
                 if v is not None:
                     telemetry[k] = v
+            mpry = st.get("mpry")
+            if mpry is not None:
+                telemetry["pad_mpry"] = str(mpry)
             if temp is not None:
                 telemetry["temperature"] = temp
 
+            vgx = telemetry.get("vgx") or 0
+            vgy = telemetry.get("vgy") or 0
+            vgz = telemetry.get("vgz") or 0
+            telemetry["speed"] = int((vgx * vgx + vgy * vgy + vgz * vgz) ** 0.5)
+            telemetry["sdk_version"] = sdk_version_value
+            telemetry["serial_number"] = serial_number_value
             telemetry["flying"] = flying
             telemetry["connected"] = connected_now
             telemetry["updated_at"] = time.time()
@@ -348,6 +380,7 @@ def reconnect_loop():
                     TELLO = Tello(host=TELLO_HOST)
                 TELLO.connect()
                 TELLO.streamon()  # keep stream alive for external UDP forward
+                refresh_drone_info_cache(TELLO)
                 # Wait for telemetry loop to confirm real state packets before marking connected.
                 last_state_seen = 0.0
                 with conn_lock:
