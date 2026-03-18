@@ -822,7 +822,11 @@ def api_telemetry():
         payload = dict(telemetry)
     payload["state_age_s"] = round(age, 3)
     payload["state_fresh"] = age <= 2.0
-    return jsonify(payload)
+    resp = jsonify(payload)
+    resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+    resp.headers["Pragma"] = "no-cache"
+    resp.headers["Expires"] = "0"
+    return resp
 
 
 @app.get("/api/logging/telemetry")

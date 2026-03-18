@@ -257,7 +257,7 @@ async function refreshTelemetry(){
   const apiEl = document.getElementById('api_status');
   const droneEl = document.getElementById('drone_status');
   try {
-    const r = await fetch('/proxy/telemetry');
+    const r = await fetch('/proxy/telemetry', {cache:'no-store'});
     if (!r.ok) throw new Error('api_error');
     const t = await r.json();
 
@@ -558,7 +558,13 @@ def proxy_log_clear():
 def proxy_telemetry():
     try:
         r = pi_get("/api/telemetry", timeout=TIMEOUT_STATUS)
-        return (r.text, r.status_code, {"Content-Type": r.headers.get("Content-Type", "application/json")})
+        headers = {
+            "Content-Type": r.headers.get("Content-Type", "application/json"),
+            "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
+            "Pragma": "no-cache",
+            "Expires": "0",
+        }
+        return (r.text, r.status_code, headers)
     except Exception as e:
         return jsonify(ok=False, error=str(e)), 502
 
