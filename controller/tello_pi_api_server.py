@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Set
 
 from djitellopy import Tello
-from flask import Flask, Response, jsonify, request
+from flask import Flask, Response, jsonify, request, send_file
 
 # Pi API server (single drone)
 HTTP_HOST = "0.0.0.0"
@@ -87,6 +87,12 @@ def load_wifi_config():
 
 def _run(cmd):
     return subprocess.run(cmd, capture_output=True, text=True)
+
+
+def host_reachable(host: str) -> bool:
+    # Lightweight connectivity check to avoid stale SDK state showing false positives.
+    r = _run(["ping", "-c", "1", "-W", "1", host])
+    return r.returncode == 0
 
 
 def wifi_connected_to(ssid: str) -> bool:
@@ -270,16 +276,25 @@ def reconnect_loop():
     while running:
         now = time.time()
         stale = (now - last_state_seen) if last_state_seen else 9999
+        reachable = host_reachable(TELLO_HOST)
+
         with conn_lock:
             last_try = conn_state["last_reconnect"]
             connected_now = conn_state["connected"]
+
+        # Force disconnected when host is unreachable (prevents stale "connected" state).
+        if not reachable and connected_now:
+            with conn_lock:
+                conn_state["connected"] = False
+            connected_now = False
 
         if connected_now != last_conn_print:
             print("[PI API] Drone connected" if connected_now else "[PI API] Drone disconnected (retrying...)")
             last_conn_print = connected_now
 
-        should_retry = (not connected_now and (now - last_try) >= CONNECT_RETRY_S) or (
-            stale > RECONNECT_AFTER_S and (now - last_try) >= RECONNECT_RETRY_S
+        should_retry = reachable and (
+            (not connected_now and (now - last_try) >= CONNECT_RETRY_S) or
+            (stale > RECONNECT_AFTER_S and (now - last_try) >= RECONNECT_RETRY_S)
         )
 
         if should_retry:
@@ -296,7 +311,7 @@ def reconnect_loop():
                     conn_state["connected"] = True
             except Exception:
                 pass
-        time.sleep(0.5)
+        time.sleep(0.8)
 
 
 def rc_loop():
@@ -536,6 +551,15 @@ def api_telemetry_log_config():
         if isinstance(path, str) and path.strip():
             telemetry_log_path = Path(path.strip())
         return jsonify(enabled=telemetry_log_enabled, path=str(telemetry_log_path))
+
+
+@app.get("/api/logging/telemetry/download")
+def api_telemetry_log_download():
+    with telemetry_log_lock:
+        p = telemetry_log_path
+    if not p.exists():
+        return jsonify(ok=False, error="telemetry log file not found", path=str(p)), 404
+    return send_file(p, as_attachment=True, download_name=p.name, mimetype="application/x-ndjson")
 
 
 @app.get("/api/telemetry/stream")

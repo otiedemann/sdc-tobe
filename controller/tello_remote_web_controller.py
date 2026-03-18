@@ -51,6 +51,7 @@ HTML = """
       </div>
       <div style=\"margin-top:8px; display:flex; gap:8px; flex-wrap:wrap;\">
         <button id=\"toggle_log\">Enable Telemetry Log</button>
+        <button id=\"download_log\">Download Telemetry Log</button>
       </div>
       <div class=\"small\" style=\"margin-top:8px;\">Keyboard in browser: W/A/S/D R/F Q/E, T, L, Space stop</div>
     </div>
@@ -95,6 +96,10 @@ document.getElementById('toggle_log').onclick = async ()=>{
     await post('/proxy/logging/telemetry',{enabled: nextEnabled});
     document.getElementById('toggle_log').textContent = nextEnabled ? 'Disable Telemetry Log' : 'Enable Telemetry Log';
   } catch {}
+};
+
+document.getElementById('download_log').onclick = ()=>{
+  window.open('/proxy/logging/telemetry/download', '_blank');
 };
 
 const map = new Set(['w','a','s','d','q','e','r','f','t','l','x',' ']);
@@ -214,6 +219,16 @@ def proxy_log_config():
     data = request.get_json(silent=True) or {}
     r = pi_post("/api/logging/telemetry", data)
     return (r.text, r.status_code, {"Content-Type": r.headers.get("Content-Type", "application/json")})
+
+
+@app.get("/proxy/logging/telemetry/download")
+def proxy_log_download():
+    r = pi_get("/api/logging/telemetry/download")
+    headers = {
+        "Content-Type": r.headers.get("Content-Type", "application/octet-stream"),
+        "Content-Disposition": r.headers.get("Content-Disposition", "attachment; filename=telemetry_log.jsonl"),
+    }
+    return (r.content, r.status_code, headers)
 
 
 @app.get("/proxy/telemetry")
