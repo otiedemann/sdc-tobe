@@ -15,6 +15,7 @@ TIMEOUT_STATUS = float(os.getenv("PI_TIMEOUT_STATUS", "0.5"))
 
 app = Flask(__name__)
 command_log_enabled = os.getenv("REMOTE_COMMAND_LOG", "0") in {"1", "true", "True"}
+command_log_path = Path(os.getenv("REMOTE_COMMAND_LOG_PATH", "remote_command_log.jsonl"))
 command_log_last: dict[str, float] = {}
 
 HTML = """
@@ -515,8 +516,11 @@ def proxy_sdk():
 
 @app.get("/proxy/safety/takeoff")
 def proxy_safe_takeoff_get():
-    r = pi_get("/api/safety/takeoff")
-    return (r.text, r.status_code, {"Content-Type": r.headers.get("Content-Type", "application/json")})
+    try:
+        r = pi_get("/api/safety/takeoff", timeout=TIMEOUT_STATUS)
+        return (r.text, r.status_code, {"Content-Type": r.headers.get("Content-Type", "application/json")})
+    except Exception as e:
+        return jsonify(ok=False, error=str(e)), 502
 
 
 @app.post("/proxy/safety/takeoff")
