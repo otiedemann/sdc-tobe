@@ -127,6 +127,15 @@ document.getElementById('flip_r').onclick = ()=>post('/proxy/flip',{dir:'r'});
 document.getElementById('flip_f').onclick = ()=>post('/proxy/flip',{dir:'f'});
 document.getElementById('flip_b').onclick = ()=>post('/proxy/flip',{dir:'b'});
 
+document.getElementById('safe_takeoff').onclick = async ()=>{
+  try {
+    const r = await fetch('/proxy/safety/takeoff');
+    const s = await r.json();
+    await post('/proxy/safety/takeoff', {enabled: !Boolean(s.enabled)});
+    refreshSafeTakeoff();
+  } catch {}
+};
+
 document.getElementById('toggle_log').onclick = async ()=>{
   try {
     const s = await fetch('/proxy/logging/telemetry');
@@ -139,6 +148,12 @@ document.getElementById('toggle_log').onclick = async ()=>{
 
 document.getElementById('download_log').onclick = ()=>{
   window.open('/proxy/logging/telemetry/download', '_blank');
+};
+
+document.getElementById('clear_log').onclick = async ()=>{
+  try {
+    await post('/proxy/logging/telemetry/clear', {});
+  } catch {}
 };
 
 const map = new Set(['w','a','s','d','q','e','r','f','t','l','x',' ']);
@@ -224,10 +239,19 @@ async function refreshLogStatus(){
     document.getElementById('toggle_log').textContent = s.enabled ? 'Disable Telemetry Log' : 'Enable Telemetry Log';
   } catch {}
 }
+async function refreshSafeTakeoff(){
+  try {
+    const r = await fetch('/proxy/safety/takeoff');
+    const s = await r.json();
+    document.getElementById('safe_takeoff').textContent = s.enabled ? 'Safe Takeoff: ON' : 'Safe Takeoff: OFF';
+  } catch {}
+}
 setInterval(refreshTelemetry, 700);
 setInterval(refreshLogStatus, 2000);
+setInterval(refreshSafeTakeoff, 2000);
 refreshTelemetry();
 refreshLogStatus();
+refreshSafeTakeoff();
 </script>
 </body>
 </html>
@@ -283,6 +307,19 @@ def proxy_flip():
 @app.post("/proxy/recover")
 def proxy_recover():
     r = pi_post("/api/recover")
+    return (r.text, r.status_code, {"Content-Type": r.headers.get("Content-Type", "application/json")})
+
+
+@app.get("/proxy/safety/takeoff")
+def proxy_safe_takeoff_get():
+    r = pi_get("/api/safety/takeoff")
+    return (r.text, r.status_code, {"Content-Type": r.headers.get("Content-Type", "application/json")})
+
+
+@app.post("/proxy/safety/takeoff")
+def proxy_safe_takeoff_set():
+    data = request.get_json(silent=True) or {}
+    r = pi_post("/api/safety/takeoff", data)
     return (r.text, r.status_code, {"Content-Type": r.headers.get("Content-Type", "application/json")})
 
 

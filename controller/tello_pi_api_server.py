@@ -75,6 +75,7 @@ telemetry_log_lock = threading.Lock()
 command_lock = threading.Lock()
 discrete_until = 0.0
 takeoff_cooldown_until = 0.0
+safe_takeoff_enabled = SAFE_TAKEOFF_DEFAULT
 
 
 def load_wifi_config():
@@ -348,12 +349,13 @@ def rc_loop():
         if has_key("t") and not flying:
             try:
                 if t is not None:
-                    start_discrete_window(3.0)
+                    hold_s = SAFE_TAKEOFF_S if safe_takeoff_enabled else 3.0
+                    start_discrete_window(hold_s)
                     with command_lock:
                         t.send_rc_control(0, 0, 0, 0)
                         t.takeoff()
                     flying = True
-                    takeoff_cooldown_until = time.time() + 3.0
+                    takeoff_cooldown_until = time.time() + hold_s
             except Exception:
                 recover_drone()
             remove_key("t")
@@ -450,13 +452,14 @@ def api_takeoff():
         return jsonify(ok=False, error="controller not ready"), 503
     try:
         if not flying:
-            start_discrete_window(3.0)
+            hold_s = SAFE_TAKEOFF_S if safe_takeoff_enabled else 3.0
+            start_discrete_window(hold_s)
             with command_lock:
                 TELLO.send_rc_control(0, 0, 0, 0)
                 TELLO.takeoff()
             flying = True
-            takeoff_cooldown_until = time.time() + 3.0
-        return jsonify(ok=True, flying=flying)
+            takeoff_cooldown_until = time.time() + hold_s
+        return jsonify(ok=True, flying=flying, safe_takeoff=safe_takeoff_enabled)
     except Exception:
         ok, msg = recover_drone()
         return jsonify(ok=False, error="takeoff_failed", recovered=ok, message=msg), 500
@@ -549,6 +552,22 @@ def api_rc():
 def api_recover():
     ok, msg = recover_drone()
     return jsonify(ok=ok, message=msg)
+
+
+@app.get("/api/safety/takeoff")
+def api_safe_takeoff_get():
+    return jsonify(enabled=safe_takeoff_enabled, hold_s=SAFE_TAKEOFF_S)
+
+
+@app.post("/api/safety/takeoff")
+def api_safe_takeoff_set():
+    global safe_takeoff_enabled
+    data = request.get_json(silent=True) or {}
+    enabled = data.get("enabled")
+    if not isinstance(enabled, bool):
+        return jsonify(ok=False, error="enabled must be boolean"), 400
+    safe_takeoff_enabled = enabled
+    return jsonify(ok=True, enabled=safe_takeoff_enabled, hold_s=SAFE_TAKEOFF_S)
 
 
 @app.get("/api/telemetry")
