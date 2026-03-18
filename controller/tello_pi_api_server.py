@@ -391,7 +391,7 @@ def reconnect_loop():
 
 
 def rc_loop():
-    global running, flying, rc_override, takeoff_cooldown_until
+    global running, flying, rc_override, rc_override_until, takeoff_cooldown_until
     period = 1.0 / RC_HZ
     while running:
         t0 = time.time()
@@ -415,10 +415,22 @@ def rc_loop():
         if has_key("l") and flying:
             try:
                 if t is not None:
-                    start_discrete_window(1.5)
-                    with command_lock:
-                        t.send_rc_control(0, 0, 0, 0)
-                        t.land()
+                    start_discrete_window(3.0)
+                    with pressed_lock:
+                        pressed_web.clear()
+                        key_last_seen.clear()
+                    with rc_lock:
+                        rc_override = None
+                        rc_override_until = 0.0
+                    for _ in range(3):
+                        try:
+                            with command_lock:
+                                t.send_rc_control(0, 0, 0, 0)
+                                time.sleep(0.15)
+                                t.land()
+                            break
+                        except Exception:
+                            time.sleep(0.25)
             except Exception:
                 pass
             flying = False
@@ -519,17 +531,36 @@ def api_takeoff():
 
 @app.post("/api/land")
 def api_land():
-    global flying
+    global flying, rc_override, rc_override_until
     if TELLO is None:
         return jsonify(ok=False, error="controller not ready"), 503
     try:
-        if flying:
-            start_discrete_window(1.5)
-            with command_lock:
-                TELLO.send_rc_control(0, 0, 0, 0)
-                TELLO.land()
-            flying = False
-        return jsonify(ok=True, flying=flying)
+        if not flying:
+            return jsonify(ok=True, flying=False)
+
+        # Make land more reliable by clearing active controls and retrying.
+        start_discrete_window(3.0)
+        with pressed_lock:
+            pressed_web.clear()
+            key_last_seen.clear()
+        with rc_lock:
+            rc_override = None
+            rc_override_until = 0.0
+
+        last_err = None
+        for _ in range(3):
+            try:
+                with command_lock:
+                    TELLO.send_rc_control(0, 0, 0, 0)
+                    time.sleep(0.15)
+                    TELLO.land()
+                flying = False
+                return jsonify(ok=True, flying=False)
+            except Exception as e:
+                last_err = e
+                time.sleep(0.25)
+
+        raise last_err if last_err else RuntimeError("land_failed")
     except Exception:
         ok, msg = recover_drone()
         return jsonify(ok=False, error="land_failed", recovered=ok, message=msg), 500
