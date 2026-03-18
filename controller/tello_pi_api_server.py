@@ -1,6 +1,7 @@
 import atexit
 import json
 import logging
+import os
 import subprocess
 import threading
 import time
@@ -19,6 +20,7 @@ RECONNECT_AFTER_S = 3.0
 RECONNECT_RETRY_S = 2.0
 CONNECT_RETRY_S = 2.0
 WIFI_RETRY_S = 3.0
+TELEMETRY_HZ = float(os.getenv("TELEMETRY_HZ", "2.0"))
 WIFI_CFG_PATH = Path(__file__).with_name("tello_wifi_config.json")
 TELLO_HOST = "192.168.10.1"
 TELEMETRY_LOG_DEFAULT = False
@@ -268,7 +270,8 @@ def telemetry_loop():
             snapshot = dict(telemetry)
 
         append_telemetry_log(snapshot)
-        time.sleep(0.5)
+        hz = TELEMETRY_HZ if TELEMETRY_HZ > 0 else 2.0
+        time.sleep(max(0.02, 1.0 / hz))
 
 
 def reconnect_loop():
