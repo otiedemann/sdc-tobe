@@ -73,12 +73,34 @@ async function post(url, body){
 function keyDown(k){ post('/proxy/key_down',{key:k}); }
 function keyUp(k){ post('/proxy/key_up',{key:k}); }
 
+const activeKeys = new Set();
+function pressKey(k){
+  if (!activeKeys.has(k)) {
+    activeKeys.add(k);
+    keyDown(k);
+  }
+}
+function releaseKey(k){
+  if (activeKeys.has(k)) {
+    activeKeys.delete(k);
+    keyUp(k);
+  }
+}
+function releaseAllKeys(){
+  Array.from(activeKeys).forEach(releaseKey);
+}
+
+setInterval(()=>{
+  activeKeys.forEach((k)=>keyDown(k));
+}, 150);
+
 const holdButtons = document.querySelectorAll('button[data-k]');
 holdButtons.forEach(btn=>{
   const k = btn.dataset.k;
-  btn.addEventListener('pointerdown', e=>{ e.preventDefault(); btn.classList.add('active'); keyDown(k); });
-  btn.addEventListener('pointerup',   e=>{ e.preventDefault(); btn.classList.remove('active'); keyUp(k); });
-  btn.addEventListener('pointerleave',e=>{ btn.classList.remove('active'); keyUp(k); });
+  btn.addEventListener('pointerdown', e=>{ e.preventDefault(); btn.classList.add('active'); pressKey(k); });
+  btn.addEventListener('pointerup',   e=>{ e.preventDefault(); btn.classList.remove('active'); releaseKey(k); });
+  btn.addEventListener('pointerleave',e=>{ btn.classList.remove('active'); releaseKey(k); });
+  btn.addEventListener('pointercancel',e=>{ e.preventDefault(); btn.classList.remove('active'); releaseKey(k); });
 });
 
 document.getElementById('takeoff').onclick = ()=>post('/proxy/takeoff',{});
@@ -108,15 +130,19 @@ window.addEventListener('keydown', (e)=>{
   const k = e.key.toLowerCase();
   if (map.has(k)) {
     e.preventDefault();
-    keyDown(k === ' ' ? 'space' : k);
+    pressKey(k === ' ' ? 'space' : k);
   }
 });
 window.addEventListener('keyup', (e)=>{
   const k = e.key.toLowerCase();
   if (map.has(k)) {
     e.preventDefault();
-    keyUp(k === ' ' ? 'space' : k);
+    releaseKey(k === ' ' ? 'space' : k);
   }
+});
+window.addEventListener('blur', ()=>releaseAllKeys());
+document.addEventListener('visibilitychange', ()=>{
+  if (document.hidden) releaseAllKeys();
 });
 
 async function refreshTelemetry(){

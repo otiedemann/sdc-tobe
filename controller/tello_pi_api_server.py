@@ -33,6 +33,7 @@ flying = False
 TELLO = None
 
 pressed_web: Set[str] = set()
+key_last_seen: Dict[str, float] = {}
 pressed_lock = threading.Lock()
 
 last_state_seen = 0.0
@@ -322,6 +323,7 @@ def rc_loop():
     period = 1.0 / RC_HZ
     while running:
         t0 = time.time()
+        reap_stale_keys(t0)
         t = TELLO
 
         if has_key("t") and not flying:
