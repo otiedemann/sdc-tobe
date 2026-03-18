@@ -7,7 +7,8 @@ from flask import Flask, Response, jsonify, request
 PI_BASE = os.getenv("PI_API_BASE", "http://192.168.179.62:8080").rstrip("/")
 HTTP_HOST = "0.0.0.0"
 HTTP_PORT = 8090
-TIMEOUT = 2.0
+TIMEOUT_CMD = float(os.getenv("PI_TIMEOUT_CMD", "1.2"))
+TIMEOUT_STATUS = float(os.getenv("PI_TIMEOUT_STATUS", "0.5"))
 
 app = Flask(__name__)
 command_log_enabled = os.getenv("REMOTE_COMMAND_LOG", "0") in {"1", "true", "True"}
