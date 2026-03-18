@@ -9,6 +9,7 @@ HTTP_PORT = 8090
 TIMEOUT = 2.0
 
 app = Flask(__name__)
+command_log_enabled = os.getenv("REMOTE_COMMAND_LOG", "0") in {"1", "true", "True"}
 
 HTML = """
 <!doctype html>
@@ -59,6 +60,9 @@ HTML = """
         <button id=\"toggle_log\">Enable Telemetry Log</button>
         <button id=\"download_log\">Download Telemetry Log</button>
         <button id=\"clear_log\">Clear Telemetry Log</button>
+      </div>
+      <div style=\"margin-top:8px; display:flex; gap:8px; flex-wrap:wrap;\">
+        <button id=\"toggle_cmd_log\">Command Logging: OFF</button>
       </div>
       <div class=\"small\" style=\"margin-top:8px;\">Keyboard in browser: W/A/S/D R/F Q/E, T, L, Space stop</div>
     </div>
@@ -152,6 +156,15 @@ document.getElementById('clear_log').onclick = async ()=>{
   } catch {}
 };
 
+document.getElementById('toggle_cmd_log').onclick = async ()=>{
+  try {
+    const r = await fetch('/proxy/logging/commands');
+    const s = await r.json();
+    await post('/proxy/logging/commands', {enabled: !Boolean(s.enabled)});
+    refreshCommandLogStatus();
+  } catch {}
+};
+
 const map = new Set(['w','a','s','d','q','e','r','f','t','l','x',' ']);
 window.addEventListener('keydown', (e)=>{
   const k = e.key.toLowerCase();
@@ -237,16 +250,32 @@ async function refreshSafeTakeoff(){
     document.getElementById('safe_takeoff').textContent = s.enabled ? 'Safe Takeoff: ON' : 'Safe Takeoff: OFF';
   } catch {}
 }
+async function refreshCommandLogStatus(){
+  try {
+    const r = await fetch('/proxy/logging/commands');
+    const s = await r.json();
+    document.getElementById('toggle_cmd_log').textContent = s.enabled ? 'Command Logging: ON' : 'Command Logging: OFF';
+  } catch {}
+}
 setInterval(refreshTelemetry, 700);
 setInterval(refreshLogStatus, 2000);
 setInterval(refreshSafeTakeoff, 2000);
+setInterval(refreshCommandLogStatus, 2000);
 refreshTelemetry();
 refreshLogStatus();
 refreshSafeTakeoff();
+refreshCommandLogStatus();
 </script>
 </body>
 </html>
 """
+
+
+def log_command(event: str, payload: dict | None = None):
+    if not command_log_enabled:
+        return
+    ts = time.strftime("%Y-%m-%d %H:%M:%S")
+    print(f"[REMOTE CMD] {ts} {event} payload={payload or {}}")
 
 
 def pi_post(path: str, body: dict | None = None):
@@ -278,6 +307,7 @@ def proxy_key_up():
 
 @app.post("/proxy/takeoff")
 def proxy_takeoff():
+    log_command("takeoff")
     r = pi_post("/api/takeoff")
     return (r.text, r.status_code, {"Content-Type": r.headers.get("Content-Type", "application/json")})
 
@@ -291,6 +321,7 @@ def proxy_land():
 @app.post("/proxy/flip")
 def proxy_flip():
     data = request.get_json(silent=True) or {}
+    log_command("flip", data)
     r = pi_post("/api/flip", data)
     return (r.text, r.status_code, {"Content-Type": r.headers.get("Content-Type", "application/json")})
 
@@ -312,6 +343,23 @@ def proxy_safe_takeoff_set():
     data = request.get_json(silent=True) or {}
     r = pi_post("/api/safety/takeoff", data)
     return (r.text, r.status_code, {"Content-Type": r.headers.get("Content-Type", "application/json")})
+
+
+@app.get("/proxy/logging/commands")
+def proxy_command_log_status():
+    return jsonify(enabled=command_log_enabled)
+
+
+@app.post("/proxy/logging/commands")
+def proxy_command_log_config():
+    global command_log_enabled
+    data = request.get_json(silent=True) or {}
+    enabled = data.get("enabled")
+    if not isinstance(enabled, bool):
+        return jsonify(ok=False, error="enabled must be boolean"), 400
+    command_log_enabled = enabled
+    print(f"[REMOTE CMD] command logging {'enabled' if enabled else 'disabled'}")
+    return jsonify(ok=True, enabled=command_log_enabled)
 
 
 @app.get("/proxy/logging/telemetry")
@@ -339,6 +387,7 @@ def proxy_log_download():
 
 @app.post("/proxy/logging/telemetry/clear")
 def proxy_log_clear():
+    log_command("telemetry_log_clear")
     r = pi_post("/api/logging/telemetry/clear")
     return (r.text, r.status_code, {"Content-Type": r.headers.get("Content-Type", "application/json")})
 
@@ -360,3 +409,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+main()
+n()
