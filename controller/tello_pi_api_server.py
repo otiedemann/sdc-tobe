@@ -204,7 +204,7 @@ def start_discrete_window(seconds: float):
 
 
 def recover_drone():
-    global flying, last_state_seen, TELLO
+    global flying, last_state_seen, TELLO, rc_override, rc_override_until
     old = TELLO
     if old is None:
         return False, "controller not ready"
@@ -235,12 +235,21 @@ def recover_drone():
             t.connect()
             t.streamon()
 
+        # Clear any latent control inputs after crash/recover.
+        with pressed_lock:
+            pressed_web.clear()
+            key_last_seen.clear()
+        with rc_lock:
+            rc_override = None
+            rc_override_until = 0.0
+
         flying = False
-        last_state_seen = time.time()
+        last_state_seen = 0.0
         with conn_lock:
-            conn_state["connected"] = True
+            # Mark disconnected until state packets are actually received.
+            conn_state["connected"] = False
             conn_state["last_reconnect"] = time.time()
-        return True, "recovered"
+        return True, "recovered_waiting_state"
     except Exception as e:
         with conn_lock:
             conn_state["connected"] = False
@@ -271,22 +280,30 @@ def telemetry_loop():
             connected_now = conn_state["connected"]
 
         with telemetry_lock:
-            telemetry["battery"] = _as_int(st.get("bat"))
-            telemetry["temperature"] = temp
-            telemetry["height_cm"] = _as_int(st.get("h"))
-            telemetry["tof_cm"] = _as_int(st.get("tof"))
-            telemetry["barometer_cm"] = _as_int(st.get("baro"))
-            telemetry["flight_time_s"] = _as_int(st.get("time"))
-            telemetry["wifi_snr"] = _as_int(st.get("wifi"))
-            telemetry["pitch"] = _as_int(st.get("pitch"))
-            telemetry["roll"] = _as_int(st.get("roll"))
-            telemetry["yaw"] = _as_int(st.get("yaw"))
-            telemetry["vgx"] = _as_int(st.get("vgx"))
-            telemetry["vgy"] = _as_int(st.get("vgy"))
-            telemetry["vgz"] = _as_int(st.get("vgz"))
-            telemetry["agx"] = _as_int(st.get("agx"))
-            telemetry["agy"] = _as_int(st.get("agy"))
-            telemetry["agz"] = _as_int(st.get("agz"))
+            # Keep last known values when no fresh state arrives, instead of wiping to null.
+            for k, src in (
+                ("battery", "bat"),
+                ("height_cm", "h"),
+                ("tof_cm", "tof"),
+                ("barometer_cm", "baro"),
+                ("flight_time_s", "time"),
+                ("wifi_snr", "wifi"),
+                ("pitch", "pitch"),
+                ("roll", "roll"),
+                ("yaw", "yaw"),
+                ("vgx", "vgx"),
+                ("vgy", "vgy"),
+                ("vgz", "vgz"),
+                ("agx", "agx"),
+                ("agy", "agy"),
+                ("agz", "agz"),
+            ):
+                v = _as_int(st.get(src))
+                if v is not None:
+                    telemetry[k] = v
+            if temp is not None:
+                telemetry["temperature"] = temp
+
             telemetry["flying"] = flying
             telemetry["connected"] = connected_now
             telemetry["updated_at"] = time.time()
@@ -332,9 +349,10 @@ def reconnect_loop():
                     TELLO = Tello(host=TELLO_HOST)
                 TELLO.connect()
                 TELLO.streamon()  # keep stream alive for external UDP forward
-                last_state_seen = time.time()
+                # Wait for telemetry loop to confirm real state packets before marking connected.
+                last_state_seen = 0.0
                 with conn_lock:
-                    conn_state["connected"] = True
+                    conn_state["connected"] = False
             except Exception:
                 pass
         time.sleep(0.8)
