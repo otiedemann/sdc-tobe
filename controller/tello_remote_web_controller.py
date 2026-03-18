@@ -48,6 +48,7 @@ HTML = """
         <button id=\"takeoff\">Takeoff (T)</button>
         <button id=\"land\">Land (L)</button>
         <button id=\"recover\">Recover</button>
+        <button id=\"safe_takeoff\">Safe Takeoff: OFF</button>
       </div>
       <div style=\"margin-top:8px; display:flex; gap:8px; flex-wrap:wrap;\">
         <button id=\"flip_l\">Flip L</button>
