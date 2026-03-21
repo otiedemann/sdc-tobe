@@ -22,7 +22,7 @@ MIN_REF_WEIGHT = 0.00  # Ignore very weak refs, but keep detection usable
 MIN_REF_COUNT = 1  # Allow single-marker pose as fallback
 POSE_HOLD_SEC = 0.8  # Hold last valid pose briefly when refs drop out
 OUTLIER_POS_THRESH = 2.5  # meters: looser outlier reject for real-world noise
-TARGET_Y_OFFSET = 0.0  # add constant offset to target Y output (e.g. +3.0 for absolute arena height)
+TARGET_Y_POS = -1.5  # fixed target Y world position (targets have defined height)
 
 def has_gui():
     system = platform.system().lower()
@@ -277,28 +277,37 @@ class HeadlessAruCoPositioning:
             mid = int(ids.flatten()[idx])
             rvec, tvec = cached_poses[mid]
 
-            # solvePnP result:
-            # X_cam = R_m_c * X_marker + t_m_c
-            # where R_m_c maps marker-frame -> camera-frame
+            # ===================== Pose math (single marker) =====================
+            # solvePnP gives marker->camera transform:
+            #   x_c = R_m_c * x_m + t_m_c
+            #
+            # with:
+            #   R_m_c : marker frame -> camera frame
+            #   t_m_c : marker origin expressed in camera frame
             R_m_c, _ = cv2.Rodrigues(rvec)
             t_m_c = tvec.reshape(3)
 
-            # Fixed marker transform in world (must stay unchanged by request)
+            # Known, fixed marker transform in world:
+            #   x_w = R_m_w * x_m + t_m_w
             R_m_w = self._get_marker_orientation(mid)
             t_m_w = self.marker_positions[mid]
 
-            # Camera origin in marker frame: C_m = -R_m_c^T * t_m_c
+            # Camera origin in marker frame:
+            # set x_c = 0 => 0 = R_m_c * C_m + t_m_c
+            # => C_m = -R_m_c^T * t_m_c
             C_m = -R_m_c.T @ t_m_c
 
-            # Camera position in world frame: C_w = R_m_w * C_m + t_m_w
+            # Camera position in world:
+            #   C_w = R_m_w * C_m + t_m_w
             c_pos_w = (R_m_w @ C_m) + t_m_w
 
-            # Camera rotation in world frame:
-            # R_c_m = R_m_c^T (camera -> marker)
-            # R_c_w = R_m_w * R_c_m (camera -> world)
+            # Camera rotation in world:
+            #   R_c_m = R_m_c^T   (camera -> marker)
+            #   R_c_w = R_m_w * R_c_m
             R_c_w = R_m_w @ R_m_c.T
 
-            # Camera forward direction = +Z axis of camera frame mapped to world
+            # Camera forward vector in world:
+            # d_w = R_c_w * [0,0,1]^T
             c_dir_w = R_c_w @ np.array([0.0, 0.0, 1.0])
             c_dir_norm = np.linalg.norm(c_dir_w)
             if c_dir_norm > 1e-9:
@@ -347,6 +356,10 @@ class HeadlessAruCoPositioning:
             weights = [weights[i] for i in keep]
             ref_marker_ids = [ref_marker_ids[i] for i in keep]
 
+        # ===================== Multi-marker fusion =====================
+        # Weighted mean of per-marker camera position/direction estimates:
+        #   C_w = sum(w_i * C_w_i) / sum(w_i)
+        #   d_w = sum(w_i * d_w_i) / sum(w_i)
         w_arr = np.array(weights) / (sum(weights) + 1e-6)
         raw_pos = sum(p * w for p, w in zip(cam_positions, w_arr))
         raw_dir = sum(d * w for d, w in zip(cam_dirs, w_arr))
@@ -360,7 +373,10 @@ class HeadlessAruCoPositioning:
         f_dir_norm = np.linalg.norm(f_dir)
         if f_dir_norm > 1e-9:
             f_dir = f_dir / f_dir_norm
-        # Use per-reference target projection and weighted fusion (more robust)
+        # ===================== Target projection =====================
+        # For each target pose t_target (in camera frame), project via each ref estimate:
+        #   T_w_i = C_w_i + R_c_w_i * t_target
+        # then weighted fusion across references.
         targets = {}
         w_ref = np.array(weights, dtype=float)
         w_ref = w_ref / (np.sum(w_ref) + 1e-9)
@@ -379,8 +395,10 @@ class HeadlessAruCoPositioning:
             for est, w in zip(target_estimates, w_ref):
                 t_w += est * w
 
-            # Apply configurable Y-offset (useful after origin shift to marker 0)
-            t_w[1] += TARGET_Y_OFFSET
+            # Optional X/Z-only refinement:
+            # reproject each estimate onto fixed target-height plane using weighted average
+            # (Y is physically defined, so keep constant and avoid Y-noise coupling)
+            t_w[1] = TARGET_Y_POS
 
             if tid not in self.target_filters:
                 self.target_filters[tid] = ExponentialMovingAverage(alpha=0.15)
@@ -431,7 +449,7 @@ def main():
     min_ref_count = MIN_REF_COUNT
     outlier_pos_thresh = OUTLIER_POS_THRESH
     pose_hold_sec = POSE_HOLD_SEC
-    target_y_offset = TARGET_Y_OFFSET
+    target_y_pos = TARGET_Y_POS
 
     if '--min-ref-weight' in sys.argv:
         try:
@@ -457,18 +475,18 @@ def main():
         except:
             print("⚠️ Invalid --pose-hold value, using default.")
 
-    if '--target-y-offset' in sys.argv:
+    if '--target-y-pos' in sys.argv:
         try:
-            target_y_offset = float(sys.argv[sys.argv.index('--target-y-offset') + 1])
+            target_y_pos = float(sys.argv[sys.argv.index('--target-y-pos') + 1])
         except:
-            print("⚠️ Invalid --target-y-offset value, using default.")
+            print("⚠️ Invalid --target-y-pos value, using default.")
 
     # Apply runtime tuning globally (used inside process_frame)
     globals()["MIN_REF_WEIGHT"] = min_ref_weight
     globals()["MIN_REF_COUNT"] = max(1, min_ref_count)
     globals()["OUTLIER_POS_THRESH"] = max(0.1, outlier_pos_thresh)
     globals()["POSE_HOLD_SEC"] = max(0.0, pose_hold_sec)
-    globals()["TARGET_Y_OFFSET"] = target_y_offset
+    globals()["TARGET_Y_POS"] = target_y_pos
 
     preview_requested = ('--preview' in sys.argv)
     gui_enabled = preview_requested and has_gui() and ('--force-headless' not in sys.argv)
@@ -490,7 +508,7 @@ def main():
     print(f"📝 Verbose Mode: {'ON' if verbose_mode else 'OFF'}")
     print(f"🔎 Detect Profile: {detect_profile}")
     print(
-        f"⚙️ min_ref_weight={MIN_REF_WEIGHT} min_ref_count={MIN_REF_COUNT} outlier={OUTLIER_POS_THRESH} pose_hold={POSE_HOLD_SEC} target_y_offset={TARGET_Y_OFFSET}")
+        f"⚙️ min_ref_weight={MIN_REF_WEIGHT} min_ref_count={MIN_REF_COUNT} outlier={OUTLIER_POS_THRESH} pose_hold={POSE_HOLD_SEC} target_y_pos={TARGET_Y_POS}")
     print(f"🖥️ Preview Requested: {'YES' if preview_requested else 'NO'}")
     print(f"🖥️ GUI Overlay: {'ON' if gui_enabled else 'OFF'}")
 
