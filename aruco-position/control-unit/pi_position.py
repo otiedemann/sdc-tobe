@@ -22,7 +22,7 @@ MIN_REF_WEIGHT = 0.00  # Ignore very weak refs, but keep detection usable
 MIN_REF_COUNT = 1  # Allow single-marker pose as fallback
 POSE_HOLD_SEC = 0.8  # Hold last valid pose briefly when refs drop out
 OUTLIER_POS_THRESH = 2.5  # meters: looser outlier reject for real-world noise
-TARGET_Y_POS = -1.5  # fixed target Y world position (targets have defined height)
+TARGET_Z_POS = -1.5  # fixed target height position
 
 def has_gui():
     system = platform.system().lower()
@@ -158,18 +158,18 @@ class HeadlessAruCoPositioning:
 
     def _initialize_marker_positions(self):
         pos = {0: np.array([0.0, 0.0, 0.0])}
-        pos[1], pos[2] = np.array([-10.0, -1.0, 6.667]), np.array([-10.0, 1.0, 6.667])
-        pos[3], pos[4] = np.array([-10.0, -1.0, 3.333]), np.array([-10.0, 1.0, 3.333])
-        pos[5], pos[6] = np.array([-6.0, -1.0, 0.0]), np.array([-6.0, 1.0, 0.0])
-        pos[7], pos[8] = np.array([-2.0, -1.0, 0.0]), np.array([-2.0, 1.0, 0.0])
-        pos[9], pos[10] = np.array([2.0, -1.0, 0.0]), np.array([2.0, 1.0, 0.0])
-        pos[11], pos[12] = np.array([6.0, -1.0, 0.0]), np.array([6.0, 1.0, 0.0])
-        pos[13], pos[14] = np.array([10.0, -1.0, 3.333]), np.array([10.0, 1.0, 3.333])
-        pos[15], pos[16] = np.array([10.0, -1.0, 6.667]), np.array([10.0, 1.0, 6.667])
-        pos[17], pos[18] = np.array([6.0, -1.0, 10.0]), np.array([6.0, 1.0, 10.0])
-        pos[19], pos[20] = np.array([2.0, -1.0, 10.0]), np.array([2.0, 1.0, 10.0])
-        pos[21], pos[22] = np.array([-2.0, -1.0, 10.0]), np.array([-2.0, 1.0, 10.0])
-        pos[23], pos[24] = np.array([-6.0, -1.0, 10.0]), np.array([-6.0, 1.0, 10.0])
+        pos[1], pos[2] = np.array([-10.0, 6.667, -1.0]), np.array([-10.0, 6.667, 1.0])
+        pos[3], pos[4] = np.array([-10.0, 3.333, -1.0]), np.array([-10.0, 3.333, 1.0])
+        pos[5], pos[6] = np.array([-6.0, 0.0, -1.0]), np.array([-6.0, 0.0, 1.0])
+        pos[7], pos[8] = np.array([-2.0, 0.0, -1.0]), np.array([-2.0, 0.0, 1.0])
+        pos[9], pos[10] = np.array([2.0, 0.0, -1.0]), np.array([2.0, 0.0, 1.0])
+        pos[11], pos[12] = np.array([6.0, 0.0, -1.0]), np.array([6.0, 0.0, 1.0])
+        pos[13], pos[14] = np.array([10.0, 3.333, -1.0]), np.array([10.0, 3.333, 1.0])
+        pos[15], pos[16] = np.array([10.0, 6.667, -1.0]), np.array([10.0, 6.667, 1.0])
+        pos[17], pos[18] = np.array([6.0, 10.0, -1.0]), np.array([6.0, 10.0, 1.0])
+        pos[19], pos[20] = np.array([2.0, 10.0, -1.0]), np.array([2.0, 10.0, 1.0])
+        pos[21], pos[22] = np.array([-2.0, 10.0, -1.0]), np.array([-2.0, 10.0, 1.0])
+        pos[23], pos[24] = np.array([-6.0, 10.0, -1.0]), np.array([-6.0, 10.0, 1.0])
         return pos
 
     def _initialize_marker_wall_types(self):
@@ -395,10 +395,8 @@ class HeadlessAruCoPositioning:
             for est, w in zip(target_estimates, w_ref):
                 t_w += est * w
 
-            # Optional X/Z-only refinement:
-            # reproject each estimate onto fixed target-height plane using weighted average
-            # (Y is physically defined, so keep constant and avoid Y-noise coupling)
-            t_w[1] = TARGET_Y_POS
+            # Keep target on fixed height axis (legacy math axis naming retained in script)
+            t_w[1] = TARGET_Z_POS
 
             if tid not in self.target_filters:
                 self.target_filters[tid] = ExponentialMovingAverage(alpha=0.15)
@@ -449,7 +447,7 @@ def main():
     min_ref_count = MIN_REF_COUNT
     outlier_pos_thresh = OUTLIER_POS_THRESH
     pose_hold_sec = POSE_HOLD_SEC
-    target_y_pos = TARGET_Y_POS
+    target_z_pos = TARGET_Z_POS
 
     if '--min-ref-weight' in sys.argv:
         try:
@@ -475,18 +473,18 @@ def main():
         except:
             print("⚠️ Invalid --pose-hold value, using default.")
 
-    if '--target-y-pos' in sys.argv:
+    if '--target-z-pos' in sys.argv:
         try:
-            target_y_pos = float(sys.argv[sys.argv.index('--target-y-pos') + 1])
+            target_z_pos = float(sys.argv[sys.argv.index('--target-z-pos') + 1])
         except:
-            print("⚠️ Invalid --target-y-pos value, using default.")
+            print("⚠️ Invalid --target-z-pos value, using default.")
 
     # Apply runtime tuning globally (used inside process_frame)
     globals()["MIN_REF_WEIGHT"] = min_ref_weight
     globals()["MIN_REF_COUNT"] = max(1, min_ref_count)
     globals()["OUTLIER_POS_THRESH"] = max(0.1, outlier_pos_thresh)
     globals()["POSE_HOLD_SEC"] = max(0.0, pose_hold_sec)
-    globals()["TARGET_Y_POS"] = target_y_pos
+    globals()["TARGET_Z_POS"] = target_z_pos
 
     preview_requested = ('--preview' in sys.argv)
     gui_enabled = preview_requested and has_gui() and ('--force-headless' not in sys.argv)
@@ -508,7 +506,7 @@ def main():
     print(f"📝 Verbose Mode: {'ON' if verbose_mode else 'OFF'}")
     print(f"🔎 Detect Profile: {detect_profile}")
     print(
-        f"⚙️ min_ref_weight={MIN_REF_WEIGHT} min_ref_count={MIN_REF_COUNT} outlier={OUTLIER_POS_THRESH} pose_hold={POSE_HOLD_SEC} target_y_pos={TARGET_Y_POS}")
+        f"⚙️ min_ref_weight={MIN_REF_WEIGHT} min_ref_count={MIN_REF_COUNT} outlier={OUTLIER_POS_THRESH} pose_hold={POSE_HOLD_SEC} target_z_pos={TARGET_Z_POS}")
     print(f"🖥️ Preview Requested: {'YES' if preview_requested else 'NO'}")
     print(f"🖥️ GUI Overlay: {'ON' if gui_enabled else 'OFF'}")
 
