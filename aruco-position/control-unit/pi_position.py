@@ -439,7 +439,7 @@ class HeadlessAruCoPositioning:
                 t_w += est * w
 
             # Keep target on fixed height axis (arena Y)
-            t_w[1] = TARGET_Z_POS
+            t_w[2] = TARGET_Z_POS
 
             if tid not in self.target_filters:
                 self.target_filters[tid] = ExponentialMovingAverage(alpha=0.15)
