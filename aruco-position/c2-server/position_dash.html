@@ -141,25 +141,25 @@
     controls.update();
 
     // Arena Visuals
-    // Box: X [-10..10], Y [-3..3], Z [0..10]  => center at (0,0,5)
+    // Box: X [-10..10], Y [0..10], Z [-3..3]  => center at (0,5,0)
     const arenaLine = new THREE.LineSegments(
-        new THREE.EdgesGeometry(new THREE.BoxGeometry(20, 6, 10)),
+        new THREE.EdgesGeometry(new THREE.BoxGeometry(20, 10, 6)),
         new THREE.LineBasicMaterial({color: 0x666666})
     );
-    arenaLine.position.set(0, 0, 5);
+    arenaLine.position.set(0, 5, 0);
     scene.add(arenaLine);
 
     // Floor grid aligned EXACTLY to arena footprint:
-    // X in [-10..10], Z in [0..10], Y = -3
-    function createRectGrid(xMin, xMax, zMin, zMax, step, y, color = 0x2c2c2c) {
+    // X in [-10..10], Y in [0..10], Z = -3
+    function createRectGrid(xMin, xMax, yMin, yMax, step, z, color = 0x2c2c2c) {
         const points = [];
-        // lines parallel to X (vary Z)
-        for (let z = zMin; z <= zMax + 1e-9; z += step) {
+        // lines parallel to X (vary Y)
+        for (let y = yMin; y <= yMax + 1e-9; y += step) {
             points.push(new THREE.Vector3(xMin, y, z), new THREE.Vector3(xMax, y, z));
         }
         // lines parallel to Z (vary X)
         for (let x = xMin; x <= xMax + 1e-9; x += step) {
-            points.push(new THREE.Vector3(x, y, zMin), new THREE.Vector3(x, y, zMax));
+            points.push(new THREE.Vector3(x, yMin, z), new THREE.Vector3(x, yMax, z));
         }
         const geom = new THREE.BufferGeometry().setFromPoints(points);
         const mat = new THREE.LineBasicMaterial({color});
@@ -169,16 +169,16 @@
     const floorGrid = createRectGrid(-10, 10, 0, 10, 1, -3, 0x303030);
     scene.add(floorGrid);
 
-    // Back-wall grid at Z=0 (X in [-10..10], Y in [-3..3])
-    function createBackWallGrid(xMin, xMax, yMin, yMax, step, z, color = 0x2e2e2e) {
+    // Back-wall grid at Y=0 (X in [-10..10], Z in [-3..3])
+    function createBackWallGrid(xMin, xMax, zMin, zMax, step, y, color = 0x2e2e2e) {
         const points = [];
         // horizontal lines (vary Y)
-        for (let y = yMin; y <= yMax + 1e-9; y += step) {
+        for (let z = zMin; z <= zMax + 1e-9; z += step) {
             points.push(new THREE.Vector3(xMin, y, z), new THREE.Vector3(xMax, y, z));
         }
         // vertical lines (vary X)
         for (let x = xMin; x <= xMax + 1e-9; x += step) {
-            points.push(new THREE.Vector3(x, yMin, z), new THREE.Vector3(x, yMax, z));
+            points.push(new THREE.Vector3(x, y, zMin), new THREE.Vector3(x, y, zMax));
         }
         const geom = new THREE.BufferGeometry().setFromPoints(points);
         const mat = new THREE.LineBasicMaterial({color});
