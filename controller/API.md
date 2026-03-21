@@ -1,6 +1,6 @@
 # Tello Control API (Pi Server)
 
-This documents the API exposed by `controller/tello_pi_api_server.py`.
+This documents the API exposed by `controller/tello_pi_api_server.py` and the key runtime environment variables.
 
 ## Base URL
 
@@ -9,6 +9,28 @@ This documents the API exposed by `controller/tello_pi_api_server.py`.
 Use JSON for POST requests:
 
 `Content-Type: application/json`
+
+---
+
+## Runtime configuration (Environment Variables)
+
+All env vars are optional.
+
+- `API_COMMAND_LOG` (bool-ish, default: `1`)
+  - Enable command logging on the API server for incoming `/api/*` POST control requests.
+- `API_COMMAND_LOG_PATH` (path, default: `controller/api_command_log.jsonl`)
+  - Command log file path on the API server host.
+- `TELEMETRY_HZ` (float, default: `2.0`)
+  - Telemetry polling/logging loop rate in Hz.
+  - Example: `TELEMETRY_HZ=5` for 5 Hz.
+- `KEY_STALE_S` (float, default: `1.0`)
+  - Stale-key timeout (deadman release). If key-down keepalive stops for longer than this timeout, key is auto-released server-side.
+
+### Fixed in code (not env-configurable currently)
+- `TELLO_HOST = "192.168.10.1"`
+- `HTTP_HOST = "0.0.0.0"`
+- `HTTP_PORT = 8080`
+- `RC_HZ = 20`
 
 ---
 
@@ -46,6 +68,10 @@ Release a key in the controller state machine.
 - Movement: `w a s d r f q e`
 - Actions: `t` (takeoff), `l` (land), `x` / `space` (stop)
 
+### Reliability behavior
+- Remote UI sends held-key keepalive updates.
+- Server uses stale-key timeout (`KEY_STALE_S`) to auto-release stuck keys.
+
 ---
 
 ## 3) High-level Flight Actions
@@ -80,6 +106,13 @@ Allowed `dir`: `l`, `r`, `f`, `b`
 ```json
 { "ok": true, "dir": "l" }
 ```
+
+### Flip guardrails
+Flip can return `409` with explicit safety errors:
+- `flip_blocked_takeoff_cooldown`
+- `flip_requires_flying`
+- `flip_requires_battery_50_plus`
+- `flip_requires_low_horizontal_speed`
 
 ---
 
@@ -118,7 +151,7 @@ Applies a temporary RC command override.
 ## 5) Recovery
 
 ### `POST /api/recover`
-Triggers crash/disconnect recovery flow (stop RC, try land, reconnect, restore control).
+Triggers crash/disconnect recovery flow (neutral RC, try land, reconnect, restore control).
 
 **Response**
 ```json
@@ -141,7 +174,7 @@ Returns latest telemetry snapshot.
   "tof_cm": 45,
   "barometer_cm": 1023,
   "flight_time_s": 38,
-  "wifi_snr": null,
+  "wifi_snr": -56,
   "pitch": 0,
   "roll": 1,
   "yaw": 90,
@@ -168,7 +201,117 @@ data: { ...telemetry json... }
 
 ---
 
-## 7) Quick `curl` Examples
+## 7) API Command Logging
+
+### `GET /api/logging/commands`
+Command logging status/path on API server.
+
+### `GET /api/logging/commands/download`
+Download API-server command log (`jsonl`).
+
+### `POST /api/logging/commands/clear`
+Clear API-server command log file.
+
+---
+
+## 8) Telemetry Logging
+
+### `GET /api/logging/telemetry`
+Read telemetry logging config.
+
+**Response**
+```json
+{ "enabled": false, "path": "/.../telemetry_log.jsonl" }
+```
+
+### `POST /api/logging/telemetry`
+Update telemetry logging config.
+
+**Body example**
+```json
+{ "enabled": true, "path": "/tmp/telemetry_log.jsonl" }
+```
+
+### `GET /api/logging/telemetry/download`
+Download current telemetry log file (`jsonl`/`ndjson`).
+
+### `POST /api/logging/telemetry/clear`
+Truncate/clear telemetry log file.
+
+**Response**
+```json
+{ "ok": true, "cleared": true, "path": "/.../telemetry_log.jsonl" }
+```
+
+---
+
+## 8) Advanced SDK Control Endpoints
+
+### `POST /api/emergency`
+Immediate motor stop (dangerous; emergency use only).
+
+### `POST /api/speed`
+Set drone speed.
+
+Body:
+```json
+{ "speed": 30 }
+```
+
+### `POST /api/move`
+Discrete move command.
+
+Body:
+```json
+{ "dir": "forward", "cm": 30 }
+```
+`dir`: `up|down|left|right|forward|back`
+
+### `POST /api/rotate`
+Discrete rotation command.
+
+Body:
+```json
+{ "dir": "cw", "deg": 45 }
+```
+`dir`: `cw|ccw`
+
+### `POST /api/go`
+Go XYZ speed command.
+
+Body:
+```json
+{ "x": 50, "y": 0, "z": 0, "speed": 20 }
+```
+
+### `POST /api/curve`
+Curve XYZ speed command.
+
+Body:
+```json
+{ "x1": 20, "y1": 0, "z1": 0, "x2": 40, "y2": 10, "z2": 0, "speed": 20 }
+```
+
+### `POST /api/stream`
+Control video stream state.
+
+Body:
+```json
+{ "action": "on" }
+```
+`action`: `on|off`
+
+### `POST /api/sdk`
+Raw SDK passthrough for advanced commands.
+
+Body:
+```json
+{ "command": "battery?" }
+```
+
+---
+
+## 9) Quick `curl` Examples
 
 ```bash
 # takeoff
@@ -189,6 +332,14 @@ curl -X POST http://<PI_IP>:8080/api/rc \
 
 # telemetry snapshot
 curl http://<PI_IP>:8080/api/telemetry
+
+# enable telemetry logging
+curl -X POST http://<PI_IP>:8080/api/logging/telemetry \
+  -H "Content-Type: application/json" \
+  -d '{"enabled":true}'
+
+# clear telemetry log
+curl -X POST http://<PI_IP>:8080/api/logging/telemetry/clear
 
 # recover
 curl -X POST http://<PI_IP>:8080/api/recover
