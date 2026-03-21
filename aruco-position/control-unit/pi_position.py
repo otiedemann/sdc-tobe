@@ -22,7 +22,7 @@ MIN_REF_WEIGHT = 0.00  # Ignore very weak refs, but keep detection usable
 MIN_REF_COUNT = 1  # Allow single-marker pose as fallback
 POSE_HOLD_SEC = 0.8  # Hold last valid pose briefly when refs drop out
 OUTLIER_POS_THRESH = 2.5  # meters: looser outlier reject for real-world noise
-TARGET_Z_POS = -1.5  # fixed target height position
+TARGET_Z_POS = -1.5  # fixed target height position (internal Z axis)
 
 
 def has_gui():
@@ -99,12 +99,7 @@ class HeadlessAruCoPositioning:
         self._apply_detection_profile(detect_profile)
         self.detector = aruco.ArucoDetector(self.aruco_dict, self.aruco_params)
         self.marker_positions = self._initialize_marker_positions()
-        self._wall_rotations = {
-            'front': np.array([[1, 0, 0], [0, 1, 0], [0, 0, 1]], dtype=float),
-            'back': np.array([[-1, 0, 0], [0, -1, 0], [0, 0, 1]], dtype=float),
-            'left': np.array([[0, -1, 0], [1, 0, 0], [0, 0, 1]], dtype=float),
-            'right': np.array([[0, 1, 0], [-1, 0, 0], [0, 0, 1]], dtype=float)
-        }
+        self._wall_rotations = self._initialize_wall_rotations()
         # IMPORTANT: Explicit wall mapping by marker ID (robust against axis/coordinate refactors)
         self.marker_wall_type = self._initialize_marker_wall_types()
         self.kf_pos = [KalmanFilter1D() for _ in range(3)]
@@ -156,6 +151,43 @@ class HeadlessAruCoPositioning:
             p.errorCorrectionRate = 0.6
             p.minCornerDistanceRate = 0.05
             p.minDistanceToBorder = 5
+
+    @staticmethod
+    def _rotz(theta_deg):
+        t = np.deg2rad(theta_deg)
+        c, s = np.cos(t), np.sin(t)
+        return np.array([
+            [c, -s, 0.0],
+            [s, c, 0.0],
+            [0.0, 0.0, 1.0],
+        ], dtype=float)
+
+    def _initialize_wall_rotations(self):
+        """
+        World orientation of each wall marker frame (marker -> world).
+
+        Baseline convention with current marker coordinates:
+        - front wall markers define the base frame
+        - back wall is +180° about world Z
+        - right wall is -90° about world Z
+        - left wall is +90° about world Z
+
+        If your printed marker local axes differ from this baseline,
+        adjust front_base_rot once and the other walls follow consistently.
+        """
+        front_base_rot = np.array([
+            [-1, 0, 0],
+            [0, 0, 1],
+            [0, 1, 0],
+        ], dtype=float)
+        # Important: wall yaw is a WORLD-frame rotation relative to front.
+        # Therefore pre-multiply: R_wall = Rz(yaw_world) @ front_base_rot
+        return {
+            'front': front_base_rot,
+            'back': self._rotz(180.0) @ front_base_rot,
+            'left': self._rotz(-90.0) @ front_base_rot,
+            'right': self._rotz(90.0) @ front_base_rot,
+        }
 
     def _initialize_marker_positions(self):
         pos = {0: np.array([0.0, 0.0, 0.0])}
@@ -303,8 +335,9 @@ class HeadlessAruCoPositioning:
             c_pos_w = (R_m_w @ C_m) + t_m_w
 
             # Camera rotation in world:
-            #   R_c_m = R_m_c^T   (camera -> marker)
-            #   R_c_w = R_m_w * R_c_m
+            #   solvePnP: x_c = R_m_c x_m + t_m_c  (marker -> camera)
+            #   so camera->marker is R_c_m = R_m_c^T
+            #   and camera->world is R_c_w = R_m_w @ R_c_m
             R_c_w = R_m_w @ R_m_c.T
 
             # Camera forward vector in world:
@@ -396,7 +429,7 @@ class HeadlessAruCoPositioning:
             for est, w in zip(target_estimates, w_ref):
                 t_w += est * w
 
-            # Keep target on fixed height axis (legacy math axis naming retained in script)
+            # Keep target on fixed height axis (arena Y)
             t_w[1] = TARGET_Z_POS
 
             if tid not in self.target_filters:
