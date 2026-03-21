@@ -24,6 +24,7 @@ POSE_HOLD_SEC = 0.8  # Hold last valid pose briefly when refs drop out
 OUTLIER_POS_THRESH = 2.5  # meters: looser outlier reject for real-world noise
 TARGET_Z_POS = -1.5  # fixed target height position
 
+
 def has_gui():
     system = platform.system().lower()
     if system == "windows":
@@ -98,28 +99,11 @@ class HeadlessAruCoPositioning:
         self._apply_detection_profile(detect_profile)
         self.detector = aruco.ArucoDetector(self.aruco_dict, self.aruco_params)
         self.marker_positions = self._initialize_marker_positions()
-
-        # World axes were changed in _initialize_marker_positions by swapping X <-> Z.
-        # The original wall rotations were defined in the old axis basis and must be
-        # transformed into the new basis to keep pose math consistent.
-        #
-        # Basis transform (new = P * old) with X<->Z swap:
-        #   [x_new, y_new, z_new]^T = P * [x_old, y_old, z_old]^T
-        # where P is its own inverse.
-        self._axis_swap_xz = np.array([
-            [0.0, 0.0, 1.0],
-            [0.0, 1.0, 0.0],
-            [1.0, 0.0, 0.0],
-        ])
-
-        old_wall_rotations = {
-            'back': np.eye(3),
-            'front': np.array([[-1, 0, 0], [0, 1, 0], [0, 0, -1]]),
-            'left': np.array([[0, 0, 1], [0, 1, 0], [-1, 0, 0]]),
-            'right': np.array([[0, 0, -1], [0, 1, 0], [1, 0, 0]])
-        }
         self._wall_rotations = {
-            k: self._axis_swap_xz @ R @ self._axis_swap_xz for k, R in old_wall_rotations.items()
+            'front': np.array([[1, 0, 0], [0, 1, 0], [0, 0, 1]], dtype=float),
+            'back': np.array([[-1, 0, 0], [0, -1, 0], [0, 0, 1]], dtype=float),
+            'left': np.array([[0, -1, 0], [1, 0, 0], [0, 0, 1]], dtype=float),
+            'right': np.array([[0, 1, 0], [-1, 0, 0], [0, 0, 1]], dtype=float)
         }
         # IMPORTANT: Explicit wall mapping by marker ID (robust against axis/coordinate refactors)
         self.marker_wall_type = self._initialize_marker_wall_types()
@@ -175,18 +159,18 @@ class HeadlessAruCoPositioning:
 
     def _initialize_marker_positions(self):
         pos = {0: np.array([0.0, 0.0, 0.0])}
-        pos[1], pos[2] = np.array([-10.0, 6.667, -1.0]), np.array([-10.0, 6.667, 1.0])
-        pos[3], pos[4] = np.array([-10.0, 3.333, -1.0]), np.array([-10.0, 3.333, 1.0])
-        pos[5], pos[6] = np.array([-6.0, 0.0, -1.0]), np.array([-6.0, 0.0, 1.0])
-        pos[7], pos[8] = np.array([-2.0, 0.0, -1.0]), np.array([-2.0, 0.0, 1.0])
-        pos[9], pos[10] = np.array([2.0, 0.0, -1.0]), np.array([2.0, 0.0, 1.0])
-        pos[11], pos[12] = np.array([6.0, 0.0, -1.0]), np.array([6.0, 0.0, 1.0])
-        pos[13], pos[14] = np.array([10.0, 3.333, -1.0]), np.array([10.0, 3.333, 1.0])
-        pos[15], pos[16] = np.array([10.0, 6.667, -1.0]), np.array([10.0, 6.667, 1.0])
-        pos[17], pos[18] = np.array([6.0, 10.0, -1.0]), np.array([6.0, 10.0, 1.0])
-        pos[19], pos[20] = np.array([2.0, 10.0, -1.0]), np.array([2.0, 10.0, 1.0])
-        pos[21], pos[22] = np.array([-2.0, 10.0, -1.0]), np.array([-2.0, 10.0, 1.0])
-        pos[23], pos[24] = np.array([-6.0, 10.0, -1.0]), np.array([-6.0, 10.0, 1.0])
+        pos[1], pos[2] = np.array([10.0, 6.667, -1.0]), np.array([10.0, 6.667, 1.0])
+        pos[3], pos[4] = np.array([10.0, 3.333, -1.0]), np.array([10.0, 3.333, 1.0])
+        pos[5], pos[6] = np.array([6.0, 0.0, -1.0]), np.array([6.0, 0.0, 1.0])
+        pos[7], pos[8] = np.array([2.0, 0.0, -1.0]), np.array([2.0, 0.0, 1.0])
+        pos[9], pos[10] = np.array([-2.0, 0.0, -1.0]), np.array([-2.0, 0.0, 1.0])
+        pos[11], pos[12] = np.array([-6.0, 0.0, -1.0]), np.array([-6.0, 0.0, 1.0])
+        pos[13], pos[14] = np.array([-10.0, 3.333, -1.0]), np.array([-10.0, 3.333, 1.0])
+        pos[15], pos[16] = np.array([-10.0, 6.667, -1.0]), np.array([-10.0, 6.667, 1.0])
+        pos[17], pos[18] = np.array([-6.0, 10.0, -1.0]), np.array([-6.0, 10.0, 1.0])
+        pos[19], pos[20] = np.array([-2.0, 10.0, -1.0]), np.array([-2.0, 10.0, 1.0])
+        pos[21], pos[22] = np.array([2.0, 10.0, -1.0]), np.array([2.0, 10.0, 1.0])
+        pos[23], pos[24] = np.array([6.0, 10.0, -1.0]), np.array([6.0, 10.0, 1.0])
         return pos
 
     def _initialize_marker_wall_types(self):
@@ -203,13 +187,13 @@ class HeadlessAruCoPositioning:
         mapping = {}
 
         for mid in [0, 5, 6, 7, 8, 9, 10, 11, 12]:
-            mapping[mid] = 'back'
-        for mid in [17, 18, 19, 20, 21, 22, 23, 24]:
             mapping[mid] = 'front'
+        for mid in [17, 18, 19, 20, 21, 22, 23, 24]:
+            mapping[mid] = 'back'
         for mid in [1, 2, 3, 4]:
-            mapping[mid] = 'left'
-        for mid in [13, 14, 15, 16]:
             mapping[mid] = 'right'
+        for mid in [13, 14, 15, 16]:
+            mapping[mid] = 'left'
 
         return mapping
 
