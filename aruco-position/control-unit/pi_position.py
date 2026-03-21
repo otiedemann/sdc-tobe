@@ -166,20 +166,29 @@ class HeadlessAruCoPositioning:
         """
         World orientation of each wall marker frame (marker -> world).
 
-        Baseline convention with current marker coordinates:
-        - front wall markers define the base frame
-        - back wall is +180° about world Z
-        - right wall is -90° about world Z
-        - left wall is +90° about world Z
+        Chosen front base mapping (validated in live tests):
+        - marker X -> world -X
+        - marker Y -> world +Z
+        - marker Z -> world +Y
 
-        If your printed marker local axes differ from this baseline,
-        adjust front_base_rot once and the other walls follow consistently.
+        This gives the expected arena output behavior (front viewed from inside),
+        while staying a proper rotation (right-handed): det(front_base_rot) = +1.
+
+        Wall rotations are applied around WORLD Z relative to front:
+        - back  = +180°
+        - left  = -90°
+        - right = +90°
+
+        If marker print orientation changes in the future, adjust ONLY front_base_rot.
         """
         front_base_rot = np.array([
             [-1, 0, 0],
             [0, 0, 1],
             [0, 1, 0],
         ], dtype=float)
+        # Safety check: must stay a pure rotation (no mirror/reflection).
+        if np.linalg.det(front_base_rot) < 0.0:
+            raise ValueError("front_base_rot is left-handed (det<0). Use a proper rotation matrix.")
         # Important: wall yaw is a WORLD-frame rotation relative to front.
         # Therefore pre-multiply: R_wall = Rz(yaw_world) @ front_base_rot
         return {
