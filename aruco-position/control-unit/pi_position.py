@@ -98,11 +98,28 @@ class HeadlessAruCoPositioning:
         self._apply_detection_profile(detect_profile)
         self.detector = aruco.ArucoDetector(self.aruco_dict, self.aruco_params)
         self.marker_positions = self._initialize_marker_positions()
-        self._wall_rotations = {
+
+        # World axes were changed in _initialize_marker_positions by swapping X <-> Z.
+        # The original wall rotations were defined in the old axis basis and must be
+        # transformed into the new basis to keep pose math consistent.
+        #
+        # Basis transform (new = P * old) with X<->Z swap:
+        #   [x_new, y_new, z_new]^T = P * [x_old, y_old, z_old]^T
+        # where P is its own inverse.
+        self._axis_swap_xz = np.array([
+            [0.0, 0.0, 1.0],
+            [0.0, 1.0, 0.0],
+            [1.0, 0.0, 0.0],
+        ])
+
+        old_wall_rotations = {
             'back': np.eye(3),
             'front': np.array([[-1, 0, 0], [0, 1, 0], [0, 0, -1]]),
             'left': np.array([[0, 0, 1], [0, 1, 0], [-1, 0, 0]]),
             'right': np.array([[0, 0, -1], [0, 1, 0], [1, 0, 0]])
+        }
+        self._wall_rotations = {
+            k: self._axis_swap_xz @ R @ self._axis_swap_xz for k, R in old_wall_rotations.items()
         }
         # IMPORTANT: Explicit wall mapping by marker ID (robust against axis/coordinate refactors)
         self.marker_wall_type = self._initialize_marker_wall_types()
