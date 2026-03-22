@@ -5,10 +5,10 @@ Simulator for Tello-like control API (`API.md`) + UDP output compatible with `pi
 ## What it does
 
 - Exposes HTTP API on `:8080` with core endpoints:
-    - `POST /api/key_down`, `POST /api/key_up`
-    - `POST /api/takeoff`, `POST /api/land`
-    - `POST /api/rc`, `POST /api/recover`, `POST /api/flip`
-    - `GET /api/telemetry`
+  - `POST /api/key_down`, `POST /api/key_up`
+  - `POST /api/takeoff`, `POST /api/land`
+  - `POST /api/rc`, `POST /api/recover`, `POST /api/flip`
+  - `GET /api/telemetry`
 - Emits UDP JSON stream (`cam`, `dir`, `targets`, `debug`) to dashboard/relay (default `127.0.0.1:5005`).
 
 ## Config format
@@ -23,7 +23,7 @@ See `sim_config.example.json`.
 
 ```bash
 cd /home/openclaw/.openclaw/workspace/sdc26/drone-sim
-python3 sim_server.py --config sim_config_sdc26.json --udp-ip 127.0.0.1 --udp-port 5005
+python3 sim_server.py --config sim_config.example.json --udp-ip 127.0.0.1 --udp-port 5005
 ```
 
 Optional flags:
