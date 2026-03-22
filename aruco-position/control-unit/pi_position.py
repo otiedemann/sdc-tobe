@@ -94,7 +94,7 @@ class HeadlessAruCoPositioning:
         self.camera_matrix = camera_matrix
         self.dist_coeffs = dist_coeffs
         self.marker_size = MARKER_SIZE
-        self.aruco_dict = aruco.getPredefinedDictionary(aruco.DICT_4X4_50)
+        self.aruco_dict = aruco.getPredefinedDictionary(aruco.DICT_4X4_100)
         self.aruco_params = aruco.DetectorParameters()
         self._apply_detection_profile(detect_profile)
         self.detector = aruco.ArucoDetector(self.aruco_dict, self.aruco_params)
