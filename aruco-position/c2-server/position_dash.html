@@ -235,6 +235,31 @@
     let selectedDebugIp = null; // only show image of this node
     let debugActive = false;
 
+    function getTargetColorById(tid) {
+        const idNum = Number.parseInt(tid, 10);
+        if (!Number.isFinite(idNum)) return 0xff00ff; // fallback
+        if (idNum >= 60 && idNum <= 69) return 0x0066ff; // blue
+        if (idNum >= 70 && idNum <= 79) return 0xff3333; // red
+        return 0xff00ff; // default for other IDs
+    }
+
+    function createTargetMarker(tid, colorHex) {
+        const marker = new THREE.Group();
+
+        const dot = new THREE.Mesh(
+            new THREE.SphereGeometry(0.25),
+            new THREE.MeshBasicMaterial({color: colorHex})
+        );
+        marker.add(dot);
+
+        const idLabel = createTextSprite(String(tid), '#ffffff');
+        idLabel.scale.set(0.9, 0.45, 1);
+        idLabel.position.set(0, 0.55, 0);
+        marker.add(idLabel);
+
+        return marker;
+    }
+
     // WebSocket Setup
     const ws = new WebSocket(`ws://${window.location.hostname}:8000/ws`);
 
@@ -393,9 +418,15 @@
 
             for (const [tid, tPos] of Object.entries(nodeData.targets || {})) {
                 const key = `${ip}_${tid}`;
+                const targetColor = getTargetColorById(tid);
                 if (!targets[key]) {
-                    targets[key] = new THREE.Mesh(new THREE.SphereGeometry(0.25), new THREE.MeshBasicMaterial({color: 0xff00ff}));
+                    targets[key] = createTargetMarker(tid, targetColor);
                     scene.add(targets[key]);
+                } else {
+                    const dot = targets[key].children[0];
+                    if (dot?.material?.color) {
+                        dot.material.color.setHex(targetColor);
+                    }
                 }
                 targets[key].position.copy(toViz(tPos[0], tPos[1], tPos[2]));
             }
