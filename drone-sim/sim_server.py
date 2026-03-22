@@ -24,7 +24,7 @@ MAX_SPEED_MPS = 2.0  # when rc=100
 MAX_YAW_DPS = 120.0  # when yaw=100
 KEY_VEL_MPS = 0.8  # key-hold translational speed
 KEY_YAW_DPS = 60.0  # key-hold yaw speed
-TAKEOFF_Z = 1.2
+TAKEOFF_Z = -1.5
 
 
 @dataclass
@@ -123,9 +123,9 @@ class DroneSimulator:
 
         keys = st.key_down
         if "a" in keys:
-            lr -= 40
-        if "d" in keys:
             lr += 40
+        if "d" in keys:
+            lr -= 40
         if "w" in keys:
             fb += 40
         if "s" in keys:
@@ -135,9 +135,9 @@ class DroneSimulator:
         if "f" in keys:
             ud -= 40
         if "q" in keys:
-            yaw -= 40
-        if "e" in keys:
             yaw += 40
+        if "e" in keys:
+            yaw -= 40
 
         # stop keys
         if "x" in keys or "space" in keys:
@@ -206,6 +206,7 @@ class DroneSimulator:
                 "agz": 1000,
                 "flying": st.flying,
                 "connected": st.connected,
+                "state_fresh": True,
                 "updated_at": time.time(),
             }
 
@@ -285,7 +286,7 @@ class ApiHandler(BaseHTTPRequestHandler):
                         st.z = TAKEOFF_Z
                 elif key == "l":
                     st.flying = False
-                    st.z = 0.0
+                    st.z = -3.0
                 elif key in ("x", "space"):
                     st.rc_override = RcOverride()
                 return self._send_json(HTTPStatus.OK, {"ok": True, "key": key})
@@ -305,7 +306,7 @@ class ApiHandler(BaseHTTPRequestHandler):
 
             if p == "/api/land":
                 st.flying = False
-                st.z = 0.0
+                st.z = -3.0
                 return self._send_json(HTTPStatus.OK, {"ok": True, "flying": False})
 
             if p == "/api/rc":
