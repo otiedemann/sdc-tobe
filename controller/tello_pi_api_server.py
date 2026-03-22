@@ -90,9 +90,11 @@ def load_wifi_config():
         data = json.loads(WIFI_CFG_PATH.read_text())
         ssid = str(data.get("ssid", "")).strip()
         password = str(data.get("password", "")).strip()
+        ifname = str(data.get("ifname", "")).strip()
+        sudo = data.get("sudo", False)
         if not ssid or not password:
             return None
-        return {"ssid": ssid, "password": password}
+        return {"ssid": ssid, "password": password, "ifname": ifname, "sudo": sudo}
     except Exception:
         return None
 
@@ -126,11 +128,17 @@ def wifi_connect_loop():
 
         ssid = cfg["ssid"]
         password = cfg["password"]
+        ifname = cfg["ifname"]
         if wifi_connected_to(ssid):
             time.sleep(WIFI_RETRY_S)
             continue
 
-        _run(["nmcli", "dev", "wifi", "connect", ssid, "password", password])
+        if cfg.get("sudo"):
+            # print(f"[PI API] Connecting to WiFi {ssid} ifname {ifname} (sudo)...")
+            _run(["sudo", "nmcli", "dev", "wifi", "connect", ssid, "password", password, "ifname", ifname])
+        else:
+            # print(f"[PI API] Connecting to WiFi {ssid} ifname {ifname}...")
+            _run(["nmcli", "dev", "wifi", "connect", ssid, "password", password, "ifname", ifname])
         time.sleep(WIFI_RETRY_S)
 
 
