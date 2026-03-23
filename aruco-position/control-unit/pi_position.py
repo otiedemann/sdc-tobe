@@ -9,6 +9,11 @@ import cv2
 import numpy as np
 from cv2 import aruco
 
+try:
+    from djitellopy import Tello
+except Exception:
+    Tello = None
+
 # --- CONFIGURATION ---
 UDP_DEST_IP = "127.0.0.1"  # Default IP des Laptops (Relay)
 UDP_PORT = 5005
@@ -547,6 +552,10 @@ def main():
     print(f"🚀 Headless Node -> {target_ip}:{UDP_PORT} (Debug CMD on {UDP_CMD_PORT})")
     print(f"📷 Camera Source: {camera_src}")
     print(f"📝 Verbose Mode: {'ON' if verbose_mode else 'OFF'}")
+
+    use_tello_stream = str(camera_src).strip().lower() in {"tello", "dji", "dji-tello", "tello-udp"}
+    tello = None
+    tello_frame_reader = None
     print(f"🔎 Detect Profile: {detect_profile}")
     print(
         f"⚙️ min_ref_weight={MIN_REF_WEIGHT} min_ref_count={MIN_REF_COUNT} outlier={OUTLIER_POS_THRESH} pose_hold={POSE_HOLD_SEC} target_z_pos={TARGET_Z_POS}")
@@ -565,8 +574,24 @@ def main():
             print("❌ Failed to load calibration.")
 
     ap = HeadlessAruCoPositioning(cm, dc, detect_profile=detect_profile)
-    cap = cv2.VideoCapture(camera_src)
-    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+
+    cap = None
+    if use_tello_stream:
+        if Tello is None:
+            raise RuntimeError(
+                "djitellopy not installiert. Install with: pip install djitellopy"
+            )
+        print("🛩️ Connecting to DJI Tello…")
+        tello = Tello()
+        tello.connect()
+        print(f"🔋 Tello battery: {tello.get_battery()}%")
+        tello.streamon()
+        tello_frame_reader = tello.get_frame_read()
+        time.sleep(0.2)
+        print("✅ Tello videostream active")
+    else:
+        cap = cv2.VideoCapture(camera_src)
+        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
 
     sock_send = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock_cmd = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -579,9 +604,19 @@ def main():
     last_heartbeat_time = 0
 
     try:
-        while cap.isOpened():
-            ret, frame = cap.read()
-            if not ret: break
+        while True:
+            if use_tello_stream:
+                frame = tello_frame_reader.frame if tello_frame_reader is not None else None
+                ret = frame is not None
+                if ret:
+                    # djitellopy/decoder can deliver RGB; OpenCV pipeline expects BGR
+                    frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+            else:
+                ret, frame = cap.read()
+
+            if not ret:
+                time.sleep(0.01)
+                continue
 
             # Check for commands (Debug On/Off)
             try:
@@ -669,8 +704,19 @@ def main():
                     tgt_count = len(result['targets']) if result['targets'] else 0
                     print(f"\rTracking: {tgt_count} Targets | Debug: {'Yes' if debug_mode else 'No'}", end="")
     finally:
-        cap.release()
+        if cap is not None:
+            cap.release()
+        if tello is not None:
+            try:
+                tello.streamoff()
+            except Exception:
+                pass
+            try:
+                tello.end()
+            except Exception:
+                pass
         sock_send.close()
+        sock_cmd.close()
         if gui_enabled and gui_available:
             try:
                 cv2.destroyAllWindows()

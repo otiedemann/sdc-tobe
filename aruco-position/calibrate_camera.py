@@ -5,6 +5,59 @@ import os
 import cv2
 import numpy as np
 
+try:
+    from djitellopy import Tello
+except Exception:
+    Tello = None
+
+
+def _is_tello_source(camera_source):
+    return str(camera_source).strip().lower() in {"tello", "dji", "dji-tello", "tello-udp"}
+
+
+def _open_video_source(camera_source):
+    if _is_tello_source(camera_source):
+        if Tello is None:
+            raise RuntimeError("djitellopy ist nicht installiert. Installiere mit: pip install djitellopy")
+        tello = Tello()
+        tello.connect()
+        print(f"🔋 Tello Battery: {tello.get_battery()}%")
+        tello.streamon()
+        frame_reader = tello.get_frame_read()
+        return {"mode": "tello", "tello": tello, "frame_reader": frame_reader, "cap": None}
+
+    cap = cv2.VideoCapture(camera_source)
+    if not cap.isOpened():
+        return None
+    return {"mode": "opencv", "tello": None, "frame_reader": None, "cap": cap}
+
+
+def _read_frame(source):
+    if source["mode"] == "tello":
+        frame = source["frame_reader"].frame if source["frame_reader"] is not None else None
+        if frame is None:
+            return False, None
+        # djitellopy/decoder can deliver RGB; OpenCV visualization expects BGR
+        frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+        return True, frame
+    return source["cap"].read()
+
+
+def _close_video_source(source):
+    if not source:
+        return
+    if source["mode"] == "opencv" and source["cap"] is not None:
+        source["cap"].release()
+    if source["mode"] == "tello" and source["tello"] is not None:
+        try:
+            source["tello"].streamoff()
+        except Exception:
+            pass
+        try:
+            source["tello"].end()
+        except Exception:
+            pass
+
 
 class CameraCalibrator:
     def __init__(self, checkerboard_size=(9, 6), square_size=0.025):
@@ -42,8 +95,13 @@ class CameraCalibrator:
         """
         os.makedirs(save_dir, exist_ok=True)
 
-        cap = cv2.VideoCapture(camera_source)
-        if not cap.isOpened():
+        try:
+            source = _open_video_source(camera_source)
+        except Exception as e:
+            print(f"Error: Cannot open camera from {camera_source}: {e}")
+            return False
+
+        if not source:
             print(f"Error: Cannot open camera from {camera_source}")
             return False
 
@@ -60,8 +118,11 @@ class CameraCalibrator:
         count = 0
 
         while count < num_images:
-            ret, frame = cap.read()
+            ret, frame = _read_frame(source)
             if not ret:
+                if source["mode"] == "tello":
+                    cv2.waitKey(1)
+                    continue
                 print("Error: Cannot read frame")
                 break
 
@@ -99,7 +160,7 @@ class CameraCalibrator:
                 print("\nCapture cancelled by user")
                 break
 
-        cap.release()
+        _close_video_source(source)
         cv2.destroyAllWindows()
 
         print(f"\nCaptured {count} images")
@@ -214,16 +275,24 @@ class CameraCalibrator:
             dist_coeffs: Distortion coefficients
             camera_source: Camera device ID (int) or IP camera URL (str)
         """
-        cap = cv2.VideoCapture(camera_source)
-        if not cap.isOpened():
+        try:
+            source = _open_video_source(camera_source)
+        except Exception as e:
+            print(f"Error: Cannot open camera from {camera_source}: {e}")
+            return
+
+        if not source:
             print(f"Error: Cannot open camera from {camera_source}")
             return
 
         print("\nTesting calibration - Press 'q' to quit")
 
         while True:
-            ret, frame = cap.read()
+            ret, frame = _read_frame(source)
             if not ret:
+                if source["mode"] == "tello":
+                    cv2.waitKey(1)
+                    continue
                 break
 
             h, w = frame.shape[:2]
@@ -248,7 +317,7 @@ class CameraCalibrator:
             if cv2.waitKey(1) & 0xFF == ord('q'):
                 break
 
-        cap.release()
+        _close_video_source(source)
         cv2.destroyAllWindows()
 
 
@@ -324,6 +393,7 @@ def main():
     # Get camera source
     print("\nCamera source:")
     print("  Enter '0' for USB camera")
+    print("  Enter 'tello' for DJI Tello stream (via djitellopy)")
     print("  Or enter IP camera URL:")
     print("    RTSP: rtsp://192.168.1.100:554/stream")
     print("    HTTP: http://192.168.1.100:8080/video")
@@ -362,7 +432,7 @@ def main():
         camera_matrix, dist_coeffs = load_calibration()
         if camera_matrix is not None:
             print("\nCamera source:")
-            print("  Enter '0' for USB camera or IP camera URL")
+            print("  Enter '0' for USB camera, 'tello' for DJI Tello, or IP camera URL")
             camera_input = input("Camera source: ").strip() or "0"
             camera_source = int(camera_input) if camera_input.isdigit() else camera_input
             calibrator.test_calibration(camera_matrix, dist_coeffs, camera_source)
