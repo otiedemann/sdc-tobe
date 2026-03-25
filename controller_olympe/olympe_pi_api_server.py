@@ -19,12 +19,65 @@ from olympe.messages.ardrone3.PilotingState import (
 )
 from olympe.messages.common.CommonState import BatteryStateChanged
 from olympe.messages.ardrone3.Animations import Flip
+from olympe.messages.ardrone3.SpeedSettings import MaxRotationSpeed, MaxVerticalSpeed
+from olympe.messages.ardrone3.PilotingSettings import MaxAltitude, MaxTilt
 
+# Optional imports – wrapped so the server starts even if SDK version lacks some
 try:
     from olympe.messages.ardrone3.Piloting import Emergency as EmergencyCmd
     HAS_EMERGENCY = True
 except ImportError:
     HAS_EMERGENCY = False
+
+try:
+    from olympe.messages.camera import (
+        start_recording,
+        stop_recording,
+        take_photo,
+    )
+    HAS_CAMERA = True
+except ImportError:
+    HAS_CAMERA = False
+
+try:
+    from olympe.messages.gimbal import set_target, attitude as gimbal_attitude
+    HAS_GIMBAL = True
+except ImportError:
+    HAS_GIMBAL = False
+
+try:
+    from olympe.messages.ardrone3.PilotingState import GpsLocationChanged
+    HAS_GPS_STATE = True
+except ImportError:
+    try:
+        from olympe.messages.ardrone3.GPSState import GpsLocationChanged
+        HAS_GPS_STATE = True
+    except ImportError:
+        HAS_GPS_STATE = False
+
+try:
+    from olympe.messages.rth import return_to_home, cancel_auto_trigger, state as rth_state
+    HAS_RTH = True
+except ImportError:
+    HAS_RTH = False
+
+try:
+    from olympe.messages.move import extended_move_to
+    HAS_MOVE_TO = True
+except ImportError:
+    HAS_MOVE_TO = False
+
+try:
+    from olympe.messages.ardrone3.SpeedSettings import MaxHorizontalSpeed
+    HAS_MAX_HORIZ_SPEED = True
+except ImportError:
+    HAS_MAX_HORIZ_SPEED = False
+
+try:
+    from olympe.messages.ardrone3.PilotingSettings import MaxDistance, NoFlyOverMaxDistance
+    HAS_GEOFENCE = True
+except ImportError:
+    HAS_GEOFENCE = False
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -34,6 +87,11 @@ HTTP_PORT = 8080
 DRONE_IP = os.getenv("ANAFI_IP", "192.168.42.1")
 RC_HZ = 20
 STICK = 60
+YAW_STICK = 90  # Yaw needs higher value for snappy rotation on Anafi
+MAX_YAW_SPEED = 150  # deg/s – applied on connect via MaxRotationSpeed
+MAX_ALTITUDE_M = float(os.getenv("MAX_ALTITUDE_M", "2.0"))  # hard ceiling in meters
+MAX_VERTICAL_SPEED = float(os.getenv("MAX_VERTICAL_SPEED", "0.5"))  # m/s vertical speed limit
+MAX_TILT = float(os.getenv("MAX_TILT", "15"))  # degrees – limits horizontal speed
 CONNECT_RETRY_S = 3.0
 TELEMETRY_HZ = float(os.getenv("TELEMETRY_HZ", "2.0"))
 KEY_STALE_S = float(os.getenv("KEY_STALE_S", "1.0"))
@@ -57,6 +115,8 @@ drone: Optional[olympe.Drone] = None
 pressed_web: Set[str] = set()
 key_last_seen: Dict[str, float] = {}
 pressed_lock = threading.Lock()
+
+last_state_seen = 0.0
 
 conn_state = {"connected": False, "last_reconnect": 0.0}
 conn_lock = threading.Lock()
@@ -254,15 +314,18 @@ def _is_flying_state(state_dict) -> bool:
 
 
 def telemetry_loop():
-    global flying
+    global flying, last_state_seen
     while running:
         with conn_lock:
             connected_now = conn_state["connected"]
+
+        got_any_state = False
 
         # --- Battery ---
         bat = None
         bat_state = _get_drone_state(BatteryStateChanged)
         if bat_state:
+            got_any_state = True
             try:
                 bat = int(bat_state["percent"])
             except Exception:
@@ -272,6 +335,7 @@ def telemetry_loop():
         pitch_deg = roll_deg = yaw_deg = None
         att_state = _get_drone_state(AttitudeChanged)
         if att_state:
+            got_any_state = True
             try:
                 pitch_deg = round(math.degrees(float(att_state["pitch"])), 2)
                 roll_deg = round(math.degrees(float(att_state["roll"])), 2)
@@ -283,6 +347,7 @@ def telemetry_loop():
         vgx = vgy = vgz = None
         spd_state = _get_drone_state(SpeedChanged)
         if spd_state:
+            got_any_state = True
             try:
                 # Olympe SpeedChanged: speedX=forward, speedY=right, speedZ=down (NED)
                 vgx = round(float(spd_state["speedX"]) * 100, 1)
@@ -295,10 +360,44 @@ def telemetry_loop():
         height_cm = None
         alt_state = _get_drone_state(AltitudeChanged)
         if alt_state:
+            got_any_state = True
             try:
                 height_cm = round(float(alt_state["altitude"]) * 100, 1)
             except Exception:
                 pass
+
+        # --- GPS position ---
+        gps_lat = gps_lon = gps_alt = None
+        if HAS_GPS_STATE:
+            gps_state = _get_drone_state(GpsLocationChanged)
+            if gps_state:
+                got_any_state = True
+                try:
+                    gps_lat = round(float(gps_state.get("latitude", 500)), 7)
+                    gps_lon = round(float(gps_state.get("longitude", 500)), 7)
+                    gps_alt = round(float(gps_state.get("altitude", 0)), 2)
+                    # 500 = "not available" sentinel in Olympe
+                    if gps_lat > 400:
+                        gps_lat = None
+                    if gps_lon > 400:
+                        gps_lon = None
+                except Exception:
+                    pass
+
+        # --- Gimbal attitude ---
+        gimbal_pitch = gimbal_roll = gimbal_yaw = None
+        if HAS_GIMBAL:
+            gim_state = _get_drone_state(gimbal_attitude)
+            if gim_state:
+                try:
+                    gimbal_pitch = round(float(gim_state.get("pitch_absolute", 0)), 2)
+                    gimbal_roll = round(float(gim_state.get("roll_absolute", 0)), 2)
+                    gimbal_yaw = round(float(gim_state.get("yaw_absolute", 0)), 2)
+                except Exception:
+                    pass
+
+        if got_any_state:
+            last_state_seen = time.time()
 
         # --- Flying state ---
         fly_state = _get_drone_state(FlyingStateChanged)
@@ -333,6 +432,18 @@ def telemetry_loop():
                 telemetry["height_cm"] = height_cm
             if speed is not None:
                 telemetry["speed"] = speed
+            if gps_lat is not None:
+                telemetry["gps_lat"] = gps_lat
+            if gps_lon is not None:
+                telemetry["gps_lon"] = gps_lon
+            if gps_alt is not None:
+                telemetry["gps_alt"] = gps_alt
+            if gimbal_pitch is not None:
+                telemetry["gimbal_pitch"] = gimbal_pitch
+            if gimbal_roll is not None:
+                telemetry["gimbal_roll"] = gimbal_roll
+            if gimbal_yaw is not None:
+                telemetry["gimbal_yaw"] = gimbal_yaw
             telemetry["flying"] = flying
             telemetry["connected"] = connected_now
             telemetry["updated_at"] = time.time()
@@ -341,6 +452,25 @@ def telemetry_loop():
         append_telemetry_log(snapshot)
         hz = TELEMETRY_HZ if TELEMETRY_HZ > 0 else 2.0
         time.sleep(max(0.05, 1.0 / hz))
+
+
+# ---------------------------------------------------------------------------
+# Flight safety limits – applied on every (re-)connect
+# ---------------------------------------------------------------------------
+
+def _apply_flight_limits(d):
+    """Set altitude ceiling, vertical speed cap, max tilt, and yaw speed on the drone."""
+    for cmd, label in [
+        (MaxAltitude(MAX_ALTITUDE_M), f"MaxAltitude={MAX_ALTITUDE_M}m"),
+        (MaxVerticalSpeed(MAX_VERTICAL_SPEED), f"MaxVerticalSpeed={MAX_VERTICAL_SPEED}m/s"),
+        (MaxTilt(MAX_TILT), f"MaxTilt={MAX_TILT}°"),
+        (MaxRotationSpeed(MAX_YAW_SPEED), f"MaxRotationSpeed={MAX_YAW_SPEED}°/s"),
+    ]:
+        try:
+            d(cmd).wait(_timeout=2)
+            print(f"[ANAFI API] Set {label}")
+        except Exception as e:
+            print(f"[ANAFI API] Failed to set {label}: {e}")
 
 
 # ---------------------------------------------------------------------------
@@ -370,6 +500,8 @@ def reconnect_loop():
                 drone = d
             try:
                 connected = d.connect()
+                if connected:
+                    _apply_flight_limits(d)
                 with conn_lock:
                     conn_state["connected"] = bool(connected)
             except Exception as e:
@@ -436,7 +568,7 @@ def rc_loop():
         lr = axis(has_key("d"), has_key("a")) * STICK
         fb = axis(has_key("w"), has_key("s")) * STICK
         ud = axis(has_key("r"), has_key("f")) * STICK
-        yaw = axis(has_key("e"), has_key("q")) * STICK
+        yaw = axis(has_key("e"), has_key("q")) * YAW_STICK
 
         if has_key("space") or has_key("x"):
             lr = fb = ud = yaw = 0
@@ -447,6 +579,12 @@ def rc_loop():
                 lr, fb, ud, yaw = rc_override
             elif rc_override is not None and now >= rc_override_until:
                 rc_override = None
+
+        # Software altitude fence: clamp upward gaz when near ceiling
+        with telemetry_lock:
+            cur_height = telemetry.get("height_cm")
+        if cur_height is not None and cur_height >= MAX_ALTITUDE_M * 100 and ud > 0:
+            ud = 0
 
         with command_lock:
             in_discrete = now < discrete_until
@@ -816,6 +954,8 @@ def api_recover():
             rc_override = None
             rc_override_until = 0.0
         connected = d.connect()
+        if connected:
+            _apply_flight_limits(d)
         flying = False
         with conn_lock:
             conn_state["connected"] = bool(connected)
@@ -829,8 +969,12 @@ def api_recover():
 
 @app.get("/api/telemetry")
 def api_telemetry():
+    now = time.time()
+    age = (now - last_state_seen) if last_state_seen else 9999.0
     with telemetry_lock:
         payload = dict(telemetry)
+    payload["state_age_s"] = round(age, 3)
+    payload["state_fresh"] = age <= 2.0
     resp = jsonify(payload)
     resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
     resp.headers["Pragma"] = "no-cache"
@@ -929,6 +1073,243 @@ def api_telemetry_log_clear():
         return jsonify(ok=True, cleared=True, path=str(p))
     except Exception as e:
         return jsonify(ok=False, error=str(e), path=str(p)), 500
+
+
+# ---------------------------------------------------------------------------
+# Camera endpoints
+# ---------------------------------------------------------------------------
+
+@app.post("/api/camera/photo")
+def api_camera_photo():
+    d = drone
+    if d is None:
+        return jsonify(ok=False, error="controller not ready"), 503
+    if not HAS_CAMERA:
+        return jsonify(ok=False, error="camera module not available"), 501
+    try:
+        with command_lock:
+            result = d(take_photo(cam_id=0)).wait(_timeout=5)
+        if result and result.success():
+            return jsonify(ok=True)
+        return jsonify(ok=False, error="photo_failed"), 500
+    except Exception as e:
+        return jsonify(ok=False, error=str(e)), 500
+
+
+@app.post("/api/camera/record/start")
+def api_camera_record_start():
+    d = drone
+    if d is None:
+        return jsonify(ok=False, error="controller not ready"), 503
+    if not HAS_CAMERA:
+        return jsonify(ok=False, error="camera module not available"), 501
+    try:
+        with command_lock:
+            result = d(start_recording(cam_id=0)).wait(_timeout=5)
+        if result and result.success():
+            return jsonify(ok=True, recording=True)
+        return jsonify(ok=False, error="record_start_failed"), 500
+    except Exception as e:
+        return jsonify(ok=False, error=str(e)), 500
+
+
+@app.post("/api/camera/record/stop")
+def api_camera_record_stop():
+    d = drone
+    if d is None:
+        return jsonify(ok=False, error="controller not ready"), 503
+    if not HAS_CAMERA:
+        return jsonify(ok=False, error="camera module not available"), 501
+    try:
+        with command_lock:
+            result = d(stop_recording(cam_id=0)).wait(_timeout=5)
+        if result and result.success():
+            return jsonify(ok=True, recording=False)
+        return jsonify(ok=False, error="record_stop_failed"), 500
+    except Exception as e:
+        return jsonify(ok=False, error=str(e)), 500
+
+
+@app.post("/api/gimbal")
+def api_gimbal():
+    """Set gimbal tilt and pan in degrees. tilt: -90 (down) to +30 (up). pan: ±180."""
+    d = drone
+    if d is None:
+        return jsonify(ok=False, error="controller not ready"), 503
+    if not HAS_GIMBAL:
+        return jsonify(ok=False, error="gimbal module not available"), 501
+    data = request.get_json(silent=True) or {}
+    tilt = float(data.get("tilt", 0))
+    pan = float(data.get("pan", 0))
+    tilt = max(-90, min(30, tilt))
+    pan = max(-180, min(180, pan))
+    try:
+        with command_lock:
+            result = d(set_target(
+                gimbal_id=0,
+                control_mode="position",
+                yaw_frame_of_reference="absolute",
+                yaw=pan,
+                pitch_frame_of_reference="absolute",
+                pitch=tilt,
+                roll_frame_of_reference="absolute",
+                roll=0,
+            )).wait(_timeout=5)
+        if result and result.success():
+            return jsonify(ok=True, tilt=tilt, pan=pan)
+        return jsonify(ok=False, error="gimbal_failed"), 500
+    except Exception as e:
+        return jsonify(ok=False, error=str(e)), 500
+
+
+# ---------------------------------------------------------------------------
+# Navigation endpoints
+# ---------------------------------------------------------------------------
+
+@app.post("/api/rth")
+def api_rth():
+    """Start or cancel Return-To-Home."""
+    d = drone
+    if d is None:
+        return jsonify(ok=False, error="controller not ready"), 503
+    if not HAS_RTH:
+        return jsonify(ok=False, error="rth module not available"), 501
+    data = request.get_json(silent=True) or {}
+    action = str(data.get("action", "start")).lower()
+    try:
+        if action == "start":
+            with command_lock:
+                result = d(return_to_home()).wait(_timeout=5)
+        elif action == "cancel":
+            with command_lock:
+                result = d(cancel_auto_trigger()).wait(_timeout=5)
+        else:
+            return jsonify(ok=False, error="action must be start|cancel"), 400
+        if result and result.success():
+            return jsonify(ok=True, action=action)
+        return jsonify(ok=False, error=f"rth_{action}_failed"), 500
+    except Exception as e:
+        return jsonify(ok=False, error=str(e)), 500
+
+
+@app.post("/api/moveto")
+def api_moveto():
+    """Move to absolute GPS coordinates. Requires GPS fix."""
+    d = drone
+    if d is None:
+        return jsonify(ok=False, error="controller not ready"), 503
+    if not HAS_MOVE_TO:
+        return jsonify(ok=False, error="moveto module not available"), 501
+    data = request.get_json(silent=True) or {}
+    lat = data.get("lat")
+    lon = data.get("lon")
+    alt = float(data.get("alt", 2.0))
+    heading = float(data.get("heading", 0))
+    if lat is None or lon is None:
+        return jsonify(ok=False, error="lat and lon required"), 400
+    try:
+        start_discrete_window(10.0)
+        with command_lock:
+            _stop_pcmd()
+            result = d(extended_move_to(
+                latitude=float(lat),
+                longitude=float(lon),
+                altitude=alt,
+                orientation_mode="heading_start",
+                heading=heading,
+                max_horizontal_speed=MAX_TILT / 5.0,
+                max_vertical_speed=MAX_VERTICAL_SPEED,
+                max_yaw_rotation_speed=MAX_YAW_SPEED,
+            )).wait(_timeout=60)
+        if result and result.success():
+            return jsonify(ok=True, lat=float(lat), lon=float(lon), alt=alt)
+        return jsonify(ok=False, error="moveto_failed"), 500
+    except Exception as e:
+        return jsonify(ok=False, error=str(e)), 500
+
+
+# ---------------------------------------------------------------------------
+# Settings endpoints
+# ---------------------------------------------------------------------------
+
+@app.get("/api/settings")
+def api_settings_get():
+    """Return current flight limit settings."""
+    return jsonify(
+        max_altitude_m=MAX_ALTITUDE_M,
+        max_vertical_speed=MAX_VERTICAL_SPEED,
+        max_tilt=MAX_TILT,
+        max_yaw_speed=MAX_YAW_SPEED,
+        geofence_available=HAS_GEOFENCE,
+        camera_available=HAS_CAMERA,
+        gimbal_available=HAS_GIMBAL,
+        gps_available=HAS_GPS_STATE,
+        rth_available=HAS_RTH,
+        moveto_available=HAS_MOVE_TO,
+    )
+
+
+@app.post("/api/settings")
+def api_settings_set():
+    """Update flight limits on the drone. All fields optional."""
+    global MAX_ALTITUDE_M, MAX_VERTICAL_SPEED, MAX_TILT, MAX_YAW_SPEED
+    d = drone
+    if d is None:
+        return jsonify(ok=False, error="controller not ready"), 503
+    data = request.get_json(silent=True) or {}
+    results = {}
+    if "max_altitude_m" in data:
+        v = float(data["max_altitude_m"])
+        v = max(0.5, min(150, v))
+        try:
+            d(MaxAltitude(v)).wait(_timeout=2)
+            MAX_ALTITUDE_M = v
+            results["max_altitude_m"] = v
+        except Exception as e:
+            results["max_altitude_m_error"] = str(e)
+    if "max_vertical_speed" in data:
+        v = float(data["max_vertical_speed"])
+        v = max(0.1, min(4.0, v))
+        try:
+            d(MaxVerticalSpeed(v)).wait(_timeout=2)
+            MAX_VERTICAL_SPEED = v
+            results["max_vertical_speed"] = v
+        except Exception as e:
+            results["max_vertical_speed_error"] = str(e)
+    if "max_tilt" in data:
+        v = float(data["max_tilt"])
+        v = max(1, min(35, v))
+        try:
+            d(MaxTilt(v)).wait(_timeout=2)
+            MAX_TILT = v
+            results["max_tilt"] = v
+        except Exception as e:
+            results["max_tilt_error"] = str(e)
+    if "max_yaw_speed" in data:
+        v = float(data["max_yaw_speed"])
+        v = max(1, min(200, v))
+        try:
+            d(MaxRotationSpeed(v)).wait(_timeout=2)
+            MAX_YAW_SPEED = v
+            results["max_yaw_speed"] = v
+        except Exception as e:
+            results["max_yaw_speed_error"] = str(e)
+    if "geofence_distance" in data and HAS_GEOFENCE:
+        v = float(data["geofence_distance"])
+        v = max(10, min(4000, v))
+        try:
+            d(MaxDistance(v)).wait(_timeout=2)
+            results["geofence_distance"] = v
+        except Exception as e:
+            results["geofence_distance_error"] = str(e)
+    if "geofence_enabled" in data and HAS_GEOFENCE:
+        enabled = bool(data["geofence_enabled"])
+        try:
+            d(NoFlyOverMaxDistance(int(enabled))).wait(_timeout=2)
+            results["geofence_enabled"] = enabled
+        except Exception as e:
+            results["geofence_enabled_error"] = str(e)
+    return jsonify(ok=True, **results)
 
 
 # ---------------------------------------------------------------------------

@@ -1,0 +1,59 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "Drone Simulator",
+      "runtimeExecutable": "python3",
+      "runtimeArgs": ["drone-sim/sim_server.py", "--config", "drone-sim/sim_config_sdc26.json", "--http-host", "0.0.0.0", "--http-port", "8080"],
+      "port": 8080
+    },
+    {
+      "name": "Tello Pi API Server",
+      "runtimeExecutable": "python3",
+      "runtimeArgs": ["controller/tello_pi_api_server.py"],
+      "port": 8080
+    },
+    {
+      "name": "Olympe Anafi API Server",
+      "runtimeExecutable": "python3",
+      "runtimeArgs": ["controller_olympe/olympe_pi_api_server.py"],
+      "port": 8080
+    },
+    {
+      "name": "Tello Remote Web Controller",
+      "runtimeExecutable": "python3",
+      "runtimeArgs": ["controller/tello_remote_web_controller.py"],
+      "port": 8090
+    },
+    {
+      "name": "Tello Web Controller (Video)",
+      "runtimeExecutable": "python3",
+      "runtimeArgs": ["controller/tello_controller_web.py"],
+      "port": 8080
+    },
+    {
+      "name": "Tello Web Controller (No Video)",
+      "runtimeExecutable": "python3",
+      "runtimeArgs": ["controller/tello_controller_web_novideo.py"],
+      "port": 8080
+    },
+    {
+      "name": "C2 Interface",
+      "runtimeExecutable": "uvicorn",
+      "runtimeArgs": ["app.main:app", "--host", "0.0.0.0", "--port", "8080", "--reload"],
+      "port": 8080
+    },
+    {
+      "name": "Aruco C2 Relay",
+      "runtimeExecutable": "uvicorn",
+      "runtimeArgs": ["relay:app", "--host", "0.0.0.0", "--port", "8000"],
+      "port": 8000
+    },
+    {
+      "name": "Sim 3D Viewer",
+      "runtimeExecutable": "python3",
+      "runtimeArgs": ["-m", "http.server", "8765"],
+      "port": 8765
+    }
+  ]
+}
