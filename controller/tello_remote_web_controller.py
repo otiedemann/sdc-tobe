@@ -99,6 +99,33 @@ HTML = """
           <button id=\"sdk_send\">Send SDK Command</button>
         </div>
       </div>
+      <div class=\"adv\" id=\"anafi_panel\">
+        <div class=\"small\" style=\"margin-bottom:6px;\">Anafi / Olympe controls</div>
+        <div class=\"adv-grid\">
+          <button id=\"take_photo\">Take Photo</button>
+          <button id=\"rec_start\">Record Start</button>
+          <button id=\"rec_stop\">Record Stop</button>
+          <button id=\"rth_start\">Return Home</button>
+          <button id=\"rth_cancel\">Cancel RTH</button>
+        </div>
+        <div class=\"row\" style=\"margin-top:8px; align-items:center;\">
+          <span class=\"small\" style=\"min-width:80px;\">Gimbal tilt</span>
+          <input id=\"gimbal_tilt\" type=\"range\" min=\"-90\" max=\"30\" value=\"0\" style=\"flex:1;\" />
+          <span id=\"gimbal_tilt_val\" class=\"small\" style=\"min-width:40px;\">0°</span>
+          <button id=\"gimbal_set\">Set</button>
+          <button id=\"gimbal_down\">Down (-90)</button>
+          <button id=\"gimbal_fwd\">Forward (0)</button>
+        </div>
+        <div class=\"row\" style=\"margin-top:8px; align-items:center;\">
+          <span class=\"small\" style=\"min-width:80px;\">Max altitude (m)</span>
+          <input id=\"set_alt\" type=\"number\" min=\"0.5\" max=\"150\" step=\"0.5\" value=\"2\" style=\"width:70px;\" />
+          <span class=\"small\" style=\"min-width:80px;\">Max vert spd</span>
+          <input id=\"set_vspd\" type=\"number\" min=\"0.1\" max=\"4\" step=\"0.1\" value=\"0.5\" style=\"width:70px;\" />
+          <span class=\"small\" style=\"min-width:80px;\">Max tilt (°)</span>
+          <input id=\"set_tilt\" type=\"number\" min=\"1\" max=\"35\" step=\"1\" value=\"15\" style=\"width:70px;\" />
+          <button id=\"apply_settings\">Apply Settings</button>
+        </div>
+      </div>
       <div class=\"small\" style=\"margin-top:8px;\">Keyboard in browser: W/A/S/D R/F Q/E, T, L, Space stop</div>
     </div>
 
@@ -211,6 +238,27 @@ document.getElementById('sdk_send').onclick = ()=>{
   if (cmd.trim()) post('/proxy/sdk',{command:cmd.trim()});
 };
 
+// Anafi / Olympe controls
+document.getElementById('take_photo').onclick = ()=>post('/proxy/camera/photo',{});
+document.getElementById('rec_start').onclick = ()=>post('/proxy/camera/record/start',{});
+document.getElementById('rec_stop').onclick = ()=>post('/proxy/camera/record/stop',{});
+document.getElementById('rth_start').onclick = ()=>post('/proxy/rth',{action:'start'});
+document.getElementById('rth_cancel').onclick = ()=>post('/proxy/rth',{action:'cancel'});
+
+const gimbalSlider = document.getElementById('gimbal_tilt');
+const gimbalVal = document.getElementById('gimbal_tilt_val');
+gimbalSlider.oninput = ()=>{ gimbalVal.textContent = gimbalSlider.value + '°'; };
+document.getElementById('gimbal_set').onclick = ()=>post('/proxy/gimbal',{tilt:Number(gimbalSlider.value),pan:0});
+document.getElementById('gimbal_down').onclick = ()=>{ gimbalSlider.value=-90; gimbalVal.textContent='-90°'; post('/proxy/gimbal',{tilt:-90,pan:0}); };
+document.getElementById('gimbal_fwd').onclick = ()=>{ gimbalSlider.value=0; gimbalVal.textContent='0°'; post('/proxy/gimbal',{tilt:0,pan:0}); };
+
+document.getElementById('apply_settings').onclick = ()=>{
+  const alt = Number(document.getElementById('set_alt').value);
+  const vs = Number(document.getElementById('set_vspd').value);
+  const tilt = Number(document.getElementById('set_tilt').value);
+  post('/proxy/settings', {max_altitude_m:alt, max_vertical_speed:vs, max_tilt:tilt});
+};
+
 document.getElementById('toggle_cmd_log').onclick = async ()=>{
   try {
     const r = await fetch('/proxy/logging/commands');
@@ -313,6 +361,8 @@ async function refreshTelemetry(){
       `sdk version: ${t.sdk_version ?? '-'}\n` +
       `serial number: ${t.serial_number ?? '-'}\n` +
       `mission pad mid/x/y/z/mpry: ${t.mid ?? '-'} / ${t.pad_x ?? '-'} / ${t.pad_y ?? '-'} / ${t.pad_z ?? '-'} / ${t.pad_mpry ?? '-'}\n` +
+      `gps: ${t.gps_lat ?? '-'}, ${t.gps_lon ?? '-'} alt=${t.gps_alt ?? '-'}m\n` +
+      `gimbal p/r/y: ${t.gimbal_pitch ?? '-'} / ${t.gimbal_roll ?? '-'} / ${t.gimbal_yaw ?? '-'}\n` +
       `state age: ${t.state_age_s ?? '-'} s\n` +
       `flying: ${t.flying}\n` +
       `connected: ${t.connected}`;
@@ -511,6 +561,70 @@ def proxy_sdk():
     data = request.get_json(silent=True) or {}
     log_command("sdk", data)
     r = pi_post("/api/sdk", data)
+    return (r.text, r.status_code, {"Content-Type": r.headers.get("Content-Type", "application/json")})
+
+
+# -- Anafi / Olympe proxy routes --
+
+@app.post("/proxy/camera/photo")
+def proxy_camera_photo():
+    log_command("camera_photo")
+    r = pi_post("/api/camera/photo")
+    return (r.text, r.status_code, {"Content-Type": r.headers.get("Content-Type", "application/json")})
+
+
+@app.post("/proxy/camera/record/start")
+def proxy_camera_record_start():
+    log_command("camera_record_start")
+    r = pi_post("/api/camera/record/start")
+    return (r.text, r.status_code, {"Content-Type": r.headers.get("Content-Type", "application/json")})
+
+
+@app.post("/proxy/camera/record/stop")
+def proxy_camera_record_stop():
+    log_command("camera_record_stop")
+    r = pi_post("/api/camera/record/stop")
+    return (r.text, r.status_code, {"Content-Type": r.headers.get("Content-Type", "application/json")})
+
+
+@app.post("/proxy/gimbal")
+def proxy_gimbal():
+    data = request.get_json(silent=True) or {}
+    log_command("gimbal", data)
+    r = pi_post("/api/gimbal", data)
+    return (r.text, r.status_code, {"Content-Type": r.headers.get("Content-Type", "application/json")})
+
+
+@app.post("/proxy/rth")
+def proxy_rth():
+    data = request.get_json(silent=True) or {}
+    log_command("rth", data)
+    r = pi_post("/api/rth", data)
+    return (r.text, r.status_code, {"Content-Type": r.headers.get("Content-Type", "application/json")})
+
+
+@app.post("/proxy/moveto")
+def proxy_moveto():
+    data = request.get_json(silent=True) or {}
+    log_command("moveto", data)
+    r = pi_post("/api/moveto", data, timeout=65)
+    return (r.text, r.status_code, {"Content-Type": r.headers.get("Content-Type", "application/json")})
+
+
+@app.get("/proxy/settings")
+def proxy_settings_get():
+    try:
+        r = pi_get("/api/settings", timeout=TIMEOUT_STATUS)
+        return (r.text, r.status_code, {"Content-Type": r.headers.get("Content-Type", "application/json")})
+    except Exception as e:
+        return jsonify(ok=False, error=str(e)), 502
+
+
+@app.post("/proxy/settings")
+def proxy_settings_set():
+    data = request.get_json(silent=True) or {}
+    log_command("settings", data)
+    r = pi_post("/api/settings", data)
     return (r.text, r.status_code, {"Content-Type": r.headers.get("Content-Type", "application/json")})
 
 
