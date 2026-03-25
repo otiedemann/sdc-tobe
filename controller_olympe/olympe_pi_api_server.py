@@ -318,11 +318,6 @@ def telemetry_loop():
     while running:
         with conn_lock:
             connected_now = conn_state["connected"]
-        state = drone.get_state(olympe.messages.ardrone3.PilotingState.FlyingStateChanged())
-        if state:
-            telemetry.update(state)
-        telemetry.update(state)
-        time.sleep(0.5)
 
         got_any_state = False
 
@@ -403,6 +398,12 @@ def telemetry_loop():
 
         if got_any_state:
             last_state_seen = time.time()
+            # If we got state data, the drone IS connected — fix stale conn_state
+            with conn_lock:
+                if not conn_state["connected"]:
+                    conn_state["connected"] = True
+                    print("[ANAFI API] Connection detected via telemetry")
+                connected_now = True
 
         # --- Flying state ---
         fly_state = _get_drone_state(FlyingStateChanged)
@@ -482,6 +483,25 @@ def _apply_flight_limits(d):
 # Reconnect loop
 # ---------------------------------------------------------------------------
 
+def _check_drone_connected(d) -> bool:
+    """Verify connection by actually querying a state from the drone."""
+    if d is None:
+        return False
+    try:
+        st = d.get_state(BatteryStateChanged)
+        if st and "percent" in st:
+            return True
+    except Exception:
+        pass
+    try:
+        st = d.get_state(FlyingStateChanged)
+        if st and "state" in st:
+            return True
+    except Exception:
+        pass
+    return False
+
+
 def reconnect_loop():
     global drone, last_conn_print
     while running:
@@ -494,7 +514,17 @@ def reconnect_loop():
             last_conn_print = connected_now
 
         now = time.time()
-        should_retry = (not connected_now) and (now - last_try) >= CONNECT_RETRY_S
+
+        # Periodic health check when we think we're connected
+        if connected_now:
+            if not _check_drone_connected(drone):
+                print("[ANAFI API] Connection lost (health check failed)")
+                with conn_lock:
+                    conn_state["connected"] = False
+            time.sleep(2.0)
+            continue
+
+        should_retry = (now - last_try) >= CONNECT_RETRY_S
 
         if should_retry:
             with conn_lock:
@@ -504,11 +534,14 @@ def reconnect_loop():
                 d = olympe.Drone(DRONE_IP)
                 drone = d
             try:
-                connected = d.connect()
-                if connected:
+                d.connect()
+                # Don't rely on connect() return value — verify with actual state query
+                actually_connected = _check_drone_connected(d)
+                if actually_connected:
                     _apply_flight_limits(d)
+                    print("[ANAFI API] Connection verified (state query OK)")
                 with conn_lock:
-                    conn_state["connected"] = bool(connected)
+                    conn_state["connected"] = actually_connected
             except Exception as e:
                 print(f"[ANAFI API] Connect failed: {e}")
                 with conn_lock:
@@ -672,15 +705,6 @@ def api_key_up():
     data = request.get_json(silent=True) or {}
     remove_key(data.get("key", ""))
     return jsonify(ok=True)
-    dx = float(data.get("dx", 0))
-    dy = float(data.get("dy", 0))
-    dz = float(data.get("dz", 0))
-    try:
-        if drone(moveBy(dx, dy, dz, 0)).wait().success():
-            return jsonify(ok=True)
-    except Exception as e:
-        print(f"Move command failed: {e}")
-    return jsonify(ok=False, error="move_failed"), 500
 
 
 @app.post("/api/takeoff")
@@ -967,14 +991,15 @@ def api_recover():
         with rc_lock:
             rc_override = None
             rc_override_until = 0.0
-        connected = d.connect()
-        if connected:
+        d.connect()
+        actually_connected = _check_drone_connected(d)
+        if actually_connected:
             _apply_flight_limits(d)
         flying = False
         with conn_lock:
-            conn_state["connected"] = bool(connected)
+            conn_state["connected"] = actually_connected
             conn_state["last_reconnect"] = time.time()
-        return jsonify(ok=bool(connected), message="recovered" if connected else "reconnect_failed")
+        return jsonify(ok=actually_connected, message="recovered" if actually_connected else "reconnect_failed")
     except Exception as e:
         with conn_lock:
             conn_state["connected"] = False
