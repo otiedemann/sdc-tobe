@@ -258,6 +258,11 @@ def telemetry_loop():
     while running:
         with conn_lock:
             connected_now = conn_state["connected"]
+        state = drone.get_state(olympe.messages.ardrone3.PilotingState.FlyingStateChanged())
+        if state:
+            telemetry.update(state)
+        telemetry.update(state)
+        time.sleep(0.5)
 
         # --- Battery ---
         bat = None
@@ -529,6 +534,15 @@ def api_key_up():
     data = request.get_json(silent=True) or {}
     remove_key(data.get("key", ""))
     return jsonify(ok=True)
+    dx = float(data.get("dx", 0))
+    dy = float(data.get("dy", 0))
+    dz = float(data.get("dz", 0))
+    try:
+        if drone(moveBy(dx, dy, dz, 0)).wait().success():
+            return jsonify(ok=True)
+    except Exception as e:
+        print(f"Move command failed: {e}")
+    return jsonify(ok=False, error="move_failed"), 500
 
 
 @app.post("/api/takeoff")
