@@ -23,7 +23,8 @@ telemetry = {}
 def telemetry_loop():
     global telemetry
     while running:
-        telemetry = drone.get_state(FlyingStateChanged())
+        state = drone.get_state(FlyingStateChanged())
+        telemetry.update(state)
         time.sleep(0.5)
 
 
