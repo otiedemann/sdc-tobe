@@ -15,7 +15,7 @@ HTTP_PORT = 8080
 app = Flask(__name__)
 running = True
 DRONE_IP = "192.168.42.1"
-
+drone_connect_tries = 5  # Number of connection attempts
 drone = olympe.Drone(DRONE_IP)
 telemetry = {}
 
@@ -87,7 +87,15 @@ def on_exit():
 
 
 def main():
-    drone.connect()
+    tries = 0
+    while tries < drone_connect_tries:
+        try:
+            drone.connect()
+            break
+        except Exception as e:
+            print(f"Connection attempt {tries+1} failed: {e}")
+            tries += 1
+            time.sleep(2)
     threading.Thread(target=telemetry_loop, daemon=True).start()
 
     print(f"Server running at http://{HTTP_HOST}:{HTTP_PORT}")
