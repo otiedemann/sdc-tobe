@@ -42,7 +42,12 @@ def api_move():
     dx = float(data.get("dx", 0))
     dy = float(data.get("dy", 0))
     dz = float(data.get("dz", 0))
-    if not drone(moveBy(dx, dy, dz, 0)).wait().success():
+    try:
+        if drone(moveBy(dx, dy, dz, 0)).wait().success():
+            return jsonify(ok=True)
+    except Exception as e:
+        print(f"Move command failed: {e}")
+    return jsonify(ok=False, error="move_failed"), 500
         return jsonify(ok=False, error="move_failed"), 500
     return jsonify(ok=True)
 
