@@ -23,7 +23,7 @@ telemetry = {}
 def telemetry_loop():
     global telemetry
     while running:
-        state = drone.get_state(FlyingStateChanged())
+        state = drone.get_state(olympe.messages.ardrone3.PilotingState.FlyingStateChanged())
         if state:
             telemetry.update(state)
         telemetry.update(state)
@@ -48,8 +48,6 @@ def api_move():
     except Exception as e:
         print(f"Move command failed: {e}")
     return jsonify(ok=False, error="move_failed"), 500
-        return jsonify(ok=False, error="move_failed"), 500
-    return jsonify(ok=True)
 
 
 @app.route("/api/flip", methods=["POST"])
