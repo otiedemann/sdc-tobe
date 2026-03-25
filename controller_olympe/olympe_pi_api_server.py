@@ -17,14 +17,13 @@ running = True
 DRONE_IP = "192.168.42.1"
 
 drone = olympe.Drone(DRONE_IP)
-driving = False
 telemetry = {}
 
 
 def telemetry_loop():
     global telemetry
     while running:
-        telemetry = drone.get_state()
+        telemetry = drone.get_state(FlyingStateChanged())
         time.sleep(0.5)
 
 
@@ -72,7 +71,10 @@ def api_land():
 def shutdown():
     global running
     running = False
-    drone.disconnect()
+    try:
+        drone.disconnect()
+    except Exception:
+        pass
 
 
 @atexit.register
@@ -84,6 +86,7 @@ def main():
     drone.connect()
     threading.Thread(target=telemetry_loop, daemon=True).start()
     app.run(host=HTTP_HOST, port=HTTP_PORT, threaded=True, use_reloader=False)
+    print(f"Server running at http://{HTTP_HOST}:{HTTP_PORT}")
 
 
 if __name__ == "__main__":
