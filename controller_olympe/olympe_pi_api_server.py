@@ -263,8 +263,8 @@ def start_discrete_window(seconds: float):
 # PCMD helper
 # ---------------------------------------------------------------------------
 
-def _send_pcmd(roll: int, pitch: int, yaw: int, gaz: int):
-    """Send a single PCMD frame. Values -100..100. Roll=lr, Pitch=fb, Gaz=ud, Yaw=yaw."""
+def _send_pcmd(roll: int, pitch: int, yaw: int, gaz: int, flag: int = 1):
+    """Send a single PCMD frame. Values -100..100. flag=1 for active control, flag=0 to release."""
     global _pcmd_seq
     d = drone
     if d is None:
@@ -273,14 +273,14 @@ def _send_pcmd(roll: int, pitch: int, yaw: int, gaz: int):
         _pcmd_seq = (_pcmd_seq + 1) & 0x7FFFFFFF
         seq = _pcmd_seq
     try:
-        d(PCMD(1, roll, pitch, yaw, gaz, seq))
+        d(PCMD(flag, roll, pitch, yaw, gaz, seq))
     except Exception:
         pass
 
 
-def _stop_pcmd():
-    """Send a zero PCMD to stop movement."""
-    _send_pcmd(0, 0, 0, 0)
+def _release_pcmd():
+    """Send flag=0 PCMD to release manual control (let drone hover autonomously)."""
+    _send_pcmd(0, 0, 0, 0, flag=0)
 
 
 # ---------------------------------------------------------------------------
@@ -571,13 +571,14 @@ def rc_loop():
         # Takeoff via key
         if has_key("t") and not flying:
             try:
-                start_discrete_window(SAFE_TAKEOFF_S if safe_takeoff_enabled else 3.0)
+                hold_s = SAFE_TAKEOFF_S if safe_takeoff_enabled else 3.0
+                start_discrete_window(hold_s)
+                _release_pcmd()
+                time.sleep(0.15)
                 with command_lock:
-                    _stop_pcmd()
-                    result = drone(TakeOff()).wait(_timeout=5)
-                if result and result.success():
-                    flying = True
-                    takeoff_cooldown_until = time.time() + (SAFE_TAKEOFF_S if safe_takeoff_enabled else 3.0)
+                    drone(TakeOff()).wait()
+                flying = True
+                takeoff_cooldown_until = time.time() + hold_s
             except Exception as e:
                 print(f"[ANAFI API] Takeoff error: {e}")
             remove_key("t")
@@ -592,9 +593,10 @@ def rc_loop():
                 with rc_lock:
                     rc_override = None
                     rc_override_until = 0.0
-                _stop_pcmd()
+                _release_pcmd()
+                time.sleep(0.15)
                 with command_lock:
-                    drone(Landing()).wait(_timeout=5)
+                    drone(Landing()).wait()
                 flying = False
             except Exception as e:
                 print(f"[ANAFI API] Land error: {e}")
@@ -628,7 +630,9 @@ def rc_loop():
             in_discrete = now < discrete_until
 
         if in_discrete:
-            _stop_pcmd()
+            # Don't send ANY PCMD during discrete commands (TakeOff/Land/moveBy).
+            # Olympe needs a clear command channel — PCMD flag=1 can block actions.
+            pass
         else:
             _send_pcmd(lr, fb, yaw, ud)
 
@@ -648,7 +652,7 @@ def shutdown():
     if d is None:
         return
     try:
-        _stop_pcmd()
+        _release_pcmd()
     except Exception:
         pass
     if flying:
@@ -719,14 +723,23 @@ def api_takeoff():
         if not flying:
             hold_s = SAFE_TAKEOFF_S if safe_takeoff_enabled else 3.0
             start_discrete_window(hold_s)
+            _release_pcmd()
+            time.sleep(0.15)  # let in-flight PCMD drain
             with command_lock:
-                _stop_pcmd()
-                result = d(TakeOff()).wait(_timeout=8)
-            if result and result.success():
+                result = d(TakeOff()).wait()
+            ok = result.success() if result is not None else False
+            if ok:
                 flying = True
                 takeoff_cooldown_until = time.time() + hold_s
             else:
-                return jsonify(ok=False, error="takeoff_failed"), 500
+                # Command may still have worked — check flying state
+                time.sleep(0.5)
+                fs = _get_drone_state(FlyingStateChanged)
+                if _is_flying_state(fs):
+                    flying = True
+                    takeoff_cooldown_until = time.time() + hold_s
+                else:
+                    return jsonify(ok=False, error="takeoff_failed"), 500
         return jsonify(ok=True, flying=flying, safe_takeoff=safe_takeoff_enabled)
     except Exception as e:
         return jsonify(ok=False, error=str(e)), 500
@@ -750,13 +763,21 @@ def api_land():
         with rc_lock:
             rc_override = None
             rc_override_until = 0.0
+        _release_pcmd()
+        time.sleep(0.15)
         last_err = None
         for _ in range(3):
             try:
-                _stop_pcmd()
                 with command_lock:
-                    result = d(Landing()).wait(_timeout=8)
-                if result and result.success():
+                    result = d(Landing()).wait()
+                ok = result.success() if result is not None else False
+                if ok:
+                    flying = False
+                    return jsonify(ok=True, flying=False)
+                # Check state even if result wasn't clean
+                time.sleep(0.5)
+                fs = _get_drone_state(FlyingStateChanged)
+                if not _is_flying_state(fs):
                     flying = False
                     return jsonify(ok=True, flying=False)
             except Exception as e:
@@ -812,7 +833,7 @@ def api_flip():
     try:
         start_discrete_window(2.0)
         with command_lock:
-            _stop_pcmd()
+            _release_pcmd()
             result = d(Flip(olympe_dir)).wait(_timeout=5)
         if result and result.success():
             return jsonify(ok=True, dir=direction)
@@ -833,7 +854,7 @@ def api_emergency():
                 d(EmergencyCmd()).wait(_timeout=3)
         else:
             # Fallback: cut PCMD and land
-            _stop_pcmd()
+            _release_pcmd()
             with command_lock:
                 d(Landing()).wait(_timeout=5)
         flying = False
@@ -874,7 +895,7 @@ def api_move():
 
         start_discrete_window(max(1.0, dist_m * 2))
         with command_lock:
-            _stop_pcmd()
+            _release_pcmd()
             result = d(moveBy(*move_args)).wait(_timeout=30)
         if result and result.success():
             return jsonify(ok=True, dir=direction, cm=dist_cm)
@@ -905,7 +926,7 @@ def api_rotate():
 
         start_discrete_window(max(1.0, degrees / 90.0))
         with command_lock:
-            _stop_pcmd()
+            _release_pcmd()
             result = d(moveBy(0, 0, 0, d_psi)).wait(_timeout=15)
         if result and result.success():
             return jsonify(ok=True, dir=direction, deg=degrees)
@@ -937,7 +958,7 @@ def api_go():
         dist = math.sqrt(dx**2 + dy**2 + dz**2)
         start_discrete_window(max(1.5, dist * 2))
         with command_lock:
-            _stop_pcmd()
+            _release_pcmd()
             result = d(moveBy(dx, dy, dz, 0)).wait(_timeout=30)
         if result and result.success():
             return jsonify(ok=True, x=x, y=y, z=z)
@@ -1249,7 +1270,7 @@ def api_moveto():
     try:
         start_discrete_window(10.0)
         with command_lock:
-            _stop_pcmd()
+            _release_pcmd()
             result = d(extended_move_to(
                 latitude=float(lat),
                 longitude=float(lon),

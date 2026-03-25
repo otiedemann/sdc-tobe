@@ -9,7 +9,7 @@ from flask import Flask, Response, jsonify, request, send_file
 # Runs on remote PC. Proxies to Pi API server.
 HTTP_HOST = "0.0.0.0"
 HTTP_PORT = 8090
-TIMEOUT_CMD = float(os.getenv("PI_TIMEOUT_CMD", "1.2"))
+TIMEOUT_CMD = float(os.getenv("PI_TIMEOUT_CMD", "12"))
 TIMEOUT_STATUS = float(os.getenv("PI_TIMEOUT_STATUS", "0.5"))
 
 # Drone fleet – id → {name, type, base URL}
