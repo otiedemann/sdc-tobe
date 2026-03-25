@@ -72,8 +72,11 @@ def shutdown():
     global running
     running = False
     try:
+        print("Disconnecting drone...")
         drone.disconnect()
-    except Exception:
+        print("Drone disconnected.")
+    except Exception as e:
+        print(f"Error during shutdown: {e}")
         pass
 
 
@@ -85,6 +88,30 @@ def on_exit():
 def main():
     drone.connect()
     threading.Thread(target=telemetry_loop, daemon=True).start()
+
+    print(f"Server running at http://{HTTP_HOST}:{HTTP_PORT}")
+
+    # Define all routes
+    @app.route("/api/key_down", methods=["POST"])
+    def api_key_down():
+        # Dummy implementation
+        return jsonify(ok=True)
+
+    @app.route("/api/key_up", methods=["POST"])
+    def api_key_up():
+        # Dummy implementation
+        return jsonify(ok=True)
+
+    @app.route("/api/safety/takeoff", methods=["GET"])
+    def api_safety_takeoff_get():
+        # Dummy implementation
+        return jsonify(enabled=True, hold_s=3.0)
+
+    @app.route("/api/logging/telemetry", methods=["GET"])
+    def api_telemetry_log_status():
+        # Dummy implementation
+        return jsonify(enabled=True, path="/path/to/telemetry/log")
+
     app.run(host=HTTP_HOST, port=HTTP_PORT, threaded=True, use_reloader=False)
     print(f"Server running at http://{HTTP_HOST}:{HTTP_PORT}")
 
