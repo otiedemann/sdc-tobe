@@ -7,11 +7,21 @@ import requests
 from flask import Flask, Response, jsonify, request, send_file
 
 # Runs on remote PC. Proxies to Pi API server.
-PI_BASE = os.getenv("PI_API_BASE", "http://192.168.1.100:8080").rstrip("/")
 HTTP_HOST = "0.0.0.0"
 HTTP_PORT = 8090
 TIMEOUT_CMD = float(os.getenv("PI_TIMEOUT_CMD", "1.2"))
 TIMEOUT_STATUS = float(os.getenv("PI_TIMEOUT_STATUS", "0.5"))
+
+# Drone fleet – id → {name, type, base URL}
+DRONES = {
+    "1": {"name": "Anafi 1", "type": "anafi", "base": "http://192.168.1.20:8080"},
+    "2": {"name": "Tello 1", "type": "tello", "base": "http://192.168.1.100:8080"},
+    "3": {"name": "Drone 3", "type": "tello", "base": "http://192.168.1.101:8080"},
+    "4": {"name": "Drone 4", "type": "tello", "base": "http://192.168.1.102:8080"},
+    "5": {"name": "Drone 5", "type": "tello", "base": "http://192.168.1.103:8080"},
+}
+active_drone_id = "1"
+PI_BASE = DRONES[active_drone_id]["base"]
 
 app = Flask(__name__)
 command_log_enabled = os.getenv("REMOTE_COMMAND_LOG", "0") in {"1", "true", "True"}
@@ -24,7 +34,7 @@ HTML = """
 <head>
   <meta charset=\"utf-8\" />
   <meta name=\"viewport\" content=\"width=device-width,initial-scale=1\" />
-  <title>Tello Remote Controller</title>
+  <title>Drone Remote Controller</title>
   <style>
     body { background:#0f172a; color:#e2e8f0; font-family:Arial,sans-serif; margin:0; padding:16px; }
     .row { display:flex; gap:16px; flex-wrap:wrap; align-items:flex-start; }
@@ -41,11 +51,17 @@ HTML = """
     .adv { margin-top:8px; border-top:1px solid #334155; padding-top:8px; }
     .adv-grid { display:grid; grid-template-columns:repeat(3,minmax(100px,1fr)); gap:8px; }
     .adv input { height:36px; border-radius:8px; border:1px solid #475569; background:#0f172a; color:#e2e8f0; padding:0 8px; }
+    .drone-bar { display:flex; gap:8px; margin-bottom:12px; }
+    .drone-btn { height:44px; padding:0 18px; border-radius:8px; border:2px solid #475569; background:#1e293b; color:#e2e8f0; font-weight:700; cursor:pointer; font-size:14px; transition:all .15s; }
+    .drone-btn.selected { background:#0ea5e9; color:#001018; border-color:#0ea5e9; }
+    .drone-btn:hover:not(.selected) { border-color:#94a3b8; }
+    .drone-type { font-size:10px; font-weight:400; opacity:.7; display:block; line-height:1; }
   </style>
 </head>
 <body>
-  <h2>Tello Remote Web Controller</h2>
-  <div class=\"small\">Pi API: <span id=\"pi\"></span></div>
+  <h2>Drone Remote Controller</h2>
+  <div class=\"drone-bar\" id=\"drone_bar\"></div>
+  <div class=\"small\">Active: <span id=\"pi\"></span></div>
   <div class=\"small\">API status: <span id=\"api_status\">checking...</span></div>
   <div class=\"small\">Drone telemetry status: <span id=\"drone_status\">checking...</span></div>
   <div class=\"row\" style=\"margin-top:10px;\">
@@ -141,7 +157,56 @@ HTML = """
     </div>
   </div>
 <script>
-document.getElementById('pi').textContent = location.origin + ' -> proxy -> Pi';
+// --- Drone fleet selector ---
+let drones = {};
+let activeDroneId = null;
+
+async function loadDrones() {
+  try {
+    const r = await fetch('/proxy/drones');
+    const d = await r.json();
+    drones = d.drones;
+    activeDroneId = d.active;
+    renderDroneBar();
+    updatePiLabel();
+  } catch {}
+}
+
+function renderDroneBar() {
+  const bar = document.getElementById('drone_bar');
+  bar.innerHTML = '';
+  for (const [id, info] of Object.entries(drones)) {
+    const btn = document.createElement('button');
+    btn.className = 'drone-btn' + (id === activeDroneId ? ' selected' : '');
+    btn.innerHTML = `${info.name}<span class="drone-type">${info.type}</span>`;
+    btn.onclick = () => switchDrone(id);
+    bar.appendChild(btn);
+  }
+  // Show/hide Anafi panel based on drone type
+  const anafiPanel = document.getElementById('anafi_panel');
+  if (anafiPanel) {
+    const droneType = drones[activeDroneId]?.type || '';
+    anafiPanel.style.display = droneType === 'anafi' ? '' : 'none';
+  }
+}
+
+async function switchDrone(id) {
+  if (id === activeDroneId) return;
+  // Release all keys on the current drone before switching
+  releaseAllKeys();
+  try {
+    await fetch('/proxy/switch', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({id:id})});
+    activeDroneId = id;
+    renderDroneBar();
+    updatePiLabel();
+    refreshTelemetry();
+  } catch {}
+}
+
+function updatePiLabel() {
+  const info = drones[activeDroneId];
+  document.getElementById('pi').textContent = info ? `${info.name} (${info.type}) @ ${info.base}` : '-';
+}
 
 async function post(url, body){
   try {
@@ -401,6 +466,7 @@ setInterval(refreshTelemetry, 700);
 setInterval(refreshLogStatus, 2000);
 setInterval(refreshSafeTakeoff, 2000);
 setInterval(refreshCommandLogStatus, 2000);
+loadDrones();
 refreshTelemetry();
 refreshLogStatus();
 refreshSafeTakeoff();
@@ -454,6 +520,25 @@ def pi_get(path: str, timeout: float | None = None):
 @app.get("/")
 def index():
     return Response(HTML, mimetype="text/html")
+
+
+@app.get("/proxy/drones")
+def proxy_drones():
+    return jsonify(drones=DRONES, active=active_drone_id)
+
+
+@app.post("/proxy/switch")
+def proxy_switch():
+    global active_drone_id, PI_BASE
+    data = request.get_json(silent=True) or {}
+    drone_id = str(data.get("id", ""))
+    if drone_id not in DRONES:
+        return jsonify(ok=False, error="unknown drone id"), 400
+    active_drone_id = drone_id
+    PI_BASE = DRONES[drone_id]["base"]
+    log_command("switch_drone", {"id": drone_id, "name": DRONES[drone_id]["name"]})
+    print(f"[REMOTE UI] Switched to {DRONES[drone_id]['name']} @ {PI_BASE}")
+    return jsonify(ok=True, active=drone_id, name=DRONES[drone_id]["name"], base=PI_BASE)
 
 
 @app.post("/proxy/key_down")
