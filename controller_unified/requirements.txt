@@ -1,0 +1,15 @@
+# Unified Pi API Server - Python dependencies
+# Install with: pip install -r requirements.txt
+
+# --- Required ---
+flask
+
+# --- Tello drone support ---
+djitellopy
+
+# --- Anafi drone support ---
+parrot-olympe
+
+# --- Video streaming (MJPEG mode) ---
+opencv-python-headless
+numpy

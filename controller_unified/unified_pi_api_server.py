@@ -58,53 +58,53 @@ try:
     from olympe.messages.ardrone3.SpeedSettings import MaxRotationSpeed, MaxVerticalSpeed
     from olympe.messages.ardrone3.PilotingSettings import MaxAltitude, MaxTilt
     HAS_OLYMPE_SDK = True
-except ImportError:
+except (ImportError, KeyError):
     pass
 
 if HAS_OLYMPE_SDK:
     try:
         from olympe.messages.ardrone3.Piloting import Emergency as EmergencyCmd
         HAS_EMERGENCY = True
-    except ImportError:
+    except (ImportError, KeyError):
         pass
     try:
         from olympe.messages.camera import start_recording, stop_recording, take_photo
         HAS_CAMERA = True
-    except ImportError:
+    except (ImportError, KeyError):
         pass
     try:
         from olympe.messages.gimbal import set_target, attitude as gimbal_attitude
         HAS_GIMBAL = True
-    except ImportError:
+    except (ImportError, KeyError):
         pass
     try:
         from olympe.messages.ardrone3.PilotingState import GpsLocationChanged
         HAS_GPS_STATE = True
-    except ImportError:
+    except (ImportError, KeyError):
         try:
             from olympe.messages.ardrone3.GPSState import GpsLocationChanged
             HAS_GPS_STATE = True
-        except ImportError:
+        except (ImportError, KeyError):
             pass
     try:
         from olympe.messages.rth import return_to_home, cancel_auto_trigger, state as rth_state
         HAS_RTH = True
-    except ImportError:
+    except (ImportError, KeyError):
         pass
     try:
         from olympe.messages.move import extended_move_to
         HAS_MOVE_TO = True
-    except ImportError:
+    except (ImportError, KeyError):
         pass
     try:
         from olympe.messages.ardrone3.SpeedSettings import MaxHorizontalSpeed
         HAS_MAX_HORIZ_SPEED = True
-    except ImportError:
+    except (ImportError, KeyError):
         pass
     try:
         from olympe.messages.ardrone3.PilotingSettings import MaxDistance, NoFlyOverMaxDistance
         HAS_GEOFENCE = True
-    except ImportError:
+    except (ImportError, KeyError):
         pass
 
 try:
@@ -963,7 +963,10 @@ class OlympeBackend(DroneBackend):
         return self._check_connected(self.drone)
 
     def verify_connection(self) -> bool:
-        return self._check_connected(self.drone)
+        """Use ping for health check — avoids racing with telemetry get_state calls."""
+        if self.drone is None:
+            return False
+        return _host_reachable(self.ip)
 
     def on_connect(self):
         d = self.drone

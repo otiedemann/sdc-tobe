@@ -26,7 +26,7 @@ from olympe.messages.ardrone3.PilotingSettings import MaxAltitude, MaxTilt
 try:
     from olympe.messages.ardrone3.Piloting import Emergency as EmergencyCmd
     HAS_EMERGENCY = True
-except ImportError:
+except (ImportError, KeyError):
     HAS_EMERGENCY = False
 
 try:
@@ -36,47 +36,47 @@ try:
         take_photo,
     )
     HAS_CAMERA = True
-except ImportError:
+except (ImportError, KeyError):
     HAS_CAMERA = False
 
 try:
     from olympe.messages.gimbal import set_target, attitude as gimbal_attitude
     HAS_GIMBAL = True
-except ImportError:
+except (ImportError, KeyError):
     HAS_GIMBAL = False
 
 try:
     from olympe.messages.ardrone3.PilotingState import GpsLocationChanged
     HAS_GPS_STATE = True
-except ImportError:
+except (ImportError, KeyError):
     try:
         from olympe.messages.ardrone3.GPSState import GpsLocationChanged
         HAS_GPS_STATE = True
-    except ImportError:
+    except (ImportError, KeyError):
         HAS_GPS_STATE = False
 
 try:
     from olympe.messages.rth import return_to_home, cancel_auto_trigger, state as rth_state
     HAS_RTH = True
-except ImportError:
+except (ImportError, KeyError):
     HAS_RTH = False
 
 try:
     from olympe.messages.move import extended_move_to
     HAS_MOVE_TO = True
-except ImportError:
+except (ImportError, KeyError):
     HAS_MOVE_TO = False
 
 try:
     from olympe.messages.ardrone3.SpeedSettings import MaxHorizontalSpeed
     HAS_MAX_HORIZ_SPEED = True
-except ImportError:
+except (ImportError, KeyError):
     HAS_MAX_HORIZ_SPEED = False
 
 try:
     from olympe.messages.ardrone3.PilotingSettings import MaxDistance, NoFlyOverMaxDistance
     HAS_GEOFENCE = True
-except ImportError:
+except (ImportError, KeyError):
     HAS_GEOFENCE = False
 
 # Optional: OpenCV for Way 1 (on-Pi MJPEG streaming)
