@@ -831,24 +831,46 @@ def watchdog_loop():
 # ---------------------------------------------------------------------------
 
 def _video_frame_callback(yuv_frame):
-    """Called by Olympe pdraw for each decoded video frame (Way 1: MJPEG)."""
+    """Called by Olympe pdraw for each decoded video frame (Way 1: MJPEG).
+
+    Olympe requires ref()/unref() lifecycle on frames. Without ref() the
+    frame buffer can be reclaimed before we finish processing.
+    """
     global _video_last_jpeg, _video_frame_count
     if not HAS_CV2:
         return
     try:
-        info = yuv_frame.info()
-        # Build YUV format lookup — Olympe versions expose these differently
-        fmt_map = {}
-        for attr, cvt in [("VDEF_I420", cv2.COLOR_YUV2BGR_I420),
-                          ("VDEF_NV12", cv2.COLOR_YUV2BGR_NV12)]:
-            fmt_const = getattr(olympe, attr, None)
-            if fmt_const is not None:
-                fmt_map[fmt_const] = cvt
-        cv_cvt_color_flag = fmt_map.get(info["yuv"]["format"])
-        if cv_cvt_color_flag is None:
-            # Fallback: try I420 (most common Anafi format)
-            cv_cvt_color_flag = cv2.COLOR_YUV2BGR_I420
-        cv_frame = cv2.cvtColor(yuv_frame.as_ndarray(), cv_cvt_color_flag)
+        yuv_frame.ref()
+    except Exception:
+        pass
+    try:
+        # Detect YUV pixel format — the info() dict structure varies by Olympe version
+        cv_cvt = cv2.COLOR_YUV2BGR_I420  # safe default for Anafi (I420/YUV420P)
+        try:
+            info = yuv_frame.info()
+            # Modern Olympe: info["yuv"]["format"]
+            yuv_fmt = None
+            if isinstance(info, dict):
+                if "yuv" in info and isinstance(info["yuv"], dict):
+                    yuv_fmt = info["yuv"].get("format")
+                elif "format" in info:
+                    yuv_fmt = info["format"]
+                elif "raw" in info and isinstance(info["raw"], dict):
+                    yuv_fmt = info["raw"].get("format")
+            if yuv_fmt is not None:
+                for attr, flag in [("VDEF_I420", cv2.COLOR_YUV2BGR_I420),
+                                   ("VDEF_NV12", cv2.COLOR_YUV2BGR_NV12)]:
+                    c = getattr(olympe, attr, None)
+                    if c is not None and c == yuv_fmt:
+                        cv_cvt = flag
+                        break
+            if _video_frame_count == 0:
+                print(f"[ANAFI API] Frame info keys: {list(info.keys()) if isinstance(info, dict) else type(info)}, using cvt={cv_cvt}")
+        except Exception as ie:
+            if _video_frame_count == 0:
+                print(f"[ANAFI API] Frame info() failed ({ie}), using default I420")
+
+        cv_frame = cv2.cvtColor(yuv_frame.as_ndarray(), cv_cvt)
         ok, jpg = cv2.imencode(
             ".jpg", cv_frame, [int(cv2.IMWRITE_JPEG_QUALITY), VIDEO_JPEG_QUALITY]
         )
@@ -856,24 +878,56 @@ def _video_frame_callback(yuv_frame):
             with _video_jpeg_lock:
                 _video_last_jpeg = jpg.tobytes()
             _video_frame_count += 1
+            if _video_frame_count == 1:
+                h, w = cv_frame.shape[:2]
+                print(f"[ANAFI API] First video frame decoded: {w}x{h}")
     except Exception as e:
         if _video_frame_count == 0:
             print(f"[ANAFI API] Video frame decode error: {e}")
+    finally:
+        try:
+            yuv_frame.unref()
+        except Exception:
+            pass
 
 
 def _video_flush_callback(stream):
-    """Required flush callback for Olympe pdraw — just acknowledge."""
+    """Required flush callback for Olympe pdraw.
+
+    Must drain all pending buffers and return True to keep the pipeline flowing.
+    Without this the pdraw pipeline stalls after a few frames.
+    """
     try:
-        # In Olympe >= 7.x the callback receives the stream queue
-        while True:
-            try:
-                buf = stream.get(timeout=0.005)
-                buf.unref()
-            except Exception:
-                break
+        # Olympe >= 7.x: stream is a queue object
+        if hasattr(stream, "empty"):
+            while not stream.empty():
+                try:
+                    stream.get(timeout=0.005).unref()
+                except Exception:
+                    break
+        elif hasattr(stream, "get"):
+            while True:
+                try:
+                    stream.get(timeout=0.005).unref()
+                except Exception:
+                    break
     except Exception:
         pass
     return True
+
+
+def _detect_olympe_streaming_api(d):
+    """Detect which Olympe streaming API is available.
+
+    Returns: ("modern", "legacy", or "none"), plus diagnostic info.
+    """
+    # Modern Olympe >= 7.x: drone.streaming.set_callbacks / .start / .stop
+    if hasattr(d, "streaming") and hasattr(d.streaming, "set_callbacks"):
+        return "modern"
+    # Legacy Olympe: drone.set_streaming_callbacks / drone.start_video_streaming
+    if hasattr(d, "set_streaming_callbacks"):
+        return "legacy"
+    return "none"
 
 
 def start_video_mjpeg():
@@ -884,30 +938,41 @@ def start_video_mjpeg():
         return False, "drone not connected"
     if not HAS_CV2:
         return False, "cv2 (OpenCV) not installed on Pi — pip install opencv-python-headless"
+
+    api = _detect_olympe_streaming_api(d)
+    print(f"[ANAFI API] Olympe streaming API detected: {api}")
+
     _video_mode = "mjpeg"
     _video_last_jpeg = b""
     _video_frame_count = 0
-    try:
-        d.streaming.set_callbacks(
-            raw_cb=_video_frame_callback,
-            flush_raw_cb=_video_flush_callback,
-        )
-        d.streaming.start()
-        _video_streaming = True
-        print("[ANAFI API] Video MJPEG streaming started (Way 1: Pi-decoded)")
-        return True, "mjpeg streaming started"
-    except Exception as e:
-        print(f"[ANAFI API] Video MJPEG start failed: {e}")
-        # Fallback: try older Olympe API
+
+    if api == "modern":
+        try:
+            d.streaming.set_callbacks(
+                raw_cb=_video_frame_callback,
+                flush_raw_cb=_video_flush_callback,
+            )
+            d.streaming.start()
+            _video_streaming = True
+            print("[ANAFI API] Video MJPEG streaming started (modern API)")
+            return True, "mjpeg streaming started"
+        except Exception as e:
+            print(f"[ANAFI API] Modern streaming API failed: {e}")
+            # Fall through to legacy
+            api = "legacy" if hasattr(d, "set_streaming_callbacks") else "none"
+
+    if api == "legacy":
         try:
             d.set_streaming_callbacks(raw_cb=_video_frame_callback)
             d.start_video_streaming()
             _video_streaming = True
-            print("[ANAFI API] Video MJPEG streaming started (legacy Olympe API)")
+            print("[ANAFI API] Video MJPEG streaming started (legacy API)")
             return True, "mjpeg streaming started (legacy)"
-        except Exception as e2:
-            print(f"[ANAFI API] Video MJPEG start failed (legacy): {e2}")
-            return False, f"failed: {e} / legacy: {e2}"
+        except Exception as e:
+            print(f"[ANAFI API] Legacy streaming API failed: {e}")
+            return False, f"legacy streaming failed: {e}"
+
+    return False, "no streaming API found in this Olympe version"
 
 
 def stop_video_mjpeg():
@@ -920,12 +985,13 @@ def stop_video_mjpeg():
         return
     try:
         d.streaming.stop()
+        print("[ANAFI API] Video MJPEG streaming stopped (modern)")
     except Exception:
         try:
             d.stop_video_streaming()
+            print("[ANAFI API] Video MJPEG streaming stopped (legacy)")
         except Exception:
             pass
-    print("[ANAFI API] Video MJPEG streaming stopped")
 
 
 def start_video_forward(target_host: str, target_port: int):
