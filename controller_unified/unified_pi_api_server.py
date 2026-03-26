@@ -766,6 +766,12 @@ class TelloBackend(DroneBackend):
                 continue
             password = cfg["password"]
             ifname = cfg["ifname"]
+            # Force a Wi-Fi rescan so the target SSID appears in nmcli's list;
+            # without this, nmcli often fails with "No network with SSID ... found"
+            subprocess.run(["nmcli", "dev", "wifi", "rescan", "ifname", ifname],
+                           capture_output=True, text=True)
+            time.sleep(2)  # give scan time to complete
+
             cmd_base = ["nmcli", "dev", "wifi", "connect", ssid, "password", password, "ifname", ifname]
             if cfg.get("sudo"):
                 cmd_base = ["sudo"] + cmd_base

@@ -138,11 +138,14 @@ def wifi_connect_loop():
             time.sleep(WIFI_RETRY_S)
             continue
 
+        # Force a Wi-Fi rescan so the target SSID appears in nmcli's list;
+        # without this, nmcli often fails with "No network with SSID ... found"
+        _run(["nmcli", "dev", "wifi", "rescan", "ifname", ifname])
+        time.sleep(2)  # give scan time to complete
+
         if cfg.get("sudo"):
-            # print(f"[PI API] Connecting to WiFi {ssid} ifname {ifname} (sudo)...")
             _run(["sudo", "nmcli", "dev", "wifi", "connect", ssid, "password", password, "ifname", ifname])
         else:
-            # print(f"[PI API] Connecting to WiFi {ssid} ifname {ifname}...")
             _run(["nmcli", "dev", "wifi", "connect", ssid, "password", password, "ifname", ifname])
         time.sleep(WIFI_RETRY_S)
 
