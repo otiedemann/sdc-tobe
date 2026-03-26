@@ -377,9 +377,20 @@ def _is_flying_state(state_dict) -> bool:
         s = state_dict.get("state")
         if s is None:
             return False
-        # state values: landed=0, takingoff=1, hovering=2, flying=3, landing=4, emergency=5
+        # Olympe enums stringify to e.g. "FlyingStateChanged_State.landed" —
+        # we must check ONLY the value after the last dot, otherwise "flying"
+        # would match the class name in every state (including "landed").
         name = str(s).lower()
-        return any(x in name for x in ("hovering", "flying", "takingoff"))
+        # Extract just the value part: "flyingstatechanged_state.landed" → "landed"
+        if "." in name:
+            name = name.rsplit(".", 1)[-1]
+        # Also try the .name attribute if it's an enum
+        try:
+            name = s.name.lower()
+        except AttributeError:
+            pass
+        # state values: landed=0, takingoff=1, hovering=2, flying=3, landing=4, emergency=5
+        return name in ("hovering", "flying", "takingoff")
     except Exception:
         return False
 
@@ -819,6 +830,10 @@ def api_takeoff():
     if not connected or d is None:
         return jsonify(ok=False, error="controller not ready"), 503
     try:
+        # Log current state so we can diagnose skipped takeoffs
+        fs = _get_drone_state(FlyingStateChanged)
+        print(f"[ANAFI API] /api/takeoff called — flying={flying}, state={fs}")
+
         if not flying:
             hold_s = SAFE_TAKEOFF_S if safe_takeoff_enabled else 3.0
             start_discrete_window(hold_s)
