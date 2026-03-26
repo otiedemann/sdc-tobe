@@ -260,27 +260,98 @@ def start_discrete_window(seconds: float):
 
 
 # ---------------------------------------------------------------------------
+# Olympe piloting interface detection
+# ---------------------------------------------------------------------------
+# Olympe has an internal PCMD scheduler running at ~25Hz.  If we also send
+# raw PCMD frames via  d(PCMD(...)),  they interleave with Olympe's own loop,
+# creating conflicting piloting signals that can block action commands
+# (TakeOff, Landing, moveBy).
+#
+# The correct approach is to use Olympe's native piloting API:
+#   drone.start_piloting()   – tell Olympe we want manual PCMD control
+#   drone.piloting_pcmd(...) – set the PCMD values Olympe should send
+#   drone.stop_piloting()    – release manual control (drone hovers)
+#
+# We detect at import time whether these methods exist and fall back to
+# raw PCMD only as a last resort.
+
+_has_piloting_api: Optional[bool] = None  # lazy-detected on first use
+
+
+def _detect_piloting_api() -> bool:
+    """Check whether the connected Drone object supports the native piloting API."""
+    global _has_piloting_api
+    if _has_piloting_api is not None:
+        return _has_piloting_api
+    d = drone
+    if d is None:
+        return False
+    _has_piloting_api = callable(getattr(d, "piloting_pcmd", None))
+    if _has_piloting_api:
+        print("[ANAFI API] Using native Olympe piloting API (piloting_pcmd / start_piloting / stop_piloting)")
+    else:
+        print("[ANAFI API] Native piloting API not found – falling back to raw d(PCMD(...))")
+    return _has_piloting_api
+
+
+# ---------------------------------------------------------------------------
 # PCMD helper
 # ---------------------------------------------------------------------------
 
 def _send_pcmd(roll: int, pitch: int, yaw: int, gaz: int, flag: int = 1):
-    """Send a single PCMD frame. Values -100..100. flag=1 for active control, flag=0 to release."""
-    global _pcmd_seq
+    """Send piloting values. Uses native API if available, raw PCMD otherwise."""
     d = drone
     if d is None:
         return
-    with _pcmd_seq_lock:
-        _pcmd_seq = (_pcmd_seq + 1) & 0x7FFFFFFF
-        seq = _pcmd_seq
-    try:
-        d(PCMD(flag, roll, pitch, yaw, gaz, seq))
-    except Exception:
-        pass
+    if _detect_piloting_api():
+        try:
+            if flag == 0:
+                d.piloting_pcmd(0, 0, 0, 0, 0)
+            else:
+                d.piloting_pcmd(roll, pitch, yaw, gaz, 0)
+        except Exception:
+            pass
+    else:
+        global _pcmd_seq
+        with _pcmd_seq_lock:
+            _pcmd_seq = (_pcmd_seq + 1) & 0x7FFFFFFF
+            seq = _pcmd_seq
+        try:
+            d(PCMD(flag, roll, pitch, yaw, gaz, seq))
+        except Exception:
+            pass
+
+
+def _start_piloting():
+    """Tell Olympe we want active manual piloting (starts internal PCMD loop)."""
+    d = drone
+    if d is None:
+        return
+    if _detect_piloting_api():
+        try:
+            d.start_piloting()
+        except Exception:
+            pass
+
+
+def _stop_piloting():
+    """Tell Olympe to release manual piloting (drone hovers autonomously)."""
+    d = drone
+    if d is None:
+        return
+    if _detect_piloting_api():
+        try:
+            d.stop_piloting()
+        except Exception:
+            pass
+    else:
+        # Fallback: send flag=0 PCMD
+        _send_pcmd(0, 0, 0, 0, flag=0)
 
 
 def _release_pcmd():
-    """Send flag=0 PCMD to release manual control (let drone hover autonomously)."""
-    _send_pcmd(0, 0, 0, 0, flag=0)
+    """Release manual control – stop piloting and send zeros."""
+    _stop_piloting()
 
 
 # ---------------------------------------------------------------------------
@@ -539,6 +610,7 @@ def reconnect_loop():
                 actually_connected = _check_drone_connected(d)
                 if actually_connected:
                     _apply_flight_limits(d)
+                    _start_piloting()
                     print("[ANAFI API] Connection verified (state query OK)")
                 with conn_lock:
                     conn_state["connected"] = actually_connected
@@ -557,6 +629,7 @@ def reconnect_loop():
 def rc_loop():
     global running, flying, rc_override, rc_override_until, takeoff_cooldown_until
     period = 1.0 / RC_HZ
+    _was_connected = False
     while running:
         t0 = time.time()
         reap_stale_keys(t0)
@@ -565,22 +638,47 @@ def rc_loop():
             connected = conn_state["connected"]
 
         if not connected:
+            _was_connected = False
             time.sleep(period)
             continue
+
+        # On (re)connect, start Olympe piloting so PCMD values are sent
+        if not _was_connected:
+            _start_piloting()
+            _was_connected = True
 
         # Takeoff via key
         if has_key("t") and not flying:
             try:
                 hold_s = SAFE_TAKEOFF_S if safe_takeoff_enabled else 3.0
                 start_discrete_window(hold_s)
-                _release_pcmd()
-                time.sleep(0.15)
+                _stop_piloting()
+                time.sleep(0.2)
+                print("[ANAFI API] Key TakeOff...")
                 with command_lock:
-                    drone(TakeOff()).wait()
-                flying = True
-                takeoff_cooldown_until = time.time() + hold_s
+                    result = drone(TakeOff()).wait(_timeout=10)
+                ok = False
+                try:
+                    ok = result.success() if result is not None else False
+                except Exception:
+                    pass
+                if ok:
+                    flying = True
+                    takeoff_cooldown_until = time.time() + hold_s
+                else:
+                    # Poll for state change
+                    for _ in range(4):
+                        time.sleep(0.5)
+                        fs = _get_drone_state(FlyingStateChanged)
+                        if _is_flying_state(fs):
+                            flying = True
+                            takeoff_cooldown_until = time.time() + hold_s
+                            break
+                print(f"[ANAFI API] Key TakeOff result: ok={ok}, flying={flying}")
+                _start_piloting()
             except Exception as e:
                 print(f"[ANAFI API] Takeoff error: {e}")
+                _start_piloting()
             remove_key("t")
 
         # Land via key
@@ -593,10 +691,11 @@ def rc_loop():
                 with rc_lock:
                     rc_override = None
                     rc_override_until = 0.0
-                _release_pcmd()
-                time.sleep(0.15)
+                _stop_piloting()
+                time.sleep(0.2)
+                print("[ANAFI API] Key Landing...")
                 with command_lock:
-                    drone(Landing()).wait()
+                    drone(Landing()).wait(_timeout=10)
                 flying = False
             except Exception as e:
                 print(f"[ANAFI API] Land error: {e}")
@@ -652,7 +751,7 @@ def shutdown():
     if d is None:
         return
     try:
-        _release_pcmd()
+        _stop_piloting()
     except Exception:
         pass
     if flying:
@@ -723,25 +822,50 @@ def api_takeoff():
         if not flying:
             hold_s = SAFE_TAKEOFF_S if safe_takeoff_enabled else 3.0
             start_discrete_window(hold_s)
-            _release_pcmd()
-            time.sleep(0.15)  # let in-flight PCMD drain
+
+            # 1. Stop piloting to clear the PCMD channel for the action command
+            _stop_piloting()
+            time.sleep(0.2)  # let any in-flight PCMD drain
+
+            # 2. Check pre-takeoff state
+            pre_state = _get_drone_state(FlyingStateChanged)
+            print(f"[ANAFI API] TakeOff: pre-state={pre_state}")
+
+            # 3. Send TakeOff — use _timeout so we never block forever
+            print("[ANAFI API] Sending TakeOff command...")
             with command_lock:
-                result = d(TakeOff()).wait()
-            ok = result.success() if result is not None else False
+                result = d(TakeOff()).wait(_timeout=10)
+
+            ok = False
+            try:
+                ok = result.success() if result is not None else False
+            except Exception:
+                pass
+            print(f"[ANAFI API] TakeOff result: ok={ok}, result={result}")
+
             if ok:
                 flying = True
                 takeoff_cooldown_until = time.time() + hold_s
             else:
-                # Command may still have worked — check flying state
-                time.sleep(0.5)
-                fs = _get_drone_state(FlyingStateChanged)
-                if _is_flying_state(fs):
-                    flying = True
-                    takeoff_cooldown_until = time.time() + hold_s
-                else:
+                # Command may still have worked — poll for state change
+                for i in range(6):
+                    time.sleep(0.5)
+                    fs = _get_drone_state(FlyingStateChanged)
+                    print(f"[ANAFI API] TakeOff poll {i}: state={fs}")
+                    if _is_flying_state(fs):
+                        flying = True
+                        takeoff_cooldown_until = time.time() + hold_s
+                        break
+                if not flying:
                     return jsonify(ok=False, error="takeoff_failed"), 500
+
+            # 4. Re-enable piloting for RC control
+            _start_piloting()
+
         return jsonify(ok=True, flying=flying, safe_takeoff=safe_takeoff_enabled)
     except Exception as e:
+        print(f"[ANAFI API] TakeOff exception: {e}")
+        _start_piloting()  # re-enable piloting even on error
         return jsonify(ok=False, error=str(e)), 500
 
 
@@ -763,14 +887,23 @@ def api_land():
         with rc_lock:
             rc_override = None
             rc_override_until = 0.0
-        _release_pcmd()
-        time.sleep(0.15)
+
+        # Stop piloting to clear PCMD channel
+        _stop_piloting()
+        time.sleep(0.2)
+
+        print("[ANAFI API] Sending Landing command...")
         last_err = None
-        for _ in range(3):
+        for attempt in range(3):
             try:
                 with command_lock:
-                    result = d(Landing()).wait()
-                ok = result.success() if result is not None else False
+                    result = d(Landing()).wait(_timeout=10)
+                ok = False
+                try:
+                    ok = result.success() if result is not None else False
+                except Exception:
+                    pass
+                print(f"[ANAFI API] Landing attempt {attempt}: ok={ok}")
                 if ok:
                     flying = False
                     return jsonify(ok=True, flying=False)
@@ -782,9 +915,11 @@ def api_land():
                     return jsonify(ok=True, flying=False)
             except Exception as e:
                 last_err = e
+                print(f"[ANAFI API] Landing attempt {attempt} error: {e}")
                 time.sleep(0.25)
         raise last_err if last_err else RuntimeError("land_failed")
     except Exception as e:
+        print(f"[ANAFI API] Land exception: {e}")
         return jsonify(ok=False, error=str(e)), 500
 
 
@@ -832,13 +967,16 @@ def api_flip():
 
     try:
         start_discrete_window(2.0)
+        _stop_piloting()
+        time.sleep(0.1)
         with command_lock:
-            _release_pcmd()
             result = d(Flip(olympe_dir)).wait(_timeout=5)
+        _start_piloting()
         if result and result.success():
             return jsonify(ok=True, dir=direction)
         return jsonify(ok=False, error="flip_failed"), 500
     except Exception as e:
+        _start_piloting()
         return jsonify(ok=False, error=str(e)), 500
 
 
@@ -849,12 +987,12 @@ def api_emergency():
     if d is None:
         return jsonify(ok=False, error="controller not ready"), 503
     try:
+        _stop_piloting()
         if HAS_EMERGENCY:
             with command_lock:
                 d(EmergencyCmd()).wait(_timeout=3)
         else:
-            # Fallback: cut PCMD and land
-            _release_pcmd()
+            # Fallback: land
             with command_lock:
                 d(Landing()).wait(_timeout=5)
         flying = False
@@ -894,13 +1032,16 @@ def api_move():
         }[direction]
 
         start_discrete_window(max(1.0, dist_m * 2))
+        _stop_piloting()
+        time.sleep(0.1)
         with command_lock:
-            _release_pcmd()
             result = d(moveBy(*move_args)).wait(_timeout=30)
+        _start_piloting()
         if result and result.success():
             return jsonify(ok=True, dir=direction, cm=dist_cm)
         return jsonify(ok=False, error="move_failed"), 500
     except Exception as e:
+        _start_piloting()
         return jsonify(ok=False, error=str(e)), 500
 
 
@@ -925,13 +1066,16 @@ def api_rotate():
         d_psi = rad if direction == "cw" else -rad
 
         start_discrete_window(max(1.0, degrees / 90.0))
+        _stop_piloting()
+        time.sleep(0.1)
         with command_lock:
-            _release_pcmd()
             result = d(moveBy(0, 0, 0, d_psi)).wait(_timeout=15)
+        _start_piloting()
         if result and result.success():
             return jsonify(ok=True, dir=direction, deg=degrees)
         return jsonify(ok=False, error="rotate_failed"), 500
     except Exception as e:
+        _start_piloting()
         return jsonify(ok=False, error=str(e)), 500
 
 
@@ -957,13 +1101,16 @@ def api_go():
 
         dist = math.sqrt(dx**2 + dy**2 + dz**2)
         start_discrete_window(max(1.5, dist * 2))
+        _stop_piloting()
+        time.sleep(0.1)
         with command_lock:
-            _release_pcmd()
             result = d(moveBy(dx, dy, dz, 0)).wait(_timeout=30)
+        _start_piloting()
         if result and result.success():
             return jsonify(ok=True, x=x, y=y, z=z)
         return jsonify(ok=False, error="go_failed"), 500
     except Exception as e:
+        _start_piloting()
         return jsonify(ok=False, error=str(e)), 500
 
 
@@ -1016,6 +1163,7 @@ def api_recover():
         actually_connected = _check_drone_connected(d)
         if actually_connected:
             _apply_flight_limits(d)
+            _start_piloting()
         flying = False
         with conn_lock:
             conn_state["connected"] = actually_connected
@@ -1269,8 +1417,9 @@ def api_moveto():
         return jsonify(ok=False, error="lat and lon required"), 400
     try:
         start_discrete_window(10.0)
+        _stop_piloting()
+        time.sleep(0.1)
         with command_lock:
-            _release_pcmd()
             result = d(extended_move_to(
                 latitude=float(lat),
                 longitude=float(lon),
@@ -1281,10 +1430,12 @@ def api_moveto():
                 max_vertical_speed=MAX_VERTICAL_SPEED,
                 max_yaw_rotation_speed=MAX_YAW_SPEED,
             )).wait(_timeout=60)
+        _start_piloting()
         if result and result.success():
             return jsonify(ok=True, lat=float(lat), lon=float(lon), alt=alt)
         return jsonify(ok=False, error="moveto_failed"), 500
     except Exception as e:
+        _start_piloting()
         return jsonify(ok=False, error=str(e)), 500
 
 
