@@ -838,10 +838,15 @@ class OlympeBackend(DroneBackend):
             print(f"[ANAFI] Native piloting API FAILED ({e}) — using raw d(PCMD(...))")
             return False
 
+    _pcmd_debug_count = 0
+
     def _send_pcmd(self, roll, pitch, yaw, gaz, flag=1):
         d = self.drone
         if d is None:
             return
+        if self.__class__._pcmd_debug_count < 5 and (roll or pitch or yaw or gaz):
+            print(f"[ANAFI] PCMD: roll={roll} pitch={pitch} yaw={yaw} gaz={gaz} flag={flag} api={self._has_piloting_api}")
+            self.__class__._pcmd_debug_count += 1
         if self._detect_piloting_api():
             try:
                 if flag == 0:
@@ -849,8 +854,9 @@ class OlympeBackend(DroneBackend):
                 else:
                     d.piloting_pcmd(roll, pitch, yaw, gaz, 0)
                 return
-            except Exception:
-                pass
+            except Exception as e:
+                if self.__class__._pcmd_debug_count < 10:
+                    print(f"[ANAFI] piloting_pcmd failed: {e}")
         with self._pcmd_seq_lock:
             self._pcmd_seq = (self._pcmd_seq + 1) & 0x7FFFFFFF
             seq = self._pcmd_seq
@@ -1077,18 +1083,27 @@ class OlympeBackend(DroneBackend):
         if d is None:
             return False, "not_ready"
         dist_m = cm / 100.0
+        # Olympe moveBy: dX=forward(+), dY=right(+), dZ=down(+), dPsi=yaw(rad)
         move_args = {
             "forward": (dist_m, 0, 0, 0), "back": (-dist_m, 0, 0, 0),
             "right": (0, dist_m, 0, 0), "left": (0, -dist_m, 0, 0),
             "up": (0, 0, -dist_m, 0), "down": (0, 0, dist_m, 0),
         }[direction]
+        print(f"[ANAFI] move({direction}, {cm}cm) -> moveBy{move_args}")
         self._stop_piloting()
         time.sleep(0.1)
         with command_lock:
             result = d(moveBy(*move_args)).wait(_timeout=30)
+        ok = False
+        try:
+            ok = result.success() if result is not None else False
+        except Exception:
+            pass
+        print(f"[ANAFI] moveBy result: ok={ok}")
         self._start_piloting()
-        if result and result.success():
+        if ok:
             return True, "ok"
+        # Even if moveBy "failed", check if the drone actually moved
         return False, "move_failed"
 
     def rotate(self, direction: str, degrees: int) -> Tuple[bool, str]:
