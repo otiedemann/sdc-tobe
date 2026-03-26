@@ -1966,14 +1966,19 @@ def api_takeoff():
         if not flying:
             hold_s = SAFE_TAKEOFF_S if safe_takeoff_enabled else 3.0
             start_discrete_window(hold_s)
+            b.before_discrete_command()
             ok, msg = b.takeoff()
+            b.after_discrete_command()
             if ok:
                 flying = True
                 takeoff_cooldown_until = time.time() + hold_s
             else:
+                print(f"[{drone_type.upper()}] Takeoff returned ok=False msg={msg}")
                 return jsonify(ok=False, error=msg), 500
         return jsonify(ok=True, flying=flying, safe_takeoff=safe_takeoff_enabled)
     except Exception as e:
+        import traceback
+        traceback.print_exc()
         # Tello: attempt recovery on failure
         if drone_type == "tello":
             rok, rmsg = b.recover()
@@ -1999,12 +2004,17 @@ def api_land():
         with rc_lock:
             rc_override = None
             rc_override_until = 0.0
+        b.before_discrete_command()
         ok, msg = b.land()
+        b.after_discrete_command()
         if ok:
             flying = False
             return jsonify(ok=True, flying=False)
+        print(f"[{drone_type.upper()}] Land returned ok=False msg={msg}")
         return jsonify(ok=False, error=msg), 500
     except Exception as e:
+        import traceback
+        traceback.print_exc()
         if drone_type == "tello":
             rok, rmsg = b.recover()
             return jsonify(ok=False, error="land_failed", recovered=rok, message=rmsg), 500
@@ -2326,25 +2336,34 @@ def api_video_start():
     b = backend
     if b is None:
         return jsonify(ok=False, error="controller not ready"), 503
-    data = request.get_json(silent=True) or {}
-    mode = data.get("mode", "mjpeg")
-    b.video_stop_all()
-    if mode == "mjpeg":
-        ok, msg = b.video_start_mjpeg()
-        if ok:
-            return jsonify(ok=True, mode="mjpeg", message=msg, stream_url=f"http://{request.host}/api/video")
-        return jsonify(ok=False, error=msg), 500
-    elif mode == "forward":
-        target_host = data.get("target_host")
-        target_port = int(data.get("target_port", VIDEO_UDP_FORWARD_PORT))
-        if not target_host:
-            return jsonify(ok=False, error="target_host required"), 400
-        ok, msg = b.video_start_forward(target_host, target_port)
-        if ok:
-            return jsonify(ok=True, mode="forward", message=msg, target=f"{target_host}:{target_port}",
-                           viewer_cmd=f"ffplay -fflags nobuffer -flags low_delay -framedrop -probesize 32 -analyzeduration 0 udp://0.0.0.0:{target_port}")
-        return jsonify(ok=False, error=msg), 500
-    return jsonify(ok=False, error=f"unknown mode: {mode}"), 400
+    try:
+        data = request.get_json(silent=True) or {}
+        mode = data.get("mode", "mjpeg")
+        b.video_stop_all()
+        if mode == "mjpeg":
+            ok, msg = b.video_start_mjpeg()
+            if ok:
+                _video_mode = "mjpeg"
+                return jsonify(ok=True, mode="mjpeg", message=msg, stream_url=f"http://{request.host}/api/video")
+            print(f"[{drone_type.upper()}] video_start_mjpeg failed: {msg}")
+            return jsonify(ok=False, error=msg), 500
+        elif mode == "forward":
+            target_host = data.get("target_host")
+            target_port = int(data.get("target_port", VIDEO_UDP_FORWARD_PORT))
+            if not target_host:
+                return jsonify(ok=False, error="target_host required"), 400
+            ok, msg = b.video_start_forward(target_host, target_port)
+            if ok:
+                _video_mode = "forward"
+                return jsonify(ok=True, mode="forward", message=msg, target=f"{target_host}:{target_port}",
+                               viewer_cmd=f"ffplay -fflags nobuffer -flags low_delay -framedrop -probesize 32 -analyzeduration 0 udp://0.0.0.0:{target_port}")
+            print(f"[{drone_type.upper()}] video_start_forward failed: {msg}")
+            return jsonify(ok=False, error=msg), 500
+        return jsonify(ok=False, error=f"unknown mode: {mode}"), 400
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return jsonify(ok=False, error=str(e)), 500
 
 
 @app.post("/api/video/stop")
