@@ -1,16 +1,28 @@
 import json
 import os
+import socket
+import threading
 import time
 from pathlib import Path
 
 import requests
 from flask import Flask, Response, jsonify, request, send_file
 
+try:
+    import cv2
+    import numpy as np
+    HAS_CV2 = True
+except ImportError:
+    HAS_CV2 = False
+
 # Runs on remote PC. Proxies to Pi API server.
 HTTP_HOST = "0.0.0.0"
 HTTP_PORT = 8090
 TIMEOUT_CMD = float(os.getenv("PI_TIMEOUT_CMD", "12"))
 TIMEOUT_STATUS = float(os.getenv("PI_TIMEOUT_STATUS", "0.5"))
+VIDEO_UDP_FORWARD_PORT = int(os.getenv("VIDEO_UDP_FORWARD_PORT", "55004"))
+VIDEO_FPS = int(os.getenv("VIDEO_FPS", "30"))
+VIDEO_JPEG_QUALITY = int(os.getenv("VIDEO_JPEG_QUALITY", "70"))
 
 # Drone fleet – id → {name, type, base URL}
 DRONES = {
@@ -152,34 +164,33 @@ HTML = """
       <div class=\"small\" style=\"margin-top:8px;\">Keyboard in browser: W/A/S/D R/F Q/E, T, L, Space stop</div>
     </div>
 
-    <div class=\"panel\">
-      <div><b>Telemetry</b></div>
-      <div class=\"status-wrap\">
-        <div class=\"meter\">
-          <div class=\"meter-label\">Battery SoC: <span id=\"battery_val\">-</span></div>
-          <div class=\"meter-track\"><div id=\"battery_bar\" class=\"meter-fill\"></div></div>
+    <div style=\"display:flex; flex-direction:column; gap:12px;\">
+      <div class=\"panel\" id=\"video_panel\">
+        <div><b>Video Stream</b></div>
+        <div class=\"video-controls\">
+          <select id=\"video_mode\">
+            <option value=\"off\">Off</option>
+            <option value=\"mjpeg\">Way 1: MJPEG (decoded on Pi)</option>
+            <option value=\"forward\">Way 2: UDP Forward (decoded on C2)</option>
+          </select>
+          <button id=\"video_toggle\">Start Video</button>
+        </div>
+        <div class=\"video-status\" id=\"video_status\">Mode: off</div>
+        <div class=\"video-url\" id=\"video_url\" style=\"display:none;\"></div>
+        <div id=\"video_container\" style=\"margin-top:8px;display:none;\">
+          <img id=\"video_img\" src=\"\" alt=\"video stream\" style=\"width:480px;height:auto;\" />
         </div>
       </div>
-      <div id=\"telemetry\" class=\"small\" style=\"white-space:pre-wrap; margin-top:10px;\">loading...</div>
-    </div>
-  </div>
-
-  <div class=\"panel video-panel\" id=\"video_panel\">
-    <div><b>Video Stream</b></div>
-    <div class=\"video-controls\">
-      <select id=\"video_mode\">
-        <option value=\"off\">Off</option>
-        <option value=\"mjpeg\">Way 1: MJPEG (decoded on Pi)</option>
-        <option value=\"forward\">Way 2: UDP Forward (raw to C2)</option>
-      </select>
-      <input id=\"video_forward_host\" type=\"text\" placeholder=\"C2 IP (e.g. 192.168.1.50)\" style=\"width:180px;display:none;\" />
-      <input id=\"video_forward_port\" type=\"number\" value=\"55004\" placeholder=\"port\" style=\"width:80px;display:none;\" />
-      <button id=\"video_toggle\">Start Video</button>
-    </div>
-    <div class=\"video-status\" id=\"video_status\">Mode: off</div>
-    <div class=\"video-url\" id=\"video_url\" style=\"display:none;\"></div>
-    <div id=\"video_container\" style=\"margin-top:8px;display:none;\">
-      <img id=\"video_img\" src=\"\" alt=\"video stream\" style=\"width:640px;height:auto;\" />
+      <div class=\"panel\">
+        <div><b>Telemetry</b></div>
+        <div class=\"status-wrap\">
+          <div class=\"meter\">
+            <div class=\"meter-label\">Battery SoC: <span id=\"battery_val\">-</span></div>
+            <div class=\"meter-track\"><div id=\"battery_bar\" class=\"meter-fill\"></div></div>
+          </div>
+        </div>
+        <div id=\"telemetry\" class=\"small\" style=\"white-space:pre-wrap; margin-top:10px;\">loading...</div>
+      </div>
     </div>
   </div>
 <script>
@@ -495,19 +506,10 @@ const videoStatus = document.getElementById('video_status');
 const videoUrl = document.getElementById('video_url');
 const videoContainer = document.getElementById('video_container');
 const videoImg = document.getElementById('video_img');
-const videoFwdHost = document.getElementById('video_forward_host');
-const videoFwdPort = document.getElementById('video_forward_port');
 let videoActive = false;
-
-videoMode.onchange = () => {
-  const m = videoMode.value;
-  videoFwdHost.style.display = m === 'forward' ? '' : 'none';
-  videoFwdPort.style.display = m === 'forward' ? '' : 'none';
-};
 
 videoToggle.onclick = async () => {
   if (videoActive) {
-    // Stop
     await post('/proxy/video/stop', {});
     videoActive = false;
     videoToggle.textContent = 'Start Video';
@@ -520,12 +522,7 @@ videoToggle.onclick = async () => {
   const mode = videoMode.value;
   if (mode === 'off') return;
   const body = {mode};
-  if (mode === 'forward') {
-    const host = videoFwdHost.value.trim();
-    if (!host) { alert('Enter C2 server IP for UDP forwarding'); return; }
-    body.target_host = host;
-    body.target_port = parseInt(videoFwdPort.value) || 55004;
-  }
+  // For forward mode, target_host is auto-detected by the web controller server
   try {
     const r = await fetch('/proxy/video/start', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(body)});
     const d = await r.json();
@@ -533,16 +530,17 @@ videoToggle.onclick = async () => {
       videoActive = true;
       videoToggle.textContent = 'Stop Video';
       videoStatus.textContent = 'Mode: ' + d.mode;
+      // Both modes show video via MJPEG in the browser
+      videoContainer.style.display = '';
       if (d.mode === 'mjpeg') {
-        // Show MJPEG stream in the img tag — proxy through web controller
-        videoContainer.style.display = '';
         videoImg.src = '/proxy/video?' + Date.now();
         videoUrl.style.display = '';
-        videoUrl.innerHTML = 'Direct URL (accessible from any device on network): <b>' + (d.stream_url || '') + '</b>';
+        videoUrl.innerHTML = 'Direct: <b>' + (d.stream_url || '') + '</b>';
       } else if (d.mode === 'forward') {
-        videoContainer.style.display = 'none';
+        // Forward mode: C2 receives UDP, decodes, serves as MJPEG
+        videoImg.src = '/proxy/video/forward_stream?' + Date.now();
         videoUrl.style.display = '';
-        videoUrl.innerHTML = 'UDP forwarding to <b>' + (d.target || '') + '</b><br>View on C2: <code>' + (d.viewer_cmd || '') + '</code>';
+        videoUrl.innerHTML = 'UDP → C2 decode → MJPEG';
       }
     } else {
       videoStatus.textContent = 'Error: ' + (d.error || 'unknown');
@@ -558,15 +556,12 @@ async function refreshVideoStatus() {
     const r = await fetch('/proxy/video/status', {cache:'no-store'});
     const d = await r.json();
     if (!videoActive && d.mode !== 'off') {
-      // External start detected
       videoActive = true;
       videoToggle.textContent = 'Stop Video';
       videoMode.value = d.mode;
     }
-    if (videoActive && d.mode === 'mjpeg') {
-      videoStatus.textContent = 'MJPEG | frames: ' + (d.frames_decoded||0) + ' | has_frame: ' + (d.has_frame||false);
-    } else if (videoActive && d.mode === 'forward') {
-      videoStatus.textContent = 'UDP Forward → ' + (d.target||'') + ' | relay alive: ' + (d.process_alive||false);
+    if (videoActive) {
+      videoStatus.textContent = 'Mode: ' + d.mode + ' | has_frame: ' + (d.has_frame||false);
     }
   } catch {}
 }
@@ -939,14 +934,39 @@ def proxy_video_feed():
 @app.post("/proxy/video/start")
 def proxy_video_start():
     data = request.get_json(silent=True) or {}
+    mode = data.get("mode", "mjpeg")
+    # For forward mode, auto-detect C2 IP (this machine) so the Pi sends UDP here
+    if mode == "forward" and not data.get("target_host"):
+        # Use the host part of request.host (what the browser connected to)
+        c2_host = request.host.split(":")[0]
+        if c2_host in ("127.0.0.1", "localhost"):
+            # Try to get our real IP
+            try:
+                s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                s.connect(("8.8.8.8", 80))
+                c2_host = s.getsockname()[0]
+                s.close()
+            except Exception:
+                pass
+        data["target_host"] = c2_host
+        data["target_port"] = data.get("target_port", VIDEO_UDP_FORWARD_PORT)
     log_command("video_start", data)
     r = pi_post("/api/video/start", data)
+    # If forward mode started successfully, start the UDP receiver on C2
+    if mode == "forward" and r.status_code == 200:
+        try:
+            resp = r.json()
+            if resp.get("ok"):
+                _start_udp_receiver()
+        except Exception:
+            pass
     return (r.text, r.status_code, {"Content-Type": r.headers.get("Content-Type", "application/json")})
 
 
 @app.post("/proxy/video/stop")
 def proxy_video_stop():
     log_command("video_stop")
+    _stop_udp_receiver()
     r = pi_post("/api/video/stop")
     return (r.text, r.status_code, {"Content-Type": r.headers.get("Content-Type", "application/json")})
 
@@ -958,6 +978,86 @@ def proxy_video_status():
         return (r.text, r.status_code, {"Content-Type": "application/json"})
     except Exception as e:
         return jsonify(ok=False, error=str(e), mode="off"), 502
+
+
+# ---------------------------------------------------------------------------
+# UDP → MJPEG bridge for forward mode
+# Receives raw H264 UDP from the Pi, decodes with cv2, serves as MJPEG
+# ---------------------------------------------------------------------------
+_udp_receiver_running = False
+_udp_receiver_thread = None
+_udp_last_frame_lock = threading.Lock()
+_udp_last_jpeg: bytes = b""
+_udp_has_frame = False
+
+
+def _start_udp_receiver():
+    """Start background thread that receives H264 UDP and decodes to JPEG frames."""
+    global _udp_receiver_running, _udp_receiver_thread, _udp_has_frame, _udp_last_jpeg
+    if _udp_receiver_running:
+        return
+    if not HAS_CV2:
+        print("[C2-VIDEO] opencv not available — cannot decode UDP forward stream")
+        return
+    _udp_receiver_running = True
+    _udp_has_frame = False
+    _udp_last_jpeg = b""
+    _udp_receiver_thread = threading.Thread(target=_udp_receiver_loop, daemon=True, name="udp-video-recv")
+    _udp_receiver_thread.start()
+
+
+def _stop_udp_receiver():
+    global _udp_receiver_running, _udp_has_frame, _udp_last_jpeg
+    _udp_receiver_running = False
+    with _udp_last_frame_lock:
+        _udp_last_jpeg = b""
+        _udp_has_frame = False
+
+
+def _udp_receiver_loop():
+    """Receive raw H264 UDP, decode with cv2 VideoCapture, produce JPEG frames."""
+    global _udp_last_jpeg, _udp_has_frame
+
+    udp_url = f"udp://0.0.0.0:{VIDEO_UDP_FORWARD_PORT}?overrun_nonfatal=1&fifo_size=50000000"
+    print(f"[C2-VIDEO] Opening cv2 VideoCapture on {udp_url} ...")
+    os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "fflags;nobuffer|flags;low_delay|framedrop;1|analyzeduration;0|probesize;32"
+    cap = cv2.VideoCapture(udp_url, cv2.CAP_FFMPEG)
+
+    if not cap.isOpened():
+        print("[C2-VIDEO] Failed to open cv2 VideoCapture on UDP stream")
+        _udp_receiver_running  # leave as-is; will be cleaned up
+        return
+
+    print("[C2-VIDEO] cv2 VideoCapture opened, decoding frames...")
+    frame_count = 0
+    while _udp_receiver_running:
+        ret, frame = cap.read()
+        if not ret:
+            continue
+        ok, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, VIDEO_JPEG_QUALITY])
+        if ok:
+            with _udp_last_frame_lock:
+                _udp_last_jpeg = buf.tobytes()
+                _udp_has_frame = True
+            frame_count += 1
+            if frame_count == 1:
+                print("[C2-VIDEO] First frame decoded successfully")
+
+    cap.release()
+    print(f"[C2-VIDEO] Receiver stopped ({frame_count} frames decoded)")
+
+
+@app.get("/proxy/video/forward_stream")
+def proxy_video_forward_stream():
+    """Serve decoded UDP forward frames as MJPEG stream."""
+    def gen():
+        while _udp_receiver_running:
+            with _udp_last_frame_lock:
+                jpg = _udp_last_jpeg
+            if jpg:
+                yield b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + jpg + b"\r\n"
+            time.sleep(1.0 / max(1, VIDEO_FPS))
+    return Response(gen(), mimetype="multipart/x-mixed-replace; boundary=frame")
 
 
 @app.get("/proxy/heartbeat")
