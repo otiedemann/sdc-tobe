@@ -751,12 +751,75 @@ class TelloBackend(DroneBackend):
             resp = t.send_command_with_return(command)
         return True, str(resp)
 
+    # --- Video (Tello MJPEG via get_frame_read) ---
+
+    _video_mjpeg_active = False
+    _video_frame_lock = threading.Lock()
+    _video_last_jpeg: bytes = b""
+
+    def video_start_mjpeg(self) -> Tuple[bool, str]:
+        t = self._t()
+        if t is None:
+            return False, "not_ready"
+        if not HAS_CV2:
+            return False, "opencv not installed"
+        if self._video_mjpeg_active:
+            return True, "already_running"
+        self._video_mjpeg_active = True
+        th = threading.Thread(target=self._video_mjpeg_loop, daemon=True, name="tello-mjpeg")
+        th.start()
+        print("[TELLO] MJPEG video started")
+        return True, "ok"
+
+    def _video_mjpeg_loop(self):
+        t = self._t()
+        if t is None:
+            self._video_mjpeg_active = False
+            return
+        try:
+            frame_read = t.get_frame_read()
+        except Exception as e:
+            print(f"[TELLO] get_frame_read failed: {e}")
+            self._video_mjpeg_active = False
+            return
+        period = 1.0 / VIDEO_FPS
+        while self._video_mjpeg_active and running:
+            try:
+                frame = frame_read.frame
+                if frame is not None:
+                    ok, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, VIDEO_JPEG_QUALITY])
+                    if ok:
+                        with self._video_frame_lock:
+                            self._video_last_jpeg = buf.tobytes()
+            except Exception:
+                pass
+            time.sleep(period)
+
+    def video_stop_mjpeg(self):
+        self._video_mjpeg_active = False
+        with self._video_frame_lock:
+            self._video_last_jpeg = b""
+        print("[TELLO] MJPEG video stopped")
+
+    def video_stop_all(self):
+        self.video_stop_mjpeg()
+
+    def video_status(self) -> dict:
+        mode = "mjpeg" if self._video_mjpeg_active else "off"
+        with self._video_frame_lock:
+            has_frame = len(self._video_last_jpeg) > 0
+        return {"mode": mode, "has_frame": has_frame, "has_cv2": HAS_CV2}
+
+    def get_video_jpeg(self) -> bytes:
+        with self._video_frame_lock:
+            return self._video_last_jpeg
+
     def capabilities(self) -> dict:
         return {
             "drone_type": "tello",
             "speed": True, "curve": True, "stream": True, "sdk": True,
             "camera": False, "gimbal": False, "rth": False, "moveto": False,
-            "video_mjpeg": False, "video_forward": False,
+            "video_mjpeg": HAS_CV2, "video_forward": False,
             "settings": False, "altitude_fence": False,
         }
 
