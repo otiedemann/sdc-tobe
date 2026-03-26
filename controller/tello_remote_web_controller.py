@@ -991,13 +991,13 @@ _udp_last_jpeg: bytes = b""
 _udp_has_frame = False
 
 
+_ffmpeg_proc = None
+
+
 def _start_udp_receiver():
-    """Start background thread that receives H264 UDP and decodes to JPEG frames."""
+    """Start ffmpeg to decode H264 UDP and produce raw frames, then encode to JPEG."""
     global _udp_receiver_running, _udp_receiver_thread, _udp_has_frame, _udp_last_jpeg
     if _udp_receiver_running:
-        return
-    if not HAS_CV2:
-        print("[C2-VIDEO] opencv not available — cannot decode UDP forward stream")
         return
     _udp_receiver_running = True
     _udp_has_frame = False
@@ -1007,43 +1007,95 @@ def _start_udp_receiver():
 
 
 def _stop_udp_receiver():
-    global _udp_receiver_running, _udp_has_frame, _udp_last_jpeg
+    global _udp_receiver_running, _udp_has_frame, _udp_last_jpeg, _ffmpeg_proc
     _udp_receiver_running = False
+    if _ffmpeg_proc is not None:
+        try:
+            _ffmpeg_proc.terminate()
+            _ffmpeg_proc.wait(timeout=3)
+        except Exception:
+            try:
+                _ffmpeg_proc.kill()
+            except Exception:
+                pass
+        _ffmpeg_proc = None
     with _udp_last_frame_lock:
         _udp_last_jpeg = b""
         _udp_has_frame = False
 
 
 def _udp_receiver_loop():
-    """Receive raw H264 UDP, decode with cv2 VideoCapture, produce JPEG frames."""
-    global _udp_last_jpeg, _udp_has_frame
+    """Use ffmpeg to decode H264 UDP stream → raw RGB frames → JPEG."""
+    global _udp_last_jpeg, _udp_has_frame, _ffmpeg_proc
+    import struct
+    import subprocess as sp
+    import shutil
 
-    udp_url = f"udp://0.0.0.0:{VIDEO_UDP_FORWARD_PORT}?overrun_nonfatal=1&fifo_size=50000000"
-    print(f"[C2-VIDEO] Opening cv2 VideoCapture on {udp_url} ...")
-    os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "fflags;nobuffer|flags;low_delay|framedrop;1|analyzeduration;0|probesize;32"
-    cap = cv2.VideoCapture(udp_url, cv2.CAP_FFMPEG)
-
-    if not cap.isOpened():
-        print("[C2-VIDEO] Failed to open cv2 VideoCapture on UDP stream")
-        _udp_receiver_running  # leave as-is; will be cleaned up
+    ffmpeg_bin = shutil.which("ffmpeg")
+    if not ffmpeg_bin:
+        print("[C2-VIDEO] ffmpeg not found — install ffmpeg to decode UDP forward stream")
+        _udp_receiver_running and None  # noqa
         return
 
-    print("[C2-VIDEO] cv2 VideoCapture opened, decoding frames...")
-    frame_count = 0
-    while _udp_receiver_running:
-        ret, frame = cap.read()
-        if not ret:
-            continue
-        ok, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, VIDEO_JPEG_QUALITY])
-        if ok:
-            with _udp_last_frame_lock:
-                _udp_last_jpeg = buf.tobytes()
-                _udp_has_frame = True
-            frame_count += 1
-            if frame_count == 1:
-                print("[C2-VIDEO] First frame decoded successfully")
+    width, height = 960, 720  # Tello default resolution
+    frame_size = width * height * 3  # RGB24
 
-    cap.release()
+    cmd = [
+        ffmpeg_bin,
+        "-fflags", "nobuffer",
+        "-flags", "low_delay",
+        "-framedrop",
+        "-probesize", "32",
+        "-analyzeduration", "0",
+        "-i", f"udp://0.0.0.0:{VIDEO_UDP_FORWARD_PORT}?overrun_nonfatal=1",
+        "-f", "rawvideo",
+        "-pix_fmt", "rgb24",
+        "-s", f"{width}x{height}",
+        "-an",
+        "-sn",
+        "-",
+    ]
+    print(f"[C2-VIDEO] Starting ffmpeg: {' '.join(cmd)}")
+    try:
+        _ffmpeg_proc = sp.Popen(cmd, stdout=sp.PIPE, stderr=sp.DEVNULL, bufsize=frame_size * 2)
+    except Exception as e:
+        print(f"[C2-VIDEO] ffmpeg failed to start: {e}")
+        return
+
+    frame_count = 0
+    buf = b""
+    while _udp_receiver_running:
+        try:
+            chunk = _ffmpeg_proc.stdout.read(frame_size - len(buf))
+            if not chunk:
+                break
+            buf += chunk
+            if len(buf) < frame_size:
+                continue
+            # We have a full frame
+            frame_data = buf[:frame_size]
+            buf = buf[frame_size:]
+            if HAS_CV2:
+                frame = np.frombuffer(frame_data, dtype=np.uint8).reshape((height, width, 3))
+                ok, jpg_buf = cv2.imencode(".jpg", cv2.cvtColor(frame, cv2.COLOR_RGB2BGR),
+                                           [cv2.IMWRITE_JPEG_QUALITY, VIDEO_JPEG_QUALITY])
+                if ok:
+                    with _udp_last_frame_lock:
+                        _udp_last_jpeg = jpg_buf.tobytes()
+                        _udp_has_frame = True
+                    frame_count += 1
+                    if frame_count == 1:
+                        print("[C2-VIDEO] First frame decoded successfully")
+        except Exception as e:
+            if _udp_receiver_running:
+                print(f"[C2-VIDEO] Error: {e}")
+            break
+
+    if _ffmpeg_proc:
+        try:
+            _ffmpeg_proc.terminate()
+        except Exception:
+            pass
     print(f"[C2-VIDEO] Receiver stopped ({frame_count} frames decoded)")
 
 
