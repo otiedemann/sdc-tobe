@@ -484,7 +484,12 @@ class TelloBackend(DroneBackend):
         if self.tello is None:
             self.tello = Tello(host=self.ip)
         self.tello.connect()
-        self.tello.streamon()
+        # Don't call streamon() if video forward is active (it has port 11111)
+        if not self._video_forward_active:
+            try:
+                self.tello.streamon()
+            except Exception:
+                pass
         self._refresh_info()
         # Verify with round-trip
         try:
@@ -511,9 +516,12 @@ class TelloBackend(DroneBackend):
             return False
         try:
             resp = str(t.send_command_with_return("battery?")).strip()
-            return resp.isdigit()
+            if resp.isdigit():
+                return True
         except Exception:
-            return False
+            pass
+        # Fallback: just ping the drone
+        return _host_reachable(self.ip)
 
     def on_connect(self):
         pass  # Tello doesn't need post-connect setup
