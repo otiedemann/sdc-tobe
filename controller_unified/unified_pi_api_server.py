@@ -1653,17 +1653,18 @@ def telemetry_loop():
             continue
 
         data = b.poll_telemetry()
-        if data:
+
+        # Extract internal flags before processing
+        sdk_flying = data.pop("_sdk_flying", None)
+        got_any = data.pop("_got_any", False)
+
+        # Only mark as connected if we got REAL sensor data from the drone
+        if got_any:
             last_state_seen = time.time()
-            # Fix stale conn_state from telemetry data
             with conn_lock:
                 if not conn_state["connected"]:
                     conn_state["connected"] = True
                     print(f"[{drone_type.upper()}] Connection detected via telemetry")
-
-        # Update flying from SDK state (Anafi provides _sdk_flying)
-        sdk_flying = data.pop("_sdk_flying", None)
-        got_any = data.pop("_got_any", None)
         if sdk_flying is not None:
             with command_lock:
                 in_discrete = time.time() < discrete_until
