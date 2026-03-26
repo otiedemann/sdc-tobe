@@ -97,6 +97,7 @@ TELEMETRY_HZ = float(os.getenv("TELEMETRY_HZ", "2.0"))
 KEY_STALE_S = float(os.getenv("KEY_STALE_S", "1.0"))
 SAFE_TAKEOFF_S = float(os.getenv("SAFE_TAKEOFF_S", "3.0"))
 SAFE_TAKEOFF_DEFAULT = os.getenv("SAFE_TAKEOFF_DEFAULT", "0") in {"1", "true", "True"}
+REMOTE_TIMEOUT_S = float(os.getenv("REMOTE_TIMEOUT_S", "5.0"))  # auto-land if no remote request for this long
 TELEMETRY_LOG_DEFAULT = False
 TELEMETRY_LOG_PATH_DEFAULT = Path(__file__).with_name("telemetry_log.jsonl")
 COMMAND_LOG_ENABLED = os.getenv("API_COMMAND_LOG", "1") in {"1", "true", "True"}
@@ -157,6 +158,10 @@ command_lock = threading.Lock()
 discrete_until = 0.0
 takeoff_cooldown_until = 0.0
 safe_takeoff_enabled = SAFE_TAKEOFF_DEFAULT
+
+# Remote controller watchdog — auto-land if remote goes silent while flying
+last_remote_request = 0.0
+_watchdog_landed = False  # prevents repeated land attempts
 
 # Sequence number counter for PCMD
 _pcmd_seq = 0
@@ -260,46 +265,47 @@ def start_discrete_window(seconds: float):
 
 
 # ---------------------------------------------------------------------------
-# Olympe piloting interface detection
+# Olympe piloting interface
 # ---------------------------------------------------------------------------
-# Olympe has an internal PCMD scheduler running at ~25Hz.  If we also send
-# raw PCMD frames via  d(PCMD(...)),  they interleave with Olympe's own loop,
-# creating conflicting piloting signals that can block action commands
-# (TakeOff, Landing, moveBy).
-#
-# The correct approach is to use Olympe's native piloting API:
-#   drone.start_piloting()   – tell Olympe we want manual PCMD control
-#   drone.piloting_pcmd(...) – set the PCMD values Olympe should send
-#   drone.stop_piloting()    – release manual control (drone hovers)
-#
-# We detect at import time whether these methods exist and fall back to
-# raw PCMD only as a last resort.
+# Some Olympe versions expose start_piloting / piloting_pcmd / stop_piloting
+# but they may fail at runtime ("Unable to launch piloting interface").
+# We detect at first use, ACTUALLY TEST the call, and fall back to raw
+# d(PCMD(...)) if the native API doesn't work.
 
-_has_piloting_api: Optional[bool] = None  # lazy-detected on first use
+_has_piloting_api: Optional[bool] = None  # None=untested, True/False=tested
 
 
 def _detect_piloting_api() -> bool:
-    """Check whether the connected Drone object supports the native piloting API."""
+    """Check whether the native piloting API actually works (not just exists)."""
     global _has_piloting_api
     if _has_piloting_api is not None:
         return _has_piloting_api
     d = drone
     if d is None:
         return False
-    _has_piloting_api = callable(getattr(d, "piloting_pcmd", None))
-    if _has_piloting_api:
-        print("[ANAFI API] Using native Olympe piloting API (piloting_pcmd / start_piloting / stop_piloting)")
-    else:
-        print("[ANAFI API] Native piloting API not found – falling back to raw d(PCMD(...))")
-    return _has_piloting_api
+    if not callable(getattr(d, "start_piloting", None)):
+        _has_piloting_api = False
+        print("[ANAFI API] Native piloting API not found – using raw d(PCMD(...))")
+        return False
+    # Method exists – try calling it to verify it actually works
+    try:
+        d.start_piloting()
+        _has_piloting_api = True
+        print("[ANAFI API] Native piloting API works (start_piloting / piloting_pcmd / stop_piloting)")
+        return True
+    except Exception as e:
+        _has_piloting_api = False
+        print(f"[ANAFI API] Native piloting API FAILED ({e}) – using raw d(PCMD(...))")
+        return False
 
 
 # ---------------------------------------------------------------------------
-# PCMD helper
+# PCMD helper — always uses raw d(PCMD(...)) since native API is unreliable
 # ---------------------------------------------------------------------------
 
 def _send_pcmd(roll: int, pitch: int, yaw: int, gaz: int, flag: int = 1):
-    """Send piloting values. Uses native API if available, raw PCMD otherwise."""
+    """Send a single PCMD frame via raw Olympe command."""
+    global _pcmd_seq
     d = drone
     if d is None:
         return
@@ -309,21 +315,21 @@ def _send_pcmd(roll: int, pitch: int, yaw: int, gaz: int, flag: int = 1):
                 d.piloting_pcmd(0, 0, 0, 0, 0)
             else:
                 d.piloting_pcmd(roll, pitch, yaw, gaz, 0)
+            return
         except Exception:
             pass
-    else:
-        global _pcmd_seq
-        with _pcmd_seq_lock:
-            _pcmd_seq = (_pcmd_seq + 1) & 0x7FFFFFFF
-            seq = _pcmd_seq
-        try:
-            d(PCMD(flag, roll, pitch, yaw, gaz, seq))
-        except Exception:
-            pass
+    # Fallback / primary: raw PCMD
+    with _pcmd_seq_lock:
+        _pcmd_seq = (_pcmd_seq + 1) & 0x7FFFFFFF
+        seq = _pcmd_seq
+    try:
+        d(PCMD(flag, roll, pitch, yaw, gaz, seq))
+    except Exception:
+        pass
 
 
 def _start_piloting():
-    """Tell Olympe we want active manual piloting (starts internal PCMD loop)."""
+    """Start manual piloting (native API) or no-op for raw PCMD mode."""
     d = drone
     if d is None:
         return
@@ -335,18 +341,25 @@ def _start_piloting():
 
 
 def _stop_piloting():
-    """Tell Olympe to release manual piloting (drone hovers autonomously)."""
+    """Stop manual piloting. For raw PCMD mode, sends flag=0 zeros."""
     d = drone
     if d is None:
         return
     if _detect_piloting_api():
         try:
             d.stop_piloting()
+            return
         except Exception:
             pass
-    else:
-        # Fallback: send flag=0 PCMD
-        _send_pcmd(0, 0, 0, 0, flag=0)
+    # Raw PCMD fallback: send flag=0 to release manual control
+    global _pcmd_seq
+    with _pcmd_seq_lock:
+        _pcmd_seq = (_pcmd_seq + 1) & 0x7FFFFFFF
+        seq = _pcmd_seq
+    try:
+        d(PCMD(0, 0, 0, 0, 0, seq))
+    except Exception:
+        pass
 
 
 def _release_pcmd():
@@ -752,6 +765,40 @@ def rc_loop():
 
 
 # ---------------------------------------------------------------------------
+# Remote controller watchdog — auto-land on connection loss
+# ---------------------------------------------------------------------------
+
+def watchdog_loop():
+    """If the remote controller stops sending requests while airborne, auto-land."""
+    global flying, _watchdog_landed
+    while running:
+        time.sleep(1.0)
+        if not flying or _watchdog_landed:
+            continue
+        if last_remote_request <= 0:
+            continue  # never received a request yet
+        silence = time.time() - last_remote_request
+        if silence >= REMOTE_TIMEOUT_S:
+            print(f"[ANAFI API] WATCHDOG: No remote request for {silence:.1f}s while flying — AUTO-LANDING")
+            _watchdog_landed = True  # don't spam land attempts
+            d = drone
+            if d is None:
+                continue
+            try:
+                _stop_piloting()
+                time.sleep(0.2)
+                with pressed_lock:
+                    pressed_web.clear()
+                    key_last_seen.clear()
+                with command_lock:
+                    d(Landing()).wait(_timeout=10)
+                flying = False
+                print("[ANAFI API] WATCHDOG: Auto-land command sent")
+            except Exception as e:
+                print(f"[ANAFI API] WATCHDOG: Auto-land failed: {e}")
+
+
+# ---------------------------------------------------------------------------
 # Shutdown
 # ---------------------------------------------------------------------------
 
@@ -780,6 +827,18 @@ def shutdown():
 # ---------------------------------------------------------------------------
 # Flask middleware
 # ---------------------------------------------------------------------------
+
+@app.before_request
+def _update_remote_heartbeat():
+    """Track last request time from remote controller for watchdog auto-land."""
+    global last_remote_request, _watchdog_landed
+    try:
+        if request.path.startswith("/api/"):
+            last_remote_request = time.time()
+            _watchdog_landed = False  # reset — remote is back
+    except Exception:
+        pass
+
 
 @app.before_request
 def _log_incoming_api_command():
@@ -1554,8 +1613,9 @@ def main():
     threading.Thread(target=reconnect_loop, daemon=True).start()
     threading.Thread(target=telemetry_loop, daemon=True).start()
     threading.Thread(target=rc_loop, daemon=True).start()
+    threading.Thread(target=watchdog_loop, daemon=True).start()
 
-    print(f"[ANAFI API] http://{HTTP_HOST}:{HTTP_PORT} (waiting for Anafi at {DRONE_IP}; auto-reconnect enabled)")
+    print(f"[ANAFI API] http://{HTTP_HOST}:{HTTP_PORT} (waiting for Anafi at {DRONE_IP}; auto-reconnect enabled; watchdog={REMOTE_TIMEOUT_S}s)")
     app.run(host=HTTP_HOST, port=HTTP_PORT, threaded=True, use_reloader=False)
 
 

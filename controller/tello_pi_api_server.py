@@ -26,7 +26,8 @@ KEY_STALE_S = float(os.getenv("KEY_STALE_S", "1.0"))
 SAFE_TAKEOFF_S = float(os.getenv("SAFE_TAKEOFF_S", "3.0"))
 SAFE_TAKEOFF_DEFAULT = os.getenv("SAFE_TAKEOFF_DEFAULT", "0") in {"1", "true", "True"}
 WIFI_CFG_PATH = Path(__file__).with_name("tello_wifi_config.json")
-TELLO_HOST = "192.168.10.1"
+TELLO_HOST = os.getenv("TELLO_HOST", "192.168.1.10")
+REMOTE_TIMEOUT_S = float(os.getenv("REMOTE_TIMEOUT_S", "5.0"))  # auto-land if no remote request for this long
 TELEMETRY_LOG_DEFAULT = False
 TELEMETRY_LOG_PATH_DEFAULT = Path(__file__).with_name("telemetry_log.jsonl")
 COMMAND_LOG_ENABLED = os.getenv("API_COMMAND_LOG", "1") in {"1", "true", "True"}
@@ -81,6 +82,10 @@ command_lock = threading.Lock()
 discrete_until = 0.0
 takeoff_cooldown_until = 0.0
 safe_takeoff_enabled = SAFE_TAKEOFF_DEFAULT
+
+# Remote controller watchdog — auto-land if remote goes silent while flying
+last_remote_request = 0.0
+_watchdog_landed = False
 sdk_version_value = None
 serial_number_value = None
 
@@ -520,6 +525,40 @@ def rc_loop():
             time.sleep(period - dt)
 
 
+# ---------------------------------------------------------------------------
+# Remote controller watchdog — auto-land on connection loss
+# ---------------------------------------------------------------------------
+
+def watchdog_loop():
+    """If the remote controller stops sending requests while airborne, auto-land."""
+    global flying, _watchdog_landed
+    while running:
+        time.sleep(1.0)
+        if not flying or _watchdog_landed:
+            continue
+        if last_remote_request <= 0:
+            continue  # never received a request yet
+        silence = time.time() - last_remote_request
+        if silence >= REMOTE_TIMEOUT_S:
+            print(f"[TELLO API] WATCHDOG: No remote request for {silence:.1f}s while flying — AUTO-LANDING")
+            _watchdog_landed = True
+            t = TELLO
+            if t is None:
+                continue
+            try:
+                with pressed_lock:
+                    pressed_web.clear()
+                    key_last_seen.clear()
+                with command_lock:
+                    t.send_rc_control(0, 0, 0, 0)
+                    time.sleep(0.15)
+                    t.land()
+                flying = False
+                print("[TELLO API] WATCHDOG: Auto-land command sent")
+            except Exception as e:
+                print(f"[TELLO API] WATCHDOG: Auto-land failed: {e}")
+
+
 def shutdown():
     global running
     running = False
@@ -537,6 +576,18 @@ def shutdown():
             pass
     try:
         t.end()
+    except Exception:
+        pass
+
+
+@app.before_request
+def _update_remote_heartbeat():
+    """Track last request time from remote controller for watchdog auto-land."""
+    global last_remote_request, _watchdog_landed
+    try:
+        if request.path.startswith("/api/"):
+            last_remote_request = time.time()
+            _watchdog_landed = False
     except Exception:
         pass
 
@@ -991,8 +1042,9 @@ def main():
     threading.Thread(target=telemetry_loop, daemon=True).start()
     threading.Thread(target=reconnect_loop, daemon=True).start()
     threading.Thread(target=rc_loop, daemon=True).start()
+    threading.Thread(target=watchdog_loop, daemon=True).start()
 
-    print(f"http://{HTTP_HOST}:{HTTP_PORT} (waiting for Tello; auto-reconnect enabled)")
+    print(f"http://{HTTP_HOST}:{HTTP_PORT} (waiting for Tello; auto-reconnect enabled; watchdog={REMOTE_TIMEOUT_S}s)")
     app.run(host=HTTP_HOST, port=HTTP_PORT, threaded=True, use_reloader=False)
 
 
