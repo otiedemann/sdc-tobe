@@ -10,6 +10,8 @@ Usage:
   python3 unified_pi_api_server.py
 """
 
+from __future__ import annotations
+
 import abc
 import atexit
 import json
