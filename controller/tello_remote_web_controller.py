@@ -96,7 +96,7 @@ HTML = """
       <div class=\"adv\">
         <div class=\"small\" style=\"margin-bottom:6px;\">Advanced SDK controls</div>
         <div class=\"adv-grid\">
-          <button id=\"emergency\">EMERGENCY</button>
+          <button id=\"emergency\" style=\"background:#7f1d1d;border-color:#dc2626;\">EMERGENCY<br><span style=\"font-size:9px;font-weight:400;opacity:.8;\">Killswitch - will shutdown drone immediately - no safe landing</span></button>
           <button id=\"rotate_cw\">Rotate CW 45°</button>
           <button id=\"rotate_ccw\">Rotate CCW 45°</button>
           <button id=\"move_up\">Up 30cm</button>
