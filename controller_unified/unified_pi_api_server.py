@@ -812,19 +812,11 @@ class TelloBackend(DroneBackend):
             return False, "not_ready"
         if self._video_forward_active:
             return True, "already_running"
-        # Stop djitellopy's video capture so we can bind port 11111 ourselves
+        # Ensure stream is on (djitellopy keeps its own receiver on 11111)
         try:
-            t.streamoff()
-            time.sleep(0.3)
+            t.streamon()
         except Exception:
             pass
-        # Kill any BackgroundFrameRead thread djitellopy may have started
-        if hasattr(t, "background_frame_read") and t.background_frame_read is not None:
-            try:
-                t.background_frame_read.stop()
-            except Exception:
-                pass
-            t.background_frame_read = None
         self._video_forward_active = True
         self._fwd_host = host
         self._fwd_port = port
@@ -833,23 +825,26 @@ class TelloBackend(DroneBackend):
         return True, "ok"
 
     def _video_forward_loop(self):
-        """Raw UDP relay: bind 11111, send 'streamon', forward all packets to C2."""
+        """Forward video by sniffing UDP packets on port 11111 alongside djitellopy."""
         import socket as _socket
         host, port = self._fwd_host, self._fwd_port
+
+        # Create a second UDP socket on port 11111 with SO_REUSEADDR + SO_REUSEPORT
+        # This allows us to receive the same packets djitellopy receives
         recv_sock = _socket.socket(_socket.AF_INET, _socket.SOCK_DGRAM)
         recv_sock.setsockopt(_socket.SOL_SOCKET, _socket.SO_REUSEADDR, 1)
+        # SO_REUSEPORT allows multiple sockets to bind same port (Linux 3.9+)
+        if hasattr(_socket, "SO_REUSEPORT"):
+            recv_sock.setsockopt(_socket.SOL_SOCKET, _socket.SO_REUSEPORT, 1)
         try:
             recv_sock.bind(("0.0.0.0", 11111))
         except OSError as e:
-            print(f"[TELLO] Cannot bind port 11111: {e}")
+            print(f"[TELLO] Cannot bind port 11111 for forwarding: {e}")
             self._video_forward_active = False
             return
         recv_sock.settimeout(2.0)
+
         fwd_sock = _socket.socket(_socket.AF_INET, _socket.SOCK_DGRAM)
-        # Send 'streamon' command to Tello via its command port (8889)
-        cmd_sock = _socket.socket(_socket.AF_INET, _socket.SOCK_DGRAM)
-        cmd_sock.sendto(b"streamon", (self.ip, 8889))
-        cmd_sock.close()
         print(f"[TELLO] Raw UDP video forward started → {host}:{port}")
         pkt_count = 0
         while self._video_forward_active and running:
@@ -861,12 +856,12 @@ class TelloBackend(DroneBackend):
                     print(f"[TELLO] First video packet received ({len(data)} bytes), forwarding")
             except _socket.timeout:
                 # Re-send streamon in case Tello stopped
-                try:
-                    cs = _socket.socket(_socket.AF_INET, _socket.SOCK_DGRAM)
-                    cs.sendto(b"streamon", (self.ip, 8889))
-                    cs.close()
-                except Exception:
-                    pass
+                t = self._t()
+                if t is not None:
+                    try:
+                        t.streamon()
+                    except Exception:
+                        pass
             except Exception as e:
                 if self._video_forward_active:
                     print(f"[TELLO] Forward relay error: {e}")
@@ -877,14 +872,6 @@ class TelloBackend(DroneBackend):
 
     def video_stop_forward(self):
         self._video_forward_active = False
-        time.sleep(0.5)  # let relay loop exit and release port 11111
-        # Restore djitellopy's stream
-        t = self._t()
-        if t is not None:
-            try:
-                t.streamon()
-            except Exception:
-                pass
         print("[TELLO] UDP video forward stopped")
 
     def video_stop_all(self):
