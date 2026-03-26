@@ -1922,6 +1922,33 @@ def root():
     return jsonify(ok=True, service="unified_pi_api_server", drone_type=drone_type, connected=connected)
 
 
+@app.get("/api/debug")
+def api_debug():
+    """Debug endpoint — curl http://PI:8080/api/debug to inspect state."""
+    b = backend
+    with conn_lock:
+        cs = dict(conn_state)
+    with telemetry_lock:
+        tel = dict(telemetry)
+    return jsonify(
+        code_version="2026-03-26-v2",
+        drone_type=drone_type,
+        drone_ip=drone_ip,
+        conn_state=cs,
+        telemetry=tel,
+        flying=flying,
+        last_state_seen=last_state_seen,
+        state_age=round(time.time() - last_state_seen, 3) if last_state_seen else None,
+        last_remote_request=last_remote_request,
+        remote_age=round(time.time() - last_remote_request, 3) if last_remote_request else None,
+        backend_type=type(b).__name__ if b else None,
+        backend_drone_exists=b.drone is not None if b and hasattr(b, "drone") else None,
+        has_olympe=HAS_OLYMPE_SDK,
+        has_tello=HAS_TELLO_SDK,
+        has_cv2=HAS_CV2,
+    )
+
+
 @app.get("/api/heartbeat")
 def api_heartbeat():
     with conn_lock:
@@ -2557,6 +2584,7 @@ def main():
     print(f"[{tag}] Unified API server: http://{HTTP_HOST}:{HTTP_PORT}")
     print(f"[{tag}] Drone: {drone_type} @ {drone_ip} (auto-reconnect; watchdog={REMOTE_TIMEOUT_S}s)")
     print(f"[{tag}] SDKs available: tello={HAS_TELLO_SDK}, olympe={HAS_OLYMPE_SDK}")
+    print(f"[{tag}] Code version: 2026-03-26-v2")
     app.run(host=HTTP_HOST, port=HTTP_PORT, threaded=True, use_reloader=False)
 
 
