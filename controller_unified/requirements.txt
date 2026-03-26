@@ -1,5 +1,8 @@
 # Unified Pi API Server - Python dependencies
 # Install with: pip install -r requirements.txt
+#
+# On Raspberry Pi (ARM): pip install -r requirements-pi.txt
+# On x86 (with Anafi):   pip install -r requirements.txt
 
 # --- Required ---
 flask
@@ -7,7 +10,7 @@ flask
 # --- Tello drone support ---
 djitellopy
 
-# --- Anafi drone support ---
+# --- Anafi drone support (x86 only, not available on ARM/Raspberry Pi) ---
 parrot-olympe
 
 # --- Video streaming (MJPEG mode) ---

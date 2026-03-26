@@ -26,6 +26,16 @@ from typing import Dict, Optional, Set, Tuple
 from flask import Flask, Response, jsonify, request, send_file
 
 # ---------------------------------------------------------------------------
+# Architecture detection — skip Olympe on Raspberry Pi (ARM)
+# ---------------------------------------------------------------------------
+import platform
+
+_machine = platform.machine().lower()
+IS_ARM = _machine.startswith("arm") or _machine.startswith("aarch")
+if IS_ARM:
+    print(f"[UNIFIED] ARM architecture detected ({_machine}) — Olympe SDK disabled, defaulting to Tello")
+
+# ---------------------------------------------------------------------------
 # Conditional SDK imports
 # ---------------------------------------------------------------------------
 
@@ -47,19 +57,20 @@ HAS_MAX_HORIZ_SPEED = False
 HAS_GEOFENCE = False
 HAS_CV2 = False
 
-try:
-    import olympe
-    from olympe.messages.ardrone3.Piloting import TakeOff, Landing, moveBy, PCMD
-    from olympe.messages.ardrone3.PilotingState import (
-        FlyingStateChanged, AttitudeChanged, SpeedChanged, AltitudeChanged,
-    )
-    from olympe.messages.common.CommonState import BatteryStateChanged
-    from olympe.messages.ardrone3.Animations import Flip
-    from olympe.messages.ardrone3.SpeedSettings import MaxRotationSpeed, MaxVerticalSpeed
-    from olympe.messages.ardrone3.PilotingSettings import MaxAltitude, MaxTilt
-    HAS_OLYMPE_SDK = True
-except (ImportError, KeyError):
-    pass
+if not IS_ARM:
+    try:
+        import olympe
+        from olympe.messages.ardrone3.Piloting import TakeOff, Landing, moveBy, PCMD
+        from olympe.messages.ardrone3.PilotingState import (
+            FlyingStateChanged, AttitudeChanged, SpeedChanged, AltitudeChanged,
+        )
+        from olympe.messages.common.CommonState import BatteryStateChanged
+        from olympe.messages.ardrone3.Animations import Flip
+        from olympe.messages.ardrone3.SpeedSettings import MaxRotationSpeed, MaxVerticalSpeed
+        from olympe.messages.ardrone3.PilotingSettings import MaxAltitude, MaxTilt
+        HAS_OLYMPE_SDK = True
+    except (ImportError, KeyError):
+        pass
 
 if HAS_OLYMPE_SDK:
     try:
@@ -190,6 +201,15 @@ def detect_drone_type() -> Tuple[str, str]:
             return "anafi", forced_ip
 
     print("[UNIFIED] Auto-detecting drone type...")
+
+    # On ARM (Raspberry Pi), only Tello is supported (no Olympe SDK)
+    if IS_ARM:
+        if _host_reachable(tello_ip):
+            print(f"[UNIFIED] Tello detected at {tello_ip}")
+        else:
+            print(f"[UNIFIED] ARM platform — defaulting to Tello @ {tello_ip} (will retry)")
+        return "tello", tello_ip
+
     if _host_reachable(anafi_ip):
         print(f"[UNIFIED] Anafi detected at {anafi_ip}")
         return "anafi", anafi_ip
