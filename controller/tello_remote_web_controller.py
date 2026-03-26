@@ -576,7 +576,7 @@ setInterval(refreshVideoStatus, 3000);
 async function sendHeartbeat(){
   try { await fetch('/proxy/heartbeat', {cache:'no-store'}); } catch {}
 }
-setInterval(sendHeartbeat, 2000);
+setInterval(sendHeartbeat, 500);
 sendHeartbeat();
 
 setInterval(refreshTelemetry, 700);

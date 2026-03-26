@@ -110,7 +110,7 @@ TELEMETRY_HZ = float(os.getenv("TELEMETRY_HZ", "2.0"))
 KEY_STALE_S = float(os.getenv("KEY_STALE_S", "1.0"))
 SAFE_TAKEOFF_S = float(os.getenv("SAFE_TAKEOFF_S", "3.0"))
 SAFE_TAKEOFF_DEFAULT = os.getenv("SAFE_TAKEOFF_DEFAULT", "0") in {"1", "true", "True"}
-REMOTE_TIMEOUT_S = float(os.getenv("REMOTE_TIMEOUT_S", "10.0"))  # auto-land if no remote heartbeat for this long
+REMOTE_TIMEOUT_S = float(os.getenv("REMOTE_TIMEOUT_S", "2.0"))  # auto-land if no remote heartbeat for this long
 
 # Video streaming config
 VIDEO_JPEG_QUALITY = int(os.getenv("VIDEO_JPEG_QUALITY", "70"))  # MJPEG quality (Way 1)
