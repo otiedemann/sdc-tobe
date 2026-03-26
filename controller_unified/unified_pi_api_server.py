@@ -801,11 +801,96 @@ class TelloBackend(DroneBackend):
             self._video_last_jpeg = b""
         print("[TELLO] MJPEG video stopped")
 
+    # --- Video (Tello UDP forward — relay port 11111 to C2) ---
+
+    _video_forward_active = False
+    _video_forward_proc = None
+
+    def video_start_forward(self, host: str, port: int) -> Tuple[bool, str]:
+        t = self._t()
+        if t is None:
+            return False, "not_ready"
+        if self._video_forward_active:
+            return True, "already_running"
+        # Make sure stream is on
+        try:
+            t.streamon()
+        except Exception:
+            pass
+        self._video_forward_active = True
+        self._fwd_host = host
+        self._fwd_port = port
+        th = threading.Thread(target=self._video_forward_loop, daemon=True, name="tello-fwd")
+        th.start()
+        print(f"[TELLO] UDP video forward started → {host}:{port}")
+        return True, "ok"
+
+    def _video_forward_loop(self):
+        """Read H264 frames from djitellopy's internal video and forward as UDP."""
+        import socket
+        fwd_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        host, port = self._fwd_host, self._fwd_port
+        t = self._t()
+        if t is None:
+            self._video_forward_active = False
+            return
+        try:
+            frame_read = t.get_frame_read()
+        except Exception as e:
+            print(f"[TELLO] get_frame_read for forward failed: {e}")
+            self._video_forward_active = False
+            return
+        # Access the internal UDP video stream from djitellopy
+        # djitellopy captures H264 on VS_UDP_IP:VS_UDP_PORT (0.0.0.0:11111)
+        # We re-encode each frame as JPEG and send via UDP
+        period = 1.0 / VIDEO_FPS
+        while self._video_forward_active and running:
+            try:
+                frame = frame_read.frame
+                if frame is not None and HAS_CV2:
+                    ok, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, VIDEO_JPEG_QUALITY])
+                    if ok:
+                        data = buf.tobytes()
+                        # UDP max ~65507 bytes; JPEG frames are typically under 50KB
+                        if len(data) <= 65000:
+                            fwd_sock.sendto(data, (host, port))
+                        else:
+                            # Fragment into chunks with header
+                            chunk_size = 60000
+                            total = (len(data) + chunk_size - 1) // chunk_size
+                            for i in range(total):
+                                chunk = data[i * chunk_size:(i + 1) * chunk_size]
+                                fwd_sock.sendto(chunk, (host, port))
+            except Exception:
+                pass
+            time.sleep(period)
+        fwd_sock.close()
+
+    def video_stop_forward(self):
+        if self._video_forward_proc is not None:
+            try:
+                self._video_forward_proc.terminate()
+                self._video_forward_proc.wait(timeout=3)
+            except Exception:
+                try:
+                    self._video_forward_proc.kill()
+                except Exception:
+                    pass
+            self._video_forward_proc = None
+        self._video_forward_active = False
+        print("[TELLO] UDP video forward stopped")
+
     def video_stop_all(self):
         self.video_stop_mjpeg()
+        self.video_stop_forward()
 
     def video_status(self) -> dict:
-        mode = "mjpeg" if self._video_mjpeg_active else "off"
+        if self._video_forward_active:
+            mode = "forward"
+        elif self._video_mjpeg_active:
+            mode = "mjpeg"
+        else:
+            mode = "off"
         with self._video_frame_lock:
             has_frame = len(self._video_last_jpeg) > 0
         return {"mode": mode, "has_frame": has_frame, "has_cv2": HAS_CV2}
@@ -819,7 +904,7 @@ class TelloBackend(DroneBackend):
             "drone_type": "tello",
             "speed": True, "curve": True, "stream": True, "sdk": True,
             "camera": False, "gimbal": False, "rth": False, "moveto": False,
-            "video_mjpeg": HAS_CV2, "video_forward": False,
+            "video_mjpeg": HAS_CV2, "video_forward": True,
             "settings": False, "altitude_fence": False,
         }
 
