@@ -79,6 +79,19 @@ try:
 except ImportError:
     HAS_GEOFENCE = False
 
+# Optional: OpenCV for Way 1 (on-Pi MJPEG streaming)
+try:
+    import cv2
+    import numpy as np
+    HAS_CV2 = True
+except ImportError:
+    HAS_CV2 = False
+
+# Optional: subprocess for Way 2 (UDP forwarding)
+import shutil
+import subprocess
+import signal
+
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
@@ -98,6 +111,12 @@ KEY_STALE_S = float(os.getenv("KEY_STALE_S", "1.0"))
 SAFE_TAKEOFF_S = float(os.getenv("SAFE_TAKEOFF_S", "3.0"))
 SAFE_TAKEOFF_DEFAULT = os.getenv("SAFE_TAKEOFF_DEFAULT", "0") in {"1", "true", "True"}
 REMOTE_TIMEOUT_S = float(os.getenv("REMOTE_TIMEOUT_S", "10.0"))  # auto-land if no remote heartbeat for this long
+
+# Video streaming config
+VIDEO_JPEG_QUALITY = int(os.getenv("VIDEO_JPEG_QUALITY", "70"))  # MJPEG quality (Way 1)
+VIDEO_FPS = int(os.getenv("VIDEO_FPS", "15"))  # target MJPEG frame rate (Way 1)
+VIDEO_UDP_FORWARD_PORT = int(os.getenv("VIDEO_UDP_FORWARD_PORT", "55004"))  # outbound port (Way 2)
+VIDEO_MODE = os.getenv("VIDEO_MODE", "off")  # "off", "mjpeg", "forward"
 TELEMETRY_LOG_DEFAULT = False
 TELEMETRY_LOG_PATH_DEFAULT = Path(__file__).with_name("telemetry_log.jsonl")
 COMMAND_LOG_ENABLED = os.getenv("API_COMMAND_LOG", "1") in {"1", "true", "True"}
@@ -166,6 +185,15 @@ _watchdog_landed = False  # prevents repeated land attempts
 # Sequence number counter for PCMD
 _pcmd_seq = 0
 _pcmd_seq_lock = threading.Lock()
+
+# Video streaming state
+_video_mode = VIDEO_MODE  # "off", "mjpeg", "forward"
+_video_last_jpeg = b""
+_video_jpeg_lock = threading.Lock()
+_video_streaming = False  # True when pdraw callbacks are active
+_video_forward_proc = None  # subprocess for UDP forwarding (Way 2)
+_video_forward_target = ""  # "host:port" for UDP forwarding
+_video_frame_count = 0
 
 
 # ---------------------------------------------------------------------------
@@ -799,12 +827,231 @@ def watchdog_loop():
 
 
 # ---------------------------------------------------------------------------
+# Video streaming
+# ---------------------------------------------------------------------------
+
+def _video_frame_callback(yuv_frame):
+    """Called by Olympe pdraw for each decoded video frame (Way 1: MJPEG)."""
+    global _video_last_jpeg, _video_frame_count
+    if not HAS_CV2:
+        return
+    try:
+        info = yuv_frame.info()
+        # Build YUV format lookup — Olympe versions expose these differently
+        fmt_map = {}
+        for attr, cvt in [("VDEF_I420", cv2.COLOR_YUV2BGR_I420),
+                          ("VDEF_NV12", cv2.COLOR_YUV2BGR_NV12)]:
+            fmt_const = getattr(olympe, attr, None)
+            if fmt_const is not None:
+                fmt_map[fmt_const] = cvt
+        cv_cvt_color_flag = fmt_map.get(info["yuv"]["format"])
+        if cv_cvt_color_flag is None:
+            # Fallback: try I420 (most common Anafi format)
+            cv_cvt_color_flag = cv2.COLOR_YUV2BGR_I420
+        cv_frame = cv2.cvtColor(yuv_frame.as_ndarray(), cv_cvt_color_flag)
+        ok, jpg = cv2.imencode(
+            ".jpg", cv_frame, [int(cv2.IMWRITE_JPEG_QUALITY), VIDEO_JPEG_QUALITY]
+        )
+        if ok:
+            with _video_jpeg_lock:
+                _video_last_jpeg = jpg.tobytes()
+            _video_frame_count += 1
+    except Exception as e:
+        if _video_frame_count == 0:
+            print(f"[ANAFI API] Video frame decode error: {e}")
+
+
+def _video_flush_callback(stream):
+    """Required flush callback for Olympe pdraw — just acknowledge."""
+    try:
+        # In Olympe >= 7.x the callback receives the stream queue
+        while True:
+            try:
+                buf = stream.get(timeout=0.005)
+                buf.unref()
+            except Exception:
+                break
+    except Exception:
+        pass
+    return True
+
+
+def start_video_mjpeg():
+    """Way 1: Start pdraw video decoding on the Pi, serve MJPEG over HTTP."""
+    global _video_streaming, _video_mode, _video_last_jpeg, _video_frame_count
+    d = drone
+    if d is None:
+        return False, "drone not connected"
+    if not HAS_CV2:
+        return False, "cv2 (OpenCV) not installed on Pi — pip install opencv-python-headless"
+    _video_mode = "mjpeg"
+    _video_last_jpeg = b""
+    _video_frame_count = 0
+    try:
+        d.streaming.set_callbacks(
+            raw_cb=_video_frame_callback,
+            flush_raw_cb=_video_flush_callback,
+        )
+        d.streaming.start()
+        _video_streaming = True
+        print("[ANAFI API] Video MJPEG streaming started (Way 1: Pi-decoded)")
+        return True, "mjpeg streaming started"
+    except Exception as e:
+        print(f"[ANAFI API] Video MJPEG start failed: {e}")
+        # Fallback: try older Olympe API
+        try:
+            d.set_streaming_callbacks(raw_cb=_video_frame_callback)
+            d.start_video_streaming()
+            _video_streaming = True
+            print("[ANAFI API] Video MJPEG streaming started (legacy Olympe API)")
+            return True, "mjpeg streaming started (legacy)"
+        except Exception as e2:
+            print(f"[ANAFI API] Video MJPEG start failed (legacy): {e2}")
+            return False, f"failed: {e} / legacy: {e2}"
+
+
+def stop_video_mjpeg():
+    """Stop pdraw MJPEG streaming."""
+    global _video_streaming, _video_last_jpeg
+    d = drone
+    _video_streaming = False
+    _video_last_jpeg = b""
+    if d is None:
+        return
+    try:
+        d.streaming.stop()
+    except Exception:
+        try:
+            d.stop_video_streaming()
+        except Exception:
+            pass
+    print("[ANAFI API] Video MJPEG streaming stopped")
+
+
+def start_video_forward(target_host: str, target_port: int):
+    """Way 2: Forward the Anafi's RTP video stream to C2 server without decoding.
+
+    The Anafi sends RTP/H.264 video to the SkyController/Pi on UDP port 55004.
+    We forward those packets to the C2 server using socat (zero-copy, no decode).
+    Alternative: GStreamer udpsrc ! udpsink, but socat is lighter and available everywhere.
+    """
+    global _video_forward_proc, _video_forward_target, _video_mode
+    stop_video_forward()  # kill any previous forwarder
+    _video_mode = "forward"
+    _video_forward_target = f"{target_host}:{target_port}"
+
+    # Try socat first (lightest option, zero-copy UDP relay)
+    socat = shutil.which("socat")
+    if socat:
+        # Listen on local port 55004 (Anafi RTP), forward to target
+        cmd = [
+            socat, "-u",
+            f"UDP-RECV:{VIDEO_UDP_FORWARD_PORT},reuseaddr",
+            f"UDP-SENDTO:{target_host}:{target_port}",
+        ]
+        try:
+            _video_forward_proc = subprocess.Popen(
+                cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE
+            )
+            print(f"[ANAFI API] Video UDP forwarding started via socat → {target_host}:{target_port}")
+            return True, f"socat forwarding to {target_host}:{target_port}"
+        except Exception as e:
+            print(f"[ANAFI API] socat failed: {e}")
+
+    # Fallback: GStreamer
+    gst = shutil.which("gst-launch-1.0")
+    if gst:
+        cmd = [
+            gst, "-q",
+            "udpsrc", f"port={VIDEO_UDP_FORWARD_PORT}",
+            "!", "udpsink", f"host={target_host}", f"port={target_port}",
+        ]
+        try:
+            _video_forward_proc = subprocess.Popen(
+                cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE
+            )
+            print(f"[ANAFI API] Video UDP forwarding started via GStreamer → {target_host}:{target_port}")
+            return True, f"gstreamer forwarding to {target_host}:{target_port}"
+        except Exception as e:
+            print(f"[ANAFI API] gstreamer failed: {e}")
+
+    # Fallback: pure Python UDP relay (works everywhere, slightly more CPU)
+    ok, msg = _start_python_udp_relay(target_host, target_port)
+    return ok, msg
+
+
+def _start_python_udp_relay(target_host: str, target_port: int):
+    """Pure-Python UDP relay as last resort (no external deps)."""
+    global _video_forward_proc, _video_streaming
+    import socket
+
+    _video_streaming = True  # flag to stop the thread
+
+    def relay_thread():
+        sock_in = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock_in.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        sock_in.bind(("0.0.0.0", VIDEO_UDP_FORWARD_PORT))
+        sock_in.settimeout(1.0)
+        sock_out = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        pkt_count = 0
+        print(f"[ANAFI API] Python UDP relay: :{VIDEO_UDP_FORWARD_PORT} → {target_host}:{target_port}")
+        while _video_streaming and running:
+            try:
+                data, _ = sock_in.recvfrom(65536)
+                sock_out.sendto(data, (target_host, target_port))
+                pkt_count += 1
+                if pkt_count == 1:
+                    print(f"[ANAFI API] Python UDP relay: first packet forwarded ({len(data)} bytes)")
+            except socket.timeout:
+                continue
+            except Exception as e:
+                if _video_streaming:
+                    print(f"[ANAFI API] Python UDP relay error: {e}")
+                break
+        sock_in.close()
+        sock_out.close()
+        print(f"[ANAFI API] Python UDP relay stopped ({pkt_count} packets forwarded)")
+
+    t = threading.Thread(target=relay_thread, daemon=True)
+    t.start()
+    print(f"[ANAFI API] Video UDP forwarding started via Python relay → {target_host}:{target_port}")
+    return True, f"python relay to {target_host}:{target_port}"
+
+
+def stop_video_forward():
+    """Stop UDP forwarding subprocess."""
+    global _video_forward_proc, _video_forward_target, _video_streaming
+    _video_streaming = False
+    if _video_forward_proc is not None:
+        try:
+            _video_forward_proc.terminate()
+            _video_forward_proc.wait(timeout=3)
+        except Exception:
+            try:
+                _video_forward_proc.kill()
+            except Exception:
+                pass
+        _video_forward_proc = None
+        print("[ANAFI API] Video UDP forwarding stopped")
+    _video_forward_target = ""
+
+
+def stop_all_video():
+    """Stop all video streaming modes."""
+    global _video_mode
+    stop_video_mjpeg()
+    stop_video_forward()
+    _video_mode = "off"
+
+
+# ---------------------------------------------------------------------------
 # Shutdown
 # ---------------------------------------------------------------------------
 
 def shutdown():
     global running
     running = False
+    stop_all_video()
     d = drone
     if d is None:
         return
@@ -1522,6 +1769,95 @@ def api_moveto():
 
 
 # ---------------------------------------------------------------------------
+# Video streaming endpoints
+# ---------------------------------------------------------------------------
+
+@app.get("/api/video")
+def api_video_feed():
+    """Way 1: MJPEG HTTP stream — decoded on the Pi, viewable in any browser.
+    URL: http://<pi-ip>:8080/api/video
+    """
+    if _video_mode != "mjpeg":
+        return jsonify(ok=False, error="MJPEG streaming not active. POST /api/video/start with mode=mjpeg"), 400
+
+    def gen():
+        while running and _video_mode == "mjpeg":
+            with _video_jpeg_lock:
+                jpg = _video_last_jpeg
+            if jpg:
+                yield (b"--frame\r\n"
+                       b"Content-Type: image/jpeg\r\n\r\n" + jpg + b"\r\n")
+            time.sleep(1.0 / max(1, VIDEO_FPS))
+
+    return Response(gen(), mimetype="multipart/x-mixed-replace; boundary=frame")
+
+
+@app.post("/api/video/start")
+def api_video_start():
+    """Start video streaming.
+
+    Body JSON:
+      mode: "mjpeg" — Way 1: decode on Pi, serve MJPEG at /api/video
+      mode: "forward" — Way 2: forward raw UDP/RTP packets to C2 server
+        target_host: str — C2 server IP (required for forward mode)
+        target_port: int — C2 server port (default: 55004)
+    """
+    global _video_mode
+    data = request.get_json(silent=True) or {}
+    mode = data.get("mode", "mjpeg")
+
+    # Stop any active streaming first
+    stop_all_video()
+
+    if mode == "mjpeg":
+        ok, msg = start_video_mjpeg()
+        if ok:
+            return jsonify(ok=True, mode="mjpeg", message=msg,
+                           stream_url=f"http://{request.host}/api/video")
+        return jsonify(ok=False, error=msg), 500
+
+    elif mode == "forward":
+        target_host = data.get("target_host")
+        target_port = int(data.get("target_port", VIDEO_UDP_FORWARD_PORT))
+        if not target_host:
+            return jsonify(ok=False, error="target_host required for forward mode"), 400
+        ok, msg = start_video_forward(target_host, target_port)
+        if ok:
+            return jsonify(ok=True, mode="forward", message=msg,
+                           target=f"{target_host}:{target_port}",
+                           viewer_cmd=f"ffplay -fflags nobuffer -flags low_delay -framedrop -probesize 32 -analyzeduration 0 udp://0.0.0.0:{target_port}")
+        return jsonify(ok=False, error=msg), 500
+
+    return jsonify(ok=False, error=f"unknown mode: {mode}. Use 'mjpeg' or 'forward'"), 400
+
+
+@app.post("/api/video/stop")
+def api_video_stop():
+    """Stop all video streaming."""
+    stop_all_video()
+    return jsonify(ok=True, mode="off")
+
+
+@app.get("/api/video/status")
+def api_video_status():
+    """Get current video streaming status."""
+    status = {
+        "mode": _video_mode,
+        "cv2_available": HAS_CV2,
+        "socat_available": shutil.which("socat") is not None,
+        "gstreamer_available": shutil.which("gst-launch-1.0") is not None,
+    }
+    if _video_mode == "mjpeg":
+        status["stream_url"] = f"http://{request.host}/api/video"
+        status["frames_decoded"] = _video_frame_count
+        status["has_frame"] = len(_video_last_jpeg) > 0
+    elif _video_mode == "forward":
+        status["target"] = _video_forward_target
+        status["process_alive"] = _video_forward_proc is not None and _video_forward_proc.poll() is None
+    return jsonify(**status)
+
+
+# ---------------------------------------------------------------------------
 # Settings endpoints
 # ---------------------------------------------------------------------------
 
@@ -1539,6 +1875,8 @@ def api_settings_get():
         gps_available=HAS_GPS_STATE,
         rth_available=HAS_RTH,
         moveto_available=HAS_MOVE_TO,
+        video_mjpeg_available=HAS_CV2,
+        video_forward_available=True,
     )
 
 

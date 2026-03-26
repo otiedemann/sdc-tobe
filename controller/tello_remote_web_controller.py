@@ -56,6 +56,13 @@ HTML = """
     .drone-btn.selected { background:#0ea5e9; color:#001018; border-color:#0ea5e9; }
     .drone-btn:hover:not(.selected) { border-color:#94a3b8; }
     .drone-type { font-size:10px; font-weight:400; opacity:.7; display:block; line-height:1; }
+    .video-panel { margin-top:12px; }
+    .video-panel img { max-width:100%; border-radius:8px; background:#000; }
+    .video-controls { display:flex; gap:8px; align-items:center; flex-wrap:wrap; margin-bottom:8px; }
+    .video-controls button { height:36px; font-size:12px; padding:0 12px; }
+    .video-controls select, .video-controls input { height:36px; border-radius:8px; border:1px solid #475569; background:#0f172a; color:#e2e8f0; padding:0 8px; }
+    .video-status { font-size:11px; color:#94a3b8; margin-top:4px; }
+    .video-url { font-size:11px; color:#38bdf8; word-break:break-all; }
   </style>
 </head>
 <body>
@@ -154,6 +161,25 @@ HTML = """
         </div>
       </div>
       <div id=\"telemetry\" class=\"small\" style=\"white-space:pre-wrap; margin-top:10px;\">loading...</div>
+    </div>
+  </div>
+
+  <div class=\"panel video-panel\" id=\"video_panel\">
+    <div><b>Video Stream</b></div>
+    <div class=\"video-controls\">
+      <select id=\"video_mode\">
+        <option value=\"off\">Off</option>
+        <option value=\"mjpeg\">Way 1: MJPEG (decoded on Pi)</option>
+        <option value=\"forward\">Way 2: UDP Forward (raw to C2)</option>
+      </select>
+      <input id=\"video_forward_host\" type=\"text\" placeholder=\"C2 IP (e.g. 192.168.1.50)\" style=\"width:180px;display:none;\" />
+      <input id=\"video_forward_port\" type=\"number\" value=\"55004\" placeholder=\"port\" style=\"width:80px;display:none;\" />
+      <button id=\"video_toggle\">Start Video</button>
+    </div>
+    <div class=\"video-status\" id=\"video_status\">Mode: off</div>
+    <div class=\"video-url\" id=\"video_url\" style=\"display:none;\"></div>
+    <div id=\"video_container\" style=\"margin-top:8px;display:none;\">
+      <img id=\"video_img\" src=\"\" alt=\"video stream\" style=\"width:640px;height:auto;\" />
     </div>
   </div>
 <script>
@@ -462,6 +488,90 @@ async function refreshCommandLogStatus(){
     document.getElementById('toggle_cmd_log').textContent = s.enabled ? 'Command Logging: ON' : 'Command Logging: OFF';
   } catch {}
 }
+// --- Video stream controls ---
+const videoMode = document.getElementById('video_mode');
+const videoToggle = document.getElementById('video_toggle');
+const videoStatus = document.getElementById('video_status');
+const videoUrl = document.getElementById('video_url');
+const videoContainer = document.getElementById('video_container');
+const videoImg = document.getElementById('video_img');
+const videoFwdHost = document.getElementById('video_forward_host');
+const videoFwdPort = document.getElementById('video_forward_port');
+let videoActive = false;
+
+videoMode.onchange = () => {
+  const m = videoMode.value;
+  videoFwdHost.style.display = m === 'forward' ? '' : 'none';
+  videoFwdPort.style.display = m === 'forward' ? '' : 'none';
+};
+
+videoToggle.onclick = async () => {
+  if (videoActive) {
+    // Stop
+    await post('/proxy/video/stop', {});
+    videoActive = false;
+    videoToggle.textContent = 'Start Video';
+    videoContainer.style.display = 'none';
+    videoUrl.style.display = 'none';
+    videoImg.src = '';
+    videoStatus.textContent = 'Mode: off';
+    return;
+  }
+  const mode = videoMode.value;
+  if (mode === 'off') return;
+  const body = {mode};
+  if (mode === 'forward') {
+    const host = videoFwdHost.value.trim();
+    if (!host) { alert('Enter C2 server IP for UDP forwarding'); return; }
+    body.target_host = host;
+    body.target_port = parseInt(videoFwdPort.value) || 55004;
+  }
+  try {
+    const r = await fetch('/proxy/video/start', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(body)});
+    const d = await r.json();
+    if (d.ok) {
+      videoActive = true;
+      videoToggle.textContent = 'Stop Video';
+      videoStatus.textContent = 'Mode: ' + d.mode;
+      if (d.mode === 'mjpeg') {
+        // Show MJPEG stream in the img tag — proxy through web controller
+        videoContainer.style.display = '';
+        videoImg.src = '/proxy/video?' + Date.now();
+        videoUrl.style.display = '';
+        videoUrl.innerHTML = 'Direct URL (accessible from any device on network): <b>' + (d.stream_url || '') + '</b>';
+      } else if (d.mode === 'forward') {
+        videoContainer.style.display = 'none';
+        videoUrl.style.display = '';
+        videoUrl.innerHTML = 'UDP forwarding to <b>' + (d.target || '') + '</b><br>View on C2: <code>' + (d.viewer_cmd || '') + '</code>';
+      }
+    } else {
+      videoStatus.textContent = 'Error: ' + (d.error || 'unknown');
+    }
+  } catch(e) {
+    videoStatus.textContent = 'Error: ' + e;
+  }
+};
+
+// Poll video status
+async function refreshVideoStatus() {
+  try {
+    const r = await fetch('/proxy/video/status', {cache:'no-store'});
+    const d = await r.json();
+    if (!videoActive && d.mode !== 'off') {
+      // External start detected
+      videoActive = true;
+      videoToggle.textContent = 'Stop Video';
+      videoMode.value = d.mode;
+    }
+    if (videoActive && d.mode === 'mjpeg') {
+      videoStatus.textContent = 'MJPEG | frames: ' + (d.frames_decoded||0) + ' | has_frame: ' + (d.has_frame||false);
+    } else if (videoActive && d.mode === 'forward') {
+      videoStatus.textContent = 'UDP Forward → ' + (d.target||'') + ' | relay alive: ' + (d.process_alive||false);
+    }
+  } catch {}
+}
+setInterval(refreshVideoStatus, 3000);
+
 // Heartbeat — keeps the drone watchdog alive so it doesn't auto-land
 async function sendHeartbeat(){
   try { await fetch('/proxy/heartbeat', {cache:'no-store'}); } catch {}
@@ -811,6 +921,43 @@ def proxy_log_clear():
     log_command("telemetry_log_clear")
     r = pi_post("/api/logging/telemetry/clear")
     return (r.text, r.status_code, {"Content-Type": r.headers.get("Content-Type", "application/json")})
+
+
+@app.get("/proxy/video")
+def proxy_video_feed():
+    """Proxy the MJPEG video stream from the Pi API server."""
+    try:
+        r = requests.get(f"{PI_BASE}/api/video", stream=True, timeout=30)
+        return Response(
+            r.iter_content(chunk_size=8192),
+            mimetype=r.headers.get("Content-Type", "multipart/x-mixed-replace; boundary=frame"),
+        )
+    except Exception as e:
+        return jsonify(ok=False, error=str(e)), 502
+
+
+@app.post("/proxy/video/start")
+def proxy_video_start():
+    data = request.get_json(silent=True) or {}
+    log_command("video_start", data)
+    r = pi_post("/api/video/start", data)
+    return (r.text, r.status_code, {"Content-Type": r.headers.get("Content-Type", "application/json")})
+
+
+@app.post("/proxy/video/stop")
+def proxy_video_stop():
+    log_command("video_stop")
+    r = pi_post("/api/video/stop")
+    return (r.text, r.status_code, {"Content-Type": r.headers.get("Content-Type", "application/json")})
+
+
+@app.get("/proxy/video/status")
+def proxy_video_status():
+    try:
+        r = pi_get("/api/video/status", timeout=TIMEOUT_STATUS)
+        return (r.text, r.status_code, {"Content-Type": "application/json"})
+    except Exception as e:
+        return jsonify(ok=False, error=str(e), mode="off"), 502
 
 
 @app.get("/proxy/heartbeat")
