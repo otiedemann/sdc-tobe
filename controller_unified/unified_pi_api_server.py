@@ -963,10 +963,12 @@ class OlympeBackend(DroneBackend):
         return self._check_connected(self.drone)
 
     def verify_connection(self) -> bool:
-        """Use ping for health check — avoids racing with telemetry get_state calls."""
+        """Check if we received telemetry recently — avoids racing with get_state calls."""
         if self.drone is None:
             return False
-        return _host_reachable(self.ip)
+        # Trust the telemetry loop: if we got data recently, we're connected.
+        # last_state_seen is updated by telemetry_loop whenever get_state succeeds.
+        return (time.time() - last_state_seen) < 5.0
 
     def on_connect(self):
         d = self.drone
@@ -1722,11 +1724,14 @@ def reconnect_loop():
                     with conn_lock:
                         conn_state["last_verify"] = now
             else:
-                # Anafi: verify via state query
+                # Anafi: trust telemetry — if we got state data recently, stay connected.
+                # Only declare disconnect after 6s of no telemetry (3 missed cycles).
                 if not b.verify_connection():
-                    print("[ANAFI] Connection lost (health check failed)")
-                    with conn_lock:
-                        conn_state["connected"] = False
+                    # Double-check with a ping before declaring disconnect
+                    if not _host_reachable(drone_ip):
+                        print("[ANAFI] Connection lost (no telemetry + ping failed)")
+                        with conn_lock:
+                            conn_state["connected"] = False
             time.sleep(2.0)
             continue
 
@@ -1743,6 +1748,7 @@ def reconnect_loop():
                 ok = b.connect()
                 if ok:
                     b.on_connect()
+                    last_state_seen = time.time()  # seed for health check
                     print(f"[{drone_type.upper()}] Connection verified")
                 with conn_lock:
                     conn_state["connected"] = ok
