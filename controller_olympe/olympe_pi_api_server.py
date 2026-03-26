@@ -97,7 +97,7 @@ TELEMETRY_HZ = float(os.getenv("TELEMETRY_HZ", "2.0"))
 KEY_STALE_S = float(os.getenv("KEY_STALE_S", "1.0"))
 SAFE_TAKEOFF_S = float(os.getenv("SAFE_TAKEOFF_S", "3.0"))
 SAFE_TAKEOFF_DEFAULT = os.getenv("SAFE_TAKEOFF_DEFAULT", "0") in {"1", "true", "True"}
-REMOTE_TIMEOUT_S = float(os.getenv("REMOTE_TIMEOUT_S", "5.0"))  # auto-land if no remote request for this long
+REMOTE_TIMEOUT_S = float(os.getenv("REMOTE_TIMEOUT_S", "10.0"))  # auto-land if no remote heartbeat for this long
 TELEMETRY_LOG_DEFAULT = False
 TELEMETRY_LOG_PATH_DEFAULT = Path(__file__).with_name("telemetry_log.jsonl")
 COMMAND_LOG_ENABLED = os.getenv("API_COMMAND_LOG", "1") in {"1", "true", "True"}
@@ -864,6 +864,14 @@ def root():
     with conn_lock:
         connected = conn_state["connected"]
     return jsonify(ok=True, service="olympe_pi_api_server", connected=connected)
+
+
+@app.get("/api/heartbeat")
+def api_heartbeat():
+    """Ultra-lightweight heartbeat — keeps watchdog alive without locks."""
+    with conn_lock:
+        connected = conn_state["connected"]
+    return jsonify(ok=True, flying=flying, connected=connected, t=time.time())
 
 
 @app.post("/api/key_down")

@@ -462,6 +462,13 @@ async function refreshCommandLogStatus(){
     document.getElementById('toggle_cmd_log').textContent = s.enabled ? 'Command Logging: ON' : 'Command Logging: OFF';
   } catch {}
 }
+// Heartbeat — keeps the drone watchdog alive so it doesn't auto-land
+async function sendHeartbeat(){
+  try { await fetch('/proxy/heartbeat', {cache:'no-store'}); } catch {}
+}
+setInterval(sendHeartbeat, 2000);
+sendHeartbeat();
+
 setInterval(refreshTelemetry, 700);
 setInterval(refreshLogStatus, 2000);
 setInterval(refreshSafeTakeoff, 2000);
@@ -804,6 +811,16 @@ def proxy_log_clear():
     log_command("telemetry_log_clear")
     r = pi_post("/api/logging/telemetry/clear")
     return (r.text, r.status_code, {"Content-Type": r.headers.get("Content-Type", "application/json")})
+
+
+@app.get("/proxy/heartbeat")
+def proxy_heartbeat():
+    """Lightweight heartbeat — keeps Olympe watchdog alive."""
+    try:
+        r = pi_get("/api/heartbeat", timeout=TIMEOUT_STATUS)
+        return (r.text, r.status_code, {"Content-Type": "application/json"})
+    except Exception as e:
+        return jsonify(ok=False, error=str(e)), 502
 
 
 @app.get("/proxy/telemetry")
