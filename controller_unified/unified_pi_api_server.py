@@ -666,6 +666,10 @@ class TelloBackend(DroneBackend):
             data["temperature"] = temp
         data["sdk_version"] = self.sdk_version
         data["serial_number"] = self.serial_number
+        # Internal flags for telemetry_loop
+        data["_got_any"] = bool(st)  # True if we got any state from Tello
+        h = _as_int(st.get("h"))
+        data["_sdk_flying"] = h is not None and h > 5
         return data
 
     # --- Recovery ---

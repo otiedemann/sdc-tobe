@@ -951,15 +951,12 @@ def proxy_video_start():
         data["target_host"] = c2_host
         data["target_port"] = data.get("target_port", VIDEO_UDP_FORWARD_PORT)
     log_command("video_start", data)
+    # For forward mode, start the UDP receiver BEFORE telling the Pi to forward
+    # so ffmpeg is already listening when packets arrive
+    if mode == "forward":
+        _start_udp_receiver()
+        time.sleep(0.5)  # Give ffmpeg time to bind the UDP port
     r = pi_post("/api/video/start", data)
-    # If forward mode started successfully, start the UDP receiver on C2
-    if mode == "forward" and r.status_code == 200:
-        try:
-            resp = r.json()
-            if resp.get("ok"):
-                _start_udp_receiver()
-        except Exception:
-            pass
     return (r.text, r.status_code, {"Content-Type": r.headers.get("Content-Type", "application/json")})
 
 
@@ -1026,15 +1023,14 @@ def _stop_udp_receiver():
 
 def _udp_receiver_loop():
     """Use ffmpeg to decode H264 UDP stream → raw RGB frames → JPEG."""
-    global _udp_last_jpeg, _udp_has_frame, _ffmpeg_proc
-    import struct
+    global _udp_last_jpeg, _udp_has_frame, _ffmpeg_proc, _udp_receiver_running
     import subprocess as sp
     import shutil
 
     ffmpeg_bin = shutil.which("ffmpeg")
     if not ffmpeg_bin:
         print("[C2-VIDEO] ffmpeg not found — install ffmpeg to decode UDP forward stream")
-        _udp_receiver_running and None  # noqa
+        _udp_receiver_running = False
         return
 
     width, height = 960, 720  # Tello default resolution
@@ -1042,42 +1038,59 @@ def _udp_receiver_loop():
 
     cmd = [
         ffmpeg_bin,
+        "-y",
         "-fflags", "nobuffer",
         "-flags", "low_delay",
         "-framedrop",
-        "-probesize", "32",
-        "-analyzeduration", "0",
-        "-i", f"udp://0.0.0.0:{VIDEO_UDP_FORWARD_PORT}?overrun_nonfatal=1",
+        "-probesize", "5000000",
+        "-analyzeduration", "5000000",
+        "-i", f"udp://0.0.0.0:{VIDEO_UDP_FORWARD_PORT}?overrun_nonfatal=1&fifo_size=50000000",
         "-f", "rawvideo",
-        "-pix_fmt", "rgb24",
-        "-s", f"{width}x{height}",
+        "-pix_fmt", "bgr24",
         "-an",
         "-sn",
-        "-",
+        "-vf", f"scale={width}:{height}",
+        "pipe:1",
     ]
-    print(f"[C2-VIDEO] Starting ffmpeg: {' '.join(cmd)}")
+    print(f"[C2-VIDEO] Starting ffmpeg on port {VIDEO_UDP_FORWARD_PORT}...")
     try:
-        _ffmpeg_proc = sp.Popen(cmd, stdout=sp.PIPE, stderr=sp.DEVNULL, bufsize=frame_size * 2)
+        _ffmpeg_proc = sp.Popen(cmd, stdout=sp.PIPE, stderr=sp.PIPE, bufsize=frame_size * 2)
     except Exception as e:
         print(f"[C2-VIDEO] ffmpeg failed to start: {e}")
+        _udp_receiver_running = False
         return
+
+    # Log stderr in a separate thread so we can see ffmpeg errors
+    def _log_stderr():
+        for line in _ffmpeg_proc.stderr:
+            txt = line.decode(errors="replace").rstrip()
+            if txt:
+                print(f"[C2-FFMPEG] {txt}")
+    threading.Thread(target=_log_stderr, daemon=True, name="ffmpeg-stderr").start()
 
     frame_count = 0
     buf = b""
     while _udp_receiver_running:
         try:
-            chunk = _ffmpeg_proc.stdout.read(frame_size - len(buf))
+            to_read = frame_size - len(buf)
+            chunk = _ffmpeg_proc.stdout.read(to_read)
             if not chunk:
-                break
+                # ffmpeg exited — check if it's still running
+                rc = _ffmpeg_proc.poll()
+                if rc is not None:
+                    print(f"[C2-VIDEO] ffmpeg exited with code {rc}")
+                    break
+                time.sleep(0.01)
+                continue
             buf += chunk
             if len(buf) < frame_size:
                 continue
-            # We have a full frame
+            # We have a full frame (BGR24)
             frame_data = buf[:frame_size]
             buf = buf[frame_size:]
             if HAS_CV2:
                 frame = np.frombuffer(frame_data, dtype=np.uint8).reshape((height, width, 3))
-                ok, jpg_buf = cv2.imencode(".jpg", cv2.cvtColor(frame, cv2.COLOR_RGB2BGR),
+                ok, jpg_buf = cv2.imencode(".jpg", frame,
                                            [cv2.IMWRITE_JPEG_QUALITY, VIDEO_JPEG_QUALITY])
                 if ok:
                     with _udp_last_frame_lock:
@@ -1091,6 +1104,7 @@ def _udp_receiver_loop():
                 print(f"[C2-VIDEO] Error: {e}")
             break
 
+    _udp_receiver_running = False
     if _ffmpeg_proc:
         try:
             _ffmpeg_proc.terminate()
@@ -1114,12 +1128,16 @@ def proxy_video_forward_stream():
 
 @app.get("/proxy/heartbeat")
 def proxy_heartbeat():
-    """Lightweight heartbeat — keeps Olympe watchdog alive."""
-    try:
-        r = pi_get("/api/heartbeat", timeout=TIMEOUT_STATUS)
-        return (r.text, r.status_code, {"Content-Type": "application/json"})
-    except Exception as e:
-        return jsonify(ok=False, error=str(e)), 502
+    """Send heartbeat to ALL drones to keep their watchdogs alive."""
+    results = {}
+    for did, info in DRONES.items():
+        base = info["base"]
+        try:
+            r = requests.get(f"{base}/api/heartbeat", timeout=0.3)
+            results[did] = r.status_code
+        except Exception:
+            results[did] = "timeout"
+    return jsonify(ok=True, drones=results)
 
 
 @app.get("/proxy/telemetry")
