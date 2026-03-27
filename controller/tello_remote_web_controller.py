@@ -161,6 +161,16 @@ HTML = """
           <button id=\"apply_settings\">Apply Settings</button>
         </div>
       </div>
+      <div class=\"adv\" id=\"mission_panel\">
+        <div class=\"small\" style=\"margin-bottom:6px;\"><b>Mission Planner</b> — enter one command per line</div>
+        <textarea id=\"mission_cmds\" rows=\"8\" style=\"width:100%;font-family:monospace;font-size:12px;background:#0f172a;color:#e2e8f0;border:1px solid #334155;border-radius:4px;padding:6px;resize:vertical;\" placeholder=\"Examples:\n100 forward\n90 cw\n50 back\n45 ccw\n80 up\n60 down\n30 left\n40 right\nwait 2\nhover 3\nland\ntakeoff\"></textarea>
+        <div style=\"margin-top:6px;display:flex;gap:8px;align-items:center;\">
+          <button id=\"mission_run\" style=\"background:#065f46;border-color:#10b981;\">Run Mission</button>
+          <button id=\"mission_stop\" style=\"background:#7f1d1d;border-color:#dc2626;display:none;\">Abort Mission</button>
+          <span id=\"mission_status\" class=\"small\" style=\"color:#94a3b8;\">idle</span>
+        </div>
+        <div id=\"mission_log\" class=\"small\" style=\"margin-top:6px;max-height:120px;overflow-y:auto;white-space:pre-wrap;color:#94a3b8;\"></div>
+      </div>
       <div class=\"small\" style=\"margin-top:8px;\">Keyboard in browser: W/A/S/D R/F Q/E, T, L, Space stop</div>
     </div>
 
@@ -583,6 +593,114 @@ refreshTelemetry();
 refreshLogStatus();
 refreshSafeTakeoff();
 refreshCommandLogStatus();
+
+// --- Mission Planner ---
+let missionRunning = false;
+let missionAbort = false;
+
+function missionLog(msg) {
+  const el = document.getElementById('mission_log');
+  el.textContent += msg + '\\n';
+  el.scrollTop = el.scrollHeight;
+}
+
+async function runMission() {
+  if (missionRunning) return;
+  const textarea = document.getElementById('mission_cmds');
+  const lines = textarea.value.split('\\n').map(l=>l.trim()).filter(l=>l && !l.startsWith('#'));
+  if (!lines.length) { missionLog('No commands to run.'); return; }
+
+  missionRunning = true;
+  missionAbort = false;
+  document.getElementById('mission_run').style.display = 'none';
+  document.getElementById('mission_stop').style.display = '';
+  document.getElementById('mission_status').textContent = 'running...';
+  document.getElementById('mission_status').style.color = '#22c55e';
+  document.getElementById('mission_log').textContent = '';
+
+  for (let i = 0; i < lines.length; i++) {
+    if (missionAbort) { missionLog('ABORTED'); break; }
+    const line = lines[i];
+    document.getElementById('mission_status').textContent = `step ${i+1}/${lines.length}: ${line}`;
+    missionLog(`> ${line}`);
+
+    const parts = line.toLowerCase().split(/\\s+/);
+    let ok = false;
+    let result = '';
+
+    try {
+      if (parts[0] === 'takeoff') {
+        const r = await post('/proxy/takeoff', {});
+        result = 'takeoff sent';
+        ok = true;
+        await sleep(3000);
+      } else if (parts[0] === 'land') {
+        const r = await post('/proxy/land', {});
+        result = 'land sent';
+        ok = true;
+        await sleep(3000);
+      } else if (parts[0] === 'wait' || parts[0] === 'hover' || parts[0] === 'sleep') {
+        const secs = parseFloat(parts[1]) || 2;
+        result = `waiting ${secs}s`;
+        ok = true;
+        await sleep(secs * 1000);
+      } else if (parts[0] === 'emergency') {
+        await post('/proxy/emergency', {});
+        result = 'emergency sent';
+        ok = true;
+        missionAbort = true;
+      } else {
+        // Parse as: <value> <direction> or <direction> <value>
+        let val = parseFloat(parts[0]);
+        let dir = parts[1];
+        if (isNaN(val)) {
+          dir = parts[0];
+          val = parseFloat(parts[1]) || 30;
+        }
+        // Map directions
+        const moveMap = {forward:1, fwd:1, back:1, backward:1, left:1, right:1, up:1, down:1};
+        const rotateMap = {cw:1, ccw:1, clockwise:'cw', counterclockwise:'ccw', turn:'cw'};
+        if (dir === 'backward') dir = 'back';
+        if (dir === 'fwd') dir = 'forward';
+
+        if (moveMap[dir]) {
+          const r = await fetch('/proxy/move', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({dir:dir, cm:Math.round(val)})});
+          const d = await r.json();
+          ok = d.ok;
+          result = ok ? `moved ${dir} ${Math.round(val)}cm` : (d.error || 'failed');
+          await sleep(1500);
+        } else if (rotateMap[dir]) {
+          const realDir = typeof rotateMap[dir] === 'string' ? rotateMap[dir] : dir;
+          const r = await fetch('/proxy/rotate', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({dir:realDir, deg:Math.round(val)})});
+          const d = await r.json();
+          ok = d.ok;
+          result = ok ? `rotated ${realDir} ${Math.round(val)}°` : (d.error || 'failed');
+          await sleep(1500);
+        } else {
+          result = `unknown command: ${line}`;
+        }
+      }
+    } catch(e) {
+      result = `error: ${e.message}`;
+    }
+    missionLog(ok ? `  OK: ${result}` : `  FAIL: ${result}`);
+  }
+
+  missionRunning = false;
+  missionAbort = false;
+  document.getElementById('mission_run').style.display = '';
+  document.getElementById('mission_stop').style.display = 'none';
+  document.getElementById('mission_status').textContent = 'done';
+  document.getElementById('mission_status').style.color = '#94a3b8';
+}
+
+function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+
+document.getElementById('mission_run').onclick = runMission;
+document.getElementById('mission_stop').onclick = () => {
+  missionAbort = true;
+  missionLog('Abort requested...');
+};
 </script>
 </body>
 </html>
