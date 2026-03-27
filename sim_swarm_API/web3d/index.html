@@ -1239,6 +1239,7 @@ let apiWs = null;
 let apiWsConnected = false;
 let apiSelectedDroneId = null;   // drone id selected by the API (e.g. "B1")
 let apiFlying = false;
+let apiEngaged = false;  // true once the API sends a flight command (takeoff/land/rc)
 const apiRc = { roll: 0, pitch: 0, throttle: 0, yaw: 0 };
 const apiKeys = new Set();
 let apiTelemetryInterval = null;
@@ -1296,6 +1297,7 @@ function handleApiCommand(cmd) {
   }
   if (t === 'takeoff') {
     apiFlying = true;
+    apiEngaged = true;
     const d = getApiDrone();
     if (d) {
       d.vel.set(0, 0.8, 0);
@@ -1305,17 +1307,20 @@ function handleApiCommand(cmd) {
   }
   if (t === 'land') {
     apiFlying = false;
+    apiEngaged = true;
     const d = getApiDrone();
     if (d) d.vel.set(0, -0.3, 0);
     return;
   }
   if (t === 'emergency') {
     apiFlying = false;
+    apiEngaged = true;
     const d = getApiDrone();
     if (d) { d.vel.set(0, -2, 0); }
     return;
   }
   if (t === 'rc') {
+    apiEngaged = true;
     apiRc.roll = Number(cmd.roll || 0);
     apiRc.pitch = Number(cmd.pitch || 0);
     apiRc.throttle = Number(cmd.throttle || 0);
@@ -1368,6 +1373,7 @@ function handleApiCommand(cmd) {
   }
   if (t === 'recover') {
     apiFlying = false;
+    apiEngaged = false;
     apiRc.roll = 0; apiRc.pitch = 0; apiRc.throttle = 0; apiRc.yaw = 0;
     for (const code of apiKeys) keys.delete(code);
     apiKeys.clear();
@@ -1452,27 +1458,29 @@ function animate(now){
   last = now;
   simTime += dt;
 
-  // If API RC controls are active, apply them to the selected drone
-  const apiDrone = getApiDrone();
-  const hasApiRc = Math.abs(apiRc.roll) > 1 || Math.abs(apiRc.pitch) > 1 || Math.abs(apiRc.throttle) > 1 || Math.abs(apiRc.yaw) > 1;
-  if (apiDrone && hasApiRc && apiFlying) {
-    applyApiRc(apiDrone, dt);
-  } else if (apiDrone && apiFlying && !hasApiRc) {
-    // Hovering: maintain altitude
-    const hoverY = Math.max(0.8, apiDrone.mesh.position.y);
-    apiDrone.vel.y += (hoverY - apiDrone.mesh.position.y) * 2.0 * dt;
-    apiDrone.vel.x *= 0.95;
-    apiDrone.vel.z *= 0.95;
-    apiDrone.mesh.position.addScaledVector(apiDrone.vel, dt);
-    clampDrone(apiDrone);
-  } else if (apiDrone && !apiFlying) {
-    // Landing/grounded: descend to floor
-    if (apiDrone.mesh.position.y > 0.26) {
-      apiDrone.vel.set(0, -0.5, 0);
+  // If API has taken over (via takeoff/land/rc commands), apply API physics to the selected drone
+  if (apiEngaged) {
+    const apiDrone = getApiDrone();
+    const hasApiRc = Math.abs(apiRc.roll) > 1 || Math.abs(apiRc.pitch) > 1 || Math.abs(apiRc.throttle) > 1 || Math.abs(apiRc.yaw) > 1;
+    if (apiDrone && hasApiRc && apiFlying) {
+      applyApiRc(apiDrone, dt);
+    } else if (apiDrone && apiFlying && !hasApiRc) {
+      // Hovering: maintain altitude
+      const hoverY = Math.max(0.8, apiDrone.mesh.position.y);
+      apiDrone.vel.y += (hoverY - apiDrone.mesh.position.y) * 2.0 * dt;
+      apiDrone.vel.x *= 0.95;
+      apiDrone.vel.z *= 0.95;
       apiDrone.mesh.position.addScaledVector(apiDrone.vel, dt);
       clampDrone(apiDrone);
-    } else {
-      apiDrone.vel.set(0, 0, 0);
+    } else if (apiDrone && !apiFlying) {
+      // Landing/grounded: descend to floor
+      if (apiDrone.mesh.position.y > 0.26) {
+        apiDrone.vel.set(0, -0.5, 0);
+        apiDrone.mesh.position.addScaledVector(apiDrone.vel, dt);
+        clampDrone(apiDrone);
+      } else {
+        apiDrone.vel.set(0, 0, 0);
+      }
     }
   }
 
