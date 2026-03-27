@@ -50,8 +50,9 @@ class TargetSpottedCommand(BaseModel):
 
 
 class SystemConfigCommand(BaseModel):
-    mode: str  # live | simulator
+    mode: str  # live | simulator | sim_api
     drone_count: int  # 2..5
+    sim_api_host: str | None = None  # host:port of sim_api_server (for sim_api mode)
 
 
 class TargetCell(BaseModel):

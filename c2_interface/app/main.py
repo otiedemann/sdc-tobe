@@ -27,19 +27,24 @@ from .state import StateStore
 BASE_DIR = Path(__file__).resolve().parents[1]
 WEB_DIR = BASE_DIR / "web"
 SIM_DIR = BASE_DIR.parent / "sim_swarm_c2"
+SIM_API_DIR = BASE_DIR.parent / "sim_swarm_API"
 LIVE_CFG = BASE_DIR / "live_drones.json"
 
 app = FastAPI(title="SDC Command & Control")
 app.mount("/static", StaticFiles(directory=str(WEB_DIR)), name="static")
 # Serve simulator assets from the same host/port as C2 to avoid cross-host disconnect issues.
 app.mount("/simviewer", StaticFiles(directory=str(SIM_DIR), html=True), name="simviewer")
+# Serve sim_swarm_API 3D viewer for the sim_api (Simulator) drone type.
+if SIM_API_DIR.exists() and (SIM_API_DIR / "web3d").exists():
+    app.mount("/simapi_viewer", StaticFiles(directory=str(SIM_API_DIR / "web3d"), html=True), name="simapi_viewer")
 
 arena = ArenaGrid()
 store = StateStore()
 mission = MissionController(store=store, adapter=DroneAdapter(), aruco=ArucoNavigator())
 
-system_mode = "live"  # live | simulator
+system_mode = "live"  # live | simulator | sim_api
 team_drone_count = 2
+sim_api_host = "localhost:8080"  # host:port of sim_api_server
 targets: list[TargetCell] = []
 sim_server: subprocess.Popen | None = None
 live_manager = LiveTelloManager()
@@ -71,7 +76,11 @@ hub = WsHub()
 
 
 def simulator_url() -> str | None:
-    return "/simviewer/web3d/" if system_mode == "simulator" else None
+    if system_mode == "simulator":
+        return "/simviewer/web3d/"
+    if system_mode == "sim_api":
+        return "/simapi_viewer/"
+    return None
 
 
 def load_live_configs(count: int) -> list[LiveDroneConfig]:
@@ -103,6 +112,8 @@ async def ensure_team_drones(count: int) -> None:
         home = GridPoint(x=1, y=min(1 + i * 2, arena.height - 1))
         existing = next((d for d in all_existing if d.drone_id == drone_id), None)
         if system_mode == "simulator":
+            video_url = f"/api/sim/video/{drone_id}"
+        elif system_mode == "sim_api":
             video_url = f"/api/sim/video/{drone_id}"
         elif system_mode == "live":
             video_url = f"/api/live/video/{drone_id}"
@@ -156,7 +167,7 @@ async def publish_state() -> None:
         {
             "type": "state",
             "drones": drones,
-            "system": {"mode": system_mode, "drone_count": team_drone_count, "simulator_url": simulator_url()},
+            "system": {"mode": system_mode, "drone_count": team_drone_count, "simulator_url": simulator_url(), "sim_api_host": sim_api_host},
             "targets": [t.model_dump() for t in targets],
         }
     )
@@ -183,24 +194,29 @@ async def get_state() -> dict:
     return {
         "arena": {"width": arena.width, "height": arena.height, "cells": [c.model_dump() for c in arena.to_cells()]},
         "drones": drones,
-        "system": {"mode": system_mode, "drone_count": team_drone_count, "simulator_url": simulator_url()},
+        "system": {"mode": system_mode, "drone_count": team_drone_count, "simulator_url": simulator_url(), "sim_api_host": sim_api_host},
         "targets": [t.model_dump() for t in targets],
     }
 
 
 @app.post("/api/system")
 async def set_system(cfg: SystemConfigCommand) -> dict:
-    global system_mode, team_drone_count
-    if cfg.mode not in {"live", "simulator"}:
-        raise HTTPException(status_code=400, detail="mode must be live or simulator")
+    global system_mode, team_drone_count, sim_api_host
+    if cfg.mode not in {"live", "simulator", "sim_api"}:
+        raise HTTPException(status_code=400, detail="mode must be live, simulator, or sim_api")
     if cfg.drone_count < 2 or cfg.drone_count > 5:
         raise HTTPException(status_code=400, detail="drone_count must be 2..5")
 
     system_mode = cfg.mode
     team_drone_count = cfg.drone_count
+    if cfg.sim_api_host:
+        sim_api_host = cfg.sim_api_host
+
     if system_mode == "simulator":
-        # Simulator is now served via /simviewer on the same C2 host/port.
         live_manager.disconnect_all()
+    elif system_mode == "sim_api":
+        live_manager.disconnect_all()
+        stop_simulator()
     else:
         stop_simulator()
         live_manager.set_drones(load_live_configs(team_drone_count))

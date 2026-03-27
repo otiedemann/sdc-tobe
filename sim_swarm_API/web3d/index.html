@@ -1,0 +1,1562 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>SDC Arena 3D Swarm Simulator</title>
+  <style>
+    body { margin:0; overflow:hidden; background:#0e1116; color:#e6e6e6; font-family: Arial, sans-serif; }
+    #ui {
+      position: absolute; top: 12px; left: 12px; z-index: 10;
+      background: rgba(18,22,30,0.93); border:1px solid #2f3b53; border-radius:10px;
+      padding:10px; width: 390px;
+    }
+    #ui h3 { margin: 0 0 8px 0; font-size: 16px; }
+    .row { display:flex; gap:8px; align-items:center; margin:6px 0; flex-wrap:wrap; }
+    label { font-size: 13px; color:#c9d3e6; }
+    input, select, button {
+      background:#1f2736; color:#eef3ff; border:1px solid #445271; border-radius:6px;
+      padding:5px 6px; font-size: 13px;
+    }
+    input[type=number] { width:80px; }
+    .small { font-size: 12px; color:#9cb0d4; }
+    .kbd { background:#111723; border:1px solid #425577; border-radius:4px; padding:1px 4px; }
+    #status { white-space: pre-wrap; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size:12px; }
+
+    #vctrl {
+      margin-top: 8px; background: rgba(13,18,26,0.85); border: 1px solid #3b4a69; border-radius: 8px; padding: 8px;
+    }
+    #vctrl h4 { margin: 0 0 6px 0; font-size: 13px; color:#d7e3ff; }
+    .meter { height: 10px; background:#152033; border:1px solid #3c4f73; border-radius: 999px; overflow:hidden; width: 150px; }
+    .fill { height:100%; width:50%; background:#5fa8ff; transition: width 40ms linear; }
+    .row2 { display:flex; gap:8px; align-items:center; margin:4px 0; }
+    .keybadge { min-width: 18px; text-align:center; padding: 2px 4px; border:1px solid #4b5d82; border-radius:4px; background:#121a2a; color:#cfe0ff; font-size:11px; }
+    .active { background:#2b4f86; color:#fff; border-color:#7cb0ff; }
+  </style>
+</head>
+<body>
+  <div id="ui">
+    <h3>SDC Arena 3D Simulator (2–5 Drones)</h3>
+    <div class="row">
+      <label>Arena X(m)<input id="arenaX" type="number" min="4" max="60" step="0.5" value="20"></label>
+      <label>Y(m)<input id="arenaY" type="number" min="4" max="60" step="0.5" value="10"></label>
+      <label>Z(m)<input id="arenaZ" type="number" min="2" max="12" step="0.5" value="6"></label>
+      <button id="applyArena">Apply Arena</button>
+    </div>
+
+    <div class="row">
+      <label>My Drones <input id="droneCount" type="number" min="2" max="5" step="1" value="3"></label>
+      <label>Enemy Drones <input id="enemyDroneCount" type="number" min="2" max="5" step="1" value="3"></label>
+      <button id="spawnDrones">Spawn Teams</button>
+      <label>Mode
+        <select id="modeSel">
+          <option value="manual">Manual (single selected)</option>
+          <option value="swarm">Auto Swarm</option>
+        </select>
+      </label>
+      <label>My Team
+        <select id="teamSel">
+          <option value="blue" selected>Blue</option>
+          <option value="red">Red</option>
+        </select>
+      </label>
+    </div>
+
+    <div class="row">
+      <label>Selected <select id="selectedDrone"></select></label>
+      <button id="setHome">Set Home = Selected Pos</button>
+      <button id="toggleTarget">Randomize Targets</button>
+    </div>
+
+    <div class="row">
+      <label>Camera
+        <select id="camMode">
+          <option value="free">Free Orbit</option>
+          <option value="follow">Follow Selected</option>
+          <option value="fpv">FPV Selected</option>
+        </select>
+      </label>
+      <button id="resetCam">Reset Cam</button>
+    </div>
+
+    <div class="row">
+      <label>Speed<input id="spd" type="number" min="0.2" max="4" step="0.1" value="1.2"></label>
+      <label>Separation<input id="sep" type="number" min="0.3" max="3" step="0.1" value="0.9"></label>
+      <label>Cohesion<input id="coh" type="number" min="0" max="2" step="0.05" value="0.35"></label>
+    </div>
+
+    <div class="row small">Manual controls:
+      <span class="kbd">W/S</span> forward/back,
+      <span class="kbd">A/D</span> left/right,
+      <span class="kbd">R/F</span> up/down,
+      <span class="kbd">Q/E</span> yaw,
+      <span class="kbd">1..5</span> select drone
+    </div>
+
+    <div id="vctrl">
+      <h4>Virtual Drone Controller (keyboard linked)</h4>
+      <div class="row2"><span style="width:72px">Throttle</span><div class="meter"><div id="mThrottle" class="fill"></div></div>
+        <span id="kRF" class="keybadge">R/F</span></div>
+      <div class="row2"><span style="width:72px">Pitch</span><div class="meter"><div id="mPitch" class="fill"></div></div>
+        <span id="kWS" class="keybadge">W/S</span></div>
+      <div class="row2"><span style="width:72px">Roll</span><div class="meter"><div id="mRoll" class="fill"></div></div>
+        <span id="kAD" class="keybadge">A/D</span></div>
+      <div class="row2"><span style="width:72px">Yaw</span><div class="meter"><div id="mYaw" class="fill"></div></div>
+        <span id="kQE" class="keybadge">Q/E</span></div>
+    </div>
+
+    
+
+    <details id="codePanel" style="margin-top:8px; border:1px solid #3b4a69; border-radius:8px; padding:6px; background:rgba(13,18,26,0.85);">
+      <summary style="cursor:pointer; color:#d7e3ff;">Swarm Controller Code (collapsible)</summary>
+      <div class="small" style="margin:6px 0;">Edit and apply JavaScript swarm logic. Function signature:<br><code>function controlSwarm(state) => commands</code></div>
+      <div id="editorWrap" style="position:relative;height:210px;border:1px solid #445271;border-radius:6px;overflow:hidden;background:#0f1522;">
+        <pre id="codePreview" style="position:absolute;inset:0;margin:0;padding:8px;overflow:auto;pointer-events:none;white-space:pre;line-height:1.35;font-family:ui-monospace,monospace;font-size:12px;color:#d9e7ff;"></pre>
+        <textarea id="swarmCode" spellcheck="false" style="position:absolute;inset:0;width:100%;height:100%;margin:0;padding:8px;resize:none;background:transparent;color:transparent;caret-color:#ffffff;border:0;outline:none;white-space:pre;line-height:1.35;font-family:ui-monospace,monospace;font-size:12px;"></textarea>
+      </div>
+      <div class="row" style="margin-top:6px;">
+        <button id="applyCode">Apply Code</button>
+        <button id="resetCode">Reset Template</button>
+        <label><input id="codeEnabled" type="checkbox" checked> Use code controller</label>
+      </div>
+      <div id="codeMsg" class="small" style="margin-top:4px;color:#9ad19a"></div>
+    </details>
+
+
+    <details id="logPanel" style="margin-top:8px; border:1px solid #3b4a69; border-radius:8px; padding:6px; background:rgba(13,18,26,0.85);">
+      <summary style="cursor:pointer; color:#d7e3ff;">Per-Drone Script Logs</summary>
+      <div class="row" style="margin-top:6px;">
+        <button id="clearLogs">Clear Logs</button>
+      </div>
+      <pre id="droneLogs" style="height:140px;overflow:auto;background:#0f1522;border:1px solid #445271;border-radius:6px;padding:8px;font-family:ui-monospace,monospace;font-size:12px;color:#cfe3ff;white-space:pre-wrap;"></pre>
+    </details>
+
+    <div id="status"></div>
+    <div id="error" class="small" style="margin-top:6px;color:#ff9a9a;"></div>
+    <div class="small">Using Three.js WebGL engine. Set exact SDC arena dimensions from the rulebook in X/Y/Z.</div>
+  </div>
+
+<script>
+  (function(){
+    const err = document.getElementById('error');
+    const status = document.getElementById('status');
+    status.textContent = 'Loading 3D engine...';
+    if (!window.WebGLRenderingContext) {
+      err.textContent = 'WebGL is not available in this browser. Please open this page in Chrome/Edge/Safari/Firefox (not in-app browser).';
+    }
+    window.addEventListener('error', (e) => {
+      if (!err.textContent) err.textContent = `Runtime error: ${e.message}`;
+    });
+    window.addEventListener('unhandledrejection', (e) => {
+      if (!err.textContent) err.textContent = `Module error: ${e.reason}`;
+    });
+  })();
+</script>
+
+<script type="module">
+import * as THREE from './vendor/three.module.js';
+import { OrbitControls } from './vendor/OrbitControls.js';
+
+const errEl = document.getElementById('error');
+const uiRoot = document.getElementById('ui');
+const q = new URLSearchParams(window.location.search);
+const panel = q.get('panel') || 'full'; // full|settings|model|fpv
+const forceTeam = q.get('team');
+const forceDrone = q.get('drone');
+const forceCam = q.get('cam');
+
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x0e1116);
+scene.fog = new THREE.Fog(0x0e1116, 20, 85);
+
+const camera = new THREE.PerspectiveCamera(60, innerWidth/innerHeight, 0.1, 500);
+camera.position.set(10, 10, 12);
+
+// Virtual front camera of selected drone (inset viewport)
+const droneCam = new THREE.PerspectiveCamera(75, 1, 0.05, 120);
+
+let renderer;
+try {
+  renderer = new THREE.WebGLRenderer({ antialias:true });
+} catch (err) {
+  errEl.textContent = `WebGL renderer init failed: ${(err && err.message) ? err.message : err}`;
+  throw err;
+}
+renderer.setSize(innerWidth, innerHeight);
+renderer.setPixelRatio(devicePixelRatio);
+renderer.autoClear = false;
+renderer.setScissorTest(true);
+document.body.appendChild(renderer.domElement);
+
+if (panel === 'model' || panel === 'fpv') {
+  uiRoot.style.display = 'none';
+}
+if (panel === 'settings') {
+  renderer.domElement.style.display = 'none';
+  document.body.style.overflow = 'auto';
+  uiRoot.style.position = 'relative';
+  uiRoot.style.top = '0';
+  uiRoot.style.left = '0';
+  uiRoot.style.width = 'auto';
+}
+
+const controls = new OrbitControls(camera, renderer.domElement);
+controls.target.set(0, 1.5, 0);
+controls.update();
+
+scene.add(new THREE.HemisphereLight(0xbfd9ff, 0x17202e, 0.65));
+const dir = new THREE.DirectionalLight(0xffffff, 1.0);
+dir.position.set(10, 14, 6);
+scene.add(dir);
+
+const grid = new THREE.GridHelper(40, 40, 0x334455, 0x223344);
+scene.add(grid);
+
+let arena = { x:20, y:10, z:6 };
+let arenaGroup = null;
+let drones = [];
+let teamDrones = { red: [], blue: [] };
+let home = new THREE.Vector3(-arena.x/2+1, 0.3, -arena.y/2+1);
+let homeMesh = null;
+let redTargets = [];
+let blueTargets = [];
+let targetsGroup = null;
+let targetUnits = [];
+const hoverTimers = new Map();
+const returnToZone = new Set();
+const enemyMem = {};
+const HOME_ZONE_LEN = 7.0;
+
+const ui = {
+  arenaX: document.getElementById('arenaX'),
+  arenaY: document.getElementById('arenaY'),
+  arenaZ: document.getElementById('arenaZ'),
+  applyArena: document.getElementById('applyArena'),
+  droneCount: document.getElementById('droneCount'),
+  enemyDroneCount: document.getElementById('enemyDroneCount'),
+  spawnDrones: document.getElementById('spawnDrones'),
+  modeSel: document.getElementById('modeSel'),
+  teamSel: document.getElementById('teamSel'),
+  selectedDrone: document.getElementById('selectedDrone'),
+  setHome: document.getElementById('setHome'),
+  toggleTarget: document.getElementById('toggleTarget'),
+  camMode: document.getElementById('camMode'),
+  resetCam: document.getElementById('resetCam'),
+  speed: document.getElementById('spd'),
+  sep: document.getElementById('sep'),
+  coh: document.getElementById('coh'),
+  status: document.getElementById('status'),
+  mThrottle: document.getElementById('mThrottle'),
+  mPitch: document.getElementById('mPitch'),
+  mRoll: document.getElementById('mRoll'),
+  mYaw: document.getElementById('mYaw'),
+  kRF: document.getElementById('kRF'),
+  kWS: document.getElementById('kWS'),
+  kAD: document.getElementById('kAD'),
+  kQE: document.getElementById('kQE'),
+  swarmCode: document.getElementById('swarmCode'),
+  applyCode: document.getElementById('applyCode'),
+  resetCode: document.getElementById('resetCode'),
+  codeEnabled: document.getElementById('codeEnabled'),
+  codeMsg: document.getElementById('codeMsg'),
+  codePreview: document.getElementById('codePreview'),
+  droneLogs: document.getElementById('droneLogs'),
+  clearLogs: document.getElementById('clearLogs')
+};
+
+const keys = new Set();
+let selected = 0;
+if (forceTeam === 'red' || forceTeam === 'blue') ui.teamSel.value = forceTeam;
+if (forceCam) ui.camMode.value = forceCam;
+
+const defaultSwarmCode = `// Winning-oriented enemy-target sweep
+// Team-aware: attack enemy targets only, hover 2s, then next target
+// Deconflicted assignment: one drone per target (same team)
+function controlSwarm(state) {
+  const cmds = {};
+  const speed = Math.max(0.8, state.params.speed);
+  const hoverAlt = 0.95;
+  const captureRadius = 0.85;
+  const hoverTime = 2.0;
+
+  if (!globalThis.__mem) globalThis.__mem = {};
+  const mem = globalThis.__mem;
+
+  const enemy = state.targets.list.filter(t => t.owner !== state.myTeam);
+
+  // Build per-step claim map so two same-team drones don't choose same target.
+  // claimed[targetId] = droneId
+  const claimed = {};
+
+  // Keep still-valid claims from previous frame first
+  for (const d of state.drones) {
+    if (!mem[d.id]) mem[d.id] = { targetId: null, hoverT: 0 };
+    const m = mem[d.id];
+    const stillEnemy = enemy.some(t => t.id === m.targetId);
+    if (stillEnemy && !claimed[m.targetId]) claimed[m.targetId] = d.id;
+    else m.targetId = null;
+  }
+
+  for (const d of state.drones) {
+    const m = mem[d.id];
+
+    // Resolve claimed target reference
+    let tgt = enemy.find(t => t.id === m.targetId && claimed[t.id] === d.id);
+
+    // If no target yet, pick nearest unclaimed enemy target
+    if (!tgt) {
+      let best = null, bestD = 1e9;
+      for (const t of enemy) {
+        if (claimed[t.id] && claimed[t.id] !== d.id) continue;
+        const dx = t.x - d.x, dz = t.z - d.z;
+        const dd = Math.hypot(dx, dz);
+        if (dd < bestD) { bestD = dd; best = t; }
+      }
+      tgt = best;
+      m.targetId = tgt ? tgt.id : null;
+      if (tgt) claimed[tgt.id] = d.id;
+    }
+
+    if (!tgt) {
+      // no enemy left: hold near home
+      const dx = state.home.x - d.x, dz = state.home.z - d.z;
+      const dist = Math.hypot(dx, dz) || 1;
+      cmds[d.id] = { vx: (dx/dist)*0.4, vy: (hoverAlt-d.y)*1.2, vz: (dz/dist)*0.4, yawRate: 0 };
+      continue;
+    }
+
+    const dx = tgt.x - d.x;
+    const dz = tgt.z - d.z;
+    const dist = Math.hypot(dx, dz);
+
+    let vx = 0, vz = 0, yawRate = 0;
+    const vy = (hoverAlt - d.y) * 1.4;
+
+    if (dist <= captureRadius) {
+      m.hoverT += state.dt;
+      // keep near target while hovering
+      vx = (dx / Math.max(1e-6, dist)) * 0.25;
+      vz = (dz / Math.max(1e-6, dist)) * 0.25;
+      if (m.hoverT >= hoverTime) {
+        m.hoverT = 0;
+        // release this target claim and retarget next frame
+        if (m.targetId && claimed[m.targetId] === d.id) delete claimed[m.targetId];
+        m.targetId = null;
+      }
+    } else {
+      m.hoverT = 0;
+      vx = (dx / Math.max(1e-6, dist)) * speed;
+      vz = (dz / Math.max(1e-6, dist)) * speed;
+      const desiredYaw = Math.atan2(vx, vz);
+      let err = desiredYaw - d.yaw;
+      while (err > Math.PI) err -= 2*Math.PI;
+      while (err < -Math.PI) err += 2*Math.PI;
+      yawRate = err * 1.5;
+    }
+
+    // separation
+    for (const o of state.drones) {
+      if (o.id === d.id) continue;
+      const rx = d.x - o.x, rz = d.z - o.z;
+      const rd = Math.hypot(rx, rz);
+      if (rd < state.params.separation && rd > 1e-4) {
+        vx += (rx / rd) * 1.0;
+        vz += (rz / rd) * 1.0;
+      }
+    }
+
+    cmds[d.id] = { vx, vy, vz, yawRate };
+  }
+
+  return cmds;
+}`;
+
+let swarmControllerFn = null;
+let lastLogAt = 0;
+
+function escapeHtml(str) {
+  return str.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+
+function renderHighlightedCode() {
+  const src = ui.swarmCode.value;
+  let html = escapeHtml(src);
+  // comments first
+  html = html.replace(/(\/\/.*)$/gm, '<span style="color:#7f8ea3;">$1</span>');
+  // strings (simplified for broad browser compatibility)
+  html = html.replace(/("[^"]*"|'[^']*')/g, '<span style="color:#86efac;">$1</span>');
+  // numbers
+  html = html.replace(/\b(\d+(?:\.\d+)?)\b/g, '<span style="color:#fca5a5;">$1</span>');
+  // keywords
+  html = html.replace(/\b(function|return|const|let|var|if|else|for|while|break|continue|new|true|false|null)\b/g, '<span style="color:#93c5fd;">$1</span>');
+  // builtins
+  html = html.replace(/\b(Math|Object|Array|Number|String|globalThis)\b/g, '<span style="color:#fcd34d;">$1</span>');
+  ui.codePreview.innerHTML = html;
+}
+
+function appendDroneLog(line) {
+  const now = performance.now();
+  if (now - lastLogAt < 120) return; // throttle
+  lastLogAt = now;
+  const pre = ui.droneLogs;
+  pre.textContent += line + '\n';
+  const maxChars = 12000;
+  if (pre.textContent.length > maxChars) {
+    pre.textContent = pre.textContent.slice(pre.textContent.length - maxChars);
+  }
+  pre.scrollTop = pre.scrollHeight;
+}
+
+function compileSwarmCode() {
+  try {
+    const userCode = ui.swarmCode.value;
+    const factory = new Function(`${userCode}; return controlSwarm;`);
+    const fn = factory();
+    if (typeof fn !== 'function') throw new Error('controlSwarm function not found');
+    swarmControllerFn = fn;
+    renderHighlightedCode();
+    ui.codeMsg.style.color = '#9ad19a';
+    ui.codeMsg.textContent = 'Controller compiled successfully.';
+  } catch (e) {
+    ui.codeMsg.style.color = '#ff9a9a';
+    ui.codeMsg.textContent = `Compile error: ${e.message}`;
+  }
+}
+
+function applyCodeController(dt) {
+  if (!ui.codeEnabled.checked || !swarmControllerFn) return false;
+  try {
+    const state = {
+      dt,
+      home: { x: home.x, y: home.y, z: home.z },
+      targets: {
+        red: redTargets.map(t=>({x:t.x,y:t.y,z:t.z})),
+        blue: blueTargets.map(t=>({x:t.x,y:t.y,z:t.z})),
+        list: targetUnits.map(t=>({ id:t.id, x:t.group.position.x, y:t.group.position.y, z:t.group.position.z, owner:t.owner }))
+      },
+      myTeam: ui.teamSel.value,
+      params: {
+        separation: Number(ui.sep.value),
+        speed: Number(ui.speed.value),
+      },
+      drones: drones.filter(d=>d.team===ui.teamSel.value).map(d=>({ id:d.id, x:d.mesh.position.x, y:d.mesh.position.y, z:d.mesh.position.z, yaw:d.yaw, battery:d.battery }))
+    };
+
+    const cmds = swarmControllerFn(state) || {};
+
+    for (const d of drones) {
+      const c = cmds[d.id];
+      if (!c) continue;
+      const vx = Number(c.vx || 0), vy = Number(c.vy || 0), vz = Number(c.vz || 0), yawRate = Number(c.yawRate || 0);
+      appendDroneLog(`[${simTime.toFixed(2)}s] ${d.id} cmd vx=${vx.toFixed(2)} vy=${vy.toFixed(2)} vz=${vz.toFixed(2)} yawRate=${yawRate.toFixed(2)}`);
+      d.yaw += yawRate * dt;
+      const desired = new THREE.Vector3(vx, vy, vz);
+      enforceReturnRule(d, desired, dt);
+      const maxSpeed = Number(ui.speed.value) * 1.8;
+      if (desired.length() > maxSpeed) desired.setLength(maxSpeed);
+      d.vel.lerp(desired, 0.12);
+      d.mesh.position.addScaledVector(d.vel, dt);
+      if (Math.hypot(d.vel.x, d.vel.z) > 1e-5) d.mesh.rotation.y = d.yaw;
+      d.battery = Math.max(0, d.battery - 0.08 * dt);
+      clampDrone(d);
+    }
+    return true;
+  } catch (e) {
+    ui.codeMsg.style.color = '#ff9a9a';
+    ui.codeMsg.textContent = `Runtime error: ${e.message}`;
+    return false;
+  }
+}
+
+
+function rand(min, max) { return min + Math.random() * (max - min); }
+
+function generateTargets() {
+  redTargets = [];
+  blueTargets = [];
+
+  // As requested: targets are in home zones.
+  const redHome = getHomeZone('red');
+  const blueHome = getHomeZone('blue');
+
+  const marginX = 0.8;
+  const marginZ = 0.8;
+
+  const redXMin = redHome.xmin + marginX;
+  const redXMax = redHome.xmax - marginX;
+  const redZMin = redHome.zmin + marginZ;
+  const redZMax = redHome.zmax - marginZ;
+
+  const blueXMin = blueHome.xmin + marginX;
+  const blueXMax = blueHome.xmax - marginX;
+  const blueZMin = blueHome.zmin + marginZ;
+  const blueZMax = blueHome.zmax - marginZ;
+
+  function rr(a,b){ return a + Math.random()*(b-a); }
+
+  for (let i = 0; i < 3; i++) {
+    redTargets.push(new THREE.Vector3(rr(redXMin, redXMax), 0.25, rr(redZMin, redZMax)));
+    blueTargets.push(new THREE.Vector3(rr(blueXMin, blueXMax), 0.25, rr(blueZMin, blueZMax)));
+  }
+}
+
+
+const markerLoader = new THREE.TextureLoader();
+const markerMatCache = new Map();
+
+function getMarkerMaterial(id) {
+  if (markerMatCache.has(id)) return markerMatCache.get(id);
+  const safeId = ((id - 1) % 40) + 1;
+  const tex = markerLoader.load(`./markers/aruco_${safeId}.svg`);
+  tex.colorSpace = THREE.SRGBColorSpace;
+  tex.minFilter = THREE.LinearFilter;
+  tex.magFilter = THREE.NearestFilter;
+  const mat = new THREE.MeshBasicMaterial({ map: tex });
+  markerMatCache.set(id, mat);
+  return mat;
+}
+
+function addTargetCrate(group, pos, teamColor, idBase, ownerTeam) {
+  const g = new THREE.Group();
+  g.position.set(pos.x, 0, pos.z);
+  g.rotation.y = Math.random() * Math.PI * 2;
+
+  // Main black equipment case (similar style to reference)
+  const caseBody = new THREE.Mesh(
+    new THREE.BoxGeometry(0.575, 0.55, 0.375),
+    new THREE.MeshStandardMaterial({ color: 0x111418, metalness: 0.2, roughness: 0.65 })
+  );
+  caseBody.position.set(0, 0.275, 0);
+  g.add(caseBody);
+
+  // Lid top + hinge hint
+  const lidTop = new THREE.Mesh(
+    new THREE.BoxGeometry(0.585, 0.03, 0.385),
+    new THREE.MeshStandardMaterial({ color: 0x171c22, metalness: 0.25, roughness: 0.55 })
+  );
+  lidTop.position.set(0, 0.565, 0);
+  g.add(lidTop);
+
+  // Open monitor panel with ArUco marker (0.5m x 0.5m)
+  const monitorPanel = new THREE.Mesh(
+    new THREE.BoxGeometry(0.5, 0.5, 0.03),
+    new THREE.MeshStandardMaterial({ color: 0x232a33, metalness: 0.2, roughness: 0.7 })
+  );
+  monitorPanel.position.set(0, 0.73, 0.17);
+  monitorPanel.rotation.x = -0.15;
+  g.add(monitorPanel);
+
+  const marker = new THREE.Mesh(new THREE.PlaneGeometry(0.5, 0.5), getMarkerMaterial(idBase));
+  marker.position.set(0, 0.73, 0.187);
+  marker.rotation.x = -0.15;
+  g.add(marker);
+
+  // Side support arms for monitor
+  const armMat = new THREE.MeshStandardMaterial({ color: teamColor, metalness: 0.2, roughness: 0.5 });
+  const armL = new THREE.Mesh(new THREE.BoxGeometry(0.03, 0.32, 0.03), armMat);
+  const armR = armL.clone();
+  armL.position.set(-0.19, 0.63, 0.13);
+  armR.position.set(0.19, 0.63, 0.13);
+  armL.rotation.x = -0.55;
+  armR.rotation.x = -0.55;
+  g.add(armL, armR);
+
+  // Front beacons/lights on floor
+  const beaconMat = new THREE.MeshStandardMaterial({ color: teamColor, emissive: teamColor, emissiveIntensity: 0.55 });
+  const beacon1 = new THREE.Mesh(new THREE.CylinderGeometry(0.08, 0.08, 0.08, 14), beaconMat);
+  const beacon2 = beacon1.clone();
+  beacon1.position.set(-0.14, 0.04, 0.26);
+  beacon2.position.set(0.14, 0.04, 0.26);
+  g.add(beacon1, beacon2);
+
+  // Team color accent strip
+  const accentMat = new THREE.MeshStandardMaterial({ color: teamColor, emissive: teamColor, emissiveIntensity: 0.25 });
+  const accent = new THREE.Mesh(
+    new THREE.BoxGeometry(0.575, 0.02, 0.02),
+    accentMat
+  );
+  accent.position.set(0, 0.12, 0.2);
+  g.add(accent);
+
+  // Back pole with secondary 0.5 x 0.5 marker
+  const pole = new THREE.Mesh(
+    new THREE.BoxGeometry(0.06, 1.8, 0.06),
+    new THREE.MeshStandardMaterial({ color: 0xe8e8e8, roughness: 0.8 })
+  );
+  pole.position.set(-0.24, 0.9, -0.24);
+  g.add(pole);
+
+  const marker2 = new THREE.Mesh(new THREE.PlaneGeometry(0.5, 0.5), getMarkerMaterial(idBase + 6));
+  marker2.position.set(-0.21, 1.35, -0.24);
+  marker2.rotation.y = Math.PI / 2;
+  g.add(marker2);
+
+  group.add(g);
+
+  return {
+    id: `T${idBase}`,
+    group: g,
+    owner: ownerTeam,
+    beaconMat,
+    accentMat,
+  };
+}
+
+
+function addBoundaryPillars(group) {
+  const h = arena.z;
+  const pillarW = 0.22;
+  const pillarMat = new THREE.MeshStandardMaterial({ color: 0xf1f5f9, roughness: 0.65, metalness: 0.05 });
+
+  const topBottomX = [-5, 0, 5];
+  const sideZ = [-arena.y/6, arena.y/6];
+
+  let markerId = 21;
+
+  function addPillar(x, z, inwardAxis) {
+    const pillar = new THREE.Mesh(new THREE.BoxGeometry(pillarW, h, pillarW), pillarMat);
+    pillar.position.set(x, h/2, z);
+    group.add(pillar);
+
+    const markerGeo = new THREE.PlaneGeometry(0.5, 0.5);
+    const heights = [Math.min(2, h - 0.25), Math.min(4, h - 0.25)].filter((v, i, a) => i === 0 || Math.abs(v - a[0]) > 0.2);
+
+    for (const yy of heights) {
+      const mat = getMarkerMaterial(markerId++).clone();
+      const m = new THREE.Mesh(markerGeo, mat);
+      if (inwardAxis === 'z+') {
+        m.position.set(x, yy, z + pillarW/2 + 0.002); // face +z
+      } else if (inwardAxis === 'z-') {
+        m.position.set(x, yy, z - pillarW/2 - 0.002);
+        m.rotation.y = Math.PI;
+      } else if (inwardAxis === 'x+') {
+        m.position.set(x + pillarW/2 + 0.002, yy, z);
+        m.rotation.y = -Math.PI/2;
+      } else {
+        m.position.set(x - pillarW/2 - 0.002, yy, z);
+        m.rotation.y = Math.PI/2;
+      }
+      group.add(m);
+
+      // extra mirrored marker on opposite side to improve visibility in drone camera
+      const mOpp = new THREE.Mesh(markerGeo, getMarkerMaterial(markerId + 10).clone());
+      if (inwardAxis === 'x+' || inwardAxis === 'x-') {
+        mOpp.position.set(x - Math.sign(m.position.x - x) * (pillarW/2 + 0.002), yy, z);
+        mOpp.rotation.y = -m.rotation.y;
+      } else {
+        mOpp.position.set(x, yy, z - Math.sign(m.position.z - z) * (pillarW/2 + 0.002));
+        mOpp.rotation.y = (m.rotation.y || 0) + Math.PI;
+      }
+      group.add(mOpp);
+    }
+  }
+
+  // Top edge (z = -arena.y/2), markers facing inward +z
+  for (const x of topBottomX) addPillar(x, -arena.y/2 + pillarW/2, 'z+');
+  // Bottom edge (z = +arena.y/2), markers facing inward -z
+  for (const x of topBottomX) addPillar(x, arena.y/2 - pillarW/2, 'z-');
+
+  // Left edge (x = -arena.x/2), markers facing inward +x
+  for (const z of sideZ) addPillar(-arena.x/2 + pillarW/2, z, 'x+');
+  // Right edge (x = +arena.x/2), markers facing inward -x
+  for (const z of sideZ) addPillar(arena.x/2 - pillarW/2, z, 'x-');
+}
+
+
+
+function getHomeZone(team) {
+  const half = arena.x / 2;
+  if (team === 'red') {
+    return { xmin: -half, xmax: -half + HOME_ZONE_LEN, zmin: -arena.y/2, zmax: arena.y/2 };
+  }
+  return { xmin: half - HOME_ZONE_LEN, xmax: half, zmin: -arena.y/2, zmax: arena.y/2 };
+}
+
+function inHomeZone(team, pos) {
+  const z = getHomeZone(team);
+  return pos.x >= z.xmin && pos.x <= z.xmax && pos.z >= z.zmin && pos.z <= z.zmax;
+}
+
+function zoneCenter(team, currentZ=0) {
+  const z = getHomeZone(team);
+  return new THREE.Vector3((z.xmin+z.xmax)/2, 0.9, Math.max(z.zmin+0.5, Math.min(z.zmax-0.5, currentZ)));
+}
+
+function enforceReturnRule(d, desired, dt) {
+  if (!returnToZone.has(d.id)) return false;
+  if (inHomeZone(d.team, d.mesh.position)) {
+    returnToZone.delete(d.id);
+    return false;
+  }
+  const homePt = zoneCenter(d.team, d.mesh.position.z);
+  const dir = homePt.clone().sub(d.mesh.position);
+  const horiz = new THREE.Vector3(dir.x, 0, dir.z);
+  if (horiz.length() > 1e-5) {
+    horiz.normalize().multiplyScalar(Math.max(0.8, Number(ui.speed.value)));
+    desired.x = horiz.x;
+    desired.z = horiz.z;
+  }
+  desired.y = (0.9 - d.mesh.position.y) * 1.4;
+  if (Math.hypot(desired.x, desired.z) > 1e-5) d.yaw = Math.atan2(desired.x, desired.z);
+  return true;
+}
+
+function setTargetOwner(unit, team) {
+  unit.owner = team;
+  const c = team === 'red' ? 0xef4444 : 0x2563eb;
+  if (unit.accentMat) {
+    unit.accentMat.color.setHex(c);
+    unit.accentMat.emissive.setHex(c);
+  }
+  if (unit.beaconMat) {
+    unit.beaconMat.color.setHex(c);
+    unit.beaconMat.emissive.setHex(c);
+  }
+}
+
+
+function enemyBotUpdate(dt) {
+  const myTeam = ui.teamSel.value;
+  const enemyTeam = myTeam === 'red' ? 'blue' : 'red';
+  const bots = teamDrones[enemyTeam] || [];
+  const speed = Number(ui.speed.value) * 0.9;
+
+  // clear stale claims
+  for (const id of Object.keys(enemyMem)) {
+    const still = bots.some(d => d.id === id);
+    if (!still) delete enemyMem[id];
+  }
+
+  const enemyTargets = targetUnits.filter(t => t.owner !== enemyTeam);
+  const claims = {};
+  for (const d of bots) {
+    const m = enemyMem[d.id] || (enemyMem[d.id] = { targetId: null, hoverT: 0 });
+    if (m.targetId && enemyTargets.some(t => t.id === m.targetId) && !claims[m.targetId]) claims[m.targetId] = d.id;
+    else m.targetId = null;
+  }
+
+  for (const d of bots) {
+    const m = enemyMem[d.id] || (enemyMem[d.id] = { targetId: null, hoverT: 0 });
+    let tgt = enemyTargets.find(t => t.id === m.targetId && claims[t.id] === d.id);
+    if (!tgt) {
+      let best = null, bestD = 1e9;
+      for (const t of enemyTargets) {
+        if (claims[t.id] && claims[t.id] !== d.id) continue;
+        const dx = t.group.position.x - d.mesh.position.x;
+        const dz = t.group.position.z - d.mesh.position.z;
+        const dd = Math.hypot(dx, dz);
+        if (dd < bestD) { bestD = dd; best = t; }
+      }
+      tgt = best;
+      m.targetId = tgt ? tgt.id : null;
+      if (tgt) claims[tgt.id] = d.id;
+    }
+
+    const desired = new THREE.Vector3(0, (0.95 - d.mesh.position.y) * 1.3, 0);
+
+    if (!enforceReturnRule(d, desired, dt)) {
+      if (tgt) {
+        const dx = tgt.group.position.x - d.mesh.position.x;
+        const dz = tgt.group.position.z - d.mesh.position.z;
+        const dist = Math.hypot(dx, dz);
+        if (dist > 0.85) {
+          desired.x = (dx/Math.max(1e-6,dist))*speed;
+          desired.z = (dz/Math.max(1e-6,dist))*speed;
+        }
+      }
+    }
+
+    d.vel.lerp(desired, 0.1);
+    d.mesh.position.addScaledVector(d.vel, dt);
+    if (Math.hypot(d.vel.x,d.vel.z)>1e-5) d.yaw = Math.atan2(d.vel.x,d.vel.z);
+    d.mesh.rotation.y = d.yaw;
+    d.battery = Math.max(0, d.battery - 0.08*dt);
+    clampDrone(d);
+  }
+}
+
+function updateTargetCaptures(dt) {
+  const captureRadius = 0.85;
+  const speedGate = 0.45;
+  const needHover = 2.0;
+
+  for (const d of drones) {
+    let activeKey = null;
+    for (const t of targetUnits) {
+      const dx = d.mesh.position.x - t.group.position.x;
+      const dz = d.mesh.position.z - t.group.position.z;
+      const dist = Math.hypot(dx, dz);
+      const spd = Math.hypot(d.vel.x, d.vel.z);
+      const capTeam = d.team;
+      if (dist <= captureRadius && spd <= speedGate && t.owner !== capTeam) {
+        const key = `${d.id}|${t.id}`;
+        activeKey = key;
+        const v = (hoverTimers.get(key) || 0) + dt;
+        hoverTimers.set(key, v);
+        if (v >= needHover) {
+          setTargetOwner(t, capTeam);
+          hoverTimers.set(key, 0);
+          returnToZone.add(d.id);
+          if (capTeam === ui.teamSel.value) appendDroneLog(`[${simTime.toFixed(2)}s] ${d.id} captured ${t.id} for ${capTeam}; return-home`);
+        }
+        break;
+      }
+    }
+    // decay timers for this drone when not actively hovering
+    if (!activeKey) {
+      for (const k of Array.from(hoverTimers.keys())) if (k.startsWith(d.id+'|')) hoverTimers.delete(k);
+    }
+  }
+}
+
+function drawTargets() {
+  if (targetsGroup) scene.remove(targetsGroup);
+  targetsGroup = new THREE.Group();
+
+  // 3 red target crates on left half, 3 blue on right half (with true ArUco SVG markers)
+  targetUnits = [];
+  let idx = 1;
+  for (const p of redTargets) targetUnits.push(addTargetCrate(targetsGroup, p, 0xef4444, idx++, 'red'));
+  for (const p of blueTargets) targetUnits.push(addTargetCrate(targetsGroup, p, 0x2563eb, idx++, 'blue'));
+
+  scene.add(targetsGroup);
+}
+
+function nearestBlueTarget(fromPos) {
+  if (!blueTargets.length) return null;
+  let best = blueTargets[0];
+  let bestD = fromPos.distanceTo(best);
+  for (let i = 1; i < blueTargets.length; i++) {
+    const d = fromPos.distanceTo(blueTargets[i]);
+    if (d < bestD) { bestD = d; best = blueTargets[i]; }
+  }
+  return best;
+}
+
+function buildArena() {
+  if (arenaGroup) scene.remove(arenaGroup);
+  arenaGroup = new THREE.Group();
+  const w = arena.x, d = arena.y, h = arena.z;
+
+  const floor = new THREE.Mesh(
+    new THREE.BoxGeometry(w, 0.02, d),
+    new THREE.MeshStandardMaterial({ color:0x1b2230, metalness:0.1, roughness:0.9 })
+  );
+  floor.position.y = 0;
+  arenaGroup.add(floor);
+
+  // Home zones (7m length each side, full width)
+  const rz = getHomeZone('red');
+  const bz = getHomeZone('blue');
+  const redZone = new THREE.Mesh(
+    new THREE.PlaneGeometry(rz.xmax-rz.xmin, arena.y),
+    new THREE.MeshBasicMaterial({ color:0xff6b6b, transparent:true, opacity:0.18, side:THREE.DoubleSide })
+  );
+  redZone.rotation.x = -Math.PI/2;
+  redZone.position.set((rz.xmin+rz.xmax)/2, 0.012, 0);
+  arenaGroup.add(redZone);
+
+  const blueZone = new THREE.Mesh(
+    new THREE.PlaneGeometry(bz.xmax-bz.xmin, arena.y),
+    new THREE.MeshBasicMaterial({ color:0x6ea8ff, transparent:true, opacity:0.18, side:THREE.DoubleSide })
+  );
+  blueZone.rotation.x = -Math.PI/2;
+  blueZone.position.set((bz.xmin+bz.xmax)/2, 0.012, 0);
+  arenaGroup.add(blueZone);
+
+  const wallMat = new THREE.MeshStandardMaterial({ color:0x2a3347, transparent:true, opacity:0.35 });
+  const wallT = 0.06;
+  const wall1 = new THREE.Mesh(new THREE.BoxGeometry(w, h, wallT), wallMat); wall1.position.set(0,h/2,-d/2);
+  const wall2 = wall1.clone(); wall2.position.set(0,h/2,d/2);
+  const wall3 = new THREE.Mesh(new THREE.BoxGeometry(wallT, h, d), wallMat); wall3.position.set(-w/2,h/2,0);
+  const wall4 = wall3.clone(); wall4.position.set(w/2,h/2,0);
+  arenaGroup.add(wall1, wall2, wall3, wall4);
+
+  const edge = new THREE.LineSegments(
+    new THREE.EdgesGeometry(new THREE.BoxGeometry(w, h, d)),
+    new THREE.LineBasicMaterial({ color:0x6f87b8 })
+  );
+  edge.position.y = h/2;
+  arenaGroup.add(edge);
+
+  // White boundary pillars from floor to ceiling with ArUco markers at 2m and 4m
+  addBoundaryPillars(arenaGroup);
+
+  scene.add(arenaGroup);
+
+  if (homeMesh) scene.remove(homeMesh);
+  homeMesh = new THREE.Mesh(new THREE.SphereGeometry(0.2, 16, 16), new THREE.MeshStandardMaterial({ color:0x2dd4bf }));
+  homeMesh.position.copy(home);
+  scene.add(homeMesh);
+
+  generateTargets();
+  drawTargets();
+}
+
+function makeRotor(x, z) {
+  const g = new THREE.Group();
+  g.position.set(x, 0.05, z);
+  const hub = new THREE.Mesh(new THREE.CylinderGeometry(0.015,0.015,0.01,12), new THREE.MeshStandardMaterial({ color:0x9aa7bd }));
+  hub.rotation.x = Math.PI/2;
+  const blade1 = new THREE.Mesh(new THREE.BoxGeometry(0.16,0.003,0.02), new THREE.MeshStandardMaterial({ color:0xd7deea }));
+  const blade2 = blade1.clone(); blade2.rotation.y = Math.PI/2;
+  g.add(hub, blade1, blade2);
+  return g;
+}
+
+function makeDrone(i, team, sideIndex) {
+  const g = new THREE.Group();
+  const bodyColor = team === 'red' ? 0xfca5a5 : 0x93c5fd;
+  const body = new THREE.Mesh(new THREE.BoxGeometry(0.32, 0.08, 0.32), new THREE.MeshStandardMaterial({ color: bodyColor }));
+  const arm1 = new THREE.Mesh(new THREE.BoxGeometry(0.55, 0.03, 0.03), new THREE.MeshStandardMaterial({ color:0x64748b }));
+  const arm2 = arm1.clone(); arm2.rotation.y = Math.PI/2;
+  g.add(body, arm1, arm2);
+
+  const rotors = [
+    makeRotor(0.23,0.23), makeRotor(-0.23,0.23), makeRotor(0.23,-0.23), makeRotor(-0.23,-0.23)
+  ];
+  for (const r of rotors) g.add(r);
+
+  const leftX = -arena.x/2 + 1.0;
+  const rightX = arena.x/2 - 1.0;
+  const zBase = -arena.y/2 + 1.0 + sideIndex*0.8;
+  const x = team === 'red' ? leftX : rightX;
+  g.position.set(x, 0.8, Math.min(arena.y/2-1.0, zBase));
+  g.rotation.y = team === 'red' ? 0 : Math.PI;
+  scene.add(g);
+  return {
+    id: `${team[0].toUpperCase()}${i+1}`,
+    team,
+    mesh: g,
+    body,
+    rotors,
+    vel: new THREE.Vector3(),
+    yaw: team === 'red' ? 0 : Math.PI,
+    battery: 100,
+  };
+}
+
+function spawnDrones(myCount, enemyCount) {
+  for (const d of drones) scene.remove(d.mesh);
+  drones = [];
+  teamDrones = { red: [], blue: [] };
+
+  const myTeam = ui.teamSel.value;
+  const enemyTeam = myTeam === 'red' ? 'blue' : 'red';
+
+  for (let i=0;i<myCount;i++) {
+    const d = makeDrone(i, myTeam, i);
+    drones.push(d); teamDrones[myTeam].push(d);
+  }
+  for (let i=0;i<enemyCount;i++) {
+    const d = makeDrone(i, enemyTeam, i);
+    drones.push(d); teamDrones[enemyTeam].push(d);
+  }
+
+  selected = 0;
+  ui.selectedDrone.innerHTML = drones.map((d,idx)=>`<option value='${idx}'>${d.id} (${d.team})</option>`).join('');
+  if (forceDrone) {
+    const wantId = `${(ui.teamSel.value || 'red').toUpperCase().slice(0,1)}${Number(forceDrone)}`;
+    const idx = drones.findIndex(d => d.id === wantId);
+    if (idx >= 0) selected = idx;
+  }
+  ui.selectedDrone.value = String(selected);
+}
+
+function clampDrone(d) {
+  const p = d.mesh.position;
+  p.x = Math.max(-arena.x/2+0.2, Math.min(arena.x/2-0.2, p.x));
+  p.z = Math.max(-arena.y/2+0.2, Math.min(arena.y/2-0.2, p.z));
+  p.y = Math.max(0.25, Math.min(arena.z-0.15, p.y));
+}
+
+function axis(plus, minus) { return (keys.has(plus)?1:0) + (keys.has(minus)?-1:0); }
+
+function manualUpdate(d, dt) {
+  const s = Number(ui.speed.value);
+  const pitchCmd = axis('KeyW','KeyS');
+  const rollCmd = axis('KeyD','KeyA');
+  const thrCmd = axis('KeyR','KeyF');
+  const yawCmd = axis('KeyQ','KeyE');
+
+  d.yaw += yawCmd * 1.6 * dt;
+  const forward = new THREE.Vector3(Math.sin(d.yaw), 0, Math.cos(d.yaw));
+  const right = new THREE.Vector3(Math.cos(d.yaw), 0, -Math.sin(d.yaw));
+
+  const acc = new THREE.Vector3();
+  acc.addScaledVector(forward, pitchCmd);
+  acc.addScaledVector(right, rollCmd);
+  acc.y += thrCmd;
+
+  if (acc.lengthSq() > 0) acc.normalize().multiplyScalar(s * 1.35);
+  enforceReturnRule(d, acc, dt);
+  d.vel.lerp(acc, 0.2);
+  d.mesh.position.addScaledVector(d.vel, dt);
+  d.mesh.rotation.y = d.yaw;
+  clampDrone(d);
+
+  // virtual controller bars
+  ui.mPitch.style.width = `${(pitchCmd*50)+50}%`;
+  ui.mRoll.style.width = `${(rollCmd*50)+50}%`;
+  ui.mThrottle.style.width = `${(thrCmd*50)+50}%`;
+  ui.mYaw.style.width = `${(yawCmd*50)+50}%`;
+  ui.kWS.classList.toggle('active', pitchCmd !== 0);
+  ui.kAD.classList.toggle('active', rollCmd !== 0);
+  ui.kRF.classList.toggle('active', thrCmd !== 0);
+  ui.kQE.classList.toggle('active', yawCmd !== 0);
+}
+
+function swarmUpdate(dt) {
+  const baseSpeed = Number(ui.speed.value);
+  const sepDist = Number(ui.sep.value);
+  const coh = Number(ui.coh.value);
+  const myTeam = ui.teamSel.value;
+  const myDrones = drones.filter(d => d.team === myTeam);
+
+  for (const d of myDrones) {
+    let desired = new THREE.Vector3();
+
+    const wp = nearestBlueTarget(d.mesh.position) || home;
+    const toTarget = wp.clone().sub(d.mesh.position); toTarget.y = 0;
+    if (toTarget.lengthSq() > 1e-6) desired.add(toTarget.normalize().multiplyScalar(baseSpeed));
+
+    const center = new THREE.Vector3();
+    for (const o of myDrones) center.add(o.mesh.position);
+    center.multiplyScalar(1 / Math.max(1, myDrones.length));
+    const toCenter = center.sub(d.mesh.position); toCenter.y = 0;
+    desired.add(toCenter.multiplyScalar(coh));
+
+    for (const o of myDrones) {
+      if (o === d) continue;
+      const delta = d.mesh.position.clone().sub(o.mesh.position);
+      const dist = delta.length();
+      if (dist < sepDist && dist > 1e-5) desired.add(delta.normalize().multiplyScalar((sepDist - dist) * 1.6));
+    }
+
+    if ((nearestBlueTarget(d.mesh.position) || home).distanceTo(d.mesh.position) < 0.7) {
+      const toHome = home.clone().sub(d.mesh.position).setY(0);
+      desired.copy(toHome.normalize().multiplyScalar(baseSpeed));
+    }
+
+    if (desired.lengthSq() > 0) desired.normalize().multiplyScalar(baseSpeed);
+    enforceReturnRule(d, desired, dt);
+    d.vel.lerp(desired, 0.065);
+    d.mesh.position.addScaledVector(d.vel, dt);
+    if (d.vel.lengthSq() > 1e-5) d.yaw = Math.atan2(d.vel.x, d.vel.z);
+    d.mesh.rotation.y = d.yaw;
+
+    const targetAlt = 0.8 + (Number(d.id.slice(1)) - 1) * 0.08;
+    d.mesh.position.y += (targetAlt - d.mesh.position.y) * 0.8 * dt;
+
+    d.battery = Math.max(0, d.battery - 0.08 * dt);
+    clampDrone(d);
+  }
+
+  // center bars in auto mode
+  ui.mPitch.style.width = ui.mRoll.style.width = ui.mThrottle.style.width = ui.mYaw.style.width = '50%';
+  ui.kWS.classList.remove('active'); ui.kAD.classList.remove('active'); ui.kRF.classList.remove('active'); ui.kQE.classList.remove('active');
+}
+
+function updateCamera(dt) {
+  const d = drones[selected];
+  if (!d) return;
+  const mode = ui.camMode.value;
+
+  if (mode === 'free') return;
+  if (mode === 'follow') {
+    controls.enabled = false;
+    const behind = new THREE.Vector3(Math.sin(d.yaw), 0, Math.cos(d.yaw)).multiplyScalar(-2.6);
+    const targetPos = d.mesh.position.clone().add(new THREE.Vector3(behind.x, 1.3, behind.z));
+    camera.position.lerp(targetPos, 1 - Math.exp(-5*dt));
+    const lookAt = d.mesh.position.clone().add(new THREE.Vector3(0,0.25,0));
+    camera.lookAt(lookAt);
+    return;
+  }
+  if (mode === 'fpv') {
+    controls.enabled = false;
+    const front = new THREE.Vector3(Math.sin(d.yaw), 0, Math.cos(d.yaw));
+    const camPos = d.mesh.position.clone().add(new THREE.Vector3(0,0.12,0)).addScaledVector(front, 0.15);
+    camera.position.lerp(camPos, 1 - Math.exp(-9*dt));
+    camera.lookAt(d.mesh.position.clone().addScaledVector(front, 3.5).add(new THREE.Vector3(0,0.1,0)));
+    return;
+  }
+}
+
+function spinRotors(dt) {
+  for (const d of drones) {
+    const speed = 25 + d.vel.length() * 60;
+    for (const r of d.rotors) r.rotation.y += speed * dt;
+  }
+}
+
+
+function updateDroneViewport() {
+  const d = drones[selected];
+  if (!d) return;
+  const forward = new THREE.Vector3(Math.sin(d.yaw), 0, Math.cos(d.yaw));
+  const up = new THREE.Vector3(0, 1, 0);
+
+  const eye = d.mesh.position.clone().add(new THREE.Vector3(0, 0.12, 0)).addScaledVector(forward, 0.14);
+  droneCam.position.copy(eye);
+  droneCam.up.copy(up);
+  droneCam.lookAt(eye.clone().addScaledVector(forward, 6.0).add(new THREE.Vector3(0, 0.05, 0)));
+}
+
+function updateStatus() {
+  const mode = ui.modeSel.value;
+  const selectedDroneId = (drones[selected] && drones[selected].id) ? drones[selected].id : '-';
+  let text = `mode: ${mode} | team: ${ui.teamSel.value} | cam: ${ui.camMode.value} | codeCtrl: ${ui.codeEnabled.checked ? 'ON':'OFF'}\nselected: ${selectedDroneId}\n`;
+  text += `arena: ${arena.x.toFixed(1)} x ${arena.y.toFixed(1)} x ${arena.z.toFixed(1)} m\n`;
+  text += `home: (${home.x.toFixed(2)}, ${home.y.toFixed(2)}, ${home.z.toFixed(2)})\n`;
+  text += `target crates (W57.5 D37.5 H55 / open 73cm, ArUco 0.5m): red=${redTargets.length}, blue=${blueTargets.length}\n`;
+  text += `boundary pillars: 10 (markers at 2m & 4m)\n`;
+  const blueOwned = targetUnits.filter(t=>t.owner==='blue').length;
+  const redOwned = targetUnits.filter(t=>t.owner==='red').length;
+  text += `score ownership -> blue:${blueOwned} red:${redOwned}\n`;
+  text += `returning drones: ${Array.from(returnToZone).length}\n`;
+  text += `auto swarm: both teams active simultaneously\n`;
+  for (const d of drones) {
+    const p = d.mesh.position;
+    text += `${d.id}: pos(${p.x.toFixed(2)},${p.y.toFixed(2)},${p.z.toFixed(2)}) bat=${d.battery.toFixed(1)}%\n`;
+  }
+  ui.status.textContent = text;
+}
+
+ui.applyArena.onclick = () => {
+  arena.x = Number(ui.arenaX.value);
+  arena.y = Number(ui.arenaY.value);
+  arena.z = Number(ui.arenaZ.value);
+  home.set(-arena.x/2+1, 0.3, -arena.y/2+1);
+  buildArena();
+  spawnDrones(Math.min(5, Math.max(2, Number(ui.droneCount.value))), Math.min(5, Math.max(2, Number(ui.enemyDroneCount.value))));
+};
+
+ui.spawnDrones.onclick = () => spawnDrones(Math.min(5, Math.max(2, Number(ui.droneCount.value))), Math.min(5, Math.max(2, Number(ui.enemyDroneCount.value))));
+ui.selectedDrone.onchange = () => selected = Number(ui.selectedDrone.value);
+ui.setHome.onclick = () => {
+  const d = drones[selected]; if (!d) return;
+  home.copy(d.mesh.position); home.y = 0.3; homeMesh.position.copy(home);
+};
+ui.toggleTarget.onclick = () => {
+  generateTargets();
+  drawTargets();
+};
+ui.resetCam.onclick = () => {
+  controls.enabled = true;
+  camera.position.set(10,10,12);
+  controls.target.set(0,1.5,0);
+  controls.update();
+  ui.camMode.value = 'free';
+};
+ui.camMode.onchange = () => {
+  if (ui.camMode.value === 'free') controls.enabled = true;
+};
+ui.teamSel.onchange = () => {
+  appendDroneLog(`[${simTime.toFixed(2)}s] switched team to ${ui.teamSel.value}`);
+  spawnDrones(Math.min(5, Math.max(2, Number(ui.droneCount.value))), Math.min(5, Math.max(2, Number(ui.enemyDroneCount.value))));
+};
+
+
+ui.applyCode.onclick = () => compileSwarmCode();
+ui.resetCode.onclick = () => {
+  ui.swarmCode.value = defaultSwarmCode;
+  renderHighlightedCode();
+  compileSwarmCode();
+};
+ui.clearLogs.onclick = () => { ui.droneLogs.textContent = ''; };
+ui.swarmCode.addEventListener('input', () => renderHighlightedCode());
+ui.swarmCode.addEventListener('scroll', () => {
+  ui.codePreview.scrollTop = ui.swarmCode.scrollTop;
+  ui.codePreview.scrollLeft = ui.swarmCode.scrollLeft;
+});
+ui.swarmCode.value = defaultSwarmCode;
+renderHighlightedCode();
+compileSwarmCode();
+
+document.addEventListener('keydown', (e) => {
+  keys.add(e.code);
+  if (/Digit[1-5]/.test(e.code)) {
+    const idx = Number(e.code.replace('Digit','')) - 1;
+    if (idx < drones.length) { selected = idx; ui.selectedDrone.value = String(idx); }
+  }
+});
+document.addEventListener('keyup', (e) => keys.delete(e.code));
+
+window.addEventListener('resize', () => {
+  camera.aspect = innerWidth/innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(innerWidth, innerHeight);
+});
+
+buildArena();
+spawnDrones(3,3);
+document.getElementById('status').textContent = '3D engine loaded. Initializing scene...';
+
+// External C2 bridge (postMessage)
+const externalWaypoints = new Map();
+function gridToWorld(x, y) {
+  const wx = -arena.x/2 + 0.5 + x;
+  const wz = -arena.y/2 + 0.5 + y;
+  return new THREE.Vector3(wx, 0.9, wz);
+}
+
+function applyExternalTargets(list) {
+  redTargets = [];
+  blueTargets = [];
+  for (const t of (list || [])) {
+    const p = gridToWorld(Number(t.x), Number(t.y));
+    if ((t.color || 'red') === 'blue') blueTargets.push(new THREE.Vector3(p.x, 0.25, p.z));
+    else redTargets.push(new THREE.Vector3(p.x, 0.25, p.z));
+  }
+  while (redTargets.length < 3) redTargets.push(new THREE.Vector3(-arena.x/2 + 2 + redTargets.length, 0.25, -1 + redTargets.length));
+  while (blueTargets.length < 3) blueTargets.push(new THREE.Vector3(arena.x/2 - 2 - blueTargets.length, 0.25, 1 - blueTargets.length));
+  drawTargets();
+}
+
+window.addEventListener('message', (ev) => {
+  const m = ev.data || {};
+  if (m.source !== 'c2') return;
+  if (m.kind === 'spawn') {
+    ui.teamSel.value = m.team || 'red';
+    ui.modeSel.value = m.mode || 'swarm';
+    ui.droneCount.value = String(Math.max(2, Math.min(5, Number(m.droneCount || 3))));
+    ui.enemyDroneCount.value = String(Math.max(2, Math.min(5, Number(m.enemyDroneCount || 3))));
+    spawnDrones(Number(ui.droneCount.value), Number(ui.enemyDroneCount.value));
+  }
+  if (m.kind === 'targets') {
+    applyExternalTargets(m.targets || []);
+  }
+  if (m.kind === 'goto') {
+    const wp = gridToWorld(Number(m.x), Number(m.y));
+    externalWaypoints.set(m.droneId, wp);
+  }
+});
+
+// ---------------------------------------------------------------------------
+// WebSocket API Bridge — connects to sim_api_server for external control
+// ---------------------------------------------------------------------------
+let apiWs = null;
+let apiWsConnected = false;
+let apiSelectedDroneId = null;   // drone id selected by the API (e.g. "B1")
+let apiFlying = false;
+const apiRc = { roll: 0, pitch: 0, throttle: 0, yaw: 0 };
+const apiKeys = new Set();
+let apiTelemetryInterval = null;
+
+function connectApiWs() {
+  const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+  const wsUrl = `${proto}://${location.host}/ws/sim`;
+  apiWs = new WebSocket(wsUrl);
+
+  apiWs.onopen = () => {
+    apiWsConnected = true;
+    console.log('[SimAPI] WebSocket connected to API server');
+  };
+
+  apiWs.onclose = () => {
+    apiWsConnected = false;
+    console.log('[SimAPI] WebSocket disconnected, reconnecting in 2s...');
+    setTimeout(connectApiWs, 2000);
+  };
+
+  apiWs.onerror = () => {
+    apiWsConnected = false;
+  };
+
+  apiWs.onmessage = (ev) => {
+    let cmd;
+    try { cmd = JSON.parse(ev.data); } catch { return; }
+    handleApiCommand(cmd);
+  };
+}
+
+function getApiDrone() {
+  if (!apiSelectedDroneId) return drones[selected] || null;
+  return drones.find(d => d.id === apiSelectedDroneId) || drones[selected] || null;
+}
+
+function handleApiCommand(cmd) {
+  const t = cmd.type;
+  if (t === 'select_drone') {
+    apiSelectedDroneId = cmd.drone_id || null;
+    // Also update the UI selection
+    const idx = drones.findIndex(d => d.id === apiSelectedDroneId);
+    if (idx >= 0) { selected = idx; ui.selectedDrone.value = String(idx); }
+    return;
+  }
+  if (t === 'key_down') {
+    const code = mapApiKeyToCode(cmd.key);
+    if (code) { keys.add(code); apiKeys.add(code); }
+    return;
+  }
+  if (t === 'key_up') {
+    const code = mapApiKeyToCode(cmd.key);
+    if (code) { keys.delete(code); apiKeys.delete(code); }
+    return;
+  }
+  if (t === 'takeoff') {
+    apiFlying = true;
+    const d = getApiDrone();
+    if (d) {
+      d.vel.set(0, 0.8, 0);
+      if (d.mesh.position.y < 0.5) d.mesh.position.y = 0.5;
+    }
+    return;
+  }
+  if (t === 'land') {
+    apiFlying = false;
+    const d = getApiDrone();
+    if (d) d.vel.set(0, -0.3, 0);
+    return;
+  }
+  if (t === 'emergency') {
+    apiFlying = false;
+    const d = getApiDrone();
+    if (d) { d.vel.set(0, -2, 0); }
+    return;
+  }
+  if (t === 'rc') {
+    apiRc.roll = Number(cmd.roll || 0);
+    apiRc.pitch = Number(cmd.pitch || 0);
+    apiRc.throttle = Number(cmd.throttle || 0);
+    apiRc.yaw = Number(cmd.yaw || 0);
+    return;
+  }
+  if (t === 'move') {
+    const d = getApiDrone();
+    if (!d) return;
+    const dist = (Number(cmd.distance) || 30) / 100; // cm -> m
+    const dir = cmd.direction || 'forward';
+    const fwd = new THREE.Vector3(Math.sin(d.yaw), 0, Math.cos(d.yaw));
+    const right = new THREE.Vector3(Math.cos(d.yaw), 0, -Math.sin(d.yaw));
+    let wp;
+    if (dir === 'forward') wp = d.mesh.position.clone().addScaledVector(fwd, dist);
+    else if (dir === 'back') wp = d.mesh.position.clone().addScaledVector(fwd, -dist);
+    else if (dir === 'right') wp = d.mesh.position.clone().addScaledVector(right, dist);
+    else if (dir === 'left') wp = d.mesh.position.clone().addScaledVector(right, -dist);
+    else if (dir === 'up') wp = d.mesh.position.clone().add(new THREE.Vector3(0, dist, 0));
+    else if (dir === 'down') wp = d.mesh.position.clone().add(new THREE.Vector3(0, -dist, 0));
+    else return;
+    externalWaypoints.set(d.id, wp);
+    return;
+  }
+  if (t === 'rotate') {
+    const d = getApiDrone();
+    if (!d) return;
+    const deg = Number(cmd.degrees || 90);
+    const sign = cmd.direction === 'ccw' ? -1 : 1;
+    d.yaw += sign * deg * Math.PI / 180;
+    d.mesh.rotation.y = d.yaw;
+    return;
+  }
+  if (t === 'flip') {
+    const d = getApiDrone();
+    if (!d) return;
+    // Quick visual flip animation: bump up briefly
+    d.vel.y += 2.0;
+    return;
+  }
+  if (t === 'go') {
+    const d = getApiDrone();
+    if (!d) return;
+    const x = (Number(cmd.x) || 0) / 100;
+    const y = (Number(cmd.y) || 0) / 100;
+    const z = (Number(cmd.z) || 0) / 100;
+    const wp = d.mesh.position.clone().add(new THREE.Vector3(x, z, y));
+    externalWaypoints.set(d.id, wp);
+    return;
+  }
+  if (t === 'recover') {
+    apiFlying = false;
+    apiRc.roll = 0; apiRc.pitch = 0; apiRc.throttle = 0; apiRc.yaw = 0;
+    for (const code of apiKeys) keys.delete(code);
+    apiKeys.clear();
+    const d = getApiDrone();
+    if (d) { d.vel.set(0, 0, 0); }
+    return;
+  }
+  if (t === 'rth') {
+    const d = getApiDrone();
+    if (!d) return;
+    externalWaypoints.set(d.id, home.clone());
+    return;
+  }
+}
+
+function mapApiKeyToCode(key) {
+  const map = {
+    'w': 'KeyW', 's': 'KeyS', 'a': 'KeyA', 'd': 'KeyD',
+    'r': 'KeyR', 'f': 'KeyF', 'q': 'KeyQ', 'e': 'KeyE',
+    'arrowup': 'KeyW', 'arrowdown': 'KeyS', 'arrowleft': 'KeyA', 'arrowright': 'KeyD',
+  };
+  return map[(key || '').toLowerCase()] || null;
+}
+
+function applyApiRc(d, dt) {
+  // RC values are -100..100, scale to velocity
+  const scale = Number(ui.speed.value) / 100;
+  const fwd = new THREE.Vector3(Math.sin(d.yaw), 0, Math.cos(d.yaw));
+  const right = new THREE.Vector3(Math.cos(d.yaw), 0, -Math.sin(d.yaw));
+
+  const desired = new THREE.Vector3();
+  desired.addScaledVector(fwd, apiRc.pitch * scale);
+  desired.addScaledVector(right, apiRc.roll * scale);
+  desired.y = apiRc.throttle * scale;
+  d.yaw += (apiRc.yaw / 100) * 1.6 * dt;
+
+  d.vel.lerp(desired, 0.2);
+  d.mesh.position.addScaledVector(d.vel, dt);
+  d.mesh.rotation.y = d.yaw;
+  clampDrone(d);
+}
+
+function sendApiTelemetry() {
+  if (!apiWs || apiWs.readyState !== WebSocket.OPEN) return;
+  const d = getApiDrone();
+  if (!d) return;
+  const p = d.mesh.position;
+  const spd = Math.hypot(d.vel.x, d.vel.z) * 100; // m/s -> cm/s
+  apiWs.send(JSON.stringify({
+    type: 'telemetry',
+    battery: Math.round(d.battery),
+    temperature: 25,
+    height_cm: Math.round(p.y * 100),
+    tof_cm: Math.round(p.y * 100),
+    barometer_cm: Math.round(p.y * 100),
+    flight_time_s: Math.round(simTime),
+    pitch: Math.round((d.vel.z / Math.max(0.01, Math.hypot(d.vel.x, d.vel.z))) * 15),
+    roll: Math.round((d.vel.x / Math.max(0.01, Math.hypot(d.vel.x, d.vel.z))) * 15),
+    yaw: Math.round(d.yaw * 180 / Math.PI),
+    vgx: Math.round(d.vel.x * 100),
+    vgy: Math.round(d.vel.y * 100),
+    vgz: Math.round(d.vel.z * 100),
+    agx: 0, agy: 0, agz: 0,
+    speed: Math.round(spd),
+    flying: apiFlying,
+    connected: true,
+    drone_id: d.id,
+    pos_x: Number(p.x.toFixed(3)),
+    pos_y: Number(p.y.toFixed(3)),
+    pos_z: Number(p.z.toFixed(3)),
+  }));
+}
+
+// Start WebSocket connection and telemetry reporting
+connectApiWs();
+apiTelemetryInterval = setInterval(sendApiTelemetry, 200);
+
+let simTime = 0;
+let last = performance.now();
+function animate(now){
+  const dt = Math.min(0.05, (now - last) / 1000);
+  last = now;
+  simTime += dt;
+
+  // If API RC controls are active, apply them to the selected drone
+  const apiDrone = getApiDrone();
+  const hasApiRc = Math.abs(apiRc.roll) > 1 || Math.abs(apiRc.pitch) > 1 || Math.abs(apiRc.throttle) > 1 || Math.abs(apiRc.yaw) > 1;
+  if (apiDrone && hasApiRc && apiFlying) {
+    applyApiRc(apiDrone, dt);
+  } else if (apiDrone && apiFlying && !hasApiRc) {
+    // Hovering: maintain altitude
+    const hoverY = Math.max(0.8, apiDrone.mesh.position.y);
+    apiDrone.vel.y += (hoverY - apiDrone.mesh.position.y) * 2.0 * dt;
+    apiDrone.vel.x *= 0.95;
+    apiDrone.vel.z *= 0.95;
+    apiDrone.mesh.position.addScaledVector(apiDrone.vel, dt);
+    clampDrone(apiDrone);
+  } else if (apiDrone && !apiFlying) {
+    // Landing/grounded: descend to floor
+    if (apiDrone.mesh.position.y > 0.26) {
+      apiDrone.vel.set(0, -0.5, 0);
+      apiDrone.mesh.position.addScaledVector(apiDrone.vel, dt);
+      clampDrone(apiDrone);
+    } else {
+      apiDrone.vel.set(0, 0, 0);
+    }
+  }
+
+  if (ui.modeSel.value === 'manual') {
+    const d = drones[selected];
+    if (d && d.team === ui.teamSel.value) manualUpdate(d, dt);
+    for (const [idx,d] of drones.entries()) if (idx !== selected) d.vel.multiplyScalar(0.95);
+  } else {
+    const usedCode = applyCodeController(dt);
+    if (!usedCode) swarmUpdate(dt);
+  }
+
+  // apply external C2 waypoints for my team drones
+  const myTeam = ui.teamSel.value;
+  for (const d of drones) {
+    if (d.team !== myTeam) continue;
+    const wp = externalWaypoints.get(`team-drone-${d.id.slice(1)}`) || externalWaypoints.get(d.id);
+    if (!wp) continue;
+    const dir = wp.clone().sub(d.mesh.position);
+    dir.y = 0;
+    if (dir.length() < 0.25) { externalWaypoints.delete(`team-drone-${d.id.slice(1)}`); externalWaypoints.delete(d.id); }
+    else {
+      dir.normalize().multiplyScalar(Math.max(0.9, Number(ui.speed.value)));
+      d.vel.lerp(new THREE.Vector3(dir.x, (0.9 - d.mesh.position.y) * 1.2, dir.z), 0.2);
+      d.mesh.position.addScaledVector(d.vel, dt);
+      if (Math.hypot(d.vel.x, d.vel.z) > 1e-5) d.yaw = Math.atan2(d.vel.x, d.vel.z);
+      d.mesh.rotation.y = d.yaw;
+      clampDrone(d);
+    }
+  }
+
+  enemyBotUpdate(dt);
+  updateTargetCaptures(dt);
+
+  const selectedObj = drones[selected];
+  const selectedId = selectedObj ? selectedObj.id : '';
+  for (const d of drones) {
+    const base = d.team === 'red' ? 0xfca5a5 : 0x93c5fd;
+    d.body.material.color.set(d.id === selectedId ? 0xfacc15 : base);
+  }
+  spinRotors(dt);
+  updateCamera(dt);
+  updateStatus();
+
+  controls.update();
+  updateDroneViewport();
+
+  const w = window.innerWidth;
+  const h = window.innerHeight;
+
+  if (panel === 'settings') {
+    // no 3D drawing needed in settings-only panel
+  } else if (panel === 'fpv') {
+    droneCam.aspect = w / h;
+    droneCam.updateProjectionMatrix();
+    renderer.setViewport(0, 0, w, h);
+    renderer.setScissor(0, 0, w, h);
+    renderer.clear(true, true, true);
+    renderer.render(scene, droneCam);
+  } else {
+    // Main view
+    renderer.setViewport(0, 0, w, h);
+    renderer.setScissor(0, 0, w, h);
+    renderer.clear(true, true, true);
+    renderer.render(scene, camera);
+
+    // Inset drone front camera (virtual 3D viewport)
+    const insetW = Math.floor(w * 0.30);
+    const insetH = Math.floor(h * 0.30);
+    const pad = 14;
+    const x = w - insetW - pad;
+    const y = pad;
+    droneCam.aspect = insetW / insetH;
+    droneCam.updateProjectionMatrix();
+
+    renderer.clearDepth();
+    renderer.setViewport(x, y, insetW, insetH);
+    renderer.setScissor(x, y, insetW, insetH);
+    renderer.render(scene, droneCam);
+  }
+
+  requestAnimationFrame(animate);
+}
+requestAnimationFrame(animate);
+</script>
+</body>
+</html>
