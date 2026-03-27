@@ -416,7 +416,14 @@ def api_telemetry():
     with telemetry_lock:
         t = dict(telemetry)
     t["flying"] = flying
-    return jsonify(ok=True, telemetry=t)
+    age = time.time() - t.get("updated_at", 0)
+    t["state_age_s"] = round(age, 3)
+    t["state_fresh"] = age <= 3.0 and t.get("connected", False)
+    resp = jsonify(t)
+    resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+    resp.headers["Pragma"] = "no-cache"
+    resp.headers["Expires"] = "0"
+    return resp
 
 
 @app.get("/api/telemetry/stream")
@@ -426,6 +433,9 @@ def api_telemetry_stream():
             with telemetry_lock:
                 t = dict(telemetry)
             t["flying"] = flying
+            age = time.time() - t.get("updated_at", 0)
+            t["state_age_s"] = round(age, 3)
+            t["state_fresh"] = age <= 3.0 and t.get("connected", False)
             yield f"data: {json.dumps(t)}\n\n"
             time.sleep(1.0 / max(0.1, TELEMETRY_HZ))
     return Response(gen(), mimetype="text/event-stream")

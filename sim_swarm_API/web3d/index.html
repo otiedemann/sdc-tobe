@@ -1173,14 +1173,22 @@ ui.swarmCode.value = defaultSwarmCode;
 renderHighlightedCode();
 compileSwarmCode();
 
+function isTyping() {
+  const t = document.activeElement?.tagName;
+  return t === 'INPUT' || t === 'TEXTAREA' || document.activeElement?.isContentEditable;
+}
 document.addEventListener('keydown', (e) => {
+  if (isTyping()) return;
   keys.add(e.code);
   if (/Digit[1-5]/.test(e.code)) {
     const idx = Number(e.code.replace('Digit','')) - 1;
     if (idx < drones.length) { selected = idx; ui.selectedDrone.value = String(idx); }
   }
 });
-document.addEventListener('keyup', (e) => keys.delete(e.code));
+document.addEventListener('keyup', (e) => {
+  if (isTyping()) { keys.clear(); return; }
+  keys.delete(e.code);
+});
 
 window.addEventListener('resize', () => {
   camera.aspect = innerWidth/innerHeight;
@@ -1438,6 +1446,9 @@ function sendApiTelemetry() {
     vgz: Math.round(d.vel.z * 100),
     agx: 0, agy: 0, agz: 0,
     speed: Math.round(spd),
+    wifi_snr: 99,
+    sdk_version: 'sim_swarm_API',
+    serial_number: 'SIM-' + d.id,
     flying: apiFlying,
     connected: true,
     drone_id: d.id,
