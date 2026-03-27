@@ -1,4 +1,4 @@
-let state = { arena: null, drones: [], system: { mode: 'live', drone_count: 2 }, targets: [] };
+let state = { arena: null, drones: [], system: { mode: 'live', drone_count: 2, sim_api_host: 'localhost:8080' }, targets: [] };
 let targetEditMode = false;
 const simDronePos = new Map();
 let simFramesKey = '';
@@ -79,7 +79,7 @@ function render() {
     droneCountSelect.value = String(state.system.drone_count);
   }
   targetModeBtn.textContent = targetEditMode ? 'Target mode ON (click cells)' : 'Set targets (max 6)';
-  connectLiveBtn.disabled = state.system.mode !== 'live';
+  connectLiveBtn.disabled = (state.system.mode !== 'live');
 
   const activeDrones = state.drones.filter(d => d.status !== 'offline');
   const nextSelectKey = activeDrones.map(d => `${d.drone_id}:${d.status}`).join('|');
@@ -135,7 +135,7 @@ function render() {
   if (nextCardsKey !== cardsRenderKey) {
     cardsEl.innerHTML = activeDrones.map(d => {
       let video = `<div class="video-preview"><div class="video-meta">960 × 720</div><div class="video">No video URL configured</div></div>`;
-      if (state.system.mode === 'simulator' && simUrl) {
+      if ((state.system.mode === 'simulator' || state.system.mode === 'sim_api') && simUrl) {
         const idx = Number((d.drone_id.split('-').pop() || '1'));
         const fpvUrl = `${simUrl}${simUrl.includes('?') ? '&' : '?'}panel=fpv&embed=1&team=red&drone=${idx}&cam=fpv&v=${SIM_BUILD_TAG}`;
         video = `<div class="video-preview"><div class="video-meta">960 × 720</div><iframe data-sim-frame="1" src="${fpvUrl}" class="video" style="border:0"></iframe></div>`;
@@ -163,7 +163,7 @@ function render() {
     });
   }
 
-  if (state.system.mode === 'simulator' && simUrl) {
+  if ((state.system.mode === 'simulator' || state.system.mode === 'sim_api') && simUrl) {
     const modelUrl = `${simUrl}${simUrl.includes('?') ? '&' : '?'}panel=model&embed=1&team=red&v=${SIM_BUILD_TAG}`;
     const framesKey = `${modelUrl}`;
     if (framesKey !== simFramesKey) {
@@ -210,8 +210,8 @@ function render() {
     simDronePos.clear();
   }
 
-  if (state.system.mode === 'simulator') {
-    const spawnKey = `${state.system.drone_count}|red|c2`;
+  if (state.system.mode === 'simulator' || state.system.mode === 'sim_api') {
+    const spawnKey = `${state.system.drone_count}|red|c2|${state.system.mode}`;
     setTimeout(() => {
       if (spawnKey !== simSpawnKey) {
         simDronePos.clear();
@@ -231,10 +231,14 @@ function render() {
 async function applySystemConfig() {
   const desiredMode = modeSelect.value;
   const desiredCount = Number(droneCountSelect.value);
+  const payload = { mode: desiredMode, drone_count: desiredCount };
+  if (desiredMode === 'sim_api') {
+    payload.sim_api_host = state.system.sim_api_host || 'localhost:8080';
+  }
   try {
     await api('/api/system', {
       method: 'POST',
-      body: JSON.stringify({ mode: desiredMode, drone_count: desiredCount }),
+      body: JSON.stringify(payload),
     });
     systemConfigDirty = false;
   } catch (err) {
@@ -306,7 +310,7 @@ async function handleGridAction(e) {
     if (!droneId) return alert('No drone selected');
 
     // Apply reroute immediately in simulator so course changes are responsive.
-    if (state.system.mode === 'simulator') postSimCommand({ kind: 'goto', droneId, x, y });
+    if (state.system.mode === 'simulator' || state.system.mode === 'sim_api') postSimCommand({ kind: 'goto', droneId, x, y });
 
     try {
       await api(`/api/drones/${droneId}/goto`, { method: 'POST', body: JSON.stringify({ x, y }) });
@@ -361,7 +365,7 @@ async function bootstrap() {
 }
 
 setInterval(() => {
-  if (state.system.mode === 'simulator' || state.system.mode === 'live') {
+  if (state.system.mode === 'simulator' || state.system.mode === 'sim_api' || state.system.mode === 'live') {
     document.querySelectorAll('img.video').forEach(img => {
       const base = img.src.split('?')[0];
       img.src = `${base}?t=${Date.now()}`;
