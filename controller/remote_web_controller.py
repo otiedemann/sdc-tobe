@@ -433,7 +433,12 @@ document.getElementById('clear_cmd_log').onclick = async ()=>{
 };
 
 const map = new Set(['w','a','s','d','q','e','r','f','t','l','x',' ']);
+function _isTyping() {
+  const t = document.activeElement?.tagName;
+  return t === 'INPUT' || t === 'TEXTAREA' || document.activeElement?.isContentEditable;
+}
 window.addEventListener('keydown', (e)=>{
+  if (_isTyping()) return;
   const k = e.key.toLowerCase();
   if (map.has(k)) {
     e.preventDefault();
@@ -441,6 +446,7 @@ window.addEventListener('keydown', (e)=>{
   }
 });
 window.addEventListener('keyup', (e)=>{
+  if (_isTyping()) { releaseAllKeys(); return; }
   const k = e.key.toLowerCase();
   if (map.has(k)) {
     e.preventDefault();
