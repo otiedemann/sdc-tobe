@@ -2,23 +2,52 @@
 
 Autonomous drone fleet command & control for the SDC26 competition. Controls drones via the API, receives ArUco positioning data, and executes game strategies (simultaneous capture, team return bonus, instant win).
 
-## Quick Start
+## Quick Start (Simulator)
+
+The easiest way to get started is with the combined launcher that starts both the 3D simulator and the C2 dashboard:
 
 ```bash
+cd /path/to/sdc-tobe
+pip install -r sim_swarm_API/requirements.txt
 pip install -r c2_strategy/requirements.txt
 
-# From the project root:
+python start_c2_sim.py
+```
+
+This starts:
+- **Simulator** at http://localhost:8080/sim/ — 3D drone environment
+- **C2 Dashboard** at http://localhost:9090/ — strategy control interface
+
+The default config connects 3 simulator drones (B1, B2, B3) to the sim_swarm_API server. Open both URLs, then use the C2 dashboard to control the drones.
+
+### Environment Variables
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `SIM_API_PORT` | `8080` | sim_swarm_API server port |
+| `C2_PORT` | `9090` | C2 strategy server port |
+
+## Starting Servers Separately
+
+If you prefer to run each server in its own terminal:
+
+**Terminal 1 — Simulator:**
+```bash
+cd /path/to/sdc-tobe/sim_swarm_API
+python sim_api_server.py
+```
+
+**Terminal 2 — C2 Strategy:**
+```bash
 cd /path/to/sdc-tobe
 python -m c2_strategy
 ```
 
-Open **http://localhost:9090** in your browser.
-
 ## Prerequisites
 
 - Python 3.11+
-- A running drone API server:
-  - **Simulator**: `sim_swarm_API/sim_api_server.py` on port 8080
+- For simulator mode: no extra hardware needed
+- For live drones:
   - **Tello**: `tello_pi_api_server.py` per drone
   - **Anafi**: `olympe_pi_api_server.py` per drone
 - (Optional) ArUco positioning: `aruco-position/c2-server/relay.py` on port 8000
