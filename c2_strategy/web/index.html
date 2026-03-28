@@ -114,6 +114,36 @@
             </div>
         </section>
 
+        <!-- ArUco Markers Config -->
+        <section id="markers-section">
+            <h2>ArUco Markers</h2>
+            <p style="color:var(--text-dim);font-size:0.8em;margin-bottom:10px">
+                Position reference markers in the arena for drone triangulation. Markers are shown as diamonds on the arena map.
+            </p>
+            <div id="marker-list"></div>
+            <div class="add-marker-form">
+                <input id="new-marker-id" type="number" placeholder="Marker ID" style="width:90px" />
+                <input id="new-marker-x" type="number" placeholder="X (m)" step="0.1" value="0" style="width:70px" />
+                <input id="new-marker-y" type="number" placeholder="Y (m)" step="0.1" value="0" style="width:70px" />
+                <input id="new-marker-z" type="number" placeholder="Z (m)" step="0.1" value="2.0" style="width:70px" />
+                <select id="new-marker-wall">
+                    <option value="front">Front (y=0)</option>
+                    <option value="back">Back (y=max)</option>
+                    <option value="left">Left (x=0)</option>
+                    <option value="right">Right (x=max)</option>
+                    <option value="pillar">Pillar</option>
+                </select>
+                <button class="btn" onclick="addMarker()">+ Add Marker</button>
+            </div>
+            <div style="margin-top:8px">
+                <button class="btn btn-green" onclick="saveMarkers()">Save Markers</button>
+                <button class="btn" onclick="loadDefaultMarkers()">Reset to Defaults</button>
+                <label style="margin-left:12px;font-size:0.8em;color:var(--text-dim)">
+                    <input type="checkbox" id="show-markers-toggle" checked onchange="render()"> Show on map
+                </label>
+            </div>
+        </section>
+
         <!-- Captures Log -->
         <section id="log-section">
             <h2>Captures Log</h2>

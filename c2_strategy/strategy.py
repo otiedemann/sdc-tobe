@@ -606,4 +606,7 @@ class StrategyEngine:
             "captures": self.state.captures_log[-20:],
             "scoring": self.scorer.summary(),
             "locator": self.locator.summary(),
+            "pillar_markers": {
+                mid: m.model_dump() for mid, m in self.config.pillar_markers.items()
+            },
         }
