@@ -5,9 +5,11 @@ Autonomous drone fleet command & control for the SDC26 competition. Controls dro
 ## Quick Start
 
 ```bash
-cd c2_strategy
-pip install -r requirements.txt
-uvicorn c2_strategy.strategy_server:app --host 0.0.0.0 --port 9090
+pip install -r c2_strategy/requirements.txt
+
+# From the project root:
+cd /path/to/sdc-tobe
+python -m c2_strategy
 ```
 
 Open **http://localhost:9090** in your browser.
