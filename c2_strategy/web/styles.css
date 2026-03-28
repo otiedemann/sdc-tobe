@@ -388,6 +388,52 @@ section h2 {
     padding: 2px 6px;
 }
 
+/* Markers */
+.add-marker-form {
+    display: flex;
+    gap: 6px;
+    align-items: center;
+    flex-wrap: wrap;
+    margin-top: 10px;
+}
+
+#marker-list {
+    max-height: 300px;
+    overflow-y: auto;
+}
+
+.marker-row {
+    display: flex;
+    gap: 6px;
+    align-items: center;
+    padding: 4px 0;
+    border-bottom: 1px solid rgba(48,54,61,0.4);
+    font-size: 0.8em;
+}
+
+.marker-row input {
+    width: 60px;
+    font-size: 0.85em;
+    padding: 3px 6px;
+}
+
+.marker-row select {
+    width: 80px;
+    font-size: 0.85em;
+    padding: 3px 6px;
+}
+
+.marker-row .marker-id-label {
+    font-weight: 600;
+    min-width: 40px;
+    color: var(--orange);
+}
+
+.marker-row .btn {
+    font-size: 0.7em;
+    padding: 2px 6px;
+}
+
 /* Captures log */
 #captures-log {
     max-height: 200px;

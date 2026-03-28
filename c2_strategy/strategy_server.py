@@ -27,6 +27,7 @@ from .models import (
     DroneConfigItem,
     ManualOverrideCommand,
     SetPhaseCommand,
+    Vec3,
 )
 from .scoring import ScoreTracker
 from .strategy import StrategyEngine
@@ -332,6 +333,43 @@ async def update_drones(drones: list[DroneConfigItem]):
     engine.init_fleet_from_config()
 
     return {"ok": True, "drone_count": len(drones)}
+
+
+@app.get("/api/config/markers")
+async def get_markers():
+    return {
+        mid: m.model_dump()
+        for mid, m in config.pillar_markers.items()
+    }
+
+
+@app.get("/api/config/markers/defaults")
+async def get_default_markers():
+    from .arena_config import _default_pillar_markers
+    defaults = _default_pillar_markers()
+    return {mid: m.model_dump() for mid, m in defaults.items()}
+
+
+@app.post("/api/config/markers")
+async def update_markers(markers: dict[str, dict]):
+    """Replace all pillar markers. Each value: {marker_id, position: {x,y,z}, wall}."""
+    global config
+    from .arena_config import PillarMarker
+    parsed = {}
+    for mid, m in markers.items():
+        pos = m.get("position", {})
+        parsed[mid] = PillarMarker(
+            marker_id=m.get("marker_id", int(mid)),
+            position=Vec3(
+                x=float(pos.get("x", 0)),
+                y=float(pos.get("y", 0)),
+                z=float(pos.get("z", 0)),
+            ),
+            wall=m.get("wall", "front"),
+        )
+    config = config.model_copy(update={"pillar_markers": parsed})
+    save_arena_config(config)
+    return {"ok": True, "marker_count": len(parsed)}
 
 
 @app.post("/api/config/team")

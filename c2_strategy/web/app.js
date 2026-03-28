@@ -212,6 +212,43 @@ function renderArena() {
     ctx.beginPath(); ctx.moveTo(cx, cy1); ctx.lineTo(cx, cy2); ctx.stroke();
     ctx.setLineDash([]);
 
+    // ArUco markers (diamonds)
+    const showMarkers = document.getElementById('show-markers-toggle')?.checked !== false;
+    const markers = state.pillar_markers || {};
+    if (showMarkers) {
+        for (const [mid, m] of Object.entries(markers)) {
+            const p = m.position;
+            if (!p) continue;
+            const [sx, sy] = toScreen(p.x, p.y);
+            const s = 5;
+
+            // Wall-based color
+            const wallColors = {
+                front: 'rgba(210,153,34,0.7)',
+                back: 'rgba(210,153,34,0.7)',
+                left: 'rgba(188,140,255,0.7)',
+                right: 'rgba(188,140,255,0.7)',
+                pillar: 'rgba(139,148,158,0.7)',
+            };
+            ctx.fillStyle = wallColors[m.wall] || 'rgba(139,148,158,0.5)';
+
+            // Diamond shape
+            ctx.beginPath();
+            ctx.moveTo(sx, sy - s);
+            ctx.lineTo(sx + s, sy);
+            ctx.lineTo(sx, sy + s);
+            ctx.lineTo(sx - s, sy);
+            ctx.closePath();
+            ctx.fill();
+
+            // ID label
+            ctx.fillStyle = 'rgba(230,237,243,0.5)';
+            ctx.font = '8px sans-serif';
+            ctx.textAlign = 'center';
+            ctx.fillText(mid, sx, sy - s - 2);
+        }
+    }
+
     // Target boxes
     const targets = state.targets || {};
     for (const [id, t] of Object.entries(targets)) {
@@ -328,6 +365,76 @@ function addTarget() {
     });
 }
 
+// ---- ArUco Markers Config ----
+
+let markerConfigs = {}; // { "21": {marker_id, position:{x,y,z}, wall}, ... }
+
+function renderMarkerList() {
+    const container = document.getElementById('marker-list');
+    const ids = Object.keys(markerConfigs).sort((a, b) => Number(a) - Number(b));
+    if (ids.length === 0) {
+        container.innerHTML = '<p style="color:var(--text-dim)">No markers configured</p>';
+        return;
+    }
+    let html = '';
+    for (const mid of ids) {
+        const m = markerConfigs[mid];
+        const p = m.position || {};
+        html += `
+        <div class="marker-row">
+            <span class="marker-id-label">#${m.marker_id}</span>
+            <label>X:</label><input type="number" step="0.1" value="${p.x ?? 0}" onchange="markerConfigs['${mid}'].position.x=parseFloat(this.value)" />
+            <label>Y:</label><input type="number" step="0.1" value="${p.y ?? 0}" onchange="markerConfigs['${mid}'].position.y=parseFloat(this.value)" />
+            <label>Z:</label><input type="number" step="0.1" value="${p.z ?? 0}" onchange="markerConfigs['${mid}'].position.z=parseFloat(this.value)" />
+            <select onchange="markerConfigs['${mid}'].wall=this.value">
+                <option value="front" ${m.wall==='front'?'selected':''}>Front</option>
+                <option value="back" ${m.wall==='back'?'selected':''}>Back</option>
+                <option value="left" ${m.wall==='left'?'selected':''}>Left</option>
+                <option value="right" ${m.wall==='right'?'selected':''}>Right</option>
+                <option value="pillar" ${m.wall==='pillar'?'selected':''}>Pillar</option>
+            </select>
+            <button class="btn btn-red" onclick="delete markerConfigs['${mid}'];renderMarkerList()">X</button>
+        </div>`;
+    }
+    container.innerHTML = html;
+}
+
+function addMarker() {
+    const id = document.getElementById('new-marker-id').value.trim();
+    if (!id) return;
+    const x = parseFloat(document.getElementById('new-marker-x').value) || 0;
+    const y = parseFloat(document.getElementById('new-marker-y').value) || 0;
+    const z = parseFloat(document.getElementById('new-marker-z').value) || 2.0;
+    const wall = document.getElementById('new-marker-wall').value;
+    markerConfigs[id] = {
+        marker_id: parseInt(id),
+        position: { x, y, z },
+        wall,
+    };
+    document.getElementById('new-marker-id').value = '';
+    renderMarkerList();
+}
+
+function saveMarkers() {
+    fetch('/api/config/markers', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(markerConfigs),
+    }).then(r => r.json()).then(data => {
+        if (data.ok) alert(`Saved ${data.marker_count} markers`);
+    });
+}
+
+function loadDefaultMarkers() {
+    if (!confirm('Reset markers to default positions?')) return;
+    // Fetch defaults from server by resetting config
+    fetch('/api/config/markers/defaults').then(r => r.json()).then(data => {
+        markerConfigs = data;
+        renderMarkerList();
+        saveMarkers();
+    });
+}
+
 // ---- Drone Config ----
 
 let droneConfigs = [];
@@ -380,6 +487,10 @@ fetch('/api/config').then(r => r.json()).then(cfg => {
     if (cfg.drone_configs) {
         droneConfigs = cfg.drone_configs;
         renderDroneConfigs();
+    }
+    if (cfg.pillar_markers) {
+        markerConfigs = cfg.pillar_markers;
+        renderMarkerList();
     }
 }).catch(() => {});
 
