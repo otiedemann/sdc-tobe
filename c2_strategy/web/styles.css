@@ -1,0 +1,410 @@
+/* SDC26 Strategy C2 Dashboard */
+:root {
+    --bg: #0d1117;
+    --surface: #161b22;
+    --border: #30363d;
+    --text: #e6edf3;
+    --text-dim: #8b949e;
+    --blue: #58a6ff;
+    --red: #f85149;
+    --green: #3fb950;
+    --orange: #d29922;
+    --purple: #bc8cff;
+}
+
+* { margin: 0; padding: 0; box-sizing: border-box; }
+
+body {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    min-height: 100vh;
+}
+
+header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 12px 24px;
+    background: var(--surface);
+    border-bottom: 1px solid var(--border);
+}
+
+header h1 {
+    font-size: 1.3em;
+    font-weight: 600;
+}
+
+.status-disconnected {
+    color: var(--red);
+    font-size: 0.85em;
+    padding: 4px 12px;
+    border: 1px solid var(--red);
+    border-radius: 12px;
+}
+
+.status-connected {
+    color: var(--green);
+    border-color: var(--green);
+}
+
+main {
+    max-width: 1400px;
+    margin: 0 auto;
+    padding: 16px;
+}
+
+/* Scoreboard */
+#scoreboard {
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    gap: 24px;
+    margin-bottom: 16px;
+    padding: 16px;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+}
+
+.score-card {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    min-width: 120px;
+}
+
+.score-card.us .team-label { color: var(--blue); }
+.score-card.them .team-label { color: var(--red); }
+
+.team-label {
+    font-size: 0.8em;
+    font-weight: 700;
+    letter-spacing: 1px;
+}
+
+.score-value {
+    font-size: 3em;
+    font-weight: 800;
+    font-variant-numeric: tabular-nums;
+}
+
+.score-middle {
+    text-align: center;
+}
+
+.phase-badge {
+    display: inline-block;
+    padding: 4px 16px;
+    border-radius: 12px;
+    font-size: 0.8em;
+    font-weight: 700;
+    letter-spacing: 1px;
+    background: var(--border);
+    color: var(--text);
+    text-transform: uppercase;
+}
+
+.phase-badge.active { background: var(--green); color: #000; }
+.phase-badge.attack { background: var(--orange); color: #000; }
+.phase-badge.danger { background: var(--red); color: #fff; }
+
+#game-timer {
+    margin-top: 4px;
+    font-size: 0.9em;
+    color: var(--text-dim);
+    font-variant-numeric: tabular-nums;
+}
+
+/* Controls */
+#controls-bar {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 16px;
+    align-items: center;
+    margin-bottom: 16px;
+    padding: 12px 16px;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+}
+
+.control-group {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+}
+
+.control-group label {
+    font-size: 0.85em;
+    color: var(--text-dim);
+    white-space: nowrap;
+}
+
+.btn {
+    padding: 6px 14px;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    background: var(--surface);
+    color: var(--text);
+    font-size: 0.85em;
+    cursor: pointer;
+    transition: all 0.15s;
+}
+
+.btn:hover { background: var(--border); }
+.btn-green { border-color: var(--green); color: var(--green); }
+.btn-green:hover { background: var(--green); color: #000; }
+.btn-red { border-color: var(--red); color: var(--red); }
+.btn-red:hover { background: var(--red); color: #fff; }
+.btn-orange { border-color: var(--orange); color: var(--orange); }
+.btn-orange:hover { background: var(--orange); color: #000; }
+
+select, input {
+    padding: 6px 10px;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    background: var(--bg);
+    color: var(--text);
+    font-size: 0.85em;
+}
+
+select:focus, input:focus {
+    outline: none;
+    border-color: var(--blue);
+}
+
+/* Main grid */
+#main-grid {
+    display: grid;
+    grid-template-columns: 2fr 1fr;
+    gap: 16px;
+    margin-bottom: 16px;
+}
+
+section {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 16px;
+    margin-bottom: 16px;
+}
+
+section h2 {
+    font-size: 1em;
+    font-weight: 600;
+    margin-bottom: 12px;
+    color: var(--text-dim);
+    text-transform: uppercase;
+    letter-spacing: 1px;
+}
+
+/* Arena */
+#arena-container {
+    position: relative;
+    border: 2px solid var(--border);
+    border-radius: 4px;
+    overflow: hidden;
+}
+
+#arena-canvas {
+    display: block;
+    width: 100%;
+    height: auto;
+    background: #0a0e14;
+}
+
+/* Drone Cards */
+#drone-cards {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+}
+
+.drone-card {
+    padding: 12px;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    background: var(--bg);
+}
+
+.drone-card-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 8px;
+}
+
+.drone-name {
+    font-weight: 600;
+    font-size: 0.95em;
+}
+
+.drone-status {
+    font-size: 0.75em;
+    padding: 2px 8px;
+    border-radius: 10px;
+    font-weight: 600;
+}
+
+.drone-status.connected { background: rgba(63,185,80,0.15); color: var(--green); }
+.drone-status.flying { background: rgba(88,166,255,0.15); color: var(--blue); }
+.drone-status.lost { background: rgba(248,81,73,0.15); color: var(--red); }
+.drone-status.idle { background: rgba(139,148,158,0.15); color: var(--text-dim); }
+
+.drone-info {
+    font-size: 0.8em;
+    color: var(--text-dim);
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 4px;
+}
+
+.drone-info span { white-space: nowrap; }
+
+.drone-actions {
+    display: flex;
+    gap: 6px;
+    margin-top: 8px;
+}
+
+.drone-actions .btn {
+    font-size: 0.75em;
+    padding: 3px 8px;
+}
+
+/* Battery bar */
+.battery-bar {
+    height: 4px;
+    background: var(--border);
+    border-radius: 2px;
+    margin-top: 6px;
+    overflow: hidden;
+}
+
+.battery-fill {
+    height: 100%;
+    border-radius: 2px;
+    transition: width 0.5s;
+}
+
+.battery-fill.high { background: var(--green); }
+.battery-fill.medium { background: var(--orange); }
+.battery-fill.low { background: var(--red); }
+
+/* Targets */
+#target-list {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    margin-bottom: 12px;
+}
+
+.target-chip {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    padding: 6px 12px;
+    border: 1px solid var(--border);
+    border-radius: 16px;
+    font-size: 0.85em;
+    background: var(--bg);
+}
+
+.target-chip.captured { border-color: var(--green); }
+.target-chip .dot {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+}
+
+.dot.red { background: var(--red); }
+.dot.blue { background: var(--blue); }
+.dot.neutral { background: var(--text-dim); }
+
+.add-target-form {
+    display: flex;
+    gap: 8px;
+    align-items: center;
+    flex-wrap: wrap;
+}
+
+.add-target-form input {
+    width: 80px;
+}
+
+.add-target-form input:first-child {
+    width: 120px;
+}
+
+/* Config */
+.config-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+    gap: 16px;
+}
+
+.config-group h3 {
+    font-size: 0.85em;
+    color: var(--text);
+    margin-bottom: 8px;
+}
+
+.config-group label {
+    display: block;
+    font-size: 0.8em;
+    color: var(--text-dim);
+    margin-bottom: 4px;
+}
+
+.config-group input {
+    width: 60px;
+}
+
+#drone-config-list {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    margin-bottom: 8px;
+}
+
+.drone-config-row {
+    display: flex;
+    gap: 6px;
+    align-items: center;
+    font-size: 0.8em;
+}
+
+.drone-config-row input {
+    width: 100px;
+}
+
+.drone-config-row select {
+    width: 90px;
+}
+
+.drone-config-row .btn {
+    font-size: 0.75em;
+    padding: 2px 6px;
+}
+
+/* Captures log */
+#captures-log {
+    max-height: 200px;
+    overflow-y: auto;
+    font-family: 'SF Mono', Monaco, monospace;
+    font-size: 0.8em;
+    color: var(--text-dim);
+}
+
+#captures-log .log-entry {
+    padding: 3px 0;
+    border-bottom: 1px solid rgba(48,54,61,0.5);
+}
+
+/* Responsive */
+@media (max-width: 900px) {
+    #main-grid {
+        grid-template-columns: 1fr;
+    }
+}
