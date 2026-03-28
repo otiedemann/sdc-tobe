@@ -1,0 +1,126 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>SDC26 Strategy C2</title>
+    <link rel="stylesheet" href="/static/styles.css">
+</head>
+<body>
+    <header>
+        <h1>SDC26 Strategy C2</h1>
+        <div id="connection-status" class="status-disconnected">Disconnected</div>
+    </header>
+
+    <main>
+        <!-- Score Board -->
+        <section id="scoreboard">
+            <div class="score-card us">
+                <span class="team-label" id="our-team-label">BLUE</span>
+                <span class="score-value" id="score-us">0</span>
+            </div>
+            <div class="score-middle">
+                <div id="game-phase" class="phase-badge">SETUP</div>
+                <div id="game-timer">--:--</div>
+            </div>
+            <div class="score-card them">
+                <span class="team-label">ENEMY</span>
+                <span class="score-value" id="score-them">0</span>
+            </div>
+        </section>
+
+        <!-- Controls Bar -->
+        <section id="controls-bar">
+            <div class="control-group">
+                <label>Strategy Engine:</label>
+                <button id="btn-start-engine" class="btn btn-green" onclick="sendCmd({cmd:'start_engine'})">Start</button>
+                <button id="btn-stop-engine" class="btn btn-red" onclick="sendCmd({cmd:'stop_engine'})">Stop</button>
+            </div>
+            <div class="control-group">
+                <label>Phase:</label>
+                <select id="phase-select">
+                    <option value="setup">Setup</option>
+                    <option value="scouting">Scouting</option>
+                    <option value="simultaneous_attack">Simultaneous Attack</option>
+                    <option value="team_return">Team Return</option>
+                    <option value="defend">Defend</option>
+                    <option value="instant_win_attempt">Instant Win</option>
+                    <option value="game_over">Game Over</option>
+                </select>
+                <button class="btn" onclick="setPhase()">Set</button>
+            </div>
+            <div class="control-group">
+                <label>Fleet:</label>
+                <button class="btn btn-green" onclick="sendCmd({cmd:'takeoff_all'})">Takeoff All</button>
+                <button class="btn btn-orange" onclick="sendCmd({cmd:'land_all'})">Land All</button>
+                <button class="btn btn-red" onclick="sendCmd({cmd:'emergency_all'})">EMERGENCY ALL</button>
+            </div>
+        </section>
+
+        <div id="main-grid">
+            <!-- Arena Map -->
+            <section id="arena-section">
+                <h2>Arena Map</h2>
+                <div id="arena-container">
+                    <canvas id="arena-canvas" width="800" height="400"></canvas>
+                </div>
+            </section>
+
+            <!-- Drone Cards -->
+            <section id="drones-section">
+                <h2>Drones</h2>
+                <div id="drone-cards"></div>
+            </section>
+        </div>
+
+        <!-- Target Boxes -->
+        <section id="targets-section">
+            <h2>Target Boxes</h2>
+            <div id="target-list"></div>
+            <div class="add-target-form">
+                <input id="new-target-id" placeholder="Box ID (e.g. 30)" />
+                <input id="new-target-x" type="number" placeholder="X" step="0.1" value="10" />
+                <input id="new-target-y" type="number" placeholder="Y" step="0.1" value="5" />
+                <select id="new-target-owner">
+                    <option value="red">Red</option>
+                    <option value="blue">Blue</option>
+                </select>
+                <button class="btn" onclick="addTarget()">Add Target</button>
+            </div>
+        </section>
+
+        <!-- Configuration Panel -->
+        <section id="config-section">
+            <h2>Configuration</h2>
+            <div class="config-grid">
+                <div class="config-group">
+                    <h3>Team</h3>
+                    <select id="team-select" onchange="setTeam(this.value)">
+                        <option value="blue">Blue</option>
+                        <option value="red">Red</option>
+                    </select>
+                </div>
+                <div class="config-group">
+                    <h3>Arena</h3>
+                    <label>Width: <input id="cfg-width" type="number" value="20" step="1" /> m</label>
+                    <label>Height: <input id="cfg-height" type="number" value="10" step="1" /> m</label>
+                </div>
+                <div class="config-group">
+                    <h3>Drone Fleet</h3>
+                    <div id="drone-config-list"></div>
+                    <button class="btn" onclick="addDroneConfig()">+ Add Drone</button>
+                    <button class="btn btn-green" onclick="saveDroneConfig()">Save Fleet Config</button>
+                </div>
+            </div>
+        </section>
+
+        <!-- Captures Log -->
+        <section id="log-section">
+            <h2>Captures Log</h2>
+            <div id="captures-log"></div>
+        </section>
+    </main>
+
+    <script src="/static/app.js"></script>
+</body>
+</html>
