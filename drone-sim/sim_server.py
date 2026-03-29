@@ -257,15 +257,19 @@ class ApiHandler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         if self.path == "/":
+            print(f"[API] GET /  -> health check")
             return self._send_json(HTTPStatus.OK, {"ok": True, "service": "tello_pi_api_server_sim"})
         if self.path == "/api/telemetry":
+            print(f"[API] GET /api/telemetry")
             return self._send_json(HTTPStatus.OK, self.simulator.telemetry())
+        print(f"[API] GET {self.path}  -> 404 not_found")
         return self._send_json(HTTPStatus.NOT_FOUND, {"ok": False, "error": "not_found"})
 
     def do_POST(self):
         try:
             data = self._read_json()
         except Exception:
+            print(f"[API] POST {self.path}  -> 400 invalid_json")
             return self._send_json(HTTPStatus.BAD_REQUEST, {"ok": False, "error": "invalid_json"})
 
         sim = self.simulator
@@ -278,6 +282,7 @@ class ApiHandler(BaseHTTPRequestHandler):
             if p == "/api/key_down":
                 key = str(data.get("key", "")).strip().lower()
                 if not key:
+                    print(f"[API] POST /api/key_down  -> 400 missing_key")
                     return self._send_json(HTTPStatus.BAD_REQUEST, {"ok": False, "error": "missing_key"})
                 st.key_down[key] = now
                 if key == "t":
@@ -289,24 +294,29 @@ class ApiHandler(BaseHTTPRequestHandler):
                     st.z = -3.0
                 elif key in ("x", "space"):
                     st.rc_override = RcOverride()
+                print(f"[API] POST /api/key_down  key={key!r}  flying={st.flying}")
                 return self._send_json(HTTPStatus.OK, {"ok": True, "key": key})
 
             if p == "/api/key_up":
                 key = str(data.get("key", "")).strip().lower()
                 if not key:
+                    print(f"[API] POST /api/key_up  -> 400 missing_key")
                     return self._send_json(HTTPStatus.BAD_REQUEST, {"ok": False, "error": "missing_key"})
                 st.key_down.pop(key, None)
+                print(f"[API] POST /api/key_up  key={key!r}")
                 return self._send_json(HTTPStatus.OK, {"ok": True, "key": key})
 
             if p == "/api/takeoff":
                 st.flying = True
                 if st.z < TAKEOFF_Z:
                     st.z = TAKEOFF_Z
+                print(f"[API] POST /api/takeoff  z={st.z:.2f}")
                 return self._send_json(HTTPStatus.OK, {"ok": True, "flying": True})
 
             if p == "/api/land":
                 st.flying = False
                 st.z = -3.0
+                print(f"[API] POST /api/land")
                 return self._send_json(HTTPStatus.OK, {"ok": True, "flying": False})
 
             if p == "/api/rc":
@@ -326,6 +336,7 @@ class ApiHandler(BaseHTTPRequestHandler):
                 duration_ms = clamp_i(duration_ms, 50, 2000)
 
                 st.rc_override = RcOverride(lr=lr, fb=fb, ud=ud, yaw=yaw, until_ts=now + duration_ms / 1000.0)
+                print(f"[API] POST /api/rc  lr={lr} fb={fb} ud={ud} yaw={yaw} duration_ms={duration_ms}")
                 return self._send_json(HTTPStatus.OK, {
                     "ok": True,
                     "rc": {"lr": lr, "fb": fb, "ud": ud, "yaw": yaw},
@@ -336,21 +347,27 @@ class ApiHandler(BaseHTTPRequestHandler):
                 st.rc_override = RcOverride()
                 st.key_down.clear()
                 st.connected = True
+                print(f"[API] POST /api/recover")
                 return self._send_json(HTTPStatus.OK, {"ok": True, "message": "recovered"})
 
             if p == "/api/flip":
                 d = str(data.get("dir", "")).strip().lower()
                 if d not in {"l", "r", "f", "b"}:
+                    print(f"[API] POST /api/flip  -> 400 invalid_flip_dir  dir={d!r}")
                     return self._send_json(HTTPStatus.BAD_REQUEST, {"ok": False, "error": "invalid_flip_dir"})
                 if not st.flying:
+                    print(f"[API] POST /api/flip  -> 409 flip_requires_flying")
                     return self._send_json(HTTPStatus.CONFLICT, {"ok": False, "error": "flip_requires_flying"})
+                print(f"[API] POST /api/flip  dir={d!r}")
                 return self._send_json(HTTPStatus.OK, {"ok": True, "dir": d})
 
             # Optional compatibility stubs
             if p in {"/api/speed", "/api/move", "/api/rotate", "/api/go", "/api/curve", "/api/stream", "/api/sdk",
                      "/api/emergency"}:
+                print(f"[API] POST {p}  -> simulated stub  data={data}")
                 return self._send_json(HTTPStatus.OK, {"ok": True, "simulated": True, "path": p})
 
+        print(f"[API] POST {p}  -> 404 not_found")
         return self._send_json(HTTPStatus.NOT_FOUND, {"ok": False, "error": "not_found"})
 
     def log_message(self, fmt, *args):
