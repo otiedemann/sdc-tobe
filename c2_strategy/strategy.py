@@ -14,6 +14,7 @@ Strategy priorities (from the v4.0 regulations):
 
 import asyncio
 import logging
+import math
 import time
 from typing import Optional
 
@@ -43,6 +44,13 @@ class StrategyEngine:
 
     TICK_INTERVAL = 0.25  # seconds between strategy ticks
 
+    # RC speed constants (−100 to 100 range)
+    RC_SPEED = 40          # forward/lateral speed for navigation
+    RC_YAW_SCAN = 35       # yaw speed during scanning rotation
+    RC_YAW_NAV = 0         # yaw during straight-line navigation
+    SCAN_DURATION = 6.0    # seconds for a full scan rotation
+    ARRIVAL_THRESHOLD = 0.8  # meters — "close enough" to waypoint
+
     def __init__(
         self,
         config: ArenaConfig,
@@ -66,6 +74,11 @@ class StrategyEngine:
         self.hover_altitude_m = 1.5
         self.attack_speed = 50
         self.return_speed = 60
+
+        # Per-drone scout state
+        self._scout_waypoints: dict[str, list[Vec2]] = {}
+        self._scout_wp_index: dict[str, int] = {}
+        self._scan_start: dict[str, float] = {}  # when current scan started
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -196,16 +209,31 @@ class StrategyEngine:
     # ------------------------------------------------------------------
 
     async def _phase_setup(self) -> None:
-        """Initialize drones. Transition to SCOUTING when all connected."""
-        all_connected = all(
-            ds.connected for ds in self.state.drones.values()
-        )
-        if all_connected and len(self.state.drones) > 0:
-            log.info("All drones connected → transitioning to SCOUTING")
+        """
+        Initialize drones. Transition to SCOUTING when all connected.
+        If drones are already flying (manual takeoff), go straight to scouting.
+        """
+        connected = [ds for ds in self.state.drones.values() if ds.connected]
+        flying = [ds for ds in self.state.drones.values() if ds.flying]
+
+        if not connected:
+            return
+
+        # If any drones are already flying, transition immediately
+        if flying:
+            log.info(f"{len(flying)} drones flying → transitioning to SCOUTING")
+            self.state.phase = GamePhase.SCOUTING
+            self.state.start_time = time.monotonic()
+            for ds in self.state.drones.values():
+                ds.role = DroneRole.SCOUT
+            return
+
+        # All connected but none flying — take off
+        if len(connected) == len(self.state.drones):
+            log.info("All drones connected → taking off and transitioning to SCOUTING")
             self.state.phase = GamePhase.SCOUTING
             self.state.start_time = time.monotonic()
 
-            # Take off all drones
             for drone_id, ds in self.state.drones.items():
                 if not ds.flying:
                     await self.fleet.takeoff(drone_id)
@@ -216,9 +244,40 @@ class StrategyEngine:
     # Phase: SCOUTING — discover target boxes
     # ------------------------------------------------------------------
 
+    def _generate_scout_waypoints(self, drone_id: str, idx: int, total: int) -> list[Vec2]:
+        """
+        Generate a patrol route for one scout drone.
+        Drones spread across the arena in lanes, visiting the enemy zone
+        and then sweeping back through the middle.
+        """
+        w = self.config.width_m
+        h = self.config.height_m
+        enemy = self.config.enemy_zone()
+        home = self.config.home_zone()
+
+        # Divide arena into horizontal lanes per drone
+        lane_y = h * (idx + 1) / (total + 1)
+        lane_y = max(1.5, min(lane_y, h - 1.5))
+
+        # Build waypoint loop: home-side center → enemy zone → sweep → back
+        mid_x = w / 2
+        enemy_cx = (enemy[0] + enemy[2]) / 2
+        home_cx = (home[0] + home[2]) / 2
+
+        waypoints = [
+            Vec2(x=mid_x, y=lane_y),             # center of arena
+            Vec2(x=enemy_cx - 2, y=lane_y),       # approach enemy zone
+            Vec2(x=enemy_cx + 2, y=lane_y),       # deep into enemy zone
+            Vec2(x=enemy_cx, y=h - lane_y),        # sweep to other side
+            Vec2(x=mid_x, y=h - lane_y),           # back through center
+            Vec2(x=home_cx + 2, y=lane_y),         # near home
+        ]
+        return waypoints
+
     async def _phase_scouting(self) -> None:
         """
         Fly drones around to discover target boxes.
+        Each drone follows a patrol route, scanning (rotating) at each waypoint.
         Once enough targets found, transition to attack.
         """
         discovered = [
@@ -226,8 +285,11 @@ class StrategyEngine:
         ]
 
         # If we have targets and enough drones, plan simultaneous attack
-        num_drones = len([d for d in self.state.drones.values() if d.flying])
-        if len(discovered) >= min(num_drones, 2):
+        flying_drones = [d for d in self.state.drones.values() if d.flying]
+        if len(discovered) >= min(len(flying_drones), 2):
+            # Stop all drones before transitioning
+            for did in self.state.drones:
+                await self._rc_stop(did)
             log.info(
                 f"Found {len(discovered)} targets, planning simultaneous attack"
             )
@@ -235,20 +297,58 @@ class StrategyEngine:
             self.state.phase = GamePhase.SIMULTANEOUS_ATTACK
             return
 
-        # Otherwise assign scout patrol routes
-        for drone_id, ds in self.state.drones.items():
-            if ds.role == DroneRole.SCOUT and ds.phase != DronePhase.FLYING_TO_TARGET:
-                # Simple patrol: fly to enemy zone to scan for boxes
-                enemy = self.config.enemy_zone()
-                cx = (enemy[0] + enemy[2]) / 2
-                cy = (enemy[1] + enemy[3]) / 2
-                # Spread drones across enemy zone
-                idx = list(self.state.drones.keys()).index(drone_id)
-                spread_y = enemy[1] + 2.0 + idx * 2.0
-                spread_y = min(spread_y, enemy[3] - 1.0)
+        # Initialize scout waypoints if needed
+        drone_ids = list(self.state.drones.keys())
+        total = len(drone_ids)
+        for i, drone_id in enumerate(drone_ids):
+            if drone_id not in self._scout_waypoints:
+                self._scout_waypoints[drone_id] = self._generate_scout_waypoints(drone_id, i, total)
+                self._scout_wp_index[drone_id] = 0
 
+        # Drive each scout drone
+        now = time.monotonic()
+        for drone_id, ds in self.state.drones.items():
+            if not ds.flying or not ds.connected:
+                continue
+            ds.role = DroneRole.SCOUT
+
+            waypoints = self._scout_waypoints.get(drone_id, [])
+            if not waypoints:
+                continue
+            wp_idx = self._scout_wp_index.get(drone_id, 0)
+            target = waypoints[wp_idx % len(waypoints)]
+
+            if not ds.position:
+                # No position yet — spin in place to scan for ArUco markers
+                ds.phase = DronePhase.ORBIT_PATROL
+                await self._rc_scan(drone_id)
+                continue
+
+            dist = ds.position.distance_to(target)
+
+            if dist <= self.ARRIVAL_THRESHOLD:
+                # Arrived at waypoint — do a scan rotation
+                if drone_id not in self._scan_start:
+                    self._scan_start[drone_id] = now
+                    ds.phase = DronePhase.ORBIT_PATROL
+                    log.info(f"{drone_id} arrived at waypoint {wp_idx}, scanning...")
+
+                scan_elapsed = now - self._scan_start[drone_id]
+                if scan_elapsed < self.SCAN_DURATION:
+                    # Still scanning — rotate in place
+                    await self._rc_scan(drone_id)
+                else:
+                    # Scan complete — advance to next waypoint
+                    self._scan_start.pop(drone_id, None)
+                    self._scout_wp_index[drone_id] = (wp_idx + 1) % len(waypoints)
+                    next_wp = waypoints[self._scout_wp_index[drone_id]]
+                    ds.phase = DronePhase.FLYING_TO_TARGET
+                    ds.assigned_target = f"wp{self._scout_wp_index[drone_id]}"
+                    log.info(f"{drone_id} → next waypoint ({next_wp.x:.1f}, {next_wp.y:.1f})")
+            else:
+                # Navigate toward waypoint using continuous rc
                 ds.phase = DronePhase.FLYING_TO_TARGET
-                await self._fly_to(drone_id, Vec2(x=cx, y=spread_y))
+                await self._rc_navigate(drone_id, target)
 
     # ------------------------------------------------------------------
     # Phase: SIMULTANEOUS_ATTACK — coordinate multi-drone capture
@@ -256,7 +356,7 @@ class StrategyEngine:
 
     async def _phase_simultaneous_attack(self) -> None:
         """
-        Fly assigned drones to their target boxes.
+        Fly assigned drones to their target boxes using continuous rc.
         Wait until all are hovering, then start capture timers simultaneously.
         """
         attackers = {
@@ -265,7 +365,6 @@ class StrategyEngine:
         }
 
         if not attackers:
-            # No attackers assigned, go back to scouting
             self.state.phase = GamePhase.SCOUTING
             return
 
@@ -279,11 +378,12 @@ class StrategyEngine:
             dist = ds.position.distance_to(target.position)
             if dist > self.config.approach_tolerance_m:
                 all_in_position = False
-                if ds.phase != DronePhase.FLYING_TO_TARGET:
-                    ds.phase = DronePhase.FLYING_TO_TARGET
-                    await self._fly_to(drone_id, target.position)
+                ds.phase = DronePhase.FLYING_TO_TARGET
+                # Continuously navigate toward target every tick
+                await self._rc_navigate(drone_id, target.position)
             else:
                 ds.phase = DronePhase.HOVERING_ON_TARGET
+                await self._rc_stop(drone_id)
 
         # If all attackers are hovering, start capture timers
         if all_in_position and len(attackers) > 0:
@@ -324,13 +424,12 @@ class StrategyEngine:
 
             if self.config.is_in_home_zone(ds.position):
                 ds.phase = DronePhase.IN_HOME_ZONE
+                await self._rc_stop(drone_id)
             else:
                 all_home = False
-                if ds.phase != DronePhase.RETURNING_HOME:
-                    ds.phase = DronePhase.RETURNING_HOME
-                # Fly home
-                home_pos = ds.home
-                await self._fly_to(drone_id, home_pos)
+                ds.phase = DronePhase.RETURNING_HOME
+                # Continuously navigate home every tick
+                await self._rc_navigate(drone_id, ds.home)
 
         self.state.all_in_home = all_home
 
@@ -370,16 +469,16 @@ class StrategyEngine:
 
         for drone_id, ds in self.state.drones.items():
             if ds.role == DroneRole.DEFENDER and ds.position:
-                # Find nearest captured box to patrol
                 if captured:
                     nearest = min(captured, key=lambda b: ds.position.distance_to(b.position))
                     if ds.position.distance_to(nearest.position) > 2.0:
-                        await self._fly_to(drone_id, nearest.position)
+                        ds.phase = DronePhase.FLYING_TO_TARGET
+                        await self._rc_navigate(drone_id, nearest.position)
                     else:
-                        # Orbit: gentle yaw rotation while hovering
+                        # Orbit: gentle yaw + lateral movement
                         ds.phase = DronePhase.ORBIT_PATROL
                         await self.fleet.command_drone(
-                            drone_id, "rc", lr=15, fb=0, ud=0, yaw=30
+                            drone_id, "rc", lr=15, fb=10, ud=0, yaw=30
                         )
 
     # ------------------------------------------------------------------
@@ -396,10 +495,8 @@ class StrategyEngine:
         ]
 
         if not uncaptured:
-            # All captured! Just wait for timer
             return
 
-        # Assign all available drones to remaining targets
         available = [
             (did, ds) for did, ds in self.state.drones.items()
             if ds.flying and ds.connected
@@ -409,14 +506,16 @@ class StrategyEngine:
             target = uncaptured[i % len(uncaptured)]
             ds.assigned_target = target.box_id
             ds.role = DroneRole.ATTACKER
-            ds.phase = DronePhase.FLYING_TO_TARGET
-            await self._fly_to(drone_id, target.position)
 
-            # Check if in position → start capture
             if ds.position and target.position:
-                if ds.position.distance_to(target.position) <= self.config.approach_tolerance_m:
+                dist = ds.position.distance_to(target.position)
+                if dist <= self.config.approach_tolerance_m:
                     ds.phase = DronePhase.HOVERING_ON_TARGET
+                    await self._rc_stop(drone_id)
                     self.scorer.start_capture(target.box_id, drone_id)
+                else:
+                    ds.phase = DronePhase.FLYING_TO_TARGET
+                    await self._rc_navigate(drone_id, target.position)
 
     # ------------------------------------------------------------------
     # Target assignment
@@ -476,32 +575,67 @@ class StrategyEngine:
                 ds.phase = DronePhase.ORBIT_PATROL
 
     # ------------------------------------------------------------------
-    # Movement helpers
+    # Movement helpers (continuous RC-based)
     # ------------------------------------------------------------------
 
-    async def _fly_to(self, drone_id: str, target: Vec2) -> None:
-        """Command a drone to fly to a 2D position."""
+    async def _rc_navigate(self, drone_id: str, target: Vec2) -> None:
+        """
+        Send rc command to fly toward a 2D target position.
+        Computes heading from current position and converts to
+        forward/lateral rc values relative to the drone's heading.
+        """
         ds = self.state.drones.get(drone_id)
         if not ds or not ds.position:
             return
 
-        # Use move_to for sim/olympe (continuous position)
-        client = self.fleet.drones.get(drone_id)
-        if client and client.drone_type in ("simulator", "anafi"):
-            await self.fleet.command_drone(
-                drone_id, "move_to",
-                x=target.x, y=target.y, z=self.hover_altitude_m,
-            )
-        else:
-            # For Tello: compute relative movement
-            dx = target.x - ds.position.x
-            dy = target.y - ds.position.y
-            # Convert to go command (cm)
-            await self.fleet.command_drone(
-                drone_id, "go",
-                x=int(dx * 100), y=int(dy * 100), z=0,
-                speed=self.attack_speed,
-            )
+        dx = target.x - ds.position.x
+        dy = target.y - ds.position.y
+        dist = math.sqrt(dx * dx + dy * dy)
+        if dist < 0.1:
+            await self._rc_stop(drone_id)
+            return
+
+        # Target bearing in world frame (radians, 0 = +Y, CW positive)
+        target_angle = math.atan2(dx, dy)
+
+        # Drone heading in radians
+        heading_rad = ds.heading_deg * math.pi / 180
+
+        # Relative angle from drone heading to target
+        rel = target_angle - heading_rad
+        # Normalize to [-pi, pi]
+        rel = (rel + math.pi) % (2 * math.pi) - math.pi
+
+        # Decompose into forward/lateral
+        speed = self.RC_SPEED
+        fb = int(speed * math.cos(rel))   # forward/back
+        lr = int(speed * math.sin(rel))   # left/right
+
+        # Slow down when close
+        if dist < 2.0:
+            factor = max(0.3, dist / 2.0)
+            fb = int(fb * factor)
+            lr = int(lr * factor)
+
+        await self.fleet.command_drone(
+            drone_id, "rc", lr=lr, fb=fb, ud=0, yaw=0
+        )
+
+    async def _rc_scan(self, drone_id: str) -> None:
+        """Rotate in place to scan for ArUco markers."""
+        await self.fleet.command_drone(
+            drone_id, "rc", lr=0, fb=0, ud=0, yaw=self.RC_YAW_SCAN
+        )
+
+    async def _rc_stop(self, drone_id: str) -> None:
+        """Stop all movement."""
+        await self.fleet.command_drone(
+            drone_id, "rc", lr=0, fb=0, ud=0, yaw=0
+        )
+
+    async def _fly_to(self, drone_id: str, target: Vec2) -> None:
+        """Navigate to a target — dispatches to rc_navigate for continuous control."""
+        await self._rc_navigate(drone_id, target)
 
     # ------------------------------------------------------------------
     # Manual overrides
