@@ -1,2 +1,4 @@
 flask>=3.0
 flask-sock>=0.7
+opencv-python>=4.8
+numpy>=1.24

@@ -132,6 +132,11 @@
     </details>
 
     <div id="status"></div>
+    <div id="aruco-hud" style="margin-top:6px;padding:4px 8px;background:rgba(0,0,0,0.6);border-radius:4px;font-size:11px;color:#8be9fd;display:none;">
+      ArUco: <span id="aruco-markers">0</span> markers |
+      Ref: <span id="aruco-refs">-</span> |
+      Pos: <span id="aruco-pos">-</span>
+    </div>
     <div id="error" class="small" style="margin-top:6px;color:#ff9a9a;"></div>
     <div class="small">Using Three.js WebGL engine. Set exact SDC arena dimensions from the rulebook in X/Y/Z.</div>
   </div>
@@ -1275,6 +1280,10 @@ function connectApiWs() {
   apiWs.onmessage = (ev) => {
     let cmd;
     try { cmd = JSON.parse(ev.data); } catch { return; }
+    if (cmd.type === 'aruco_result') {
+      handleArucoResult(cmd);
+      return;
+    }
     handleApiCommand(cmd);
   };
 }
@@ -1458,6 +1467,114 @@ function sendApiTelemetry() {
   }));
 }
 
+// ---------------------------------------------------------------------------
+// ArUco virtual camera frame capture
+// Renders droneCam to an offscreen canvas, converts to JPEG, sends via WS
+// ---------------------------------------------------------------------------
+const ARUCO_FRAME_W = 320;
+const ARUCO_FRAME_H = 240;
+const ARUCO_FPS = 5;      // frames per second sent to server
+let arucoEnabled = true;
+let arucoLastSend = 0;
+let arucoMarkersDetected = 0;
+let arucoRefMarkers = [];
+let arucoArenaPos = null;
+
+// Offscreen renderer for ArUco frame capture
+let arucoRenderer = null;
+let arucoRenderTarget = null;
+let arucoPixelBuf = null;
+let arucoCanvas2d = null;
+
+function initArucoCapture() {
+  try {
+    arucoRenderer = new THREE.WebGLRenderer({ antialias: false, alpha: false });
+    arucoRenderer.setSize(ARUCO_FRAME_W, ARUCO_FRAME_H);
+    arucoRenderer.autoClear = true;
+    // Hidden, not added to DOM
+    arucoCanvas2d = document.createElement('canvas');
+    arucoCanvas2d.width = ARUCO_FRAME_W;
+    arucoCanvas2d.height = ARUCO_FRAME_H;
+    console.log('ArUco capture initialized:', ARUCO_FRAME_W, 'x', ARUCO_FRAME_H, '@', ARUCO_FPS, 'fps');
+  } catch (e) {
+    console.warn('ArUco capture init failed:', e);
+    arucoEnabled = false;
+  }
+}
+
+function captureAndSendFrame() {
+  if (!arucoEnabled || !apiWs || apiWs.readyState !== WebSocket.OPEN) return;
+  if (!arucoRenderer) return;
+
+  const now = performance.now() / 1000;
+  if (now - arucoLastSend < 1.0 / ARUCO_FPS) return;
+  arucoLastSend = now;
+
+  const d = getApiDrone() || drones[selected];
+  if (!d) return;
+
+  // Set up camera matching the offscreen size
+  const cam = droneCam.clone();
+  cam.aspect = ARUCO_FRAME_W / ARUCO_FRAME_H;
+  cam.updateProjectionMatrix();
+
+  // Update drone camera position
+  const forward = new THREE.Vector3(Math.sin(d.yaw), 0, Math.cos(d.yaw));
+  const eye = d.mesh.position.clone().add(new THREE.Vector3(0, 0.12, 0)).addScaledVector(forward, 0.14);
+  cam.position.copy(eye);
+  cam.up.set(0, 1, 0);
+  cam.lookAt(eye.clone().addScaledVector(forward, 6.0).add(new THREE.Vector3(0, 0.05, 0)));
+
+  // Render to offscreen
+  arucoRenderer.render(scene, cam);
+
+  // Read pixels from WebGL canvas → 2D canvas → JPEG
+  const ctx = arucoCanvas2d.getContext('2d');
+  ctx.drawImage(arucoRenderer.domElement, 0, 0);
+
+  // Convert to JPEG blob and send as base64
+  arucoCanvas2d.toBlob(function(blob) {
+    if (!blob || !apiWs || apiWs.readyState !== WebSocket.OPEN) return;
+    const reader = new FileReader();
+    reader.onload = function() {
+      const b64 = reader.result.split(',')[1]; // strip data:image/jpeg;base64,
+      apiWs.send(JSON.stringify({
+        type: 'camera_frame',
+        frame: b64,
+        drone_id: d.id,
+        width: ARUCO_FRAME_W,
+        height: ARUCO_FRAME_H,
+      }));
+    };
+    reader.readAsDataURL(blob);
+  }, 'image/jpeg', 0.85);
+}
+
+// Handle ArUco results from server
+function handleArucoResult(data) {
+  arucoMarkersDetected = data.markers_detected || 0;
+  arucoRefMarkers = data.ref_markers || [];
+  arucoArenaPos = data.arena || null;
+
+  // Update HUD
+  const hud = document.getElementById('aruco-hud');
+  if (hud) {
+    hud.style.display = 'block';
+    document.getElementById('aruco-markers').textContent = arucoMarkersDetected;
+    document.getElementById('aruco-refs').textContent = arucoRefMarkers.length > 0 ? arucoRefMarkers.join(', ') : '-';
+    if (arucoArenaPos) {
+      document.getElementById('aruco-pos').textContent =
+        `(${arucoArenaPos.aruco_x.toFixed(1)}, ${arucoArenaPos.aruco_y.toFixed(1)}, ${arucoArenaPos.aruco_z.toFixed(1)})`;
+      hud.style.color = '#50fa7b';
+    } else {
+      document.getElementById('aruco-pos').textContent = 'no fix';
+      hud.style.color = '#ff5555';
+    }
+  }
+}
+
+initArucoCapture();
+
 // Start WebSocket connection and telemetry reporting
 connectApiWs();
 apiTelemetryInterval = setInterval(sendApiTelemetry, 200);
@@ -1571,6 +1688,15 @@ function animate(now){
     renderer.setViewport(x, y, insetW, insetH);
     renderer.setScissor(x, y, insetW, insetH);
     renderer.render(scene, droneCam);
+  }
+
+  // Capture drone camera frame for ArUco processing
+  captureAndSendFrame();
+
+  // Draw ArUco debug overlay on main canvas
+  if (arucoMarkersDetected > 0 && panel !== 'settings') {
+    const ctx2 = renderer.domElement.getContext && null; // WebGL, use overlay instead
+    // We'll draw the info in the HUD section below
   }
 
   requestAnimationFrame(animate);
