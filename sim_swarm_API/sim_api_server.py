@@ -7,6 +7,7 @@ via WebSocket.  The remote-controller web UI (or any client) calls the same REST
 whichever browser tab is running the sim_swarm_API 3D viewer.
 """
 
+import base64
 import json
 import logging
 import os
@@ -55,6 +56,26 @@ pressed_lock = threading.Lock()
 
 safe_takeoff_enabled = SAFE_TAKEOFF_DEFAULT
 command_log_lock = threading.Lock()
+
+# ArUco processor for virtual camera frames
+_aruco_processor = None
+_aruco_lock = threading.Lock()
+_aruco_result: Dict = {}   # latest ArUco result per drone
+_aruco_enabled = True       # can be toggled
+
+def _get_aruco_processor():
+    global _aruco_processor
+    if _aruco_processor is None:
+        try:
+            from sim_aruco_processor import SimArucoProcessor
+            _aruco_processor = SimArucoProcessor(
+                frame_width=320, frame_height=240, fov_deg=75.0,
+            )
+            log.info("ArUco processor initialized")
+        except ImportError as e:
+            log.warning(f"ArUco processor not available (missing opencv?): {e}")
+            _aruco_processor = False  # sentinel: don't retry
+    return _aruco_processor if _aruco_processor is not False else None
 
 # Telemetry received from the browser sim via WebSocket
 telemetry: Dict = {
@@ -220,13 +241,51 @@ def ws_sim(ws):
             except (json.JSONDecodeError, TypeError):
                 continue
 
-            if data.get("type") == "telemetry":
+            msg_type = data.get("type")
+
+            if msg_type == "telemetry":
                 with telemetry_lock:
                     for k in telemetry:
                         if k in data:
                             telemetry[k] = data[k]
                     telemetry["connected"] = True
                     telemetry["updated_at"] = time.time()
+                    # Merge ArUco position if available
+                    with _aruco_lock:
+                        if _aruco_result:
+                            for k, v in _aruco_result.items():
+                                telemetry[k] = v
+
+            elif msg_type == "camera_frame":
+                # Virtual camera frame for ArUco processing
+                if _aruco_enabled:
+                    proc = _get_aruco_processor()
+                    if proc:
+                        frame_b64 = data.get("frame")
+                        drone = data.get("drone_id", "unknown")
+                        if frame_b64:
+                            try:
+                                jpeg_bytes = base64.b64decode(frame_b64)
+                                result = proc.process_frame(jpeg_bytes, drone)
+                                arena_pos = proc.get_arena_position(result)
+                                if arena_pos:
+                                    with _aruco_lock:
+                                        _aruco_result.update(arena_pos)
+                                # Send result back to browser for debug overlay
+                                try:
+                                    ws.send(json.dumps({
+                                        "type": "aruco_result",
+                                        "markers_detected": result.get("markers_detected", 0),
+                                        "ref_markers": result.get("ref_markers", []),
+                                        "position": result.get("cam"),
+                                        "arena": arena_pos,
+                                    }))
+                                except Exception:
+                                    pass
+                                # Also send as UDP (pi_position format) for C2 locator
+                                proc.send_udp(result)
+                            except Exception as e:
+                                log.debug(f"ArUco frame error: {e}")
     except Exception:
         pass
     finally:
@@ -561,6 +620,32 @@ def api_settings_post():
     data = request.get_json(silent=True) or {}
     enqueue_cmd({"type": "settings", **data})
     return jsonify(ok=True)
+
+
+# ArUco processing endpoints
+@app.get("/api/aruco")
+def api_aruco_status():
+    """Get ArUco processing status and latest result."""
+    with _aruco_lock:
+        result = dict(_aruco_result)
+    proc = _get_aruco_processor()
+    return jsonify(
+        ok=True,
+        enabled=_aruco_enabled,
+        available=proc is not None,
+        position=result,
+        ref_markers=proc.last_ref_markers if proc else [],
+        markers_detected=result.get("aruco_markers_detected", 0),
+    )
+
+
+@app.post("/api/aruco/toggle")
+def api_aruco_toggle():
+    """Enable/disable ArUco processing."""
+    global _aruco_enabled
+    data = request.get_json(silent=True) or {}
+    _aruco_enabled = data.get("enabled", not _aruco_enabled)
+    return jsonify(ok=True, enabled=_aruco_enabled)
 
 
 # ---------------------------------------------------------------------------
