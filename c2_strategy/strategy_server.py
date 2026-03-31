@@ -418,11 +418,14 @@ async def add_target(data: dict):
 
 def _get_sim_base_url() -> str:
     """Get the sim API base URL from the first drone config."""
-    cfg = load_arena_config()
-    if cfg.drone_configs:
-        base = cfg.drone_configs[0].get("api_base_url", "http://localhost:8080")
-        if base:
-            return base.rstrip("/")
+    try:
+        cfg = load_arena_config()
+        if cfg.drone_configs:
+            base = cfg.drone_configs[0].api_base_url
+            if base:
+                return base.rstrip("/")
+    except Exception:
+        pass
     return "http://localhost:8080"
 
 
