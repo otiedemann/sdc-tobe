@@ -171,16 +171,45 @@ class StrategyEngine:
                 raw_heading = telem.get("yaw", telem.get("heading", ds.heading_deg))
                 ds.heading_deg = raw_heading % 360  # normalize to [0, 360)
 
-                # Position from telemetry (sim mode gives x/y directly)
-                tx = telem.get("x")
-                ty = telem.get("y")
-                if tx is not None and ty is not None:
-                    ds.position = Vec2(x=float(tx), y=float(ty))
-                    # Also feed into locator for unified view
+                # Position from telemetry — check multiple sources:
+                # 1. ArUco position (arena coords, highest priority)
+                ax = telem.get("aruco_x")
+                ay = telem.get("aruco_y")
+                if ax is not None and ay is not None:
+                    ds.position = Vec2(x=float(ax), y=float(ay))
+                    az = telem.get("aruco_z")
+                    if az is not None:
+                        ds.altitude_m = float(az)
                     self.locator.update_drone_position_from_telemetry(
-                        drone_id, float(tx), float(ty),
-                        float(telem.get("z", telem.get("h", 0)))
+                        drone_id, float(ax), float(ay),
+                        float(az) if az is not None else 0.0,
                     )
+                else:
+                    # 2. Sim position (Three.js world → arena coords)
+                    px = telem.get("pos_x")
+                    pz = telem.get("pos_z")
+                    if px is not None and pz is not None:
+                        # Convert: arena_x = world_x + 10, arena_y = world_z + 5
+                        arena_x = float(px) + 10.0
+                        arena_y = float(pz) + 5.0
+                        ds.position = Vec2(x=arena_x, y=arena_y)
+                        py = telem.get("pos_y")
+                        if py is not None:
+                            ds.altitude_m = float(py)
+                        self.locator.update_drone_position_from_telemetry(
+                            drone_id, arena_x, arena_y,
+                            float(py) if py is not None else 0.0,
+                        )
+                    else:
+                        # 3. Legacy x/y keys
+                        tx = telem.get("x")
+                        ty = telem.get("y")
+                        if tx is not None and ty is not None:
+                            ds.position = Vec2(x=float(tx), y=float(ty))
+                            self.locator.update_drone_position_from_telemetry(
+                                drone_id, float(tx), float(ty),
+                                float(telem.get("z", telem.get("h", 0)))
+                            )
 
             # Try ArUco locator position (overwrites sim if available)
             aruco_pos = self.locator.get_drone_position(drone_id)
