@@ -658,6 +658,28 @@ def api_aruco_toggle():
     return jsonify(ok=True, enabled=_aruco_enabled)
 
 
+_placeholder_frame = None
+
+def _get_placeholder_frame():
+    """Generate a 320x240 placeholder frame showing 'Waiting for camera...'"""
+    global _placeholder_frame
+    if _placeholder_frame is not None:
+        return _placeholder_frame
+    try:
+        import cv2
+        import numpy as np
+        img = np.zeros((240, 320, 3), dtype=np.uint8)
+        cv2.putText(img, "Waiting for camera...", (40, 120),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (100, 100, 100), 1)
+        cv2.putText(img, "Drones must be flying in sim", (30, 160),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (80, 80, 80), 1)
+        _, jpeg = cv2.imencode('.jpg', img)
+        _placeholder_frame = jpeg.tobytes()
+    except Exception:
+        _placeholder_frame = b""
+    return _placeholder_frame
+
+
 @app.get("/api/aruco/frame")
 def api_aruco_frame():
     """Get the latest annotated camera frame as JPEG."""
@@ -668,7 +690,14 @@ def api_aruco_frame():
             mimetype="image/jpeg",
             headers={"Cache-Control": "no-cache, no-store"},
         )
-    # Return a 1x1 black pixel JPEG if no frame available
+    # Return placeholder when no frame available
+    placeholder = _get_placeholder_frame()
+    if placeholder:
+        return Response(
+            placeholder,
+            mimetype="image/jpeg",
+            headers={"Cache-Control": "no-cache, no-store"},
+        )
     return Response(b"", status=204)
 
 
