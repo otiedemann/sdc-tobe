@@ -1515,6 +1515,7 @@ let arucoLastSend = 0;
 let arucoMarkersDetected = 0;
 let arucoRefMarkers = [];
 let arucoArenaPos = null;
+let arucoDroneIndex = 0;  // rotate through drones for ArUco capture
 
 // Offscreen renderer for ArUco frame capture
 let arucoRenderer = null;
@@ -1546,8 +1547,14 @@ function captureAndSendFrame() {
   if (now - arucoLastSend < 1.0 / ARUCO_FPS) return;
   arucoLastSend = now;
 
-  const d = getApiDrone() || drones[selected];
-  if (!d) return;
+  // Rotate through all flying drones for ArUco capture
+  const flyingDrones = drones.filter(d => {
+    const st = apiDroneState[d.id];
+    return st && st.flying;
+  });
+  if (flyingDrones.length === 0) return;
+  arucoDroneIndex = (arucoDroneIndex + 1) % flyingDrones.length;
+  const d = flyingDrones[arucoDroneIndex];
 
   // Set up camera matching the offscreen size
   const cam = droneCam.clone();

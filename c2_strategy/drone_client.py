@@ -87,6 +87,9 @@ class DroneClient:
         return await self._post("/api/go", {"x": x, "y": y, "z": z, "speed": speed})
 
     async def get_telemetry(self) -> dict:
+        # Request per-drone telemetry using sim_drone_id (e.g. "B1")
+        if self.sim_drone_id:
+            return await self._get(f"/api/telemetry?drone_id={self.sim_drone_id}")
         return await self._get("/api/telemetry")
 
     async def recover(self) -> dict:
