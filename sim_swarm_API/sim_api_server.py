@@ -44,6 +44,16 @@ sock = Sock(app)
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("sim_api")
 
+
+@app.after_request
+def add_cors_headers(response):
+    """Allow cross-origin requests from the C2 dashboard."""
+    response.headers["Access-Control-Allow-Origin"] = "*"
+    response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
+    response.headers["Access-Control-Allow-Headers"] = "Content-Type"
+    return response
+
+
 # ---------------------------------------------------------------------------
 # Global state
 # ---------------------------------------------------------------------------
@@ -646,6 +656,49 @@ def api_aruco_toggle():
     data = request.get_json(silent=True) or {}
     _aruco_enabled = data.get("enabled", not _aruco_enabled)
     return jsonify(ok=True, enabled=_aruco_enabled)
+
+
+@app.get("/api/aruco/frame")
+def api_aruco_frame():
+    """Get the latest annotated camera frame as JPEG."""
+    proc = _get_aruco_processor()
+    if proc and proc.last_annotated_frame:
+        return Response(
+            proc.last_annotated_frame,
+            mimetype="image/jpeg",
+            headers={"Cache-Control": "no-cache, no-store"},
+        )
+    # Return a 1x1 black pixel JPEG if no frame available
+    return Response(b"", status=204)
+
+
+@app.get("/api/aruco/stream")
+def api_aruco_stream():
+    """MJPEG stream of annotated ArUco camera frames (for <img> tags)."""
+    def generate():
+        proc = _get_aruco_processor()
+        last_frame = None
+        while True:
+            if proc is None:
+                proc = _get_aruco_processor()
+            if proc and proc.last_annotated_frame and proc.last_annotated_frame is not last_frame:
+                last_frame = proc.last_annotated_frame
+                yield (
+                    b"--frame\r\n"
+                    b"Content-Type: image/jpeg\r\n\r\n"
+                    + last_frame
+                    + b"\r\n"
+                )
+            time.sleep(0.1)  # ~10fps max for MJPEG stream
+
+    return Response(
+        generate(),
+        mimetype="multipart/x-mixed-replace; boundary=frame",
+        headers={
+            "Cache-Control": "no-cache, no-store",
+            "Access-Control-Allow-Origin": "*",
+        },
+    )
 
 
 # ---------------------------------------------------------------------------

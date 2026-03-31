@@ -455,6 +455,7 @@ function applyCodeController(dt) {
       const vx = Number(c.vx || 0), vy = Number(c.vy || 0), vz = Number(c.vz || 0), yawRate = Number(c.yawRate || 0);
       appendDroneLog(`[${simTime.toFixed(2)}s] ${d.id} cmd vx=${vx.toFixed(2)} vy=${vy.toFixed(2)} vz=${vz.toFixed(2)} yawRate=${yawRate.toFixed(2)}`);
       d.yaw += yawRate * dt;
+      d.yaw = Math.atan2(Math.sin(d.yaw), Math.cos(d.yaw));
       const desired = new THREE.Vector3(vx, vy, vz);
       enforceReturnRule(d, desired, dt);
       const maxSpeed = Number(ui.speed.value) * 1.8;
@@ -985,6 +986,7 @@ function manualUpdate(d, dt) {
   const yawCmd = axis('KeyQ','KeyE');
 
   d.yaw += yawCmd * 1.6 * dt;
+  d.yaw = Math.atan2(Math.sin(d.yaw), Math.cos(d.yaw));
   const forward = new THREE.Vector3(Math.sin(d.yaw), 0, Math.cos(d.yaw));
   const right = new THREE.Vector3(Math.cos(d.yaw), 0, -Math.sin(d.yaw));
 
@@ -1251,9 +1253,21 @@ window.addEventListener('message', (ev) => {
 let apiWs = null;
 let apiWsConnected = false;
 let apiSelectedDroneId = null;   // drone id selected by the API (e.g. "B1")
-let apiFlying = false;
-let apiEngaged = false;  // true once the API sends a flight command (takeoff/land/rc)
-const apiRc = { roll: 0, pitch: 0, throttle: 0, yaw: 0 };
+let apiEngaged = false;  // true once the API sends a flight command
+
+// Per-drone API state (keyed by drone id, e.g. "B1")
+const apiDroneState = {};  // { "B1": { flying: false, rc: {roll,pitch,throttle,yaw} }, ... }
+
+function getApiDroneState(droneId) {
+  if (!apiDroneState[droneId]) {
+    apiDroneState[droneId] = {
+      flying: false,
+      rc: { roll: 0, pitch: 0, throttle: 0, yaw: 0 },
+    };
+  }
+  return apiDroneState[droneId];
+}
+
 const apiKeys = new Set();
 let apiTelemetryInterval = null;
 
@@ -1313,35 +1327,46 @@ function handleApiCommand(cmd) {
     return;
   }
   if (t === 'takeoff') {
-    apiFlying = true;
     apiEngaged = true;
     const d = getApiDrone();
     if (d) {
+      const st = getApiDroneState(d.id);
+      st.flying = true;
       d.vel.set(0, 0.8, 0);
       if (d.mesh.position.y < 0.5) d.mesh.position.y = 0.5;
     }
     return;
   }
   if (t === 'land') {
-    apiFlying = false;
     apiEngaged = true;
     const d = getApiDrone();
-    if (d) d.vel.set(0, -0.3, 0);
+    if (d) {
+      const st = getApiDroneState(d.id);
+      st.flying = false;
+      d.vel.set(0, -0.3, 0);
+    }
     return;
   }
   if (t === 'emergency') {
-    apiFlying = false;
     apiEngaged = true;
     const d = getApiDrone();
-    if (d) { d.vel.set(0, -2, 0); }
+    if (d) {
+      const st = getApiDroneState(d.id);
+      st.flying = false;
+      d.vel.set(0, -2, 0);
+    }
     return;
   }
   if (t === 'rc') {
     apiEngaged = true;
-    apiRc.roll = Number(cmd.roll || 0);
-    apiRc.pitch = Number(cmd.pitch || 0);
-    apiRc.throttle = Number(cmd.throttle || 0);
-    apiRc.yaw = Number(cmd.yaw || 0);
+    const d = getApiDrone();
+    if (d) {
+      const st = getApiDroneState(d.id);
+      st.rc.roll = Number(cmd.roll || 0);
+      st.rc.pitch = Number(cmd.pitch || 0);
+      st.rc.throttle = Number(cmd.throttle || 0);
+      st.rc.yaw = Number(cmd.yaw || 0);
+    }
     return;
   }
   if (t === 'move') {
@@ -1368,6 +1393,7 @@ function handleApiCommand(cmd) {
     const deg = Number(cmd.degrees || 90);
     const sign = cmd.direction === 'ccw' ? -1 : 1;
     d.yaw += sign * deg * Math.PI / 180;
+    d.yaw = Math.atan2(Math.sin(d.yaw), Math.cos(d.yaw));
     d.mesh.rotation.y = d.yaw;
     return;
   }
@@ -1389,13 +1415,16 @@ function handleApiCommand(cmd) {
     return;
   }
   if (t === 'recover') {
-    apiFlying = false;
+    const d = getApiDrone();
+    if (d) {
+      const st = getApiDroneState(d.id);
+      st.flying = false;
+      st.rc.roll = 0; st.rc.pitch = 0; st.rc.throttle = 0; st.rc.yaw = 0;
+      d.vel.set(0, 0, 0);
+    }
     apiEngaged = false;
-    apiRc.roll = 0; apiRc.pitch = 0; apiRc.throttle = 0; apiRc.yaw = 0;
     for (const code of apiKeys) keys.delete(code);
     apiKeys.clear();
-    const d = getApiDrone();
-    if (d) { d.vel.set(0, 0, 0); }
     return;
   }
   if (t === 'rth') {
@@ -1415,17 +1444,20 @@ function mapApiKeyToCode(key) {
   return map[(key || '').toLowerCase()] || null;
 }
 
-function applyApiRc(d, dt) {
+function applyApiRcForDrone(d, rc, dt) {
   // RC values are -100..100, scale to velocity
   const scale = Number(ui.speed.value) / 100;
   const fwd = new THREE.Vector3(Math.sin(d.yaw), 0, Math.cos(d.yaw));
   const right = new THREE.Vector3(Math.cos(d.yaw), 0, -Math.sin(d.yaw));
 
   const desired = new THREE.Vector3();
-  desired.addScaledVector(fwd, apiRc.pitch * scale);
-  desired.addScaledVector(right, apiRc.roll * scale);
-  desired.y = apiRc.throttle * scale;
-  d.yaw += (apiRc.yaw / 100) * 1.6 * dt;
+  desired.addScaledVector(fwd, rc.pitch * scale);
+  desired.addScaledVector(right, rc.roll * scale);
+  desired.y = rc.throttle * scale;
+  d.yaw += (rc.yaw / 100) * 1.6 * dt;
+
+  // Wrap yaw to [-PI, PI] (atan2 handles negative correctly, unlike JS %)
+  d.yaw = Math.atan2(Math.sin(d.yaw), Math.cos(d.yaw));
 
   d.vel.lerp(desired, 0.2);
   d.mesh.position.addScaledVector(d.vel, dt);
@@ -1435,36 +1467,39 @@ function applyApiRc(d, dt) {
 
 function sendApiTelemetry() {
   if (!apiWs || apiWs.readyState !== WebSocket.OPEN) return;
-  const d = getApiDrone();
-  if (!d) return;
-  const p = d.mesh.position;
-  const spd = Math.hypot(d.vel.x, d.vel.z) * 100; // m/s -> cm/s
-  apiWs.send(JSON.stringify({
-    type: 'telemetry',
-    battery: Math.round(d.battery),
-    temperature: 25,
-    height_cm: Math.round(p.y * 100),
-    tof_cm: Math.round(p.y * 100),
-    barometer_cm: Math.round(p.y * 100),
-    flight_time_s: Math.round(simTime),
-    pitch: Math.round((d.vel.z / Math.max(0.01, Math.hypot(d.vel.x, d.vel.z))) * 15),
-    roll: Math.round((d.vel.x / Math.max(0.01, Math.hypot(d.vel.x, d.vel.z))) * 15),
-    yaw: Math.round(d.yaw * 180 / Math.PI),
-    vgx: Math.round(d.vel.x * 100),
-    vgy: Math.round(d.vel.y * 100),
-    vgz: Math.round(d.vel.z * 100),
-    agx: 0, agy: 0, agz: 0,
-    speed: Math.round(spd),
-    wifi_snr: 99,
-    sdk_version: 'sim_swarm_API',
-    serial_number: 'SIM-' + d.id,
-    flying: apiFlying,
-    connected: true,
-    drone_id: d.id,
-    pos_x: Number(p.x.toFixed(3)),
-    pos_y: Number(p.y.toFixed(3)),
-    pos_z: Number(p.z.toFixed(3)),
-  }));
+  // Send telemetry for ALL drones that have API state
+  for (const d of drones) {
+    const st = apiDroneState[d.id];
+    if (!st) continue;  // no API state yet for this drone
+    const p = d.mesh.position;
+    const spd = Math.hypot(d.vel.x, d.vel.z) * 100; // m/s -> cm/s
+    apiWs.send(JSON.stringify({
+      type: 'telemetry',
+      battery: Math.round(d.battery),
+      temperature: 25,
+      height_cm: Math.round(p.y * 100),
+      tof_cm: Math.round(p.y * 100),
+      barometer_cm: Math.round(p.y * 100),
+      flight_time_s: Math.round(simTime),
+      pitch: Math.round((d.vel.z / Math.max(0.01, Math.hypot(d.vel.x, d.vel.z))) * 15),
+      roll: Math.round((d.vel.x / Math.max(0.01, Math.hypot(d.vel.x, d.vel.z))) * 15),
+      yaw: Math.round(((d.yaw * 180 / Math.PI) % 360 + 360) % 360),
+      vgx: Math.round(d.vel.x * 100),
+      vgy: Math.round(d.vel.y * 100),
+      vgz: Math.round(d.vel.z * 100),
+      agx: 0, agy: 0, agz: 0,
+      speed: Math.round(spd),
+      wifi_snr: 99,
+      sdk_version: 'sim_swarm_API',
+      serial_number: 'SIM-' + d.id,
+      flying: st.flying,
+      connected: true,
+      drone_id: d.id,
+      pos_x: Number(p.x.toFixed(3)),
+      pos_y: Number(p.y.toFixed(3)),
+      pos_z: Number(p.z.toFixed(3)),
+    }));
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -1586,28 +1621,34 @@ function animate(now){
   last = now;
   simTime += dt;
 
-  // If API has taken over (via takeoff/land/rc commands), apply API physics to the selected drone
+  // Apply API physics to ALL drones with per-drone state
   if (apiEngaged) {
-    const apiDrone = getApiDrone();
-    const hasApiRc = Math.abs(apiRc.roll) > 1 || Math.abs(apiRc.pitch) > 1 || Math.abs(apiRc.throttle) > 1 || Math.abs(apiRc.yaw) > 1;
-    if (apiDrone && hasApiRc && apiFlying) {
-      applyApiRc(apiDrone, dt);
-    } else if (apiDrone && apiFlying && !hasApiRc) {
-      // Hovering: maintain altitude
-      const hoverY = Math.max(0.8, apiDrone.mesh.position.y);
-      apiDrone.vel.y += (hoverY - apiDrone.mesh.position.y) * 2.0 * dt;
-      apiDrone.vel.x *= 0.95;
-      apiDrone.vel.z *= 0.95;
-      apiDrone.mesh.position.addScaledVector(apiDrone.vel, dt);
-      clampDrone(apiDrone);
-    } else if (apiDrone && !apiFlying) {
-      // Landing/grounded: descend to floor
-      if (apiDrone.mesh.position.y > 0.26) {
-        apiDrone.vel.set(0, -0.5, 0);
-        apiDrone.mesh.position.addScaledVector(apiDrone.vel, dt);
-        clampDrone(apiDrone);
-      } else {
-        apiDrone.vel.set(0, 0, 0);
+    for (const d of drones) {
+      const st = apiDroneState[d.id];
+      if (!st) continue;  // no API state for this drone
+
+      const rc = st.rc;
+      const hasRc = Math.abs(rc.roll) > 1 || Math.abs(rc.pitch) > 1 || Math.abs(rc.throttle) > 1 || Math.abs(rc.yaw) > 1;
+
+      if (st.flying && hasRc) {
+        applyApiRcForDrone(d, rc, dt);
+      } else if (st.flying && !hasRc) {
+        // Hovering: maintain altitude
+        const hoverY = Math.max(0.8, d.mesh.position.y);
+        d.vel.y += (hoverY - d.mesh.position.y) * 2.0 * dt;
+        d.vel.x *= 0.95;
+        d.vel.z *= 0.95;
+        d.mesh.position.addScaledVector(d.vel, dt);
+        clampDrone(d);
+      } else if (!st.flying) {
+        // Landing/grounded: descend to floor
+        if (d.mesh.position.y > 0.26) {
+          d.vel.set(0, -0.5, 0);
+          d.mesh.position.addScaledVector(d.vel, dt);
+          clampDrone(d);
+        } else {
+          d.vel.set(0, 0, 0);
+        }
       }
     }
   }

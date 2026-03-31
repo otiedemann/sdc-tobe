@@ -7,7 +7,7 @@ using solvePnP against known marker world positions.
 
 Uses the same solvePnP pipeline as aruco-position/aruco_positioning.py
 but with marker positions matching the sim's pillar layout.
-The sim uses DICT_ARUCO_ORIGINAL (5x5 classic) markers, not DICT_4X4_50.
+The sim uses DICT_4X4_100 markers, matching the real drone pipeline.
 
 Coordinate system (pi_position world coords):
   x: left/right (-10..10), y: height (0..6), z: forward/back (0..10)
@@ -33,7 +33,7 @@ log = logging.getLogger("sim_aruco")
 class SimArucoProcessor:
     """
     Processes virtual camera frames and detects ArUco markers.
-    Uses the exact same DICT_4X4_50 dictionary as the real pipeline.
+    Uses DICT_4X4_100 dictionary, matching the real drone pipeline.
     """
 
     # 0.5m x 0.5m marker corners (same as aruco_positioning.py)
@@ -71,8 +71,8 @@ class SimArucoProcessor:
         # No lens distortion in the virtual camera
         self.dist_coeffs = np.zeros(5, dtype=np.float64)
 
-        # ArUco detector — the sim SVGs use DICT_ARUCO_ORIGINAL (5x5 classic)
-        self.aruco_dict = aruco.getPredefinedDictionary(aruco.DICT_ARUCO_ORIGINAL)
+        # ArUco detector — sim SVGs use DICT_4X4_100, matching the real drone pipeline
+        self.aruco_dict = aruco.getPredefinedDictionary(aruco.DICT_4X4_100)
         self.aruco_params = aruco.DetectorParameters()
         self.detector = aruco.ArucoDetector(self.aruco_dict, self.aruco_params)
 
@@ -108,6 +108,7 @@ class SimArucoProcessor:
         self.last_ref_markers: list[int] = []
         self.last_targets: dict = {}
         self._last_process_time = 0.0
+        self.last_annotated_frame: Optional[bytes] = None  # JPEG bytes of annotated frame
 
         log.info(
             f"SimArucoProcessor ready: {frame_width}x{frame_height}, "
@@ -220,6 +221,8 @@ class SimArucoProcessor:
 
         if ids is None or len(ids) == 0:
             self._reset_filters()
+            # Annotate frame even when no markers found
+            self._annotate_and_store(frame, corners, ids, None, None, [], {})
             return {
                 "cam": None,
                 "dir": None,
@@ -264,11 +267,13 @@ class SimArucoProcessor:
                 tgt_poses[mid] = tvec
 
         if not ref_poses:
+            detected_ids = [int(ids[i][0]) for i in range(len(ids))]
+            self._annotate_and_store(frame, corners, ids, None, None, detected_ids, {})
             return {
                 "cam": None,
                 "dir": None,
                 "targets": {},
-                "ref_markers": [int(ids[i][0]) for i in range(len(ids))],
+                "ref_markers": detected_ids,
                 "markers_detected": len(ids),
             }
 
@@ -311,6 +316,13 @@ class SimArucoProcessor:
             "process_ms": round(elapsed * 1000, 1),
         }
 
+        # Generate annotated frame
+        arena_pos = self.get_arena_position(result)
+        self._annotate_and_store(
+            frame, corners, ids, filt_pos, arena_pos,
+            self.last_ref_markers, targets,
+        )
+
         return result
 
     def send_udp(self, result: dict, stale: bool = False) -> None:
@@ -345,6 +357,83 @@ class SimArucoProcessor:
             "aruco_ref_markers": result.get("ref_markers", []),
             "aruco_markers_detected": result.get("markers_detected", 0),
         }
+
+    def _annotate_and_store(
+        self,
+        frame: np.ndarray,
+        corners,
+        ids,
+        cam_pos: Optional[np.ndarray],
+        arena_pos: Optional[dict],
+        ref_markers: list,
+        targets: dict,
+    ) -> None:
+        """Draw ArUco detection overlay on frame and store as JPEG."""
+        try:
+            annotated = frame.copy()
+
+            # Draw detected markers
+            if ids is not None and len(ids) > 0:
+                aruco.drawDetectedMarkers(annotated, corners, ids)
+
+                # Label each marker with its ID and ref/target status
+                for i, corner in enumerate(corners):
+                    mid = int(ids[i][0])
+                    pts = corner.reshape(4, 2)
+                    cx = int(pts[:, 0].mean())
+                    cy = int(pts[:, 1].mean())
+
+                    if mid in self.marker_positions:
+                        color = (0, 255, 0)  # Green for reference
+                        label = f"REF #{mid}"
+                    elif mid >= 30:
+                        color = (0, 165, 255)  # Orange for target
+                        label = f"TGT #{mid}"
+                    else:
+                        color = (255, 255, 0)  # Cyan for unknown
+                        label = f"#{mid}"
+
+                    cv2.putText(annotated, label, (cx - 30, cy - 10),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1)
+
+            # Status bar at top
+            h, w = annotated.shape[:2]
+            cv2.rectangle(annotated, (0, 0), (w, 24), (0, 0, 0), -1)
+
+            n_markers = len(ids) if ids is not None else 0
+            n_ref = len(ref_markers)
+
+            if cam_pos is not None and arena_pos:
+                # Green status — position fix
+                status = (
+                    f"FIX  Markers:{n_markers} Ref:{n_ref}  "
+                    f"Arena:({arena_pos['aruco_x']:.1f}, {arena_pos['aruco_y']:.1f})  "
+                    f"Alt:{arena_pos.get('aruco_z', 0):.1f}m"
+                )
+                cv2.putText(annotated, status, (4, 16),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 0), 1)
+            elif n_markers > 0:
+                # Yellow — markers seen but no fix
+                status = f"NO FIX  Markers:{n_markers} (no ref match)"
+                cv2.putText(annotated, status, (4, 16),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 255), 1)
+            else:
+                # Red — no markers
+                status = "SEARCHING  No markers detected"
+                cv2.putText(annotated, status, (4, 16),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 0, 255), 1)
+
+            # Draw crosshair at center
+            ch_size = 10
+            cx, cy = w // 2, h // 2
+            cv2.line(annotated, (cx - ch_size, cy), (cx + ch_size, cy), (255, 255, 255), 1)
+            cv2.line(annotated, (cx, cy - ch_size), (cx, cy + ch_size), (255, 255, 255), 1)
+
+            # Encode to JPEG
+            _, jpeg = cv2.imencode('.jpg', annotated, [cv2.IMWRITE_JPEG_QUALITY, 70])
+            self.last_annotated_frame = jpeg.tobytes()
+        except Exception as e:
+            log.debug(f"Frame annotation failed: {e}")
 
     def _marker_weight(self, corner, distance: float) -> float:
         pts = corner.reshape(4, 2)

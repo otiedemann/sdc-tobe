@@ -480,6 +480,89 @@ function saveDroneConfig() {
     });
 }
 
+// ---- Virtual Camera Feed ----
+
+let cameraConnected = false;
+let cameraInterval = null;
+
+function toggleCameraFeed() {
+    if (cameraConnected) {
+        disconnectCamera();
+    } else {
+        connectCamera();
+    }
+}
+
+function connectCamera() {
+    const baseUrl = document.getElementById('cam-api-url').value.trim();
+    const usePolling = document.getElementById('cam-poll-mode').checked;
+    const img = document.getElementById('camera-feed');
+    const statusEl = document.getElementById('camera-status');
+    const overlayEl = document.getElementById('camera-overlay');
+    const btn = document.getElementById('cam-connect-btn');
+
+    if (usePolling) {
+        // Polling mode: fetch individual frames + ArUco status
+        let frameCount = 0;
+        cameraInterval = setInterval(() => {
+            // Refresh frame by changing src with cache-bust
+            img.src = `${baseUrl}/api/aruco/frame?t=${Date.now()}`;
+            frameCount++;
+
+            // Also fetch ArUco status for overlay data
+            fetch(`${baseUrl}/api/aruco`)
+                .then(r => r.json())
+                .then(data => {
+                    overlayEl.style.display = 'block';
+                    document.getElementById('cam-markers').textContent = data.markers_detected || 0;
+                    document.getElementById('cam-refs').textContent =
+                        (data.ref_markers && data.ref_markers.length > 0) ? data.ref_markers.join(', ') : '-';
+                    const pos = data.position;
+                    if (pos && pos.aruco_x !== undefined) {
+                        document.getElementById('cam-arena-pos').textContent =
+                            `(${pos.aruco_x.toFixed(1)}, ${pos.aruco_y.toFixed(1)})`;
+                        document.getElementById('cam-arena-pos').style.color = '#50fa7b';
+                    } else {
+                        document.getElementById('cam-arena-pos').textContent = '-';
+                        document.getElementById('cam-arena-pos').style.color = '#ff5555';
+                    }
+                })
+                .catch(() => {});
+        }, 200);  // 5fps polling
+    } else {
+        // MJPEG stream mode
+        img.src = `${baseUrl}/api/aruco/stream`;
+        overlayEl.style.display = 'block';
+    }
+
+    cameraConnected = true;
+    statusEl.textContent = 'Connected';
+    statusEl.style.background = 'rgba(80,250,123,0.2)';
+    statusEl.style.color = '#50fa7b';
+    btn.textContent = 'Disconnect';
+    btn.classList.add('btn-red');
+}
+
+function disconnectCamera() {
+    const img = document.getElementById('camera-feed');
+    const statusEl = document.getElementById('camera-status');
+    const overlayEl = document.getElementById('camera-overlay');
+    const btn = document.getElementById('cam-connect-btn');
+
+    if (cameraInterval) {
+        clearInterval(cameraInterval);
+        cameraInterval = null;
+    }
+    img.src = '';
+    cameraConnected = false;
+    overlayEl.style.display = 'none';
+    statusEl.textContent = 'Disconnected';
+    statusEl.style.background = 'var(--bg-tertiary)';
+    statusEl.style.color = 'var(--text-dim)';
+    btn.textContent = 'Connect';
+    btn.classList.remove('btn-red');
+}
+
 // ---- Init ----
 
 // Load initial config

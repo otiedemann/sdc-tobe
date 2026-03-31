@@ -144,6 +144,34 @@
             </div>
         </section>
 
+        <!-- Virtual Camera Feed -->
+        <section id="camera-section">
+            <h2>Virtual Camera
+                <span id="camera-status" style="font-size:0.6em;font-weight:normal;margin-left:8px;padding:2px 8px;border-radius:4px;background:var(--bg-tertiary);color:var(--text-dim)">Disconnected</span>
+            </h2>
+            <p style="color:var(--text-dim);font-size:0.8em;margin-bottom:8px">
+                Live ArUco marker detection from drone virtual camera. Shows detected markers, reference IDs, and triangulated position.
+            </p>
+            <div id="camera-feed-container" style="position:relative;background:#000;border-radius:8px;overflow:hidden;max-width:640px;">
+                <img id="camera-feed" style="width:100%;display:block;image-rendering:auto;" alt="Camera feed" />
+                <div id="camera-overlay" style="position:absolute;bottom:0;left:0;right:0;padding:6px 10px;background:rgba(0,0,0,0.7);font-size:11px;color:#8be9fd;display:none;">
+                    <span>Markers: <b id="cam-markers">0</b></span> &nbsp;|&nbsp;
+                    <span>Ref: <b id="cam-refs">-</b></span> &nbsp;|&nbsp;
+                    <span>Arena Pos: <b id="cam-arena-pos">-</b></span>
+                </div>
+            </div>
+            <div style="margin-top:8px;display:flex;gap:8px;align-items:center;">
+                <label style="font-size:0.8em;color:var(--text-dim)">
+                    Sim API URL:
+                    <input id="cam-api-url" value="http://localhost:8080" style="width:180px;margin-left:4px;" />
+                </label>
+                <button class="btn" id="cam-connect-btn" onclick="toggleCameraFeed()">Connect</button>
+                <label style="font-size:0.8em;color:var(--text-dim)">
+                    <input type="checkbox" id="cam-poll-mode" checked> Auto-refresh
+                </label>
+            </div>
+        </section>
+
         <!-- Captures Log -->
         <section id="log-section">
             <h2>Captures Log</h2>
