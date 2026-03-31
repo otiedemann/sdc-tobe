@@ -79,7 +79,7 @@ def _get_aruco_processor():
         try:
             from sim_aruco_processor import SimArucoProcessor
             _aruco_processor = SimArucoProcessor(
-                frame_width=320, frame_height=240, fov_deg=75.0,
+                frame_width=640, frame_height=480, fov_deg=75.0,
             )
             log.info("ArUco processor initialized")
         except ImportError as e:
@@ -661,18 +661,18 @@ def api_aruco_toggle():
 _placeholder_frame = None
 
 def _get_placeholder_frame():
-    """Generate a 320x240 placeholder frame showing 'Waiting for camera...'"""
+    """Generate a 640x480 placeholder frame showing 'Waiting for camera...'"""
     global _placeholder_frame
     if _placeholder_frame is not None:
         return _placeholder_frame
     try:
         import cv2
         import numpy as np
-        img = np.zeros((240, 320, 3), dtype=np.uint8)
-        cv2.putText(img, "Waiting for camera...", (40, 120),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (100, 100, 100), 1)
-        cv2.putText(img, "Drones must be flying in sim", (30, 160),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (80, 80, 80), 1)
+        img = np.zeros((480, 640, 3), dtype=np.uint8)
+        cv2.putText(img, "Waiting for camera...", (160, 220),
+                    cv2.FONT_HERSHEY_SIMPLEX, 1.0, (100, 100, 100), 2)
+        cv2.putText(img, "Drones must be flying in sim", (140, 270),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (80, 80, 80), 1)
         _, jpeg = cv2.imencode('.jpg', img)
         _placeholder_frame = jpeg.tobytes()
     except Exception:

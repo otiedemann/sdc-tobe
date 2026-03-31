@@ -46,8 +46,8 @@ class SimArucoProcessor:
 
     def __init__(
         self,
-        frame_width: int = 320,
-        frame_height: int = 240,
+        frame_width: int = 640,
+        frame_height: int = 480,
         fov_deg: float = 75.0,
         udp_target: str = "127.0.0.1",
         udp_port: int = 5005,
