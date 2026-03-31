@@ -79,6 +79,7 @@ class StrategyEngine:
         self._scout_waypoints: dict[str, list[Vec2]] = {}
         self._scout_wp_index: dict[str, int] = {}
         self._scan_start: dict[str, float] = {}  # when current scan started
+        self._manual_phase_until: float = 0.0  # prevent auto phase change
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -171,12 +172,19 @@ class StrategyEngine:
                 raw_heading = telem.get("yaw", telem.get("heading", ds.heading_deg))
                 ds.heading_deg = raw_heading % 360  # normalize to [0, 360)
 
+                # ArUco detection info
+                ds.aruco_markers_detected = telem.get("aruco_markers_detected", 0)
+                ds.aruco_ref_markers = telem.get("aruco_ref_markers", [])
+
                 # Position from telemetry — check multiple sources:
+                now = time.monotonic()
                 # 1. ArUco position (arena coords, highest priority)
                 ax = telem.get("aruco_x")
                 ay = telem.get("aruco_y")
                 if ax is not None and ay is not None:
                     ds.position = Vec2(x=float(ax), y=float(ay))
+                    ds.position_source = "aruco"
+                    ds.last_position_at = now
                     az = telem.get("aruco_z")
                     if az is not None:
                         ds.altitude_m = float(az)
@@ -189,10 +197,11 @@ class StrategyEngine:
                     px = telem.get("pos_x")
                     pz = telem.get("pos_z")
                     if px is not None and pz is not None:
-                        # Convert: arena_x = world_x + 10, arena_y = world_z + 5
                         arena_x = float(px) + 10.0
                         arena_y = float(pz) + 5.0
                         ds.position = Vec2(x=arena_x, y=arena_y)
+                        ds.position_source = "sim"
+                        ds.last_position_at = now
                         py = telem.get("pos_y")
                         if py is not None:
                             ds.altitude_m = float(py)
@@ -200,16 +209,9 @@ class StrategyEngine:
                             drone_id, arena_x, arena_y,
                             float(py) if py is not None else 0.0,
                         )
-                    else:
-                        # 3. Legacy x/y keys
-                        tx = telem.get("x")
-                        ty = telem.get("y")
-                        if tx is not None and ty is not None:
-                            ds.position = Vec2(x=float(tx), y=float(ty))
-                            self.locator.update_drone_position_from_telemetry(
-                                drone_id, float(tx), float(ty),
-                                float(telem.get("z", telem.get("h", 0)))
-                            )
+
+                # Update position age
+                ds.position_age_s = round(now - ds.last_position_at, 1) if ds.last_position_at > 0 else 999.0
 
             # Try ArUco locator position (overwrites sim if available)
             aruco_pos = self.locator.get_drone_position(drone_id)
@@ -384,6 +386,10 @@ class StrategyEngine:
     # Phase: SIMULTANEOUS_ATTACK — coordinate multi-drone capture
     # ------------------------------------------------------------------
 
+    def _is_manual_phase(self) -> bool:
+        """True if phase was recently set manually (no auto-revert)."""
+        return time.monotonic() < self._manual_phase_until
+
     async def _phase_simultaneous_attack(self) -> None:
         """
         Fly assigned drones to their target boxes using continuous rc.
@@ -395,6 +401,8 @@ class StrategyEngine:
         }
 
         if not attackers:
+            if self._is_manual_phase():
+                return  # Don't auto-revert during manual phase
             self.state.phase = GamePhase.SCOUTING
             return
 
@@ -708,10 +716,11 @@ class StrategyEngine:
             return {"ok": False, "error": f"Unknown action: {action}"}
 
     def set_phase(self, phase_str: str) -> bool:
-        """Manually set the game phase."""
+        """Manually set the game phase. Prevents auto-reversion for 10s."""
         try:
             new_phase = GamePhase(phase_str)
             self.state.phase = new_phase
+            self._manual_phase_until = time.monotonic() + 10.0
             log.info(f"Phase manually set to {new_phase.value}")
             return True
         except ValueError:

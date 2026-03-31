@@ -453,6 +453,28 @@ async def camera_frame_proxy():
     return Response(content=b"", status_code=204)
 
 
+@app.get("/api/camera/frame/{drone_id}")
+async def camera_frame_drone_proxy(drone_id: str):
+    """Proxy per-drone annotated ArUco frame from the sim API server."""
+    # Map strategy drone_id (e.g. "drone-1") to sim_drone_id (e.g. "B1")
+    sim_drone_id = drone_id
+    cfg = load_arena_config()
+    for dc in cfg.drone_configs:
+        if dc.drone_id == drone_id and dc.sim_drone_id:
+            sim_drone_id = dc.sim_drone_id
+            break
+
+    sim_url = _get_sim_base_url()
+    data = _proxy_fetch(f"{sim_url}/api/aruco/frame/{sim_drone_id}")
+    if data:
+        return Response(
+            content=data,
+            media_type="image/jpeg",
+            headers={"Cache-Control": "no-cache, no-store"},
+        )
+    return Response(content=b"", status_code=204)
+
+
 @app.get("/api/camera/status")
 async def camera_status_proxy():
     """Proxy the ArUco status from the sim API server."""
