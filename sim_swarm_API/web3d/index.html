@@ -1507,9 +1507,9 @@ function sendApiTelemetry() {
 // ArUco virtual camera frame capture
 // Renders droneCam to an offscreen canvas, converts to JPEG, sends via WS
 // ---------------------------------------------------------------------------
-const ARUCO_FRAME_W = 320;
-const ARUCO_FRAME_H = 240;
-const ARUCO_FPS = 5;      // frames per second sent to server
+const ARUCO_FRAME_W = 640;
+const ARUCO_FRAME_H = 480;
+const ARUCO_FPS = 15;     // frames per second sent to server
 let arucoEnabled = true;
 let arucoLastSend = 0;
 let arucoMarkersDetected = 0;
