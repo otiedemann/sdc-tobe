@@ -10,6 +10,7 @@
     --green: #3fb950;
     --orange: #d29922;
     --purple: #bc8cff;
+    --bg-tertiary: #21262d;
 }
 
 * { margin: 0; padding: 0; box-sizing: border-box; }

@@ -168,7 +168,8 @@ class StrategyEngine:
                 ds.battery_pct = telem.get("bat", telem.get("battery", ds.battery_pct))
                 ds.flying = telem.get("flying", ds.flying)
                 ds.altitude_m = telem.get("h", telem.get("altitude", ds.altitude_m))
-                ds.heading_deg = telem.get("yaw", telem.get("heading", ds.heading_deg))
+                raw_heading = telem.get("yaw", telem.get("heading", ds.heading_deg))
+                ds.heading_deg = raw_heading % 360  # normalize to [0, 360)
 
                 # Position from telemetry (sim mode gives x/y directly)
                 tx = telem.get("x")
