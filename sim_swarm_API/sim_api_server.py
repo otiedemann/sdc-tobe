@@ -70,7 +70,7 @@ command_log_lock = threading.Lock()
 # ArUco processor for virtual camera frames
 _aruco_processor = None
 _aruco_lock = threading.Lock()
-_aruco_result: Dict = {}   # latest ArUco result per drone
+_aruco_results: Dict[str, Dict] = {}   # per-drone ArUco results: {"B1": {...}, "B2": {...}}
 _aruco_enabled = True       # can be toggled
 
 def _get_aruco_processor():
@@ -87,7 +87,12 @@ def _get_aruco_processor():
             _aruco_processor = False  # sentinel: don't retry
     return _aruco_processor if _aruco_processor is not False else None
 
-# Telemetry received from the browser sim via WebSocket
+# Per-drone telemetry received from the browser sim via WebSocket
+# Key = sim drone id (e.g. "B1"), value = telemetry dict
+_drone_telemetry: Dict[str, Dict] = {}
+telemetry_lock = threading.Lock()
+
+# Legacy single telemetry dict (updated with last-received drone data)
 telemetry: Dict = {
     "battery": 100,
     "temperature": 25,
@@ -109,7 +114,6 @@ telemetry: Dict = {
     "connected": False,
     "updated_at": 0.0,
 }
-telemetry_lock = threading.Lock()
 
 # Commands queued for the browser sim (consumed by WebSocket poll)
 _cmd_queue: list[dict] = []
@@ -254,17 +258,29 @@ def ws_sim(ws):
             msg_type = data.get("type")
 
             if msg_type == "telemetry":
+                drone_id = data.get("drone_id", "unknown")
+                now = time.time()
                 with telemetry_lock:
+                    # Store per-drone telemetry
+                    if drone_id not in _drone_telemetry:
+                        _drone_telemetry[drone_id] = {}
+                    dt = _drone_telemetry[drone_id]
+                    for k, v in data.items():
+                        dt[k] = v
+                    dt["connected"] = True
+                    dt["updated_at"] = now
+                    # Merge per-drone ArUco position if available
+                    with _aruco_lock:
+                        aruco_data = _aruco_results.get(drone_id)
+                        if aruco_data:
+                            for k, v in aruco_data.items():
+                                dt[k] = v
+                    # Also update legacy single telemetry dict
                     for k in telemetry:
                         if k in data:
                             telemetry[k] = data[k]
                     telemetry["connected"] = True
-                    telemetry["updated_at"] = time.time()
-                    # Merge ArUco position if available
-                    with _aruco_lock:
-                        if _aruco_result:
-                            for k, v in _aruco_result.items():
-                                telemetry[k] = v
+                    telemetry["updated_at"] = now
 
             elif msg_type == "camera_frame":
                 # Virtual camera frame for ArUco processing
@@ -280,11 +296,12 @@ def ws_sim(ws):
                                 arena_pos = proc.get_arena_position(result)
                                 if arena_pos:
                                     with _aruco_lock:
-                                        _aruco_result.update(arena_pos)
+                                        _aruco_results[drone] = arena_pos
                                 # Send result back to browser for debug overlay
                                 try:
                                     ws.send(json.dumps({
                                         "type": "aruco_result",
+                                        "drone_id": drone,
                                         "markers_detected": result.get("markers_detected", 0),
                                         "ref_markers": result.get("ref_markers", []),
                                         "position": result.get("cam"),
@@ -482,9 +499,19 @@ def api_safety_takeoff_post():
 
 @app.get("/api/telemetry")
 def api_telemetry():
+    drone_id = request.args.get("drone_id")
     with telemetry_lock:
-        t = dict(telemetry)
-    t["flying"] = flying
+        if drone_id and drone_id in _drone_telemetry:
+            t = dict(_drone_telemetry[drone_id])
+        else:
+            # Legacy: return last-updated telemetry or selected drone
+            with selected_drone_lock:
+                sel = selected_drone_id
+            if sel in _drone_telemetry:
+                t = dict(_drone_telemetry[sel])
+            else:
+                t = dict(telemetry)
+    t["flying"] = t.get("flying", flying)
     age = time.time() - t.get("updated_at", 0)
     t["state_age_s"] = round(age, 3)
     t["state_fresh"] = age <= 3.0 and t.get("connected", False)
@@ -635,17 +662,22 @@ def api_settings_post():
 # ArUco processing endpoints
 @app.get("/api/aruco")
 def api_aruco_status():
-    """Get ArUco processing status and latest result."""
+    """Get ArUco processing status and latest results for all drones."""
     with _aruco_lock:
-        result = dict(_aruco_result)
+        all_results = {k: dict(v) for k, v in _aruco_results.items()}
     proc = _get_aruco_processor()
+    # For backward compatibility, also return the most recent single result
+    latest = {}
+    for v in all_results.values():
+        latest.update(v)
     return jsonify(
         ok=True,
         enabled=_aruco_enabled,
         available=proc is not None,
-        position=result,
+        position=latest,
+        per_drone=all_results,
         ref_markers=proc.last_ref_markers if proc else [],
-        markers_detected=result.get("aruco_markers_detected", 0),
+        markers_detected=latest.get("aruco_markers_detected", 0),
     )
 
 
