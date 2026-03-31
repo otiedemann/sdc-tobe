@@ -579,6 +579,9 @@ fetch('/api/config').then(r => r.json()).then(cfg => {
 
 connect();
 
+// Auto-connect camera feed
+setTimeout(connectCamera, 1000);
+
 // Resize canvas on window resize
 function resizeCanvas() {
     const canvas = document.getElementById('arena-canvas');
