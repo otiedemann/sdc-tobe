@@ -91,6 +91,12 @@ class DroneState(BaseModel):
     sim_drone_id: Optional[str] = None  # e.g. "B1" for simulator selection
     connected: bool = False
     flying: bool = False
+    # ArUco position tracking
+    aruco_markers_detected: int = 0
+    aruco_ref_markers: list[int] = []
+    position_source: str = "none"  # "aruco", "sim", "none"
+    position_age_s: float = 999.0  # seconds since last position update
+    last_position_at: float = 0.0
 
 
 # ---------------------------------------------------------------------------

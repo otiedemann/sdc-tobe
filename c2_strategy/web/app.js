@@ -83,6 +83,21 @@ function renderDroneCards() {
         const batClass = bat > 50 ? 'high' : bat > 20 ? 'medium' : 'low';
         const pos = d.position ? `(${d.position.x.toFixed(1)}, ${d.position.y.toFixed(1)})` : '--';
 
+        // Position source and confidence
+        const src = d.position_source || 'none';
+        const age = d.position_age_s ?? 999;
+        const nMarkers = d.aruco_markers_detected || 0;
+        const refMarkers = d.aruco_ref_markers || [];
+        const posColor = src === 'aruco' && age < 2 ? '#50fa7b' :
+                         src === 'sim' ? '#8be9fd' :
+                         src === 'aruco' ? '#f1fa8c' : '#ff5555';
+        const posLabel = src === 'none' ? 'No fix' :
+                         `${src.toUpperCase()} ${age < 2 ? '(live)' : `(${age.toFixed(0)}s ago)`}`;
+        const markerInfo = nMarkers > 0 ? `${nMarkers} marker${nMarkers > 1 ? 's' : ''} (ref: ${refMarkers.join(',') || '-'})` : 'No markers';
+
+        // Per-drone camera image (sim_drone_id needed for the frame)
+        const simId = d.sim_drone_id || '';
+
         html += `
         <div class="drone-card">
             <div class="drone-card-header">
@@ -94,16 +109,25 @@ function renderDroneCards() {
                 <span>Phase: ${d.phase || '--'}</span>
                 <span>Pos: ${pos}</span>
                 <span>Alt: ${(d.altitude_m || 0).toFixed(1)}m</span>
-                <span>Hdg: ${Math.round(d.heading_deg || 0)}°</span>
+                <span>Hdg: ${Math.round(d.heading_deg || 0)}\u00B0</span>
                 <span>Target: ${d.assigned_target || '--'}</span>
+            </div>
+            <div class="drone-position-info" style="font-size:0.75em;padding:4px 8px;background:rgba(0,0,0,0.3);border-radius:4px;margin:4px 0;">
+                <span style="color:${posColor}">${posLabel}</span>
+                <span style="color:var(--text-dim);margin-left:8px">${markerInfo}</span>
             </div>
             <div class="battery-bar">
                 <div class="battery-fill ${batClass}" style="width:${bat}%"></div>
             </div>
-            <div class="drone-actions">
-                <button class="btn btn-green" onclick="sendCmd({cmd:'takeoff',drone_id:'${id}'})">Takeoff</button>
-                <button class="btn btn-orange" onclick="sendCmd({cmd:'land',drone_id:'${id}'})">Land</button>
-                <button class="btn btn-red" onclick="sendCmd({cmd:'emergency',drone_id:'${id}'})">E-Stop</button>
+            <div style="display:flex;gap:8px;align-items:flex-start;">
+                <div class="drone-actions" style="flex:1;">
+                    <button class="btn btn-green" onclick="sendCmd({cmd:'takeoff',drone_id:'${id}'})">Takeoff</button>
+                    <button class="btn btn-orange" onclick="sendCmd({cmd:'land',drone_id:'${id}'})">Land</button>
+                    <button class="btn btn-red" onclick="sendCmd({cmd:'emergency',drone_id:'${id}'})">E-Stop</button>
+                </div>
+                <div class="drone-cam" style="width:160px;height:120px;background:#000;border-radius:4px;overflow:hidden;flex-shrink:0;">
+                    <img id="cam-${id}" style="width:100%;height:100%;object-fit:cover;" alt="" />
+                </div>
             </div>
         </div>`;
     }
@@ -501,8 +525,17 @@ function connectCamera() {
 
     // Use same-origin proxy endpoints (avoids CORS issues)
     cameraInterval = setInterval(() => {
-        // Refresh frame via proxy on this server
+        // Refresh main camera frame
         img.src = `/api/camera/frame?t=${Date.now()}`;
+
+        // Update per-drone camera thumbnails
+        const drones = state.drones || {};
+        for (const id of Object.keys(drones)) {
+            const camImg = document.getElementById(`cam-${id}`);
+            if (camImg) {
+                camImg.src = `/api/camera/frame/${id}?t=${Date.now()}`;
+            }
+        }
 
         // Also fetch ArUco status via proxy
         fetch('/api/camera/status')
@@ -523,7 +556,7 @@ function connectCamera() {
                 }
             })
             .catch(() => {});
-    }, 200);  // 5fps polling
+    }, 300);  // ~3fps polling (5 drones × frame fetch = manageable load)
 
     cameraConnected = true;
     statusEl.textContent = 'Connected';

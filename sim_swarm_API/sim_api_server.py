@@ -712,6 +712,24 @@ def _get_placeholder_frame():
     return _placeholder_frame
 
 
+@app.get("/api/aruco/frame/<drone_id>")
+def api_aruco_frame_drone(drone_id):
+    """Get annotated camera frame for a specific drone."""
+    proc = _get_aruco_processor()
+    if proc and drone_id in proc.per_drone_frames:
+        return Response(
+            proc.per_drone_frames[drone_id],
+            mimetype="image/jpeg",
+            headers={"Cache-Control": "no-cache, no-store"},
+        )
+    # Fall through to placeholder
+    placeholder = _get_placeholder_frame()
+    if placeholder:
+        return Response(placeholder, mimetype="image/jpeg",
+                        headers={"Cache-Control": "no-cache, no-store"})
+    return Response(b"", status=204)
+
+
 @app.get("/api/aruco/frame")
 def api_aruco_frame():
     """Get the latest annotated camera frame as JPEG."""

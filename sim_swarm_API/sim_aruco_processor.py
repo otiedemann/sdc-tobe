@@ -108,7 +108,8 @@ class SimArucoProcessor:
         self.last_ref_markers: list[int] = []
         self.last_targets: dict = {}
         self._last_process_time = 0.0
-        self.last_annotated_frame: Optional[bytes] = None  # JPEG bytes of annotated frame
+        self.last_annotated_frame: Optional[bytes] = None  # JPEG bytes of last annotated frame
+        self.per_drone_frames: dict[str, bytes] = {}  # per-drone annotated frames
 
         log.info(
             f"SimArucoProcessor ready: {frame_width}x{frame_height}, "
@@ -222,7 +223,7 @@ class SimArucoProcessor:
         if ids is None or len(ids) == 0:
             self._reset_filters()
             # Annotate frame even when no markers found
-            self._annotate_and_store(frame, corners, ids, None, None, [], {})
+            self._annotate_and_store(frame, corners, ids, None, None, [], {}, drone_id)
             return {
                 "cam": None,
                 "dir": None,
@@ -268,7 +269,7 @@ class SimArucoProcessor:
 
         if not ref_poses:
             detected_ids = [int(ids[i][0]) for i in range(len(ids))]
-            self._annotate_and_store(frame, corners, ids, None, None, detected_ids, {})
+            self._annotate_and_store(frame, corners, ids, None, None, detected_ids, {}, drone_id)
             return {
                 "cam": None,
                 "dir": None,
@@ -320,7 +321,7 @@ class SimArucoProcessor:
         arena_pos = self.get_arena_position(result)
         self._annotate_and_store(
             frame, corners, ids, filt_pos, arena_pos,
-            self.last_ref_markers, targets,
+            self.last_ref_markers, targets, drone_id,
         )
 
         return result
@@ -367,6 +368,7 @@ class SimArucoProcessor:
         arena_pos: Optional[dict],
         ref_markers: list,
         targets: dict,
+        drone_id: str = "unknown",
     ) -> None:
         """Draw ArUco detection overlay on frame and store as JPEG."""
         try:
@@ -431,7 +433,9 @@ class SimArucoProcessor:
 
             # Encode to JPEG
             _, jpeg = cv2.imencode('.jpg', annotated, [cv2.IMWRITE_JPEG_QUALITY, 70])
-            self.last_annotated_frame = jpeg.tobytes()
+            frame_bytes = jpeg.tobytes()
+            self.last_annotated_frame = frame_bytes
+            self.per_drone_frames[drone_id] = frame_bytes
         except Exception as e:
             log.debug(f"Frame annotation failed: {e}")
 
