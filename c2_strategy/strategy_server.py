@@ -14,8 +14,9 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Optional
 
+import urllib.request
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, Response
 from fastapi.staticfiles import StaticFiles
 
 from .arena_config import ArenaConfig, default_arena_config, load_arena_config, save_arena_config
@@ -409,6 +410,57 @@ async def add_target(data: dict):
         engine.state.target_boxes[box_id] = box
 
     return {"ok": True, "box_id": box_id}
+
+
+# ---------------------------------------------------------------------------
+# Camera proxy — fetches ArUco frames from sim API to avoid CORS issues
+# ---------------------------------------------------------------------------
+
+def _get_sim_base_url() -> str:
+    """Get the sim API base URL from the first drone config."""
+    cfg = load_arena_config()
+    if cfg.drone_configs:
+        base = cfg.drone_configs[0].get("api_base_url", "http://localhost:8080")
+        if base:
+            return base.rstrip("/")
+    return "http://localhost:8080"
+
+
+def _proxy_fetch(url: str, timeout: float = 2.0) -> Optional[bytes]:
+    """Fetch URL content using stdlib urllib."""
+    try:
+        req = urllib.request.Request(url)
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return resp.read()
+    except Exception:
+        return None
+
+
+@app.get("/api/camera/frame")
+async def camera_frame_proxy():
+    """Proxy the annotated ArUco frame from the sim API server."""
+    sim_url = _get_sim_base_url()
+    data = _proxy_fetch(f"{sim_url}/api/aruco/frame")
+    if data:
+        return Response(
+            content=data,
+            media_type="image/jpeg",
+            headers={"Cache-Control": "no-cache, no-store"},
+        )
+    return Response(content=b"", status_code=204)
+
+
+@app.get("/api/camera/status")
+async def camera_status_proxy():
+    """Proxy the ArUco status from the sim API server."""
+    sim_url = _get_sim_base_url()
+    data = _proxy_fetch(f"{sim_url}/api/aruco")
+    if data:
+        return Response(
+            content=data,
+            media_type="application/json",
+        )
+    return {"ok": False, "error": "sim API unavailable"}
 
 
 # ---------------------------------------------------------------------------
