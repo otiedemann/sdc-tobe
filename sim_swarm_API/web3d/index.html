@@ -1103,10 +1103,11 @@ function updateDroneViewport() {
   const forward = new THREE.Vector3(Math.sin(d.yaw), 0, Math.cos(d.yaw));
   const up = new THREE.Vector3(0, 1, 0);
 
-  const eye = d.mesh.position.clone().add(new THREE.Vector3(0, 0.12, 0)).addScaledVector(forward, 0.14);
+  const eye = d.mesh.position.clone().add(new THREE.Vector3(0, 0.15, 0)).addScaledVector(forward, 0.14);
   droneCam.position.copy(eye);
   droneCam.up.copy(up);
-  droneCam.lookAt(eye.clone().addScaledVector(forward, 6.0).add(new THREE.Vector3(0, 0.05, 0)));
+  // Look forward and upward to see pillar markers at 2-4m height
+  droneCam.lookAt(eye.clone().addScaledVector(forward, 4.0).add(new THREE.Vector3(0, 1.8, 0)));
 }
 
 function updateStatus() {
@@ -1553,12 +1554,14 @@ function captureAndSendFrame() {
   cam.aspect = ARUCO_FRAME_W / ARUCO_FRAME_H;
   cam.updateProjectionMatrix();
 
-  // Update drone camera position
+  // Update drone camera position — tilted upward to see pillar markers at 2-4m
   const forward = new THREE.Vector3(Math.sin(d.yaw), 0, Math.cos(d.yaw));
-  const eye = d.mesh.position.clone().add(new THREE.Vector3(0, 0.12, 0)).addScaledVector(forward, 0.14);
+  const eye = d.mesh.position.clone().add(new THREE.Vector3(0, 0.15, 0)).addScaledVector(forward, 0.14);
   cam.position.copy(eye);
   cam.up.set(0, 1, 0);
-  cam.lookAt(eye.clone().addScaledVector(forward, 6.0).add(new THREE.Vector3(0, 0.05, 0)));
+  // Look forward and upward: target ~2m above at 4m distance (roughly 25° up)
+  const lookTarget = eye.clone().addScaledVector(forward, 4.0).add(new THREE.Vector3(0, 1.8, 0));
+  cam.lookAt(lookTarget);
 
   // Render to offscreen
   arucoRenderer.render(scene, cam);
