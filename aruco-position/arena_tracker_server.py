@@ -1,23 +1,37 @@
 """
 Arena Position Tracker Server
 ==============================
-Reads live video from Parrot Anafi (RTSP stream decoded on Pi), runs ArUco
-marker detection, triangulates drone position in arena coordinates, and
-streams everything to a browser dashboard.
+By default connects directly to a Parrot Anafi at 192.168.42.1 via the
+Olympe SDK — no RTSP needed.  Olympe decodes the video via PDraw and
+delivers raw YUV frames; telemetry (speed / attitude) is polled directly
+from Olympe state without touching any external API server.
+
+Alternatively you can point it at any OpenCV-compatible source (USB camera,
+HTTP MJPEG from the olympe_pi_api_server, etc.) with --src.
 
 Run:
+    # Olympe-direct (default – Anafi on 192.168.42.1):
     python arena_tracker_server.py
-    python arena_tracker_server.py --src rtsp://192.168.42.1/live --port 8099
-    python arena_tracker_server.py --src 0 --calib camera_cal.npz
-    python arena_tracker_server.py --telemetry http://192.168.1.20:8080/api/telemetry
+
+    # Explicit Olympe drone IP:
+    python arena_tracker_server.py --drone 192.168.42.1
+
+    # Fallback – USB cam / HTTP MJPEG / RTSP (no Olympe needed):
+    python arena_tracker_server.py --src 0
+    python arena_tracker_server.py --src http://192.168.1.20:8080/api/video
+    python arena_tracker_server.py --src rtsp://some-other-camera/live
+
+    # Other options:
+    python arena_tracker_server.py --port 8099 --calib camera_cal.npz
+    python arena_tracker_server.py --fov 69 --detect sensitive --latency 300
 
 Arguments:
-    --src <url|int>     Camera source: RTSP URL or device index (default: rtsp://192.168.42.1/live)
+    --drone <ip>        Anafi IP for Olympe-direct mode (default: 192.168.42.1)
+    --src <url|int>     Override: use cv2.VideoCapture source instead of Olympe
     --port <n>          HTTP port (default: 8099)
     --calib <file>      Camera calibration .npz (camera_matrix, dist_coeffs)
-    --fov <deg>         Camera horizontal FOV in degrees used for default intrinsics (default: 69)
+    --fov <deg>         Camera horizontal FOV in degrees (default: 69)
     --detect <profile>  balanced | sensitive | strict  (default: balanced)
-    --telemetry <url>   Olympe API telemetry URL for external velocity injection (optional)
     --latency <ms>      Initial display latency compensation in ms (default: 200)
 """
 
@@ -29,13 +43,27 @@ import queue
 import sys
 import threading
 import time
-import urllib.request
 from pathlib import Path
 
 import cv2
 import numpy as np
 from cv2 import aruco
 from flask import Flask, Response, jsonify, request, send_file
+
+# ── Optional Olympe import ────────────────────────────────────────────────────
+try:
+    import olympe
+    from olympe.messages.ardrone3.PilotingState import (
+        SpeedChanged,
+        AttitudeChanged,
+        AltitudeChanged,
+        FlyingStateChanged,
+    )
+    from olympe.messages.common.CommonState import BatteryStateChanged
+    HAS_OLYMPE = True
+except ImportError:
+    HAS_OLYMPE = False
+    print("[tracker] WARNING: olympe not available – Olympe-direct mode disabled.")
 
 # ── Import ArUco processor ────────────────────────────────────────────────────
 _here = Path(__file__).parent
@@ -75,13 +103,18 @@ class _State:
         self.vel: list = [0.0, 0.0, 0.0]
         self.vel_ts: float = 0.0
 
+        # Drone telemetry (Olympe-direct)
+        self.battery_pct: int | None = None
+        self.altitude_m: float | None = None
+        self.yaw_deg: float | None = None
+        self.flying_state: str | None = None
+
         # Metrics
         self.fps: float = 0.0
         self.total_frames: int = 0
 
         # Settings (adjustable at runtime via /api/settings)
         self.latency_ms: float = 200.0
-        self.camera_src: str = "rtsp://192.168.42.1/live"
         self.detect_profile: str = "balanced"
         self.fov_deg: float = 69.0
 
@@ -169,6 +202,21 @@ def _annotate(frame: np.ndarray, corners, ids,
     tag = "  [STALE]" if stale else ""
     lines.append(f"Refs: {n_ref}   FPS: {fps:.1f}{tag}")
 
+    # Telemetry overlay (Olympe-direct)
+    with st.lock:
+        batt = st.battery_pct
+        alt = st.altitude_m
+        fly = st.flying_state
+    telem_parts = []
+    if batt is not None:
+        telem_parts.append(f"Bat:{batt}%")
+    if alt is not None:
+        telem_parts.append(f"Alt:{alt:.1f}m")
+    if fly:
+        telem_parts.append(fly)
+    if telem_parts:
+        lines.append("  ".join(telem_parts))
+
     for i, line in enumerate(lines):
         y = 22 + i * 24
         tw = cv2.getTextSize(line, cv2.FONT_HERSHEY_SIMPLEX, 0.52, 1)[0][0]
@@ -179,7 +227,6 @@ def _annotate(frame: np.ndarray, corners, ids,
     # Direction arrow from frame center
     if dir_vec:
         cx_f, cy_f = w // 2, h // 2
-        # Project arena XY movement direction onto image
         ax, ay = dir_vec[0], -dir_vec[1]   # flip arena Y → image Y
         n = math.sqrt(ax * ax + ay * ay) + 1e-9
         length = 55
@@ -190,12 +237,289 @@ def _annotate(frame: np.ndarray, corners, ids,
     return out
 
 
+def _process_and_publish(frame: np.ndarray, ts: float,
+                          processor: "HeadlessAruCoPositioning",
+                          fps_buf: list) -> None:
+    """Run ArUco detection on frame, update shared state, publish JPEG + SSE."""
+    result = processor.process_frame(frame)
+
+    # Re-detect markers separately for annotation (process_frame doesn't return corners)
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    corners, ids, _ = processor.detector.detectMarkers(gray)
+
+    pos = dir_vec = None
+    weights: dict = {}
+    ref_markers: list = []
+    stale = False
+
+    if result:
+        pos = result.get("cam")
+        dir_vec = result.get("dir")
+        weights = result.get("marker_weights", {})
+        ref_markers = result.get("ref_markers", [])
+        stale = result.get("stale", False)
+
+        with st.lock:
+            if pos:
+                _update_velocity_from_pos(pos, ts)
+            st.pos = pos
+            st.dir_vec = dir_vec
+            st.pos_ts = ts
+            st.ref_markers = ref_markers[:]
+            st.marker_weights = dict(weights)
+            st.stale = stale
+
+    # FPS rolling average over last 2 s
+    fps_buf.append(ts)
+    while fps_buf and ts - fps_buf[0] > 2.0:
+        fps_buf.pop(0)
+    fps = len(fps_buf) / 2.0
+
+    with st.lock:
+        st.fps = fps
+        st.total_frames += 1
+
+    # Build annotated JPEG
+    ann = _annotate(frame, corners, ids, pos, dir_vec, weights, fps, stale)
+    _, jpg_enc = cv2.imencode(".jpg", ann, [cv2.IMWRITE_JPEG_QUALITY, 72])
+    jpg_bytes = jpg_enc.tobytes()
+
+    with st.frame_cond:
+        st.frame_jpg = jpg_bytes
+        st.frame_seq += 1
+        st.frame_cond.notify_all()
+
+    # SSE event
+    with st.lock:
+        vel_snap = st.vel[:]
+        latency_snap = st.latency_ms
+        batt = st.battery_pct
+        alt = st.altitude_m
+        yaw = st.yaw_deg
+        fly = st.flying_state
+
+    _broadcast_sse({
+        "ts": ts,
+        "pos": pos,
+        "dir": dir_vec,
+        "vel": vel_snap,
+        "latency_ms": latency_snap,
+        "ref_markers": ref_markers,
+        "marker_weights": weights,
+        "stale": stale,
+        "fps": round(fps, 1),
+        "battery_pct": batt,
+        "altitude_m": alt,
+        "yaw_deg": yaw,
+        "flying_state": fly,
+    })
+
+
 # ─────────────────────────────────────────────────────────────────────────────
-# Capture + detection loop
+# Olympe-direct capture loop
 # ─────────────────────────────────────────────────────────────────────────────
 
-def capture_loop(src, calib_file: str | None, fov_deg: float, detect_profile: str):
-    """Background thread: read frames, run ArUco, publish JPEG + SSE."""
+def capture_loop_olympe(drone_ip: str, calib_file: str | None,
+                         fov_deg: float, detect_profile: str):
+    """
+    Connect to Parrot Anafi via Olympe, decode video with PDraw callbacks,
+    poll telemetry from Olympe state — no RTSP, no external API needed.
+    """
+    cam_matrix = None
+    dist_coeffs = np.zeros(5, dtype=float)
+
+    if calib_file:
+        try:
+            d = np.load(calib_file)
+            cam_matrix = d["camera_matrix"]
+            dist_coeffs = d["dist_coeffs"]
+            print(f"[tracker] Loaded calibration from {calib_file}")
+        except Exception as e:
+            print(f"[tracker] WARNING: calibration load failed: {e}")
+
+    # Queue carries (bgr_ndarray, timestamp) pairs from YUV callback → main loop
+    _frame_q: queue.Queue = queue.Queue(maxsize=4)
+    processor = None
+    fps_buf: list[float] = []
+
+    def _yuv_frame_cb(yuv_frame):
+        """Called by Olympe PDraw in a worker thread for each decoded frame."""
+        try:
+            yuv_frame.ref()
+        except Exception:
+            pass
+        try:
+            # Detect pixel format (I420 default for Anafi 4K/720p)
+            cv_cvt = cv2.COLOR_YUV2BGR_I420
+            try:
+                info = yuv_frame.info()
+                yuv_fmt = None
+                if isinstance(info, dict):
+                    if "yuv" in info:
+                        yuv_fmt = info["yuv"].get("format")
+                    elif "raw" in info:
+                        yuv_fmt = info["raw"].get("format")
+                if yuv_fmt is not None:
+                    for attr, flag in [("VDEF_I420", cv2.COLOR_YUV2BGR_I420),
+                                       ("VDEF_NV12", cv2.COLOR_YUV2BGR_NV12)]:
+                        c = getattr(olympe, attr, None)
+                        if c is not None and c == yuv_fmt:
+                            cv_cvt = flag
+                            break
+            except Exception:
+                pass
+
+            bgr = cv2.cvtColor(yuv_frame.as_ndarray(), cv_cvt)
+            try:
+                _frame_q.put_nowait((bgr, time.time()))
+            except queue.Full:
+                pass  # drop oldest implicitly
+        except Exception as e:
+            print(f"[tracker] YUV frame error: {e}")
+        finally:
+            try:
+                yuv_frame.unref()
+            except Exception:
+                pass
+
+    def _flush_cb(stream):
+        """Called by PDraw when it needs to flush pending buffers (prevents stall)."""
+        while True:
+            try:
+                _frame_q.get_nowait()
+            except queue.Empty:
+                break
+
+    print(f"[tracker] Olympe-direct mode: connecting to {drone_ip}")
+
+    while st.running:
+        d = None
+        streaming_started = False
+        try:
+            d = olympe.Drone(drone_ip)
+            connected = d.connect()
+            if not connected:
+                print(f"[tracker] Olympe: could not connect to {drone_ip}, retrying in 5s...")
+                time.sleep(5.0)
+                continue
+
+            print(f"[tracker] Olympe: connected to {drone_ip}")
+
+            # Start video streaming via PDraw
+            if hasattr(d, "streaming") and hasattr(d.streaming, "set_callbacks"):
+                d.streaming.set_callbacks(
+                    raw_cb=_yuv_frame_cb,
+                    flush_raw_cb=_flush_cb,
+                )
+                d.streaming.start()
+                streaming_started = True
+            elif hasattr(d, "set_streaming_callbacks"):   # legacy Olympe API
+                d.set_streaming_callbacks(raw_cb=_yuv_frame_cb)
+                d.start_video_streaming()
+                streaming_started = True
+            else:
+                print("[tracker] WARNING: Olympe streaming API not found on this version.")
+
+            # ── Main processing loop ──────────────────────────────────────────
+            while st.running:
+                # ---- Telemetry polling (Olympe state) ----------------------
+                try:
+                    spd = d.get_state(SpeedChanged)
+                    att = d.get_state(AttitudeChanged)
+
+                    vfwd   = float(spd.get("speedX", 0.0))
+                    vright = float(spd.get("speedY", 0.0))
+                    vdown  = float(spd.get("speedZ", 0.0))
+                    yaw_rad = float(att.get("yaw", 0.0))
+
+                    # Rotate body-frame velocity → arena XY frame
+                    vx =  vfwd * math.cos(yaw_rad) - vright * math.sin(yaw_rad)
+                    vy =  vfwd * math.sin(yaw_rad) + vright * math.cos(yaw_rad)
+                    vz = -vdown   # NED down → arena Z up
+
+                    alpha = 0.35
+                    with st.lock:
+                        st.vel[0] = alpha * vx + (1 - alpha) * st.vel[0]
+                        st.vel[1] = alpha * vy + (1 - alpha) * st.vel[1]
+                        st.vel[2] = alpha * vz + (1 - alpha) * st.vel[2]
+                        st.vel_ts = time.time()
+                        st.yaw_deg = math.degrees(yaw_rad)
+                except Exception:
+                    pass
+
+                try:
+                    alt_state = d.get_state(AltitudeChanged)
+                    with st.lock:
+                        st.altitude_m = float(alt_state.get("altitude", 0.0))
+                except Exception:
+                    pass
+
+                try:
+                    bat_state = d.get_state(BatteryStateChanged)
+                    with st.lock:
+                        st.battery_pct = int(bat_state.get("percent", 0))
+                except Exception:
+                    pass
+
+                try:
+                    fly_state = d.get_state(FlyingStateChanged)
+                    raw_fly = fly_state.get("state")
+                    with st.lock:
+                        st.flying_state = str(raw_fly).split(".")[-1] if raw_fly else None
+                except Exception:
+                    pass
+
+                # ---- Frame processing ----------------------------------------
+                try:
+                    bgr, ts = _frame_q.get(timeout=0.5)
+                except queue.Empty:
+                    continue
+
+                if processor is None:
+                    hf, wf = bgr.shape[:2]
+                    if cam_matrix is None:
+                        cam_matrix = _default_camera_matrix(wf, hf, fov_deg)
+                        print(f"[tracker] Default intrinsics for {wf}x{hf}, "
+                              f"FOV={fov_deg}°: fx={cam_matrix[0,0]:.0f}")
+                    processor = HeadlessAruCoPositioning(
+                        cam_matrix, dist_coeffs, detect_profile=detect_profile)
+                    print(f"[tracker] Processor ready (profile={detect_profile})")
+
+                _process_and_publish(bgr, ts, processor, fps_buf)
+
+        except Exception as exc:
+            print(f"[tracker] Olympe error: {exc}")
+        finally:
+            if d is not None:
+                try:
+                    if streaming_started:
+                        if hasattr(d, "streaming"):
+                            d.streaming.stop()
+                        elif hasattr(d, "stop_video_streaming"):
+                            d.stop_video_streaming()
+                except Exception:
+                    pass
+                try:
+                    d.disconnect()
+                except Exception:
+                    pass
+
+        if st.running:
+            print("[tracker] Olympe: reconnecting in 5s...")
+            time.sleep(5.0)
+
+    print("[tracker] Olympe capture loop exited.")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# cv2.VideoCapture fallback loop
+# ─────────────────────────────────────────────────────────────────────────────
+
+def capture_loop_cv2(src, calib_file: str | None, fov_deg: float, detect_profile: str):
+    """
+    Fallback: read frames from any OpenCV-compatible source (USB cam, HTTP MJPEG,
+    RTSP from a third-party cam, etc.).  Used when --src is given explicitly.
+    """
     cam_matrix = None
     dist_coeffs = np.zeros(5, dtype=float)
 
@@ -209,10 +533,8 @@ def capture_loop(src, calib_file: str | None, fov_deg: float, detect_profile: st
             print(f"[tracker] WARNING: calibration load failed: {e}")
 
     cap = None
-    processor: HeadlessAruCoPositioning | None = None
-    frame_ts_buf: list[float] = []
-    detect_count = 0
-    total_count = 0
+    processor = None
+    fps_buf: list[float] = []
 
     while st.running:
         if cap is None or not cap.isOpened():
@@ -220,7 +542,7 @@ def capture_loop(src, calib_file: str | None, fov_deg: float, detect_profile: st
             cap = cv2.VideoCapture(src)
             cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
             if not cap.isOpened():
-                print("[tracker] Could not open camera, retrying in 3s...")
+                print("[tracker] Could not open source, retrying in 3s...")
                 time.sleep(3.0)
                 continue
 
@@ -238,8 +560,8 @@ def capture_loop(src, calib_file: str | None, fov_deg: float, detect_profile: st
                 print(f"[tracker] Default intrinsics for {wf}x{hf}, FOV={fov_deg}°: "
                       f"fx={cam_matrix[0,0]:.0f}")
 
-            processor = HeadlessAruCoPositioning(cam_matrix, dist_coeffs,
-                                                  detect_profile=detect_profile)
+            processor = HeadlessAruCoPositioning(
+                cam_matrix, dist_coeffs, detect_profile=detect_profile)
             print(f"[tracker] Ready (profile={detect_profile})")
 
         ret, frame = cap.read()
@@ -250,108 +572,11 @@ def capture_loop(src, calib_file: str | None, fov_deg: float, detect_profile: st
             continue
 
         ts = time.time()
-        total_count += 1
-
-        # ArUco detection + triangulation
-        result = processor.process_frame(frame)
-
-        # Re-detect markers separately for annotation (process_frame doesn't return corners)
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        corners, ids, _ = processor.detector.detectMarkers(gray)
-
-        pos = dir_vec = None
-        weights: dict = {}
-        ref_markers: list = []
-        stale = False
-
-        if result:
-            pos = result.get("cam")
-            dir_vec = result.get("dir")
-            weights = result.get("marker_weights", {})
-            ref_markers = result.get("ref_markers", [])
-            stale = result.get("stale", False)
-            detect_count += 1
-
-            with st.lock:
-                if pos:
-                    _update_velocity_from_pos(pos, ts)
-                st.pos = pos
-                st.dir_vec = dir_vec
-                st.pos_ts = ts
-                st.ref_markers = ref_markers[:]
-                st.marker_weights = dict(weights)
-                st.stale = stale
-
-        # FPS rolling average over last 2 s
-        frame_ts_buf.append(ts)
-        frame_ts_buf = [t for t in frame_ts_buf if ts - t < 2.0]
-        fps = len(frame_ts_buf) / 2.0
-
-        with st.lock:
-            st.fps = fps
-            st.total_frames = total_count
-
-        # Build annotated JPEG
-        ann = _annotate(frame, corners, ids, pos, dir_vec, weights, fps, stale)
-        _, jpg_enc = cv2.imencode(".jpg", ann, [cv2.IMWRITE_JPEG_QUALITY, 72])
-        jpg_bytes = jpg_enc.tobytes()
-
-        with st.frame_cond:
-            st.frame_jpg = jpg_bytes
-            st.frame_seq += 1
-            st.frame_cond.notify_all()
-
-        # SSE event
-        with st.lock:
-            vel_snap = st.vel[:]
-            latency_snap = st.latency_ms
-
-        _broadcast_sse({
-            "ts": ts,
-            "pos": pos,
-            "dir": dir_vec,
-            "vel": vel_snap,
-            "latency_ms": latency_snap,
-            "ref_markers": ref_markers,
-            "marker_weights": weights,
-            "stale": stale,
-            "fps": round(fps, 1),
-        })
+        _process_and_publish(frame, ts, processor, fps_buf)
 
     if cap:
         cap.release()
-    print("[tracker] Capture loop exited.")
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Optional: poll Olympe server for external velocity (dead-reckoning)
-# ─────────────────────────────────────────────────────────────────────────────
-
-def telemetry_poller(telemetry_url: str):
-    """Poll Olympe /api/telemetry and inject velocity for dead-reckoning."""
-    print(f"[tracker] Telemetry poller: {telemetry_url}")
-    while st.running:
-        try:
-            with urllib.request.urlopen(telemetry_url, timeout=0.8) as resp:
-                d = json.loads(resp.read())
-            # Olympe reports speed_x (forward), speed_y (right), speed_z (down NED), yaw (deg)
-            vfwd = float(d.get("speed_x", d.get("speedX", 0.0)))
-            vright = float(d.get("speed_y", d.get("speedY", 0.0)))
-            vdown = float(d.get("speed_z", d.get("speedZ", 0.0)))
-            yaw = math.radians(float(d.get("yaw", 0.0)))
-            # Rotate body-frame → arena XY
-            vx = vfwd * math.cos(yaw) - vright * math.sin(yaw)
-            vy = vfwd * math.sin(yaw) + vright * math.cos(yaw)
-            vz = -vdown   # NED down → arena Z up
-            alpha = 0.35
-            with st.lock:
-                st.vel[0] = alpha * vx + (1 - alpha) * st.vel[0]
-                st.vel[1] = alpha * vy + (1 - alpha) * st.vel[1]
-                st.vel[2] = alpha * vz + (1 - alpha) * st.vel[2]
-                st.vel_ts = time.time()
-        except Exception:
-            pass
-        time.sleep(0.15)   # ~7 Hz
+    print("[tracker] cv2 capture loop exited.")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -389,7 +614,7 @@ def video_stream():
 
 @app.get("/events")
 def sse():
-    """Server-Sent Events stream: position + velocity updates ~every frame."""
+    """Server-Sent Events stream: position + velocity + telemetry updates ~every frame."""
     q: queue.Queue = queue.Queue(maxsize=12)
     with _sse_lock:
         _sse_queues.append(q)
@@ -408,6 +633,10 @@ def sse():
                     "marker_weights": dict(st.marker_weights),
                     "stale": st.stale,
                     "fps": st.fps,
+                    "battery_pct": st.battery_pct,
+                    "altitude_m": st.altitude_m,
+                    "yaw_deg": st.yaw_deg,
+                    "flying_state": st.flying_state,
                 }
             yield f"data: {json.dumps(init)}\n\n"
 
@@ -442,12 +671,16 @@ def api_position():
             "fps": st.fps,
             "ts": st.pos_ts,
             "latency_ms": st.latency_ms,
+            "battery_pct": st.battery_pct,
+            "altitude_m": st.altitude_m,
+            "yaw_deg": st.yaw_deg,
+            "flying_state": st.flying_state,
         })
 
 
 @app.post("/api/telemetry")
 def api_telemetry_inject():
-    """Inject arena-frame velocity directly (vx, vy, vz in m/s)."""
+    """Inject arena-frame velocity directly (vx, vy, vz in m/s) — for testing / external override."""
     d = request.get_json(silent=True) or {}
     with st.lock:
         st.vel = [float(d.get("vx", 0)), float(d.get("vy", 0)), float(d.get("vz", 0))]
@@ -460,7 +693,6 @@ def api_settings_get():
     return jsonify({
         "latency_ms": st.latency_ms,
         "detect_profile": st.detect_profile,
-        "camera_src": st.camera_src,
         "fov_deg": st.fov_deg,
     })
 
@@ -480,44 +712,56 @@ def api_settings_post():
 
 def main():
     p = argparse.ArgumentParser(description="Arena Position Tracker Server")
-    p.add_argument("--src", default=os.getenv("CAMERA_SRC", "rtsp://192.168.42.1/live"),
-                   help="Camera source: RTSP URL or device index integer")
+    p.add_argument("--drone", default=os.getenv("DRONE_IP", "192.168.42.1"),
+                   help="Parrot Anafi IP for Olympe-direct mode (default: 192.168.42.1)")
+    p.add_argument("--src", default=None,
+                   help="Override: use cv2.VideoCapture source instead of Olympe "
+                        "(e.g. 0, http://PI_IP:8080/api/video)")
     p.add_argument("--port", type=int, default=int(os.getenv("PORT", "8099")))
     p.add_argument("--calib", default=None, help="NPZ calibration file")
     p.add_argument("--fov", type=float, default=69.0, help="Camera horizontal FOV (degrees)")
     p.add_argument("--detect", default="balanced",
                    choices=["balanced", "sensitive", "strict"])
-    p.add_argument("--telemetry", default=None,
-                   help="Olympe telemetry URL for velocity (e.g. http://PI_IP:8080/api/telemetry)")
     p.add_argument("--latency", type=float, default=200.0,
                    help="Initial latency compensation in ms (default: 200)")
     args = p.parse_args()
 
-    src = int(args.src) if args.src.isdigit() else args.src
-    st.camera_src = str(src)
     st.detect_profile = args.detect
     st.fov_deg = args.fov
     st.latency_ms = args.latency
 
+    # Decide which capture backend to use
+    use_olympe = (args.src is None) and HAS_OLYMPE
+
     print(f"[tracker] Arena Position Tracker")
-    print(f"[tracker]   Camera:  {src}")
+    if use_olympe:
+        print(f"[tracker]   Mode:    Olympe-direct (Anafi @ {args.drone})")
+    else:
+        src_raw = args.src if args.src else "cv2 (no --src given, Olympe unavailable)"
+        src = int(args.src) if (args.src and args.src.isdigit()) else args.src
+        print(f"[tracker]   Mode:    cv2.VideoCapture  src={src_raw}")
+        if not HAS_OLYMPE and args.src is None:
+            print("[tracker]   WARNING: olympe not installed; falling back to cv2 with no source.")
+            print("[tracker]   Use --src to specify a camera URL or device index.")
     print(f"[tracker]   Profile: {args.detect}")
     print(f"[tracker]   FOV:     {args.fov}°")
     print(f"[tracker]   Latency: {args.latency} ms (initial)")
     print(f"[tracker]   Port:    {args.port}")
     print(f"[tracker]   UI:      http://localhost:{args.port}/")
 
-    cap_thread = threading.Thread(
-        target=capture_loop,
-        args=(src, args.calib, args.fov, args.detect),
-        daemon=True, name="capture")
-    cap_thread.start()
+    if use_olympe:
+        cap_thread = threading.Thread(
+            target=capture_loop_olympe,
+            args=(args.drone, args.calib, args.fov, args.detect),
+            daemon=True, name="capture-olympe")
+    else:
+        src = int(args.src) if (args.src and args.src.isdigit()) else (args.src or 0)
+        cap_thread = threading.Thread(
+            target=capture_loop_cv2,
+            args=(src, args.calib, args.fov, args.detect),
+            daemon=True, name="capture-cv2")
 
-    if args.telemetry:
-        tel_thread = threading.Thread(
-            target=telemetry_poller, args=(args.telemetry,),
-            daemon=True, name="telemetry")
-        tel_thread.start()
+    cap_thread.start()
 
     try:
         app.run(host="0.0.0.0", port=args.port, threaded=True, use_reloader=False)
