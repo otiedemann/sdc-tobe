@@ -141,6 +141,8 @@ COMMAND_LOG_PATH = Path(
 # Positioning subsystem config
 POSITION_CONFIG_PATH = Path(__file__).with_name("position_config.json")
 POSITION_CALIB_PATH  = Path(__file__).with_name("position_calib.npz")
+ARENA_CONFIG_PATH    = Path(__file__).with_name("arena_config.json")
+FLIGHT_CONFIG_PATH   = Path(__file__).with_name("flight_config.json")
 
 # ---------------------------------------------------------------------------
 # Global state
@@ -237,6 +239,96 @@ def _save_position_config(cfg: dict):
         print(f"[POSITIONING] Config save error: {_e}")
 
 
+# ── Arena config ──────────────────────────────────────────────────────────────
+_ARENA_CONFIG_DEFAULT: dict = {
+    "arena": {"width_m": 20.0, "depth_m": 10.0,
+               "height_min_m": -1.0, "height_max_m": 1.0},
+    "marker_size_m": 0.5,
+    "markers": {
+        "0":  {"pos": [0.0,   0.0,    0.0],  "wall": "front"},
+        "1":  {"pos": [10.0,  6.667, -1.0],  "wall": "right"},
+        "2":  {"pos": [10.0,  6.667,  1.0],  "wall": "right"},
+        "3":  {"pos": [10.0,  3.333, -1.0],  "wall": "right"},
+        "4":  {"pos": [10.0,  3.333,  1.0],  "wall": "right"},
+        "5":  {"pos": [6.0,   0.0,   -1.0],  "wall": "front"},
+        "6":  {"pos": [6.0,   0.0,    1.0],  "wall": "front"},
+        "7":  {"pos": [2.0,   0.0,   -1.0],  "wall": "front"},
+        "8":  {"pos": [2.0,   0.0,    1.0],  "wall": "front"},
+        "9":  {"pos": [-2.0,  0.0,   -1.0],  "wall": "front"},
+        "10": {"pos": [-2.0,  0.0,    1.0],  "wall": "front"},
+        "11": {"pos": [-6.0,  0.0,   -1.0],  "wall": "front"},
+        "12": {"pos": [-6.0,  0.0,    1.0],  "wall": "front"},
+        "13": {"pos": [-10.0, 3.333, -1.0],  "wall": "left"},
+        "14": {"pos": [-10.0, 3.333,  1.0],  "wall": "left"},
+        "15": {"pos": [-10.0, 6.667, -1.0],  "wall": "left"},
+        "16": {"pos": [-10.0, 6.667,  1.0],  "wall": "left"},
+        "17": {"pos": [-6.0,  10.0,  -1.0],  "wall": "back"},
+        "18": {"pos": [-6.0,  10.0,   1.0],  "wall": "back"},
+        "19": {"pos": [-2.0,  10.0,  -1.0],  "wall": "back"},
+        "20": {"pos": [-2.0,  10.0,   1.0],  "wall": "back"},
+        "21": {"pos": [2.0,   10.0,  -1.0],  "wall": "back"},
+        "22": {"pos": [2.0,   10.0,   1.0],  "wall": "back"},
+        "23": {"pos": [6.0,   10.0,  -1.0],  "wall": "back"},
+        "24": {"pos": [6.0,   10.0,   1.0],  "wall": "back"},
+    },
+}
+_arena_config: dict = {}
+_arena_cfg_lock = threading.Lock()
+
+def _load_arena_config() -> dict:
+    import copy
+    base = copy.deepcopy(_ARENA_CONFIG_DEFAULT)
+    if ARENA_CONFIG_PATH.exists():
+        try:
+            with open(ARENA_CONFIG_PATH) as _f:
+                stored = json.load(_f)
+            # Merge top-level keys; keep defaults for anything not stored
+            if "arena" in stored:
+                base["arena"].update(stored["arena"])
+            if "marker_size_m" in stored:
+                base["marker_size_m"] = float(stored["marker_size_m"])
+            if "markers" in stored:
+                base["markers"] = stored["markers"]  # full replace
+        except Exception as _e:
+            print(f"[ARENA] Config load error: {_e}")
+    return base
+
+def _save_arena_config(cfg: dict):
+    try:
+        with open(ARENA_CONFIG_PATH, "w") as _f:
+            json.dump(cfg, _f, indent=2)
+    except Exception as _e:
+        print(f"[ARENA] Config save error: {_e}")
+
+
+# ── Flight settings persistence ───────────────────────────────────────────────
+def _load_flight_config() -> dict:
+    defaults = {
+        "max_altitude_m": MAX_ALTITUDE_M,
+        "max_vertical_speed": MAX_VERTICAL_SPEED,
+        "max_tilt": MAX_TILT,
+        "max_yaw_speed": MAX_YAW_SPEED,
+    }
+    if FLIGHT_CONFIG_PATH.exists():
+        try:
+            with open(FLIGHT_CONFIG_PATH) as _f:
+                stored = json.load(_f)
+            defaults.update({k: float(v) for k, v in stored.items() if k in defaults})
+        except Exception as _e:
+            print(f"[FLIGHT CFG] Load error: {_e}")
+    return defaults
+
+def _save_flight_config():
+    try:
+        with open(FLIGHT_CONFIG_PATH, "w") as _f:
+            json.dump({"max_altitude_m": MAX_ALTITUDE_M,
+                       "max_vertical_speed": MAX_VERTICAL_SPEED,
+                       "max_tilt": MAX_TILT,
+                       "max_yaw_speed": MAX_YAW_SPEED}, _f, indent=2)
+    except Exception as _e:
+        print(f"[FLIGHT CFG] Save error: {_e}")
+
+
 class _PositioningState:
     def __init__(self):
         self.lock = threading.Lock()
@@ -283,6 +375,12 @@ if HAS_POSITIONING and POSITION_CALIB_PATH.exists():
         print(f"[POSITIONING] Loaded calibration from {POSITION_CALIB_PATH}")
     except Exception as _cal_e:
         print(f"[POSITIONING] Calibration load error: {_cal_e}")
+
+# Load arena config
+_arena_config = _load_arena_config()
+print(f"[ARENA] Loaded config: {len(_arena_config.get('markers', {}))} markers, "
+      f"size={_arena_config.get('marker_size_m')}m, "
+      f"arena {_arena_config['arena']['width_m']}x{_arena_config['arena']['depth_m']}m")
 
 
 # ---------------------------------------------------------------------------
@@ -1342,6 +1440,36 @@ def positioning_loop():
                 time.sleep(1.0)
                 continue
 
+            # Apply arena configuration to processor
+            try:
+                with _arena_cfg_lock:
+                    ac = dict(_arena_config)
+                marker_pos = {}
+                marker_wall = {}
+                for mid_s, info in ac.get("markers", {}).items():
+                    try:
+                        mid = int(mid_s)
+                        marker_pos[mid]  = np.array(info["pos"], dtype=float)
+                        marker_wall[mid] = info.get("wall", "front")
+                    except (ValueError, KeyError):
+                        pass
+                if marker_pos:
+                    processor.marker_positions  = marker_pos
+                    processor.marker_wall_type  = marker_wall
+                ms = float(ac.get("marker_size_m", 0.5))
+                processor.marker_size = ms
+                half = ms / 2.0
+                processor.MARKER_3D_POINTS = np.array([
+                    [-half,  half, 0.0],
+                    [ half,  half, 0.0],
+                    [ half, -half, 0.0],
+                    [-half, -half, 0.0],
+                ], dtype=np.float32)
+                print(f"[POSITIONING] Arena config applied: {len(marker_pos)} markers, "
+                      f"marker_size={ms}m")
+            except Exception as _ae:
+                print(f"[POSITIONING] Arena config apply error: {_ae}")
+
         # Run ArUco detection
         try:
             result = processor.process_frame(bgr)
@@ -2310,6 +2438,9 @@ def api_settings_set():
             results["geofence_enabled"] = enabled
         except Exception as e:
             results["geofence_enabled_error"] = str(e)
+    # Persist flight limits that were successfully updated
+    if any(k in results for k in ("max_altitude_m", "max_vertical_speed", "max_tilt", "max_yaw_speed")):
+        _save_flight_config()
     return jsonify(ok=True, **results)
 
 
@@ -2454,13 +2585,81 @@ def api_position_calibration_download():
 
 
 # ---------------------------------------------------------------------------
+# Arena configuration routes
+# ---------------------------------------------------------------------------
+
+@app.get("/api/arena/config")
+def api_arena_config_get():
+    """Return current arena configuration (dimensions, marker positions, marker size)."""
+    with _arena_cfg_lock:
+        return jsonify(_arena_config)
+
+
+@app.post("/api/arena/config")
+def api_arena_config_set():
+    """
+    Update arena configuration.  Send a full or partial config JSON:
+      { "arena": {"width_m": 20, "depth_m": 10, ...},
+        "marker_size_m": 0.5,
+        "markers": {"0": {"pos": [0,0,0], "wall": "front"}, ...} }
+
+    Omitted top-level keys keep their current values.
+    After saving, the positioning processor is flagged for reinit so the
+    new marker positions take effect on the next frame.
+    """
+    data = request.get_json(silent=True) or {}
+    with _arena_cfg_lock:
+        if "arena" in data and isinstance(data["arena"], dict):
+            _arena_config["arena"].update(data["arena"])
+        if "marker_size_m" in data:
+            _arena_config["marker_size_m"] = float(data["marker_size_m"])
+        if "markers" in data and isinstance(data["markers"], dict):
+            _arena_config["markers"] = data["markers"]
+        cfg_snap = dict(_arena_config)
+
+    _save_arena_config(cfg_snap)
+
+    # Reinit positioning processor so new marker layout takes effect
+    with _pos_st.lock:
+        _pos_st._reinit = True
+
+    return jsonify(ok=True,
+                   marker_count=len(cfg_snap.get("markers", {})),
+                   marker_size_m=cfg_snap.get("marker_size_m"),
+                   arena=cfg_snap.get("arena"))
+
+
+@app.post("/api/arena/config/reset")
+def api_arena_config_reset():
+    """Reset arena configuration to built-in defaults."""
+    import copy
+    with _arena_cfg_lock:
+        _arena_config.clear()
+        _arena_config.update(copy.deepcopy(_ARENA_CONFIG_DEFAULT))
+        cfg_snap = dict(_arena_config)
+    _save_arena_config(cfg_snap)
+    with _pos_st.lock:
+        _pos_st._reinit = True
+    return jsonify(ok=True, reset=True)
+
+
+# ---------------------------------------------------------------------------
 # Startup
 # ---------------------------------------------------------------------------
 
 def main():
-    global drone
+    global drone, MAX_ALTITUDE_M, MAX_VERTICAL_SPEED, MAX_TILT, MAX_YAW_SPEED
     logging.getLogger("olympe").setLevel(logging.WARNING)
     logging.getLogger("werkzeug").setLevel(logging.ERROR)
+
+    # Apply persisted flight limits (overrides env-var defaults)
+    _fc = _load_flight_config()
+    MAX_ALTITUDE_M     = _fc["max_altitude_m"]
+    MAX_VERTICAL_SPEED = _fc["max_vertical_speed"]
+    MAX_TILT           = _fc["max_tilt"]
+    MAX_YAW_SPEED      = _fc["max_yaw_speed"]
+    print(f"[FLIGHT CFG] Loaded: alt={MAX_ALTITUDE_M}m vs={MAX_VERTICAL_SPEED}m/s "
+          f"tilt={MAX_TILT}° yaw={MAX_YAW_SPEED}°/s")
 
     drone = olympe.Drone(DRONE_IP)
 

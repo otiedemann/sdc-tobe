@@ -313,6 +313,43 @@ HTML = """
       </div>
     </div>
   </div>
+
+  <div class=\"row\" style=\"margin-top:12px;\">
+    <div class=\"panel\" style=\"min-width:340px;flex:1;\">
+      <div style=\"display:flex;align-items:center;gap:10px;margin-bottom:8px;\">
+        <b>Arena Configuration</b>
+        <span class=\"small\" style=\"color:#94a3b8;\">marker layout &amp; physical dimensions</span>
+        <button id=\"arena_cfg_toggle\" style=\"margin-left:auto;padding:2px 10px;font-size:11px;background:#1e293b;\">Show</button>
+      </div>
+      <div id=\"arena_cfg_body\" style=\"display:none;\">
+        <div style=\"display:flex;gap:12px;flex-wrap:wrap;margin-bottom:8px;\">
+          <label class=\"small\">Arena width (m):
+            <input id=\"ac_width\" type=\"number\" step=\"0.5\" value=\"20\" style=\"width:70px;height:30px;border-radius:5px;border:1px solid #475569;background:#0f172a;color:#e2e8f0;padding:0 6px;\" />
+          </label>
+          <label class=\"small\">Arena depth (m):
+            <input id=\"ac_depth\" type=\"number\" step=\"0.5\" value=\"10\" style=\"width:70px;height:30px;border-radius:5px;border:1px solid #475569;background:#0f172a;color:#e2e8f0;padding:0 6px;\" />
+          </label>
+          <label class=\"small\">Height min (m):
+            <input id=\"ac_hmin\" type=\"number\" step=\"0.1\" value=\"-1\" style=\"width:60px;height:30px;border-radius:5px;border:1px solid #475569;background:#0f172a;color:#e2e8f0;padding:0 6px;\" />
+          </label>
+          <label class=\"small\">Height max (m):
+            <input id=\"ac_hmax\" type=\"number\" step=\"0.1\" value=\"1\" style=\"width:60px;height:30px;border-radius:5px;border:1px solid #475569;background:#0f172a;color:#e2e8f0;padding:0 6px;\" />
+          </label>
+          <label class=\"small\">Marker size (m):
+            <input id=\"ac_msize\" type=\"number\" step=\"0.05\" value=\"0.5\" style=\"width:65px;height:30px;border-radius:5px;border:1px solid #475569;background:#0f172a;color:#e2e8f0;padding:0 6px;\" />
+          </label>
+        </div>
+        <div class=\"small\" style=\"margin-bottom:4px;color:#94a3b8;\">Marker positions (ID · X · Y · Z · Wall)</div>
+        <div id=\"arena_marker_table\" style=\"max-height:280px;overflow-y:auto;font-size:11px;\"></div>
+        <div style=\"margin-top:6px;display:flex;gap:8px;flex-wrap:wrap;align-items:center;\">
+          <button id=\"arena_add_marker\" style=\"padding:4px 10px;font-size:11px;background:#065f46;border-color:#10b981;\">+ Add Marker</button>
+          <button id=\"arena_save\" style=\"padding:4px 10px;font-size:11px;background:#1e3a5f;border-color:#3b82f6;\">Save Config</button>
+          <button id=\"arena_reset\" style=\"padding:4px 10px;font-size:11px;background:#374151;border-color:#6b7280;\">Reset to Defaults</button>
+          <span id=\"arena_cfg_status\" class=\"small\" style=\"color:#94a3b8;\"></span>
+        </div>
+      </div>
+    </div>
+  </div>
 <script>
 // --- Drone fleet selector ---
 let drones = {};
@@ -1061,6 +1098,134 @@ document.getElementById('pos_video_toggle').onclick = () => {
 
 loadPosConfig();
 drawArena(null, null, null);
+
+// ── Arena Configuration ───────────────────────────────────────────────────────
+let arenaMarkers = {};   // {id_str: {pos:[x,y,z], wall:'front'}}
+
+const WALLS = ['front','back','left','right'];
+
+function renderMarkerTable() {
+  const tbody = document.getElementById('arena_marker_table');
+  const sorted = Object.keys(arenaMarkers).sort((a,b) => Number(a)-Number(b));
+  tbody.innerHTML = '';
+  const rowStyle = 'display:flex;gap:4px;align-items:center;margin-bottom:3px;';
+  const iStyle = 'height:26px;border-radius:4px;border:1px solid #334155;background:#0f172a;color:#e2e8f0;padding:0 4px;';
+  sorted.forEach(id => {
+    const m = arenaMarkers[id];
+    const row = document.createElement('div');
+    row.style.cssText = rowStyle;
+    const wallOpts = WALLS.map(w => `<option value="${w}" ${m.wall===w?'selected':''}>${w}</option>`).join('');
+    row.innerHTML = `
+      <span style="min-width:24px;text-align:right;color:#94a3b8;font-size:11px;">${id}</span>
+      <input type="number" step="0.001" value="${m.pos[0]}" data-id="${id}" data-f="0" style="${iStyle}width:58px;" title="X" />
+      <input type="number" step="0.001" value="${m.pos[1]}" data-id="${id}" data-f="1" style="${iStyle}width:58px;" title="Y" />
+      <input type="number" step="0.001" value="${m.pos[2]}" data-id="${id}" data-f="2" style="${iStyle}width:52px;" title="Z" />
+      <select data-id="${id}" data-f="wall" style="${iStyle}width:70px;">${wallOpts}</select>
+      <button data-del="${id}" style="padding:1px 6px;font-size:10px;background:#7f1d1d;border-color:#dc2626;">✕</button>
+    `;
+    tbody.appendChild(row);
+  });
+  // Bind change events
+  tbody.querySelectorAll('input[data-f]').forEach(el => {
+    el.addEventListener('change', () => {
+      const id = el.dataset.id, f = parseInt(el.dataset.f);
+      if (arenaMarkers[id]) arenaMarkers[id].pos[f] = parseFloat(el.value) || 0;
+    });
+  });
+  tbody.querySelectorAll('select[data-f]').forEach(el => {
+    el.addEventListener('change', () => {
+      if (arenaMarkers[el.dataset.id]) arenaMarkers[el.dataset.id].wall = el.value;
+    });
+  });
+  tbody.querySelectorAll('button[data-del]').forEach(btn => {
+    btn.addEventListener('click', () => {
+      delete arenaMarkers[btn.dataset.del];
+      renderMarkerTable();
+    });
+  });
+}
+
+async function loadArenaConfig() {
+  try {
+    const r = await fetch('/proxy/arena/config');
+    const d = await r.json();
+    if (d.arena) {
+      document.getElementById('ac_width').value = d.arena.width_m ?? 20;
+      document.getElementById('ac_depth').value = d.arena.depth_m ?? 10;
+      document.getElementById('ac_hmin').value  = d.arena.height_min_m ?? -1;
+      document.getElementById('ac_hmax').value  = d.arena.height_max_m ?? 1;
+    }
+    if (d.marker_size_m != null) document.getElementById('ac_msize').value = d.marker_size_m;
+    if (d.markers) { arenaMarkers = JSON.parse(JSON.stringify(d.markers)); renderMarkerTable(); }
+    // Also update arena canvas dimensions
+    if (d.arena) { ARENA_W_dyn = d.arena.width_m || 20; ARENA_D_dyn = d.arena.depth_m || 10; }
+  } catch {}
+}
+
+document.getElementById('arena_cfg_toggle').onclick = function() {
+  const body = document.getElementById('arena_cfg_body');
+  const hidden = body.style.display === 'none';
+  body.style.display = hidden ? '' : 'none';
+  this.textContent = hidden ? 'Hide' : 'Show';
+  if (hidden) loadArenaConfig();
+};
+
+document.getElementById('arena_add_marker').onclick = () => {
+  const ids = Object.keys(arenaMarkers).map(Number).filter(n=>!isNaN(n));
+  const newId = String(ids.length ? Math.max(...ids) + 1 : 30);
+  arenaMarkers[newId] = {pos: [0, 0, 0], wall: 'front'};
+  renderMarkerTable();
+  // Scroll to bottom
+  const tb = document.getElementById('arena_marker_table');
+  tb.scrollTop = tb.scrollHeight;
+};
+
+document.getElementById('arena_save').onclick = async () => {
+  // Sync any un-committed inputs
+  document.querySelectorAll('#arena_marker_table input[data-f]').forEach(el => {
+    const id = el.dataset.id, f = parseInt(el.dataset.f);
+    if (arenaMarkers[id]) arenaMarkers[id].pos[f] = parseFloat(el.value) || 0;
+  });
+  document.querySelectorAll('#arena_marker_table select[data-f]').forEach(el => {
+    if (arenaMarkers[el.dataset.id]) arenaMarkers[el.dataset.id].wall = el.value;
+  });
+  const payload = {
+    arena: {
+      width_m: parseFloat(document.getElementById('ac_width').value),
+      depth_m: parseFloat(document.getElementById('ac_depth').value),
+      height_min_m: parseFloat(document.getElementById('ac_hmin').value),
+      height_max_m: parseFloat(document.getElementById('ac_hmax').value),
+    },
+    marker_size_m: parseFloat(document.getElementById('ac_msize').value),
+    markers: arenaMarkers,
+  };
+  const st = document.getElementById('arena_cfg_status');
+  st.textContent = 'saving...'; st.style.color = '#94a3b8';
+  try {
+    const r = await fetch('/proxy/arena/config', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify(payload)
+    });
+    const d = await r.json();
+    st.textContent = d.ok ? `\\u2713 saved (${d.marker_count} markers)` : ('error: ' + (d.error||'?'));
+    st.style.color = d.ok ? '#22c55e' : '#ef4444';
+  } catch(e) { st.textContent = 'error: ' + e.message; st.style.color = '#ef4444'; }
+};
+
+document.getElementById('arena_reset').onclick = async () => {
+  if (!confirm('Reset arena config to built-in defaults?')) return;
+  const st = document.getElementById('arena_cfg_status');
+  st.textContent = 'resetting...'; st.style.color = '#94a3b8';
+  try {
+    const r = await fetch('/proxy/arena/config/reset', {method:'POST', headers:{'Content-Type':'application/json'}, body:'{}'});
+    const d = await r.json();
+    if (d.ok) { await loadArenaConfig(); st.textContent = '\\u2713 reset to defaults'; st.style.color = '#22c55e'; }
+    else { st.textContent = 'error'; st.style.color = '#ef4444'; }
+  } catch(e) { st.textContent = 'error: ' + e.message; st.style.color = '#ef4444'; }
+};
+
+// Dynamic arena dimensions (updated when config is loaded)
+let ARENA_W_dyn = 20, ARENA_D_dyn = 10;
 </script>
 </body>
 </html>
@@ -1741,6 +1906,36 @@ def proxy_position_calibration():
                         content_type=resp.headers.get("Content-Type", "application/json"))
     except Exception as e:
         return jsonify(ok=False, error=str(e)), 500
+
+
+# ── Arena configuration proxy ─────────────────────────────────────────────────
+
+@app.get("/proxy/arena/config")
+def proxy_arena_config_get():
+    try:
+        r = pi_get("/api/arena/config", timeout=TIMEOUT_STATUS)
+        return (r.text, r.status_code, {"Content-Type": r.headers.get("Content-Type", "application/json")})
+    except Exception as e:
+        return jsonify(ok=False, error=str(e)), 502
+
+
+@app.post("/proxy/arena/config")
+def proxy_arena_config_set():
+    data = request.get_json(silent=True) or {}
+    try:
+        r = pi_post("/api/arena/config", data)
+        return (r.text, r.status_code, {"Content-Type": r.headers.get("Content-Type", "application/json")})
+    except Exception as e:
+        return jsonify(ok=False, error=str(e)), 502
+
+
+@app.post("/proxy/arena/config/reset")
+def proxy_arena_config_reset():
+    try:
+        r = pi_post("/api/arena/config/reset", {})
+        return (r.text, r.status_code, {"Content-Type": r.headers.get("Content-Type", "application/json")})
+    except Exception as e:
+        return jsonify(ok=False, error=str(e)), 502
 
 
 def main():
