@@ -733,16 +733,33 @@ def main():
     # Decide which capture backend to use
     use_olympe = (args.src is None) and HAS_OLYMPE
 
+    # Abort early with a helpful message when there is no valid video source
+    if not use_olympe and args.src is None:
+        print()
+        print("[tracker] ERROR: Cannot start — no video source available.")
+        print("[tracker]")
+        print("[tracker]   olympe is not installed on this machine, so Olympe-direct")
+        print("[tracker]   mode (the default) cannot be used.")
+        print()
+        print("[tracker]   Options:")
+        print(f"[tracker]     Run on the Pi (where olympe is installed):")
+        print(f"[tracker]       python arena_tracker_server.py")
+        print()
+        print(f"[tracker]     Or use the Pi's HTTP MJPEG stream as fallback:")
+        print(f"[tracker]       python arena_tracker_server.py --src http://PI_IP:8080/api/video")
+        print(f"[tracker]     (Start the MJPEG stream first:  POST /api/video/start?mode=mjpeg)")
+        print()
+        print(f"[tracker]     Or use a local USB / built-in camera:")
+        print(f"[tracker]       python arena_tracker_server.py --src 0")
+        print()
+        sys.exit(1)
+
     print(f"[tracker] Arena Position Tracker")
     if use_olympe:
         print(f"[tracker]   Mode:    Olympe-direct (Anafi @ {args.drone})")
     else:
-        src_raw = args.src if args.src else "cv2 (no --src given, Olympe unavailable)"
-        src = int(args.src) if (args.src and args.src.isdigit()) else args.src
-        print(f"[tracker]   Mode:    cv2.VideoCapture  src={src_raw}")
-        if not HAS_OLYMPE and args.src is None:
-            print("[tracker]   WARNING: olympe not installed; falling back to cv2 with no source.")
-            print("[tracker]   Use --src to specify a camera URL or device index.")
+        src_display = args.src
+        print(f"[tracker]   Mode:    cv2.VideoCapture  src={src_display}")
     print(f"[tracker]   Profile: {args.detect}")
     print(f"[tracker]   FOV:     {args.fov}°")
     print(f"[tracker]   Latency: {args.latency} ms (initial)")
@@ -755,7 +772,7 @@ def main():
             args=(args.drone, args.calib, args.fov, args.detect),
             daemon=True, name="capture-olympe")
     else:
-        src = int(args.src) if (args.src and args.src.isdigit()) else (args.src or 0)
+        src = int(args.src) if args.src.isdigit() else args.src
         cap_thread = threading.Thread(
             target=capture_loop_cv2,
             args=(src, args.calib, args.fov, args.detect),
