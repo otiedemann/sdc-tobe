@@ -145,6 +145,21 @@ HTML = """
       <div class=\"small\" style=\"margin-top:8px;\">Keyboard in browser: W/A/S/D R/F Q/E, T, L, Space stop</div>
     </div>
 
+    <div class=\"panel\" style=\"min-width:320px; flex:1;\">
+      <div style=\"display:flex; align-items:center; gap:12px; flex-wrap:wrap; margin-bottom:8px;\">
+        <b>Mission</b>
+        <label class=\"small\" style=\"display:flex; align-items:center; gap:6px;\">
+          Step delay (ms):
+          <input id=\"mission_delay\" type=\"number\" min=\"0\" max=\"30000\" step=\"100\" value=\"500\" style=\"width:80px;\" />
+        </label>
+        <button id=\"mission_run\" style=\"background:#166534; border-color:#16a34a; color:#dcfce7;\">&#9654; Run</button>
+        <button id=\"mission_stop\" style=\"background:#7f1d1d; border-color:#b91c1c; color:#fee2e2;\" disabled>&#9632; Stop</button>
+        <span id=\"mission_status\" class=\"small\" style=\"color:#94a3b8;\"></span>
+      </div>
+      <textarea id=\"mission_editor\" rows=\"12\" spellcheck=\"false\" style=\"width:100%; box-sizing:border-box; background:#0f172a; color:#e2e8f0; border:1px solid #334155; border-radius:6px; padding:8px; font-family:monospace; font-size:13px; resize:vertical;\" placeholder=\"# Mission script&#10;# Commands: takeoff  land  forward <cm>  back <cm>&#10;#           left <cm>  right <cm>  up <cm>  down <cm>&#10;#           rotate cw <deg>  rotate ccw <deg>&#10;#           delay <ms>  (extra pause at this step)&#10;# Lines starting with # are comments&#10;&#10;takeoff&#10;forward 500&#10;rotate cw 90&#10;forward 500&#10;land\"></textarea>
+      <div class=\"small\" style=\"margin-top:4px; color:#475569;\">Commands: takeoff &nbsp;|&nbsp; land &nbsp;|&nbsp; forward/back/left/right/up/down &lt;cm&gt; &nbsp;|&nbsp; rotate cw/ccw &lt;deg&gt; &nbsp;|&nbsp; delay &lt;ms&gt;</div>
+    </div>
+
     <div class=\"panel\">
       <div><b>Telemetry</b></div>
       <div class=\"status-wrap\">
@@ -477,6 +492,101 @@ refreshTelemetry();
 refreshLogStatus();
 refreshSafeTakeoff();
 refreshCommandLogStatus();
+
+// --- Mission runner ---
+let missionRunning = false;
+let missionAbort = false;
+
+function parseMission(text) {
+  const steps = [];
+  for (const raw of text.split('\\n')) {
+    const line = raw.trim();
+    if (!line || line.startsWith('#')) continue;
+    const parts = line.split(/\\s+/);
+    const cmd = parts[0].toLowerCase();
+    if (cmd === 'takeoff') {
+      steps.push({ type: 'takeoff' });
+    } else if (cmd === 'land') {
+      steps.push({ type: 'land' });
+    } else if (['forward','back','left','right','up','down'].includes(cmd)) {
+      const cm = parseInt(parts[1]);
+      if (isNaN(cm)) throw new Error('Missing cm value for: ' + line);
+      steps.push({ type: 'move', dir: cmd, cm });
+    } else if (cmd === 'rotate') {
+      const dir = (parts[1] || '').toLowerCase();
+      if (!['cw','ccw'].includes(dir)) throw new Error('rotate needs cw or ccw: ' + line);
+      const deg = parseInt(parts[2]);
+      if (isNaN(deg)) throw new Error('Missing deg for: ' + line);
+      steps.push({ type: 'rotate', dir, deg });
+    } else if (cmd === 'delay') {
+      const ms = parseInt(parts[1]);
+      if (isNaN(ms)) throw new Error('Missing ms for: ' + line);
+      steps.push({ type: 'delay', ms });
+    } else {
+      throw new Error('Unknown command: ' + cmd);
+    }
+  }
+  return steps;
+}
+
+async function runStep(step) {
+  if (step.type === 'takeoff')  return post('/proxy/takeoff', {});
+  if (step.type === 'land')     return post('/proxy/land', {});
+  if (step.type === 'move')     return post('/proxy/move', { dir: step.dir, cm: step.cm });
+  if (step.type === 'rotate')   return post('/proxy/rotate', { dir: step.dir, deg: step.deg });
+  if (step.type === 'delay')    return new Promise(r => setTimeout(r, step.ms));
+}
+
+async function runMission() {
+  const text = document.getElementById('mission_editor').value;
+  let steps;
+  try {
+    steps = parseMission(text);
+  } catch (e) {
+    document.getElementById('mission_status').textContent = 'Parse error: ' + e.message;
+    document.getElementById('mission_status').style.color = '#f87171';
+    return;
+  }
+  if (steps.length === 0) {
+    document.getElementById('mission_status').textContent = 'No steps found.';
+    return;
+  }
+
+  const stepDelayMs = parseInt(document.getElementById('mission_delay').value) || 0;
+  missionRunning = true;
+  missionAbort = false;
+  document.getElementById('mission_run').disabled = true;
+  document.getElementById('mission_stop').disabled = false;
+
+  const statusEl = document.getElementById('mission_status');
+  statusEl.style.color = '#94a3b8';
+
+  for (let i = 0; i < steps.length; i++) {
+    if (missionAbort) break;
+    const step = steps[i];
+    statusEl.textContent = `Step ${i + 1}/${steps.length}: ${JSON.stringify(step)}`;
+    statusEl.style.color = '#60a5fa';
+    await runStep(step);
+    if (missionAbort) break;
+    if (stepDelayMs > 0 && step.type !== 'delay') {
+      await new Promise(r => setTimeout(r, stepDelayMs));
+    }
+  }
+
+  missionRunning = false;
+  document.getElementById('mission_run').disabled = false;
+  document.getElementById('mission_stop').disabled = true;
+  if (missionAbort) {
+    statusEl.textContent = 'Mission stopped.';
+    statusEl.style.color = '#fb923c';
+  } else {
+    statusEl.textContent = `Done (${steps.length} steps).`;
+    statusEl.style.color = '#4ade80';
+  }
+}
+
+document.getElementById('mission_run').onclick = () => { if (!missionRunning) runMission(); };
+document.getElementById('mission_stop').onclick = () => { missionAbort = true; };
 </script>
 </body>
 </html>

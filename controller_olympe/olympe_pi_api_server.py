@@ -880,7 +880,7 @@ def api_move():
 
     try:
         dist_cm = int(data.get("cm", 20))
-        dist_cm = max(20, min(500, dist_cm))
+        dist_cm = max(20, min(2000, dist_cm))
         dist_m = dist_cm / 100.0
 
         # Olympe moveBy: dX=forward(+), dY=right(+), dZ=down(+), dPsi=yaw(rad)
