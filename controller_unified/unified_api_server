@@ -325,12 +325,43 @@ _pos_cfg: dict = {
     "dist_coeffs": None,
 }
 
-# Arena config
+# Arena config — SDC challenge default layout.
+# Coordinates: X = left(-10) / right(+10), Y = near(0) / far(10), Z = low(-1) / high(+1).
+# Markers come in vertical pairs (low/high) except ID 0 (origin).
+# Wall types: 'front'=Y=0 wall, 'back'=Y=10 wall, 'right'=X=+10, 'left'=X=-10.
 _ARENA_CONFIG_DEFAULT: dict = {
-    "arena_width_m": 10.0,
+    "arena_width_m": 20.0,
     "arena_height_m": 10.0,
+    "arena_origin_x": -10.0,
+    "arena_origin_y": 0.0,
     "marker_size_m": 0.5,
-    "markers": [],   # list of {id, x, y, z, wall}
+    "markers": [
+        {"id":  0, "label": "Origin",       "x":   0.0, "y":  0.0,   "z":  0.0, "wall": "front"},
+        {"id":  1, "label": "Right A low",  "x":  10.0, "y":  6.667, "z": -1.0, "wall": "right"},
+        {"id":  2, "label": "Right A high", "x":  10.0, "y":  6.667, "z":  1.0, "wall": "right"},
+        {"id":  3, "label": "Right B low",  "x":  10.0, "y":  3.333, "z": -1.0, "wall": "right"},
+        {"id":  4, "label": "Right B high", "x":  10.0, "y":  3.333, "z":  1.0, "wall": "right"},
+        {"id":  5, "label": "Front A low",  "x":   6.0, "y":  0.0,   "z": -1.0, "wall": "front"},
+        {"id":  6, "label": "Front A high", "x":   6.0, "y":  0.0,   "z":  1.0, "wall": "front"},
+        {"id":  7, "label": "Front B low",  "x":   2.0, "y":  0.0,   "z": -1.0, "wall": "front"},
+        {"id":  8, "label": "Front B high", "x":   2.0, "y":  0.0,   "z":  1.0, "wall": "front"},
+        {"id":  9, "label": "Front C low",  "x":  -2.0, "y":  0.0,   "z": -1.0, "wall": "front"},
+        {"id": 10, "label": "Front C high", "x":  -2.0, "y":  0.0,   "z":  1.0, "wall": "front"},
+        {"id": 11, "label": "Front D low",  "x":  -6.0, "y":  0.0,   "z": -1.0, "wall": "front"},
+        {"id": 12, "label": "Front D high", "x":  -6.0, "y":  0.0,   "z":  1.0, "wall": "front"},
+        {"id": 13, "label": "Left A low",   "x": -10.0, "y":  3.333, "z": -1.0, "wall": "left"},
+        {"id": 14, "label": "Left A high",  "x": -10.0, "y":  3.333, "z":  1.0, "wall": "left"},
+        {"id": 15, "label": "Left B low",   "x": -10.0, "y":  6.667, "z": -1.0, "wall": "left"},
+        {"id": 16, "label": "Left B high",  "x": -10.0, "y":  6.667, "z":  1.0, "wall": "left"},
+        {"id": 17, "label": "Back A low",   "x":  -6.0, "y": 10.0,   "z": -1.0, "wall": "back"},
+        {"id": 18, "label": "Back A high",  "x":  -6.0, "y": 10.0,   "z":  1.0, "wall": "back"},
+        {"id": 19, "label": "Back B low",   "x":  -2.0, "y": 10.0,   "z": -1.0, "wall": "back"},
+        {"id": 20, "label": "Back B high",  "x":  -2.0, "y": 10.0,   "z":  1.0, "wall": "back"},
+        {"id": 21, "label": "Back C low",   "x":   2.0, "y": 10.0,   "z": -1.0, "wall": "back"},
+        {"id": 22, "label": "Back C high",  "x":   2.0, "y": 10.0,   "z":  1.0, "wall": "back"},
+        {"id": 23, "label": "Back D low",   "x":   6.0, "y": 10.0,   "z": -1.0, "wall": "back"},
+        {"id": 24, "label": "Back D high",  "x":   6.0, "y": 10.0,   "z":  1.0, "wall": "back"},
+    ],
 }
 _arena_cfg: dict = {}
 _arena_cfg_lock = threading.Lock()

@@ -298,8 +298,9 @@ class HeadlessAruCoPositioning:
             self.direction_filter.reset()
             return None
         cached_poses = {}
-        marker_points = np.array([[-0.25, 0.25, 0], [0.25, 0.25, 0], [0.25, -0.25, 0], [-0.25, -0.25, 0]],
-                                 dtype=np.float32)
+        # Use self.MARKER_3D_POINTS so that the configured marker_size_m is
+        # taken into account when estimating camera-to-marker distance via solvePnP.
+        marker_points = self.MARKER_3D_POINTS.astype(np.float32)
         for i, mid_raw in enumerate(ids.flatten()):
             mid = int(mid_raw)
             ok, rvec, tvec = cv2.solvePnP(marker_points, corners[i].reshape(-1, 2), self.camera_matrix,
