@@ -6,6 +6,8 @@ import os
 import threading
 import time
 from pathlib import Path
+import queue
+import sys
 from typing import Dict, Optional, Set, Tuple
 
 import olympe
@@ -87,6 +89,18 @@ try:
 except ImportError:
     HAS_CV2 = False
 
+# Optional: ArUco positioning subsystem (pi_position.py from aruco-position/)
+try:
+    _pos_module_dir = Path(__file__).parent.parent / "aruco-position" / "control-unit"
+    if str(_pos_module_dir) not in sys.path:
+        sys.path.insert(0, str(_pos_module_dir))
+    from pi_position import HeadlessAruCoPositioning as _HeadlessAruCo
+    HAS_POSITIONING = HAS_CV2  # also requires cv2
+except ImportError as _pos_exc:
+    HAS_POSITIONING = False
+    _HeadlessAruCo = None
+    print(f"[ANAFI API] ArUco positioning unavailable: {_pos_exc}")
+
 # Optional: subprocess for Way 2 (UDP forwarding)
 import shutil
 import subprocess
@@ -123,6 +137,10 @@ COMMAND_LOG_ENABLED = os.getenv("API_COMMAND_LOG", "1") in {"1", "true", "True"}
 COMMAND_LOG_PATH = Path(
     os.getenv("API_COMMAND_LOG_PATH", str(Path(__file__).with_name("api_command_log.jsonl")))
 )
+
+# Positioning subsystem config
+POSITION_CONFIG_PATH = Path(__file__).with_name("position_config.json")
+POSITION_CALIB_PATH  = Path(__file__).with_name("position_calib.npz")
 
 # ---------------------------------------------------------------------------
 # Global state
@@ -194,6 +212,77 @@ _video_streaming = False  # True when pdraw callbacks are active
 _video_forward_proc = None  # subprocess for UDP forwarding (Way 2)
 _video_forward_target = ""  # "host:port" for UDP forwarding
 _video_frame_count = 0
+
+
+# ---------------------------------------------------------------------------
+# Positioning subsystem state
+# ---------------------------------------------------------------------------
+
+def _load_position_config() -> dict:
+    defaults = {"enabled": False, "detect_profile": "balanced",
+                "fov_deg": 69.0, "latency_ms": 200.0}
+    if POSITION_CONFIG_PATH.exists():
+        try:
+            with open(POSITION_CONFIG_PATH) as _f:
+                defaults.update(json.load(_f))
+        except Exception as _e:
+            print(f"[POSITIONING] Config load error: {_e}")
+    return defaults
+
+def _save_position_config(cfg: dict):
+    try:
+        with open(POSITION_CONFIG_PATH, "w") as _f:
+            json.dump(cfg, _f, indent=2)
+    except Exception as _e:
+        print(f"[POSITIONING] Config save error: {_e}")
+
+
+class _PositioningState:
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.frame_cond = threading.Condition(self.lock)
+        cfg = _load_position_config()
+        self.enabled: bool          = bool(cfg.get("enabled", False))
+        self.detect_profile: str    = str(cfg.get("detect_profile", "balanced"))
+        self.fov_deg: float         = float(cfg.get("fov_deg", 69.0))
+        self.latency_ms: float      = float(cfg.get("latency_ms", 200.0))
+        self.camera_matrix          = None   # np.ndarray or None
+        self.dist_coeffs            = None   # np.ndarray or None
+        # Results
+        self.pos                    = None
+        self.dir_vec                = None
+        self.pos_ts: float          = 0.0
+        self.ref_markers: list      = []
+        self.marker_weights: dict   = {}
+        self.stale: bool            = False
+        self.vel: list              = [0.0, 0.0, 0.0]
+        self.vel_ts: float          = 0.0
+        self._prev_pos              = None
+        self._prev_pos_ts: float    = 0.0
+        # Annotated MJPEG
+        self.frame_jpg: bytes | None = None
+        self.frame_seq: int          = 0
+        # Metrics
+        self.fps: float             = 0.0
+        self.proc_active: bool      = False
+        self._reinit: bool          = False
+
+
+_pos_st = _PositioningState()
+_pos_sse_queues: list = []
+_pos_sse_lock = threading.Lock()
+_pos_frame_q: queue.Queue = queue.Queue(maxsize=3)
+
+# Load saved calibration
+if HAS_POSITIONING and POSITION_CALIB_PATH.exists():
+    try:
+        import numpy as _np_cal
+        _cal = _np_cal.load(str(POSITION_CALIB_PATH))
+        _pos_st.camera_matrix = _cal["camera_matrix"]
+        _pos_st.dist_coeffs   = _cal["dist_coeffs"]
+        print(f"[POSITIONING] Loaded calibration from {POSITION_CALIB_PATH}")
+    except Exception as _cal_e:
+        print(f"[POSITIONING] Calibration load error: {_cal_e}")
 
 
 # ---------------------------------------------------------------------------
@@ -881,6 +970,12 @@ def _video_frame_callback(yuv_frame):
             if _video_frame_count == 1:
                 h, w = cv_frame.shape[:2]
                 print(f"[ANAFI API] First video frame decoded: {w}x{h}")
+            # Feed ArUco positioning subsystem (non-blocking, drop if full)
+            if _pos_st.enabled and HAS_POSITIONING:
+                try:
+                    _pos_frame_q.put_nowait((cv_frame.copy(), time.time()))
+                except queue.Full:
+                    pass
     except Exception as e:
         if _video_frame_count == 0:
             print(f"[ANAFI API] Video frame decode error: {e}")
@@ -1108,6 +1203,215 @@ def stop_all_video():
     stop_video_mjpeg()
     stop_video_forward()
     _video_mode = "off"
+
+
+
+# ---------------------------------------------------------------------------
+# Positioning subsystem helpers and loop
+# ---------------------------------------------------------------------------
+
+def _broadcast_pos_sse(data: dict):
+    msg = f"data: {json.dumps(data)}\n\n"
+    with _pos_sse_lock:
+        dead = []
+        for _q in _pos_sse_queues:
+            try:
+                _q.put_nowait(msg)
+            except queue.Full:
+                dead.append(_q)
+        for _q in dead:
+            try:
+                _pos_sse_queues.remove(_q)
+            except ValueError:
+                pass
+
+
+def _pos_update_velocity(new_pos: list, ts: float):
+    """EMA-smoothed velocity from position deltas. Must hold _pos_st.lock before calling."""
+    prev = _pos_st._prev_pos
+    prev_ts = _pos_st._prev_pos_ts
+    if prev is not None:
+        dt = ts - prev_ts
+        if 0.04 < dt < 1.5:
+            raw = [(new_pos[i] - prev[i]) / dt for i in range(3)]
+            raw = [max(-15.0, min(15.0, v)) for v in raw]
+            alpha = 0.25
+            _pos_st.vel = [alpha * raw[i] + (1 - alpha) * _pos_st.vel[i] for i in range(3)]
+            _pos_st.vel_ts = ts
+    _pos_st._prev_pos = new_pos[:]
+    _pos_st._prev_pos_ts = ts
+
+
+def _pos_annotate(bgr: "np.ndarray", processor, result, fps: float) -> "np.ndarray":
+    """Draw ArUco detections and position overlay on frame."""
+    from cv2 import aruco as _aruco
+    out = bgr.copy()
+    h, w = out.shape[:2]
+    pos = dir_vec = None
+    weights: dict = {}
+    stale = False
+    if result:
+        pos     = result.get("cam")
+        dir_vec = result.get("dir")
+        weights = result.get("marker_weights", {})
+        stale   = result.get("stale", False)
+    gray = cv2.cvtColor(out, cv2.COLOR_BGR2GRAY)
+    corners, ids, _ = processor.detector.detectMarkers(gray)
+    if ids is not None and len(ids) > 0:
+        _aruco.drawDetectedMarkers(out, corners, ids)
+        for i, mid in enumerate(ids.flatten()):
+            mid_s = str(int(mid))
+            wt = weights.get(mid_s)
+            pts = corners[i].reshape(4, 2).astype(int)
+            cx_m, cy_m = int(pts[:, 0].mean()), int(pts[:, 1].mean())
+            label = f"ID{int(mid)}" + (f" {wt:.2f}" if wt is not None else "")
+            cv2.putText(out, label, (cx_m - 20, cy_m - 6),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.42, (50, 255, 120), 1, cv2.LINE_AA)
+    lines = []
+    if pos:
+        lines.append(f"X={pos[0]:+6.2f}m  Y={pos[1]:6.2f}m  Z={pos[2]:+5.2f}m")
+    n_ref = len(weights)
+    tag = " [STALE]" if stale else ""
+    lines.append(f"Refs:{n_ref}  FPS:{fps:.1f}{tag}")
+    for i, line in enumerate(lines):
+        y = 20 + i * 22
+        tw = cv2.getTextSize(line, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)[0][0]
+        cv2.rectangle(out, (3, y - 15), (7 + tw, y + 5), (0, 0, 0), -1)
+        color = (80, 200, 80) if not stale else (255, 180, 60)
+        cv2.putText(out, line, (5, y), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1, cv2.LINE_AA)
+    if dir_vec:
+        cx_f, cy_f = w // 2, h // 2
+        ax, ay = dir_vec[0], -dir_vec[1]
+        n = math.sqrt(ax * ax + ay * ay) + 1e-9
+        ex = int(cx_f + (ax / n) * 50)
+        ey = int(cy_f + (ay / n) * 50)
+        cv2.arrowedLine(out, (cx_f, cy_f), (ex, ey), (0, 210, 255), 2, tipLength=0.28)
+    return out
+
+
+def _default_camera_matrix_pos(w: int, h: int, fov_deg: float) -> "np.ndarray":
+    f = (w / 2.0) / math.tan(math.radians(fov_deg / 2.0))
+    return np.array([[f, 0, w / 2.0], [0, f, h / 2.0], [0, 0, 1]], dtype=float)
+
+
+def positioning_loop():
+    """Background thread: reads BGR frames from _pos_frame_q, runs ArUco, publishes SSE."""
+    if not HAS_POSITIONING:
+        print("[POSITIONING] Module unavailable — positioning loop not started.")
+        return
+
+    processor = None
+    fps_buf: list = []
+    last_profile = None
+
+    while running:
+        if not _pos_st.enabled:
+            time.sleep(0.5)
+            processor = None  # reset so processor reinits when re-enabled
+            continue
+
+        try:
+            bgr, ts = _pos_frame_q.get(timeout=1.0)
+        except queue.Empty:
+            continue
+
+        # Get current config snapshot
+        with _pos_st.lock:
+            profile  = _pos_st.detect_profile
+            fov      = _pos_st.fov_deg
+            cam_mat  = _pos_st.camera_matrix
+            dist_c   = (_pos_st.dist_coeffs if _pos_st.dist_coeffs is not None
+                        else np.zeros(5, dtype=float))
+            reinit   = _pos_st._reinit
+            if reinit:
+                _pos_st._reinit = False
+
+        # (Re)initialize processor
+        if processor is None or reinit or profile != last_profile:
+            h, w = bgr.shape[:2]
+            if cam_mat is None:
+                cam_mat = _default_camera_matrix_pos(w, h, fov)
+            try:
+                processor = _HeadlessAruCo(cam_mat, dist_c, detect_profile=profile)
+                last_profile = profile
+                print(f"[POSITIONING] Processor initialized ({w}x{h}, profile={profile})")
+                with _pos_st.lock:
+                    _pos_st.proc_active = True
+            except Exception as e:
+                print(f"[POSITIONING] Processor init failed: {e}")
+                time.sleep(1.0)
+                continue
+
+        # Run ArUco detection
+        try:
+            result = processor.process_frame(bgr)
+        except Exception as e:
+            print(f"[POSITIONING] process_frame error: {e}")
+            continue
+
+        pos = dir_vec = None
+        weights: dict = {}
+        ref_markers: list = []
+        stale = False
+        if result:
+            pos         = result.get("cam")
+            dir_vec     = result.get("dir")
+            weights     = result.get("marker_weights", {})
+            ref_markers = result.get("ref_markers", [])
+            stale       = result.get("stale", False)
+
+        # FPS rolling window
+        fps_buf.append(ts)
+        while fps_buf and ts - fps_buf[0] > 2.0:
+            fps_buf.pop(0)
+        fps = len(fps_buf) / 2.0
+
+        # Annotate frame
+        ann = _pos_annotate(bgr, processor, result, fps)
+        _, jpg_enc = cv2.imencode(".jpg", ann, [cv2.IMWRITE_JPEG_QUALITY, 72])
+        jpg_bytes = jpg_enc.tobytes()
+
+        # Update shared state
+        with _pos_st.frame_cond:
+            if pos:
+                _pos_update_velocity(pos, ts)
+            _pos_st.pos           = pos
+            _pos_st.dir_vec       = dir_vec
+            _pos_st.pos_ts        = ts
+            _pos_st.ref_markers   = ref_markers[:]
+            _pos_st.marker_weights = dict(weights)
+            _pos_st.stale         = stale
+            _pos_st.fps           = fps
+            _pos_st.frame_jpg     = jpg_bytes
+            _pos_st.frame_seq    += 1
+            _pos_st.frame_cond.notify_all()
+
+        # Pull telemetry for SSE enrichment
+        with telemetry_lock:
+            batt = telemetry.get("battery")
+            yaw  = telemetry.get("yaw")
+            alt  = telemetry.get("height_cm")
+
+        with _pos_st.lock:
+            vel_snap = _pos_st.vel[:]
+            lat      = _pos_st.latency_ms
+
+        _broadcast_pos_sse({
+            "ts": ts,
+            "pos": pos,
+            "dir": dir_vec,
+            "vel": vel_snap,
+            "latency_ms": lat,
+            "ref_markers": ref_markers,
+            "marker_weights": weights,
+            "stale": stale,
+            "fps": round(fps, 1),
+            "battery_pct": batt,
+            "altitude_cm": alt,
+            "yaw_deg": yaw,
+        })
+
+    print("[POSITIONING] Loop exited.")
 
 
 # ---------------------------------------------------------------------------
@@ -2010,6 +2314,146 @@ def api_settings_set():
 
 
 # ---------------------------------------------------------------------------
+# Positioning API routes
+# ---------------------------------------------------------------------------
+
+@app.get("/api/position")
+def api_position_get():
+    with _pos_st.lock:
+        return jsonify({
+            "enabled":        _pos_st.enabled,
+            "pos":            _pos_st.pos,
+            "dir":            _pos_st.dir_vec,
+            "vel":            _pos_st.vel[:],
+            "ref_markers":    _pos_st.ref_markers[:],
+            "marker_weights": dict(_pos_st.marker_weights),
+            "stale":          _pos_st.stale,
+            "fps":            _pos_st.fps,
+            "ts":             _pos_st.pos_ts,
+            "latency_ms":     _pos_st.latency_ms,
+            "proc_active":    _pos_st.proc_active,
+        })
+
+
+@app.get("/api/position/events")
+def api_position_events():
+    """SSE: position + velocity update per processed frame."""
+    _q: queue.Queue = queue.Queue(maxsize=12)
+    with _pos_sse_lock:
+        _pos_sse_queues.append(_q)
+
+    def generate():
+        try:
+            with _pos_st.lock:
+                init = {
+                    "ts": time.time(), "pos": _pos_st.pos, "dir": _pos_st.dir_vec,
+                    "vel": _pos_st.vel[:], "latency_ms": _pos_st.latency_ms,
+                    "ref_markers": _pos_st.ref_markers[:],
+                    "marker_weights": dict(_pos_st.marker_weights),
+                    "stale": _pos_st.stale, "fps": _pos_st.fps, "enabled": _pos_st.enabled,
+                }
+            yield f"data: {json.dumps(init)}\n\n"
+            while running:
+                try:
+                    yield _q.get(timeout=5.0)
+                except queue.Empty:
+                    yield ": keepalive\n\n"
+        finally:
+            with _pos_sse_lock:
+                try:
+                    _pos_sse_queues.remove(_q)
+                except ValueError:
+                    pass
+
+    return Response(generate(), mimetype="text/event-stream",
+                    headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+
+
+@app.get("/api/position/video")
+def api_position_video():
+    """MJPEG stream of ArUco-annotated camera frames."""
+    def generate():
+        last_seq = -1
+        while running:
+            with _pos_st.frame_cond:
+                if not _pos_st.frame_cond.wait_for(
+                        lambda: _pos_st.frame_seq != last_seq or not running, timeout=3.0):
+                    yield b"--frame\r\nContent-Type: image/jpeg\r\n\r\n\r\n"
+                    continue
+                if not running:
+                    break
+                jpg = _pos_st.frame_jpg
+                last_seq = _pos_st.frame_seq
+            if jpg:
+                yield b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + jpg + b"\r\n"
+    return Response(generate(), mimetype="multipart/x-mixed-replace; boundary=frame",
+                    headers={"Cache-Control": "no-store"})
+
+
+@app.get("/api/position/config")
+def api_position_config_get():
+    with _pos_st.lock:
+        return jsonify({
+            "enabled":           _pos_st.enabled,
+            "detect_profile":    _pos_st.detect_profile,
+            "fov_deg":           _pos_st.fov_deg,
+            "latency_ms":        _pos_st.latency_ms,
+            "has_calibration":   _pos_st.camera_matrix is not None,
+            "has_module":        HAS_POSITIONING,
+        })
+
+
+@app.post("/api/position/config")
+def api_position_config_set():
+    data = request.get_json(silent=True) or {}
+    with _pos_st.lock:
+        if "enabled" in data:
+            _pos_st.enabled = bool(data["enabled"])
+        if "detect_profile" in data and data["detect_profile"] in ("balanced", "sensitive", "strict"):
+            _pos_st.detect_profile = data["detect_profile"]
+            _pos_st._reinit = True
+        if "fov_deg" in data:
+            _pos_st.fov_deg = float(data["fov_deg"])
+            _pos_st._reinit = True
+        if "latency_ms" in data:
+            _pos_st.latency_ms = max(0.0, float(data["latency_ms"]))
+        cfg = {"enabled": _pos_st.enabled, "detect_profile": _pos_st.detect_profile,
+               "fov_deg": _pos_st.fov_deg, "latency_ms": _pos_st.latency_ms}
+    _save_position_config(cfg)
+    return jsonify(ok=True)
+
+
+@app.post("/api/position/calibration")
+def api_position_calibration_upload():
+    """Upload camera calibration NPZ (fields: camera_matrix, dist_coeffs)."""
+    if "file" not in request.files:
+        return jsonify(ok=False, error="no file field"), 400
+    f = request.files["file"]
+    try:
+        import io
+        raw = f.read()
+        cal_data = np.load(io.BytesIO(raw))
+        cam_mat  = cal_data["camera_matrix"]
+        dist_c   = cal_data["dist_coeffs"]
+        np.savez(str(POSITION_CALIB_PATH), camera_matrix=cam_mat, dist_coeffs=dist_c)
+        with _pos_st.lock:
+            _pos_st.camera_matrix = cam_mat
+            _pos_st.dist_coeffs   = dist_c
+            _pos_st._reinit       = True
+        return jsonify(ok=True, shape=list(cam_mat.shape))
+    except Exception as e:
+        return jsonify(ok=False, error=str(e)), 400
+
+
+@app.get("/api/position/calibration")
+def api_position_calibration_download():
+    if POSITION_CALIB_PATH.exists():
+        return send_file(str(POSITION_CALIB_PATH), as_attachment=True,
+                         download_name="position_calib.npz")
+    return jsonify(ok=False, error="no calibration saved"), 404
+
+
+# ---------------------------------------------------------------------------
 # Startup
 # ---------------------------------------------------------------------------
 
@@ -2026,6 +2470,7 @@ def main():
     threading.Thread(target=telemetry_loop, daemon=True).start()
     threading.Thread(target=rc_loop, daemon=True).start()
     threading.Thread(target=watchdog_loop, daemon=True).start()
+    threading.Thread(target=positioning_loop, daemon=True, name="positioning").start()
 
     print(f"[ANAFI API] http://{HTTP_HOST}:{HTTP_PORT} (waiting for Anafi at {DRONE_IP}; auto-reconnect enabled; watchdog={REMOTE_TIMEOUT_S}s)")
     app.run(host=HTTP_HOST, port=HTTP_PORT, threaded=True, use_reloader=False)

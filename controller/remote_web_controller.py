@@ -102,6 +102,15 @@ HTML = """
     .video-controls select, .video-controls input { height:36px; border-radius:8px; border:1px solid #475569; background:#0f172a; color:#e2e8f0; padding:0 8px; }
     .video-status { font-size:11px; color:#94a3b8; margin-top:4px; }
     .video-url { font-size:11px; color:#38bdf8; word-break:break-all; }
+    .pos-panel { min-width:260px; }
+    .pos-coords { font-family:monospace; font-size:14px; letter-spacing:0.05em; margin:8px 0; }
+    .pos-x { color:#38bdf8; } .pos-y { color:#4ade80; } .pos-z { color:#fb923c; }
+    .pos-stale { color:#f59e0b; font-size:11px; }
+    .arena-canvas { display:block; border-radius:6px; background:#0f172a; border:1px solid #334155; }
+    .pos-cfg { margin-top:8px; border-top:1px solid #334155; padding-top:8px; }
+    .pos-cfg label { font-size:12px; color:#94a3b8; }
+    .pos-cfg input, .pos-cfg select { height:32px; border-radius:6px; border:1px solid #475569; background:#0f172a; color:#e2e8f0; padding:0 6px; }
+    .pos-cfg button { height:32px; font-size:12px; padding:0 10px; }
   </style>
 </head>
 <body>
@@ -242,6 +251,65 @@ HTML = """
           </div>
         </div>
         <div id=\"telemetry\" class=\"small\" style=\"white-space:pre-wrap; margin-top:10px;\">loading...</div>
+      </div>
+    </div>
+  </div>
+
+  <div class=\"row\" style=\"margin-top:12px;\">
+    <div class=\"panel pos-panel\">
+      <div style=\"display:flex;align-items:center;gap:10px;margin-bottom:8px;\">
+        <b>Position Tracker</b>
+        <label style=\"display:flex;align-items:center;gap:5px;font-size:12px;color:#94a3b8;cursor:pointer;\">
+          <input type=\"checkbox\" id=\"pos_enabled\" style=\"accent-color:#0ea5e9;\" />
+          Enable
+        </label>
+        <span id=\"pos_status_badge\" class=\"small\" style=\"color:#64748b;\">disabled</span>
+      </div>
+      <canvas id=\"arena_canvas\" class=\"arena-canvas\" width=\"300\" height=\"160\"></canvas>
+      <div class=\"pos-coords\" style=\"margin-top:6px;\">
+        <span class=\"pos-x\">X: <span id=\"pos_x\">—</span></span>&nbsp;&nbsp;
+        <span class=\"pos-y\">Y: <span id=\"pos_y\">—</span></span>&nbsp;&nbsp;
+        <span class=\"pos-z\">Z: <span id=\"pos_z\">—</span></span>
+      </div>
+      <div class=\"small\" style=\"color:#94a3b8;\">
+        Hdg: <span id=\"pos_hdg\">—</span>°&nbsp;&nbsp;
+        Vel: <span id=\"pos_vel\">—</span>&nbsp;&nbsp;
+        Refs: <span id=\"pos_refs\">—</span>&nbsp;&nbsp;
+        FPS: <span id=\"pos_fps\">—</span>
+        <span id=\"pos_stale\" class=\"pos-stale\" style=\"display:none;\"> ⚠ STALE</span>
+      </div>
+      <div class=\"pos-cfg\">
+        <div style=\"display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:6px;\">
+          <label>Profile:
+            <select id=\"pos_profile\" class=\"pos-cfg\">
+              <option value=\"balanced\">Balanced</option>
+              <option value=\"sensitive\">Sensitive</option>
+              <option value=\"strict\">Strict</option>
+            </select>
+          </label>
+          <label>FOV°:
+            <input id=\"pos_fov\" type=\"number\" min=\"40\" max=\"120\" value=\"69\" style=\"width:60px;\" />
+          </label>
+          <label>Latency ms:
+            <input id=\"pos_latency\" type=\"range\" min=\"0\" max=\"800\" value=\"200\" style=\"width:90px;vertical-align:middle;\" />
+            <span id=\"pos_latency_val\" style=\"font-size:11px;color:#94a3b8;\">200</span>
+          </label>
+        </div>
+        <div style=\"display:flex;gap:8px;flex-wrap:wrap;align-items:center;\">
+          <button id=\"pos_cfg_save\" class=\"pos-cfg\">Apply Config</button>
+          <label style=\"cursor:pointer;\">
+            <button id=\"pos_calib_btn\" class=\"pos-cfg\" onclick=\"document.getElementById('pos_calib_file').click()\">Upload Calibration (.npz)</button>
+            <input type=\"file\" id=\"pos_calib_file\" accept=\".npz\" style=\"display:none;\" />
+          </label>
+          <span id=\"pos_calib_status\" class=\"small\" style=\"color:#94a3b8;\"></span>
+        </div>
+        <div style=\"margin-top:6px;display:flex;gap:8px;align-items:center;\">
+          <button id=\"pos_video_toggle\" class=\"pos-cfg\">Show ArUco Video</button>
+          <a id=\"pos_tracker_link\" href=\"#\" target=\"_blank\" class=\"small\" style=\"color:#38bdf8;display:none;\">Open full arena tracker ↗</a>
+        </div>
+        <div id=\"pos_video_container\" style=\"display:none;margin-top:6px;\">
+          <img id=\"pos_video_img\" src=\"\" style=\"max-width:100%;border-radius:6px;background:#000;\" />
+        </div>
       </div>
     </div>
   </div>
@@ -841,6 +909,158 @@ document.getElementById('drone_config_save').onclick = async () => {
 document.getElementById('drone_config_cancel').onclick = () => { modal.style.display = 'none'; };
 document.getElementById('edit_drones_btn').onclick = openDroneConfig;
 modal.onclick = (e) => { if (e.target === modal) modal.style.display = 'none'; };
+
+// ── Position Tracker ─────────────────────────────────────────────────────────
+let posEvtSource = null;
+let posVideoOn = false;
+
+const arenaCanvas = document.getElementById('arena_canvas');
+const arenaCtx = arenaCanvas.getContext('2d');
+const ARENA_W = 20, ARENA_D = 10;
+
+function arenaToCanvas(ax, ay) {
+  return [
+    (ax + ARENA_W / 2) / ARENA_W * arenaCanvas.width,
+    (1 - ay / ARENA_D) * arenaCanvas.height
+  ];
+}
+
+function drawArena(pos, compPos, dir) {
+  const ctx = arenaCtx;
+  const W = arenaCanvas.width, H = arenaCanvas.height;
+  ctx.clearRect(0, 0, W, H);
+  ctx.fillStyle = '#0f172a'; ctx.fillRect(0, 0, W, H);
+  ctx.strokeStyle = '#334155'; ctx.lineWidth = 2;
+  ctx.strokeRect(2, 2, W - 4, H - 4);
+  ctx.strokeStyle = '#1e293b'; ctx.lineWidth = 1;
+  for (let x = -5; x <= 5; x += 5) {
+    const [cx] = arenaToCanvas(x, 0);
+    ctx.beginPath(); ctx.moveTo(cx, 0); ctx.lineTo(cx, H); ctx.stroke();
+  }
+  for (let y = 0; y <= 10; y += 5) {
+    const [, cy] = arenaToCanvas(0, y);
+    ctx.beginPath(); ctx.moveTo(0, cy); ctx.lineTo(W, cy); ctx.stroke();
+  }
+  if (!pos) return;
+  // Raw position — blue ghost
+  const [rx, ry] = arenaToCanvas(pos[0], pos[1]);
+  ctx.beginPath(); ctx.arc(rx, ry, 5, 0, Math.PI * 2);
+  ctx.fillStyle = 'rgba(56,189,248,0.35)'; ctx.fill();
+  ctx.strokeStyle = '#38bdf8'; ctx.lineWidth = 1.5; ctx.stroke();
+  if (!compPos) return;
+  // Dead-reckoning compensated — orange
+  const [cx2, cy2] = arenaToCanvas(compPos[0], compPos[1]);
+  ctx.beginPath(); ctx.arc(cx2, cy2, 7, 0, Math.PI * 2);
+  ctx.fillStyle = '#f97316'; ctx.fill();
+  if (dir) {
+    const ang = Math.atan2(dir[0], dir[1]);
+    const len = 20;
+    ctx.strokeStyle = '#facc15'; ctx.lineWidth = 2;
+    ctx.beginPath(); ctx.moveTo(cx2, cy2);
+    ctx.lineTo(cx2 + Math.sin(ang) * len, cy2 - Math.cos(ang) * len); ctx.stroke();
+  }
+}
+
+function updatePosUI(d) {
+  const pos = d.pos;
+  const vel = d.vel || [0, 0, 0];
+  const lat = (d.latency_ms || 0) / 1000;
+  const compPos = pos ? pos.map((v, i) => v + (vel[i] || 0) * lat) : null;
+
+  document.getElementById('pos_x').textContent = pos ? pos[0].toFixed(2) : '\\u2014';
+  document.getElementById('pos_y').textContent = pos ? pos[1].toFixed(2) : '\\u2014';
+  document.getElementById('pos_z').textContent = pos ? pos[2].toFixed(2) : '\\u2014';
+
+  const dir = d.dir;
+  const hdg = dir ? ((Math.atan2(dir[0], dir[1]) * 180 / Math.PI + 360) % 360).toFixed(1) : '\\u2014';
+  document.getElementById('pos_hdg').textContent = hdg;
+  const spd = vel ? Math.sqrt((vel[0]||0)**2 + (vel[1]||0)**2).toFixed(2) : '\\u2014';
+  document.getElementById('pos_vel').textContent = spd + ' m/s';
+  document.getElementById('pos_refs').textContent = d.ref_markers ? d.ref_markers.length : '\\u2014';
+  document.getElementById('pos_fps').textContent = d.fps != null ? d.fps : '\\u2014';
+  document.getElementById('pos_stale').style.display = d.stale ? '' : 'none';
+
+  const enabled = d.enabled !== false;
+  const badge = document.getElementById('pos_status_badge');
+  badge.textContent = !enabled ? 'disabled' : pos ? (d.stale ? 'stale' : 'live') : 'no markers';
+  badge.style.color = !enabled ? '#64748b' : (pos && !d.stale) ? '#22c55e' : '#f59e0b';
+
+  drawArena(pos, compPos, dir);
+}
+
+function startPosEvents() {
+  if (posEvtSource) { posEvtSource.close(); posEvtSource = null; }
+  posEvtSource = new EventSource('/proxy/position/events');
+  posEvtSource.onmessage = (e) => { try { updatePosUI(JSON.parse(e.data)); } catch {} };
+  posEvtSource.onerror = () => {
+    posEvtSource.close(); posEvtSource = null;
+    setTimeout(startPosEvents, 3000);
+  };
+}
+
+async function loadPosConfig() {
+  try {
+    const r = await fetch('/proxy/position/config');
+    const d = await r.json();
+    document.getElementById('pos_enabled').checked = !!d.enabled;
+    if (d.detect_profile) document.getElementById('pos_profile').value = d.detect_profile;
+    if (d.fov_deg) document.getElementById('pos_fov').value = d.fov_deg;
+    if (d.latency_ms != null) {
+      document.getElementById('pos_latency').value = d.latency_ms;
+      document.getElementById('pos_latency_val').textContent = Math.round(d.latency_ms);
+    }
+    const cs = document.getElementById('pos_calib_status');
+    cs.textContent = d.has_calibration ? '\\u2713 calibration loaded' : 'no calibration';
+    cs.style.color = d.has_calibration ? '#22c55e' : '#94a3b8';
+    if (d.enabled) startPosEvents();
+  } catch {}
+}
+
+document.getElementById('pos_enabled').onchange = async function() {
+  await post('/proxy/position/config', { enabled: this.checked });
+  if (this.checked) startPosEvents();
+  else { if (posEvtSource) { posEvtSource.close(); posEvtSource = null; } drawArena(null, null, null); }
+};
+
+document.getElementById('pos_latency').oninput = function() {
+  document.getElementById('pos_latency_val').textContent = this.value;
+};
+
+document.getElementById('pos_cfg_save').onclick = async () => {
+  const profile = document.getElementById('pos_profile').value;
+  const fov = parseFloat(document.getElementById('pos_fov').value);
+  const lat = parseFloat(document.getElementById('pos_latency').value);
+  await post('/proxy/position/config', { detect_profile: profile, fov_deg: fov, latency_ms: lat });
+  setTimeout(loadPosConfig, 400);
+};
+
+document.getElementById('pos_calib_file').onchange = async function() {
+  if (!this.files.length) return;
+  const fd = new FormData();
+  fd.append('file', this.files[0]);
+  const cs = document.getElementById('pos_calib_status');
+  cs.textContent = 'uploading...'; cs.style.color = '#94a3b8';
+  try {
+    const r = await fetch('/proxy/position/calibration', { method: 'POST', body: fd });
+    const d = await r.json();
+    cs.textContent = d.ok ? '\\u2713 calibration saved' : ('error: ' + d.error);
+    cs.style.color = d.ok ? '#22c55e' : '#ef4444';
+    if (d.ok) loadPosConfig();
+  } catch { cs.textContent = 'upload error'; cs.style.color = '#ef4444'; }
+  this.value = '';
+};
+
+document.getElementById('pos_video_toggle').onclick = () => {
+  posVideoOn = !posVideoOn;
+  document.getElementById('pos_video_toggle').textContent = posVideoOn ? 'Hide ArUco Video' : 'Show ArUco Video';
+  const container = document.getElementById('pos_video_container');
+  const img = document.getElementById('pos_video_img');
+  if (posVideoOn) { img.src = '/proxy/position/video?' + Date.now(); container.style.display = ''; }
+  else { img.src = ''; container.style.display = 'none'; }
+};
+
+loadPosConfig();
+drawArena(null, null, null);
 </script>
 </body>
 </html>
@@ -1439,6 +1659,88 @@ def proxy_telemetry():
         return (r.text, r.status_code, headers)
     except Exception as e:
         return jsonify(ok=False, error=str(e)), 502
+
+
+# ── Positioning subsystem proxy ───────────────────────────────────────────────
+
+@app.get("/proxy/position")
+def proxy_position_get():
+    try:
+        r = pi_get("/api/position", timeout=TIMEOUT_STATUS)
+        return (r.text, r.status_code, {"Content-Type": r.headers.get("Content-Type", "application/json")})
+    except Exception as e:
+        return jsonify(ok=False, error=str(e)), 502
+
+
+@app.get("/proxy/position/events")
+def proxy_position_events():
+    """SSE proxy — streams ArUco position events from Pi to browser."""
+    pi_url = PI_BASE + "/api/position/events"
+
+    def generate():
+        try:
+            with requests.get(pi_url, stream=True, timeout=(3, 120)) as resp:
+                for chunk in resp.iter_content(chunk_size=512):
+                    if chunk:
+                        yield chunk
+        except Exception as e:
+            import json as _json
+            yield f"data: {_json.dumps({'error': str(e)})}\n\n".encode()
+
+    return Response(generate(), mimetype="text/event-stream",
+                    headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+
+
+@app.get("/proxy/position/video")
+def proxy_position_video():
+    """MJPEG proxy — streams ArUco-annotated frames from Pi."""
+    pi_url = PI_BASE + "/api/position/video"
+
+    def generate():
+        try:
+            with requests.get(pi_url, stream=True, timeout=(3, 120)) as resp:
+                for chunk in resp.iter_content(chunk_size=4096):
+                    if chunk:
+                        yield chunk
+        except Exception:
+            pass
+
+    return Response(generate(), mimetype="multipart/x-mixed-replace; boundary=frame",
+                    headers={"Cache-Control": "no-store"})
+
+
+@app.get("/proxy/position/config")
+def proxy_position_config_get():
+    try:
+        r = pi_get("/api/position/config", timeout=TIMEOUT_STATUS)
+        return (r.text, r.status_code, {"Content-Type": r.headers.get("Content-Type", "application/json")})
+    except Exception as e:
+        return jsonify(ok=False, error=str(e)), 502
+
+
+@app.post("/proxy/position/config")
+def proxy_position_config_set():
+    data = request.get_json(silent=True) or {}
+    r = pi_post("/api/position/config", data)
+    return (r.text, r.status_code, {"Content-Type": r.headers.get("Content-Type", "application/json")})
+
+
+@app.post("/proxy/position/calibration")
+def proxy_position_calibration():
+    """Proxy NPZ calibration file upload to Pi."""
+    if "file" not in request.files:
+        return jsonify(ok=False, error="no file"), 400
+    f = request.files["file"]
+    try:
+        resp = requests.post(
+            PI_BASE + "/api/position/calibration",
+            files={"file": (f.filename, f.read(), "application/octet-stream")},
+            timeout=15,
+        )
+        return Response(resp.content, status=resp.status_code,
+                        content_type=resp.headers.get("Content-Type", "application/json"))
+    except Exception as e:
+        return jsonify(ok=False, error=str(e)), 500
 
 
 def main():
