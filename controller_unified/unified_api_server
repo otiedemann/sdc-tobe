@@ -2897,17 +2897,39 @@ def api_telemetry_log_clear():
 # ═══════════════════════════════════════════════════════════════════════════
 
 def _pos_snapshot_to_js(snapshot: dict) -> dict:
-    """Convert flat _pos_st snapshot to the nested format the JS updatePosUI expects."""
+    """Convert flat _pos_st snapshot to the nested format the JS updatePosUI expects.
+
+    Velocity is taken from the drone telemetry (cm/s → m/s) and rotated into
+    arena frame using the ArUco heading direction so dead-reckoning is correct.
+    """
     x, y, z = snapshot.get("x"), snapshot.get("y"), snapshot.get("z")
     pos = [x, y, z] if x is not None else None
     dx, dy = snapshot.get("dx"), snapshot.get("dy")
     direction = [dx, dy] if dx is not None else None
+
+    # Pull live velocity from telemetry (Anafi: SpeedChanged cm/s; Tello: same)
+    with telemetry_lock:
+        tel_vx = telemetry.get("vgx") or 0.0   # drone-frame forward, cm/s
+        tel_vy = telemetry.get("vgy") or 0.0   # drone-frame lateral, cm/s
+        tel_vz = telemetry.get("vgz") or 0.0   # vertical, cm/s
+
+    # Rotate drone-frame velocity into arena frame using ArUco heading
+    fwd = tel_vx / 100.0   # m/s
+    lat = tel_vy / 100.0
+    if direction is not None and (dx**2 + dy**2) > 1e-6:
+        # heading angle from +Y axis (arena north)
+        heading = math.atan2(dx, dy)
+        arena_vx = fwd * math.sin(heading) + lat * math.cos(heading)
+        arena_vy = fwd * math.cos(heading) - lat * math.sin(heading)
+    else:
+        arena_vx, arena_vy = fwd, lat
+
     with _pos_cfg_lock:
         enabled = _pos_cfg.get("enabled", False)
         lat_ms = round(_pos_cfg.get("latency_comp_s", 0.05) * 1000)
     return {
         "pos": pos,
-        "vel": [snapshot.get("vx", 0.0), snapshot.get("vy", 0.0), snapshot.get("vz", 0.0)],
+        "vel": [round(arena_vx, 3), round(arena_vy, 3), round(tel_vz / 100.0, 3)],
         "dir": direction,
         "fps": snapshot.get("fps"),
         "ref_markers": snapshot.get("ref_markers", []),

@@ -265,7 +265,7 @@ HTML = """
         </label>
         <span id=\"pos_status_badge\" class=\"small\" style=\"color:#64748b;\">disabled</span>
       </div>
-      <canvas id=\"arena_canvas\" class=\"arena-canvas\" width=\"300\" height=\"160\"></canvas>
+      <canvas id=\"arena_canvas\" class=\"arena-canvas\" width=\"380\" height=\"210\"></canvas>
       <div class=\"pos-coords\" style=\"margin-top:6px;\">
         <span class=\"pos-x\">X: <span id=\"pos_x\">—</span></span>&nbsp;&nbsp;
         <span class=\"pos-y\">Y: <span id=\"pos_y\">—</span></span>&nbsp;&nbsp;
@@ -607,9 +607,11 @@ async function refreshTelemetry(){
     document.getElementById('tel_vx').textContent = fmt(t.vgx);
     document.getElementById('tel_vy').textContent = fmt(t.vgy);
     document.getElementById('tel_vz').textContent = fmt(t.vgz);
-    document.getElementById('tel_ax').textContent = fmt(t.agx);
-    document.getElementById('tel_ay').textContent = fmt(t.agy);
-    document.getElementById('tel_az').textContent = fmt(t.agz);
+    // Acceleration: only available on Tello; Anafi SDK does not expose it
+    const hasAccel = t.agx != null;
+    document.getElementById('tel_ax').textContent = hasAccel ? fmt(t.agx) : 'N/A';
+    document.getElementById('tel_ay').textContent = hasAccel ? fmt(t.agy) : 'N/A';
+    document.getElementById('tel_az').textContent = hasAccel ? fmt(t.agz) : 'N/A';
 
     apiEl.textContent = 'connected';
     apiEl.style.color = '#22c55e';
@@ -973,48 +975,104 @@ let posVideoOn = false;
 
 const arenaCanvas = document.getElementById('arena_canvas');
 const arenaCtx = arenaCanvas.getContext('2d');
-const ARENA_W = 20, ARENA_D = 10;
+
+// World dimensions — updated when arena config loads
+let arenaW = 20, arenaD = 10, arenaOX = -10, arenaOY = 0;
+
+const ARENA_PAD = 26;  // pixel padding for axis labels
 
 function arenaToCanvas(ax, ay) {
+  const W = arenaCanvas.width, H = arenaCanvas.height;
+  const iw = W - 2 * ARENA_PAD, ih = H - 2 * ARENA_PAD;
   return [
-    (ax + ARENA_W / 2) / ARENA_W * arenaCanvas.width,
-    (1 - ay / ARENA_D) * arenaCanvas.height
+    ARENA_PAD + (ax - arenaOX) / arenaW * iw,
+    H - ARENA_PAD - (ay - arenaOY) / arenaD * ih,
   ];
 }
+
+const WALL_COLOR = { front:'#6366f1', back:'#a855f7', left:'#06b6d4', right:'#10b981' };
 
 function drawArena(pos, compPos, dir) {
   const ctx = arenaCtx;
   const W = arenaCanvas.width, H = arenaCanvas.height;
-  ctx.clearRect(0, 0, W, H);
+  const PAD = ARENA_PAD;
+
+  // Background
   ctx.fillStyle = '#0f172a'; ctx.fillRect(0, 0, W, H);
-  ctx.strokeStyle = '#334155'; ctx.lineWidth = 2;
-  ctx.strokeRect(2, 2, W - 4, H - 4);
-  ctx.strokeStyle = '#1e293b'; ctx.lineWidth = 1;
-  for (let x = -5; x <= 5; x += 5) {
-    const [cx] = arenaToCanvas(x, 0);
-    ctx.beginPath(); ctx.moveTo(cx, 0); ctx.lineTo(cx, H); ctx.stroke();
+
+  // Grid lines (5 m spacing)
+  ctx.strokeStyle = '#1e3a5f'; ctx.lineWidth = 1;
+  for (let gx = arenaOX; gx <= arenaOX + arenaW + 0.01; gx += 5) {
+    const [cx] = arenaToCanvas(gx, arenaOY);
+    ctx.beginPath(); ctx.moveTo(cx, PAD); ctx.lineTo(cx, H - PAD); ctx.stroke();
   }
-  for (let y = 0; y <= 10; y += 5) {
-    const [, cy] = arenaToCanvas(0, y);
-    ctx.beginPath(); ctx.moveTo(0, cy); ctx.lineTo(W, cy); ctx.stroke();
+  for (let gy = arenaOY; gy <= arenaOY + arenaD + 0.01; gy += 5) {
+    const [, cy] = arenaToCanvas(arenaOX, gy);
+    ctx.beginPath(); ctx.moveTo(PAD, cy); ctx.lineTo(W - PAD, cy); ctx.stroke();
   }
+
+  // Arena border
+  ctx.strokeStyle = '#475569'; ctx.lineWidth = 2;
+  ctx.strokeRect(PAD, PAD, W - 2*PAD, H - 2*PAD);
+
+  // Axis labels
+  ctx.fillStyle = '#475569'; ctx.font = '9px monospace'; ctx.textAlign = 'center';
+  for (let gx = arenaOX; gx <= arenaOX + arenaW + 0.01; gx += 5) {
+    const [cx] = arenaToCanvas(gx, arenaOY);
+    ctx.fillText(gx, cx, H - 2);
+  }
+  ctx.textAlign = 'right';
+  for (let gy = arenaOY; gy <= arenaOY + arenaD + 0.01; gy += 5) {
+    const [, cy] = arenaToCanvas(arenaOX, gy);
+    ctx.fillText(gy, PAD - 3, cy + 3);
+  }
+
+  // Wall labels
+  ctx.fillStyle = '#64748b'; ctx.font = 'bold 9px monospace'; ctx.textAlign = 'center';
+  ctx.fillText('BACK', W / 2, PAD - 3);
+  ctx.fillText('FRONT', W / 2, H - PAD + 12);
+  ctx.textAlign = 'left';
+  ctx.save(); ctx.translate(PAD - 3, H / 2); ctx.rotate(-Math.PI / 2);
+  ctx.textAlign = 'center'; ctx.fillText('LEFT', 0, 0); ctx.restore();
+  ctx.save(); ctx.translate(W - PAD + 3, H / 2); ctx.rotate(Math.PI / 2);
+  ctx.textAlign = 'center'; ctx.fillText('RIGHT', 0, 0); ctx.restore();
+
+  // Arena markers (from loaded config)
+  for (const [id, m] of Object.entries(arenaMarkers)) {
+    if (!m.pos) continue;
+    const [mx, my] = arenaToCanvas(m.pos[0], m.pos[1]);
+    if (mx < PAD - 4 || mx > W - PAD + 4 || my < PAD - 4 || my > H - PAD + 4) continue;
+    ctx.fillStyle = WALL_COLOR[m.wall] || '#94a3b8';
+    ctx.fillRect(mx - 3, my - 3, 6, 6);
+    ctx.fillStyle = '#94a3b8'; ctx.font = '8px monospace'; ctx.textAlign = 'center';
+    ctx.fillText(id, mx, my - 5);
+  }
+
+  // Drone positions
   if (!pos) return;
-  // Raw position — blue ghost
+
+  // Raw — blue ghost
   const [rx, ry] = arenaToCanvas(pos[0], pos[1]);
   ctx.beginPath(); ctx.arc(rx, ry, 5, 0, Math.PI * 2);
-  ctx.fillStyle = 'rgba(56,189,248,0.35)'; ctx.fill();
-  ctx.strokeStyle = '#38bdf8'; ctx.lineWidth = 1.5; ctx.stroke();
+  ctx.fillStyle = 'rgba(56,189,248,0.25)'; ctx.fill();
+  ctx.strokeStyle = '#38bdf8'; ctx.lineWidth = 1; ctx.stroke();
+
   if (!compPos) return;
-  // Dead-reckoning compensated — orange
-  const [cx2, cy2] = arenaToCanvas(compPos[0], compPos[1]);
-  ctx.beginPath(); ctx.arc(cx2, cy2, 7, 0, Math.PI * 2);
+
+  // Latency-compensated — orange drone
+  const [dx, dy] = arenaToCanvas(compPos[0], compPos[1]);
+  ctx.beginPath(); ctx.arc(dx, dy, 9, 0, Math.PI * 2);
   ctx.fillStyle = '#f97316'; ctx.fill();
+  ctx.strokeStyle = '#fed7aa'; ctx.lineWidth = 1.5; ctx.stroke();
+
+  // Heading arrow
   if (dir) {
     const ang = Math.atan2(dir[0], dir[1]);
     const len = 20;
-    ctx.strokeStyle = '#facc15'; ctx.lineWidth = 2;
-    ctx.beginPath(); ctx.moveTo(cx2, cy2);
-    ctx.lineTo(cx2 + Math.sin(ang) * len, cy2 - Math.cos(ang) * len); ctx.stroke();
+    ctx.strokeStyle = '#facc15'; ctx.lineWidth = 2.5; ctx.lineCap = 'round';
+    ctx.beginPath(); ctx.moveTo(dx, dy);
+    ctx.lineTo(dx + Math.sin(ang) * len, dy - Math.cos(ang) * len); ctx.stroke();
+    ctx.lineCap = 'butt';
   }
 }
 
@@ -1177,8 +1235,14 @@ async function loadArenaConfig() {
     }
     if (d.marker_size_m != null) document.getElementById('ac_msize').value = d.marker_size_m;
     if (d.markers) { arenaMarkers = JSON.parse(JSON.stringify(d.markers)); renderMarkerTable(); }
-    // Also update arena canvas dimensions
-    if (d.arena) { ARENA_W_dyn = d.arena.width_m || 20; ARENA_D_dyn = d.arena.depth_m || 10; }
+    // Update arena canvas world dimensions
+    if (d.arena) {
+      arenaW = d.arena.width_m  || 20;
+      arenaD = d.arena.depth_m  || 10;
+      arenaOX = -(arenaW / 2);   // symmetric: origin at left edge
+      arenaOY = 0;
+      drawArena(null, null, null);
+    }
   } catch {}
 }
 
