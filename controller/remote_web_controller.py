@@ -1003,7 +1003,7 @@ function arenaToCanvas(ax, ay) {
 const WALL_COLOR = { front:'#6366f1', back:'#a855f7', left:'#06b6d4', right:'#10b981' };
 
 // Track last drawn position so arena config reload doesn't erase the dot
-let _lastPos = null, _lastCompPos = null, _lastDir = null;
+let _lastPos = null, _lastCompPos = null, _lastDir = null, _lastFrameRes = null;
 
 function drawArena(pos, compPos, dir) {
   // Persist last known position so config reloads don't blank it
@@ -1079,10 +1079,11 @@ function drawArena(pos, compPos, dir) {
     ctx.fillText(id, mx, my - 6);
   }
 
-  // Debug: show view params and pos on canvas top-left
+  // Debug: show view params, pos, and frame resolution on canvas top-left
   ctx.fillStyle = '#22d3ee'; ctx.font = '9px monospace'; ctx.textAlign = 'left';
   ctx.fillText(`view: ox=${viewOX} oy=${viewOY} w=${viewW} d=${viewD}`, PAD + 2, PAD + 10);
   ctx.fillText(`pos: ${_pos ? _pos.map(v=>v.toFixed(1)).join(',') : 'null'}`, PAD + 2, PAD + 20);
+  ctx.fillText(`frame: ${_lastFrameRes || 'unknown'}`, PAD + 2, PAD + 30);
 
   // Drone positions
   if (!_pos) return;
@@ -1099,7 +1100,7 @@ function drawArena(pos, compPos, dir) {
   const cp = _compPos || _pos;
   const [rpx, rpy] = arenaToCanvas(cp[0], cp[1]);
   const [cx2, cy2, outOfBounds] = clampPx(rpx, rpy);
-  ctx.fillText(`raw px: ${rpx.toFixed(0)},${rpy.toFixed(0)} clamp: ${cx2.toFixed(0)},${cy2.toFixed(0)} oob:${outOfBounds}`, PAD + 2, PAD + 30);
+  ctx.fillText(`raw px: ${rpx.toFixed(0)},${rpy.toFixed(0)} clamp: ${cx2.toFixed(0)},${cy2.toFixed(0)} oob:${outOfBounds}`, PAD + 2, PAD + 40);
   const dotColor = outOfBounds ? '#ef4444' : '#f97316';
   const dotBorder = outOfBounds ? '#fca5a5' : '#fed7aa';
 
@@ -1158,6 +1159,7 @@ function updatePosUI(d) {
   badge.textContent = !enabled ? 'disabled' : pos ? (d.stale ? 'stale' : 'live') : 'no markers';
   badge.style.color = !enabled ? '#64748b' : (pos && !d.stale) ? '#22c55e' : '#f59e0b';
 
+  if (d.frame_w && d.frame_h) _lastFrameRes = `${d.frame_w}x${d.frame_h}`;
   drawArena(pos, compPos, dir);
 }
 

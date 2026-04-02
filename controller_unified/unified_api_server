@@ -2937,6 +2937,8 @@ def _pos_snapshot_to_js(snapshot: dict) -> dict:
         "stale": snapshot.get("stale", True),
         "enabled": enabled,
         "latency_ms": lat_ms,
+        "frame_w": snapshot.get("frame_w"),
+        "frame_h": snapshot.get("frame_h"),
     }
 
 
@@ -3107,6 +3109,8 @@ def positioning_loop():
             _pos_st["stale"] = stale
             _pos_st["ts"] = ts
             _pos_st["fps"] = _pos_fps_current
+            _pos_st["frame_w"] = w
+            _pos_st["frame_h"] = h
             snapshot = dict(_pos_st)
 
         _broadcast_pos_sse(snapshot)
