@@ -310,8 +310,12 @@ _pos_st: dict = {
     "dx": None, "dy": None,
     "vx": 0.0, "vy": 0.0, "vz": 0.0,
     "markers": {}, "ref_markers": [],
-    "stale": True, "ts": 0.0,
+    "stale": True, "ts": 0.0, "fps": None,
 }
+# FPS tracking for positioning loop
+_pos_fps_counter = 0
+_pos_fps_last_reset = 0.0
+_pos_fps_current: float = 0.0
 _pos_st_lock = threading.Lock()
 _pos_annotated_jpeg = b""
 _pos_annotated_lock = threading.Lock()
@@ -337,30 +341,30 @@ _ARENA_CONFIG_DEFAULT: dict = {
     "marker_size_m": 0.5,
     "markers": [
         {"id":  0, "label": "Origin",       "x":   0.0, "y":  0.0,   "z":  0.0, "wall": "front"},
-        {"id":  1, "label": "Right A low",  "x":  10.0, "y":  6.667, "z": -1.0, "wall": "right"},
-        {"id":  2, "label": "Right A high", "x":  10.0, "y":  6.667, "z":  1.0, "wall": "right"},
-        {"id":  3, "label": "Right B low",  "x":  10.0, "y":  3.333, "z": -1.0, "wall": "right"},
-        {"id":  4, "label": "Right B high", "x":  10.0, "y":  3.333, "z":  1.0, "wall": "right"},
-        {"id":  5, "label": "Front A low",  "x":   6.0, "y":  0.0,   "z": -1.0, "wall": "front"},
-        {"id":  6, "label": "Front A high", "x":   6.0, "y":  0.0,   "z":  1.0, "wall": "front"},
-        {"id":  7, "label": "Front B low",  "x":   2.0, "y":  0.0,   "z": -1.0, "wall": "front"},
-        {"id":  8, "label": "Front B high", "x":   2.0, "y":  0.0,   "z":  1.0, "wall": "front"},
-        {"id":  9, "label": "Front C low",  "x":  -2.0, "y":  0.0,   "z": -1.0, "wall": "front"},
-        {"id": 10, "label": "Front C high", "x":  -2.0, "y":  0.0,   "z":  1.0, "wall": "front"},
-        {"id": 11, "label": "Front D low",  "x":  -6.0, "y":  0.0,   "z": -1.0, "wall": "front"},
-        {"id": 12, "label": "Front D high", "x":  -6.0, "y":  0.0,   "z":  1.0, "wall": "front"},
-        {"id": 13, "label": "Left A low",   "x": -10.0, "y":  3.333, "z": -1.0, "wall": "left"},
-        {"id": 14, "label": "Left A high",  "x": -10.0, "y":  3.333, "z":  1.0, "wall": "left"},
-        {"id": 15, "label": "Left B low",   "x": -10.0, "y":  6.667, "z": -1.0, "wall": "left"},
-        {"id": 16, "label": "Left B high",  "x": -10.0, "y":  6.667, "z":  1.0, "wall": "left"},
-        {"id": 17, "label": "Back A low",   "x":  -6.0, "y": 10.0,   "z": -1.0, "wall": "back"},
-        {"id": 18, "label": "Back A high",  "x":  -6.0, "y": 10.0,   "z":  1.0, "wall": "back"},
-        {"id": 19, "label": "Back B low",   "x":  -2.0, "y": 10.0,   "z": -1.0, "wall": "back"},
-        {"id": 20, "label": "Back B high",  "x":  -2.0, "y": 10.0,   "z":  1.0, "wall": "back"},
-        {"id": 21, "label": "Back C low",   "x":   2.0, "y": 10.0,   "z": -1.0, "wall": "back"},
-        {"id": 22, "label": "Back C high",  "x":   2.0, "y": 10.0,   "z":  1.0, "wall": "back"},
-        {"id": 23, "label": "Back D low",   "x":   6.0, "y": 10.0,   "z": -1.0, "wall": "back"},
-        {"id": 24, "label": "Back D high",  "x":   6.0, "y": 10.0,   "z":  1.0, "wall": "back"},
+        {"id":  1, "label": "Right A low",  "x":  10.0, "y":  6.667, "z":  2.0, "wall": "right"},
+        {"id":  2, "label": "Right A high", "x":  10.0, "y":  6.667, "z":  4.0, "wall": "right"},
+        {"id":  3, "label": "Right B low",  "x":  10.0, "y":  3.333, "z":  2.0, "wall": "right"},
+        {"id":  4, "label": "Right B high", "x":  10.0, "y":  3.333, "z":  4.0, "wall": "right"},
+        {"id":  5, "label": "Front A low",  "x":   6.0, "y":  0.0,   "z":  2.0, "wall": "front"},
+        {"id":  6, "label": "Front A high", "x":   6.0, "y":  0.0,   "z":  4.0, "wall": "front"},
+        {"id":  7, "label": "Front B low",  "x":   2.0, "y":  0.0,   "z":  2.0, "wall": "front"},
+        {"id":  8, "label": "Front B high", "x":   2.0, "y":  0.0,   "z":  4.0, "wall": "front"},
+        {"id":  9, "label": "Front C low",  "x":  -2.0, "y":  0.0,   "z":  2.0, "wall": "front"},
+        {"id": 10, "label": "Front C high", "x":  -2.0, "y":  0.0,   "z":  4.0, "wall": "front"},
+        {"id": 11, "label": "Front D low",  "x":  -6.0, "y":  0.0,   "z":  2.0, "wall": "front"},
+        {"id": 12, "label": "Front D high", "x":  -6.0, "y":  0.0,   "z":  4.0, "wall": "front"},
+        {"id": 13, "label": "Left A low",   "x": -10.0, "y":  3.333, "z":  2.0, "wall": "left"},
+        {"id": 14, "label": "Left A high",  "x": -10.0, "y":  3.333, "z":  4.0, "wall": "left"},
+        {"id": 15, "label": "Left B low",   "x": -10.0, "y":  6.667, "z":  2.0, "wall": "left"},
+        {"id": 16, "label": "Left B high",  "x": -10.0, "y":  6.667, "z":  4.0, "wall": "left"},
+        {"id": 17, "label": "Back A low",   "x":  -6.0, "y": 10.0,   "z":  2.0, "wall": "back"},
+        {"id": 18, "label": "Back A high",  "x":  -6.0, "y": 10.0,   "z":  4.0, "wall": "back"},
+        {"id": 19, "label": "Back B low",   "x":  -2.0, "y": 10.0,   "z":  2.0, "wall": "back"},
+        {"id": 20, "label": "Back B high",  "x":  -2.0, "y": 10.0,   "z":  4.0, "wall": "back"},
+        {"id": 21, "label": "Back C low",   "x":   2.0, "y": 10.0,   "z":  2.0, "wall": "back"},
+        {"id": 22, "label": "Back C high",  "x":   2.0, "y": 10.0,   "z":  4.0, "wall": "back"},
+        {"id": 23, "label": "Back D low",   "x":   6.0, "y": 10.0,   "z":  2.0, "wall": "back"},
+        {"id": 24, "label": "Back D high",  "x":   6.0, "y": 10.0,   "z":  4.0, "wall": "back"},
     ],
 }
 _arena_cfg: dict = {}
@@ -2892,8 +2896,29 @@ def api_telemetry_log_clear():
 # Positioning subsystem
 # ═══════════════════════════════════════════════════════════════════════════
 
-def _broadcast_pos_sse(data: dict):
-    msg = f"data: {json.dumps(data)}\n\n"
+def _pos_snapshot_to_js(snapshot: dict) -> dict:
+    """Convert flat _pos_st snapshot to the nested format the JS updatePosUI expects."""
+    x, y, z = snapshot.get("x"), snapshot.get("y"), snapshot.get("z")
+    pos = [x, y, z] if x is not None else None
+    dx, dy = snapshot.get("dx"), snapshot.get("dy")
+    direction = [dx, dy] if dx is not None else None
+    with _pos_cfg_lock:
+        enabled = _pos_cfg.get("enabled", False)
+        lat_ms = round(_pos_cfg.get("latency_comp_s", 0.05) * 1000)
+    return {
+        "pos": pos,
+        "vel": [snapshot.get("vx", 0.0), snapshot.get("vy", 0.0), snapshot.get("vz", 0.0)],
+        "dir": direction,
+        "fps": snapshot.get("fps"),
+        "ref_markers": snapshot.get("ref_markers", []),
+        "stale": snapshot.get("stale", True),
+        "enabled": enabled,
+        "latency_ms": lat_ms,
+    }
+
+
+def _broadcast_pos_sse(snapshot: dict):
+    msg = f"data: {json.dumps(_pos_snapshot_to_js(snapshot))}\n\n"
     with _pos_sse_lock:
         dead = []
         for q in _pos_sse_queues:
@@ -3030,6 +3055,16 @@ def positioning_loop():
         direction = result.get("dir")
         stale = result.get("stale", True)
 
+        # FPS tracking
+        global _pos_fps_counter, _pos_fps_last_reset, _pos_fps_current
+        _pos_fps_counter += 1
+        _fps_now = time.time()
+        if _fps_now - _pos_fps_last_reset >= 1.0:
+            _pos_fps_current = round(
+                _pos_fps_counter / max(0.001, _fps_now - _pos_fps_last_reset), 1)
+            _pos_fps_counter = 0
+            _pos_fps_last_reset = _fps_now
+
         with _pos_st_lock:
             if cam is not None:
                 _pos_st["x"] = round(float(cam[0]), 4)
@@ -3043,6 +3078,7 @@ def positioning_loop():
             _pos_st["ref_markers"] = list(result.get("ref_markers") or [])
             _pos_st["stale"] = stale
             _pos_st["ts"] = ts
+            _pos_st["fps"] = _pos_fps_current
             snapshot = dict(_pos_st)
 
         _broadcast_pos_sse(snapshot)
@@ -3074,7 +3110,7 @@ def positioning_loop():
 def api_position_get():
     with _pos_st_lock:
         snap = dict(_pos_st)
-    return jsonify(ok=True, **snap)
+    return jsonify(ok=True, **_pos_snapshot_to_js(snap))
 
 
 @app.get("/api/position/events")

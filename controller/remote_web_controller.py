@@ -278,6 +278,14 @@ HTML = """
         FPS: <span id=\"pos_fps\">—</span>
         <span id=\"pos_stale\" class=\"pos-stale\" style=\"display:none;\"> ⚠ STALE</span>
       </div>
+      <div class=\"small\" style=\"color:#94a3b8;margin-top:2px;\">
+        Vx:&nbsp;<span id=\"tel_vx\">—</span>&nbsp;
+        Vy:&nbsp;<span id=\"tel_vy\">—</span>&nbsp;
+        Vz:&nbsp;<span id=\"tel_vz\">—</span>&nbsp;cm/s&nbsp;&nbsp;&nbsp;
+        Ax:&nbsp;<span id=\"tel_ax\">—</span>&nbsp;
+        Ay:&nbsp;<span id=\"tel_ay\">—</span>&nbsp;
+        Az:&nbsp;<span id=\"tel_az\">—</span>&nbsp;cm/s²
+      </div>
       <div class=\"pos-cfg\">
         <div style=\"display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:6px;\">
           <label>Profile:
@@ -583,6 +591,8 @@ function setMeter(idBar, idVal, value, suffix=''){
   val.textContent = `${Math.round(v)}${suffix}`;
 }
 
+let lastTelemetry = {};
+
 async function refreshTelemetry(){
   const apiEl = document.getElementById('api_status');
   const droneEl = document.getElementById('drone_status');
@@ -590,6 +600,16 @@ async function refreshTelemetry(){
     const r = await fetch('/proxy/telemetry', {cache:'no-store'});
     if (!r.ok) throw new Error('api_error');
     const t = await r.json();
+    lastTelemetry = t;
+
+    // Update telemetry speed/accel in position tracker section
+    const fmt = v => (v != null && !isNaN(v)) ? Number(v).toFixed(1) : '—';
+    document.getElementById('tel_vx').textContent = fmt(t.vgx);
+    document.getElementById('tel_vy').textContent = fmt(t.vgy);
+    document.getElementById('tel_vz').textContent = fmt(t.vgz);
+    document.getElementById('tel_ax').textContent = fmt(t.agx);
+    document.getElementById('tel_ay').textContent = fmt(t.agy);
+    document.getElementById('tel_az').textContent = fmt(t.agz);
 
     apiEl.textContent = 'connected';
     apiEl.style.color = '#22c55e';

@@ -18,7 +18,7 @@
       "label": "Right A low",
       "x": 10.0,
       "y": 6.667,
-      "z": -1.0,
+      "z": 2.0,
       "wall": "right"
     },
     {
@@ -26,7 +26,7 @@
       "label": "Right A high",
       "x": 10.0,
       "y": 6.667,
-      "z": 1.0,
+      "z": 4.0,
       "wall": "right"
     },
     {
@@ -34,7 +34,7 @@
       "label": "Right B low",
       "x": 10.0,
       "y": 3.333,
-      "z": -1.0,
+      "z": 2.0,
       "wall": "right"
     },
     {
@@ -42,7 +42,7 @@
       "label": "Right B high",
       "x": 10.0,
       "y": 3.333,
-      "z": 1.0,
+      "z": 4.0,
       "wall": "right"
     },
     {
@@ -50,7 +50,7 @@
       "label": "Front A low",
       "x": 6.0,
       "y": 0.0,
-      "z": -1.0,
+      "z": 2.0,
       "wall": "front"
     },
     {
@@ -58,7 +58,7 @@
       "label": "Front A high",
       "x": 6.0,
       "y": 0.0,
-      "z": 1.0,
+      "z": 4.0,
       "wall": "front"
     },
     {
@@ -66,7 +66,7 @@
       "label": "Front B low",
       "x": 2.0,
       "y": 0.0,
-      "z": -1.0,
+      "z": 2.0,
       "wall": "front"
     },
     {
@@ -74,7 +74,7 @@
       "label": "Front B high",
       "x": 2.0,
       "y": 0.0,
-      "z": 1.0,
+      "z": 4.0,
       "wall": "front"
     },
     {
@@ -82,7 +82,7 @@
       "label": "Front C low",
       "x": -2.0,
       "y": 0.0,
-      "z": -1.0,
+      "z": 2.0,
       "wall": "front"
     },
     {
@@ -90,7 +90,7 @@
       "label": "Front C high",
       "x": -2.0,
       "y": 0.0,
-      "z": 1.0,
+      "z": 4.0,
       "wall": "front"
     },
     {
@@ -98,7 +98,7 @@
       "label": "Front D low",
       "x": -6.0,
       "y": 0.0,
-      "z": -1.0,
+      "z": 2.0,
       "wall": "front"
     },
     {
@@ -106,7 +106,7 @@
       "label": "Front D high",
       "x": -6.0,
       "y": 0.0,
-      "z": 1.0,
+      "z": 4.0,
       "wall": "front"
     },
     {
@@ -114,7 +114,7 @@
       "label": "Left A low",
       "x": -10.0,
       "y": 3.333,
-      "z": -1.0,
+      "z": 2.0,
       "wall": "left"
     },
     {
@@ -122,7 +122,7 @@
       "label": "Left A high",
       "x": -10.0,
       "y": 3.333,
-      "z": 1.0,
+      "z": 4.0,
       "wall": "left"
     },
     {
@@ -130,7 +130,7 @@
       "label": "Left B low",
       "x": -10.0,
       "y": 6.667,
-      "z": -1.0,
+      "z": 2.0,
       "wall": "left"
     },
     {
@@ -138,7 +138,7 @@
       "label": "Left B high",
       "x": -10.0,
       "y": 6.667,
-      "z": 1.0,
+      "z": 4.0,
       "wall": "left"
     },
     {
@@ -146,7 +146,7 @@
       "label": "Back A low",
       "x": -6.0,
       "y": 10.0,
-      "z": -1.0,
+      "z": 2.0,
       "wall": "back"
     },
     {
@@ -154,7 +154,7 @@
       "label": "Back A high",
       "x": -6.0,
       "y": 10.0,
-      "z": 1.0,
+      "z": 4.0,
       "wall": "back"
     },
     {
@@ -162,7 +162,7 @@
       "label": "Back B low",
       "x": -2.0,
       "y": 10.0,
-      "z": -1.0,
+      "z": 2.0,
       "wall": "back"
     },
     {
@@ -170,7 +170,7 @@
       "label": "Back B high",
       "x": -2.0,
       "y": 10.0,
-      "z": 1.0,
+      "z": 4.0,
       "wall": "back"
     },
     {
@@ -178,7 +178,7 @@
       "label": "Back C low",
       "x": 2.0,
       "y": 10.0,
-      "z": -1.0,
+      "z": 2.0,
       "wall": "back"
     },
     {
@@ -186,7 +186,7 @@
       "label": "Back C high",
       "x": 2.0,
       "y": 10.0,
-      "z": 1.0,
+      "z": 4.0,
       "wall": "back"
     },
     {
@@ -194,7 +194,7 @@
       "label": "Back D low",
       "x": 6.0,
       "y": 10.0,
-      "z": -1.0,
+      "z": 2.0,
       "wall": "back"
     },
     {
@@ -202,7 +202,7 @@
       "label": "Back D high",
       "x": 6.0,
       "y": 10.0,
-      "z": 1.0,
+      "z": 4.0,
       "wall": "back"
     }
   ]
