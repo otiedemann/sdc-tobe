@@ -321,6 +321,13 @@ _pos_st_lock = threading.Lock()
 _pos_annotated_jpeg = b""
 _pos_annotated_lock = threading.Lock()
 _pos_cfg_lock = threading.Lock()
+
+# Video recording state
+_rec_lock = threading.Lock()
+_rec_enabled = False
+_rec_writer = None        # cv2.VideoWriter
+_rec_path: str = ""
+_rec_frame_count = 0
 _pos_cfg: dict = {
     "enabled": False,
     "fps": 5,
@@ -3132,6 +3139,14 @@ def positioning_loop():
             if ok2:
                 with _pos_annotated_lock:
                     _pos_annotated_jpeg = jpg2.tobytes()
+            # Write annotated frame to recording if active
+            with _rec_lock:
+                if _rec_enabled and _rec_writer is not None:
+                    try:
+                        _rec_writer.write(ann)
+                        _rec_frame_count += 1
+                    except Exception:
+                        pass
         except Exception:
             pass
 
@@ -3188,6 +3203,63 @@ def api_position_video():
                 time.sleep(0.02)   # 50 Hz poll — tight but not a busy-spin
     return Response(gen(), mimetype="multipart/x-mixed-replace; boundary=frame",
                     headers={"Cache-Control": "no-cache"})
+
+
+@app.get("/api/video/record/status")
+def api_rec_status():
+    with _rec_lock:
+        return jsonify(ok=True, recording=_rec_enabled, path=_rec_path, frames=_rec_frame_count)
+
+
+@app.post("/api/video/record/start")
+def api_rec_start():
+    global _rec_enabled, _rec_writer, _rec_path, _rec_frame_count
+    data = request.get_json(silent=True) or {}
+    with _rec_lock:
+        if _rec_enabled:
+            return jsonify(ok=False, error="already recording", path=_rec_path)
+        fname = data.get("filename") or f"rec_{int(time.time())}.mp4"
+        # Ensure recordings dir exists
+        rec_dir = pathlib.Path(__file__).parent / "recordings"
+        rec_dir.mkdir(exist_ok=True)
+        full_path = str(rec_dir / fname)
+        try:
+            # Use first available frame to get resolution; fall back to 960x720
+            with _pos_st_lock:
+                fw = _pos_st.get("frame_w") or 960
+                fh = _pos_st.get("frame_h") or 720
+            fps_target = _pos_fps_current or 5.0
+            fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+            writer = cv2.VideoWriter(full_path, fourcc, fps_target, (fw, fh))
+            if not writer.isOpened():
+                return jsonify(ok=False, error="VideoWriter failed to open")
+            _rec_writer = writer
+            _rec_path = full_path
+            _rec_frame_count = 0
+            _rec_enabled = True
+            print(f"[REC] Recording started: {full_path} @ {fw}x{fh} {fps_target}fps")
+            return jsonify(ok=True, path=full_path)
+        except Exception as e:
+            return jsonify(ok=False, error=str(e))
+
+
+@app.post("/api/video/record/stop")
+def api_rec_stop():
+    global _rec_enabled, _rec_writer, _rec_path, _rec_frame_count
+    with _rec_lock:
+        if not _rec_enabled:
+            return jsonify(ok=False, error="not recording")
+        _rec_enabled = False
+        frames = _rec_frame_count
+        path = _rec_path
+        try:
+            if _rec_writer:
+                _rec_writer.release()
+                _rec_writer = None
+        except Exception:
+            pass
+        print(f"[REC] Recording stopped: {path} ({frames} frames)")
+    return jsonify(ok=True, path=path, frames=frames)
 
 
 @app.get("/api/position/config")

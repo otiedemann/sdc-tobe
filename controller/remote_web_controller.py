@@ -313,6 +313,8 @@ HTML = """
         </div>
         <div style=\"margin-top:6px;display:flex;gap:8px;align-items:center;\">
           <button id=\"pos_video_toggle\" class=\"pos-cfg\">Show ArUco Video</button>
+          <button id=\"rec_btn\" class=\"pos-cfg\" style=\"background:#1e3a2e;border-color:#22c55e;color:#22c55e;\">&#9679; Record</button>
+          <span id=\"rec_status\" class=\"small\" style=\"color:#64748b;\"></span>
           <a id=\"pos_tracker_link\" href=\"#\" target=\"_blank\" class=\"small\" style=\"color:#38bdf8;display:none;\">Open full arena tracker ↗</a>
         </div>
         <div id=\"pos_video_container\" style=\"display:none;margin-top:6px;\">
@@ -1088,35 +1090,48 @@ function drawArena(pos, compPos, dir) {
   // Drone positions
   if (!_pos) return;
 
-  // Helper: clamp canvas coords to inner area, return clamped flag
-  function clampPx(px, py) {
-    const M = PAD + 8;
-    const cx = Math.max(M, Math.min(W - M, px));
-    const cy = Math.max(M, Math.min(H - M, py));
-    return [cx, cy, px !== cx || py !== cy];
-  }
-
-  // Compensated position — primary dot (orange when in view, red when clamped)
+  // Clamp canvas coords to inner area; returns [cx, cy, wasOutOfBounds, rawPx, rawPy]
+  const M = PAD + 8;
   const cp = _compPos || _pos;
   const [rpx, rpy] = arenaToCanvas(cp[0], cp[1]);
-  const [cx2, cy2, outOfBounds] = clampPx(rpx, rpy);
-  ctx.fillText(`raw px: ${rpx.toFixed(0)},${rpy.toFixed(0)} clamp: ${cx2.toFixed(0)},${cy2.toFixed(0)} oob:${outOfBounds}`, PAD + 2, PAD + 40);
-  const dotColor = outOfBounds ? '#ef4444' : '#f97316';
-  const dotBorder = outOfBounds ? '#fca5a5' : '#fed7aa';
+  const cx2 = Math.max(M, Math.min(W - M, rpx));
+  const cy2 = Math.max(M, Math.min(H - M, rpy));
+  const outOfBounds = rpx !== cx2 || rpy !== cy2;
 
+  ctx.fillStyle = '#22d3ee'; ctx.font = '9px monospace'; ctx.textAlign = 'left';
+  ctx.fillText(`raw px: ${rpx.toFixed(0)},${rpy.toFixed(0)} clamp: ${cx2.toFixed(0)},${cy2.toFixed(0)} oob:${outOfBounds}`, PAD + 2, PAD + 40);
+
+  const dotColor = outOfBounds ? '#ef4444' : '#f97316';
+
+  // Outer glow ring (always drawn, big and visible)
+  ctx.beginPath(); ctx.arc(cx2, cy2, 18, 0, Math.PI * 2);
+  ctx.strokeStyle = outOfBounds ? 'rgba(239,68,68,0.5)' : 'rgba(249,115,22,0.4)';
+  ctx.lineWidth = 4; ctx.stroke();
+
+  // Solid filled dot
   ctx.beginPath(); ctx.arc(cx2, cy2, 10, 0, Math.PI * 2);
   ctx.fillStyle = dotColor; ctx.fill();
-  ctx.strokeStyle = dotBorder; ctx.lineWidth = 2; ctx.stroke();
-  ctx.strokeStyle = 'rgba(255,255,255,0.6)'; ctx.lineWidth = 1;
-  ctx.beginPath(); ctx.moveTo(cx2 - 16, cy2); ctx.lineTo(cx2 + 16, cy2); ctx.stroke();
-  ctx.beginPath(); ctx.moveTo(cx2, cy2 - 16); ctx.lineTo(cx2, cy2 + 16); ctx.stroke();
+  ctx.strokeStyle = '#ffffff'; ctx.lineWidth = 2; ctx.stroke();
 
-  // If clamped, draw an arrow from dot edge toward true position
+  // Crosshair
+  ctx.strokeStyle = 'rgba(255,255,255,0.8)'; ctx.lineWidth = 1.5;
+  ctx.beginPath(); ctx.moveTo(cx2 - 20, cy2); ctx.lineTo(cx2 + 20, cy2); ctx.stroke();
+  ctx.beginPath(); ctx.moveTo(cx2, cy2 - 20); ctx.lineTo(cx2, cy2 + 20); ctx.stroke();
+
+  // Arrow toward true out-of-bounds position
   if (outOfBounds) {
     const ang = Math.atan2(rpy - cy2, rpx - cx2);
-    ctx.strokeStyle = '#ef4444'; ctx.lineWidth = 2; ctx.lineCap = 'round';
+    ctx.strokeStyle = '#ef4444'; ctx.lineWidth = 3; ctx.lineCap = 'round';
+    const ax = cx2 + Math.cos(ang) * 24, ay = cy2 + Math.sin(ang) * 24;
     ctx.beginPath(); ctx.moveTo(cx2 + Math.cos(ang) * 12, cy2 + Math.sin(ang) * 12);
-    ctx.lineTo(cx2 + Math.cos(ang) * 22, cy2 + Math.sin(ang) * 22); ctx.stroke();
+    ctx.lineTo(ax, ay); ctx.stroke();
+    // arrowhead
+    const perp = ang + Math.PI / 2;
+    ctx.beginPath();
+    ctx.moveTo(ax, ay);
+    ctx.lineTo(ax - Math.cos(ang)*6 + Math.cos(perp)*4, ay - Math.sin(ang)*6 + Math.sin(perp)*4);
+    ctx.lineTo(ax - Math.cos(ang)*6 - Math.cos(perp)*4, ay - Math.sin(ang)*6 - Math.sin(perp)*4);
+    ctx.closePath(); ctx.fillStyle = '#ef4444'; ctx.fill();
     ctx.lineCap = 'butt';
   }
 
@@ -1129,10 +1144,15 @@ function drawArena(pos, compPos, dir) {
     ctx.lineCap = 'butt';
   }
 
-  // Coordinate label — show "OUT" prefix when clamped
+  // Coordinate label — "OUT" prefix + background box for readability
   const label = (outOfBounds ? 'OUT ' : '') + `(${_pos[0].toFixed(1)},${_pos[1].toFixed(1)})`;
-  ctx.fillStyle = dotColor; ctx.font = 'bold 10px monospace'; ctx.textAlign = 'left';
-  ctx.fillText(label, cx2 + 13, cy2 - 4);
+  ctx.font = 'bold 11px monospace';
+  const lw = ctx.measureText(label).width;
+  const lx = Math.min(cx2 + 14, W - lw - PAD - 4);
+  const ly = cy2 - 6;
+  ctx.fillStyle = 'rgba(0,0,0,0.6)'; ctx.fillRect(lx - 2, ly - 11, lw + 4, 14);
+  ctx.fillStyle = dotColor; ctx.textAlign = 'left';
+  ctx.fillText(label, lx, ly);
 }
 
 function updatePosUI(d) {
@@ -1233,6 +1253,38 @@ document.getElementById('pos_video_toggle').onclick = () => {
   if (posVideoOn) { img.src = '/proxy/position/video?' + Date.now(); container.style.display = ''; }
   else { img.src = ''; container.style.display = 'none'; }
 };
+
+let _recActive = false;
+const recBtn = document.getElementById('rec_btn');
+const recStatus = document.getElementById('rec_status');
+
+async function refreshRecStatus() {
+  try {
+    const d = await (await fetch('/proxy/video/record/status')).json();
+    _recActive = d.recording;
+    recBtn.textContent = _recActive ? '\\u25a0 Stop Rec' : '\\u25cf Record';
+    recBtn.style.borderColor = _recActive ? '#ef4444' : '#22c55e';
+    recBtn.style.color = _recActive ? '#ef4444' : '#22c55e';
+    recBtn.style.background = _recActive ? '#3b0f0f' : '#1e3a2e';
+    if (_recActive) recStatus.textContent = `${d.frames} frames \u2022 ${d.path.split('/').pop()}`;
+    else recStatus.textContent = d.frames ? `saved ${d.frames} frames` : '';
+  } catch {}
+}
+
+recBtn.onclick = async () => {
+  if (_recActive) {
+    const d = await (await fetch('/proxy/video/record/stop', {method:'POST'})).json();
+    recStatus.textContent = d.ok ? `saved ${d.frames} frames: ${d.path.split('/').pop()}` : ('error: ' + d.error);
+  } else {
+    const d = await (await fetch('/proxy/video/record/start', {method:'POST',
+      headers:{'Content-Type':'application/json'}, body:'{}'})).json();
+    recStatus.textContent = d.ok ? `recording... ${d.path.split('/').pop()}` : ('error: ' + d.error);
+  }
+  refreshRecStatus();
+};
+
+refreshRecStatus();
+setInterval(refreshRecStatus, 3000);
 
 loadPosConfig();
 loadArenaConfig();   // pre-load markers so canvas shows them before panel is opened
@@ -2160,6 +2212,34 @@ def proxy_arena_config_set():
 def proxy_arena_config_reset():
     try:
         r = pi_post("/api/arena/config/reset", {})
+        return (r.text, r.status_code, {"Content-Type": r.headers.get("Content-Type", "application/json")})
+    except Exception as e:
+        return jsonify(ok=False, error=str(e)), 502
+
+
+@app.get("/proxy/video/record/status")
+def proxy_rec_status():
+    try:
+        r = pi_get("/api/video/record/status", timeout=TIMEOUT_STATUS)
+        return (r.text, r.status_code, {"Content-Type": r.headers.get("Content-Type", "application/json")})
+    except Exception as e:
+        return jsonify(ok=False, error=str(e)), 502
+
+
+@app.post("/proxy/video/record/start")
+def proxy_rec_start():
+    try:
+        data = request.get_json(silent=True) or {}
+        r = pi_post("/api/video/record/start", data)
+        return (r.text, r.status_code, {"Content-Type": r.headers.get("Content-Type", "application/json")})
+    except Exception as e:
+        return jsonify(ok=False, error=str(e)), 502
+
+
+@app.post("/proxy/video/record/stop")
+def proxy_rec_stop():
+    try:
+        r = pi_post("/api/video/record/stop", {})
         return (r.text, r.status_code, {"Content-Type": r.headers.get("Content-Type", "application/json")})
     except Exception as e:
         return jsonify(ok=False, error=str(e)), 502
