@@ -1,0 +1,6 @@
+{
+  "enabled": true,
+  "fps": 5,
+  "detect_profile": "balanced",
+  "latency_comp_s": 0.05
+}

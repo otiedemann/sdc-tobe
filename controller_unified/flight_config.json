@@ -1,0 +1,5 @@
+{
+  "max_vertical_speed": 0.5,
+  "max_tilt": 35,
+  "max_altitude_m": 2.0
+}
