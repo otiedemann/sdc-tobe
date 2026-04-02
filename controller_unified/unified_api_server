@@ -3001,12 +3001,30 @@ def positioning_loop():
                 time.sleep(1)
                 continue
 
-        # Run detection
+        # Detect markers for visual annotation (separate fast pass before heavy pose estimation)
+        ann = frame.copy()
+        raw_corners = raw_ids = None
+        try:
+            from cv2 import aruco as _aruco
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            raw_corners, raw_ids, _ = processor.detector.detectMarkers(gray)
+            if raw_ids is not None and len(raw_ids) > 0:
+                _aruco.drawDetectedMarkers(ann, raw_corners, raw_ids)
+        except Exception as ae:
+            if _video_frame_count < 5:
+                print(f"[POS] annotation detect error: {ae}")
+
+        # Run pose estimation
         try:
             result = processor.process_frame(frame)
         except Exception as pe:
             print(f"[POS] process_frame error: {pe}")
-            continue
+            result = None
+
+        # process_frame returns None when no reference markers visible
+        if result is None:
+            result = {"stale": True, "cam": None, "dir": None,
+                      "marker_weights": {}, "ref_markers": []}
 
         cam = result.get("cam")
         direction = result.get("dir")
@@ -3029,12 +3047,19 @@ def positioning_loop():
 
         _broadcast_pos_sse(snapshot)
 
-        # Annotated JPEG
+        # Overlay position text and encode annotated JPEG
         try:
-            ann = frame.copy()
+            n_detected = len(raw_ids) if raw_ids is not None else 0
             if cam is not None and not stale:
                 txt = f"x={cam[0]:.2f} y={cam[1]:.2f} z={cam[2]:.2f}"
-                cv2.putText(ann, txt, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+                cv2.putText(ann, txt, (10, 30), cv2.FONT_HERSHEY_SIMPLEX,
+                            0.7, (0, 255, 0), 2)
+            elif n_detected > 0:
+                cv2.putText(ann, f"{n_detected} marker(s) — no ref pose",
+                            (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 200, 255), 2)
+            else:
+                cv2.putText(ann, "no markers", (10, 30), cv2.FONT_HERSHEY_SIMPLEX,
+                            0.6, (100, 100, 100), 2)
             ok2, jpg2 = cv2.imencode(".jpg", ann, [int(cv2.IMWRITE_JPEG_QUALITY), 70])
             if ok2:
                 with _pos_annotated_lock:
@@ -3079,17 +3104,20 @@ def api_position_events():
 
 @app.get("/api/position/video")
 def api_position_video():
-    """MJPEG stream with ArUco annotations."""
+    """MJPEG stream with ArUco annotations — served at the rate frames are produced."""
     def gen():
+        last_sent = None
         while running:
             with _pos_annotated_lock:
                 jpg = _pos_annotated_jpeg
             if not jpg:
                 with _video_jpeg_lock:
                     jpg = _video_last_jpeg
-            if jpg:
+            if jpg and jpg is not last_sent:
+                last_sent = jpg
                 yield (b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + jpg + b"\r\n")
-            time.sleep(1.0 / max(1, _pos_cfg.get("fps", 5)))
+            else:
+                time.sleep(0.02)   # 50 Hz poll — tight but not a busy-spin
     return Response(gen(), mimetype="multipart/x-mixed-replace; boundary=frame",
                     headers={"Cache-Control": "no-cache"})
 
