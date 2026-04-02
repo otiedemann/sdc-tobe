@@ -95,10 +95,17 @@ class HeadlessAruCoPositioning:
         [-0.25, -0.25, 0.0],
     ], dtype=np.float32)
 
-    def __init__(self, camera_matrix, dist_coeffs, detect_profile="balanced"):
+    def __init__(self, camera_matrix, dist_coeffs, detect_profile="balanced", marker_size=None):
         self.camera_matrix = camera_matrix
         self.dist_coeffs = dist_coeffs
-        self.marker_size = MARKER_SIZE
+        self.marker_size = marker_size if marker_size is not None else MARKER_SIZE
+        half = self.marker_size / 2.0
+        self.MARKER_3D_POINTS = np.array([
+            [-half,  half, 0.0],
+            [ half,  half, 0.0],
+            [ half, -half, 0.0],
+            [-half, -half, 0.0],
+        ], dtype=np.float32)
         self.aruco_dict = aruco.getPredefinedDictionary(aruco.DICT_4X4_100)
         self.aruco_params = aruco.DetectorParameters()
         self._apply_detection_profile(detect_profile)

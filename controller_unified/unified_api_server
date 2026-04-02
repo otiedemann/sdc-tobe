@@ -303,6 +303,7 @@ _video_frame_count = 0
 # Positioning state
 # ---------------------------------------------------------------------------
 _pos_frame_q: "queue.Queue" = queue.Queue(maxsize=3)   # BGR frames tapped from video cb
+_pos_processor = None   # live HeadlessAruCoPositioning instance (set by positioning_loop)
 _pos_sse_queues: list = []
 _pos_sse_lock = threading.Lock()
 _pos_st: dict = {
@@ -3040,8 +3041,13 @@ def positioning_loop():
             calib_w, calib_h = w, h
             profile = cfg.get("detect_profile", "default")
             try:
-                processor = _HeadlessAruCo(cam_mat, dist, detect_profile=profile)
+                global _pos_processor
+                with _arena_cfg_lock:
+                    init_marker_size = float(_arena_cfg.get("marker_size_m", 0.5))
+                processor = _HeadlessAruCo(cam_mat, dist, detect_profile=profile,
+                                           marker_size=init_marker_size)
                 _apply_arena_cfg_to_processor(processor)
+                _pos_processor = processor
                 print(f"[POS] Processor initialised (profile={profile})")
             except Exception as ie:
                 print(f"[POS] Processor init error: {ie}")
@@ -3275,6 +3281,7 @@ def api_arena_config_set():
             _arena_cfg["markers"] = data["markers"]
         cfg = dict(_arena_cfg)
     _save_arena_config(cfg)
+    _apply_arena_cfg_to_processor(_pos_processor)
     return jsonify(ok=True, **cfg)
 
 
@@ -3285,6 +3292,7 @@ def api_arena_config_reset():
         _arena_cfg = dict(_ARENA_CONFIG_DEFAULT)
         cfg = dict(_arena_cfg)
     _save_arena_config(cfg)
+    _apply_arena_cfg_to_processor(_pos_processor)
     return jsonify(ok=True, **cfg)
 
 
