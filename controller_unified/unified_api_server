@@ -311,6 +311,7 @@ _pos_st: dict = {
     "dx": None, "dy": None,
     "vx": 0.0, "vy": 0.0, "vz": 0.0,
     "markers": {}, "ref_markers": [],
+    "seen_markers": [], "seen_count": 0,
     "stale": True, "ts": 0.0, "fps": None,
 }
 # FPS tracking for positioning loop
@@ -347,7 +348,7 @@ _ARENA_CONFIG_DEFAULT: dict = {
     "arena_height_m": 10.0,
     "arena_origin_x": -10.0,
     "arena_origin_y": 0.0,
-    "marker_size_m": 0.5,
+    "marker_size_m": 0.18,
     "markers": [
         {"id":  0, "label": "Origin",       "x":   0.0, "y":  0.0,   "z":  0.0, "wall": "front"},
         {"id":  1, "label": "Right A low",  "x":  10.0, "y":  6.667, "z":  2.0, "wall": "right"},
@@ -2942,6 +2943,8 @@ def _pos_snapshot_to_js(snapshot: dict) -> dict:
         "dir": direction,
         "fps": snapshot.get("fps"),
         "ref_markers": snapshot.get("ref_markers", []),
+        "seen_markers": snapshot.get("seen_markers", []),
+        "seen_count": snapshot.get("seen_count", 0),
         "stale": snapshot.get("stale", True),
         "enabled": enabled,
         "latency_ms": lat_ms,
@@ -2979,7 +2982,7 @@ def _apply_arena_cfg_to_processor(processor):
         with _arena_cfg_lock:
             cfg = dict(_arena_cfg)
         markers = cfg.get("markers", [])
-        mk_size = float(cfg.get("marker_size_m", 0.5))
+        mk_size = float(cfg.get("marker_size_m", 0.18))
         if markers:
             new_positions = {}
             new_wall_types = {}
@@ -3053,7 +3056,7 @@ def positioning_loop():
             try:
                 global _pos_processor
                 with _arena_cfg_lock:
-                    init_marker_size = float(_arena_cfg.get("marker_size_m", 0.5))
+                    init_marker_size = float(_arena_cfg.get("marker_size_m", 0.18))
                 processor = _HeadlessAruCo(cam_mat, dist, detect_profile=profile,
                                            marker_size=init_marker_size)
                 _apply_arena_cfg_to_processor(processor)
@@ -3077,9 +3080,16 @@ def positioning_loop():
             if _video_frame_count < 5:
                 print(f"[POS] annotation detect error: {ae}")
 
-        # Run pose estimation
+        # Run pose estimation (latency-aware)
         try:
-            result = processor.process_frame(frame)
+            with _pos_cfg_lock:
+                latency_comp_s = max(0.0, float(_pos_cfg.get("latency_comp_s", 0.05)))
+            result = processor.process_frame(
+                frame,
+                frame_ts=ts,
+                latency_s=latency_comp_s,
+                now_ts=time.time(),
+            )
         except Exception as pe:
             print(f"[POS] process_frame error: {pe}")
             result = None
@@ -3114,6 +3124,8 @@ def positioning_loop():
             _pos_st["markers"] = {str(k): round(float(v), 4)
                                    for k, v in (result.get("marker_weights") or {}).items()}
             _pos_st["ref_markers"] = list(result.get("ref_markers") or [])
+            _pos_st["seen_markers"] = list(result.get("seen_markers") or [])
+            _pos_st["seen_count"] = int(result.get("seen_count") or 0)
             _pos_st["stale"] = stale
             _pos_st["ts"] = ts
             _pos_st["fps"] = _pos_fps_current

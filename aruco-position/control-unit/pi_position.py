@@ -18,7 +18,7 @@ except Exception:
 UDP_DEST_IP = "127.0.0.1"  # Default IP des Laptops (Relay)
 UDP_PORT = 5005
 UDP_CMD_PORT = 5006  # Port für eingehende Befehle vom Relay
-MARKER_SIZE = 0.5
+MARKER_SIZE = 0.18
 CAMERA_SOURCE = 0
 HEARTBEAT_INTERVAL = 1.0  # Sekunden: Status senden auch ohne Marker
 
@@ -28,6 +28,12 @@ MIN_REF_COUNT = 1  # Allow single-marker pose as fallback
 POSE_HOLD_SEC = 0.8  # Hold last valid pose briefly when refs drop out
 OUTLIER_POS_THRESH = 2.5  # meters: looser outlier reject for real-world noise
 TARGET_Z_POS = -1.5  # fixed target height position (internal Z axis)
+
+# Motion model / delayed-measurement tuning
+MAX_STATE_DT = 1.0
+VEL_BLEND = 0.25
+MEAS_BLEND_MIN = 0.35
+MEAS_BLEND_MAX = 0.85
 
 
 def has_gui():
@@ -122,6 +128,53 @@ class HeadlessAruCoPositioning:
         self.last_valid_pose = None
         self.last_valid_dir = None
         self.last_valid_ts = 0.0
+
+        # Constant-velocity world-state used for latency-aware prediction.
+        # State time is in wall-clock seconds and is advanced with capture/eval timestamps.
+        self.state_pos = None
+        self.state_vel = np.zeros(3, dtype=float)
+        self.state_ts = None
+
+    def _reset_motion_state(self):
+        self.state_pos = None
+        self.state_vel = np.zeros(3, dtype=float)
+        self.state_ts = None
+
+    def _predict_state(self, target_ts):
+        if self.state_pos is None or self.state_ts is None:
+            return None
+        dt = float(target_ts) - float(self.state_ts)
+        if dt <= 0.0:
+            return self.state_pos.copy()
+        dt = min(dt, MAX_STATE_DT)
+        return self.state_pos + self.state_vel * dt
+
+    def _update_motion_state(self, meas_pos, meas_ts, blend_alpha):
+        meas_pos = np.asarray(meas_pos, dtype=float)
+        meas_ts = float(meas_ts)
+        blend_alpha = float(np.clip(blend_alpha, MEAS_BLEND_MIN, MEAS_BLEND_MAX))
+        if self.state_ts is not None and meas_ts < float(self.state_ts):
+            meas_ts = float(self.state_ts)
+
+        pred = self._predict_state(meas_ts)
+        if pred is None:
+            fused = meas_pos.copy()
+        else:
+            innov = meas_pos - pred
+            if np.linalg.norm(innov) > (OUTLIER_POS_THRESH * 1.5):
+                blend_alpha *= 0.5
+            fused = pred + blend_alpha * innov
+
+        if self.state_pos is not None and self.state_ts is not None:
+            dt = meas_ts - float(self.state_ts)
+            if 1e-3 < dt <= MAX_STATE_DT:
+                inst_vel = (fused - self.state_pos) / dt
+                self.state_vel = (1.0 - VEL_BLEND) * self.state_vel + VEL_BLEND * inst_vel
+            elif dt > MAX_STATE_DT:
+                self.state_vel = np.zeros(3, dtype=float)
+        self.state_pos = fused.copy()
+        self.state_ts = meas_ts
+        return fused
 
     def _apply_detection_profile(self, profile):
         p = self.aruco_params
@@ -287,49 +340,71 @@ class HeadlessAruCoPositioning:
 
         return float(area_w * dist_w * shape_w * reproj_w)
 
-    def process_frame(self, frame):
+    def process_frame(self, frame, frame_ts=None, latency_s=0.0, now_ts=None):
+        now_wall = float(now_ts) if now_ts is not None else time.time()
+        frame_ts = float(frame_ts) if frame_ts is not None else now_wall
+        latency_s = max(0.0, float(latency_s))
+        capture_ts = frame_ts - latency_s
+        eval_ts = max(capture_ts, now_wall)
+
+        def _stale_payload(refs=None, marker_weights=None, seen_ids=None):
+            if refs is None:
+                refs = []
+            if marker_weights is None:
+                marker_weights = {}
+            if seen_ids is None:
+                seen_ids = []
+            pred = self._predict_state(eval_ts)
+            cam_out = pred if pred is not None else self.last_valid_pose
+            if cam_out is None:
+                return None
+            return {
+                "cam": np.asarray(cam_out, dtype=float).tolist(),
+                "dir": self.last_valid_dir.tolist() if self.last_valid_dir is not None else None,
+                "targets": {},
+                "ref_markers": refs,
+                "marker_weights": marker_weights,
+                "seen_markers": [int(m) for m in seen_ids],
+                "seen_count": len(seen_ids),
+                "capture_ts": capture_ts,
+                "eval_ts": eval_ts,
+                "state_vel": self.state_vel.tolist(),
+                "stale": True,
+            }
+
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         corners, ids, _ = self.detector.detectMarkers(gray)
         if ids is None or len(ids) == 0:
             # short hold to avoid immediate dropouts
-            if self.last_valid_pose is not None and (time.time() - self.last_valid_ts) <= POSE_HOLD_SEC:
-                return {
-                    "cam": self.last_valid_pose.tolist(),
-                    "dir": self.last_valid_dir.tolist() if self.last_valid_dir is not None else None,
-                    "targets": {},
-                    "ref_markers": [],
-                    "marker_weights": {},
-                    "stale": True
-                }
-            for kf in self.kf_pos: kf.reset()
+            if self.last_valid_pose is not None and (now_wall - self.last_valid_ts) <= POSE_HOLD_SEC:
+                return _stale_payload()
+            for kf in self.kf_pos:
+                kf.reset()
             self.direction_filter.reset()
+            self._reset_motion_state()
             return None
+
+        seen_ids = [int(mid) for mid in ids.flatten()]
         cached_poses = {}
         # Use self.MARKER_3D_POINTS so that the configured marker_size_m is
         # taken into account when estimating camera-to-marker distance via solvePnP.
         marker_points = self.MARKER_3D_POINTS.astype(np.float32)
-        for i, mid_raw in enumerate(ids.flatten()):
+        for i, mid_raw in enumerate(seen_ids):
             mid = int(mid_raw)
             ok, rvec, tvec = cv2.solvePnP(marker_points, corners[i].reshape(-1, 2), self.camera_matrix,
                                           self.dist_coeffs, flags=cv2.SOLVEPNP_IPPE_SQUARE)
-            if ok: cached_poses[mid] = (rvec, tvec.reshape(3))
-        ref_indices = [i for i, mid in enumerate(ids.flatten()) if
+            if ok:
+                cached_poses[mid] = (rvec, tvec.reshape(3))
+        ref_indices = [i for i, mid in enumerate(seen_ids) if
                        int(mid) in self.marker_positions and int(mid) in cached_poses]
-        tgt_indices = [i for i, mid in enumerate(ids.flatten()) if int(mid) >= 30 and int(mid) in cached_poses]
+        tgt_indices = [i for i, mid in enumerate(seen_ids) if int(mid) >= 30 and int(mid) in cached_poses]
         if not ref_indices:
-            if self.last_valid_pose is not None and (time.time() - self.last_valid_ts) <= POSE_HOLD_SEC:
-                return {
-                    "cam": self.last_valid_pose.tolist(),
-                    "dir": self.last_valid_dir.tolist() if self.last_valid_dir is not None else None,
-                    "targets": {},
-                    "ref_markers": [],
-                    "marker_weights": {},
-                    "stale": True
-                }
+            if self.last_valid_pose is not None and (now_wall - self.last_valid_ts) <= POSE_HOLD_SEC:
+                return _stale_payload(seen_ids=seen_ids)
             return None
         cam_positions, cam_dirs, rot_mats, weights, ref_marker_ids = [], [], [], [], []
         for idx in ref_indices:
-            mid = int(ids.flatten()[idx])
+            mid = int(seen_ids[idx])
             rvec, tvec = cached_poses[mid]
 
             # ===================== Pose math (single marker) =====================
@@ -382,15 +457,12 @@ class HeadlessAruCoPositioning:
 
         # If too few high-quality refs remain, hold recent pose instead of producing bad estimates
         if len(weights) < MIN_REF_COUNT:
-            if self.last_valid_pose is not None and (time.time() - self.last_valid_ts) <= POSE_HOLD_SEC:
-                return {
-                    "cam": self.last_valid_pose.tolist(),
-                    "dir": self.last_valid_dir.tolist() if self.last_valid_dir is not None else None,
-                    "targets": {},
-                    "ref_markers": ref_marker_ids,
-                    "marker_weights": {str(mid): float(w) for mid, w in zip(ref_marker_ids, weights)},
-                    "stale": True
-                }
+            if self.last_valid_pose is not None and (now_wall - self.last_valid_ts) <= POSE_HOLD_SEC:
+                return _stale_payload(
+                    refs=[int(m) for m in ref_marker_ids],
+                    marker_weights={str(mid): float(w) for mid, w in zip(ref_marker_ids, weights)},
+                    seen_ids=seen_ids
+                )
             return None
 
         # Keep only top-4 best reference markers when more are visible
@@ -419,7 +491,15 @@ class HeadlessAruCoPositioning:
         w_arr = np.array(weights) / (sum(weights) + 1e-6)
         raw_pos = sum(p * w for p, w in zip(cam_positions, w_arr))
         raw_dir = sum(d * w for d, w in zip(cam_dirs, w_arr))
-        f_pos = np.array([self.kf_pos[j].update(raw_pos[j]) for j in range(3)])
+        f_pos_meas = np.array([self.kf_pos[j].update(raw_pos[j]) for j in range(3)])
+
+        # Apply delayed measurement update at capture time, then predict to evaluation time.
+        quality = float(np.mean(weights)) * min(1.0, len(weights) / 3.0)
+        blend_alpha = np.clip(0.35 + 0.5 * quality, MEAS_BLEND_MIN, MEAS_BLEND_MAX)
+        self._update_motion_state(f_pos_meas, capture_ts, blend_alpha)
+        f_pos = self._predict_state(eval_ts)
+        if f_pos is None:
+            f_pos = f_pos_meas.copy()
 
         raw_dir_norm = np.linalg.norm(raw_dir)
         if raw_dir_norm > 1e-9:
@@ -438,7 +518,7 @@ class HeadlessAruCoPositioning:
         w_ref = w_ref / (np.sum(w_ref) + 1e-9)
 
         for idx in tgt_indices:
-            tid = int(ids.flatten()[idx])
+            tid = int(seen_ids[idx])
             tvec_target = cached_poses[tid][1]
 
             # Estimate target world position from each reference marker independently
@@ -461,7 +541,7 @@ class HeadlessAruCoPositioning:
         # cache valid pose
         self.last_valid_pose = f_pos.copy()
         self.last_valid_dir = f_dir.copy()
-        self.last_valid_ts = time.time()
+        self.last_valid_ts = now_wall
 
         marker_weights = {
             str(mid): float(w) for mid, w in zip(ref_marker_ids, weights)
@@ -472,7 +552,12 @@ class HeadlessAruCoPositioning:
             "dir": f_dir.tolist(),
             "targets": targets,
             "ref_markers": [int(m) for m in ref_marker_ids],
-            "marker_weights": marker_weights
+            "marker_weights": marker_weights,
+            "seen_markers": seen_ids,
+            "seen_count": len(seen_ids),
+            "capture_ts": capture_ts,
+            "eval_ts": eval_ts,
+            "state_vel": self.state_vel.tolist(),
         }
 
 
