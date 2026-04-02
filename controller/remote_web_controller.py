@@ -1082,21 +1082,36 @@ function drawArena(pos, compPos, dir) {
   // Drone positions
   if (!_pos) return;
 
-  // Raw ArUco position — cyan ring
-  const [rx, ry] = arenaToCanvas(_pos[0], _pos[1]);
-  ctx.beginPath(); ctx.arc(rx, ry, 6, 0, Math.PI * 2);
-  ctx.fillStyle = 'rgba(56,189,248,0.3)'; ctx.fill();
-  ctx.strokeStyle = '#38bdf8'; ctx.lineWidth = 2; ctx.stroke();
+  // Helper: clamp canvas coords to inner area, return clamped flag
+  function clampPx(px, py) {
+    const M = PAD + 8;
+    const cx = Math.max(M, Math.min(W - M, px));
+    const cy = Math.max(M, Math.min(H - M, py));
+    return [cx, cy, px !== cx || py !== cy];
+  }
 
-  // Compensated position — solid orange filled circle + crosshair
+  // Compensated position — primary dot (orange when in view, red when clamped)
   const cp = _compPos || _pos;
-  const [cx2, cy2] = arenaToCanvas(cp[0], cp[1]);
+  const [rpx, rpy] = arenaToCanvas(cp[0], cp[1]);
+  const [cx2, cy2, outOfBounds] = clampPx(rpx, rpy);
+  const dotColor = outOfBounds ? '#ef4444' : '#f97316';
+  const dotBorder = outOfBounds ? '#fca5a5' : '#fed7aa';
+
   ctx.beginPath(); ctx.arc(cx2, cy2, 10, 0, Math.PI * 2);
-  ctx.fillStyle = '#f97316'; ctx.fill();
-  ctx.strokeStyle = '#fed7aa'; ctx.lineWidth = 2; ctx.stroke();
+  ctx.fillStyle = dotColor; ctx.fill();
+  ctx.strokeStyle = dotBorder; ctx.lineWidth = 2; ctx.stroke();
   ctx.strokeStyle = 'rgba(255,255,255,0.6)'; ctx.lineWidth = 1;
   ctx.beginPath(); ctx.moveTo(cx2 - 16, cy2); ctx.lineTo(cx2 + 16, cy2); ctx.stroke();
   ctx.beginPath(); ctx.moveTo(cx2, cy2 - 16); ctx.lineTo(cx2, cy2 + 16); ctx.stroke();
+
+  // If clamped, draw an arrow from dot edge toward true position
+  if (outOfBounds) {
+    const ang = Math.atan2(rpy - cy2, rpx - cx2);
+    ctx.strokeStyle = '#ef4444'; ctx.lineWidth = 2; ctx.lineCap = 'round';
+    ctx.beginPath(); ctx.moveTo(cx2 + Math.cos(ang) * 12, cy2 + Math.sin(ang) * 12);
+    ctx.lineTo(cx2 + Math.cos(ang) * 22, cy2 + Math.sin(ang) * 22); ctx.stroke();
+    ctx.lineCap = 'butt';
+  }
 
   // Heading arrow
   if (_dir) {
@@ -1107,9 +1122,10 @@ function drawArena(pos, compPos, dir) {
     ctx.lineCap = 'butt';
   }
 
-  // Coordinate label next to dot
-  ctx.fillStyle = '#f97316'; ctx.font = 'bold 10px monospace'; ctx.textAlign = 'left';
-  ctx.fillText(`(${_pos[0].toFixed(1)},${_pos[1].toFixed(1)})`, cx2 + 13, cy2 - 4);
+  // Coordinate label — show "OUT" prefix when clamped
+  const label = (outOfBounds ? 'OUT ' : '') + `(${_pos[0].toFixed(1)},${_pos[1].toFixed(1)})`;
+  ctx.fillStyle = dotColor; ctx.font = 'bold 10px monospace'; ctx.textAlign = 'left';
+  ctx.fillText(label, cx2 + 13, cy2 - 4);
 }
 
 function updatePosUI(d) {
