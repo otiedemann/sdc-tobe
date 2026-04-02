@@ -1051,29 +1051,35 @@ function drawArena(pos, compPos, dir) {
   // Drone positions
   if (!pos) return;
 
-  // Raw — blue ghost
+  // Raw ArUco position — cyan ring
   const [rx, ry] = arenaToCanvas(pos[0], pos[1]);
-  ctx.beginPath(); ctx.arc(rx, ry, 5, 0, Math.PI * 2);
-  ctx.fillStyle = 'rgba(56,189,248,0.25)'; ctx.fill();
-  ctx.strokeStyle = '#38bdf8'; ctx.lineWidth = 1; ctx.stroke();
+  ctx.beginPath(); ctx.arc(rx, ry, 6, 0, Math.PI * 2);
+  ctx.fillStyle = 'rgba(56,189,248,0.3)'; ctx.fill();
+  ctx.strokeStyle = '#38bdf8'; ctx.lineWidth = 2; ctx.stroke();
 
-  if (!compPos) return;
-
-  // Latency-compensated — orange drone
-  const [dx, dy] = arenaToCanvas(compPos[0], compPos[1]);
-  ctx.beginPath(); ctx.arc(dx, dy, 9, 0, Math.PI * 2);
+  // Compensated position — solid orange filled circle + crosshair
+  const cp = compPos || pos;
+  const [cx2, cy2] = arenaToCanvas(cp[0], cp[1]);
+  ctx.beginPath(); ctx.arc(cx2, cy2, 10, 0, Math.PI * 2);
   ctx.fillStyle = '#f97316'; ctx.fill();
-  ctx.strokeStyle = '#fed7aa'; ctx.lineWidth = 1.5; ctx.stroke();
+  ctx.strokeStyle = '#fed7aa'; ctx.lineWidth = 2; ctx.stroke();
+  ctx.strokeStyle = 'rgba(255,255,255,0.5)'; ctx.lineWidth = 1;
+  ctx.beginPath(); ctx.moveTo(cx2 - 14, cy2); ctx.lineTo(cx2 + 14, cy2); ctx.stroke();
+  ctx.beginPath(); ctx.moveTo(cx2, cy2 - 14); ctx.lineTo(cx2, cy2 + 14); ctx.stroke();
 
   // Heading arrow
   if (dir) {
     const ang = Math.atan2(dir[0], dir[1]);
-    const len = 20;
+    const len = 24;
     ctx.strokeStyle = '#facc15'; ctx.lineWidth = 2.5; ctx.lineCap = 'round';
-    ctx.beginPath(); ctx.moveTo(dx, dy);
-    ctx.lineTo(dx + Math.sin(ang) * len, dy - Math.cos(ang) * len); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(cx2, cy2);
+    ctx.lineTo(cx2 + Math.sin(ang) * len, cy2 - Math.cos(ang) * len); ctx.stroke();
     ctx.lineCap = 'butt';
   }
+
+  // Coordinate label next to dot
+  ctx.fillStyle = '#f97316'; ctx.font = 'bold 10px monospace'; ctx.textAlign = 'left';
+  ctx.fillText(`(${pos[0].toFixed(1)},${pos[1].toFixed(1)})`, cx2 + 13, cy2 - 4);
 }
 
 function updatePosUI(d) {
@@ -1175,6 +1181,7 @@ document.getElementById('pos_video_toggle').onclick = () => {
 };
 
 loadPosConfig();
+loadArenaConfig();   // pre-load markers so canvas shows them before panel is opened
 drawArena(null, null, null);
 
 // ── Arena Configuration ───────────────────────────────────────────────────────
