@@ -1910,11 +1910,90 @@ def proxy_position_calibration():
 
 # ── Arena configuration proxy ─────────────────────────────────────────────────
 
+def _pi_arena_to_js(d: dict) -> dict:
+    """Convert Pi API flat arena format → JS-expected nested format.
+
+    Pi API returns:
+      {arena_width_m, arena_height_m, marker_size_m,
+       markers: [{id, x, y, z, wall, label?}, ...]}
+
+    JS expects:
+      {arena: {width_m, depth_m, height_min_m, height_max_m},
+       marker_size_m,
+       markers: {"0": {pos:[x,y,z], wall, label?}, ...}}
+    """
+    out: dict = {"ok": d.get("ok", True)}
+    out["arena"] = {
+        "width_m":      d.get("arena_width_m", 20.0),
+        "depth_m":      d.get("arena_height_m", 10.0),
+        "height_min_m": d.get("arena_height_min_m", -1.0),
+        "height_max_m": d.get("arena_height_max_m",  1.0),
+    }
+    out["marker_size_m"] = d.get("marker_size_m", 0.5)
+    markers_dict: dict = {}
+    for m in (d.get("markers") or []):
+        mid = str(m.get("id", "?"))
+        entry: dict = {
+            "pos": [
+                float(m.get("x", 0)),
+                float(m.get("y", 0)),
+                float(m.get("z", 0)),
+            ],
+            "wall": m.get("wall", "front"),
+        }
+        if "label" in m:
+            entry["label"] = m["label"]
+        markers_dict[mid] = entry
+    out["markers"] = markers_dict
+    return out
+
+
+def _js_arena_to_pi(data: dict) -> dict:
+    """Convert JS POST format → Pi API format.
+
+    JS sends:
+      {arena: {width_m, depth_m, height_min_m, height_max_m},
+       marker_size_m,
+       markers: {"0": {pos:[x,y,z], wall, label?}, ...}}
+
+    Pi API expects:
+      {arena_width_m, arena_height_m, marker_size_m,
+       markers: [{id, x, y, z, wall}, ...]}
+    """
+    out: dict = {}
+    arena = data.get("arena") or {}
+    if arena.get("width_m") is not None:
+        out["arena_width_m"] = float(arena["width_m"])
+    if arena.get("depth_m") is not None:
+        out["arena_height_m"] = float(arena["depth_m"])
+    if data.get("marker_size_m") is not None:
+        out["marker_size_m"] = float(data["marker_size_m"])
+    raw_markers = data.get("markers")
+    if isinstance(raw_markers, dict):
+        arr = []
+        for mid_str, m in raw_markers.items():
+            pos = m.get("pos") or [0, 0, 0]
+            entry: dict = {
+                "id":   int(mid_str),
+                "x":    float(pos[0]) if len(pos) > 0 else 0.0,
+                "y":    float(pos[1]) if len(pos) > 1 else 0.0,
+                "z":    float(pos[2]) if len(pos) > 2 else 0.0,
+                "wall": m.get("wall", "front"),
+            }
+            if "label" in m:
+                entry["label"] = m["label"]
+            arr.append(entry)
+        arr.sort(key=lambda e: e["id"])
+        out["markers"] = arr
+    return out
+
+
 @app.get("/proxy/arena/config")
 def proxy_arena_config_get():
     try:
         r = pi_get("/api/arena/config", timeout=TIMEOUT_STATUS)
-        return (r.text, r.status_code, {"Content-Type": r.headers.get("Content-Type", "application/json")})
+        d = r.json()
+        return jsonify(**_pi_arena_to_js(d))
     except Exception as e:
         return jsonify(ok=False, error=str(e)), 502
 
@@ -1923,8 +2002,10 @@ def proxy_arena_config_get():
 def proxy_arena_config_set():
     data = request.get_json(silent=True) or {}
     try:
-        r = pi_post("/api/arena/config", data)
-        return (r.text, r.status_code, {"Content-Type": r.headers.get("Content-Type", "application/json")})
+        pi_payload = _js_arena_to_pi(data)
+        r = pi_post("/api/arena/config", pi_payload)
+        d = r.json()
+        return jsonify(**_pi_arena_to_js(d))
     except Exception as e:
         return jsonify(ok=False, error=str(e)), 502
 
