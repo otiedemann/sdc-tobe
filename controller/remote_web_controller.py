@@ -265,7 +265,7 @@ HTML = """
         </label>
         <span id=\"pos_status_badge\" class=\"small\" style=\"color:#64748b;\">disabled</span>
       </div>
-      <canvas id=\"arena_canvas\" class=\"arena-canvas\" width=\"380\" height=\"210\"></canvas>
+      <canvas id=\"arena_canvas\" class=\"arena-canvas\" width=\"600\" height=\"400\"></canvas>
       <div class=\"pos-coords\" style=\"margin-top:6px;\">
         <span class=\"pos-x\">X: <span id=\"pos_x\">—</span></span>&nbsp;&nbsp;
         <span class=\"pos-y\">Y: <span id=\"pos_y\">—</span></span>&nbsp;&nbsp;
@@ -978,21 +978,38 @@ const arenaCtx = arenaCanvas.getContext('2d');
 
 // World dimensions — updated when arena config loads
 let arenaW = 20, arenaD = 10, arenaOX = -10, arenaOY = 0;
+// View adds a margin around arena so out-of-bounds positions are still visible
+const VIEW_MARGIN = 5;  // metres
+let viewOX = -15, viewOY = -5, viewW = 30, viewD = 20;
 
-const ARENA_PAD = 26;  // pixel padding for axis labels
+function _updateView() {
+  viewOX = arenaOX - VIEW_MARGIN;
+  viewOY = arenaOY - VIEW_MARGIN;
+  viewW  = arenaW + 2 * VIEW_MARGIN;
+  viewD  = arenaD + 2 * VIEW_MARGIN;
+}
+
+const ARENA_PAD = 30;  // pixel padding for axis labels
 
 function arenaToCanvas(ax, ay) {
   const W = arenaCanvas.width, H = arenaCanvas.height;
   const iw = W - 2 * ARENA_PAD, ih = H - 2 * ARENA_PAD;
   return [
-    ARENA_PAD + (ax - arenaOX) / arenaW * iw,
-    H - ARENA_PAD - (ay - arenaOY) / arenaD * ih,
+    ARENA_PAD + (ax - viewOX) / viewW * iw,
+    H - ARENA_PAD - (ay - viewOY) / viewD * ih,
   ];
 }
 
 const WALL_COLOR = { front:'#6366f1', back:'#a855f7', left:'#06b6d4', right:'#10b981' };
 
+// Track last drawn position so arena config reload doesn't erase the dot
+let _lastPos = null, _lastCompPos = null, _lastDir = null;
+
 function drawArena(pos, compPos, dir) {
+  // Persist last known position so config reloads don't blank it
+  if (pos !== undefined) { _lastPos = pos; _lastCompPos = compPos; _lastDir = dir; }
+  const _pos = _lastPos, _compPos = _lastCompPos, _dir = _lastDir;
+
   const ctx = arenaCtx;
   const W = arenaCanvas.width, H = arenaCanvas.height;
   const PAD = ARENA_PAD;
@@ -1000,86 +1017,99 @@ function drawArena(pos, compPos, dir) {
   // Background
   ctx.fillStyle = '#0f172a'; ctx.fillRect(0, 0, W, H);
 
-  // Grid lines (5 m spacing)
+  // Compute arena sub-rect in canvas pixels
+  const [ax0, ay0] = arenaToCanvas(arenaOX, arenaOY + arenaD);
+  const [ax1, ay1] = arenaToCanvas(arenaOX + arenaW, arenaOY);
+
+  // Dim margin zone outside arena, brighter inside
+  ctx.fillStyle = 'rgba(0,0,0,0.4)'; ctx.fillRect(PAD, PAD, W - 2*PAD, H - 2*PAD);
+  ctx.fillStyle = '#0f172a'; ctx.fillRect(ax0, ay0, ax1 - ax0, ay1 - ay0);
+
+  // Grid lines over full view (5 m spacing)
   ctx.strokeStyle = '#1e3a5f'; ctx.lineWidth = 1;
-  for (let gx = arenaOX; gx <= arenaOX + arenaW + 0.01; gx += 5) {
-    const [cx] = arenaToCanvas(gx, arenaOY);
+  for (let gx = Math.ceil(viewOX / 5) * 5; gx <= viewOX + viewW + 0.01; gx += 5) {
+    const [cx] = arenaToCanvas(gx, viewOY);
     ctx.beginPath(); ctx.moveTo(cx, PAD); ctx.lineTo(cx, H - PAD); ctx.stroke();
   }
-  for (let gy = arenaOY; gy <= arenaOY + arenaD + 0.01; gy += 5) {
-    const [, cy] = arenaToCanvas(arenaOX, gy);
+  for (let gy = Math.ceil(viewOY / 5) * 5; gy <= viewOY + viewD + 0.01; gy += 5) {
+    const [, cy] = arenaToCanvas(viewOX, gy);
     ctx.beginPath(); ctx.moveTo(PAD, cy); ctx.lineTo(W - PAD, cy); ctx.stroke();
   }
 
-  // Arena border
+  // Arena border (highlighted)
   ctx.strokeStyle = '#475569'; ctx.lineWidth = 2;
+  ctx.strokeRect(ax0, ay0, ax1 - ax0, ay1 - ay0);
+
+  // Outer view border
+  ctx.strokeStyle = '#1e293b'; ctx.lineWidth = 1;
   ctx.strokeRect(PAD, PAD, W - 2*PAD, H - 2*PAD);
 
-  // Axis labels
-  ctx.fillStyle = '#475569'; ctx.font = '9px monospace'; ctx.textAlign = 'center';
-  for (let gx = arenaOX; gx <= arenaOX + arenaW + 0.01; gx += 5) {
-    const [cx] = arenaToCanvas(gx, arenaOY);
+  // Axis labels every 5 m (brighter inside arena range)
+  ctx.font = '9px monospace'; ctx.textAlign = 'center';
+  for (let gx = Math.ceil(viewOX / 5) * 5; gx <= viewOX + viewW + 0.01; gx += 5) {
+    const [cx] = arenaToCanvas(gx, viewOY);
+    ctx.fillStyle = (gx >= arenaOX && gx <= arenaOX + arenaW) ? '#64748b' : '#334155';
     ctx.fillText(gx, cx, H - 2);
   }
-  ctx.textAlign = 'right';
-  for (let gy = arenaOY; gy <= arenaOY + arenaD + 0.01; gy += 5) {
-    const [, cy] = arenaToCanvas(arenaOX, gy);
+  for (let gy = Math.ceil(viewOY / 5) * 5; gy <= viewOY + viewD + 0.01; gy += 5) {
+    const [, cy] = arenaToCanvas(viewOX, gy);
+    ctx.textAlign = 'right';
+    ctx.fillStyle = (gy >= arenaOY && gy <= arenaOY + arenaD) ? '#64748b' : '#334155';
     ctx.fillText(gy, PAD - 3, cy + 3);
   }
 
-  // Wall labels
+  // Wall labels inside arena
+  const midAx = (ax0 + ax1) / 2, midAy = (ay0 + ay1) / 2;
   ctx.fillStyle = '#64748b'; ctx.font = 'bold 9px monospace'; ctx.textAlign = 'center';
-  ctx.fillText('BACK', W / 2, PAD - 3);
-  ctx.fillText('FRONT', W / 2, H - PAD + 12);
-  ctx.textAlign = 'left';
-  ctx.save(); ctx.translate(PAD - 3, H / 2); ctx.rotate(-Math.PI / 2);
+  ctx.fillText('BACK',  midAx, ay0 + 11);
+  ctx.fillText('FRONT', midAx, ay1 - 4);
+  ctx.save(); ctx.translate(ax0 + 10, midAy); ctx.rotate(-Math.PI / 2);
   ctx.textAlign = 'center'; ctx.fillText('LEFT', 0, 0); ctx.restore();
-  ctx.save(); ctx.translate(W - PAD + 3, H / 2); ctx.rotate(Math.PI / 2);
+  ctx.save(); ctx.translate(ax1 - 10, midAy); ctx.rotate(Math.PI / 2);
   ctx.textAlign = 'center'; ctx.fillText('RIGHT', 0, 0); ctx.restore();
 
-  // Arena markers (from loaded config)
+  // Arena markers
   for (const [id, m] of Object.entries(arenaMarkers)) {
     if (!m.pos) continue;
     const [mx, my] = arenaToCanvas(m.pos[0], m.pos[1]);
     if (mx < PAD - 4 || mx > W - PAD + 4 || my < PAD - 4 || my > H - PAD + 4) continue;
     ctx.fillStyle = WALL_COLOR[m.wall] || '#94a3b8';
-    ctx.fillRect(mx - 3, my - 3, 6, 6);
-    ctx.fillStyle = '#94a3b8'; ctx.font = '8px monospace'; ctx.textAlign = 'center';
-    ctx.fillText(id, mx, my - 5);
+    ctx.fillRect(mx - 4, my - 4, 8, 8);
+    ctx.fillStyle = '#cbd5e1'; ctx.font = '9px monospace'; ctx.textAlign = 'center';
+    ctx.fillText(id, mx, my - 6);
   }
 
   // Drone positions
-  if (!pos) return;
+  if (!_pos) return;
 
   // Raw ArUco position — cyan ring
-  const [rx, ry] = arenaToCanvas(pos[0], pos[1]);
+  const [rx, ry] = arenaToCanvas(_pos[0], _pos[1]);
   ctx.beginPath(); ctx.arc(rx, ry, 6, 0, Math.PI * 2);
   ctx.fillStyle = 'rgba(56,189,248,0.3)'; ctx.fill();
   ctx.strokeStyle = '#38bdf8'; ctx.lineWidth = 2; ctx.stroke();
 
   // Compensated position — solid orange filled circle + crosshair
-  const cp = compPos || pos;
+  const cp = _compPos || _pos;
   const [cx2, cy2] = arenaToCanvas(cp[0], cp[1]);
   ctx.beginPath(); ctx.arc(cx2, cy2, 10, 0, Math.PI * 2);
   ctx.fillStyle = '#f97316'; ctx.fill();
   ctx.strokeStyle = '#fed7aa'; ctx.lineWidth = 2; ctx.stroke();
-  ctx.strokeStyle = 'rgba(255,255,255,0.5)'; ctx.lineWidth = 1;
-  ctx.beginPath(); ctx.moveTo(cx2 - 14, cy2); ctx.lineTo(cx2 + 14, cy2); ctx.stroke();
-  ctx.beginPath(); ctx.moveTo(cx2, cy2 - 14); ctx.lineTo(cx2, cy2 + 14); ctx.stroke();
+  ctx.strokeStyle = 'rgba(255,255,255,0.6)'; ctx.lineWidth = 1;
+  ctx.beginPath(); ctx.moveTo(cx2 - 16, cy2); ctx.lineTo(cx2 + 16, cy2); ctx.stroke();
+  ctx.beginPath(); ctx.moveTo(cx2, cy2 - 16); ctx.lineTo(cx2, cy2 + 16); ctx.stroke();
 
   // Heading arrow
-  if (dir) {
-    const ang = Math.atan2(dir[0], dir[1]);
-    const len = 24;
+  if (_dir) {
+    const ang = Math.atan2(_dir[0], _dir[1]);
     ctx.strokeStyle = '#facc15'; ctx.lineWidth = 2.5; ctx.lineCap = 'round';
     ctx.beginPath(); ctx.moveTo(cx2, cy2);
-    ctx.lineTo(cx2 + Math.sin(ang) * len, cy2 - Math.cos(ang) * len); ctx.stroke();
+    ctx.lineTo(cx2 + Math.sin(ang) * 28, cy2 - Math.cos(ang) * 28); ctx.stroke();
     ctx.lineCap = 'butt';
   }
 
   // Coordinate label next to dot
   ctx.fillStyle = '#f97316'; ctx.font = 'bold 10px monospace'; ctx.textAlign = 'left';
-  ctx.fillText(`(${pos[0].toFixed(1)},${pos[1].toFixed(1)})`, cx2 + 13, cy2 - 4);
+  ctx.fillText(`(${_pos[0].toFixed(1)},${_pos[1].toFixed(1)})`, cx2 + 13, cy2 - 4);
 }
 
 function updatePosUI(d) {
@@ -1140,7 +1170,7 @@ async function loadPosConfig() {
 document.getElementById('pos_enabled').onchange = async function() {
   await post('/proxy/position/config', { enabled: this.checked });
   if (this.checked) startPosEvents();
-  else { if (posEvtSource) { posEvtSource.close(); posEvtSource = null; } drawArena(null, null, null); }
+  else { if (posEvtSource) { posEvtSource.close(); posEvtSource = null; } _lastPos = null; drawArena(); }
 };
 
 document.getElementById('pos_latency').oninput = function() {
@@ -1182,7 +1212,7 @@ document.getElementById('pos_video_toggle').onclick = () => {
 
 loadPosConfig();
 loadArenaConfig();   // pre-load markers so canvas shows them before panel is opened
-drawArena(null, null, null);
+drawArena();
 
 // ── Arena Configuration ───────────────────────────────────────────────────────
 let arenaMarkers = {};   // {id_str: {pos:[x,y,z], wall:'front'}}
@@ -1246,9 +1276,10 @@ async function loadArenaConfig() {
     if (d.arena) {
       arenaW = d.arena.width_m  || 20;
       arenaD = d.arena.depth_m  || 10;
-      arenaOX = -(arenaW / 2);   // symmetric: origin at left edge
+      arenaOX = -(arenaW / 2);
       arenaOY = 0;
-      drawArena(null, null, null);
+      _updateView();
+      drawArena();  // redraw with last known position (no args = use saved state)
     }
   } catch {}
 }
