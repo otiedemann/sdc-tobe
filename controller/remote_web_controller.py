@@ -1081,11 +1081,17 @@ function drawArena(pos, compPos, dir) {
     ctx.fillText(id, mx, my - 6);
   }
 
-  // Debug: show view params, pos, and frame resolution on canvas top-left
-  ctx.fillStyle = '#22d3ee'; ctx.font = '9px monospace'; ctx.textAlign = 'left';
-  ctx.fillText(`view: ox=${viewOX} oy=${viewOY} w=${viewW} d=${viewD}`, PAD + 2, PAD + 10);
-  ctx.fillText(`pos: ${_pos ? _pos.map(v=>v.toFixed(1)).join(',') : 'null'}`, PAD + 2, PAD + 20);
-  ctx.fillText(`frame: ${_lastFrameRes || 'unknown'}`, PAD + 2, PAD + 30);
+  // Debug overlay — large text, dark background box, drawn over everything
+  const dbgLines = [
+    `view: [${viewOX},${viewOX+viewW}] x [${viewOY},${viewOY+viewD}]`,
+    `pos: ${_pos ? `${_pos[0].toFixed(2)}, ${_pos[1].toFixed(2)}, ${_pos[2].toFixed(2)}` : 'null'}`,
+    `frame: ${_lastFrameRes || 'unknown'}`,
+  ];
+  ctx.font = 'bold 12px monospace';
+  const dbgW = Math.max(...dbgLines.map(l => ctx.measureText(l).width)) + 10;
+  ctx.fillStyle = 'rgba(0,0,0,0.75)'; ctx.fillRect(PAD, PAD, dbgW, dbgLines.length * 16 + 6);
+  ctx.fillStyle = '#22d3ee'; ctx.textAlign = 'left';
+  dbgLines.forEach((l, i) => ctx.fillText(l, PAD + 5, PAD + 15 + i * 16));
 
   // Drone positions
   if (!_pos) return;
@@ -1098,8 +1104,12 @@ function drawArena(pos, compPos, dir) {
   const cy2 = Math.max(M, Math.min(H - M, rpy));
   const outOfBounds = rpx !== cx2 || rpy !== cy2;
 
-  ctx.fillStyle = '#22d3ee'; ctx.font = '9px monospace'; ctx.textAlign = 'left';
-  ctx.fillText(`raw px: ${rpx.toFixed(0)},${rpy.toFixed(0)} clamp: ${cx2.toFixed(0)},${cy2.toFixed(0)} oob:${outOfBounds}`, PAD + 2, PAD + 40);
+  const pxDbg = `px: raw(${rpx.toFixed(0)},${rpy.toFixed(0)}) clamped(${cx2.toFixed(0)},${cy2.toFixed(0)}) oob:${outOfBounds}`;
+  console.log('[POS]', pxDbg);
+  ctx.font = 'bold 12px monospace'; ctx.textAlign = 'left';
+  const pdW = ctx.measureText(pxDbg).width + 10;
+  ctx.fillStyle = 'rgba(0,0,0,0.75)'; ctx.fillRect(PAD, PAD + 56, pdW, 20);
+  ctx.fillStyle = '#22d3ee'; ctx.fillText(pxDbg, PAD + 5, PAD + 70);
 
   const dotColor = outOfBounds ? '#ef4444' : '#f97316';
 
@@ -1180,6 +1190,7 @@ function updatePosUI(d) {
   badge.style.color = !enabled ? '#64748b' : (pos && !d.stale) ? '#22c55e' : '#f59e0b';
 
   if (d.frame_w && d.frame_h) _lastFrameRes = `${d.frame_w}x${d.frame_h}`;
+  if (pos) console.log('[POS] drawArena pos=', pos, 'compPos=', compPos, 'frame=', _lastFrameRes);
   drawArena(pos, compPos, dir);
 }
 

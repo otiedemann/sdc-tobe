@@ -3220,7 +3220,7 @@ def api_rec_start():
             return jsonify(ok=False, error="already recording", path=_rec_path)
         fname = data.get("filename") or f"rec_{int(time.time())}.mp4"
         # Ensure recordings dir exists
-        rec_dir = pathlib.Path(__file__).parent / "recordings"
+        rec_dir = Path(__file__).parent / "recordings"
         rec_dir.mkdir(exist_ok=True)
         full_path = str(rec_dir / fname)
         try:
