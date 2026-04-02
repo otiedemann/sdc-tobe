@@ -314,6 +314,9 @@ HTML = """
         <div style=\"margin-top:6px;display:flex;gap:8px;align-items:center;\">
           <button id=\"pos_video_toggle\" class=\"pos-cfg\">Show ArUco Video</button>
           <button id=\"rec_btn\" class=\"pos-cfg\" style=\"background:#1e3a2e;border-color:#22c55e;color:#22c55e;\">&#9679; Record</button>
+          <label style=\"display:flex;align-items:center;gap:4px;font-size:12px;color:#94a3b8;cursor:pointer;\">
+            <input type=\"checkbox\" id=\"rec_raw\" style=\"accent-color:#22c55e;\" /> Raw
+          </label>
           <span id=\"rec_status\" class=\"small\" style=\"color:#64748b;\"></span>
           <a id=\"pos_tracker_link\" href=\"#\" target=\"_blank\" class=\"small\" style=\"color:#38bdf8;display:none;\">Open full arena tracker ↗</a>
         </div>
@@ -1277,7 +1280,8 @@ async function refreshRecStatus() {
     recBtn.style.borderColor = _recActive ? '#ef4444' : '#22c55e';
     recBtn.style.color = _recActive ? '#ef4444' : '#22c55e';
     recBtn.style.background = _recActive ? '#3b0f0f' : '#1e3a2e';
-    if (_recActive) recStatus.textContent = `${d.frames} frames \u2022 ${d.path.split('/').pop()}`;
+    document.getElementById('rec_raw').disabled = _recActive;
+    if (_recActive) recStatus.textContent = `${d.frames} frames \u2022 ${d.raw ? 'raw' : 'ann'} \u2022 ${d.path.split('/').pop()}`;
     else recStatus.textContent = d.frames ? `saved ${d.frames} frames` : '';
   } catch {}
 }
@@ -1287,8 +1291,9 @@ recBtn.onclick = async () => {
     const d = await (await fetch('/proxy/video/record/stop', {method:'POST'})).json();
     recStatus.textContent = d.ok ? `saved ${d.frames} frames: ${d.path.split('/').pop()}` : ('error: ' + d.error);
   } else {
+    const raw = document.getElementById('rec_raw').checked;
     const d = await (await fetch('/proxy/video/record/start', {method:'POST',
-      headers:{'Content-Type':'application/json'}, body:'{}'})).json();
+      headers:{'Content-Type':'application/json'}, body:JSON.stringify({raw})})).json();
     recStatus.textContent = d.ok ? `recording... ${d.path.split('/').pop()}` : ('error: ' + d.error);
   }
   refreshRecStatus();

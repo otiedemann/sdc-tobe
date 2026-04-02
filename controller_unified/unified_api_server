@@ -325,6 +325,7 @@ _pos_cfg_lock = threading.Lock()
 # Video recording state
 _rec_lock = threading.Lock()
 _rec_enabled = False
+_rec_raw = False          # True = record raw frame, False = record annotated frame
 _rec_writer = None        # cv2.VideoWriter
 _rec_path: str = ""
 _rec_frame_count = 0
@@ -3139,11 +3140,11 @@ def positioning_loop():
             if ok2:
                 with _pos_annotated_lock:
                     _pos_annotated_jpeg = jpg2.tobytes()
-            # Write annotated frame to recording if active
+            # Write frame to recording if active (raw or annotated)
             with _rec_lock:
                 if _rec_enabled and _rec_writer is not None:
                     try:
-                        _rec_writer.write(ann)
+                        _rec_writer.write(frame if _rec_raw else ann)
                         _rec_frame_count += 1
                     except Exception:
                         pass
@@ -3208,17 +3209,19 @@ def api_position_video():
 @app.get("/api/video/record/status")
 def api_rec_status():
     with _rec_lock:
-        return jsonify(ok=True, recording=_rec_enabled, path=_rec_path, frames=_rec_frame_count)
+        return jsonify(ok=True, recording=_rec_enabled, raw=_rec_raw, path=_rec_path, frames=_rec_frame_count)
 
 
 @app.post("/api/video/record/start")
 def api_rec_start():
-    global _rec_enabled, _rec_writer, _rec_path, _rec_frame_count
+    global _rec_enabled, _rec_raw, _rec_writer, _rec_path, _rec_frame_count
     data = request.get_json(silent=True) or {}
     with _rec_lock:
         if _rec_enabled:
             return jsonify(ok=False, error="already recording", path=_rec_path)
-        fname = data.get("filename") or f"rec_{int(time.time())}.mp4"
+        raw_mode = bool(data.get("raw", False))
+        suffix = "_raw" if raw_mode else "_ann"
+        fname = data.get("filename") or f"rec{suffix}_{int(time.time())}.mp4"
         # Ensure recordings dir exists
         rec_dir = Path(__file__).parent / "recordings"
         rec_dir.mkdir(exist_ok=True)
@@ -3236,8 +3239,9 @@ def api_rec_start():
             _rec_writer = writer
             _rec_path = full_path
             _rec_frame_count = 0
+            _rec_raw = raw_mode
             _rec_enabled = True
-            print(f"[REC] Recording started: {full_path} @ {fw}x{fh} {fps_target}fps")
+            print(f"[REC] Recording started ({'raw' if raw_mode else 'annotated'}): {full_path} @ {fw}x{fh} {fps_target}fps")
             return jsonify(ok=True, path=full_path)
         except Exception as e:
             return jsonify(ok=False, error=str(e))
