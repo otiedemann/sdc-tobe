@@ -1079,6 +1079,11 @@ function drawArena(pos, compPos, dir) {
     ctx.fillText(id, mx, my - 6);
   }
 
+  // Debug: show view params and pos on canvas top-left
+  ctx.fillStyle = '#22d3ee'; ctx.font = '9px monospace'; ctx.textAlign = 'left';
+  ctx.fillText(`view: ox=${viewOX} oy=${viewOY} w=${viewW} d=${viewD}`, PAD + 2, PAD + 10);
+  ctx.fillText(`pos: ${_pos ? _pos.map(v=>v.toFixed(1)).join(',') : 'null'}`, PAD + 2, PAD + 20);
+
   // Drone positions
   if (!_pos) return;
 
@@ -1094,6 +1099,7 @@ function drawArena(pos, compPos, dir) {
   const cp = _compPos || _pos;
   const [rpx, rpy] = arenaToCanvas(cp[0], cp[1]);
   const [cx2, cy2, outOfBounds] = clampPx(rpx, rpy);
+  ctx.fillText(`raw px: ${rpx.toFixed(0)},${rpy.toFixed(0)} clamp: ${cx2.toFixed(0)},${cy2.toFixed(0)} oob:${outOfBounds}`, PAD + 2, PAD + 30);
   const dotColor = outOfBounds ? '#ef4444' : '#f97316';
   const dotBorder = outOfBounds ? '#fca5a5' : '#fed7aa';
 
@@ -1158,7 +1164,7 @@ function updatePosUI(d) {
 function startPosEvents() {
   if (posEvtSource) { posEvtSource.close(); posEvtSource = null; }
   posEvtSource = new EventSource('/proxy/position/events');
-  posEvtSource.onmessage = (e) => { try { updatePosUI(JSON.parse(e.data)); } catch {} };
+  posEvtSource.onmessage = (e) => { try { updatePosUI(JSON.parse(e.data)); } catch(err) { console.error('POS SSE error:', err, e.data); } };
   posEvtSource.onerror = () => {
     posEvtSource.close(); posEvtSource = null;
     setTimeout(startPosEvents, 3000);
