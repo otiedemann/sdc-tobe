@@ -1,6 +1,8 @@
 import glob
 import json
 import os
+import threading
+from typing import Any
 
 import cv2
 import numpy as np
@@ -10,12 +12,53 @@ try:
 except Exception:
     Tello = None
 
+try:
+    import olympe
+except Exception:
+    olympe = None
+
 
 def _is_tello_source(camera_source):
     return str(camera_source).strip().lower() in {"tello", "dji", "dji-tello", "tello-udp"}
 
 
-def _open_video_source(camera_source):
+def _is_anafi_source(camera_source):
+    source = str(camera_source).strip().lower()
+    return source in {"anafi", "parrot", "parrot-anafi"} or source.startswith("anafi:") or source.startswith("anafi://")
+
+
+def _parse_anafi_ip(camera_source):
+    source = str(camera_source).strip()
+    source_lower = source.lower()
+    if source_lower in {"anafi", "parrot", "parrot-anafi"}:
+        return os.getenv("ANAFI_IP") or os.getenv("DRONE_IP") or "192.168.42.1"
+    if source_lower.startswith("anafi://"):
+        return source.split("://", 1)[1].strip() or "192.168.42.1"
+    if source_lower.startswith("anafi:"):
+        return source.split(":", 1)[1].strip() or "192.168.42.1"
+    return "192.168.42.1"
+
+
+def _anafi_flush_cb(stream):
+    try:
+        if hasattr(stream, "empty"):
+            while not stream.empty():
+                try:
+                    stream.get(timeout=0.005).unref()
+                except Exception:
+                    break
+        elif hasattr(stream, "get"):
+            while True:
+                try:
+                    stream.get(timeout=0.005).unref()
+                except Exception:
+                    break
+    except Exception:
+        pass
+    return True
+
+
+def _open_video_source(camera_source: int | str):
     if _is_tello_source(camera_source):
         if Tello is None:
             raise RuntimeError("djitellopy ist nicht installiert. Installiere mit: pip install djitellopy")
@@ -26,13 +69,89 @@ def _open_video_source(camera_source):
         frame_reader = tello.get_frame_read()
         return {"mode": "tello", "tello": tello, "frame_reader": frame_reader, "cap": None}
 
+    if _is_anafi_source(camera_source):
+        if olympe is None:
+            raise RuntimeError("Parrot Olympe ist nicht installiert. Installiere mit: pip install parrot-olympe")
+
+        anafi_ip = _parse_anafi_ip(camera_source)
+        drone = olympe.Drone(anafi_ip)
+        drone.connect()
+
+        frame_state = {"frame": None}
+        frame_lock = threading.Lock()
+
+        def _anafi_frame_cb(yuv_frame):
+            try:
+                yuv_frame.ref()
+            except Exception:
+                pass
+
+            try:
+                cv_cvt = cv2.COLOR_YUV2BGR_I420
+                try:
+                    info = yuv_frame.info()
+                    yuv_fmt = None
+                    if isinstance(info, dict):
+                        if "yuv" in info and isinstance(info["yuv"], dict):
+                            yuv_fmt = info["yuv"].get("format")
+                        elif "format" in info:
+                            yuv_fmt = info["format"]
+                        elif "raw" in info and isinstance(info["raw"], dict):
+                            yuv_fmt = info["raw"].get("format")
+
+                    if yuv_fmt is not None:
+                        for attr, flag in (("VDEF_I420", cv2.COLOR_YUV2BGR_I420),
+                                           ("VDEF_NV12", cv2.COLOR_YUV2BGR_NV12)):
+                            fmt_const = getattr(olympe, attr, None)
+                            if fmt_const is not None and fmt_const == yuv_fmt:
+                                cv_cvt = flag
+                                break
+                except Exception:
+                    pass
+
+                frame = cv2.cvtColor(yuv_frame.as_ndarray(), cv_cvt)
+                with frame_lock:
+                    frame_state["frame"] = frame
+            finally:
+                try:
+                    yuv_frame.unref()
+                except Exception:
+                    pass
+
+        stream_api = "none"
+        if hasattr(drone, "streaming") and hasattr(drone.streaming, "set_callbacks"):
+            drone.streaming.set_callbacks(raw_cb=_anafi_frame_cb, flush_raw_cb=_anafi_flush_cb)
+            drone.streaming.start()
+            stream_api = "modern"
+        elif hasattr(drone, "set_streaming_callbacks"):
+            drone.set_streaming_callbacks(raw_cb=_anafi_frame_cb)
+            drone.start_video_streaming()
+            stream_api = "legacy"
+        else:
+            try:
+                drone.disconnect()
+            except Exception:
+                pass
+            raise RuntimeError("Keine kompatible Olympe-Streaming-API gefunden")
+
+        return {
+            "mode": "anafi",
+            "cap": None,
+            "tello": None,
+            "frame_reader": None,
+            "drone": drone,
+            "stream_api": stream_api,
+            "frame_state": frame_state,
+            "frame_lock": frame_lock,
+        }
+
     cap = cv2.VideoCapture(camera_source)
     if not cap.isOpened():
         return None
     return {"mode": "opencv", "tello": None, "frame_reader": None, "cap": cap}
 
 
-def _read_frame(source):
+def _read_frame(source: dict[str, Any]):
     if source["mode"] == "tello":
         frame = source["frame_reader"].frame if source["frame_reader"] is not None else None
         if frame is None:
@@ -40,6 +159,13 @@ def _read_frame(source):
         # djitellopy/decoder can deliver RGB; OpenCV visualization expects BGR
         frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
         return True, frame
+    if source["mode"] == "anafi":
+        with source["frame_lock"]:
+            frame = source["frame_state"].get("frame")
+            if frame is None:
+                return False, None
+            frame_copy = frame.copy()
+            return True, frame_copy
     return source["cap"].read()
 
 
@@ -55,6 +181,25 @@ def _close_video_source(source):
             pass
         try:
             source["tello"].end()
+        except Exception:
+            pass
+    if source["mode"] == "anafi" and source.get("drone") is not None:
+        drone = source["drone"]
+        try:
+            if source.get("stream_api") == "modern":
+                drone.streaming.stop()
+            else:
+                drone.stop_video_streaming()
+        except Exception:
+            try:
+                drone.streaming.stop()
+            except Exception:
+                try:
+                    drone.stop_video_streaming()
+                except Exception:
+                    pass
+        try:
+            drone.disconnect()
         except Exception:
             pass
 
@@ -83,14 +228,15 @@ class CameraCalibrator:
         self.objpoints = []  # 3D points in real world
         self.imgpoints = []  # 2D points in image plane
 
-    def capture_images(self, num_images=20, camera_source=0, save_dir="calibration_images"):
+    def capture_images(self, num_images=20, camera_source: int | str = 0, save_dir="calibration_images"):
         """
         Capture calibration images interactively
 
         Args:
             num_images: Number of images to capture
             camera_source: Camera device ID (int) or IP camera URL (str)
-                          Examples: 0, "rtsp://192.168.1.100:554/stream", "http://192.168.1.100:8080/video"
+                          Examples: 0, "tello", "anafi", "anafi:192.168.42.1",
+                                    "rtsp://192.168.1.100:554/stream", "http://192.168.1.100:8080/video"
             save_dir: Directory to save captured images
         """
         os.makedirs(save_dir, exist_ok=True)
@@ -120,11 +266,13 @@ class CameraCalibrator:
         while count < num_images:
             ret, frame = _read_frame(source)
             if not ret:
-                if source["mode"] == "tello":
+                if source["mode"] in {"tello", "anafi"}:
                     cv2.waitKey(1)
                     continue
                 print("Error: Cannot read frame")
                 break
+            if frame is None:
+                continue
 
             gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
             display = frame.copy()
@@ -266,7 +414,7 @@ class CameraCalibrator:
             json.dump(calib_data, f, indent=2)
         print(f"Calibration also saved to: {json_filename}")
 
-    def test_calibration(self, camera_matrix, dist_coeffs, camera_source=0):
+    def test_calibration(self, camera_matrix, dist_coeffs, camera_source: int | str = 0):
         """
         Test calibration by showing undistorted video
 
@@ -290,10 +438,12 @@ class CameraCalibrator:
         while True:
             ret, frame = _read_frame(source)
             if not ret:
-                if source["mode"] == "tello":
+                if source["mode"] in {"tello", "anafi"}:
                     cv2.waitKey(1)
                     continue
                 break
+            if frame is None:
+                continue
 
             h, w = frame.shape[:2]
 
@@ -394,6 +544,8 @@ def main():
     print("\nCamera source:")
     print("  Enter '0' for USB camera")
     print("  Enter 'tello' for DJI Tello stream (via djitellopy)")
+    print("  Enter 'anafi' for Parrot Anafi stream (via Olympe)")
+    print("  Enter 'anafi:192.168.42.1' for Anafi with custom IP")
     print("  Or enter IP camera URL:")
     print("    RTSP: rtsp://192.168.1.100:554/stream")
     print("    HTTP: http://192.168.1.100:8080/video")
@@ -432,7 +584,7 @@ def main():
         camera_matrix, dist_coeffs = load_calibration()
         if camera_matrix is not None:
             print("\nCamera source:")
-            print("  Enter '0' for USB camera, 'tello' for DJI Tello, or IP camera URL")
+            print("  Enter '0' for USB camera, 'tello', 'anafi', or IP camera URL")
             camera_input = input("Camera source: ").strip() or "0"
             camera_source = int(camera_input) if camera_input.isdigit() else camera_input
             calibrator.test_calibration(camera_matrix, dist_coeffs, camera_source)
