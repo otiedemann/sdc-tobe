@@ -137,7 +137,7 @@ if HAS_CV2 and not IS_ARM:
         _aruco_path = str(Path(__file__).parent.parent / "aruco-position" / "control-unit")
         if _aruco_path not in sys.path:
             sys.path.insert(0, _aruco_path)
-        from pi_position import HeadlessAruCoPositioning as _HeadlessAruCo
+        from ctrl_position import HeadlessAruCoPositioning as _HeadlessAruCo
         HAS_POSITIONING = True
         print("[UNIFIED] HeadlessAruCoPositioning loaded")
     except ImportError as _e:
@@ -1966,7 +1966,7 @@ class OlympeBackend(DroneBackend):
                 _pos_enabled = _pos_cfg.get("enabled", False)
             if _pos_enabled:
                 try:
-                    _pos_frame_q.put_nowait((cv_frame.copy(), time.time()))
+                    _pos_frame_q.put_nowait((cv_frame.copy(), time.monotonic()))
                 except queue.Full:
                     pass
         except Exception as e:
@@ -3058,7 +3058,7 @@ def positioning_loop():
                 with _arena_cfg_lock:
                     init_marker_size = float(_arena_cfg.get("marker_size_m", 0.18))
                 processor = _HeadlessAruCo(cam_mat, dist, detect_profile=profile,
-                                           marker_size=init_marker_size)
+                                           marker_size=init_marker_size, enable_kalman_filter=False)
                 _apply_arena_cfg_to_processor(processor)
                 _pos_processor = processor
                 print(f"[POS] Processor initialised (profile={profile})")

@@ -147,7 +147,14 @@ class HeadlessAruCoPositioning:
         [-0.25, -0.25, 0.0],
     ], dtype=np.float32)
 
-    def __init__(self, camera_matrix, dist_coeffs, detect_profile="balanced", marker_size=None):
+    def __init__(
+        self,
+        camera_matrix,
+        dist_coeffs,
+        detect_profile="balanced",
+        marker_size=None,
+        enable_kalman_filter=True,
+    ):
         self.camera_matrix = camera_matrix
         self.dist_coeffs = dist_coeffs
         self.marker_size = marker_size if marker_size is not None else MARKER_SIZE
@@ -166,6 +173,7 @@ class HeadlessAruCoPositioning:
         self._wall_rotations = self._initialize_wall_rotations()
         # IMPORTANT: Explicit wall mapping by marker ID (robust against axis/coordinate refactors)
         self.marker_wall_type = self._initialize_marker_wall_types()
+        self.enable_kalman_filter = bool(enable_kalman_filter)
         self.kf_pos = [KalmanFilter1D() for _ in range(3)]
         self.direction_filter = ExponentialMovingAverage(alpha=0.2)
         self.target_filters = {}
@@ -537,7 +545,10 @@ class HeadlessAruCoPositioning:
         w_arr = np.array(weights) / (sum(weights) + 1e-6)
         raw_pos = sum(p * w for p, w in zip(cam_positions, w_arr))
         raw_dir = sum(d * w for d, w in zip(cam_dirs, w_arr))
-        f_pos_meas = np.array([self.kf_pos[j].update(raw_pos[j]) for j in range(3)])
+        if self.enable_kalman_filter:
+            f_pos_meas = np.array([self.kf_pos[j].update(raw_pos[j]) for j in range(3)])
+        else:
+            f_pos_meas = raw_pos.copy()
 
         # Apply delayed measurement update at capture time, then predict to evaluation time.
         quality = float(np.mean(weights)) * min(1.0, len(weights) / 3.0)
@@ -635,6 +646,7 @@ def main():
     outlier_pos_thresh = OUTLIER_POS_THRESH
     pose_hold_sec = POSE_HOLD_SEC
     target_z_pos = TARGET_Z_POS
+    enable_kalman_filter = True
 
     if '--min-ref-weight' in sys.argv:
         try:
@@ -665,6 +677,9 @@ def main():
             target_z_pos = float(sys.argv[sys.argv.index('--target-z-pos') + 1])
         except:
             print("⚠️ Invalid --target-z-pos value, using default.")
+
+    if '--no-kalman' in sys.argv:
+        enable_kalman_filter = False
 
     # Apply runtime tuning globally (used inside process_frame)
     globals()["MIN_REF_WEIGHT"] = min_ref_weight
@@ -703,6 +718,7 @@ def main():
     print(f"🔎 Detect Profile: {detect_profile}")
     print(
         f"⚙️ min_ref_weight={MIN_REF_WEIGHT} min_ref_count={MIN_REF_COUNT} outlier={OUTLIER_POS_THRESH} pose_hold={POSE_HOLD_SEC} target_z_pos={TARGET_Z_POS}")
+    print(f"📉 Per-axis Kalman: {'ON' if enable_kalman_filter else 'OFF'}")
     print(f"🖥️ Preview Requested: {'YES' if preview_requested else 'NO'}")
     print(f"🖥️ GUI Overlay: {'ON' if gui_enabled else 'OFF'}")
 
@@ -717,7 +733,12 @@ def main():
         except:
             print("❌ Failed to load calibration.")
 
-    ap = HeadlessAruCoPositioning(cm, dc, detect_profile=detect_profile)
+    ap = HeadlessAruCoPositioning(
+        cm,
+        dc,
+        detect_profile=detect_profile,
+        enable_kalman_filter=enable_kalman_filter,
+    )
 
     cap = None
     if use_tello_stream:
