@@ -1,39 +1,176 @@
-import base64
 import json
 import socket
 import threading
 import time
-import sys
+from typing import Any, Dict, Optional
 
 import cv2
 import numpy as np
 from cv2 import aruco
 
-from pi_position_core import (
-    UDP_DEST_IP,
-    UDP_PORT,
-    UDP_CMD_PORT,
-    CAMERA_SOURCE,
-    HEARTBEAT_INTERVAL,
-    MIN_REF_WEIGHT,
-    MIN_REF_COUNT,
-    OUTLIER_POS_THRESH,
-    POSE_HOLD_SEC,
-    TARGET_Z_POS,
-    Tello,
-    olympe,
-    has_gui,
-    _is_tello_source,
-    _is_anafi_source,
-    _parse_anafi_ip,
-    _anafi_flush_cb,
-    HeadlessAruCoPositioning,
-)
+import pi_position_core as core
+from motion_estimator import MotionEstimator, MotionState
 
+
+# ============================================================
+# Optional imports for future modules
+# If they don't exist yet, built-in fallback functions are used
+# ============================================================
+
+try:
+    import input as input_module
+except Exception:
+    input_module = None
+
+try:
+    import fusion as fusion_module
+except Exception:
+    fusion_module = None
+
+try:
+    import prediction as prediction_module
+except Exception:
+    prediction_module = None
+
+
+# ============================================================
+# Fallbacks for not-yet-existing modules
+# ============================================================
+
+def fallback_get_motion_input() -> Dict[str, Any]:
+    """
+    Expected later from input module.
+    Body-frame velocities:
+      vx_body > 0 forward
+      vy_body > 0 left
+      vz_body > 0 down   (will be converted in MotionEstimator)
+    yaw_rate in rad/s
+    """
+    return {
+        "timestamp": time.monotonic(),
+        "vx_body": 0.0,
+        "vy_body": 0.0,
+        "vz_body": 0.0,
+        "yaw_rate": 0.0,
+    }
+
+
+def fallback_fuse_motion_and_vision(
+    motion_state: Optional[MotionState],
+    vision_update: Optional[Dict[str, Any]],
+) -> Optional[Dict[str, Any]]:
+    """
+    Very simple fallback:
+    - if vision cam pose exists, take it as fused position
+    - otherwise use motion state
+    - velocities come from motion_state if available
+    """
+    if motion_state is None and vision_update is None:
+        return None
+
+    vx = 0.0
+    vy = 0.0
+    vz = 0.0
+
+    # Optional velocity estimate from motion history could be added later.
+    # For now keep it simple.
+    if vision_update is not None and vision_update.get("cam") is not None:
+        cam = vision_update["cam"]
+        return {
+            "timestamp": vision_update.get("timestamp", time.monotonic()),
+            "x": float(cam[0]),
+            "y": float(cam[1]),
+            "z": float(cam[2]),
+            "yaw": float(motion_state.yaw if motion_state is not None else 0.0),
+            "vx": vx,
+            "vy": vy,
+            "vz": vz,
+            "source": "vision",
+            "vision": vision_update,
+            "motion": motion_state,
+        }
+
+    if motion_state is not None:
+        return {
+            "timestamp": float(motion_state.timestamp),
+            "x": float(motion_state.x),
+            "y": float(motion_state.y),
+            "z": float(motion_state.z),
+            "yaw": float(motion_state.yaw),
+            "vx": vx,
+            "vy": vy,
+            "vz": vz,
+            "source": "motion",
+            "vision": vision_update,
+            "motion": motion_state,
+        }
+
+    return None
+
+
+def fallback_predict_to_now(
+    fused_state: Optional[Dict[str, Any]],
+    now_ts: float,
+) -> Optional[Dict[str, Any]]:
+    """
+    Very simple extrapolation using vx/vy/vz if present.
+    """
+    if fused_state is None:
+        return None
+
+    dt = max(0.0, now_ts - fused_state["timestamp"])
+
+    return {
+        "timestamp": now_ts,
+        "x": float(fused_state["x"] + fused_state.get("vx", 0.0) * dt),
+        "y": float(fused_state["y"] + fused_state.get("vy", 0.0) * dt),
+        "z": float(fused_state["z"] + fused_state.get("vz", 0.0) * dt),
+        "yaw": float(fused_state.get("yaw", 0.0)),
+        "vx": float(fused_state.get("vx", 0.0)),
+        "vy": float(fused_state.get("vy", 0.0)),
+        "vz": float(fused_state.get("vz", 0.0)),
+        "source": fused_state.get("source", "unknown"),
+        "vision": fused_state.get("vision"),
+        "motion": fused_state.get("motion"),
+    }
+
+
+def get_motion_input() -> Dict[str, Any]:
+    if input_module is not None and hasattr(input_module, "get_motion_input"):
+        return input_module.get_motion_input()
+    return fallback_get_motion_input()
+
+
+def fuse_motion_and_vision(
+    motion_state: Optional[MotionState],
+    vision_update: Optional[Dict[str, Any]],
+) -> Optional[Dict[str, Any]]:
+    if fusion_module is not None and hasattr(fusion_module, "fuse_motion_and_vision"):
+        return fusion_module.fuse_motion_and_vision(motion_state, vision_update)
+    return fallback_fuse_motion_and_vision(motion_state, vision_update)
+
+
+def predict_to_now(
+    fused_state: Optional[Dict[str, Any]],
+    now_ts: float,
+) -> Optional[Dict[str, Any]]:
+    if prediction_module is not None and hasattr(prediction_module, "predict_to_now"):
+        return prediction_module.predict_to_now(fused_state, now_ts)
+    return fallback_predict_to_now(fused_state, now_ts)
+
+
+# ============================================================
+# Main
+# ============================================================
 
 def main():
-    camera_src = CAMERA_SOURCE
-    target_ip = UDP_DEST_IP
+    import sys
+
+    # --------------------------------------------------------
+    # Command line args
+    # --------------------------------------------------------
+    camera_src = core.CAMERA_SOURCE
+    target_ip = core.UDP_DEST_IP
     verbose_mode = False
 
     if "--src" in sys.argv:
@@ -52,11 +189,11 @@ def main():
     if "--verbose" in sys.argv:
         verbose_mode = True
 
-    min_ref_weight = MIN_REF_WEIGHT
-    min_ref_count = MIN_REF_COUNT
-    outlier_pos_thresh = OUTLIER_POS_THRESH
-    pose_hold_sec = POSE_HOLD_SEC
-    target_z_pos = TARGET_Z_POS
+    min_ref_weight = core.MIN_REF_WEIGHT
+    min_ref_count = core.MIN_REF_COUNT
+    outlier_pos_thresh = core.OUTLIER_POS_THRESH
+    pose_hold_sec = core.POSE_HOLD_SEC
+    target_z_pos = core.TARGET_Z_POS
 
     if "--min-ref-weight" in sys.argv:
         try:
@@ -88,16 +225,8 @@ def main():
         except Exception:
             print("⚠️ Invalid --target-z-pos value, using default.")
 
-    # Runtime tuning global im Core-Modul setzen
-    import pi_position_core as core
-    core.MIN_REF_WEIGHT = min_ref_weight
-    core.MIN_REF_COUNT = max(1, min_ref_count)
-    core.OUTLIER_POS_THRESH = max(0.1, outlier_pos_thresh)
-    core.POSE_HOLD_SEC = max(0.0, pose_hold_sec)
-    core.TARGET_Z_POS = target_z_pos
-
-    preview_requested = "--preview" in sys.argv
-    gui_enabled = preview_requested and has_gui() and ("--force-headless" not in sys.argv)
+    preview_requested = ("--preview" in sys.argv)
+    gui_enabled = preview_requested and core.has_gui() and ("--force-headless" not in sys.argv)
     gui_available = True
 
     detect_profile = "balanced"
@@ -111,20 +240,16 @@ def main():
         except Exception:
             print("⚠️ Missing value for --detect, using 'balanced'.")
 
-    print(f"🚀 Headless Node -> {target_ip}:{UDP_PORT} (Debug CMD on {UDP_CMD_PORT})")
+    # runtime tuning back into core module
+    core.MIN_REF_WEIGHT = min_ref_weight
+    core.MIN_REF_COUNT = max(1, min_ref_count)
+    core.OUTLIER_POS_THRESH = max(0.1, outlier_pos_thresh)
+    core.POSE_HOLD_SEC = max(0.0, pose_hold_sec)
+    core.TARGET_Z_POS = target_z_pos
+
+    print(f"🚀 Node -> {target_ip}:{core.UDP_PORT} (Debug CMD on {core.UDP_CMD_PORT})")
     print(f"📷 Camera Source: {camera_src}")
     print(f"📝 Verbose Mode: {'ON' if verbose_mode else 'OFF'}")
-
-    use_tello_stream = _is_tello_source(camera_src)
-    use_anafi_stream = _is_anafi_source(camera_src)
-
-    tello = None
-    tello_frame_reader = None
-    anafi_drone = None
-    anafi_stream_api = None
-    anafi_frame_state = {"frame": None}
-    anafi_frame_lock = threading.Lock()
-
     print(f"🔎 Detect Profile: {detect_profile}")
     print(
         f"⚙️ min_ref_weight={core.MIN_REF_WEIGHT} "
@@ -136,8 +261,13 @@ def main():
     print(f"🖥️ Preview Requested: {'YES' if preview_requested else 'NO'}")
     print(f"🖥️ GUI Overlay: {'ON' if gui_enabled else 'OFF'}")
 
+    # --------------------------------------------------------
+    # Camera calibration
+    # --------------------------------------------------------
     cm = np.array(
-        [[850.0, 0.0, 320.0], [0.0, 850.0, 240.0], [0.0, 0.0, 1.0]],
+        [[850.0, 0.0, 320.0],
+         [0.0, 850.0, 240.0],
+         [0.0, 0.0, 1.0]],
         dtype=float,
     )
     dc = np.zeros(5, dtype=float)
@@ -150,17 +280,61 @@ def main():
         except Exception:
             print("❌ Failed to load calibration.")
 
-    ap = HeadlessAruCoPositioning(cm, dc, detect_profile=detect_profile)
+    # --------------------------------------------------------
+    # Vision processor
+    # --------------------------------------------------------
+    vision_processor = core.HeadlessAruCoPositioning(
+        cm,
+        dc,
+        detect_profile=detect_profile,
+    )
+
+    # --------------------------------------------------------
+    # Motion estimator
+    # --------------------------------------------------------
+    motion_rate_hz = 25.0
+    vision_rate_hz = 5.0
+
+    motion_dt = 1.0 / motion_rate_hz
+    vision_dt = 1.0 / vision_rate_hz
+
+    motion_estimator = MotionEstimator(
+        history_seconds=2.0,
+        nominal_dt=motion_dt,
+        initial_pose=(0.0, 0.0, 0.0, 0.0),
+        initial_variance=(0.01, 0.01, 0.01, 0.01),
+        body_y_positive_is_left=True,
+        body_z_positive_is_down=True,
+        yaw_positive_is_ccw=True,
+    )
+
+    last_motion_state: Optional[MotionState] = motion_estimator.get_current_state()
+    last_vision_update: Optional[Dict[str, Any]] = None
+    last_fused_state: Optional[Dict[str, Any]] = None
+    last_prediction: Optional[Dict[str, Any]] = None
+
+    # --------------------------------------------------------
+    # Video source setup
+    # --------------------------------------------------------
+    use_tello_stream = core._is_tello_source(camera_src)
+    use_anafi_stream = core._is_anafi_source(camera_src)
+
+    tello = None
+    tello_frame_reader = None
+
+    anafi_drone = None
+    anafi_stream_api = None
+    anafi_frame_state = {"frame": None}
+    anafi_frame_lock = threading.Lock()
 
     cap = None
+
     if use_tello_stream:
-        if Tello is None:
-            raise RuntimeError(
-                "djitellopy nicht installiert. Install with: pip install djitellopy"
-            )
+        if core.Tello is None:
+            raise RuntimeError("djitellopy not installed. Install with: pip install djitellopy")
 
         print("🛩️ Connecting to DJI Tello…")
-        tello = Tello()
+        tello = core.Tello()
         tello.connect()
         print(f"🔋 Tello battery: {tello.get_battery()}%")
         tello.streamon()
@@ -169,14 +343,12 @@ def main():
         print("✅ Tello videostream active")
 
     elif use_anafi_stream:
-        if olympe is None:
-            raise RuntimeError(
-                "Parrot Olympe nicht installiert. Install with: pip install parrot-olympe"
-            )
+        if core.olympe is None:
+            raise RuntimeError("Parrot Olympe not installed. Install with: pip install parrot-olympe")
 
-        anafi_ip = _parse_anafi_ip(camera_src)
+        anafi_ip = core._parse_anafi_ip(camera_src)
         print(f"🛩️ Connecting to Parrot Anafi at {anafi_ip}…")
-        anafi_drone = olympe.Drone(anafi_ip)
+        anafi_drone = core.olympe.Drone(anafi_ip)
         anafi_drone.connect()
 
         def _anafi_frame_cb(yuv_frame):
@@ -190,6 +362,7 @@ def main():
                 try:
                     info = yuv_frame.info()
                     yuv_fmt = None
+
                     if isinstance(info, dict):
                         if "yuv" in info and isinstance(info["yuv"], dict):
                             yuv_fmt = info["yuv"].get("format")
@@ -203,7 +376,7 @@ def main():
                             ("VDEF_I420", cv2.COLOR_YUV2BGR_I420),
                             ("VDEF_NV12", cv2.COLOR_YUV2BGR_NV12),
                         ):
-                            fmt_const = getattr(olympe, attr, None)
+                            fmt_const = getattr(core.olympe, attr, None)
                             if fmt_const is not None and fmt_const == yuv_fmt:
                                 cv_cvt = flag
                                 break
@@ -220,10 +393,7 @@ def main():
                     pass
 
         if hasattr(anafi_drone, "streaming") and hasattr(anafi_drone.streaming, "set_callbacks"):
-            anafi_drone.streaming.set_callbacks(
-                raw_cb=_anafi_frame_cb,
-                flush_raw_cb=_anafi_flush_cb,
-            )
+            anafi_drone.streaming.set_callbacks(raw_cb=_anafi_frame_cb, flush_raw_cb=core._anafi_flush_cb)
             anafi_drone.streaming.start()
             anafi_stream_api = "modern"
         elif hasattr(anafi_drone, "set_streaming_callbacks"):
@@ -240,41 +410,51 @@ def main():
         cap = cv2.VideoCapture(camera_src)
         cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
 
+    # --------------------------------------------------------
+    # UDP
+    # --------------------------------------------------------
     sock_send = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock_cmd = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    sock_cmd.bind(("0.0.0.0", UDP_CMD_PORT))
+    sock_cmd.bind(("0.0.0.0", core.UDP_CMD_PORT))
     sock_cmd.setblocking(False)
 
     debug_mode = False
-    last_send_time = 0
-    last_img_time = 0
-    last_heartbeat_time = 0
+    last_send_time = 0.0
+    last_img_time = 0.0
+    last_heartbeat_time = 0.0
+
+    next_motion_time = time.monotonic()
+    next_vision_time = time.monotonic()
+
+    def read_frame():
+        if use_tello_stream:
+            frame = tello_frame_reader.frame if tello_frame_reader is not None else None
+            if frame is None:
+                return False, None
+            # keep previous behavior
+            frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+            return True, frame
+
+        if use_anafi_stream:
+            with anafi_frame_lock:
+                frame = anafi_frame_state.get("frame")
+                if frame is not None:
+                    frame = frame.copy()
+            return (frame is not None), frame
+
+        if cap is not None:
+            ret, frame = cap.read()
+            return ret, frame
+
+        return False, None
 
     try:
         while True:
-            ret, frame = False, None
+            now = time.monotonic()
 
-            if use_tello_stream:
-                frame = tello_frame_reader.frame if tello_frame_reader is not None else None
-                ret = frame is not None
-                if ret:
-                    frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
-
-            elif use_anafi_stream:
-                with anafi_frame_lock:
-                    frame = anafi_frame_state.get("frame")
-                    if frame is not None:
-                        frame = frame.copy()
-                ret = frame is not None
-
-            else:
-                if cap is not None:
-                    ret, frame = cap.read()
-
-            if not ret or frame is None:
-                time.sleep(0.01)
-                continue
-
+            # --------------------------------------
+            # Debug command socket
+            # --------------------------------------
             try:
                 data, _ = sock_cmd.recvfrom(1024)
                 cmd = json.loads(data.decode())
@@ -282,14 +462,132 @@ def main():
                     debug_mode = bool(cmd["debug"])
             except BlockingIOError:
                 pass
+            except Exception:
+                pass
 
-            result = ap.process_frame(frame)
-            now = time.time()
+            # --------------------------------------
+            # Motion update @ 25 Hz
+            # --------------------------------------
+            if now >= next_motion_time:
+                motion_sample = get_motion_input()
 
-            if gui_enabled and gui_available:
-                preview = frame.copy()
+                # minimal validation / defaults
+                ts = float(motion_sample.get("timestamp", now))
+                vx_body = float(motion_sample.get("vx_body", 0.0))
+                vy_body = float(motion_sample.get("vy_body", 0.0))
+                vz_body = float(motion_sample.get("vz_body", 0.0))
+                yaw_rate = float(motion_sample.get("yaw_rate", 0.0))
+
+                last_motion_state = motion_estimator.update_body_frame(
+                    timestamp=ts,
+                    vx_body=vx_body,
+                    vy_body=vy_body,
+                    vz_body=vz_body,
+                    yaw_rate=yaw_rate,
+                )
+
+                next_motion_time += motion_dt
+                if now - next_motion_time > motion_dt:
+                    next_motion_time = now + motion_dt
+
+            # --------------------------------------
+            # Vision update @ 5 Hz
+            # --------------------------------------
+            current_frame = None
+
+            if now >= next_vision_time:
+                ret, current_frame = read_frame()
+
+                if ret and current_frame is not None:
+                    result = vision_processor.process_frame(
+                        current_frame,
+                        frame_ts=now,
+                        now_ts=now,
+                    )
+
+                    if result is None:
+                        result = {"cam": None, "dir": None, "targets": {}}
+
+                    result["timestamp"] = now
+                    result["debug"] = debug_mode
+                    last_vision_update = result
+
+                next_vision_time += vision_dt
+                if now - next_vision_time > vision_dt:
+                    next_vision_time = now + vision_dt
+
+            # For preview/debug image we may still want a frame if vision did not run now
+            if current_frame is None and (gui_enabled or debug_mode):
+                ret, current_frame = read_frame()
+                if not ret:
+                    current_frame = None
+
+            # --------------------------------------
+            # Fusion
+            # --------------------------------------
+            last_fused_state = fuse_motion_and_vision(
+                motion_state=last_motion_state,
+                vision_update=last_vision_update,
+            )
+
+            # --------------------------------------
+            # Prediction to "now"
+            # --------------------------------------
+            last_prediction = predict_to_now(
+                fused_state=last_fused_state,
+                now_ts=now,
+            )
+
+            # --------------------------------------
+            # Build outgoing payload
+            # Keep old info if available, extend with new pipeline states
+            # --------------------------------------
+            result = {"cam": None, "dir": None, "targets": {}, "debug": debug_mode}
+
+            if last_vision_update is not None:
+                result.update(last_vision_update)
+                result["debug"] = debug_mode
+
+            if last_prediction is not None:
+                result["pred"] = {
+                    "x": last_prediction["x"],
+                    "y": last_prediction["y"],
+                    "z": last_prediction["z"],
+                    "yaw": last_prediction["yaw"],
+                    "source": last_prediction.get("source", "unknown"),
+                    "timestamp": last_prediction["timestamp"],
+                }
+
+            if last_motion_state is not None:
+                result["motion"] = {
+                    "x": last_motion_state.x,
+                    "y": last_motion_state.y,
+                    "z": last_motion_state.z,
+                    "yaw": last_motion_state.yaw,
+                    "var_x": last_motion_state.var_x,
+                    "var_y": last_motion_state.var_y,
+                    "var_z": last_motion_state.var_z,
+                    "var_yaw": last_motion_state.var_yaw,
+                    "timestamp": last_motion_state.timestamp,
+                }
+
+            if last_fused_state is not None:
+                result["fused"] = {
+                    "x": last_fused_state["x"],
+                    "y": last_fused_state["y"],
+                    "z": last_fused_state["z"],
+                    "yaw": last_fused_state.get("yaw", 0.0),
+                    "source": last_fused_state.get("source", "unknown"),
+                    "timestamp": last_fused_state["timestamp"],
+                }
+
+            # --------------------------------------
+            # Local preview
+            # --------------------------------------
+            if gui_enabled and gui_available and current_frame is not None:
+                preview = current_frame.copy()
                 gray = cv2.cvtColor(preview, cv2.COLOR_BGR2GRAY)
-                c_dbg, i_dbg, _ = ap.detector.detectMarkers(gray)
+                c_dbg, i_dbg, _ = vision_processor.detector.detectMarkers(gray)
                 if i_dbg is not None:
                     aruco.drawDetectedMarkers(preview, c_dbg, i_dbg)
 
@@ -303,6 +601,22 @@ def main():
                     2,
                 )
 
+                if last_prediction is not None:
+                    txt = (
+                        f"PRED x={last_prediction['x']:+.2f} "
+                        f"y={last_prediction['y']:+.2f} "
+                        f"z={last_prediction['z']:+.2f}"
+                    )
+                    cv2.putText(
+                        preview,
+                        txt,
+                        (10, 60),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.6,
+                        (0, 255, 0),
+                        2,
+                    )
+
                 try:
                     cv2.imshow("pi_position Preview", preview)
                     key = cv2.waitKey(1) & 0xFF
@@ -310,37 +624,39 @@ def main():
                         break
                 except cv2.error:
                     gui_available = False
-                    print("\n⚠️ OpenCV HighGUI nicht verfügbar. Preview wird deaktiviert.")
+                    print("\n⚠️ OpenCV HighGUI not available. Disabling local preview window.")
 
-            if result is None:
-                result = {"cam": None, "dir": None, "targets": {}}
-
-            result["debug"] = debug_mode
-
-            if debug_mode and now - last_img_time > 0.1:
-                small = cv2.resize(frame, (320, 240))
+            # --------------------------------------
+            # Debug image (max 10 FPS)
+            # --------------------------------------
+            if debug_mode and current_frame is not None and now - last_img_time > 0.1:
+                small = cv2.resize(current_frame, (320, 240))
                 _, buf = cv2.imencode(".jpg", small, [cv2.IMWRITE_JPEG_QUALITY, 40])
                 result["img"] = base64.b64encode(buf).decode()
                 last_img_time = now
 
-            should_send_tracking = (result["cam"] is not None) and (now - last_send_time > 0.03)
+            # --------------------------------------
+            # Send data
+            # old behavior + new pipeline additions
+            # --------------------------------------
+            should_send_tracking = (result.get("cam") is not None) and (now - last_send_time > 0.03)
             should_send_debug = debug_mode and (now - last_send_time > 0.03)
-            should_send_heartbeat = now - last_heartbeat_time > HEARTBEAT_INTERVAL
+            should_send_heartbeat = (now - last_heartbeat_time > core.HEARTBEAT_INTERVAL)
 
             if should_send_tracking or should_send_debug or should_send_heartbeat:
-                sock_send.sendto(json.dumps(result).encode(), (target_ip, UDP_PORT))
+                sock_send.sendto(json.dumps(result).encode(), (target_ip, core.UDP_PORT))
 
                 if should_send_tracking or should_send_debug:
                     last_send_time = now
                 if should_send_heartbeat:
                     last_heartbeat_time = now
 
-                if verbose_mode and result["cam"] is not None and result["dir"] is not None:
+                if verbose_mode and result.get("cam") is not None and result.get("dir") is not None:
                     cam = result["cam"]
                     dirv = result["dir"]
 
                     targets_txt = ""
-                    if result["targets"]:
+                    if result.get("targets"):
                         parts = []
                         for tid, tpos in result["targets"].items():
                             parts.append(f"T{tid}:[{tpos[0]:+.2f},{tpos[1]:+.2f},{tpos[2]:+.2f}]")
@@ -354,16 +670,28 @@ def main():
                             marker_parts.append(f"M{mid}:{w:.3f}")
                         marker_txt = " | REF: " + " ".join(marker_parts)
 
+                    pred_txt = ""
+                    if result.get("pred") is not None:
+                        p = result["pred"]
+                        pred_txt = f" | PRED:[{p['x']:+.2f},{p['y']:+.2f},{p['z']:+.2f}]"
+
                     print(
                         f"\rCAM: [{cam[0]:+.3f}, {cam[1]:+.3f}, {cam[2]:+.3f}] "
                         f"DIR: [{dirv[0]:+.3f}, {dirv[1]:+.3f}, {dirv[2]:+.3f}] "
-                        f"Targets: {len(result['targets'])} Debug: {'ON' if debug_mode else 'OFF'}"
-                        f"{marker_txt}{targets_txt}",
+                        f"Targets: {len(result.get('targets', {}))} "
+                        f"Debug: {'ON' if debug_mode else 'OFF'}"
+                        f"{marker_txt}{targets_txt}{pred_txt}",
                         end="",
                     )
                 else:
-                    tgt_count = len(result["targets"]) if result["targets"] else 0
-                    print(f"\rTracking: {tgt_count} Targets | Debug: {'Yes' if debug_mode else 'No'}", end="")
+                    tgt_count = len(result["targets"]) if result.get("targets") else 0
+                    src = result.get("pred", {}).get("source", "-")
+                    print(
+                        f"\rTracking: {tgt_count} Targets | Debug: {'Yes' if debug_mode else 'No'} | PredSrc: {src}",
+                        end="",
+                    )
+
+            time.sleep(0.001)
 
     finally:
         if cap is not None:
@@ -373,6 +701,43 @@ def main():
             try:
                 tello.streamoff()
             except Exception:
+                pass
+            try:
+                tello.end()
+            except Exception:
+                pass
+
+        if anafi_drone is not None:
+            try:
+                if anafi_stream_api == "modern":
+                    anafi_drone.streaming.stop()
+                else:
+                    anafi_drone.stop_video_streaming()
+            except Exception:
+                try:
+                    anafi_drone.streaming.stop()
+                except Exception:
+                    try:
+                        anafi_drone.stop_video_streaming()
+                    except Exception:
+                        pass
+            try:
+                anafi_drone.disconnect()
+            except Exception:
+                pass
+
+        sock_send.close()
+        sock_cmd.close()
+
+        if gui_enabled and gui_available:
+            try:
+                cv2.destroyAllWindows()
+            except cv2.error:
+                pass
+
+
+if __name__ == "__main__":
+    main():
                 pass
             try:
                 tello.end()
