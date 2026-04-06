@@ -18,30 +18,47 @@ def wrap_angle_pi(angle_rad: float) -> float:
 @dataclass
 class MotionState:
     timestamp: float
+
+    # absolute pose in world frame
     x: float
     y: float
     z: float
     yaw: float
+
+    # accumulated variances
     var_x: float
     var_y: float
     var_z: float
     var_yaw: float
+
+    # last-step increments used to reach this state from previous state
+    delta_x: float = 0.0
+    delta_y: float = 0.0
+    delta_z: float = 0.0
+    delta_yaw: float = 0.0
+
+    # process variance added in this last step
+    proc_var_x: float = 0.0
+    proc_var_y: float = 0.0
+    proc_var_z: float = 0.0
+    proc_var_yaw: float = 0.0
 
 
 class MotionEstimator:
     """
     Reine Bewegungsfortschreibung ohne Filterung.
 
-    Annahmen:
-    - Eingangsdaten liegen im Body-Frame vor.
-    - Weltkoordinatensystem:
+    Weltkoordinatensystem:
         +X nach vorne beim Start
         +Y nach links
         +Z nach oben
-    - Body-System der Drohne:
+
+    Body-System der Drohne:
         +X nach vorne
-        +Z nach unten
-    - Startausrichtung der Drohne entspricht yaw = 0 im Welt-CS.
+        +Z nach unten (falls body_z_positive_is_down=True)
+
+    Eingangsgrößen:
+        vx_body, vy_body, vz_body, yaw_rate
     """
 
     def __init__(
@@ -76,7 +93,7 @@ class MotionEstimator:
         x, y, z, yaw = initial_pose
         var_x, var_y, var_z, var_yaw = initial_variance
 
-        now = time.time()
+        now = time.monotonic()
         self._buffer.append(
             MotionState(
                 timestamp=now,
@@ -103,20 +120,10 @@ class MotionEstimator:
         vz_body: float,
         yaw_rate: float,
     ) -> Tuple[float, float, float, float]:
-        """
-        Bringt SDK-/Drohnenkonventionen in die gewünschte Modellkonvention:
-        - +X forward
-        - +Y left
-        - +Z up
-        - +yaw gegen Uhrzeigersinn
-        """
-
         vx = vx_body
-
         vy = vy_body if self.body_y_positive_is_left else -vy_body
         vz = -vz_body if self.body_z_positive_is_down else vz_body
         yr = yaw_rate if self.yaw_positive_is_ccw else -yaw_rate
-
         return vx, vy, vz, yr
 
     def _body_to_world_velocity(
@@ -126,14 +133,11 @@ class MotionEstimator:
         vz_body: float,
         yaw: float,
     ) -> Tuple[float, float, float]:
-        """
-        Rotation aus Body nach Welt unter Nutzung von yaw.
-        """
-        cos_yaw = math.cos(yaw)
-        sin_yaw = math.sin(yaw)
+        c = math.cos(yaw)
+        s = math.sin(yaw)
 
-        vx_world = cos_yaw * vx_body - sin_yaw * vy_body
-        vy_world = sin_yaw * vx_body + cos_yaw * vy_body
+        vx_world = c * vx_body - s * vy_body
+        vy_world = s * vx_body + c * vy_body
         vz_world = vz_body
 
         return vx_world, vy_world, vz_world
@@ -168,9 +172,6 @@ class MotionEstimator:
         vz_body: float,
         yaw_rate: float = 0.0,
     ) -> MotionState:
-        """
-        Fortschreiben aus Body-Frame Geschwindigkeiten.
-        """
         last = self._buffer[-1]
         dt = timestamp - last.timestamp
 
@@ -181,18 +182,25 @@ class MotionEstimator:
             vx_body, vy_body, vz_body, yaw_rate
         )
 
-        new_yaw = wrap_angle_pi(last.yaw + yaw_rate_n * dt)
+        # midpoint yaw is a bit more accurate than using only last.yaw
+        yaw_mid = wrap_angle_pi(last.yaw + 0.5 * yaw_rate_n * dt)
 
         vx_world, vy_world, vz_world = self._body_to_world_velocity(
             vx_body=vx_body_n,
             vy_body=vy_body_n,
             vz_body=vz_body_n,
-            yaw=last.yaw,
+            yaw=yaw_mid,
         )
 
-        new_x = last.x + vx_world * dt
-        new_y = last.y + vy_world * dt
-        new_z = last.z + vz_world * dt
+        delta_x = vx_world * dt
+        delta_y = vy_world * dt
+        delta_z = vz_world * dt
+        delta_yaw = yaw_rate_n * dt
+
+        new_x = last.x + delta_x
+        new_y = last.y + delta_y
+        new_z = last.z + delta_z
+        new_yaw = wrap_angle_pi(last.yaw + delta_yaw)
 
         proc_var_x, proc_var_y, proc_var_z, proc_var_yaw = self._compute_process_variance(
             vx_world=vx_world,
@@ -212,6 +220,14 @@ class MotionEstimator:
             var_y=last.var_y + proc_var_y,
             var_z=last.var_z + proc_var_z,
             var_yaw=last.var_yaw + proc_var_yaw,
+            delta_x=delta_x,
+            delta_y=delta_y,
+            delta_z=delta_z,
+            delta_yaw=delta_yaw,
+            proc_var_x=proc_var_x,
+            proc_var_y=proc_var_y,
+            proc_var_z=proc_var_z,
+            proc_var_yaw=proc_var_yaw,
         )
 
         self._buffer.append(state)
@@ -223,3 +239,44 @@ class MotionEstimator:
 
     def get_history(self) -> List[MotionState]:
         return list(self._buffer)
+
+    def apply_fused_history(self, new_history: List[MotionState]) -> MotionState:
+        """
+        Ersetzt den aktuellen Buffer durch eine bereits gefusete Historie.
+        Gibt den neuesten Zustand zurück.
+        """
+        if not new_history:
+            return self.get_current_state()
+
+        self._buffer.clear()
+        for state in new_history:
+            self._buffer.append(state)
+
+        return self._buffer[-1]
+
+    def reset(
+        self,
+        timestamp: float,
+        x: float,
+        y: float,
+        z: float,
+        yaw: float,
+        var_x: float,
+        var_y: float,
+        var_z: float,
+        var_yaw: float,
+    ) -> None:
+        self._buffer.clear()
+        self._buffer.append(
+            MotionState(
+                timestamp=timestamp,
+                x=x,
+                y=y,
+                z=z,
+                yaw=wrap_angle_pi(yaw),
+                var_x=var_x,
+                var_y=var_y,
+                var_z=var_z,
+                var_yaw=var_yaw,
+            )
+        )
