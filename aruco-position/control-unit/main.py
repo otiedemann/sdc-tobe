@@ -10,6 +10,8 @@ import numpy as np
 from cv2 import aruco
 
 import pi_position_core as core
+import prediction as prediction_module
+
 from motion_estimator import MotionEstimator, MotionState
 from fusion import fuse_delayed_vision_update
 
@@ -501,7 +503,8 @@ def main():
             # Aktuellen gefuseten Zustand aufbauen
             # --------------------------------------
             current_state = motion_estimator.get_current_state()
-            est_vx, est_vy, est_vz = estimate_velocity_from_history(motion_estimator.get_history())
+            history = motion_estimator.get_history()
+            est_vx, est_vy, est_vz = estimate_velocity_from_history(history)
 
             last_fused_state = {
                 "timestamp": current_state.timestamp,
@@ -512,7 +515,21 @@ def main():
                 "vx": est_vx,
                 "vy": est_vy,
                 "vz": est_vz,
+                "var_x": current_state.var_x,
+                "var_y": current_state.var_y,
+                "var_z": current_state.var_z,
+                "var_yaw": current_state.var_yaw,
                 "source": "fusion" if last_vision_update is not None else "motion_only",
+                "history": [
+                    {
+                        "timestamp": s.timestamp,
+                        "x": s.x,
+                        "y": s.y,
+                        "z": s.z,
+                        "yaw": s.yaw,
+                    }
+                    for s in history
+                ],
             }
 
             # --------------------------------------
@@ -568,8 +585,13 @@ def main():
                     "vx": last_prediction["vx"],
                     "vy": last_prediction["vy"],
                     "vz": last_prediction["vz"],
+                    "std_x": last_prediction["std_x"],
+                    "std_y": last_prediction["std_y"],
+                    "std_z": last_prediction["std_z"],
+                    "std_pos": last_prediction["std_pos"],
                     "timestamp": last_prediction["timestamp"],
                     "source": last_prediction["source"],
+                    "method": last_prediction["method"],
                 }
 
             if last_fusion_result is not None:
@@ -600,17 +622,31 @@ def main():
                 )
 
                 if last_prediction is not None:
-                    txt = (
+                    txt1 = (
                         f"PRED x={last_prediction['x']:+.2f} "
                         f"y={last_prediction['y']:+.2f} "
                         f"z={last_prediction['z']:+.2f}"
                     )
+                    txt2 = (
+                        f"{last_prediction['method']} | "
+                        f"std={last_prediction['std_pos']:.2f} m"
+                    )
+
                     cv2.putText(
                         preview,
-                        txt,
+                        txt1,
                         (10, 60),
                         cv2.FONT_HERSHEY_SIMPLEX,
                         0.6,
+                        (0, 255, 0),
+                        2,
+                    )
+                    cv2.putText(
+                        preview,
+                        txt2,
+                        (10, 85),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.55,
                         (0, 255, 0),
                         2,
                     )
