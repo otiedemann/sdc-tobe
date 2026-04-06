@@ -1,3 +1,4 @@
+import base64
 import json
 import socket
 import threading
@@ -10,11 +11,11 @@ from cv2 import aruco
 
 import pi_position_core as core
 from motion_estimator import MotionEstimator, MotionState
+from fusion import fuse_delayed_vision_update
 
 
 # ============================================================
 # Optional imports for future modules
-# If they don't exist yet, built-in fallback functions are used
 # ============================================================
 
 try:
@@ -23,28 +24,25 @@ except Exception:
     input_module = None
 
 try:
-    import fusion as fusion_module
-except Exception:
-    fusion_module = None
-
-try:
     import prediction as prediction_module
 except Exception:
     prediction_module = None
 
 
 # ============================================================
-# Fallbacks for not-yet-existing modules
+# Fallbacks
 # ============================================================
 
 def fallback_get_motion_input() -> Dict[str, Any]:
     """
-    Expected later from input module.
-    Body-frame velocities:
-      vx_body > 0 forward
-      vy_body > 0 left
-      vz_body > 0 down   (will be converted in MotionEstimator)
-    yaw_rate in rad/s
+    Erwartetes späteres Format aus input-Modul:
+    {
+        "timestamp": float,
+        "vx_body": float,
+        "vy_body": float,
+        "vz_body": float,
+        "yaw_rate": float,
+    }
     """
     return {
         "timestamp": time.monotonic(),
@@ -55,66 +53,16 @@ def fallback_get_motion_input() -> Dict[str, Any]:
     }
 
 
-def fallback_fuse_motion_and_vision(
-    motion_state: Optional[MotionState],
-    vision_update: Optional[Dict[str, Any]],
-) -> Optional[Dict[str, Any]]:
-    """
-    Very simple fallback:
-    - if vision cam pose exists, take it as fused position
-    - otherwise use motion state
-    - velocities come from motion_state if available
-    """
-    if motion_state is None and vision_update is None:
-        return None
-
-    vx = 0.0
-    vy = 0.0
-    vz = 0.0
-
-    # Optional velocity estimate from motion history could be added later.
-    # For now keep it simple.
-    if vision_update is not None and vision_update.get("cam") is not None:
-        cam = vision_update["cam"]
-        return {
-            "timestamp": vision_update.get("timestamp", time.monotonic()),
-            "x": float(cam[0]),
-            "y": float(cam[1]),
-            "z": float(cam[2]),
-            "yaw": float(motion_state.yaw if motion_state is not None else 0.0),
-            "vx": vx,
-            "vy": vy,
-            "vz": vz,
-            "source": "vision",
-            "vision": vision_update,
-            "motion": motion_state,
-        }
-
-    if motion_state is not None:
-        return {
-            "timestamp": float(motion_state.timestamp),
-            "x": float(motion_state.x),
-            "y": float(motion_state.y),
-            "z": float(motion_state.z),
-            "yaw": float(motion_state.yaw),
-            "vx": vx,
-            "vy": vy,
-            "vz": vz,
-            "source": "motion",
-            "vision": vision_update,
-            "motion": motion_state,
-        }
-
-    return None
+def get_motion_input() -> Dict[str, Any]:
+    if input_module is not None and hasattr(input_module, "get_motion_input"):
+        return input_module.get_motion_input()
+    return fallback_get_motion_input()
 
 
 def fallback_predict_to_now(
     fused_state: Optional[Dict[str, Any]],
     now_ts: float,
 ) -> Optional[Dict[str, Any]]:
-    """
-    Very simple extrapolation using vx/vy/vz if present.
-    """
     if fused_state is None:
         return None
 
@@ -130,24 +78,7 @@ def fallback_predict_to_now(
         "vy": float(fused_state.get("vy", 0.0)),
         "vz": float(fused_state.get("vz", 0.0)),
         "source": fused_state.get("source", "unknown"),
-        "vision": fused_state.get("vision"),
-        "motion": fused_state.get("motion"),
     }
-
-
-def get_motion_input() -> Dict[str, Any]:
-    if input_module is not None and hasattr(input_module, "get_motion_input"):
-        return input_module.get_motion_input()
-    return fallback_get_motion_input()
-
-
-def fuse_motion_and_vision(
-    motion_state: Optional[MotionState],
-    vision_update: Optional[Dict[str, Any]],
-) -> Optional[Dict[str, Any]]:
-    if fusion_module is not None and hasattr(fusion_module, "fuse_motion_and_vision"):
-        return fusion_module.fuse_motion_and_vision(motion_state, vision_update)
-    return fallback_fuse_motion_and_vision(motion_state, vision_update)
 
 
 def predict_to_now(
@@ -159,6 +90,25 @@ def predict_to_now(
     return fallback_predict_to_now(fused_state, now_ts)
 
 
+def estimate_velocity_from_history(history: list[MotionState]) -> tuple[float, float, float]:
+    """
+    Einfache Geschwindigkeitsabschätzung aus den letzten zwei Zuständen.
+    """
+    if len(history) < 2:
+        return 0.0, 0.0, 0.0
+
+    s0 = history[-2]
+    s1 = history[-1]
+    dt = s1.timestamp - s0.timestamp
+    if dt <= 1e-6:
+        return 0.0, 0.0, 0.0
+
+    vx = (s1.x - s0.x) / dt
+    vy = (s1.y - s0.y) / dt
+    vz = (s1.z - s0.z) / dt
+    return vx, vy, vz
+
+
 # ============================================================
 # Main
 # ============================================================
@@ -167,7 +117,7 @@ def main():
     import sys
 
     # --------------------------------------------------------
-    # Command line args
+    # CLI args
     # --------------------------------------------------------
     camera_src = core.CAMERA_SOURCE
     target_ip = core.UDP_DEST_IP
@@ -240,7 +190,7 @@ def main():
         except Exception:
             print("⚠️ Missing value for --detect, using 'balanced'.")
 
-    # runtime tuning back into core module
+    # Runtime-Tuning zurück ins Core-Modul
     core.MIN_REF_WEIGHT = min_ref_weight
     core.MIN_REF_COUNT = max(1, min_ref_count)
     core.OUTLIER_POS_THRESH = max(0.1, outlier_pos_thresh)
@@ -262,7 +212,7 @@ def main():
     print(f"🖥️ GUI Overlay: {'ON' if gui_enabled else 'OFF'}")
 
     # --------------------------------------------------------
-    # Camera calibration
+    # Calibration
     # --------------------------------------------------------
     cm = np.array(
         [[850.0, 0.0, 320.0],
@@ -290,7 +240,7 @@ def main():
     )
 
     # --------------------------------------------------------
-    # Motion estimator
+    # Rates
     # --------------------------------------------------------
     motion_rate_hz = 25.0
     vision_rate_hz = 5.0
@@ -298,6 +248,9 @@ def main():
     motion_dt = 1.0 / motion_rate_hz
     vision_dt = 1.0 / vision_rate_hz
 
+    # --------------------------------------------------------
+    # Motion estimator
+    # --------------------------------------------------------
     motion_estimator = MotionEstimator(
         history_seconds=2.0,
         nominal_dt=motion_dt,
@@ -310,8 +263,10 @@ def main():
 
     last_motion_state: Optional[MotionState] = motion_estimator.get_current_state()
     last_vision_update: Optional[Dict[str, Any]] = None
+    pending_vision_update: Optional[Dict[str, Any]] = None
     last_fused_state: Optional[Dict[str, Any]] = None
     last_prediction: Optional[Dict[str, Any]] = None
+    last_fusion_result: Optional[Dict[str, Any]] = None
 
     # --------------------------------------------------------
     # Video source setup
@@ -431,7 +386,6 @@ def main():
             frame = tello_frame_reader.frame if tello_frame_reader is not None else None
             if frame is None:
                 return False, None
-            # keep previous behavior
             frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
             return True, frame
 
@@ -471,7 +425,6 @@ def main():
             if now >= next_motion_time:
                 motion_sample = get_motion_input()
 
-                # minimal validation / defaults
                 ts = float(motion_sample.get("timestamp", now))
                 vx_body = float(motion_sample.get("vx_body", 0.0))
                 vy_body = float(motion_sample.get("vy_body", 0.0))
@@ -510,28 +463,60 @@ def main():
 
                     result["timestamp"] = now
                     result["debug"] = debug_mode
+
                     last_vision_update = result
+
+                    # Nur wirklich neue verwertbare Vision-Updates in die Fusion geben
+                    if result.get("cam") is not None:
+                        pending_vision_update = result
 
                 next_vision_time += vision_dt
                 if now - next_vision_time > vision_dt:
                     next_vision_time = now + vision_dt
 
-            # For preview/debug image we may still want a frame if vision did not run now
+            # Falls wir für Preview/Debug ein Frame brauchen
             if current_frame is None and (gui_enabled or debug_mode):
                 ret, current_frame = read_frame()
                 if not ret:
                     current_frame = None
 
             # --------------------------------------
-            # Fusion
+            # Fusion nur bei neuem Vision-Update
             # --------------------------------------
-            last_fused_state = fuse_motion_and_vision(
-                motion_state=last_motion_state,
-                vision_update=last_vision_update,
-            )
+            if pending_vision_update is not None:
+                last_fusion_result = fuse_delayed_vision_update(
+                    motion_history=motion_estimator.get_history(),
+                    vision_update=pending_vision_update,
+                    use_yaw_if_available=True,
+                    prefer_repropagation=True,
+                )
+
+                updated_history = last_fusion_result.get("updated_history")
+                if updated_history:
+                    last_motion_state = motion_estimator.apply_fused_history(updated_history)
+
+                pending_vision_update = None
 
             # --------------------------------------
-            # Prediction to "now"
+            # Aktuellen gefuseten Zustand aufbauen
+            # --------------------------------------
+            current_state = motion_estimator.get_current_state()
+            est_vx, est_vy, est_vz = estimate_velocity_from_history(motion_estimator.get_history())
+
+            last_fused_state = {
+                "timestamp": current_state.timestamp,
+                "x": current_state.x,
+                "y": current_state.y,
+                "z": current_state.z,
+                "yaw": current_state.yaw,
+                "vx": est_vx,
+                "vy": est_vy,
+                "vz": est_vz,
+                "source": "fusion" if last_vision_update is not None else "motion_only",
+            }
+
+            # --------------------------------------
+            # Prediction auf jetzt
             # --------------------------------------
             last_prediction = predict_to_now(
                 fused_state=last_fused_state,
@@ -539,24 +524,14 @@ def main():
             )
 
             # --------------------------------------
-            # Build outgoing payload
-            # Keep old info if available, extend with new pipeline states
+            # Outgoing payload
+            # Alte Daten beibehalten + neue ergänzen
             # --------------------------------------
             result = {"cam": None, "dir": None, "targets": {}, "debug": debug_mode}
 
             if last_vision_update is not None:
                 result.update(last_vision_update)
                 result["debug"] = debug_mode
-
-            if last_prediction is not None:
-                result["pred"] = {
-                    "x": last_prediction["x"],
-                    "y": last_prediction["y"],
-                    "z": last_prediction["z"],
-                    "yaw": last_prediction["yaw"],
-                    "source": last_prediction.get("source", "unknown"),
-                    "timestamp": last_prediction["timestamp"],
-                }
 
             if last_motion_state is not None:
                 result["motion"] = {
@@ -576,9 +551,32 @@ def main():
                     "x": last_fused_state["x"],
                     "y": last_fused_state["y"],
                     "z": last_fused_state["z"],
-                    "yaw": last_fused_state.get("yaw", 0.0),
-                    "source": last_fused_state.get("source", "unknown"),
+                    "yaw": last_fused_state["yaw"],
+                    "vx": last_fused_state["vx"],
+                    "vy": last_fused_state["vy"],
+                    "vz": last_fused_state["vz"],
                     "timestamp": last_fused_state["timestamp"],
+                    "source": last_fused_state["source"],
+                }
+
+            if last_prediction is not None:
+                result["pred"] = {
+                    "x": last_prediction["x"],
+                    "y": last_prediction["y"],
+                    "z": last_prediction["z"],
+                    "yaw": last_prediction["yaw"],
+                    "vx": last_prediction["vx"],
+                    "vy": last_prediction["vy"],
+                    "vz": last_prediction["vz"],
+                    "timestamp": last_prediction["timestamp"],
+                    "source": last_prediction["source"],
+                }
+
+            if last_fusion_result is not None:
+                result["fusion"] = {
+                    "reference_index": last_fusion_result.get("reference_index"),
+                    "correction": last_fusion_result.get("correction"),
+                    "innovation": last_fusion_result.get("innovation"),
                 }
 
             # --------------------------------------
@@ -637,7 +635,6 @@ def main():
 
             # --------------------------------------
             # Send data
-            # old behavior + new pipeline additions
             # --------------------------------------
             should_send_tracking = (result.get("cam") is not None) and (now - last_send_time > 0.03)
             should_send_debug = debug_mode and (now - last_send_time > 0.03)
@@ -721,44 +718,6 @@ def main():
                         anafi_drone.stop_video_streaming()
                     except Exception:
                         pass
-            try:
-                anafi_drone.disconnect()
-            except Exception:
-                pass
-
-        sock_send.close()
-        sock_cmd.close()
-
-        if gui_enabled and gui_available:
-            try:
-                cv2.destroyAllWindows()
-            except cv2.error:
-                pass
-
-
-if __name__ == "__main__":
-    main():
-                pass
-            try:
-                tello.end()
-            except Exception:
-                pass
-
-        if anafi_drone is not None:
-            try:
-                if anafi_stream_api == "modern":
-                    anafi_drone.streaming.stop()
-                else:
-                    anafi_drone.stop_video_streaming()
-            except Exception:
-                try:
-                    anafi_drone.streaming.stop()
-                except Exception:
-                    try:
-                        anafi_drone.stop_video_streaming()
-                    except Exception:
-                        pass
-
             try:
                 anafi_drone.disconnect()
             except Exception:
