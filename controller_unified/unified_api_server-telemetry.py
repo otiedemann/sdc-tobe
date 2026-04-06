@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import abc
 import atexit
+from collections import deque
 import json
 import logging
 import math
@@ -275,12 +276,15 @@ telemetry: Dict = {
     "vgx": None, "vgy": None, "vgz": None,
     "agx": None, "agy": None, "agz": None,
     "speed": None, "flying": False, "connected": False, "updated_at": 0.0,
+    "updated_at_mono": 0.0,
 }
 telemetry_lock = threading.Lock()
 telemetry_log_enabled = TELEMETRY_LOG_DEFAULT
 telemetry_log_path = TELEMETRY_LOG_PATH_DEFAULT
 telemetry_log_lock = threading.Lock()
 command_log_lock = threading.Lock()
+_telemetry_sync_buf = deque(maxlen=3000)
+_telemetry_sync_lock = threading.Lock()
 
 command_lock = threading.Lock()
 discrete_until = 0.0
@@ -313,6 +317,8 @@ _pos_st: dict = {
     "markers": {}, "ref_markers": [],
     "seen_markers": [], "seen_count": 0,
     "stale": True, "ts": 0.0, "fps": None,
+    "tel_vgx": 0.0, "tel_vgy": 0.0, "tel_vgz": 0.0,
+    "sync_quality": "none", "sync_age_ms": None,
 }
 # FPS tracking for positioning loop
 _pos_fps_counter = 0
@@ -335,6 +341,8 @@ _pos_cfg: dict = {
     "fps": 5,
     "detect_profile": "default",
     "latency_comp_s": 0.05,
+    "sync_max_gap_s": 0.20,
+    "telemetry_buffer_s": 5.0,
     "camera_matrix": None,
     "dist_coeffs": None,
 }
@@ -521,6 +529,96 @@ def start_discrete_window(seconds: float):
     global discrete_until
     with command_lock:
         discrete_until = max(discrete_until, time.time() + max(0.0, seconds))
+
+
+def _telemetry_buffer_retention_s() -> float:
+    with _pos_cfg_lock:
+        v = float(_pos_cfg.get("telemetry_buffer_s", 5.0))
+    return max(1.0, min(30.0, v))
+
+
+def _append_telemetry_sync_sample(sample: dict):
+    ts_mono = float(sample.get("ts_mono", 0.0))
+    if ts_mono <= 0.0:
+        return
+    retention = _telemetry_buffer_retention_s()
+    with _telemetry_sync_lock:
+        _telemetry_sync_buf.append(sample)
+        cutoff = ts_mono - retention
+        while _telemetry_sync_buf and _telemetry_sync_buf[0].get("ts_mono", 0.0) < cutoff:
+            _telemetry_sync_buf.popleft()
+
+
+def _interp_angle_deg(a0: float, a1: float, alpha: float) -> float:
+    d = ((a1 - a0 + 180.0) % 360.0) - 180.0
+    return a0 + alpha * d
+
+
+def _telemetry_at(ts_mono: float, max_gap_s: float | None = None) -> dict:
+    if ts_mono <= 0.0:
+        return {"sample": None, "quality": "none", "age_s": None}
+    if max_gap_s is None:
+        with _pos_cfg_lock:
+            max_gap_s = float(_pos_cfg.get("sync_max_gap_s", 0.20))
+    max_gap_s = max(0.01, min(2.0, max_gap_s))
+
+    with _telemetry_sync_lock:
+        items = list(_telemetry_sync_buf)
+    if not items:
+        return {"sample": None, "quality": "none", "age_s": None}
+
+    prev = None
+    nxt = None
+    for s in items:
+        s_ts = float(s.get("ts_mono", 0.0))
+        if s_ts <= ts_mono:
+            prev = s
+            continue
+        nxt = s
+        break
+
+    if prev is None and nxt is None:
+        return {"sample": None, "quality": "none", "age_s": None}
+
+    if prev is not None and nxt is not None:
+        t0 = float(prev.get("ts_mono", 0.0))
+        t1 = float(nxt.get("ts_mono", 0.0))
+        if t1 <= t0:
+            nearest = prev
+            quality = "nearest"
+        else:
+            alpha = max(0.0, min(1.0, (ts_mono - t0) / (t1 - t0)))
+            interp = {"ts_mono": ts_mono}
+            for key in ("vgx", "vgy", "vgz", "height_cm"):
+                v0 = prev.get(key)
+                v1 = nxt.get(key)
+                if isinstance(v0, (int, float)) and isinstance(v1, (int, float)):
+                    interp[key] = float(v0) + alpha * (float(v1) - float(v0))
+                elif isinstance(v0, (int, float)):
+                    interp[key] = float(v0)
+                elif isinstance(v1, (int, float)):
+                    interp[key] = float(v1)
+            for key in ("yaw", "pitch", "roll"):
+                v0 = prev.get(key)
+                v1 = nxt.get(key)
+                if isinstance(v0, (int, float)) and isinstance(v1, (int, float)):
+                    interp[key] = _interp_angle_deg(float(v0), float(v1), alpha)
+                elif isinstance(v0, (int, float)):
+                    interp[key] = float(v0)
+                elif isinstance(v1, (int, float)):
+                    interp[key] = float(v1)
+            interp["connected"] = bool(prev.get("connected", True) and nxt.get("connected", True))
+            nearest = interp
+            quality = "interpolated"
+    else:
+        nearest = prev if prev is not None else nxt
+        quality = "nearest"
+
+    nearest_ts = float(nearest.get("ts_mono", 0.0))
+    age_s = abs(ts_mono - nearest_ts)
+    if age_s > max_gap_s:
+        return {"sample": nearest, "quality": "stale", "age_s": age_s}
+    return {"sample": nearest, "quality": quality, "age_s": age_s}
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -2010,6 +2108,7 @@ backend: Optional[DroneBackend] = None
 def telemetry_loop():
     global flying, last_state_seen
     while running:
+        loop_mono = time.monotonic()
         b = backend
         if b is None:
             time.sleep(0.5)
@@ -2051,7 +2150,22 @@ def telemetry_loop():
             telemetry["flying"] = flying
             telemetry["connected"] = connected_now
             telemetry["updated_at"] = time.time()
+            telemetry["updated_at_mono"] = loop_mono
             snapshot = dict(telemetry)
+
+        _append_telemetry_sync_sample(
+            {
+                "ts_mono": loop_mono,
+                "vgx": snapshot.get("vgx"),
+                "vgy": snapshot.get("vgy"),
+                "vgz": snapshot.get("vgz"),
+                "yaw": snapshot.get("yaw"),
+                "pitch": snapshot.get("pitch"),
+                "roll": snapshot.get("roll"),
+                "height_cm": snapshot.get("height_cm"),
+                "connected": snapshot.get("connected", False),
+            }
+        )
 
         append_telemetry_log(snapshot)
         hz = TELEMETRY_HZ if TELEMETRY_HZ > 0 else 2.0
@@ -2909,19 +3023,17 @@ def api_telemetry_log_clear():
 def _pos_snapshot_to_js(snapshot: dict) -> dict:
     """Convert flat _pos_st snapshot to the nested format the JS updatePosUI expects.
 
-    Velocity is taken from the drone telemetry (cm/s → m/s) and rotated into
-    arena frame using the ArUco heading direction so dead-reckoning is correct.
+    Velocity uses frame-matched telemetry (cm/s -> m/s), then rotates into
+    arena frame using the ArUco heading direction.
     """
     x, y, z = snapshot.get("x"), snapshot.get("y"), snapshot.get("z")
     pos = [x, y, z] if x is not None else None
     dx, dy = snapshot.get("dx"), snapshot.get("dy")
     direction = [dx, dy] if dx is not None else None
 
-    # Pull live velocity from telemetry (Anafi: SpeedChanged cm/s; Tello: same)
-    with telemetry_lock:
-        tel_vx = telemetry.get("vgx") or 0.0   # drone-frame forward, cm/s
-        tel_vy = telemetry.get("vgy") or 0.0   # drone-frame lateral, cm/s
-        tel_vz = telemetry.get("vgz") or 0.0   # vertical, cm/s
+    tel_vx = snapshot.get("tel_vgx") or 0.0   # drone-frame forward, cm/s
+    tel_vy = snapshot.get("tel_vgy") or 0.0   # drone-frame lateral, cm/s
+    tel_vz = snapshot.get("tel_vgz") or 0.0   # vertical, cm/s
 
     # Rotate drone-frame velocity into arena frame using ArUco heading
     fwd = tel_vx / 100.0   # m/s
@@ -2948,6 +3060,8 @@ def _pos_snapshot_to_js(snapshot: dict) -> dict:
         "stale": snapshot.get("stale", True),
         "enabled": enabled,
         "latency_ms": lat_ms,
+        "sync_quality": snapshot.get("sync_quality", "none"),
+        "sync_age_ms": snapshot.get("sync_age_ms"),
         "frame_w": snapshot.get("frame_w"),
         "frame_h": snapshot.get("frame_h"),
     }
@@ -3084,6 +3198,7 @@ def positioning_loop():
         try:
             with _pos_cfg_lock:
                 latency_comp_s = max(0.0, float(_pos_cfg.get("latency_comp_s", 0.05)))
+                sync_max_gap_s = max(0.01, float(_pos_cfg.get("sync_max_gap_s", 0.20)))
             result = processor.process_frame(
                 frame,
                 frame_ts=ts,
@@ -3102,6 +3217,19 @@ def positioning_loop():
         cam = result.get("cam")
         direction = result.get("dir")
         stale = result.get("stale", True)
+
+        # Match telemetry to this frame timestamp (compensate camera pipeline delay)
+        tel_target_ts = ts - latency_comp_s
+        tel_match = _telemetry_at(tel_target_ts, max_gap_s=sync_max_gap_s)
+        tel_sample = tel_match.get("sample") or {}
+        tel_quality = tel_match.get("quality", "none")
+        tel_age_s = tel_match.get("age_s")
+        if tel_quality in {"none", "stale"}:
+            tel_vgx = tel_vgy = tel_vgz = 0.0
+        else:
+            tel_vgx = float(tel_sample.get("vgx") or 0.0)
+            tel_vgy = float(tel_sample.get("vgy") or 0.0)
+            tel_vgz = float(tel_sample.get("vgz") or 0.0)
 
         # FPS tracking
         global _pos_fps_counter, _pos_fps_last_reset, _pos_fps_current
@@ -3128,6 +3256,11 @@ def positioning_loop():
             _pos_st["seen_count"] = int(result.get("seen_count") or 0)
             _pos_st["stale"] = stale
             _pos_st["ts"] = ts
+            _pos_st["tel_vgx"] = round(tel_vgx, 3)
+            _pos_st["tel_vgy"] = round(tel_vgy, 3)
+            _pos_st["tel_vgz"] = round(tel_vgz, 3)
+            _pos_st["sync_quality"] = tel_quality
+            _pos_st["sync_age_ms"] = round(float(tel_age_s) * 1000.0, 1) if tel_age_s is not None else None
             _pos_st["fps"] = _pos_fps_current
             _pos_st["frame_w"] = w
             _pos_st["frame_h"] = h
@@ -3304,7 +3437,11 @@ def api_pos_config_set():
         if "detect_profile" in data:
             _pos_cfg["detect_profile"] = str(data["detect_profile"])
         if "latency_comp_s" in data:
-            _pos_cfg["latency_comp_s"] = float(data["latency_comp_s"])
+            _pos_cfg["latency_comp_s"] = max(0.0, min(1.0, float(data["latency_comp_s"])))
+        if "sync_max_gap_s" in data:
+            _pos_cfg["sync_max_gap_s"] = max(0.01, min(2.0, float(data["sync_max_gap_s"])))
+        if "telemetry_buffer_s" in data:
+            _pos_cfg["telemetry_buffer_s"] = max(1.0, min(30.0, float(data["telemetry_buffer_s"])))
         cfg_snap = dict(_pos_cfg)
     cfg_snap.pop("camera_matrix", None)
     cfg_snap.pop("dist_coeffs", None)
