@@ -25,11 +25,6 @@ try:
 except Exception:
     input_module = None
 
-try:
-    import prediction as prediction_module
-except Exception:
-    prediction_module = None
-
 
 # ============================================================
 # Fallbacks
@@ -59,37 +54,6 @@ def get_motion_input() -> Dict[str, Any]:
     if input_module is not None and hasattr(input_module, "get_motion_input"):
         return input_module.get_motion_input()
     return fallback_get_motion_input()
-
-
-def fallback_predict_to_now(
-    fused_state: Optional[Dict[str, Any]],
-    now_ts: float,
-) -> Optional[Dict[str, Any]]:
-    if fused_state is None:
-        return None
-
-    dt = max(0.0, now_ts - fused_state["timestamp"])
-
-    return {
-        "timestamp": now_ts,
-        "x": float(fused_state["x"] + fused_state.get("vx", 0.0) * dt),
-        "y": float(fused_state["y"] + fused_state.get("vy", 0.0) * dt),
-        "z": float(fused_state["z"] + fused_state.get("vz", 0.0) * dt),
-        "yaw": float(fused_state.get("yaw", 0.0)),
-        "vx": float(fused_state.get("vx", 0.0)),
-        "vy": float(fused_state.get("vy", 0.0)),
-        "vz": float(fused_state.get("vz", 0.0)),
-        "source": fused_state.get("source", "unknown"),
-    }
-
-
-def predict_to_now(
-    fused_state: Optional[Dict[str, Any]],
-    now_ts: float,
-) -> Optional[Dict[str, Any]]:
-    if prediction_module is not None and hasattr(prediction_module, "predict_to_now"):
-        return prediction_module.predict_to_now(fused_state, now_ts)
-    return fallback_predict_to_now(fused_state, now_ts)
 
 
 def estimate_velocity_from_history(history: list[MotionState]) -> tuple[float, float, float]:
@@ -425,6 +389,7 @@ def main():
             # Motion update @ 25 Hz
             # --------------------------------------
             if now >= next_motion_time:
+                # TODO: Input fuer motion aus telemetrie erzeugen #help
                 motion_sample = get_motion_input()
 
                 ts = float(motion_sample.get("timestamp", now))
@@ -540,6 +505,19 @@ def main():
                 now_ts=now,
             )
 
+
+            # --------------------------------------
+            # Drone Position Controller
+            # --------------------------------------
+
+            # TODO: Zielposition aus C2 ist hier input
+            # 
+            # Regler erstellen der eine Fluganweisung fuer die Drohne erzeugt
+            # aus last_prediction und target_position (kommt vom C2)
+            # -> ggf regelt er den yaw immer nach 0, darueber habe ich aber noch nicht genug nachgedacht
+            #    evtl brauchen wir die drohne auch in Blickrichtung da wir ggf objekten ausweichen wollen
+            
+            
             # --------------------------------------
             # Outgoing payload
             # Alte Daten beibehalten + neue ergänzen
