@@ -188,11 +188,21 @@ class HeadlessAruCoPositioning:
         self.state_pos = None
         self.state_vel = np.zeros(3, dtype=float)
         self.state_ts = None
+        self.imu_vel = np.zeros(3, dtype=float)  # IMU velocity in arena frame (m/s)
 
     def _reset_motion_state(self):
         self.state_pos = None
         self.state_vel = np.zeros(3, dtype=float)
         self.state_ts = None
+        self.imu_vel = np.zeros(3, dtype=float)  # latest IMU velocity in arena frame
+
+    def set_imu_velocity(self, vel_arena):
+        """Update the latest IMU velocity (arena frame, m/s).
+
+        Call this before process_frame so the motion model can fuse it.
+        """
+        if vel_arena is not None:
+            self.imu_vel = np.asarray(vel_arena, dtype=float)
 
     def _predict_state(self, target_ts):
         if self.state_pos is None or self.state_ts is None:
@@ -202,6 +212,22 @@ class HeadlessAruCoPositioning:
             return self.state_pos.copy()
         dt = min(dt, MAX_STATE_DT)
         return self.state_pos + self.state_vel * dt
+
+    def _predict_imu(self, target_ts):
+        """Dead-reckon using IMU velocity only (no ArUco measurement)."""
+        if self.state_pos is None or self.state_ts is None:
+            return None
+        dt = float(target_ts) - float(self.state_ts)
+        if dt <= 0.0:
+            return self.state_pos.copy()
+        if dt > 2.0:
+            return None  # too stale
+        pos = self.state_pos + self.imu_vel * dt
+        # Update state so dead-reckoning accumulates
+        self.state_pos = pos.copy()
+        self.state_vel = self.imu_vel.copy()
+        self.state_ts = target_ts
+        return pos
 
     def _update_motion_state(self, meas_pos, meas_ts, blend_alpha):
         meas_pos = np.asarray(meas_pos, dtype=float)
@@ -222,10 +248,13 @@ class HeadlessAruCoPositioning:
         if self.state_pos is not None and self.state_ts is not None:
             dt = meas_ts - float(self.state_ts)
             if 1e-3 < dt <= MAX_STATE_DT:
+                # Blend vision-derived velocity with IMU velocity
                 inst_vel = (fused - self.state_pos) / dt
-                self.state_vel = (1.0 - VEL_BLEND) * self.state_vel + VEL_BLEND * inst_vel
+                imu_weight = 0.3  # trust IMU for 30% of velocity estimate
+                blended_vel = (1.0 - imu_weight) * inst_vel + imu_weight * self.imu_vel
+                self.state_vel = (1.0 - VEL_BLEND) * self.state_vel + VEL_BLEND * blended_vel
             elif dt > MAX_STATE_DT:
-                self.state_vel = np.zeros(3, dtype=float)
+                self.state_vel = self.imu_vel.copy()  # use IMU when vision gap is large
         self.state_pos = fused.copy()
         self.state_ts = meas_ts
         return fused
@@ -429,6 +458,27 @@ class HeadlessAruCoPositioning:
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         corners, ids, _ = self.detector.detectMarkers(gray)
         if ids is None or len(ids) == 0:
+            # Try IMU dead-reckoning when we have state + IMU velocity
+            imu_speed = float(np.linalg.norm(self.imu_vel))
+            if self.state_pos is not None and imu_speed > 0.01:
+                dr_pos = self._predict_imu(eval_ts)
+                if dr_pos is not None:
+                    self.last_valid_pose = dr_pos.copy()
+                    self.last_valid_ts = now_wall
+                    return {
+                        "cam": dr_pos.tolist(),
+                        "dir": self.last_valid_dir.tolist() if self.last_valid_dir is not None else None,
+                        "targets": {},
+                        "ref_markers": [],
+                        "marker_weights": {},
+                        "seen_markers": [],
+                        "seen_count": 0,
+                        "capture_ts": capture_ts,
+                        "eval_ts": eval_ts,
+                        "state_vel": self.state_vel.tolist(),
+                        "stale": True,
+                        "dead_reckoning": True,
+                    }
             # short hold to avoid immediate dropouts
             if self.last_valid_pose is not None and (now_wall - self.last_valid_ts) <= POSE_HOLD_SEC:
                 return _stale_payload()

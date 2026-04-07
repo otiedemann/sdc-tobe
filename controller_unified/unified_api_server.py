@@ -2946,6 +2946,7 @@ def _pos_snapshot_to_js(snapshot: dict) -> dict:
         "seen_markers": snapshot.get("seen_markers", []),
         "seen_count": snapshot.get("seen_count", 0),
         "stale": snapshot.get("stale", True),
+        "dead_reckoning": snapshot.get("dead_reckoning", False),
         "enabled": enabled,
         "latency_ms": lat_ms,
         "frame_w": snapshot.get("frame_w"),
@@ -3080,6 +3081,29 @@ def positioning_loop():
             if _video_frame_count < 5:
                 print(f"[POS] annotation detect error: {ae}")
 
+        # Inject IMU velocity into processor before pose estimation
+        try:
+            with telemetry_lock:
+                tel_vx = telemetry.get("vgx") or 0.0  # drone forward cm/s
+                tel_vy = telemetry.get("vgy") or 0.0  # drone lateral cm/s
+                tel_vz = telemetry.get("vgz") or 0.0  # vertical cm/s
+            fwd = tel_vx / 100.0  # m/s
+            lat = tel_vy / 100.0
+            vz = tel_vz / 100.0
+            # Rotate drone-frame velocity into arena frame using last known heading
+            with _pos_st_lock:
+                dx = _pos_st.get("dx")
+                dy = _pos_st.get("dy")
+            if dx is not None and dy is not None and (dx**2 + dy**2) > 1e-6:
+                heading = math.atan2(dx, dy)
+                arena_vx = fwd * math.sin(heading) + lat * math.cos(heading)
+                arena_vy = fwd * math.cos(heading) - lat * math.sin(heading)
+            else:
+                arena_vx, arena_vy = fwd, lat
+            processor.set_imu_velocity([arena_vx, arena_vy, vz])
+        except Exception:
+            pass
+
         # Run pose estimation (latency-aware)
         try:
             with _pos_cfg_lock:
@@ -3127,6 +3151,7 @@ def positioning_loop():
             _pos_st["seen_markers"] = list(result.get("seen_markers") or [])
             _pos_st["seen_count"] = int(result.get("seen_count") or 0)
             _pos_st["stale"] = stale
+            _pos_st["dead_reckoning"] = result.get("dead_reckoning", False)
             _pos_st["ts"] = ts
             _pos_st["fps"] = _pos_fps_current
             _pos_st["frame_w"] = w
