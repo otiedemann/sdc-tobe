@@ -13,7 +13,7 @@ from reportlab.lib.units import cm
 from reportlab.pdfgen import canvas
 
 
-def generate_aruco_pdf(filename="aruco_markers_4x4_100.pdf", marker_size_cm=18.0):
+def generate_aruco_pdf(filename="aruco_markers_4x4_100.pdf", marker_size_cm=10.0):
     aruco_dict = aruco.getPredefinedDictionary(aruco.DICT_4X4_100)
 
     c = canvas.Canvas(filename, pagesize=A4)
@@ -21,7 +21,7 @@ def generate_aruco_pdf(filename="aruco_markers_4x4_100.pdf", marker_size_cm=18.0
     size = marker_size_cm * cm
 
     # IDs: 1-24 (reference/pillar markers) and 61-76 (target markers)
-    marker_ids = list(range(1, 25)) + list(range(61, 77))
+    marker_ids = list(range(7, 11)) + list(range(0, 1))
 
     print(f"Generating PDF: {filename}")
     print(f"  Dictionary: DICT_4X4_100")

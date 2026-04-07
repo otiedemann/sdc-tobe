@@ -81,6 +81,9 @@ The script supports multiple camera sources:
 | USB webcam | `0`           | Default, system camera index            |
 | IP camera  | RTSP/HTTP URL | e.g., `rtsp://192.168.1.100:554/stream` |
 | DJI Tello  | `tello`       | Requires `djitellopy` package           |
+| Parrot Anafi | `anafi` or `anafi:192.168.42.1` | Requires `parrot-olympe` package |
+
+For Anafi, the default IP is `192.168.42.1`. You can also set `ANAFI_IP` (or `DRONE_IP`) in the environment and use `anafi` as input.
 
 ## Output Files
 

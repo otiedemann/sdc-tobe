@@ -1,0 +1,27 @@
+{
+  "1": {
+    "base": "http://127.0.0.1:8080",
+    "name": "Anafi 1",
+    "type": "anafi"
+  },
+  "2": {
+    "base": "http://192.168.1.100:8080",
+    "name": "Tello 1",
+    "type": "tello"
+  },
+  "3": {
+    "base": "http://192.168.1.101:8080",
+    "name": "Drone 3",
+    "type": "tello"
+  },
+  "4": {
+    "base": "http://192.168.1.102:8080",
+    "name": "Drone 4",
+    "type": "tello"
+  },
+  "5": {
+    "base": "http://192.168.1.103:8080",
+    "name": "Drone 5",
+    "type": "tello"
+  }
+}
