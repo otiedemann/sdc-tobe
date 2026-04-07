@@ -1189,8 +1189,9 @@ function updatePosUI(d) {
 
   const enabled = d.enabled !== false;
   const badge = document.getElementById('pos_status_badge');
-  badge.textContent = !enabled ? 'disabled' : pos ? (d.stale ? 'stale' : 'live') : 'no markers';
-  badge.style.color = !enabled ? '#64748b' : (pos && !d.stale) ? '#22c55e' : '#f59e0b';
+  const dr = d.dead_reckoning;
+  badge.textContent = !enabled ? 'disabled' : pos ? (dr ? 'IMU DR' : d.stale ? 'stale' : 'live') : 'no markers';
+  badge.style.color = !enabled ? '#64748b' : (pos && !d.stale && !dr) ? '#22c55e' : dr ? '#06b6d4' : '#f59e0b';
 
   if (d.frame_w && d.frame_h) _lastFrameRes = `${d.frame_w}x${d.frame_h}`;
   if (pos) console.log('[POS] drawArena pos=', pos, 'compPos=', compPos, 'frame=', _lastFrameRes);

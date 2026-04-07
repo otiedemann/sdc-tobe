@@ -38,6 +38,15 @@ def has_gui():
 
 
 class KalmanFilter1D:
+    """1-D Kalman filter with state [position, velocity].
+
+    Supports three operations:
+    - update(measurement):  predict + measurement update (ArUco position)
+    - update_with_imu(measurement, imu_vel): predict using IMU velocity,
+        then measurement update with ArUco position
+    - predict_only(imu_vel): predict step only using IMU velocity
+        (dead-reckoning when no ArUco measurement is available)
+    """
     def __init__(self, process_variance=1e-3, measurement_variance=1e-1):
         self.process_variance = process_variance
         self.measurement_variance = measurement_variance
@@ -45,7 +54,27 @@ class KalmanFilter1D:
         self.covariance = np.eye(2)
         self.last_time = None
 
+    def _predict(self, dt, imu_vel=None):
+        """Run prediction step. If imu_vel is given, override velocity state."""
+        F = np.array([[1, dt], [0, 1]])
+        if imu_vel is not None:
+            # Inject IMU velocity before prediction
+            self.state[1] = imu_vel
+        self.state = F @ self.state
+        Q = np.array([[1e-4, 0], [0, 1e-2]]) * self.process_variance
+        self.covariance = F @ self.covariance @ F.T + Q
+
+    def _measurement_update(self, measurement):
+        """Run measurement update step."""
+        H = np.array([[1, 0]])
+        y = measurement - (H @ self.state)
+        S = H @ self.covariance @ H.T + self.measurement_variance
+        K = self.covariance @ H.T @ np.linalg.inv(S)
+        self.state = self.state + K @ y
+        self.covariance = (np.eye(2) - K @ H) @ self.covariance
+
     def update(self, measurement):
+        """Predict + measurement update (original behaviour, no IMU)."""
         now = time.time()
         if self.state is None:
             self.state = np.array([measurement, 0.0])
@@ -56,16 +85,38 @@ class KalmanFilter1D:
         if dt > 0.5:
             self.state[0], self.state[1] = measurement, 0.0
             return measurement
-        F = np.array([[1, dt], [0, 1]])
-        self.state = F @ self.state
-        Q = np.array([[1e-4, 0], [0, 1e-2]]) * self.process_variance
-        self.covariance = F @ self.covariance @ F.T + Q
-        H = np.array([[1, 0]])
-        y = measurement - (H @ self.state)
-        S = H @ self.covariance @ H.T + self.measurement_variance
-        K = self.covariance @ H.T @ np.linalg.inv(S)
-        self.state = self.state + K @ y
-        self.covariance = (np.eye(2) - K @ H) @ self.covariance
+        self._predict(dt)
+        self._measurement_update(measurement)
+        return self.state[0]
+
+    def update_with_imu(self, measurement, imu_vel):
+        """Predict using IMU velocity, then update with ArUco measurement."""
+        now = time.time()
+        if self.state is None:
+            self.state = np.array([measurement, imu_vel])
+            self.last_time = now
+            return measurement
+        dt = now - self.last_time
+        self.last_time = now
+        if dt > 0.5:
+            self.state[0], self.state[1] = measurement, imu_vel
+            return measurement
+        self._predict(dt, imu_vel=imu_vel)
+        self._measurement_update(measurement)
+        return self.state[0]
+
+    def predict_only(self, imu_vel):
+        """Dead-reckon using IMU velocity (no ArUco measurement)."""
+        now = time.time()
+        if self.state is None:
+            return None
+        dt = now - self.last_time
+        self.last_time = now
+        if dt > 2.0:
+            return None  # too stale to dead-reckon
+        self._predict(dt, imu_vel=imu_vel)
+        # Inflate covariance faster during dead-reckoning to trust next ArUco more
+        self.covariance *= 1.05
         return self.state[0]
 
     def reset(self):
@@ -287,10 +338,35 @@ class HeadlessAruCoPositioning:
 
         return float(area_w * dist_w * shape_w * reproj_w)
 
-    def process_frame(self, frame):
+    def process_frame(self, frame, imu_velocity=None):
+        """Process a video frame for ArUco positioning.
+
+        Args:
+            frame: BGR image from camera.
+            imu_velocity: optional [vx, vy, vz] in arena frame (m/s) from
+                drone telemetry.  Used to improve Kalman prediction and
+                enable dead-reckoning when markers are temporarily lost.
+        """
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         corners, ids, _ = self.detector.detectMarkers(gray)
         if ids is None or len(ids) == 0:
+            # Dead-reckon using IMU when we have state + velocity
+            if imu_velocity is not None and self.kf_pos[0].state is not None:
+                dr = [self.kf_pos[j].predict_only(imu_velocity[j])
+                      for j in range(3)]
+                if all(v is not None for v in dr):
+                    pos = np.array(dr)
+                    self.last_valid_pose = pos.copy()
+                    self.last_valid_ts = time.time()
+                    return {
+                        "cam": pos.tolist(),
+                        "dir": self.last_valid_dir.tolist() if self.last_valid_dir is not None else None,
+                        "targets": {},
+                        "ref_markers": [],
+                        "marker_weights": {},
+                        "stale": True,
+                        "dead_reckoning": True,
+                    }
             # short hold to avoid immediate dropouts
             if self.last_valid_pose is not None and (time.time() - self.last_valid_ts) <= POSE_HOLD_SEC:
                 return {
@@ -419,7 +495,11 @@ class HeadlessAruCoPositioning:
         w_arr = np.array(weights) / (sum(weights) + 1e-6)
         raw_pos = sum(p * w for p, w in zip(cam_positions, w_arr))
         raw_dir = sum(d * w for d, w in zip(cam_dirs, w_arr))
-        f_pos = np.array([self.kf_pos[j].update(raw_pos[j]) for j in range(3)])
+        if imu_velocity is not None:
+            f_pos = np.array([self.kf_pos[j].update_with_imu(raw_pos[j], imu_velocity[j])
+                              for j in range(3)])
+        else:
+            f_pos = np.array([self.kf_pos[j].update(raw_pos[j]) for j in range(3)])
 
         raw_dir_norm = np.linalg.norm(raw_dir)
         if raw_dir_norm > 1e-9:

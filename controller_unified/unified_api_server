@@ -2943,6 +2943,7 @@ def _pos_snapshot_to_js(snapshot: dict) -> dict:
         "fps": snapshot.get("fps"),
         "ref_markers": snapshot.get("ref_markers", []),
         "stale": snapshot.get("stale", True),
+        "dead_reckoning": snapshot.get("dead_reckoning", False),
         "enabled": enabled,
         "latency_ms": lat_ms,
         "frame_w": snapshot.get("frame_w"),
@@ -3077,9 +3078,33 @@ def positioning_loop():
             if _video_frame_count < 5:
                 print(f"[POS] annotation detect error: {ae}")
 
-        # Run pose estimation
+        # Build arena-frame velocity from telemetry for IMU fusion
+        imu_vel = None
         try:
-            result = processor.process_frame(frame)
+            with telemetry_lock:
+                tel_vx = telemetry.get("vgx") or 0.0  # drone forward cm/s
+                tel_vy = telemetry.get("vgy") or 0.0  # drone lateral cm/s
+                tel_vz = telemetry.get("vgz") or 0.0  # vertical cm/s
+            fwd = tel_vx / 100.0  # m/s
+            lat = tel_vy / 100.0
+            vz = tel_vz / 100.0
+            # Rotate drone-frame to arena-frame using last known heading
+            with _pos_st_lock:
+                dx = _pos_st.get("dx")
+                dy = _pos_st.get("dy")
+            if dx is not None and dy is not None and (dx**2 + dy**2) > 1e-6:
+                heading = math.atan2(dx, dy)
+                arena_vx = fwd * math.sin(heading) + lat * math.cos(heading)
+                arena_vy = fwd * math.cos(heading) - lat * math.sin(heading)
+            else:
+                arena_vx, arena_vy = fwd, lat
+            imu_vel = [arena_vx, arena_vy, vz]
+        except Exception:
+            pass
+
+        # Run pose estimation with IMU fusion
+        try:
+            result = processor.process_frame(frame, imu_velocity=imu_vel)
         except Exception as pe:
             print(f"[POS] process_frame error: {pe}")
             result = None
@@ -3115,6 +3140,7 @@ def positioning_loop():
                                    for k, v in (result.get("marker_weights") or {}).items()}
             _pos_st["ref_markers"] = list(result.get("ref_markers") or [])
             _pos_st["stale"] = stale
+            _pos_st["dead_reckoning"] = result.get("dead_reckoning", False)
             _pos_st["ts"] = ts
             _pos_st["fps"] = _pos_fps_current
             _pos_st["frame_w"] = w
