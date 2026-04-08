@@ -3399,3 +3399,547 @@
 {"ts": "2026-04-02 15:03:13", "event": "/api/key_down", "payload": {"key": "l"}}
 {"ts": "2026-04-02 15:03:13", "event": "/api/key_up", "payload": {"key": "l"}}
 {"ts": "2026-04-02 15:03:17", "event": "/api/video/record/stop", "payload": {}}
+{"ts": "2026-04-07 09:30:43", "event": "/api/key_down", "payload": {"key": "t"}}
+{"ts": "2026-04-07 09:30:43", "event": "/api/key_down", "payload": {"key": "t"}}
+{"ts": "2026-04-07 09:30:43", "event": "/api/key_up", "payload": {"key": "t"}}
+{"ts": "2026-04-07 09:30:49", "event": "/api/key_down", "payload": {"key": "d"}}
+{"ts": "2026-04-07 09:30:49", "event": "/api/key_down", "payload": {"key": "d"}}
+{"ts": "2026-04-07 09:30:49", "event": "/api/key_down", "payload": {"key": "d"}}
+{"ts": "2026-04-07 09:30:50", "event": "/api/key_up", "payload": {"key": "d"}}
+{"ts": "2026-04-07 09:30:53", "event": "/api/key_down", "payload": {"key": "s"}}
+{"ts": "2026-04-07 09:30:53", "event": "/api/key_down", "payload": {"key": "s"}}
+{"ts": "2026-04-07 09:30:53", "event": "/api/key_up", "payload": {"key": "s"}}
+{"ts": "2026-04-07 09:30:59", "event": "/api/key_down", "payload": {"key": "w"}}
+{"ts": "2026-04-07 09:30:59", "event": "/api/key_down", "payload": {"key": "w"}}
+{"ts": "2026-04-07 09:30:59", "event": "/api/key_down", "payload": {"key": "w"}}
+{"ts": "2026-04-07 09:30:59", "event": "/api/key_up", "payload": {"key": "w"}}
+{"ts": "2026-04-07 09:31:00", "event": "/api/key_down", "payload": {"key": "w"}}
+{"ts": "2026-04-07 09:31:00", "event": "/api/key_down", "payload": {"key": "w"}}
+{"ts": "2026-04-07 09:31:00", "event": "/api/key_down", "payload": {"key": "w"}}
+{"ts": "2026-04-07 09:31:00", "event": "/api/key_up", "payload": {"key": "w"}}
+{"ts": "2026-04-07 09:31:05", "event": "/api/key_down", "payload": {"key": "s"}}
+{"ts": "2026-04-07 09:31:05", "event": "/api/key_down", "payload": {"key": "s"}}
+{"ts": "2026-04-07 09:31:05", "event": "/api/key_up", "payload": {"key": "s"}}
+{"ts": "2026-04-07 09:31:05", "event": "/api/key_down", "payload": {"key": "s"}}
+{"ts": "2026-04-07 09:31:05", "event": "/api/key_down", "payload": {"key": "s"}}
+{"ts": "2026-04-07 09:31:05", "event": "/api/key_down", "payload": {"key": "s"}}
+{"ts": "2026-04-07 09:31:06", "event": "/api/key_down", "payload": {"key": "s"}}
+{"ts": "2026-04-07 09:31:06", "event": "/api/key_down", "payload": {"key": "s"}}
+{"ts": "2026-04-07 09:31:06", "event": "/api/key_up", "payload": {"key": "s"}}
+{"ts": "2026-04-07 09:31:06", "event": "/api/key_down", "payload": {"key": "s"}}
+{"ts": "2026-04-07 09:31:07", "event": "/api/key_down", "payload": {"key": "s"}}
+{"ts": "2026-04-07 09:31:07", "event": "/api/key_down", "payload": {"key": "s"}}
+{"ts": "2026-04-07 09:31:07", "event": "/api/key_down", "payload": {"key": "s"}}
+{"ts": "2026-04-07 09:31:07", "event": "/api/key_up", "payload": {"key": "s"}}
+{"ts": "2026-04-07 09:31:09", "event": "/api/key_down", "payload": {"key": "a"}}
+{"ts": "2026-04-07 09:31:09", "event": "/api/key_down", "payload": {"key": "a"}}
+{"ts": "2026-04-07 09:31:09", "event": "/api/key_down", "payload": {"key": "a"}}
+{"ts": "2026-04-07 09:31:09", "event": "/api/key_down", "payload": {"key": "a"}}
+{"ts": "2026-04-07 09:31:10", "event": "/api/key_down", "payload": {"key": "a"}}
+{"ts": "2026-04-07 09:31:10", "event": "/api/key_up", "payload": {"key": "a"}}
+{"ts": "2026-04-07 09:31:11", "event": "/api/key_down", "payload": {"key": "d"}}
+{"ts": "2026-04-07 09:31:11", "event": "/api/key_down", "payload": {"key": "d"}}
+{"ts": "2026-04-07 09:31:12", "event": "/api/key_down", "payload": {"key": "d"}}
+{"ts": "2026-04-07 09:31:12", "event": "/api/key_down", "payload": {"key": "d"}}
+{"ts": "2026-04-07 09:31:12", "event": "/api/key_up", "payload": {"key": "d"}}
+{"ts": "2026-04-07 09:31:15", "event": "/api/key_down", "payload": {"key": "a"}}
+{"ts": "2026-04-07 09:31:15", "event": "/api/key_down", "payload": {"key": "a"}}
+{"ts": "2026-04-07 09:31:16", "event": "/api/key_down", "payload": {"key": "a"}}
+{"ts": "2026-04-07 09:31:16", "event": "/api/key_up", "payload": {"key": "a"}}
+{"ts": "2026-04-07 09:31:16", "event": "/api/key_down", "payload": {"key": "a"}}
+{"ts": "2026-04-07 09:31:16", "event": "/api/key_down", "payload": {"key": "a"}}
+{"ts": "2026-04-07 09:31:16", "event": "/api/key_down", "payload": {"key": "a"}}
+{"ts": "2026-04-07 09:31:16", "event": "/api/key_down", "payload": {"key": "a"}}
+{"ts": "2026-04-07 09:31:16", "event": "/api/key_up", "payload": {"key": "a"}}
+{"ts": "2026-04-07 09:31:19", "event": "/api/key_down", "payload": {"key": "d"}}
+{"ts": "2026-04-07 09:31:19", "event": "/api/key_down", "payload": {"key": "d"}}
+{"ts": "2026-04-07 09:31:19", "event": "/api/key_up", "payload": {"key": "d"}}
+{"ts": "2026-04-07 09:31:19", "event": "/api/key_down", "payload": {"key": "d"}}
+{"ts": "2026-04-07 09:31:19", "event": "/api/key_down", "payload": {"key": "d"}}
+{"ts": "2026-04-07 09:31:19", "event": "/api/key_up", "payload": {"key": "d"}}
+{"ts": "2026-04-07 09:31:26", "event": "/api/key_down", "payload": {"key": "d"}}
+{"ts": "2026-04-07 09:31:26", "event": "/api/key_down", "payload": {"key": "d"}}
+{"ts": "2026-04-07 09:31:26", "event": "/api/key_down", "payload": {"key": "d"}}
+{"ts": "2026-04-07 09:31:26", "event": "/api/key_up", "payload": {"key": "d"}}
+{"ts": "2026-04-07 09:31:26", "event": "/api/key_down", "payload": {"key": "d"}}
+{"ts": "2026-04-07 09:31:26", "event": "/api/key_down", "payload": {"key": "d"}}
+{"ts": "2026-04-07 09:31:26", "event": "/api/key_up", "payload": {"key": "d"}}
+{"ts": "2026-04-07 09:31:29", "event": "/api/key_down", "payload": {"key": "a"}}
+{"ts": "2026-04-07 09:31:29", "event": "/api/key_down", "payload": {"key": "a"}}
+{"ts": "2026-04-07 09:31:29", "event": "/api/key_up", "payload": {"key": "a"}}
+{"ts": "2026-04-07 09:31:29", "event": "/api/key_down", "payload": {"key": "a"}}
+{"ts": "2026-04-07 09:31:29", "event": "/api/key_down", "payload": {"key": "a"}}
+{"ts": "2026-04-07 09:31:29", "event": "/api/key_up", "payload": {"key": "a"}}
+{"ts": "2026-04-07 09:31:29", "event": "/api/key_down", "payload": {"key": "a"}}
+{"ts": "2026-04-07 09:31:29", "event": "/api/key_down", "payload": {"key": "a"}}
+{"ts": "2026-04-07 09:31:29", "event": "/api/key_up", "payload": {"key": "a"}}
+{"ts": "2026-04-07 09:31:31", "event": "/api/key_down", "payload": {"key": "d"}}
+{"ts": "2026-04-07 09:31:31", "event": "/api/key_down", "payload": {"key": "d"}}
+{"ts": "2026-04-07 09:31:31", "event": "/api/key_up", "payload": {"key": "d"}}
+{"ts": "2026-04-07 09:31:31", "event": "/api/key_down", "payload": {"key": "d"}}
+{"ts": "2026-04-07 09:31:32", "event": "/api/key_up", "payload": {"key": "d"}}
+{"ts": "2026-04-07 09:31:32", "event": "/api/key_down", "payload": {"key": "d"}}
+{"ts": "2026-04-07 09:31:32", "event": "/api/key_up", "payload": {"key": "d"}}
+{"ts": "2026-04-07 09:31:32", "event": "/api/key_down", "payload": {"key": "d"}}
+{"ts": "2026-04-07 09:31:32", "event": "/api/key_down", "payload": {"key": "d"}}
+{"ts": "2026-04-07 09:31:33", "event": "/api/key_down", "payload": {"key": "d"}}
+{"ts": "2026-04-07 09:31:33", "event": "/api/key_up", "payload": {"key": "d"}}
+{"ts": "2026-04-07 09:31:34", "event": "/api/key_down", "payload": {"key": "w"}}
+{"ts": "2026-04-07 09:31:34", "event": "/api/key_down", "payload": {"key": "w"}}
+{"ts": "2026-04-07 09:31:34", "event": "/api/key_up", "payload": {"key": "w"}}
+{"ts": "2026-04-07 09:31:35", "event": "/api/key_down", "payload": {"key": "w"}}
+{"ts": "2026-04-07 09:31:35", "event": "/api/key_down", "payload": {"key": "w"}}
+{"ts": "2026-04-07 09:31:35", "event": "/api/key_up", "payload": {"key": "w"}}
+{"ts": "2026-04-07 09:31:36", "event": "/api/key_down", "payload": {"key": "l"}}
+{"ts": "2026-04-07 09:31:36", "event": "/api/key_up", "payload": {"key": "l"}}
+{"ts": "2026-04-07 09:34:10", "event": "/api/video/start", "payload": {"mode": "mjpeg"}}
+{"ts": "2026-04-07 09:34:24", "event": "/api/position/config", "payload": {"enabled": true}}
+{"ts": "2026-04-07 10:09:11", "event": "/api/video/stop", "payload": {}}
+{"ts": "2026-04-07 10:09:11", "event": "/api/video/start", "payload": {"mode": "mjpeg"}}
+{"ts": "2026-04-07 10:09:14", "event": "/api/video/stop", "payload": {}}
+{"ts": "2026-04-07 10:10:00", "event": "/api/video/start", "payload": {"mode": "mjpeg"}}
+{"ts": "2026-04-07 10:10:01", "event": "/api/video/start", "payload": {"mode": "mjpeg"}}
+{"ts": "2026-04-07 10:11:46", "event": "/api/key_down", "payload": {"key": "t"}}
+{"ts": "2026-04-07 10:11:46", "event": "/api/key_down", "payload": {"key": "t"}}
+{"ts": "2026-04-07 10:11:46", "event": "/api/key_up", "payload": {"key": "t"}}
+{"ts": "2026-04-07 10:11:56", "event": "/api/key_down", "payload": {"key": "w"}}
+{"ts": "2026-04-07 10:11:56", "event": "/api/key_down", "payload": {"key": "w"}}
+{"ts": "2026-04-07 10:11:56", "event": "/api/key_down", "payload": {"key": "w"}}
+{"ts": "2026-04-07 10:11:56", "event": "/api/key_up", "payload": {"key": "w"}}
+{"ts": "2026-04-07 10:11:57", "event": "/api/key_down", "payload": {"key": "w"}}
+{"ts": "2026-04-07 10:11:57", "event": "/api/key_down", "payload": {"key": "w"}}
+{"ts": "2026-04-07 10:11:57", "event": "/api/key_down", "payload": {"key": "w"}}
+{"ts": "2026-04-07 10:11:57", "event": "/api/key_down", "payload": {"key": "w"}}
+{"ts": "2026-04-07 10:11:57", "event": "/api/key_down", "payload": {"key": "w"}}
+{"ts": "2026-04-07 10:11:57", "event": "/api/key_up", "payload": {"key": "w"}}
+{"ts": "2026-04-07 10:11:58", "event": "/api/key_down", "payload": {"key": "s"}}
+{"ts": "2026-04-07 10:11:58", "event": "/api/key_down", "payload": {"key": "s"}}
+{"ts": "2026-04-07 10:11:58", "event": "/api/key_down", "payload": {"key": "s"}}
+{"ts": "2026-04-07 10:11:58", "event": "/api/key_down", "payload": {"key": "s"}}
+{"ts": "2026-04-07 10:11:58", "event": "/api/key_up", "payload": {"key": "s"}}
+{"ts": "2026-04-07 10:11:59", "event": "/api/key_down", "payload": {"key": "a"}}
+{"ts": "2026-04-07 10:11:59", "event": "/api/key_down", "payload": {"key": "a"}}
+{"ts": "2026-04-07 10:11:59", "event": "/api/key_down", "payload": {"key": "a"}}
+{"ts": "2026-04-07 10:12:00", "event": "/api/key_up", "payload": {"key": "a"}}
+{"ts": "2026-04-07 10:12:00", "event": "/api/key_down", "payload": {"key": "d"}}
+{"ts": "2026-04-07 10:12:00", "event": "/api/key_down", "payload": {"key": "d"}}
+{"ts": "2026-04-07 10:12:00", "event": "/api/key_down", "payload": {"key": "d"}}
+{"ts": "2026-04-07 10:12:00", "event": "/api/key_down", "payload": {"key": "d"}}
+{"ts": "2026-04-07 10:12:00", "event": "/api/key_up", "payload": {"key": "d"}}
+{"ts": "2026-04-07 10:12:02", "event": "/api/key_down", "payload": {"key": "l"}}
+{"ts": "2026-04-07 10:12:02", "event": "/api/key_down", "payload": {"key": "l"}}
+{"ts": "2026-04-07 10:12:02", "event": "/api/key_up", "payload": {"key": "l"}}
+{"ts": "2026-04-07 11:37:16", "event": "/api/key_down", "payload": {"key": "r"}}
+{"ts": "2026-04-07 11:37:16", "event": "/api/key_down", "payload": {"key": "r"}}
+{"ts": "2026-04-07 11:37:16", "event": "/api/key_up", "payload": {"key": "r"}}
+{"ts": "2026-04-07 11:37:39", "event": "/api/position/config", "payload": {"enabled": true}}
+{"ts": "2026-04-07 11:38:04", "event": "/api/takeoff", "payload": {}}
+{"ts": "2026-04-07 11:38:10", "event": "/api/move", "payload": {"dir": "forward", "cm": 100}}
+{"ts": "2026-04-07 11:38:15", "event": "/api/move", "payload": {"dir": "back", "cm": 100}}
+{"ts": "2026-04-07 11:38:21", "event": "/api/land", "payload": {}}
+{"ts": "2026-04-07 11:39:00", "event": "/api/takeoff", "payload": {}}
+{"ts": "2026-04-07 11:39:06", "event": "/api/takeoff", "payload": {}}
+{"ts": "2026-04-07 11:39:11", "event": "/api/key_down", "payload": {"key": "l"}}
+{"ts": "2026-04-07 11:39:11", "event": "/api/key_down", "payload": {"key": "l"}}
+{"ts": "2026-04-07 11:39:11", "event": "/api/key_up", "payload": {"key": "l"}}
+{"ts": "2026-04-07 11:39:37", "event": "/api/takeoff", "payload": {}}
+{"ts": "2026-04-07 11:39:42", "event": "/api/move", "payload": {"dir": "forward", "cm": 200}}
+{"ts": "2026-04-07 11:39:48", "event": "/api/rotate", "payload": {"dir": "ccw", "deg": 180}}
+{"ts": "2026-04-07 11:39:49", "event": "/api/key_down", "payload": {"key": "l"}}
+{"ts": "2026-04-07 11:39:49", "event": "/api/key_down", "payload": {"key": "l"}}
+{"ts": "2026-04-07 11:39:49", "event": "/api/key_up", "payload": {"key": "l"}}
+{"ts": "2026-04-07 11:39:49", "event": "/api/key_down", "payload": {"key": "l"}}
+{"ts": "2026-04-07 11:39:49", "event": "/api/key_up", "payload": {"key": "l"}}
+{"ts": "2026-04-07 11:39:49", "event": "/api/key_down", "payload": {"key": "l"}}
+{"ts": "2026-04-07 11:39:50", "event": "/api/key_down", "payload": {"key": "l"}}
+{"ts": "2026-04-07 11:39:50", "event": "/api/key_up", "payload": {"key": "l"}}
+{"ts": "2026-04-07 11:39:50", "event": "/api/key_down", "payload": {"key": "l"}}
+{"ts": "2026-04-07 11:39:50", "event": "/api/key_down", "payload": {"key": "l"}}
+{"ts": "2026-04-07 11:39:50", "event": "/api/key_up", "payload": {"key": "l"}}
+{"ts": "2026-04-07 11:39:50", "event": "/api/key_down", "payload": {"key": "l"}}
+{"ts": "2026-04-07 11:39:50", "event": "/api/key_down", "payload": {"key": "l"}}
+{"ts": "2026-04-07 11:39:50", "event": "/api/key_up", "payload": {"key": "l"}}
+{"ts": "2026-04-07 11:39:50", "event": "/api/key_down", "payload": {"key": "l"}}
+{"ts": "2026-04-07 11:39:50", "event": "/api/key_up", "payload": {"key": "l"}}
+{"ts": "2026-04-07 11:39:51", "event": "/api/key_down", "payload": {"key": "l"}}
+{"ts": "2026-04-07 11:39:51", "event": "/api/key_down", "payload": {"key": "l"}}
+{"ts": "2026-04-07 11:39:51", "event": "/api/key_up", "payload": {"key": "l"}}
+{"ts": "2026-04-07 11:39:51", "event": "/api/key_down", "payload": {"key": "l"}}
+{"ts": "2026-04-07 11:39:51", "event": "/api/key_down", "payload": {"key": "l"}}
+{"ts": "2026-04-07 11:39:51", "event": "/api/key_up", "payload": {"key": "l"}}
+{"ts": "2026-04-07 11:39:51", "event": "/api/key_down", "payload": {"key": "l"}}
+{"ts": "2026-04-07 11:39:51", "event": "/api/key_down", "payload": {"key": "l"}}
+{"ts": "2026-04-07 11:39:51", "event": "/api/key_up", "payload": {"key": "l"}}
+{"ts": "2026-04-07 11:39:51", "event": "/api/key_down", "payload": {"key": "l"}}
+{"ts": "2026-04-07 11:39:51", "event": "/api/key_down", "payload": {"key": "l"}}
+{"ts": "2026-04-07 11:39:51", "event": "/api/key_up", "payload": {"key": "l"}}
+{"ts": "2026-04-07 11:39:52", "event": "/api/key_down", "payload": {"key": "l"}}
+{"ts": "2026-04-07 11:39:52", "event": "/api/key_down", "payload": {"key": "l"}}
+{"ts": "2026-04-07 11:39:52", "event": "/api/key_up", "payload": {"key": "l"}}
+{"ts": "2026-04-07 11:39:52", "event": "/api/key_down", "payload": {"key": "l"}}
+{"ts": "2026-04-07 11:39:52", "event": "/api/key_down", "payload": {"key": "l"}}
+{"ts": "2026-04-07 11:39:52", "event": "/api/key_up", "payload": {"key": "l"}}
+{"ts": "2026-04-07 11:39:55", "event": "/api/key_down", "payload": {"key": "l"}}
+{"ts": "2026-04-07 11:39:55", "event": "/api/key_down", "payload": {"key": "l"}}
+{"ts": "2026-04-07 11:39:55", "event": "/api/key_down", "payload": {"key": "l"}}
+{"ts": "2026-04-07 11:39:56", "event": "/api/key_up", "payload": {"key": "l"}}
+{"ts": "2026-04-07 11:39:56", "event": "/api/key_down", "payload": {"key": "l"}}
+{"ts": "2026-04-07 11:39:56", "event": "/api/key_down", "payload": {"key": "l"}}
+{"ts": "2026-04-07 11:39:56", "event": "/api/key_up", "payload": {"key": "l"}}
+{"ts": "2026-04-07 11:39:56", "event": "/api/key_down", "payload": {"key": "l"}}
+{"ts": "2026-04-07 11:39:56", "event": "/api/key_down", "payload": {"key": "l"}}
+{"ts": "2026-04-07 11:39:56", "event": "/api/key_up", "payload": {"key": "l"}}
+{"ts": "2026-04-07 11:39:57", "event": "/api/key_down", "payload": {"key": "l"}}
+{"ts": "2026-04-07 11:39:57", "event": "/api/key_up", "payload": {"key": "l"}}
+{"ts": "2026-04-07 11:39:58", "event": "/api/key_down", "payload": {"key": "l"}}
+{"ts": "2026-04-07 11:39:58", "event": "/api/key_down", "payload": {"key": "l"}}
+{"ts": "2026-04-07 11:39:58", "event": "/api/key_up", "payload": {"key": "l"}}
+{"ts": "2026-04-07 11:40:20", "event": "/api/takeoff", "payload": {}}
+{"ts": "2026-04-07 11:40:26", "event": "/api/move", "payload": {"dir": "forward", "cm": 200}}
+{"ts": "2026-04-07 11:40:32", "event": "/api/rotate", "payload": {"dir": "ccw", "deg": 180}}
+{"ts": "2026-04-07 11:40:38", "event": "/api/move", "payload": {"dir": "forward", "cm": 200}}
+{"ts": "2026-04-07 11:40:44", "event": "/api/land", "payload": {}}
+{"ts": "2026-04-07 11:41:29", "event": "/api/takeoff", "payload": {}}
+{"ts": "2026-04-07 11:41:34", "event": "/api/move", "payload": {"dir": "forward", "cm": 200}}
+{"ts": "2026-04-07 11:41:40", "event": "/api/rotate", "payload": {"dir": "ccw", "deg": 180}}
+{"ts": "2026-04-07 11:41:46", "event": "/api/move", "payload": {"dir": "forward", "cm": 200}}
+{"ts": "2026-04-07 11:41:53", "event": "/api/land", "payload": {}}
+{"ts": "2026-04-07 11:44:47", "event": "/api/takeoff", "payload": {}}
+{"ts": "2026-04-07 11:44:52", "event": "/api/move", "payload": {"dir": "forward", "cm": 200}}
+{"ts": "2026-04-07 11:44:59", "event": "/api/move", "payload": {"dir": "back", "cm": 200}}
+{"ts": "2026-04-07 11:45:05", "event": "/api/land", "payload": {}}
+{"ts": "2026-04-07 11:45:35", "event": "/api/takeoff", "payload": {}}
+{"ts": "2026-04-07 11:45:40", "event": "/api/move", "payload": {"dir": "forward", "cm": 200}}
+{"ts": "2026-04-07 11:45:46", "event": "/api/move", "payload": {"dir": "back", "cm": 200}}
+{"ts": "2026-04-07 11:45:53", "event": "/api/land", "payload": {}}
+{"ts": "2026-04-07 11:46:17", "event": "/api/takeoff", "payload": {}}
+{"ts": "2026-04-07 11:46:23", "event": "/api/move", "payload": {"dir": "forward", "cm": 200}}
+{"ts": "2026-04-07 11:46:29", "event": "/api/move", "payload": {"dir": "back", "cm": 200}}
+{"ts": "2026-04-07 11:46:35", "event": "/api/land", "payload": {}}
+{"ts": "2026-04-07 11:47:04", "event": "/api/takeoff", "payload": {}}
+{"ts": "2026-04-07 11:47:09", "event": "/api/move", "payload": {"dir": "forward", "cm": 200}}
+{"ts": "2026-04-07 11:47:15", "event": "/api/move", "payload": {"dir": "back", "cm": 200}}
+{"ts": "2026-04-07 11:47:22", "event": "/api/land", "payload": {}}
+{"ts": "2026-04-07 11:47:53", "event": "/api/takeoff", "payload": {}}
+{"ts": "2026-04-07 11:47:58", "event": "/api/move", "payload": {"dir": "forward", "cm": 200}}
+{"ts": "2026-04-07 11:48:05", "event": "/api/move", "payload": {"dir": "back", "cm": 200}}
+{"ts": "2026-04-07 11:48:11", "event": "/api/land", "payload": {}}
+{"ts": "2026-04-07 11:50:49", "event": "/api/video/start", "payload": {"mode": "mjpeg"}}
+{"ts": "2026-04-08 14:35:53", "event": "/api/key_down", "payload": {"key": "t"}}
+{"ts": "2026-04-08 14:35:53", "event": "/api/key_down", "payload": {"key": "t"}}
+{"ts": "2026-04-08 14:35:53", "event": "/api/key_up", "payload": {"key": "t"}}
+{"ts": "2026-04-08 14:36:57", "event": "/api/key_down", "payload": {"key": "t"}}
+{"ts": "2026-04-08 14:36:57", "event": "/api/key_down", "payload": {"key": "t"}}
+{"ts": "2026-04-08 14:36:57", "event": "/api/key_up", "payload": {"key": "t"}}
+{"ts": "2026-04-08 14:37:02", "event": "/api/key_down", "payload": {"key": "w"}}
+{"ts": "2026-04-08 14:37:03", "event": "/api/key_down", "payload": {"key": "w"}}
+{"ts": "2026-04-08 14:37:03", "event": "/api/key_down", "payload": {"key": "w"}}
+{"ts": "2026-04-08 14:37:03", "event": "/api/key_down", "payload": {"key": "w"}}
+{"ts": "2026-04-08 14:37:03", "event": "/api/key_down", "payload": {"key": "w"}}
+{"ts": "2026-04-08 14:37:03", "event": "/api/key_down", "payload": {"key": "w"}}
+{"ts": "2026-04-08 14:37:03", "event": "/api/key_down", "payload": {"key": "w"}}
+{"ts": "2026-04-08 14:37:04", "event": "/api/key_down", "payload": {"key": "w"}}
+{"ts": "2026-04-08 14:37:04", "event": "/api/key_down", "payload": {"key": "w"}}
+{"ts": "2026-04-08 14:37:04", "event": "/api/key_down", "payload": {"key": "w"}}
+{"ts": "2026-04-08 14:37:04", "event": "/api/key_down", "payload": {"key": "w"}}
+{"ts": "2026-04-08 14:37:04", "event": "/api/key_down", "payload": {"key": "w"}}
+{"ts": "2026-04-08 14:37:04", "event": "/api/key_down", "payload": {"key": "w"}}
+{"ts": "2026-04-08 14:37:04", "event": "/api/key_up", "payload": {"key": "w"}}
+{"ts": "2026-04-08 14:37:05", "event": "/api/key_down", "payload": {"key": "s"}}
+{"ts": "2026-04-08 14:37:05", "event": "/api/key_down", "payload": {"key": "s"}}
+{"ts": "2026-04-08 14:37:05", "event": "/api/key_up", "payload": {"key": "s"}}
+{"ts": "2026-04-08 14:37:06", "event": "/api/key_down", "payload": {"key": "d"}}
+{"ts": "2026-04-08 14:37:06", "event": "/api/key_down", "payload": {"key": "d"}}
+{"ts": "2026-04-08 14:37:06", "event": "/api/key_down", "payload": {"key": "d"}}
+{"ts": "2026-04-08 14:37:06", "event": "/api/key_down", "payload": {"key": "d"}}
+{"ts": "2026-04-08 14:37:07", "event": "/api/key_down", "payload": {"key": "d"}}
+{"ts": "2026-04-08 14:37:07", "event": "/api/key_up", "payload": {"key": "d"}}
+{"ts": "2026-04-08 14:37:07", "event": "/api/key_down", "payload": {"key": "d"}}
+{"ts": "2026-04-08 14:37:07", "event": "/api/key_down", "payload": {"key": "d"}}
+{"ts": "2026-04-08 14:37:08", "event": "/api/key_down", "payload": {"key": "d"}}
+{"ts": "2026-04-08 14:37:08", "event": "/api/key_down", "payload": {"key": "d"}}
+{"ts": "2026-04-08 14:37:08", "event": "/api/key_down", "payload": {"key": "d"}}
+{"ts": "2026-04-08 14:37:08", "event": "/api/key_down", "payload": {"key": "d"}}
+{"ts": "2026-04-08 14:37:08", "event": "/api/key_down", "payload": {"key": "d"}}
+{"ts": "2026-04-08 14:37:08", "event": "/api/key_down", "payload": {"key": "d"}}
+{"ts": "2026-04-08 14:37:08", "event": "/api/key_up", "payload": {"key": "d"}}
+{"ts": "2026-04-08 14:37:09", "event": "/api/key_down", "payload": {"key": "a"}}
+{"ts": "2026-04-08 14:37:09", "event": "/api/key_down", "payload": {"key": "a"}}
+{"ts": "2026-04-08 14:37:10", "event": "/api/key_down", "payload": {"key": "a"}}
+{"ts": "2026-04-08 14:37:10", "event": "/api/key_down", "payload": {"key": "a"}}
+{"ts": "2026-04-08 14:37:10", "event": "/api/key_down", "payload": {"key": "a"}}
+{"ts": "2026-04-08 14:37:10", "event": "/api/key_down", "payload": {"key": "a"}}
+{"ts": "2026-04-08 14:37:10", "event": "/api/key_up", "payload": {"key": "a"}}
+{"ts": "2026-04-08 14:37:11", "event": "/api/key_down", "payload": {"key": "a"}}
+{"ts": "2026-04-08 14:37:11", "event": "/api/key_down", "payload": {"key": "a"}}
+{"ts": "2026-04-08 14:37:11", "event": "/api/key_down", "payload": {"key": "a"}}
+{"ts": "2026-04-08 14:37:11", "event": "/api/key_down", "payload": {"key": "a"}}
+{"ts": "2026-04-08 14:37:12", "event": "/api/key_down", "payload": {"key": "a"}}
+{"ts": "2026-04-08 14:37:12", "event": "/api/key_up", "payload": {"key": "a"}}
+{"ts": "2026-04-08 14:37:13", "event": "/api/key_down", "payload": {"key": "e"}}
+{"ts": "2026-04-08 14:37:13", "event": "/api/key_down", "payload": {"key": "e"}}
+{"ts": "2026-04-08 14:37:14", "event": "/api/key_down", "payload": {"key": "e"}}
+{"ts": "2026-04-08 14:37:14", "event": "/api/key_down", "payload": {"key": "e"}}
+{"ts": "2026-04-08 14:37:14", "event": "/api/key_down", "payload": {"key": "e"}}
+{"ts": "2026-04-08 14:37:14", "event": "/api/key_down", "payload": {"key": "e"}}
+{"ts": "2026-04-08 14:37:14", "event": "/api/key_down", "payload": {"key": "e"}}
+{"ts": "2026-04-08 14:37:14", "event": "/api/key_down", "payload": {"key": "e"}}
+{"ts": "2026-04-08 14:37:14", "event": "/api/key_up", "payload": {"key": "e"}}
+{"ts": "2026-04-08 14:37:17", "event": "/api/key_down", "payload": {"key": "w"}}
+{"ts": "2026-04-08 14:37:17", "event": "/api/key_down", "payload": {"key": "w"}}
+{"ts": "2026-04-08 14:37:18", "event": "/api/key_down", "payload": {"key": "w"}}
+{"ts": "2026-04-08 14:37:18", "event": "/api/key_down", "payload": {"key": "w"}}
+{"ts": "2026-04-08 14:37:18", "event": "/api/key_down", "payload": {"key": "w"}}
+{"ts": "2026-04-08 14:37:18", "event": "/api/key_down", "payload": {"key": "w"}}
+{"ts": "2026-04-08 14:37:18", "event": "/api/key_down", "payload": {"key": "w"}}
+{"ts": "2026-04-08 14:37:18", "event": "/api/key_up", "payload": {"key": "w"}}
+{"ts": "2026-04-08 14:37:19", "event": "/api/key_down", "payload": {"key": "w"}}
+{"ts": "2026-04-08 14:37:19", "event": "/api/key_down", "payload": {"key": "w"}}
+{"ts": "2026-04-08 14:37:19", "event": "/api/key_down", "payload": {"key": "w"}}
+{"ts": "2026-04-08 14:37:19", "event": "/api/key_down", "payload": {"key": "w"}}
+{"ts": "2026-04-08 14:37:19", "event": "/api/key_down", "payload": {"key": "w"}}
+{"ts": "2026-04-08 14:37:19", "event": "/api/key_down", "payload": {"key": "w"}}
+{"ts": "2026-04-08 14:37:20", "event": "/api/key_up", "payload": {"key": "w"}}
+{"ts": "2026-04-08 14:37:20", "event": "/api/key_down", "payload": {"key": "w"}}
+{"ts": "2026-04-08 14:37:20", "event": "/api/key_down", "payload": {"key": "w"}}
+{"ts": "2026-04-08 14:37:20", "event": "/api/key_down", "payload": {"key": "w"}}
+{"ts": "2026-04-08 14:37:20", "event": "/api/key_up", "payload": {"key": "w"}}
+{"ts": "2026-04-08 14:37:21", "event": "/api/key_down", "payload": {"key": "e"}}
+{"ts": "2026-04-08 14:37:21", "event": "/api/key_down", "payload": {"key": "e"}}
+{"ts": "2026-04-08 14:37:21", "event": "/api/key_down", "payload": {"key": "e"}}
+{"ts": "2026-04-08 14:37:21", "event": "/api/key_down", "payload": {"key": "e"}}
+{"ts": "2026-04-08 14:37:21", "event": "/api/key_down", "payload": {"key": "e"}}
+{"ts": "2026-04-08 14:37:22", "event": "/api/key_down", "payload": {"key": "e"}}
+{"ts": "2026-04-08 14:37:22", "event": "/api/key_up", "payload": {"key": "e"}}
+{"ts": "2026-04-08 14:37:22", "event": "/api/key_down", "payload": {"key": "e"}}
+{"ts": "2026-04-08 14:37:22", "event": "/api/key_down", "payload": {"key": "e"}}
+{"ts": "2026-04-08 14:37:22", "event": "/api/key_up", "payload": {"key": "e"}}
+{"ts": "2026-04-08 14:37:22", "event": "/api/key_down", "payload": {"key": "w"}}
+{"ts": "2026-04-08 14:37:23", "event": "/api/key_down", "payload": {"key": "w"}}
+{"ts": "2026-04-08 14:37:23", "event": "/api/key_down", "payload": {"key": "w"}}
+{"ts": "2026-04-08 14:37:23", "event": "/api/key_down", "payload": {"key": "w"}}
+{"ts": "2026-04-08 14:37:23", "event": "/api/key_down", "payload": {"key": "w"}}
+{"ts": "2026-04-08 14:37:23", "event": "/api/key_down", "payload": {"key": "w"}}
+{"ts": "2026-04-08 14:37:23", "event": "/api/key_down", "payload": {"key": "w"}}
+{"ts": "2026-04-08 14:37:23", "event": "/api/key_up", "payload": {"key": "w"}}
+{"ts": "2026-04-08 14:37:24", "event": "/api/key_down", "payload": {"key": "w"}}
+{"ts": "2026-04-08 14:37:24", "event": "/api/key_down", "payload": {"key": "w"}}
+{"ts": "2026-04-08 14:37:24", "event": "/api/key_down", "payload": {"key": "w"}}
+{"ts": "2026-04-08 14:37:24", "event": "/api/key_down", "payload": {"key": "w"}}
+{"ts": "2026-04-08 14:37:24", "event": "/api/key_down", "payload": {"key": "w"}}
+{"ts": "2026-04-08 14:37:25", "event": "/api/key_down", "payload": {"key": "w"}}
+{"ts": "2026-04-08 14:37:25", "event": "/api/key_up", "payload": {"key": "w"}}
+{"ts": "2026-04-08 14:37:25", "event": "/api/key_down", "payload": {"key": "w"}}
+{"ts": "2026-04-08 14:37:25", "event": "/api/key_down", "payload": {"key": "w"}}
+{"ts": "2026-04-08 14:37:25", "event": "/api/key_up", "payload": {"key": "w"}}
+{"ts": "2026-04-08 14:37:26", "event": "/api/key_down", "payload": {"key": "e"}}
+{"ts": "2026-04-08 14:37:26", "event": "/api/key_down", "payload": {"key": "e"}}
+{"ts": "2026-04-08 14:37:26", "event": "/api/key_down", "payload": {"key": "e"}}
+{"ts": "2026-04-08 14:37:26", "event": "/api/key_down", "payload": {"key": "e"}}
+{"ts": "2026-04-08 14:37:26", "event": "/api/key_down", "payload": {"key": "e"}}
+{"ts": "2026-04-08 14:37:26", "event": "/api/key_down", "payload": {"key": "e"}}
+{"ts": "2026-04-08 14:37:27", "event": "/api/key_up", "payload": {"key": "e"}}
+{"ts": "2026-04-08 14:37:27", "event": "/api/key_down", "payload": {"key": "w"}}
+{"ts": "2026-04-08 14:37:27", "event": "/api/key_down", "payload": {"key": "w"}}
+{"ts": "2026-04-08 14:37:27", "event": "/api/key_down", "payload": {"key": "w"}}
+{"ts": "2026-04-08 14:37:27", "event": "/api/key_down", "payload": {"key": "w"}}
+{"ts": "2026-04-08 14:37:28", "event": "/api/key_down", "payload": {"key": "w"}}
+{"ts": "2026-04-08 14:37:28", "event": "/api/key_down", "payload": {"key": "w"}}
+{"ts": "2026-04-08 14:37:28", "event": "/api/key_up", "payload": {"key": "w"}}
+{"ts": "2026-04-08 14:37:28", "event": "/api/key_down", "payload": {"key": "q"}}
+{"ts": "2026-04-08 14:37:28", "event": "/api/key_down", "payload": {"key": "q"}}
+{"ts": "2026-04-08 14:37:28", "event": "/api/key_down", "payload": {"key": "q"}}
+{"ts": "2026-04-08 14:37:28", "event": "/api/key_down", "payload": {"key": "q"}}
+{"ts": "2026-04-08 14:37:28", "event": "/api/key_up", "payload": {"key": "q"}}
+{"ts": "2026-04-08 14:37:29", "event": "/api/key_down", "payload": {"key": "w"}}
+{"ts": "2026-04-08 14:37:29", "event": "/api/key_down", "payload": {"key": "w"}}
+{"ts": "2026-04-08 14:37:29", "event": "/api/key_down", "payload": {"key": "w"}}
+{"ts": "2026-04-08 14:37:29", "event": "/api/key_down", "payload": {"key": "w"}}
+{"ts": "2026-04-08 14:37:29", "event": "/api/key_down", "payload": {"key": "w"}}
+{"ts": "2026-04-08 14:37:29", "event": "/api/key_up", "payload": {"key": "w"}}
+{"ts": "2026-04-08 14:37:30", "event": "/api/key_down", "payload": {"key": "w"}}
+{"ts": "2026-04-08 14:37:30", "event": "/api/key_down", "payload": {"key": "w"}}
+{"ts": "2026-04-08 14:37:30", "event": "/api/key_down", "payload": {"key": "w"}}
+{"ts": "2026-04-08 14:37:30", "event": "/api/key_down", "payload": {"key": "w"}}
+{"ts": "2026-04-08 14:37:30", "event": "/api/key_down", "payload": {"key": "w"}}
+{"ts": "2026-04-08 14:37:30", "event": "/api/key_up", "payload": {"key": "w"}}
+{"ts": "2026-04-08 14:37:31", "event": "/api/key_down", "payload": {"key": "e"}}
+{"ts": "2026-04-08 14:37:31", "event": "/api/key_down", "payload": {"key": "e"}}
+{"ts": "2026-04-08 14:37:31", "event": "/api/key_down", "payload": {"key": "e"}}
+{"ts": "2026-04-08 14:37:31", "event": "/api/key_down", "payload": {"key": "e"}}
+{"ts": "2026-04-08 14:37:31", "event": "/api/key_down", "payload": {"key": "e"}}
+{"ts": "2026-04-08 14:37:31", "event": "/api/key_down", "payload": {"key": "e"}}
+{"ts": "2026-04-08 14:37:31", "event": "/api/key_down", "payload": {"key": "e"}}
+{"ts": "2026-04-08 14:37:32", "event": "/api/key_down", "payload": {"key": "e"}}
+{"ts": "2026-04-08 14:37:32", "event": "/api/key_up", "payload": {"key": "e"}}
+{"ts": "2026-04-08 14:37:32", "event": "/api/key_down", "payload": {"key": "e"}}
+{"ts": "2026-04-08 14:37:32", "event": "/api/key_down", "payload": {"key": "e"}}
+{"ts": "2026-04-08 14:37:32", "event": "/api/key_down", "payload": {"key": "e"}}
+{"ts": "2026-04-08 14:37:32", "event": "/api/key_down", "payload": {"key": "e"}}
+{"ts": "2026-04-08 14:37:32", "event": "/api/key_down", "payload": {"key": "e"}}
+{"ts": "2026-04-08 14:37:33", "event": "/api/key_down", "payload": {"key": "e"}}
+{"ts": "2026-04-08 14:37:33", "event": "/api/key_up", "payload": {"key": "e"}}
+{"ts": "2026-04-08 14:37:33", "event": "/api/key_down", "payload": {"key": "w"}}
+{"ts": "2026-04-08 14:37:33", "event": "/api/key_down", "payload": {"key": "w"}}
+{"ts": "2026-04-08 14:37:33", "event": "/api/key_down", "payload": {"key": "w"}}
+{"ts": "2026-04-08 14:37:34", "event": "/api/key_up", "payload": {"key": "w"}}
+{"ts": "2026-04-08 14:37:34", "event": "/api/key_down", "payload": {"key": "w"}}
+{"ts": "2026-04-08 14:37:34", "event": "/api/key_down", "payload": {"key": "w"}}
+{"ts": "2026-04-08 14:37:34", "event": "/api/key_down", "payload": {"key": "w"}}
+{"ts": "2026-04-08 14:37:34", "event": "/api/key_down", "payload": {"key": "w"}}
+{"ts": "2026-04-08 14:37:34", "event": "/api/key_down", "payload": {"key": "w"}}
+{"ts": "2026-04-08 14:37:34", "event": "/api/key_up", "payload": {"key": "w"}}
+{"ts": "2026-04-08 14:37:35", "event": "/api/key_down", "payload": {"key": "q"}}
+{"ts": "2026-04-08 14:37:35", "event": "/api/key_down", "payload": {"key": "q"}}
+{"ts": "2026-04-08 14:37:35", "event": "/api/key_down", "payload": {"key": "q"}}
+{"ts": "2026-04-08 14:37:35", "event": "/api/key_up", "payload": {"key": "q"}}
+{"ts": "2026-04-08 14:37:35", "event": "/api/key_down", "payload": {"key": "w"}}
+{"ts": "2026-04-08 14:37:35", "event": "/api/key_down", "payload": {"key": "w"}}
+{"ts": "2026-04-08 14:37:35", "event": "/api/key_down", "payload": {"key": "w"}}
+{"ts": "2026-04-08 14:37:35", "event": "/api/key_down", "payload": {"key": "w"}}
+{"ts": "2026-04-08 14:37:36", "event": "/api/key_up", "payload": {"key": "w"}}
+{"ts": "2026-04-08 14:37:36", "event": "/api/key_down", "payload": {"key": "q"}}
+{"ts": "2026-04-08 14:37:36", "event": "/api/key_up", "payload": {"key": "q"}}
+{"ts": "2026-04-08 14:37:36", "event": "/api/key_down", "payload": {"key": "q"}}
+{"ts": "2026-04-08 14:37:36", "event": "/api/key_down", "payload": {"key": "q"}}
+{"ts": "2026-04-08 14:37:37", "event": "/api/key_up", "payload": {"key": "q"}}
+{"ts": "2026-04-08 14:37:37", "event": "/api/key_down", "payload": {"key": "w"}}
+{"ts": "2026-04-08 14:37:37", "event": "/api/key_down", "payload": {"key": "w"}}
+{"ts": "2026-04-08 14:37:37", "event": "/api/key_down", "payload": {"key": "w"}}
+{"ts": "2026-04-08 14:37:37", "event": "/api/key_up", "payload": {"key": "w"}}
+{"ts": "2026-04-08 14:37:38", "event": "/api/key_down", "payload": {"key": "d"}}
+{"ts": "2026-04-08 14:37:38", "event": "/api/key_down", "payload": {"key": "d"}}
+{"ts": "2026-04-08 14:37:38", "event": "/api/key_up", "payload": {"key": "d"}}
+{"ts": "2026-04-08 14:37:38", "event": "/api/key_down", "payload": {"key": "d"}}
+{"ts": "2026-04-08 14:37:38", "event": "/api/key_down", "payload": {"key": "d"}}
+{"ts": "2026-04-08 14:37:38", "event": "/api/key_up", "payload": {"key": "d"}}
+{"ts": "2026-04-08 14:37:39", "event": "/api/key_down", "payload": {"key": "f"}}
+{"ts": "2026-04-08 14:37:39", "event": "/api/key_down", "payload": {"key": "f"}}
+{"ts": "2026-04-08 14:37:40", "event": "/api/key_down", "payload": {"key": "f"}}
+{"ts": "2026-04-08 14:37:40", "event": "/api/key_down", "payload": {"key": "f"}}
+{"ts": "2026-04-08 14:37:40", "event": "/api/key_down", "payload": {"key": "f"}}
+{"ts": "2026-04-08 14:37:40", "event": "/api/key_down", "payload": {"key": "f"}}
+{"ts": "2026-04-08 14:37:40", "event": "/api/key_down", "payload": {"key": "f"}}
+{"ts": "2026-04-08 14:37:40", "event": "/api/key_down", "payload": {"key": "f"}}
+{"ts": "2026-04-08 14:37:40", "event": "/api/key_down", "payload": {"key": "f"}}
+{"ts": "2026-04-08 14:37:41", "event": "/api/key_down", "payload": {"key": "f"}}
+{"ts": "2026-04-08 14:37:41", "event": "/api/key_down", "payload": {"key": "f"}}
+{"ts": "2026-04-08 14:37:41", "event": "/api/key_down", "payload": {"key": "f"}}
+{"ts": "2026-04-08 14:37:41", "event": "/api/key_down", "payload": {"key": "f"}}
+{"ts": "2026-04-08 14:37:41", "event": "/api/key_down", "payload": {"key": "f"}}
+{"ts": "2026-04-08 14:37:41", "event": "/api/key_down", "payload": {"key": "f"}}
+{"ts": "2026-04-08 14:37:42", "event": "/api/key_down", "payload": {"key": "f"}}
+{"ts": "2026-04-08 14:37:42", "event": "/api/key_down", "payload": {"key": "f"}}
+{"ts": "2026-04-08 14:37:42", "event": "/api/key_up", "payload": {"key": "f"}}
+{"ts": "2026-04-08 14:37:42", "event": "/api/key_down", "payload": {"key": "r"}}
+{"ts": "2026-04-08 14:37:42", "event": "/api/key_down", "payload": {"key": "r"}}
+{"ts": "2026-04-08 14:37:42", "event": "/api/key_down", "payload": {"key": "r"}}
+{"ts": "2026-04-08 14:37:42", "event": "/api/key_down", "payload": {"key": "r"}}
+{"ts": "2026-04-08 14:37:43", "event": "/api/key_down", "payload": {"key": "r"}}
+{"ts": "2026-04-08 14:37:43", "event": "/api/key_down", "payload": {"key": "r"}}
+{"ts": "2026-04-08 14:37:43", "event": "/api/key_down", "payload": {"key": "r"}}
+{"ts": "2026-04-08 14:37:43", "event": "/api/key_down", "payload": {"key": "r"}}
+{"ts": "2026-04-08 14:37:43", "event": "/api/key_down", "payload": {"key": "r"}}
+{"ts": "2026-04-08 14:37:43", "event": "/api/key_down", "payload": {"key": "r"}}
+{"ts": "2026-04-08 14:37:44", "event": "/api/key_down", "payload": {"key": "r"}}
+{"ts": "2026-04-08 14:37:44", "event": "/api/key_down", "payload": {"key": "r"}}
+{"ts": "2026-04-08 14:37:44", "event": "/api/key_down", "payload": {"key": "r"}}
+{"ts": "2026-04-08 14:37:44", "event": "/api/key_down", "payload": {"key": "r"}}
+{"ts": "2026-04-08 14:37:44", "event": "/api/key_down", "payload": {"key": "r"}}
+{"ts": "2026-04-08 14:37:44", "event": "/api/key_down", "payload": {"key": "r"}}
+{"ts": "2026-04-08 14:37:44", "event": "/api/key_down", "payload": {"key": "r"}}
+{"ts": "2026-04-08 14:37:45", "event": "/api/key_down", "payload": {"key": "r"}}
+{"ts": "2026-04-08 14:37:45", "event": "/api/key_down", "payload": {"key": "r"}}
+{"ts": "2026-04-08 14:37:45", "event": "/api/key_down", "payload": {"key": "r"}}
+{"ts": "2026-04-08 14:37:45", "event": "/api/key_down", "payload": {"key": "r"}}
+{"ts": "2026-04-08 14:37:45", "event": "/api/key_down", "payload": {"key": "r"}}
+{"ts": "2026-04-08 14:37:45", "event": "/api/key_down", "payload": {"key": "r"}}
+{"ts": "2026-04-08 14:37:45", "event": "/api/key_down", "payload": {"key": "r"}}
+{"ts": "2026-04-08 14:37:46", "event": "/api/key_down", "payload": {"key": "r"}}
+{"ts": "2026-04-08 14:37:46", "event": "/api/key_down", "payload": {"key": "r"}}
+{"ts": "2026-04-08 14:37:46", "event": "/api/key_down", "payload": {"key": "r"}}
+{"ts": "2026-04-08 14:37:46", "event": "/api/key_down", "payload": {"key": "r"}}
+{"ts": "2026-04-08 14:37:46", "event": "/api/key_down", "payload": {"key": "r"}}
+{"ts": "2026-04-08 14:37:46", "event": "/api/key_down", "payload": {"key": "r"}}
+{"ts": "2026-04-08 14:37:47", "event": "/api/key_down", "payload": {"key": "r"}}
+{"ts": "2026-04-08 14:37:47", "event": "/api/key_down", "payload": {"key": "r"}}
+{"ts": "2026-04-08 14:37:47", "event": "/api/key_down", "payload": {"key": "r"}}
+{"ts": "2026-04-08 14:37:47", "event": "/api/key_down", "payload": {"key": "r"}}
+{"ts": "2026-04-08 14:37:47", "event": "/api/key_down", "payload": {"key": "r"}}
+{"ts": "2026-04-08 14:37:47", "event": "/api/key_down", "payload": {"key": "r"}}
+{"ts": "2026-04-08 14:37:47", "event": "/api/key_down", "payload": {"key": "r"}}
+{"ts": "2026-04-08 14:37:48", "event": "/api/key_down", "payload": {"key": "r"}}
+{"ts": "2026-04-08 14:37:48", "event": "/api/key_down", "payload": {"key": "r"}}
+{"ts": "2026-04-08 14:37:48", "event": "/api/key_down", "payload": {"key": "r"}}
+{"ts": "2026-04-08 14:37:48", "event": "/api/key_down", "payload": {"key": "r"}}
+{"ts": "2026-04-08 14:37:48", "event": "/api/key_down", "payload": {"key": "r"}}
+{"ts": "2026-04-08 14:37:48", "event": "/api/key_down", "payload": {"key": "r"}}
+{"ts": "2026-04-08 14:37:48", "event": "/api/key_down", "payload": {"key": "r"}}
+{"ts": "2026-04-08 14:37:49", "event": "/api/key_up", "payload": {"key": "r"}}
+{"ts": "2026-04-08 14:37:49", "event": "/api/key_down", "payload": {"key": "f"}}
+{"ts": "2026-04-08 14:37:49", "event": "/api/key_down", "payload": {"key": "f"}}
+{"ts": "2026-04-08 14:37:49", "event": "/api/key_down", "payload": {"key": "f"}}
+{"ts": "2026-04-08 14:37:49", "event": "/api/key_down", "payload": {"key": "f"}}
+{"ts": "2026-04-08 14:37:49", "event": "/api/key_down", "payload": {"key": "f"}}
+{"ts": "2026-04-08 14:37:49", "event": "/api/key_down", "payload": {"key": "f"}}
+{"ts": "2026-04-08 14:37:50", "event": "/api/key_down", "payload": {"key": "f"}}
+{"ts": "2026-04-08 14:37:50", "event": "/api/key_down", "payload": {"key": "f"}}
+{"ts": "2026-04-08 14:37:50", "event": "/api/key_down", "payload": {"key": "f"}}
+{"ts": "2026-04-08 14:37:50", "event": "/api/key_down", "payload": {"key": "f"}}
+{"ts": "2026-04-08 14:37:50", "event": "/api/key_down", "payload": {"key": "f"}}
+{"ts": "2026-04-08 14:37:50", "event": "/api/key_down", "payload": {"key": "f"}}
+{"ts": "2026-04-08 14:37:50", "event": "/api/key_down", "payload": {"key": "f"}}
+{"ts": "2026-04-08 14:37:51", "event": "/api/key_down", "payload": {"key": "f"}}
+{"ts": "2026-04-08 14:37:51", "event": "/api/key_down", "payload": {"key": "f"}}
+{"ts": "2026-04-08 14:37:51", "event": "/api/key_down", "payload": {"key": "f"}}
+{"ts": "2026-04-08 14:37:51", "event": "/api/key_down", "payload": {"key": "f"}}
+{"ts": "2026-04-08 14:37:51", "event": "/api/key_down", "payload": {"key": "f"}}
+{"ts": "2026-04-08 14:37:51", "event": "/api/key_down", "payload": {"key": "f"}}
+{"ts": "2026-04-08 14:37:52", "event": "/api/key_down", "payload": {"key": "f"}}
+{"ts": "2026-04-08 14:37:52", "event": "/api/key_down", "payload": {"key": "f"}}
+{"ts": "2026-04-08 14:37:52", "event": "/api/key_down", "payload": {"key": "f"}}
+{"ts": "2026-04-08 14:37:52", "event": "/api/key_down", "payload": {"key": "f"}}
+{"ts": "2026-04-08 14:37:52", "event": "/api/key_down", "payload": {"key": "f"}}
+{"ts": "2026-04-08 14:37:52", "event": "/api/key_down", "payload": {"key": "f"}}
+{"ts": "2026-04-08 14:37:52", "event": "/api/key_down", "payload": {"key": "f"}}
+{"ts": "2026-04-08 14:37:53", "event": "/api/key_down", "payload": {"key": "f"}}
+{"ts": "2026-04-08 14:37:53", "event": "/api/key_down", "payload": {"key": "f"}}
+{"ts": "2026-04-08 14:37:53", "event": "/api/key_down", "payload": {"key": "f"}}
+{"ts": "2026-04-08 14:37:53", "event": "/api/key_down", "payload": {"key": "f"}}
+{"ts": "2026-04-08 14:37:53", "event": "/api/key_down", "payload": {"key": "f"}}
+{"ts": "2026-04-08 14:37:53", "event": "/api/key_down", "payload": {"key": "f"}}
+{"ts": "2026-04-08 14:37:53", "event": "/api/key_down", "payload": {"key": "q"}}
+{"ts": "2026-04-08 14:37:53", "event": "/api/key_down", "payload": {"key": "q"}}
+{"ts": "2026-04-08 14:37:53", "event": "/api/key_down", "payload": {"key": "f"}}
+{"ts": "2026-04-08 14:37:54", "event": "/api/key_down", "payload": {"key": "f"}}
+{"ts": "2026-04-08 14:37:54", "event": "/api/key_down", "payload": {"key": "q"}}
+{"ts": "2026-04-08 14:37:54", "event": "/api/key_down", "payload": {"key": "f"}}
+{"ts": "2026-04-08 14:37:54", "event": "/api/key_down", "payload": {"key": "q"}}
+{"ts": "2026-04-08 14:37:54", "event": "/api/key_down", "payload": {"key": "f"}}
+{"ts": "2026-04-08 14:37:54", "event": "/api/key_down", "payload": {"key": "q"}}
+{"ts": "2026-04-08 14:37:54", "event": "/api/key_down", "payload": {"key": "f"}}
+{"ts": "2026-04-08 14:37:54", "event": "/api/key_down", "payload": {"key": "q"}}
+{"ts": "2026-04-08 14:37:54", "event": "/api/key_up", "payload": {"key": "q"}}
+{"ts": "2026-04-08 14:37:54", "event": "/api/key_down", "payload": {"key": "f"}}
+{"ts": "2026-04-08 14:37:54", "event": "/api/key_up", "payload": {"key": "f"}}
+{"ts": "2026-04-08 14:37:55", "event": "/api/key_down", "payload": {"key": "e"}}
+{"ts": "2026-04-08 14:37:55", "event": "/api/key_down", "payload": {"key": "e"}}
+{"ts": "2026-04-08 14:37:56", "event": "/api/key_down", "payload": {"key": "e"}}
+{"ts": "2026-04-08 14:37:56", "event": "/api/key_up", "payload": {"key": "e"}}
+{"ts": "2026-04-08 14:37:59", "event": "/api/key_down", "payload": {"key": "l"}}
+{"ts": "2026-04-08 14:37:59", "event": "/api/key_down", "payload": {"key": "l"}}
+{"ts": "2026-04-08 14:37:59", "event": "/api/key_up", "payload": {"key": "l"}}
+{"ts": "2026-04-08 14:40:11", "event": "/api/takeoff", "payload": {}}
+{"ts": "2026-04-08 14:40:17", "event": "/api/move", "payload": {"dir": "forward", "cm": 300}}
+{"ts": "2026-04-08 14:40:23", "event": "/api/rotate", "payload": {"dir": "ccw", "deg": 180}}
+{"ts": "2026-04-08 14:40:29", "event": "/api/move", "payload": {"dir": "forward", "cm": 300}}
+{"ts": "2026-04-08 14:40:36", "event": "/api/rotate", "payload": {"dir": "ccw", "deg": 180}}
+{"ts": "2026-04-08 14:40:42", "event": "/api/move", "payload": {"dir": "forward", "cm": 300}}
+{"ts": "2026-04-08 14:40:49", "event": "/api/rotate", "payload": {"dir": "cw", "deg": 90}}
+{"ts": "2026-04-08 14:40:53", "event": "/api/move", "payload": {"dir": "forward", "cm": 80}}
+{"ts": "2026-04-08 14:40:59", "event": "/api/rotate", "payload": {"dir": "cw", "deg": 90}}
+{"ts": "2026-04-08 14:41:03", "event": "/api/move", "payload": {"dir": "forward", "cm": 300}}
+{"ts": "2026-04-08 14:41:09", "event": "/api/rotate", "payload": {"dir": "cw", "deg": 90}}
+{"ts": "2026-04-08 14:41:14", "event": "/api/move", "payload": {"dir": "forward", "cm": 80}}
+{"ts": "2026-04-08 14:41:19", "event": "/api/rotate", "payload": {"dir": "cw", "deg": 90}}
+{"ts": "2026-04-08 14:41:23", "event": "/api/land", "payload": {}}
