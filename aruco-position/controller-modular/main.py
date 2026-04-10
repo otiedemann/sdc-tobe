@@ -316,8 +316,6 @@ def main():
     last_motion_state: Optional[MotionState] = motion_estimator.get_current_state()
     last_vision_update: Optional[Dict[str, Any]] = None
     pending_vision_update: Optional[Dict[str, Any]] = None
-    last_fused_state: Optional[Dict[str, Any]] = None
-    last_prediction: Optional[Dict[str, Any]] = None
     last_fusion_result: Optional[Dict[str, Any]] = None
 
     # --------------------------------------------------------
