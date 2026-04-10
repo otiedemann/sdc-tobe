@@ -1,5 +1,6 @@
 import base64
 import json
+import os
 import socket
 import threading
 import time
@@ -89,6 +90,10 @@ def main():
     target_ip = core.UDP_DEST_IP
     verbose_mode = False
 
+    # Default: look for arena_config.json next to this script
+    _default_config = os.path.join(os.path.dirname(os.path.abspath(__file__)), "arena_config.json")
+    arena_config_path = _default_config if os.path.isfile(_default_config) else None
+
     if "--src" in sys.argv:
         try:
             src_val = sys.argv[sys.argv.index("--src") + 1]
@@ -104,6 +109,12 @@ def main():
 
     if "--verbose" in sys.argv:
         verbose_mode = True
+
+    if "--arena-config" in sys.argv:
+        try:
+            arena_config_path = sys.argv[sys.argv.index("--arena-config") + 1]
+        except Exception:
+            print("❌ Invalid --arena-config value, using default.")
 
     min_ref_weight = core.MIN_REF_WEIGHT
     min_ref_count = core.MIN_REF_COUNT
@@ -209,6 +220,7 @@ def main():
         dc,
         detect_profile=detect_profile,
         enable_kalman_filter=enable_kalman_filter,
+        arena_config_path=arena_config_path,
     )
 
     # --------------------------------------------------------
