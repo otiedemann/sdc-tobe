@@ -186,7 +186,7 @@ def main():
     outlier_pos_thresh = OUTLIER_POS_THRESH
     pose_hold_sec = POSE_HOLD_SEC
     target_z_pos = TARGET_Z_POS
-    enable_kalman_filter = True
+    enable_kalman_filter = False
 
     if "--min-ref-weight" in sys.argv:
         try:
@@ -218,8 +218,8 @@ def main():
         except Exception:
             print("⚠️ Invalid --target-z-pos value, using default.")
 
-    if '--no-kalman' in sys.argv:
-        enable_kalman_filter = False
+    if '--pos-kalman' in sys.argv:
+        enable_kalman_filter = True
 
     preview_requested = ("--preview" in sys.argv)
     gui_enabled = preview_requested and has_gui() and ("--force-headless" not in sys.argv)
