@@ -1,6 +1,7 @@
 import base64
 import json
 import os
+import platform
 import socket
 import threading
 import time
@@ -10,12 +11,36 @@ import cv2
 import numpy as np
 from cv2 import aruco
 
-import aruco_position as core
+import aruco_position as aruco_pos
 import prediction as predict
-
-from motion_estimator import MotionEstimator, MotionState
 from fusion import fuse_delayed_vision_update
+from motion_estimator import MotionEstimator, MotionState
 
+try:
+    import olympe
+except Exception:
+    olympe = None
+
+# --- CONFIGURATION ---
+UDP_DEST_IP = "127.0.0.1"  # Default IP des Laptops (Relay)
+UDP_PORT = 5005
+UDP_CMD_PORT = 5006  # Port für eingehende Befehle vom Relay
+CAMERA_SOURCE = 0
+HEARTBEAT_INTERVAL = 1.0  # Sekunden: Status senden auch ohne Marker
+TARGET_Z_POS = -1.5  # fixed target height position (internal Z axis)
+MARKER_SIZE = 0.5
+
+# Pose robustness settings
+MIN_REF_WEIGHT = 0.00  # Ignore very weak refs, but keep detection usable
+MIN_REF_COUNT = 1  # Allow single-marker pose as fallback
+POSE_HOLD_SEC = 0.8  # Hold last valid pose briefly when refs drop out
+OUTLIER_POS_THRESH = 2.5  # meters: looser outlier reject for real-world noise
+
+# Motion model / delayed-measurement tuning
+MAX_STATE_DT = 1.0
+VEL_BLEND = 0.25
+MEAS_BLEND_MIN = 0.35
+MEAS_BLEND_MAX = 0.85
 
 # ============================================================
 # Optional imports for future modules
@@ -75,6 +100,46 @@ def estimate_velocity_from_history(history: list[MotionState]) -> tuple[float, f
     vz = (s1.z - s0.z) / dt
     return vx, vy, vz
 
+def _is_anafi_source(camera_source):
+    source = str(camera_source).strip().lower()
+    return source in {"anafi", "parrot", "parrot-anafi"} or source.startswith("anafi:") or source.startswith("anafi://")
+
+
+def _parse_anafi_ip(camera_source):
+    source = str(camera_source).strip()
+    source_lower = source.lower()
+    if source_lower in {"anafi", "parrot", "parrot-anafi"}:
+        return os.getenv("ANAFI_IP") or os.getenv("DRONE_IP") or "192.168.42.1"
+    if source_lower.startswith("anafi://"):
+        return source.split("://", 1)[1].strip() or "192.168.42.1"
+    if source_lower.startswith("anafi:"):
+        return source.split(":", 1)[1].strip() or "192.168.42.1"
+    return "192.168.42.1"
+
+
+def _anafi_flush_cb(stream):
+    try:
+        if hasattr(stream, "empty"):
+            while not stream.empty():
+                try:
+                    stream.get(timeout=0.005).unref()
+                except Exception:
+                    break
+        elif hasattr(stream, "get"):
+            while True:
+                try:
+                    stream.get(timeout=0.005).unref()
+                except Exception:
+                    break
+    except Exception:
+        pass
+    return True
+
+def has_gui():
+    system = platform.system().lower()
+    if system == "windows":
+        return True
+    return bool(os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"))
 
 # ============================================================
 # Main
@@ -86,8 +151,8 @@ def main():
     # --------------------------------------------------------
     # CLI args
     # --------------------------------------------------------
-    camera_src = core.CAMERA_SOURCE
-    target_ip = core.UDP_DEST_IP
+    camera_src = CAMERA_SOURCE
+    target_ip = UDP_DEST_IP
     verbose_mode = False
 
     # Default: look for arena_config.json next to this script
@@ -116,11 +181,11 @@ def main():
         except Exception:
             print("❌ Invalid --arena-config value, using default.")
 
-    min_ref_weight = core.MIN_REF_WEIGHT
-    min_ref_count = core.MIN_REF_COUNT
-    outlier_pos_thresh = core.OUTLIER_POS_THRESH
-    pose_hold_sec = core.POSE_HOLD_SEC
-    target_z_pos = core.TARGET_Z_POS
+    min_ref_weight = MIN_REF_WEIGHT
+    min_ref_count = MIN_REF_COUNT
+    outlier_pos_thresh = OUTLIER_POS_THRESH
+    pose_hold_sec = POSE_HOLD_SEC
+    target_z_pos = TARGET_Z_POS
     enable_kalman_filter = True
 
     if "--min-ref-weight" in sys.argv:
@@ -157,7 +222,7 @@ def main():
         enable_kalman_filter = False
 
     preview_requested = ("--preview" in sys.argv)
-    gui_enabled = preview_requested and core.has_gui() and ("--force-headless" not in sys.argv)
+    gui_enabled = preview_requested and has_gui() and ("--force-headless" not in sys.argv)
     gui_available = True
 
     detect_profile = "balanced"
@@ -171,23 +236,16 @@ def main():
         except Exception:
             print("⚠️ Missing value for --detect, using 'balanced'.")
 
-    # Runtime-Tuning zurück ins Core-Modul
-    core.MIN_REF_WEIGHT = min_ref_weight
-    core.MIN_REF_COUNT = max(1, min_ref_count)
-    core.OUTLIER_POS_THRESH = max(0.1, outlier_pos_thresh)
-    core.POSE_HOLD_SEC = max(0.0, pose_hold_sec)
-    core.TARGET_Z_POS = target_z_pos
-
-    print(f"🚀 Node -> {target_ip}:{core.UDP_PORT} (Debug CMD on {core.UDP_CMD_PORT})")
+    print(f"🚀 Node -> {target_ip}:{UDP_PORT} (Debug CMD on {UDP_CMD_PORT})")
     print(f"📷 Camera Source: {camera_src}")
     print(f"📝 Verbose Mode: {'ON' if verbose_mode else 'OFF'}")
     print(f"🔎 Detect Profile: {detect_profile}")
     print(
-        f"⚙️ min_ref_weight={core.MIN_REF_WEIGHT} "
-        f"min_ref_count={core.MIN_REF_COUNT} "
-        f"outlier={core.OUTLIER_POS_THRESH} "
-        f"pose_hold={core.POSE_HOLD_SEC} "
-        f"target_z_pos={core.TARGET_Z_POS}"
+        f"⚙️ min_ref_weight={min_ref_weight} "
+        f"min_ref_count={min_ref_count} "
+        f"outlier={outlier_pos_thresh} "
+        f"pose_hold={pose_hold_sec} "
+        f"target_z_pos={target_z_pos}"
     )
     print(f"📉 Per-axis Kalman: {'ON' if enable_kalman_filter else 'OFF'}")
     print(f"🖥️ Preview Requested: {'YES' if preview_requested else 'NO'}")
@@ -215,12 +273,17 @@ def main():
     # --------------------------------------------------------
     # Vision processor
     # --------------------------------------------------------
-    vision_processor = core.HeadlessAruCoPositioning(
+    vision_processor = aruco_pos.HeadlessAruCoPositioning(
         cm,
         dc,
         detect_profile=detect_profile,
         enable_kalman_filter=enable_kalman_filter,
         arena_config_path=arena_config_path,
+        min_ref_weight=min_ref_weight,
+        min_ref_count=max(1, min_ref_count),
+        pose_hold_sec=max(0.0, pose_hold_sec),
+        outlier_pos_thresh=max(0.1, outlier_pos_thresh),
+        target_z_pos=target_z_pos,
     )
 
     # --------------------------------------------------------
@@ -255,11 +318,7 @@ def main():
     # --------------------------------------------------------
     # Video source setup
     # --------------------------------------------------------
-    use_tello_stream = core._is_tello_source(camera_src)
-    use_anafi_stream = core._is_anafi_source(camera_src)
-
-    tello = None
-    tello_frame_reader = None
+    use_anafi_stream = _is_anafi_source(camera_src)
 
     anafi_drone = None
     anafi_stream_api = None
@@ -268,26 +327,13 @@ def main():
 
     cap = None
 
-    if use_tello_stream:
-        if core.Tello is None:
-            raise RuntimeError("djitellopy not installed. Install with: pip install djitellopy")
-
-        print("🛩️ Connecting to DJI Tello…")
-        tello = core.Tello()
-        tello.connect()
-        print(f"🔋 Tello battery: {tello.get_battery()}%")
-        tello.streamon()
-        tello_frame_reader = tello.get_frame_read()
-        time.sleep(0.2)
-        print("✅ Tello videostream active")
-
-    elif use_anafi_stream:
-        if core.olympe is None:
+    if use_anafi_stream:
+        if olympe is None:
             raise RuntimeError("Parrot Olympe not installed. Install with: pip install parrot-olympe")
 
-        anafi_ip = core._parse_anafi_ip(camera_src)
+        anafi_ip = _parse_anafi_ip(camera_src)
         print(f"🛩️ Connecting to Parrot Anafi at {anafi_ip}…")
-        anafi_drone = core.olympe.Drone(anafi_ip)
+        anafi_drone = olympe.Drone(anafi_ip)
         anafi_drone.connect()
 
         def _anafi_frame_cb(yuv_frame):
@@ -315,7 +361,7 @@ def main():
                             ("VDEF_I420", cv2.COLOR_YUV2BGR_I420),
                             ("VDEF_NV12", cv2.COLOR_YUV2BGR_NV12),
                         ):
-                            fmt_const = getattr(core.olympe, attr, None)
+                            fmt_const = getattr(olympe, attr, None)
                             if fmt_const is not None and fmt_const == yuv_fmt:
                                 cv_cvt = flag
                                 break
@@ -332,7 +378,7 @@ def main():
                     pass
 
         if hasattr(anafi_drone, "streaming") and hasattr(anafi_drone.streaming, "set_callbacks"):
-            anafi_drone.streaming.set_callbacks(raw_cb=_anafi_frame_cb, flush_raw_cb=core._anafi_flush_cb)
+            anafi_drone.streaming.set_callbacks(raw_cb=_anafi_frame_cb, flush_raw_cb=_anafi_flush_cb)
             anafi_drone.streaming.start()
             anafi_stream_api = "modern"
         elif hasattr(anafi_drone, "set_streaming_callbacks"):
@@ -354,7 +400,7 @@ def main():
     # --------------------------------------------------------
     sock_send = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock_cmd = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    sock_cmd.bind(("0.0.0.0", core.UDP_CMD_PORT))
+    sock_cmd.bind(("0.0.0.0", UDP_CMD_PORT))
     sock_cmd.setblocking(False)
 
     debug_mode = False
@@ -366,13 +412,6 @@ def main():
     next_vision_time = time.monotonic()
 
     def read_frame():
-        if use_tello_stream:
-            frame = tello_frame_reader.frame if tello_frame_reader is not None else None
-            if frame is None:
-                return False, None
-            frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
-            return True, frame
-
         if use_anafi_stream:
             with anafi_frame_lock:
                 frame = anafi_frame_state.get("frame")
@@ -670,10 +709,10 @@ def main():
             # --------------------------------------
             should_send_tracking = (result.get("cam") is not None) and (now - last_send_time > 0.03)
             should_send_debug = debug_mode and (now - last_send_time > 0.03)
-            should_send_heartbeat = (now - last_heartbeat_time > core.HEARTBEAT_INTERVAL)
+            should_send_heartbeat = (now - last_heartbeat_time > HEARTBEAT_INTERVAL)
 
             if should_send_tracking or should_send_debug or should_send_heartbeat:
-                sock_send.sendto(json.dumps(result).encode(), (target_ip, core.UDP_PORT))
+                sock_send.sendto(json.dumps(result).encode(), (target_ip, UDP_PORT))
 
                 if should_send_tracking or should_send_debug:
                     last_send_time = now
@@ -725,16 +764,6 @@ def main():
     finally:
         if cap is not None:
             cap.release()
-
-        if tello is not None:
-            try:
-                tello.streamoff()
-            except Exception:
-                pass
-            try:
-                tello.end()
-            except Exception:
-                pass
 
         if anafi_drone is not None:
             try:

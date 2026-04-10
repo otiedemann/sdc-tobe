@@ -1,48 +1,11 @@
-import base64
 import json
-import os
-import platform
-import socket
-import threading
 import time
 
 import cv2
 import numpy as np
 from cv2 import aruco
 
-try:
-    from djitellopy import Tello
-except Exception:
-    Tello = None
-
-try:
-    import olympe
-except Exception:
-    olympe = None
-
-# --- CONFIGURATION ---
-UDP_DEST_IP = "127.0.0.1"  # Default IP des Laptops (Relay)
-UDP_PORT = 5005
-UDP_CMD_PORT = 5006  # Port für eingehende Befehle vom Relay
-MARKER_SIZE = 0.5
-CAMERA_SOURCE = 0
-HEARTBEAT_INTERVAL = 1.0  # Sekunden: Status senden auch ohne Marker
-
-# Pose robustness settings
-MIN_REF_WEIGHT = 0.00  # Ignore very weak refs, but keep detection usable
-MIN_REF_COUNT = 1  # Allow single-marker pose as fallback
-POSE_HOLD_SEC = 0.8  # Hold last valid pose briefly when refs drop out
-OUTLIER_POS_THRESH = 2.5  # meters: looser outlier reject for real-world noise
-TARGET_Z_POS = -1.5  # fixed target height position (internal Z axis)
-
-# Motion model / delayed-measurement tuning
-MAX_STATE_DT = 1.0
-VEL_BLEND = 0.25
-MEAS_BLEND_MIN = 0.35
-MEAS_BLEND_MAX = 0.85
-
-
-def _load_arena_config(path):
+def _load_arena_config(path, default_marker_size=0.5):
     """Load marker positions, wall types, and marker size from an arena_config.json file.
 
     Returns (marker_positions, marker_wall_type, marker_size_m) or raises on error.
@@ -55,55 +18,8 @@ def _load_arena_config(path):
         mid = int(m["id"])
         marker_positions[mid] = np.array([float(m["x"]), float(m["y"]), float(m["z"])], dtype=np.float64)
         marker_wall_type[mid] = str(m["wall"])
-    marker_size_m = float(cfg.get("marker_size_m", MARKER_SIZE))
+    marker_size_m = float(cfg.get("marker_size_m", default_marker_size))
     return marker_positions, marker_wall_type, marker_size_m
-
-
-def has_gui():
-    system = platform.system().lower()
-    if system == "windows":
-        return True
-    return bool(os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"))
-
-
-def _is_tello_source(camera_source):
-    return str(camera_source).strip().lower() in {"tello", "dji", "dji-tello", "tello-udp"}
-
-
-def _is_anafi_source(camera_source):
-    source = str(camera_source).strip().lower()
-    return source in {"anafi", "parrot", "parrot-anafi"} or source.startswith("anafi:") or source.startswith("anafi://")
-
-
-def _parse_anafi_ip(camera_source):
-    source = str(camera_source).strip()
-    source_lower = source.lower()
-    if source_lower in {"anafi", "parrot", "parrot-anafi"}:
-        return os.getenv("ANAFI_IP") or os.getenv("DRONE_IP") or "192.168.42.1"
-    if source_lower.startswith("anafi://"):
-        return source.split("://", 1)[1].strip() or "192.168.42.1"
-    if source_lower.startswith("anafi:"):
-        return source.split(":", 1)[1].strip() or "192.168.42.1"
-    return "192.168.42.1"
-
-
-def _anafi_flush_cb(stream):
-    try:
-        if hasattr(stream, "empty"):
-            while not stream.empty():
-                try:
-                    stream.get(timeout=0.005).unref()
-                except Exception:
-                    break
-        elif hasattr(stream, "get"):
-            while True:
-                try:
-                    stream.get(timeout=0.005).unref()
-                except Exception:
-                    break
-    except Exception:
-        pass
-    return True
 
 
 class KalmanFilter1D:
@@ -172,19 +88,38 @@ class HeadlessAruCoPositioning:
         marker_size=None,
         enable_kalman_filter=True,
         arena_config_path=None,
+        min_ref_weight=0.00,
+        min_ref_count=1,
+        pose_hold_sec=0.8,
+        outlier_pos_thresh=2.5,
+        target_z_pos=-1.5,
+        max_state_dt=1.0,
+        vel_blend=0.25,
+        meas_blend_min=0.35,
+        meas_blend_max=0.85,
     ):
         self.camera_matrix = camera_matrix
         self.dist_coeffs = dist_coeffs
+        self.min_ref_weight = min_ref_weight
+        self.min_ref_count = min_ref_count
+        self.pose_hold_sec = pose_hold_sec
+        self.outlier_pos_thresh = outlier_pos_thresh
+        self.target_z_pos = target_z_pos
+        self.max_state_dt = max_state_dt
+        self.vel_blend = vel_blend
+        self.meas_blend_min = meas_blend_min
+        self.meas_blend_max = meas_blend_max
 
+        _default_marker_size = 0.5
         # Load arena config from file when provided
         if arena_config_path is not None:
-            loaded_positions, loaded_wall_types, loaded_marker_size = _load_arena_config(arena_config_path)
+            loaded_positions, loaded_wall_types, loaded_marker_size = _load_arena_config(arena_config_path, default_marker_size=_default_marker_size)
             self.marker_positions = loaded_positions
             self.marker_wall_type = loaded_wall_types
             self.marker_size = marker_size if marker_size is not None else loaded_marker_size
             print(f"✅ Arena config loaded from {arena_config_path} ({len(self.marker_positions)} markers, marker_size={self.marker_size}m)")
         else:
-            self.marker_size = marker_size if marker_size is not None else MARKER_SIZE
+            self.marker_size = marker_size if marker_size is not None else _default_marker_size
             self.marker_positions = self._initialize_marker_positions()
             self.marker_wall_type = self._initialize_marker_wall_types()
 
@@ -237,7 +172,7 @@ class HeadlessAruCoPositioning:
         dt = float(target_ts) - float(self.state_ts)
         if dt <= 0.0:
             return self.state_pos.copy()
-        dt = min(dt, MAX_STATE_DT)
+        dt = min(dt, self.max_state_dt)
         return self.state_pos + self.state_vel * dt
 
     def _predict_imu(self, target_ts):
@@ -259,7 +194,7 @@ class HeadlessAruCoPositioning:
     def _update_motion_state(self, meas_pos, meas_ts, blend_alpha):
         meas_pos = np.asarray(meas_pos, dtype=float)
         meas_ts = float(meas_ts)
-        blend_alpha = float(np.clip(blend_alpha, MEAS_BLEND_MIN, MEAS_BLEND_MAX))
+        blend_alpha = float(np.clip(blend_alpha, self.meas_blend_min, self.meas_blend_max))
         if self.state_ts is not None and meas_ts < float(self.state_ts):
             meas_ts = float(self.state_ts)
 
@@ -268,19 +203,19 @@ class HeadlessAruCoPositioning:
             fused = meas_pos.copy()
         else:
             innov = meas_pos - pred
-            if np.linalg.norm(innov) > (OUTLIER_POS_THRESH * 1.5):
+            if np.linalg.norm(innov) > (self.outlier_pos_thresh * 1.5):
                 blend_alpha *= 0.5
             fused = pred + blend_alpha * innov
 
         if self.state_pos is not None and self.state_ts is not None:
             dt = meas_ts - float(self.state_ts)
-            if 1e-3 < dt <= MAX_STATE_DT:
+            if 1e-3 < dt <= self.max_state_dt:
                 # Blend vision-derived velocity with IMU velocity
                 inst_vel = (fused - self.state_pos) / dt
                 imu_weight = 0.3  # trust IMU for 30% of velocity estimate
                 blended_vel = (1.0 - imu_weight) * inst_vel + imu_weight * self.imu_vel
-                self.state_vel = (1.0 - VEL_BLEND) * self.state_vel + VEL_BLEND * blended_vel
-            elif dt > MAX_STATE_DT:
+                self.state_vel = (1.0 - self.vel_blend) * self.state_vel + self.vel_blend * blended_vel
+            elif dt > self.max_state_dt:
                 self.state_vel = self.imu_vel.copy()  # use IMU when vision gap is large
         self.state_pos = fused.copy()
         self.state_ts = meas_ts
@@ -507,7 +442,7 @@ class HeadlessAruCoPositioning:
                         "dead_reckoning": True,
                     }
             # short hold to avoid immediate dropouts
-            if self.last_valid_pose is not None and (now_wall - self.last_valid_ts) <= POSE_HOLD_SEC:
+            if self.last_valid_pose is not None and (now_wall - self.last_valid_ts) <= self.pose_hold_sec:
                 return _stale_payload()
             for kf in self.kf_pos:
                 kf.reset()
@@ -530,7 +465,7 @@ class HeadlessAruCoPositioning:
                        int(mid) in self.marker_positions and int(mid) in cached_poses]
         tgt_indices = [i for i, mid in enumerate(seen_ids) if int(mid) >= 30 and int(mid) in cached_poses]
         if not ref_indices:
-            if self.last_valid_pose is not None and (now_wall - self.last_valid_ts) <= POSE_HOLD_SEC:
+            if self.last_valid_pose is not None and (now_wall - self.last_valid_ts) <= self.pose_hold_sec:
                 return _stale_payload(seen_ids=seen_ids)
             return None
         cam_positions, cam_dirs, rot_mats, weights, ref_marker_ids = [], [], [], [], []
@@ -577,7 +512,7 @@ class HeadlessAruCoPositioning:
 
             # keep existing quality weighting logic
             w = self._calculate_marker_weight(corners[idx], np.linalg.norm(t_m_c), rvec=rvec, tvec=t_m_c)
-            if w < MIN_REF_WEIGHT:
+            if w < self.min_ref_weight:
                 continue
 
             cam_positions.append(c_pos_w)
@@ -587,8 +522,8 @@ class HeadlessAruCoPositioning:
             ref_marker_ids.append(mid)
 
         # If too few high-quality refs remain, hold recent pose instead of producing bad estimates
-        if len(weights) < MIN_REF_COUNT:
-            if self.last_valid_pose is not None and (now_wall - self.last_valid_ts) <= POSE_HOLD_SEC:
+        if len(weights) < self.min_ref_count:
+            if self.last_valid_pose is not None and (now_wall - self.last_valid_ts) <= self.pose_hold_sec:
                 return _stale_payload(
                     refs=[int(m) for m in ref_marker_ids],
                     marker_weights={str(mid): float(w) for mid, w in zip(ref_marker_ids, weights)},
@@ -607,8 +542,8 @@ class HeadlessAruCoPositioning:
 
         # Outlier rejection in position domain
         center = np.mean(np.array(cam_positions), axis=0)
-        keep = [i for i, p in enumerate(cam_positions) if np.linalg.norm(p - center) <= OUTLIER_POS_THRESH]
-        if len(keep) >= MIN_REF_COUNT:
+        keep = [i for i, p in enumerate(cam_positions) if np.linalg.norm(p - center) <= self.outlier_pos_thresh]
+        if len(keep) >= self.min_ref_count:
             cam_positions = [cam_positions[i] for i in keep]
             cam_dirs = [cam_dirs[i] for i in keep]
             rot_mats = [rot_mats[i] for i in keep]
@@ -629,7 +564,7 @@ class HeadlessAruCoPositioning:
 
         # Apply delayed measurement update at capture time, then predict to evaluation time.
         quality = float(np.mean(weights)) * min(1.0, len(weights) / 3.0)
-        blend_alpha = np.clip(0.35 + 0.5 * quality, MEAS_BLEND_MIN, MEAS_BLEND_MAX)
+        blend_alpha = np.clip(0.35 + 0.5 * quality, self.meas_blend_min, self.meas_blend_max)
         self._update_motion_state(f_pos_meas, capture_ts, blend_alpha)
         f_pos = self._predict_state(eval_ts)
         if f_pos is None:
@@ -666,7 +601,7 @@ class HeadlessAruCoPositioning:
                 t_w += est * w
 
             # Keep target on fixed height axis (arena Y)
-            t_w[2] = TARGET_Z_POS
+            t_w[2] = self.target_z_pos
 
             if tid not in self.target_filters:
                 self.target_filters[tid] = ExponentialMovingAverage(alpha=0.15)
