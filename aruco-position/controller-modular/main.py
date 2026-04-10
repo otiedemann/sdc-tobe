@@ -51,6 +51,11 @@ try:
 except Exception:
     input_module = None
 
+try:
+    import controller as ctrl_module
+except Exception:
+    ctrl_module = None
+
 _motion_input_enabled: bool = False
 
 
@@ -225,6 +230,19 @@ def main():
 
     enable_motion_input = "--motion-input" in sys.argv
 
+    # --ctrl-target x,y,z   e.g. --ctrl-target 3.0,1.5,1.2
+    ctrl_target: Optional[tuple] = None
+    if "--ctrl-target" in sys.argv:
+        try:
+            raw = sys.argv[sys.argv.index("--ctrl-target") + 1]
+            parts = [float(v) for v in raw.split(",")]
+            if len(parts) == 3:
+                ctrl_target = (parts[0], parts[1], parts[2])
+            else:
+                print("⚠️ --ctrl-target expects x,y,z  e.g. 3.0,1.5,1.2")
+        except Exception:
+            print("⚠️ Invalid --ctrl-target value, controller disabled.")
+
     preview_requested = ("--preview" in sys.argv)
     gui_enabled = preview_requested and has_gui() and ("--force-headless" not in sys.argv)
     gui_available = True
@@ -253,6 +271,7 @@ def main():
     )
     print(f"📉 Per-axis Kalman: {'ON' if enable_kalman_filter else 'OFF'}")
     print(f"📡 Motion Input: {'ON' if enable_motion_input else 'OFF'}")
+    print(f"🎯 Ctrl Target: {ctrl_target if ctrl_target else 'none'}")
     print(f"🖥️ Preview Requested: {'YES' if preview_requested else 'NO'}")
     print(f"🖥️ GUI Overlay: {'ON' if gui_enabled else 'OFF'}")
 
@@ -403,6 +422,9 @@ def main():
         time.sleep(0.2)
         print("✅ Anafi videostream active")
 
+        if ctrl_target is not None and ctrl_module is not None:
+            ctrl_module.set_target(*ctrl_target)
+
     else:
         cap = cv2.VideoCapture(camera_src)
         cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
@@ -458,7 +480,7 @@ def main():
             # Motion update @ 25 Hz
             # --------------------------------------
             if now >= next_motion_time:
-                # TODO: Input fuer motion aus telemetrie erzeugen #help
+
                 motion_sample = get_motion_input()
 
                 ts = float(motion_sample.get("timestamp", now))
@@ -579,13 +601,11 @@ def main():
             # Drone Position Controller
             # --------------------------------------
 
-            # TODO: Zielposition aus C2 ist hier input
-            # 
-            # Regler erstellen der eine Fluganweisung fuer die Drohne erzeugt
-            # aus last_prediction und target_position (kommt vom C2)
-            # -> ggf regelt er den yaw immer nach 0, darueber habe ich aber noch nicht genug nachgedacht
-            #    evtl brauchen wir die drohne auch in Blickrichtung da wir ggf objekten ausweichen wollen
-            
+            if ctrl_module is not None and last_prediction is not None:
+                rc = ctrl_module.update(last_prediction)
+                if rc is not None and anafi_drone is not None:
+                    ctrl_module.send_pcmd_olympe(anafi_drone, rc)
+
             
             # --------------------------------------
             # Outgoing payload
@@ -647,6 +667,9 @@ def main():
                     "correction": last_fusion_result.get("correction"),
                     "innovation": last_fusion_result.get("innovation"),
                 }
+
+            if ctrl_module is not None:
+                result["ctrl"] = ctrl_module.position_controller.status()
 
             # --------------------------------------
             # Local preview
