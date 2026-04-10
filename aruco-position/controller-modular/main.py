@@ -332,6 +332,12 @@ def main():
             raise RuntimeError("Parrot Olympe not installed. Install with: pip install parrot-olympe")
 
         anafi_ip = _parse_anafi_ip(camera_src)
+
+        # Pass resolved IP to the input module before video setup so the
+        # telemetry thread can start connecting in parallel.
+        if input_module is not None and hasattr(input_module, "init"):
+            input_module.init(anafi_ip=anafi_ip)
+
         print(f"🛩️ Connecting to Parrot Anafi at {anafi_ip}…")
         anafi_drone = olympe.Drone(anafi_ip)
         anafi_drone.connect()
