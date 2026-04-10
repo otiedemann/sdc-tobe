@@ -51,6 +51,8 @@ try:
 except Exception:
     input_module = None
 
+_motion_input_enabled: bool = False
+
 
 # ============================================================
 # Fallbacks
@@ -77,7 +79,7 @@ def fallback_get_motion_input() -> Dict[str, Any]:
 
 
 def get_motion_input() -> Dict[str, Any]:
-    if input_module is not None and hasattr(input_module, "get_motion_input"):
+    if _motion_input_enabled and input_module is not None and hasattr(input_module, "get_motion_input"):
         return input_module.get_motion_input()
     return fallback_get_motion_input()
 
@@ -221,6 +223,8 @@ def main():
     if '--pos-kalman' in sys.argv:
         enable_kalman_filter = True
 
+    enable_motion_input = "--motion-input" in sys.argv
+
     preview_requested = ("--preview" in sys.argv)
     gui_enabled = preview_requested and has_gui() and ("--force-headless" not in sys.argv)
     gui_available = True
@@ -248,6 +252,7 @@ def main():
         f"target_z_pos={target_z_pos}"
     )
     print(f"📉 Per-axis Kalman: {'ON' if enable_kalman_filter else 'OFF'}")
+    print(f"📡 Motion Input: {'ON' if enable_motion_input else 'OFF'}")
     print(f"🖥️ Preview Requested: {'YES' if preview_requested else 'NO'}")
     print(f"🖥️ GUI Overlay: {'ON' if gui_enabled else 'OFF'}")
 
@@ -327,6 +332,9 @@ def main():
 
     cap = None
 
+    global _motion_input_enabled
+    _motion_input_enabled = enable_motion_input
+
     if use_anafi_stream:
         if olympe is None:
             raise RuntimeError("Parrot Olympe not installed. Install with: pip install parrot-olympe")
@@ -335,7 +343,7 @@ def main():
 
         # Pass resolved IP to the input module before video setup so the
         # telemetry thread can start connecting in parallel.
-        if input_module is not None and hasattr(input_module, "init"):
+        if enable_motion_input and input_module is not None and hasattr(input_module, "init"):
             input_module.init(anafi_ip=anafi_ip)
 
         print(f"🛩️ Connecting to Parrot Anafi at {anafi_ip}…")

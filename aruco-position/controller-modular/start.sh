@@ -19,3 +19,4 @@ python "$SCRIPT_DIR/main.py" \
     # --preview                                        # show local OpenCV preview window
     # --force-headless                                 # disable GUI even if display is available
     # --pos-kalman                                     # enable per-axis Kalman filter in aruco position module
+    # --motion-input                                   # enable motion input module
