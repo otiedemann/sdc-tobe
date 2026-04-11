@@ -1,11 +1,17 @@
 import base64
 import json
+import logging
 import os
 import platform
 import socket
 import threading
 import time
 from typing import Any, Dict, Optional
+
+# Point Qt's font lookup at the standard dejavu location before importing cv2.
+# Fixes: "Qt no longer ships fonts" warning on embedded Linux / Raspberry Pi.
+# No-op on systems where the path doesn't exist.
+os.environ.setdefault("QT_QPA_FONTDIR", "/usr/share/fonts/truetype/dejavu")
 
 import cv2
 import numpy as np
@@ -58,6 +64,9 @@ except Exception:
 
 _motion_input_enabled: bool = False
 
+# Suppress olympe / arsdk / pdraw log noise (H264/AVCC decoder warnings, etc.)
+logging.getLogger("olympe").setLevel(logging.CRITICAL)
+logging.getLogger("ulog").setLevel(logging.CRITICAL)
 
 # ============================================================
 # Fallbacks
@@ -441,6 +450,7 @@ def main():
     last_send_time = 0.0
     last_img_time = 0.0
     last_heartbeat_time = 0.0
+    last_motion_sample: Optional[Dict] = None
 
     next_motion_time = time.monotonic()
     next_vision_time = time.monotonic()
@@ -481,13 +491,13 @@ def main():
             # --------------------------------------
             if now >= next_motion_time:
 
-                motion_sample = get_motion_input()
+                last_motion_sample = get_motion_input()
 
-                ts = float(motion_sample.get("timestamp", now))
-                vx_body = float(motion_sample.get("vx_body", 0.0))
-                vy_body = float(motion_sample.get("vy_body", 0.0))
-                vz_body = float(motion_sample.get("vz_body", 0.0))
-                yaw_rate = float(motion_sample.get("yaw_rate", 0.0))
+                ts = float(last_motion_sample.get("timestamp", now))
+                vx_body = float(last_motion_sample.get("vx_body", 0.0))
+                vy_body = float(last_motion_sample.get("vy_body", 0.0))
+                vz_body = float(last_motion_sample.get("vz_body", 0.0))
+                yaw_rate = float(last_motion_sample.get("yaw_rate", 0.0))
 
                 last_motion_state = motion_estimator.update_body_frame(
                     timestamp=ts,
@@ -691,6 +701,18 @@ def main():
                     2,
                 )
 
+                cam = result.get("cam")
+                if cam is not None:
+                    cv2.putText(
+                        preview,
+                        f"CAM x={cam[0]:+.3f} y={cam[1]:+.3f} z={cam[2]:+.3f}",
+                        (10, 60),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.6,
+                        (0, 200, 255),
+                        2,
+                    )
+
                 if last_prediction is not None:
                     txt1 = (
                         f"PRED x={last_prediction['x']:+.2f} "
@@ -705,7 +727,7 @@ def main():
                     cv2.putText(
                         preview,
                         txt1,
-                        (10, 60),
+                        (10, 85),
                         cv2.FONT_HERSHEY_SIMPLEX,
                         0.6,
                         (0, 255, 0),
@@ -714,10 +736,26 @@ def main():
                     cv2.putText(
                         preview,
                         txt2,
-                        (10, 85),
+                        (10, 110),
                         cv2.FONT_HERSHEY_SIMPLEX,
-                        0.55,
+                        0.6,
                         (0, 255, 0),
+                        2,
+                    )
+
+                if last_motion_sample is not None:
+                    timestamp = last_motion_sample.get("timestamp", 0.0)
+                    vx = last_motion_sample.get("vx_body", 0.0)
+                    vy = last_motion_sample.get("vy_body", 0.0)
+                    vz = last_motion_sample.get("vz_body", 0.0)
+                    yr = last_motion_sample.get("yaw_rate", 0.0)
+                    cv2.putText(
+                        preview,
+                        f"MOT vx={vx:+.3f} vy={vy:+.3f} vz={vz:+.3f} yr={yr:+.3f} time={timestamp}",
+                        (10, 130),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.5,
+                        (255, 180, 0),
                         2,
                     )
 

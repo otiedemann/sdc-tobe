@@ -207,6 +207,8 @@ def _olympe_loop() -> None:
             print(f"[input] Connecting to Anafi at {_ANAFI_IP} via Olympe…")
             drone = olympe.Drone(_ANAFI_IP)
             drone.connect()
+            # Give the drone ~1 s to send its initial telemetry bursts before polling.
+            time.sleep(1.0)
             print("[input] Olympe connection established")
         except Exception as exc:
             print(f"[input] Olympe connect failed: {exc}; retrying in 5 s")
@@ -221,6 +223,10 @@ def _olympe_loop() -> None:
                 spd = drone.get_state(SpeedChanged)
                 att = drone.get_state(AttitudeChanged)
             except Exception as exc:
+                if "uninitialized" in str(exc).lower():
+                    # Drone hasn't sent this telemetry yet - normal on startup, not a real failure.
+                    time.sleep(interval)
+                    continue
                 consecutive_failures += 1
                 if consecutive_failures >= 10:
                     print(f"[input] Olympe get_state failed {consecutive_failures}x: {exc}; reconnecting")
