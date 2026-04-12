@@ -19,10 +19,10 @@ def wrap_angle_pi(angle_rad: float) -> float:
 class MotionState:
     timestamp: float
 
-    # absolute pose in world frame
-    x: float
-    y: float
-    z: float
+    # absolute pose in world frame (NED)
+    x: float  # North
+    y: float  # East
+    z: float  # Down
     yaw: float
 
     # accumulated variances
@@ -48,17 +48,19 @@ class MotionEstimator:
     """
     Reine Bewegungsfortschreibung ohne Filterung.
 
-    Weltkoordinatensystem:
-        +X nach vorne beim Start
-        +Y nach links
-        +Z nach oben
+    Weltkoordinatensystem: NED
+        +X = North
+        +Y = East
+        +Z = Down
 
-    Body-System der Drohne:
-        +X nach vorne
-        +Z nach unten (falls body_z_positive_is_down=True)
+    Eingangsgrößen liegen bereits im Weltkoordinatensystem vor:
+        vx_world, vy_world, vz_world, yaw_rate
 
-    Eingangsgrößen:
-        vx_body, vy_body, vz_body, yaw_rate
+    Wichtige Annahmen:
+        - vx_world, vy_world, vz_world in m/s
+        - timestamp in Sekunden
+        - yaw_rate in rad/s
+        - yaw wird nur fortgeschrieben, aber nicht zur Translation benutzt
     """
 
     def __init__(
@@ -71,8 +73,6 @@ class MotionEstimator:
         base_process_var_yaw: float = 0.0005,
         dyn_gain_pos: float = 0.01,
         dyn_gain_yaw: float = 0.01,
-        body_y_positive_is_left: bool = True,
-        body_z_positive_is_down: bool = True,
         yaw_positive_is_ccw: bool = True,
     ):
         self.history_seconds = history_seconds
@@ -85,9 +85,6 @@ class MotionEstimator:
         self.base_process_var_yaw = base_process_var_yaw
         self.dyn_gain_pos = dyn_gain_pos
         self.dyn_gain_yaw = dyn_gain_yaw
-
-        self.body_y_positive_is_left = body_y_positive_is_left
-        self.body_z_positive_is_down = body_z_positive_is_down
         self.yaw_positive_is_ccw = yaw_positive_is_ccw
 
         x, y, z, yaw = initial_pose
@@ -113,34 +110,18 @@ class MotionEstimator:
         while len(self._buffer) > 1 and self._buffer[0].timestamp < cutoff:
             self._buffer.popleft()
 
-    def _normalize_body_axes(
+    def _normalize_world_axes(
         self,
-        vx_body: float,
-        vy_body: float,
-        vz_body: float,
+        vx_world: float,
+        vy_world: float,
+        vz_world: float,
         yaw_rate: float,
     ) -> Tuple[float, float, float, float]:
-        vx = vx_body
-        vy = vy_body if self.body_y_positive_is_left else -vy_body
-        vz = -vz_body if self.body_z_positive_is_down else vz_body
+        vx = vx_world
+        vy = -vy_world
+        vz = vz_world
         yr = yaw_rate if self.yaw_positive_is_ccw else -yaw_rate
         return vx, vy, vz, yr
-
-    def _body_to_world_velocity(
-        self,
-        vx_body: float,
-        vy_body: float,
-        vz_body: float,
-        yaw: float,
-    ) -> Tuple[float, float, float]:
-        c = math.cos(yaw)
-        s = math.sin(yaw)
-
-        vx_world = c * vx_body - s * vy_body
-        vy_world = s * vx_body + c * vy_body
-        vz_world = vz_body
-
-        return vx_world, vy_world, vz_world
 
     def _compute_process_variance(
         self,
@@ -164,12 +145,12 @@ class MotionEstimator:
 
         return proc_var_x, proc_var_y, proc_var_z, proc_var_yaw
 
-    def update_body_frame(
+    def update_world_frame(
         self,
         timestamp: float,
-        vx_body: float,
-        vy_body: float,
-        vz_body: float,
+        vx_world: float,
+        vy_world: float,
+        vz_world: float,
         yaw_rate: float = 0.0,
     ) -> MotionState:
         last = self._buffer[-1]
@@ -178,23 +159,13 @@ class MotionEstimator:
         if dt <= 0.0:
             return last
 
-        vx_body_n, vy_body_n, vz_body_n, yaw_rate_n = self._normalize_body_axes(
-            vx_body, vy_body, vz_body, yaw_rate
+        vx_world_n, vy_world_n, vz_world_n, yaw_rate_n = self._normalize_world_axes(
+            vx_world, vy_world, vz_world, yaw_rate
         )
 
-        # midpoint yaw is a bit more accurate than using only last.yaw
-        yaw_mid = wrap_angle_pi(last.yaw + 0.5 * yaw_rate_n * dt)
-
-        vx_world, vy_world, vz_world = self._body_to_world_velocity(
-            vx_body=vx_body_n,
-            vy_body=vy_body_n,
-            vz_body=vz_body_n,
-            yaw=yaw_mid,
-        )
-
-        delta_x = vx_world * dt
-        delta_y = vy_world * dt
-        delta_z = vz_world * dt
+        delta_x = vx_world_n * dt
+        delta_y = vy_world_n * dt
+        delta_z = vz_world_n * dt
         delta_yaw = yaw_rate_n * dt
 
         new_x = last.x + delta_x
@@ -203,9 +174,9 @@ class MotionEstimator:
         new_yaw = wrap_angle_pi(last.yaw + delta_yaw)
 
         proc_var_x, proc_var_y, proc_var_z, proc_var_yaw = self._compute_process_variance(
-            vx_world=vx_world,
-            vy_world=vy_world,
-            vz_world=vz_world,
+            vx_world=vx_world_n,
+            vy_world=vy_world_n,
+            vz_world=vz_world_n,
             yaw_rate=yaw_rate_n,
             dt=dt,
         )
