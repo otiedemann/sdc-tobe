@@ -53,6 +53,8 @@ MISSION_TIMEOUT_S = 120.0     # total mission timeout
 SETTLE_TIME_S = 3.0           # time to wait after takeoff before scanning
 ARRIVAL_RADIUS_M = 0.25       # close enough to target
 ALTITUDE_TOLERANCE_M = 0.3    # acceptable altitude error
+WALL_SAFE_DISTANCE_M = 0.8   # hard minimum distance from any wall
+WALL_BRAKE_DISTANCE_M = 1.5  # start braking when this close to a wall
 
 # ─── Globals ─────────────────────────────────────────────────────────────────
 
@@ -215,6 +217,94 @@ def get_marker_positions(arena_cfg: dict) -> dict[int, dict]:
     return markers
 
 
+# ─── Wall / arena boundary awareness ────────────────────────────────────────
+
+class ArenaBounds:
+    """
+    Axis-aligned arena boundary computed from arena config.
+
+    Walls:
+      front: Y = y_min
+      back:  Y = y_max
+      left:  X = x_min
+      right: X = x_max
+    """
+
+    def __init__(self, arena_cfg: dict):
+        w = float(arena_cfg.get("arena_width_m", 20))
+        d = float(arena_cfg.get("arena_height_m", 10))
+        # Arena is centred on X, starts at Y=0
+        self.x_min = -w / 2.0
+        self.x_max = w / 2.0
+        self.y_min = 0.0
+        self.y_max = d
+        self.width = w
+        self.depth = d
+
+    def wall_distances(self, x: float, y: float) -> dict[str, float]:
+        """Return signed distance to each wall (positive = inside arena)."""
+        return {
+            "front": y - self.y_min,       # distance from front wall (Y=0)
+            "back":  self.y_max - y,        # distance from back wall
+            "left":  x - self.x_min,        # distance from left wall
+            "right": self.x_max - x,        # distance from right wall
+        }
+
+    def nearest_wall(self, x: float, y: float) -> tuple[str, float]:
+        """Return (wall_name, distance) for the closest wall."""
+        dists = self.wall_distances(x, y)
+        return min(dists.items(), key=lambda kv: kv[1])
+
+    def clamp_target(self, tx: float, ty: float, safe_dist: float) -> tuple[float, float]:
+        """Clamp a target position to be at least safe_dist from every wall."""
+        tx = max(self.x_min + safe_dist, min(self.x_max - safe_dist, tx))
+        ty = max(self.y_min + safe_dist, min(self.y_max - safe_dist, ty))
+        return tx, ty
+
+    def wall_brake_factor(self, x: float, y: float,
+                          vx: float, vy: float) -> float:
+        """
+        Compute a 0..1 speed multiplier based on wall proximity.
+
+        Returns 1.0 when far from walls, scales down to 0.0 when at
+        WALL_SAFE_DISTANCE from any wall the drone is moving toward.
+        Only brakes for walls the drone is approaching (not retreating from).
+        """
+        dists = self.wall_distances(x, y)
+        factor = 1.0
+
+        # Check each wall — only brake if moving toward it
+        # front (Y=y_min): approaching if vy < 0
+        if vy < 0 and dists["front"] < WALL_BRAKE_DISTANCE_M:
+            f = max(0.0, (dists["front"] - WALL_SAFE_DISTANCE_M) /
+                         (WALL_BRAKE_DISTANCE_M - WALL_SAFE_DISTANCE_M))
+            factor = min(factor, f)
+
+        # back (Y=y_max): approaching if vy > 0
+        if vy > 0 and dists["back"] < WALL_BRAKE_DISTANCE_M:
+            f = max(0.0, (dists["back"] - WALL_SAFE_DISTANCE_M) /
+                         (WALL_BRAKE_DISTANCE_M - WALL_SAFE_DISTANCE_M))
+            factor = min(factor, f)
+
+        # left (X=x_min): approaching if vx < 0
+        if vx < 0 and dists["left"] < WALL_BRAKE_DISTANCE_M:
+            f = max(0.0, (dists["left"] - WALL_SAFE_DISTANCE_M) /
+                         (WALL_BRAKE_DISTANCE_M - WALL_SAFE_DISTANCE_M))
+            factor = min(factor, f)
+
+        # right (X=x_max): approaching if vx > 0
+        if vx > 0 and dists["right"] < WALL_BRAKE_DISTANCE_M:
+            f = max(0.0, (dists["right"] - WALL_SAFE_DISTANCE_M) /
+                         (WALL_BRAKE_DISTANCE_M - WALL_SAFE_DISTANCE_M))
+            factor = min(factor, f)
+
+        return factor
+
+    def __repr__(self):
+        return (f"ArenaBounds(x=[{self.x_min:.1f}, {self.x_max:.1f}], "
+                f"y=[{self.y_min:.1f}, {self.y_max:.1f}])")
+
+
 # ─── Coordinate math ────────────────────────────────────────────────────────
 
 def compute_approach_target(
@@ -345,6 +435,11 @@ def run_mission(
     if not marker_positions:
         log("WARNING: No markers in arena config. Will use position SSE seen_markers only.")
 
+    # Compute arena boundaries for wall avoidance
+    arena_bounds = ArenaBounds(arena_cfg)
+    log(f"  Arena bounds: {arena_bounds}")
+    log(f"  Wall safety: brake at {WALL_BRAKE_DISTANCE_M}m, hard stop at {WALL_SAFE_DISTANCE_M}m")
+
     # Start video stream — required for ArUco detection
     # The positioning loop processes frames from the video callback;
     # without an active video stream, no frames are fed to OpenCV.
@@ -460,6 +555,9 @@ def run_mission(
                     if target_marker_id in marker_positions:
                         mk = marker_positions[target_marker_id]
                         tx, ty, tz, tyaw = compute_approach_target(mk, hover_distance)
+                        # Clamp target to stay away from all walls
+                        if arena_bounds:
+                            tx, ty = arena_bounds.clamp_target(tx, ty, WALL_SAFE_DISTANCE_M)
                         target_pos = (tx, ty, tz, tyaw)
                         log(f"  Marker at ({mk['x']:.1f}, {mk['y']:.1f}, {mk['z']:.1f}) wall={mk['wall']}")
                         log(f"  Approach target: ({tx:.2f}, {ty:.2f}, {tz:.2f}) yaw={math.degrees(tyaw):.0f} deg")
@@ -525,18 +623,51 @@ def run_mission(
                 tx, ty, tz, tyaw = target_pos
                 cx, cy, cz = pos[0], pos[1], pos[2]
 
-                # Position error
+                # Position error toward target
                 ex = tx - cx
                 ey = ty - cy
                 ez = tz - cz
                 dist_xy = math.sqrt(ex * ex + ey * ey)
+
+                # ── Wall proximity check ──────────────────────────────
+                # Compute distance to the marker (= distance to wall surface)
+                # This works without arena config since the marker IS on the wall.
+                marker_wall_dist = None
+                if target_marker_id is not None and target_marker_id in marker_positions:
+                    mk = marker_positions[target_marker_id]
+                    dmx = mk["x"] - cx
+                    dmy = mk["y"] - cy
+                    marker_wall_dist = math.sqrt(dmx**2 + dmy**2)
+
+                # Also check arena bounds if available
+                arena_wall_name, arena_wall_dist = "", float("inf")
+                if arena_bounds:
+                    arena_wall_name, arena_wall_dist = arena_bounds.nearest_wall(cx, cy)
+
+                # Use the smaller of marker distance and arena wall distance
+                effective_wall_dist = min(
+                    marker_wall_dist if marker_wall_dist is not None else float("inf"),
+                    arena_wall_dist,
+                )
+
+                # HARD STOP: too close to wall — back away!
+                if effective_wall_dist < WALL_SAFE_DISTANCE_M:
+                    send_rc_stop()
+                    log(f"WALL PROXIMITY STOP! dist={effective_wall_dist:.2f}m "
+                        f"(safe={WALL_SAFE_DISTANCE_M}m) — holding position")
+                    # Arrived at safe hover distance from marker/wall
+                    phase = Phase.HOVER
+                    phase_start = time.time()
+                    # Update target to current position (don't push closer)
+                    target_pos = (cx, cy, cz, tyaw)
+                    continue
 
                 # Get current yaw from telemetry
                 tel = get_telemetry()
                 cur_yaw_deg = tel.get("yaw") or 0.0
                 cur_yaw = math.radians(cur_yaw_deg)
 
-                # Check if arrived
+                # Check if arrived at target
                 if dist_xy < ARRIVAL_RADIUS_M and abs(ez) < ALTITUDE_TOLERANCE_M:
                     send_rc_stop()
                     log(f"ARRIVED at target! dist={dist_xy:.2f}m  alt_err={ez:.2f}m")
@@ -552,7 +683,6 @@ def run_mission(
                     continue
 
                 # Compute RC commands (simplified P controller)
-                # World frame velocity setpoint
                 kp_xy = 0.6
                 kp_z = 0.5
                 kp_yaw = 1.2
@@ -567,6 +697,20 @@ def run_mission(
                 if horiz > max_speed:
                     vx_sp = vx_sp / horiz * max_speed
                     vy_sp = vy_sp / horiz * max_speed
+
+                # ── Wall proximity braking ────────────────────────────
+                # Smoothly reduce speed as we approach the wall
+                if effective_wall_dist < WALL_BRAKE_DISTANCE_M:
+                    brake = max(0.0, (effective_wall_dist - WALL_SAFE_DISTANCE_M) /
+                                     (WALL_BRAKE_DISTANCE_M - WALL_SAFE_DISTANCE_M))
+                    vx_sp *= brake
+                    vy_sp *= brake
+
+                # Also use arena bounds brake factor (per-axis, direction-aware)
+                if arena_bounds:
+                    arena_brake = arena_bounds.wall_brake_factor(cx, cy, vx_sp, vy_sp)
+                    vx_sp *= arena_brake
+                    vy_sp *= arena_brake
 
                 # Yaw toward target
                 yaw_err = wrap_pi(tyaw - cur_yaw)
@@ -589,7 +733,10 @@ def run_mission(
 
                 send_rc(lr, fb, ud, yaw_rc)
 
-                log(f"Approach: dist={dist_xy:.2f}m  alt_err={ez:.2f}m  "
+                wall_info = f"wall={effective_wall_dist:.2f}m"
+                if arena_wall_dist < float("inf"):
+                    wall_info += f"({arena_wall_name})"
+                log(f"Approach: dist={dist_xy:.2f}m  {wall_info}  alt_err={ez:.2f}m  "
                     f"yaw_err={math.degrees(yaw_err):.0f}deg  "
                     f"RC fb={fb} lr={lr} ud={ud} yaw={yaw_rc}")
 
@@ -607,6 +754,23 @@ def run_mission(
                 ex, ey, ez = tx - cx, ty - cy, tz - cz
                 dist_xy = math.sqrt(ex**2 + ey**2)
 
+                # Wall proximity check during hover too
+                marker_wall_dist = None
+                if target_marker_id is not None and target_marker_id in marker_positions:
+                    mk = marker_positions[target_marker_id]
+                    dmx = mk["x"] - cx
+                    dmy = mk["y"] - cy
+                    marker_wall_dist = math.sqrt(dmx**2 + dmy**2)
+
+                arena_wall_dist = float("inf")
+                if arena_bounds:
+                    _, arena_wall_dist = arena_bounds.nearest_wall(cx, cy)
+
+                effective_wall_dist = min(
+                    marker_wall_dist if marker_wall_dist is not None else float("inf"),
+                    arena_wall_dist,
+                )
+
                 tel = get_telemetry()
                 cur_yaw = math.radians(tel.get("yaw") or 0.0)
 
@@ -617,6 +781,14 @@ def run_mission(
                 vz_sp = 0.3 * ez
                 yaw_err = wrap_pi(tyaw - cur_yaw)
                 yaw_rate = 0.8 * yaw_err
+
+                # During hover, never push toward a wall
+                if effective_wall_dist < WALL_SAFE_DISTANCE_M + 0.2:
+                    # Kill any velocity component toward the wall
+                    if arena_bounds:
+                        brake = arena_bounds.wall_brake_factor(cx, cy, vx_sp, vy_sp)
+                        vx_sp *= brake
+                        vy_sp *= brake
 
                 vx_body, vy_body = world_to_body(vx_sp, vy_sp, cur_yaw)
 
@@ -629,6 +801,7 @@ def run_mission(
 
                 hover_dur = time.time() - phase_start
                 log(f"HOVER: ({cx:.2f},{cy:.2f},{cz:.2f}) err_xy={dist_xy:.2f}m  "
+                    f"wall={effective_wall_dist:.2f}m  "
                     f"facing marker {target_marker_id}  t={hover_dur:.0f}s  "
                     f"[Ctrl+C to land]")
 
