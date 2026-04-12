@@ -1,0 +1,204 @@
+from __future__ import annotations
+
+from dataclasses import dataclass
+import math
+
+
+def clamp(value: float, min_value: float, max_value: float) -> float:
+    return max(min_value, min(max_value, value))
+
+
+def wrap_angle_pi(angle_rad: float) -> float:
+    while angle_rad > math.pi:
+        angle_rad -= 2.0 * math.pi
+    while angle_rad < -math.pi:
+        angle_rad += 2.0 * math.pi
+    return angle_rad
+
+
+@dataclass
+class Pose:
+    x: float
+    y: float
+    z: float
+    yaw: float  # rad
+
+
+@dataclass
+class TargetPose:
+    x: float
+    y: float
+    z: float
+    yaw: float | None = None
+
+
+@dataclass
+class VelocityCommand:
+    vx_world: float
+    vy_world: float
+    vz_world: float
+    yaw_rate: float
+
+
+@dataclass
+class PCMDCommand:
+    roll: int   # [-100, 100]
+    pitch: int  # [-100, 100]
+    yaw: int    # [-100, 100]
+    gaz: int    # [-100, 100]
+
+
+class PositionController:
+    """
+    Einfacher Positionsregler:
+    - Positionsfehler in Weltkoordinaten
+    - P-Regler auf Soll-Geschwindigkeit
+    - Rotation Welt -> Body mit aktuellem Yaw
+    - Mapping auf PCMD
+    """
+
+    def __init__(
+        self,
+        kp_xy: float = 0.8,
+        kp_z: float = 0.8,
+        kp_yaw: float = 1.5,
+        max_v_xy: float = 1.5,      # m/s
+        max_v_z: float = 1.0,       # m/s
+        max_yaw_rate: float = 1.0,  # rad/s
+        max_tilt_cmd: int = 60,
+        max_gaz_cmd: int = 60,
+        max_yaw_cmd: int = 60,
+        pos_tolerance_xy: float = 0.10,
+        pos_tolerance_z: float = 0.10,
+        yaw_tolerance_rad: float = math.radians(5.0),
+    ) -> None:
+        self.kp_xy = kp_xy
+        self.kp_z = kp_z
+        self.kp_yaw = kp_yaw
+
+        self.max_v_xy = max_v_xy
+        self.max_v_z = max_v_z
+        self.max_yaw_rate = max_yaw_rate
+
+        self.max_tilt_cmd = max_tilt_cmd
+        self.max_gaz_cmd = max_gaz_cmd
+        self.max_yaw_cmd = max_yaw_cmd
+
+        self.pos_tolerance_xy = pos_tolerance_xy
+        self.pos_tolerance_z = pos_tolerance_z
+        self.yaw_tolerance_rad = yaw_tolerance_rad
+
+    def compute_velocity_command(
+        self,
+        current: Pose,
+        target: TargetPose,
+    ) -> VelocityCommand:
+        # Positionsfehler im Welt-Frame
+        ex = target.x - current.x
+        ey = target.y - current.y
+        ez = target.z - current.z
+
+        # P-Regler -> Sollgeschwindigkeit im Welt-Frame
+        vx = self.kp_xy * ex
+        vy = self.kp_xy * ey
+        vz = self.kp_z * ez
+
+        # Begrenzen
+        v_xy_norm = math.hypot(vx, vy)
+        if v_xy_norm > self.max_v_xy and v_xy_norm > 1e-9:
+            scale = self.max_v_xy / v_xy_norm
+            vx *= scale
+            vy *= scale
+
+        vz = clamp(vz, -self.max_v_z, self.max_v_z)
+
+        # Optional Yaw-Regelung
+        yaw_rate = 0.0
+        if target.yaw is not None:
+            yaw_error = wrap_angle_pi(target.yaw - current.yaw)
+            yaw_rate = self.kp_yaw * yaw_error
+            yaw_rate = clamp(yaw_rate, -self.max_yaw_rate, self.max_yaw_rate)
+
+        return VelocityCommand(
+            vx_world=vx,
+            vy_world=vy,
+            vz_world=vz,
+            yaw_rate=yaw_rate,
+        )
+
+    def world_to_body_velocity(
+        self,
+        vx_world: float,
+        vy_world: float,
+        yaw: float,
+    ) -> tuple[float, float]:
+        """
+        Rotation Welt -> Body.
+        Ergebnis:
+        - vx_body: vorwärts positiv
+        - vy_body: rechts positiv
+        """
+        c = math.cos(yaw)
+        s = math.sin(yaw)
+
+        vx_body = c * vx_world + s * vy_world
+        vy_body = -s * vx_world + c * vy_world
+        return vx_body, vy_body
+
+    def velocity_to_pcmd(
+        self,
+        vel_cmd: VelocityCommand,
+        current_yaw: float,
+    ) -> PCMDCommand:
+        vx_body, vy_body = self.world_to_body_velocity(
+            vel_cmd.vx_world,
+            vel_cmd.vy_world,
+            current_yaw,
+        )
+
+        # Auf normierte Steuergrößen mappen
+        # pitch: vor/zurück
+        # roll: links/rechts
+        pitch_norm = clamp(vx_body / self.max_v_xy, -1.0, 1.0)
+        roll_norm = clamp(vy_body / self.max_v_xy, -1.0, 1.0)
+        gaz_norm = clamp(vel_cmd.vz_world / self.max_v_z, -1.0, 1.0)
+        yaw_norm = clamp(vel_cmd.yaw_rate / self.max_yaw_rate, -1.0, 1.0)
+
+        pitch_cmd = int(round(pitch_norm * self.max_tilt_cmd))
+        roll_cmd = int(round(roll_norm * self.max_tilt_cmd))
+        gaz_cmd = int(round(gaz_norm * self.max_gaz_cmd))
+        yaw_cmd = int(round(yaw_norm * self.max_yaw_cmd))
+
+        return PCMDCommand(
+            roll=roll_cmd,
+            pitch=pitch_cmd,
+            yaw=yaw_cmd,
+            gaz=gaz_cmd,
+        )
+
+    def compute_pcmd(
+        self,
+        current: Pose,
+        target: TargetPose,
+    ) -> PCMDCommand:
+        vel_cmd = self.compute_velocity_command(current, target)
+        return self.velocity_to_pcmd(vel_cmd, current.yaw)
+
+    def is_target_reached(
+        self,
+        current: Pose,
+        target: TargetPose,
+    ) -> bool:
+        ex = target.x - current.x
+        ey = target.y - current.y
+        ez = target.z - current.z
+
+        xy_ok = math.hypot(ex, ey) <= self.pos_tolerance_xy
+        z_ok = abs(ez) <= self.pos_tolerance_z
+
+        yaw_ok = True
+        if target.yaw is not None:
+            yaw_error = wrap_angle_pi(target.yaw - current.yaw)
+            yaw_ok = abs(yaw_error) <= self.yaw_tolerance_rad
+
+        return xy_ok and z_ok and yaw_ok
