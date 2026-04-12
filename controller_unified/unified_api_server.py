@@ -2815,8 +2815,13 @@ def api_telemetry():
 def api_telemetry_stream():
     def gen():
         while running:
+            now = time.time()
+            age = (now - last_state_seen) if last_state_seen else 9999.0
             with telemetry_lock:
                 payload = dict(telemetry)
+            payload["state_age_s"] = round(age, 3)
+            payload["state_fresh"] = age <= 2.0
+            payload["drone_type"] = drone_type
             yield f"data: {json.dumps(payload)}\n\n"
             time.sleep(0.1)  # 10 Hz — matches telemetry collection rate
     return Response(gen(), mimetype="text/event-stream",
@@ -3128,6 +3133,25 @@ def positioning_loop():
         direction = result.get("dir")
         stale = result.get("stale", True)
 
+        # Compute marker pixel sizes and centers from raw detection
+        # (always available when markers are detected, even without ref pose)
+        raw_pixel_sizes = {}
+        raw_centers = {}
+        raw_seen_ids = []
+        try:
+            if raw_corners is not None and raw_ids is not None and len(raw_ids) > 0:
+                for i, mid_arr in enumerate(raw_ids):
+                    mid = int(mid_arr[0]) if hasattr(mid_arr, '__len__') else int(mid_arr)
+                    raw_seen_ids.append(mid)
+                    pts = raw_corners[i].reshape(4, 2)
+                    side_lens = [float(np.linalg.norm(pts[j] - pts[(j + 1) % 4])) for j in range(4)]
+                    raw_pixel_sizes[str(mid)] = round(float(np.mean(side_lens)), 2)
+                    cx_px = round(float(np.mean(pts[:, 0])), 1)
+                    cy_px = round(float(np.mean(pts[:, 1])), 1)
+                    raw_centers[str(mid)] = [cx_px, cy_px]
+        except Exception as px_err:
+            print(f"[POS] pixel size computation error: {px_err}")
+
         # FPS tracking
         global _pos_fps_counter, _pos_fps_last_reset, _pos_fps_current
         _pos_fps_counter += 1
@@ -3149,8 +3173,12 @@ def positioning_loop():
             _pos_st["markers"] = {str(k): round(float(v), 4)
                                    for k, v in (result.get("marker_weights") or {}).items()}
             _pos_st["ref_markers"] = list(result.get("ref_markers") or [])
-            _pos_st["seen_markers"] = list(result.get("seen_markers") or [])
-            _pos_st["seen_count"] = int(result.get("seen_count") or 0)
+            # Use raw detection for seen_markers (always available)
+            _pos_st["seen_markers"] = raw_seen_ids if raw_seen_ids else list(result.get("seen_markers") or [])
+            _pos_st["seen_count"] = len(raw_seen_ids) if raw_seen_ids else int(result.get("seen_count") or 0)
+            # Always use raw-computed pixel data (works even without ref pose)
+            _pos_st["marker_pixel_sizes"] = raw_pixel_sizes
+            _pos_st["marker_centers"] = raw_centers
             _pos_st["stale"] = stale
             _pos_st["dead_reckoning"] = result.get("dead_reckoning", False)
             _pos_st["ts"] = ts
@@ -3182,10 +3210,25 @@ def positioning_loop():
             with _rec_lock:
                 if _rec_enabled and _rec_writer is not None:
                     try:
-                        _rec_writer.write(frame if _rec_raw else ann)
+                        out_frame = frame if _rec_raw else ann
+                        # If writer was created with default resolution before frames
+                        # arrived, recreate it with the actual frame size
+                        fh_actual, fw_actual = out_frame.shape[:2]
+                        if _rec_frame_count == 0:
+                            # Check if resolution matches; if not, recreate writer
+                            _check_w = int(_rec_writer.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
+                            _check_h = int(_rec_writer.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
+                            if (_check_w != fw_actual or _check_h != fh_actual) and _check_w > 0:
+                                print(f"[REC] Resolution mismatch: writer={_check_w}x{_check_h}, frame={fw_actual}x{fh_actual}. Recreating.")
+                                _rec_writer.release()
+                                fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+                                fps_t = _pos_fps_current or 5.0
+                                _rec_writer = cv2.VideoWriter(_rec_path, fourcc, fps_t, (fw_actual, fh_actual))
+                        _rec_writer.write(out_frame)
                         _rec_frame_count += 1
-                    except Exception:
-                        pass
+                    except Exception as rec_err:
+                        if _rec_frame_count == 0:
+                            print(f"[REC] Write error on first frame: {rec_err}")
         except Exception:
             pass
 

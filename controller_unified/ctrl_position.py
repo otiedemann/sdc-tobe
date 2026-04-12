@@ -418,6 +418,8 @@ class HeadlessAruCoPositioning:
                 "targets": {},
                 "ref_markers": refs,
                 "marker_weights": marker_weights,
+                "marker_pixel_sizes": {},
+                "marker_centers": {},
                 "seen_markers": [int(m) for m in seen_ids],
                 "seen_count": len(seen_ids),
                 "capture_ts": capture_ts,
@@ -604,12 +606,26 @@ class HeadlessAruCoPositioning:
             str(mid): float(w) for mid, w in zip(ref_marker_ids, weights)
         }
 
+        # Compute average marker pixel sizes and center pixel coords for all seen markers
+        marker_pixel_sizes = {}
+        marker_centers = {}
+        for i, mid_raw in enumerate(seen_ids):
+            mid = int(mid_raw)
+            pts = corners[i].reshape(4, 2)
+            side_lens = [float(np.linalg.norm(pts[j] - pts[(j + 1) % 4])) for j in range(4)]
+            marker_pixel_sizes[str(mid)] = round(float(np.mean(side_lens)), 2)
+            cx = round(float(np.mean(pts[:, 0])), 1)
+            cy = round(float(np.mean(pts[:, 1])), 1)
+            marker_centers[str(mid)] = [cx, cy]
+
         return {
             "cam": f_pos.tolist(),
             "dir": f_dir.tolist(),
             "targets": targets,
             "ref_markers": [int(m) for m in ref_marker_ids],
             "marker_weights": marker_weights,
+            "marker_pixel_sizes": marker_pixel_sizes,
+            "marker_centers": marker_centers,
             "seen_markers": seen_ids,
             "seen_count": len(seen_ids),
             "capture_ts": capture_ts,
