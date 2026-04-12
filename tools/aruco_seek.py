@@ -578,9 +578,12 @@ def run_mission(
 
                     target_marker_id = best_id
                     send_rc_stop()
+                    centers = pos_data.get("marker_centers", {})
                     est_dist = pixel_distance_estimate(best_px) if best_px > 0 else "?"
                     log(f"MARKER FOUND! ID={target_marker_id}  "
-                        f"px_size={best_px:.0f}  est_dist≈{est_dist}m")
+                        f"px_size={best_px:.0f}  est_dist≈{est_dist}m  "
+                        f"center={centers.get(str(best_id), 'N/A')}  "
+                        f"all_px={px_sizes}")
                     phase = Phase.APPROACH
                     approach_start_time = time.time()
                     phase_start = time.time()
