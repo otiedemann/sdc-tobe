@@ -340,9 +340,21 @@ def run_mission(
     log("Pre-flight: loading arena configuration...")
     arena_cfg = get_arena_config()
     marker_positions = get_marker_positions(arena_cfg)
-    log(f"  {len(marker_positions)} markers configured")
+    marker_size = arena_cfg.get("marker_size_m", "?")
+    log(f"  {len(marker_positions)} markers configured, marker_size={marker_size}m")
     if not marker_positions:
         log("WARNING: No markers in arena config. Will use position SSE seen_markers only.")
+
+    # Start video stream — required for ArUco detection
+    # The positioning loop processes frames from the video callback;
+    # without an active video stream, no frames are fed to OpenCV.
+    log("Pre-flight: starting video stream (MJPEG)...")
+    vid_result = api_post("/api/video/start", {"mode": "mjpeg"})
+    if vid_result.get("ok"):
+        log(f"  Video stream started: {vid_result.get('mode', '?')}")
+    else:
+        log(f"  WARNING: Video start failed: {vid_result.get('error', '?')}")
+        log(f"  ArUco detection may not work without video!")
 
     # Enable position tracking
     log("Pre-flight: enabling position tracking...")
@@ -651,6 +663,13 @@ def run_mission(
 
     pos_listener.stop()
     _abort.set()
+
+    # Stop video stream
+    try:
+        api_post("/api/video/stop")
+        log("Video stream stopped")
+    except Exception:
+        pass
 
     log(f"\n{'='*60}")
     log(f"Mission ended — phase: {phase}")
