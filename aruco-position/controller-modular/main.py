@@ -163,7 +163,7 @@ def has_gui():
 # ============================================================
 
 TARGET_MARKER_ID = 15          # ArUco marker to find and approach
-APPROACH_DISTANCE = 1.5        # metres in front of the marker face
+APPROACH_DISTANCE = 0.5        # units to fly forward when marker is found
 TAKEOFF_HEIGHT_Z = 1.2         # world-frame Z (up) to wait for after takeoff
 TAKEOFF_TIMEOUT_S = 15.0       # abort takeoff after this many seconds
 SEARCH_YAW_RATE = 0.3          # rad/s slow rotation during search
@@ -355,7 +355,7 @@ class AutonomousMission:
     def _tick_search(self, vision_result, now, drone):
         seen = self._seen_markers(vision_result)
         if self.target_id in seen:
-            approach = self._compute_approach()
+            approach = self._compute_approach(vision_result)
             if approach is not None:
                 self._approach_target = approach
                 x, y, z, yaw = approach
@@ -479,45 +479,50 @@ class AutonomousMission:
         if self.ctrl is not None:
             self.ctrl.clear_target()
 
-    def _compute_approach(self) -> Optional[tuple]:
+    def _compute_approach(self, vision_result: Optional[dict]) -> Optional[tuple]:
         """
-        Return (x, y, z, yaw) for the approach position 1.5 m in front of
-        the target marker, perpendicular to its wall face.
+        Return (x, y, z, yaw) by flying 5 units forward from the current
+        cam position along the camera's current forward direction.
 
-        Position and wall type come exclusively from the arena config loaded
-        into the vision processor.  The approach height equals the marker's
-        own z so the drone hovers directly in front of it.
+        Uses vision_result["cam"] (position) and vision_result["dir"]
+        (world-frame forward unit vector) from the vision processor.
         """
-        vp  = self.vision
-        mid = self.target_id
-
-        if mid not in vp.marker_positions:
-            print(f"[mission] Marker {mid} not in arena config – cannot compute approach")
+        cam = self._get_cam_pos(vision_result)
+        if cam is None:
+            print("[mission] No cam position available – cannot compute approach")
             return None
 
-        # World position of the marker (x, y, z from arena_config.json)
-        m_pos  = np.asarray(vp.marker_positions[mid], dtype=float)
-        wall   = vp.marker_wall_type.get(mid, "front")
-        normal = _WALL_NORMALS.get(wall, np.array([1.0, 0.0, 0.0]))
+        # Camera forward direction in world frame (3-element unit vector).
+        raw_dir = None
+        if vision_result is not None:
+            raw_dir = vision_result.get("dir")
 
-        # Offset 1.5 m along the inward wall normal (XY plane only)
-        approach_x = m_pos[0] + normal[0] * self.approach_dist
-        approach_y = m_pos[1] + normal[1] * self.approach_dist
-        # Hover at the same height as the marker (z from arena_config.json)
-        approach_z = float(m_pos[2])
+        if raw_dir is not None and len(raw_dir) >= 2:
+            dx, dy = float(raw_dir[0]), float(raw_dir[1])
+        else:
+            # Fallback: fly along world +X if no direction is available.
+            dx, dy = 1.0, 0.0
 
-        # Yaw: face opposite to the inward normal → look straight at the wall
-        yaw = math.atan2(-normal[1], -normal[0])   # rad, CCW positive
+        # Normalise the horizontal (XY) component.
+        mag = math.sqrt(dx * dx + dy * dy)
+        if mag < 1e-6:
+            dx, dy = 1.0, 0.0
+        else:
+            dx, dy = dx / mag, dy / mag
+
+        target_x = cam[0] + dx * self.approach_dist
+        target_y = cam[1] + dy * self.approach_dist
+        target_z = cam[2]                            # keep current height
+        yaw      = math.atan2(dy, dx)               # face direction of travel
 
         print(
-            f"[mission] Approach for marker {mid} ({wall} wall): "
-            f"pos=({approach_x:.2f}, {approach_y:.2f}, {approach_z:.2f}) "
-            f"yaw={math.degrees(yaw):.1f}°  "
-            f"[marker at ({m_pos[0]:.2f}, {m_pos[1]:.2f}, {m_pos[2]:.2f}), "
-            f"normal=({normal[0]:.0f},{normal[1]:.0f})]"
+            f"[mission] Approach: fly {self.approach_dist} units forward  "
+            f"from ({cam[0]:.2f}, {cam[1]:.2f}, {cam[2]:.2f})  "
+            f"dir=({dx:+.2f}, {dy:+.2f})  "
+            f"→ ({target_x:.2f}, {target_y:.2f}, {target_z:.2f})"
         )
 
-        return (float(approach_x), float(approach_y), float(approach_z), float(yaw))
+        return (float(target_x), float(target_y), float(target_z), float(yaw))
 
 
 # ============================================================
