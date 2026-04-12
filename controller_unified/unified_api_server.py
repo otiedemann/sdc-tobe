@@ -2818,8 +2818,9 @@ def api_telemetry_stream():
             with telemetry_lock:
                 payload = dict(telemetry)
             yield f"data: {json.dumps(payload)}\n\n"
-            time.sleep(0.4)
-    return Response(gen(), mimetype="text/event-stream")
+            time.sleep(0.1)  # 10 Hz — matches telemetry collection rate
+    return Response(gen(), mimetype="text/event-stream",
+                    headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
 
 # --- Safety ---
