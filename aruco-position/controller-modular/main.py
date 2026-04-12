@@ -724,6 +724,7 @@ def main():
         body_y_positive_is_left=True,
         body_z_positive_is_down=True,
         yaw_positive_is_ccw=True,
+        initial_timestamp=time.monotonic(),
     )
 
     last_motion_state: Optional[MotionState] = motion_estimator.get_current_state()
@@ -958,16 +959,16 @@ def main():
                 last_motion_sample = get_motion_input()
 
                 ts = float(last_motion_sample.get("timestamp", now))
-                vx_body = float(last_motion_sample.get("vx_body", 0.0))
-                vy_body = float(last_motion_sample.get("vy_body", 0.0))
-                vz_body = float(last_motion_sample.get("vz_body", 0.0))
+                vx_world = float(last_motion_sample.get("vx_world", 0.0))
+                vy_world = float(last_motion_sample.get("vy_world", 0.0))
+                vz_world = float(last_motion_sample.get("vz_world", 0.0))
                 yaw_rate = float(last_motion_sample.get("yaw_rate", 0.0))
 
                 last_motion_state = motion_estimator.update_body_frame(
                     timestamp=ts,
-                    vx_body=vx_body,
-                    vy_body=vy_body,
-                    vz_body=vz_body,
+                    vx_world=vx_world,
+                    vy_world=vy_world,
+                    vz_world=vz_world,
                     yaw_rate=yaw_rate,
                 )
 
