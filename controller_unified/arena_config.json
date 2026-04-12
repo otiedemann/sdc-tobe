@@ -3,7 +3,7 @@
   "arena_height_m": 10.0,
   "arena_origin_x": -10.0,
   "arena_origin_y": 0.0,
-  "marker_size_m": 0.5,
+  "marker_size_m": 0.18,
   "markers": [
     {
       "id": 0,

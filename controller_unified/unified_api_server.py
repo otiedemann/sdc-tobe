@@ -3151,6 +3151,8 @@ def positioning_loop():
             _pos_st["ref_markers"] = list(result.get("ref_markers") or [])
             _pos_st["seen_markers"] = list(result.get("seen_markers") or [])
             _pos_st["seen_count"] = int(result.get("seen_count") or 0)
+            _pos_st["marker_pixel_sizes"] = result.get("marker_pixel_sizes") or {}
+            _pos_st["marker_centers"] = result.get("marker_centers") or {}
             _pos_st["stale"] = stale
             _pos_st["dead_reckoning"] = result.get("dead_reckoning", False)
             _pos_st["ts"] = ts
@@ -3182,10 +3184,25 @@ def positioning_loop():
             with _rec_lock:
                 if _rec_enabled and _rec_writer is not None:
                     try:
-                        _rec_writer.write(frame if _rec_raw else ann)
+                        out_frame = frame if _rec_raw else ann
+                        # If writer was created with default resolution before frames
+                        # arrived, recreate it with the actual frame size
+                        fh_actual, fw_actual = out_frame.shape[:2]
+                        if _rec_frame_count == 0:
+                            # Check if resolution matches; if not, recreate writer
+                            _check_w = int(_rec_writer.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
+                            _check_h = int(_rec_writer.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
+                            if (_check_w != fw_actual or _check_h != fh_actual) and _check_w > 0:
+                                print(f"[REC] Resolution mismatch: writer={_check_w}x{_check_h}, frame={fw_actual}x{fh_actual}. Recreating.")
+                                _rec_writer.release()
+                                fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+                                fps_t = _pos_fps_current or 5.0
+                                _rec_writer = cv2.VideoWriter(_rec_path, fourcc, fps_t, (fw_actual, fh_actual))
+                        _rec_writer.write(out_frame)
                         _rec_frame_count += 1
-                    except Exception:
-                        pass
+                    except Exception as rec_err:
+                        if _rec_frame_count == 0:
+                            print(f"[REC] Write error on first frame: {rec_err}")
         except Exception:
             pass
 
