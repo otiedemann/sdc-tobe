@@ -74,6 +74,7 @@ class MotionEstimator:
         dyn_gain_pos: float = 0.01,
         dyn_gain_yaw: float = 0.01,
         yaw_positive_is_ccw: bool = True,
+        initial_timestamp: float = 0.0,   # 👈 jetzt Pflicht (Default optional)
     ):
         self.history_seconds = history_seconds
         self.nominal_dt = nominal_dt
@@ -90,7 +91,7 @@ class MotionEstimator:
         x, y, z, yaw = initial_pose
         var_x, var_y, var_z, var_yaw = initial_variance
 
-        now = time.monotonic()
+        now = initial_timestamp
         self._buffer.append(
             MotionState(
                 timestamp=now,
