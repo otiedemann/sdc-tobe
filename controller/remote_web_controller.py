@@ -28,11 +28,10 @@ VIDEO_JPEG_QUALITY = int(os.getenv("VIDEO_JPEG_QUALITY", "70"))
 DRONES_CONFIG_PATH = Path(__file__).parent / "drones_config.json"
 
 DEFAULT_DRONES = {
-    "1": {"name": "Anafi 1", "type": "anafi", "base": "http://192.168.1.20:8080"},
-    "2": {"name": "Tello 1", "type": "tello", "base": "http://192.168.1.100:8080"},
-    "3": {"name": "Drone 3", "type": "tello", "base": "http://192.168.1.101:8080"},
-    "4": {"name": "Drone 4", "type": "tello", "base": "http://192.168.1.102:8080"},
-    "5": {"name": "Drone 5", "type": "tello", "base": "http://192.168.1.103:8080"},
+    "1": {"name": "Anafi 1", "type": "anafi", "base": "http://flightctrl1:8080"},
+    "2": {"name": "Anafi 2", "type": "anafi", "base": "http://flightctrl2:8080"},
+    "3": {"name": "Anafi 3", "type": "anafi", "base": "http://flightctrl3:8080"},
+    "4": {"name": "Anafi 4", "type": "anafi", "base": "http://flightctrl4:8080"},
 }
 
 def load_drones_config() -> dict:

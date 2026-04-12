@@ -1,27 +1,22 @@
 {
   "1": {
-    "base": "http://127.0.0.1:8080",
     "name": "Anafi 1",
-    "type": "anafi"
+    "type": "anafi",
+    "base": "http://flightctrl1:8080"
   },
   "2": {
-    "base": "http://192.168.1.100:8080",
-    "name": "Tello 1",
-    "type": "tello"
+    "name": "Anafi 2",
+    "type": "anafi",
+    "base": "http://flightctrl2:8080"
   },
   "3": {
-    "base": "http://192.168.1.101:8080",
-    "name": "Drone 3",
-    "type": "tello"
+    "name": "Anafi 3",
+    "type": "anafi",
+    "base": "http://flightctrl3:8080"
   },
   "4": {
-    "base": "http://192.168.1.102:8080",
-    "name": "Drone 4",
-    "type": "tello"
-  },
-  "5": {
-    "base": "http://192.168.1.103:8080",
-    "name": "Drone 5",
-    "type": "tello"
+    "name": "Anafi 4",
+    "type": "anafi",
+    "base": "http://flightctrl4:8080"
   }
 }
