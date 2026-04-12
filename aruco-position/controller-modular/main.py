@@ -1,6 +1,7 @@
 import base64
 import json
 import logging
+import math
 import os
 import platform
 import socket
@@ -158,6 +159,368 @@ def has_gui():
     return bool(os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"))
 
 # ============================================================
+# Autonomous Mission
+# ============================================================
+
+TARGET_MARKER_ID = 15          # ArUco marker to find and approach
+APPROACH_DISTANCE = 1.5        # metres in front of the marker face
+TAKEOFF_HEIGHT_Z = 1.2         # world-frame Z (up) to wait for after takeoff
+TAKEOFF_TIMEOUT_S = 15.0       # abort takeoff after this many seconds
+SEARCH_YAW_RATE = 0.3          # rad/s slow rotation during search
+HOLD_ARRIVE_RADIUS = 0.25      # m – radius at which HOLD is declared
+
+# Inward wall normals matching arena_config.json:
+#   front wall  at y= 0  → normal +Y
+#   back  wall  at y=10  → normal -Y
+#   right wall  at x=10  → normal -X
+#   left  wall  at x=-10 → normal +X
+_WALL_NORMALS = {
+    "front":  np.array([ 0.0,  1.0, 0.0]),
+    "back":   np.array([ 0.0, -1.0, 0.0]),
+    "left":   np.array([ 1.0,  0.0, 0.0]),
+    "right":  np.array([-1.0,  0.0, 0.0]),
+}
+
+
+class MissionPhase:
+    IDLE     = "idle"
+    TAKEOFF  = "takeoff"
+    SEARCH   = "search"
+    APPROACH = "approach"
+    HOLD     = "hold"
+    FAILED   = "failed"
+    ABORTED  = "aborted"
+
+
+class AutonomousMission:
+    """
+    State machine that:
+      1. Commands the drone to take off.
+      2. Slowly rotates (SEARCH) until ArUco marker <target_marker_id> is seen.
+      3. Flies to <approach_distance> metres in front of the marker at a
+         90-degree angle (perpendicular to the marker face).
+      4. Holds position indefinitely.
+
+    Integration in main.py
+    ----------------------
+    After the prediction block and before the outgoing payload:
+
+        mission.tick(last_prediction, last_vision_update, anafi_drone)
+
+    The mission drives ctrl_module.set_target() internally and sends
+    Olympe TakeOff / PCMD commands through the drone handle.
+    """
+
+    def __init__(
+        self,
+        target_marker_id: int,
+        approach_distance: float,
+        vision_processor,               # HeadlessAruCoPositioning instance
+        ctrl_module,                    # controller module (may be None)
+        takeoff_height_z: float = TAKEOFF_HEIGHT_Z,
+    ) -> None:
+        self.target_id        = target_marker_id
+        self.approach_dist    = approach_distance
+        self.vision           = vision_processor
+        self.ctrl             = ctrl_module
+        self.takeoff_height_z = takeoff_height_z
+
+        self._phase: str               = MissionPhase.IDLE
+        self._phase_start: float       = 0.0
+        self._approach_target: Optional[tuple] = None  # (x, y, z, yaw)
+        self._last_seen_ts: float      = 0.0
+        self._search_yaw_sent: bool    = False
+        self._pending_phase: Optional[str] = None   # next phase awaiting SPACE confirm
+        self._pending_prompt: str      = ""          # message shown while waiting
+
+    # ------------------------------------------------------------------ #
+    # Public                                                               #
+    # ------------------------------------------------------------------ #
+
+    def start(self, drone) -> None:
+        """Call once to kick off the mission (issues TakeOff)."""
+        if self._phase != MissionPhase.IDLE:
+            return
+        print(f"[mission] Starting – target marker {self.target_id}")
+        self._transition(MissionPhase.TAKEOFF)
+        self._send_takeoff(drone)
+
+    @property
+    def phase(self) -> str:
+        return self._phase
+
+    @property
+    def waiting_for_confirm(self) -> bool:
+        """True when the mission is paused and waiting for a SPACE keypress."""
+        return self._pending_phase is not None
+
+    @property
+    def pending_prompt(self) -> str:
+        return self._pending_prompt
+
+    def confirm(self, drone=None) -> None:
+        """Advance to the queued next phase (called when SPACE is pressed)."""
+        if self._pending_phase is None:
+            return
+        phase = self._pending_phase
+        # Kick off phase-specific actions before the transition.
+        if phase == MissionPhase.SEARCH:
+            self._begin_search(drone)
+        elif phase == MissionPhase.APPROACH and self._approach_target is not None:
+            x, y, z, yaw = self._approach_target
+            if self.ctrl is not None:
+                self.ctrl.set_target(x, y, z, hold_yaw=yaw)
+        print(f"[mission] Confirmed → {phase}")
+        self._transition(phase)
+
+    def abort(self, drone) -> None:
+        """
+        Emergency abort: stop the mission, command the drone to land, and
+        clear the position controller target.  Safe to call from any thread.
+        """
+        if self._phase in (MissionPhase.IDLE, MissionPhase.ABORTED):
+            return
+        print("\n🚨 [mission] ABORT – sending Landing command")
+        self._transition(MissionPhase.ABORTED)
+        if self.ctrl is not None:
+            self.ctrl.clear_target()
+        if drone is not None:
+            try:
+                from olympe.messages.ardrone3.Piloting import Landing
+                drone(Landing())
+                print("[mission] Landing command sent")
+            except Exception as exc:
+                print(f"[mission] Landing command failed: {exc}")
+
+    def tick(
+        self,
+        state: Optional[dict],
+        vision_result: Optional[dict],
+        drone,
+    ) -> None:
+        """Call every control tick (25 Hz) after the prediction step.
+
+        Position decisions use vision_result["cam"] exclusively.
+        `state` (prediction) is only kept as a takeoff-altitude fallback
+        when no ArUco markers are visible yet.
+        """
+        if self._phase in (MissionPhase.IDLE, MissionPhase.FAILED, MissionPhase.ABORTED):
+            return
+
+        # Paused: waiting for operator to press SPACE before the next step.
+        if self._pending_phase is not None:
+            return
+
+        now = time.monotonic()
+
+        if self._phase == MissionPhase.TAKEOFF:
+            self._tick_takeoff(vision_result, state, now, drone)
+
+        elif self._phase == MissionPhase.SEARCH:
+            self._tick_search(vision_result, now, drone)
+
+        elif self._phase == MissionPhase.APPROACH:
+            self._tick_approach(vision_result, now)
+
+        elif self._phase == MissionPhase.HOLD:
+            self._tick_hold(vision_result, now)
+
+    # ------------------------------------------------------------------ #
+    # Phase handlers                                                       #
+    # ------------------------------------------------------------------ #
+
+    def _tick_takeoff(self, vision_result, state_fallback, now, drone):
+        elapsed = now - self._phase_start
+        if elapsed > TAKEOFF_TIMEOUT_S:
+            print("[mission] Takeoff timeout – aborting")
+            self._transition(MissionPhase.FAILED)
+            return
+
+        # Prefer CAM-derived altitude; fall back to motion-estimator z when
+        # no markers are visible yet (drone still on ground / spinning up).
+        cam = self._get_cam_pos(vision_result)
+        if cam is not None:
+            z = cam[2]
+        elif state_fallback is not None:
+            z = float(state_fallback.get("z", 0.0))
+        else:
+            return
+
+        if z >= self.takeoff_height_z * 0.7:
+            self._queue_confirm(
+                MissionPhase.SEARCH,
+                f"Airborne – cam z={z:.2f} m.  Ready to start SEARCH.",
+            )
+
+    def _tick_search(self, vision_result, now, drone):
+        seen = self._seen_markers(vision_result)
+        if self.target_id in seen:
+            approach = self._compute_approach()
+            if approach is not None:
+                self._approach_target = approach
+                x, y, z, yaw = approach
+                self._queue_confirm(
+                    MissionPhase.APPROACH,
+                    f"Marker {self.target_id} found – "
+                    f"approach → ({x:.2f}, {y:.2f}, {z:.2f})  "
+                    f"yaw={math.degrees(yaw):.1f}°.  Ready to APPROACH.",
+                )
+                return
+
+        # Rotate in place: pure yaw PCMD only — no position controller target.
+        if drone is not None:
+            self._send_search_yaw(drone)
+
+    def _tick_approach(self, vision_result, now):
+        if self._approach_target is None:
+            self._transition(MissionPhase.SEARCH)
+            return
+
+        seen = self._seen_markers(vision_result)
+        if self.target_id in seen:
+            self._last_seen_ts = now
+
+        # Primary: controller HOVER phase
+        if self.ctrl is not None and hasattr(self.ctrl, "position_controller"):
+            from controller import Phase
+            if self.ctrl.position_controller.phase == Phase.HOVER:
+                self._queue_confirm(
+                    MissionPhase.HOLD,
+                    "Arrived at approach point.  Ready to HOLD.",
+                )
+            return
+
+        # Fallback: distance check using cam position
+        cam = self._get_cam_pos(vision_result)
+        if cam is not None and self._approach_target is not None:
+            tx, ty, tz, _ = self._approach_target
+            dist = math.sqrt((tx - cam[0])**2 + (ty - cam[1])**2 + (tz - cam[2])**2)
+            if dist < HOLD_ARRIVE_RADIUS:
+                self._queue_confirm(
+                    MissionPhase.HOLD,
+                    f"Arrived (cam dist={dist:.2f} m).  Ready to HOLD.",
+                )
+
+    def _tick_hold(self, vision_result, now):
+        # Controller holds position; just track marker visibility.
+        seen = self._seen_markers(vision_result)
+        if self.target_id in seen:
+            self._last_seen_ts = now
+        elif now - self._last_seen_ts > 5.0:
+            print(
+                f"[mission] HOLD – marker {self.target_id} not seen for "
+                f"{now - self._last_seen_ts:.1f} s"
+            )
+
+    # ------------------------------------------------------------------ #
+    # Helpers                                                              #
+    # ------------------------------------------------------------------ #
+
+    def _queue_confirm(self, next_phase: str, prompt: str) -> None:
+        """Pause mission and wait for SPACE before entering next_phase."""
+        if self._pending_phase == next_phase:
+            return   # already queued – don't spam the console
+        self._pending_phase = next_phase
+        self._pending_prompt = prompt
+        print(f"\n⏸  [mission] {prompt}")
+        print(f"   → Press SPACE to continue to [{next_phase.upper()}]  (ESC to abort)")
+
+    def _transition(self, phase: str) -> None:
+        self._pending_phase = None
+        self._pending_prompt = ""
+        print(f"[mission] {self._phase} → {phase}")
+        self._phase = phase
+        self._phase_start = time.monotonic()
+
+    @staticmethod
+    def _send_takeoff(drone) -> None:
+        if drone is None:
+            print("[mission] No drone handle – skipping TakeOff command")
+            return
+        try:
+            from olympe.messages.ardrone3.Piloting import TakeOff
+            drone(TakeOff())
+            print("[mission] TakeOff command sent")
+        except Exception as exc:
+            print(f"[mission] TakeOff failed: {exc}")
+
+    _search_seq: int = 0   # class-level PCMD sequence counter for search
+
+    def _send_search_yaw(self, drone) -> None:
+        """Send a pure yaw PCMD — zero roll, pitch, and gaz — to rotate in place."""
+        try:
+            from olympe.messages.ardrone3.Piloting import PCMD
+            AutonomousMission._search_seq = (AutonomousMission._search_seq + 1) & 0x7FFFFFFF
+            yaw_pct = int(SEARCH_YAW_RATE / 0.8 * 100)  # scale: 0.8 rad/s → 100 %
+            drone(PCMD(1, 0, 0, yaw_pct, 0, AutonomousMission._search_seq))
+        except Exception:
+            pass
+
+    @staticmethod
+    def _get_cam_pos(vision_result: Optional[dict]) -> Optional[list]:
+        """Return [x, y, z] from vision_result['cam'], or None if unavailable."""
+        if vision_result is None:
+            return None
+        cam = vision_result.get("cam")
+        if cam is None or len(cam) < 3:
+            return None
+        return [float(cam[0]), float(cam[1]), float(cam[2])]
+
+    @staticmethod
+    def _seen_markers(vision_result: Optional[dict]):
+        if vision_result is None:
+            return set()
+        return set(int(m) for m in vision_result.get("seen_markers", []))
+
+    def _begin_search(self, drone) -> None:
+        print(f"[mission] SEARCH – yaw-rotating to find marker {self.target_id}")
+        # Clear any active controller target so the position controller outputs
+        # nothing and the pure-yaw PCMD is the only command sent to the drone.
+        if self.ctrl is not None:
+            self.ctrl.clear_target()
+
+    def _compute_approach(self) -> Optional[tuple]:
+        """
+        Return (x, y, z, yaw) for the approach position 1.5 m in front of
+        the target marker, perpendicular to its wall face.
+
+        Position and wall type come exclusively from the arena config loaded
+        into the vision processor.  The approach height equals the marker's
+        own z so the drone hovers directly in front of it.
+        """
+        vp  = self.vision
+        mid = self.target_id
+
+        if mid not in vp.marker_positions:
+            print(f"[mission] Marker {mid} not in arena config – cannot compute approach")
+            return None
+
+        # World position of the marker (x, y, z from arena_config.json)
+        m_pos  = np.asarray(vp.marker_positions[mid], dtype=float)
+        wall   = vp.marker_wall_type.get(mid, "front")
+        normal = _WALL_NORMALS.get(wall, np.array([1.0, 0.0, 0.0]))
+
+        # Offset 1.5 m along the inward wall normal (XY plane only)
+        approach_x = m_pos[0] + normal[0] * self.approach_dist
+        approach_y = m_pos[1] + normal[1] * self.approach_dist
+        # Hover at the same height as the marker (z from arena_config.json)
+        approach_z = float(m_pos[2])
+
+        # Yaw: face opposite to the inward normal → look straight at the wall
+        yaw = math.atan2(-normal[1], -normal[0])   # rad, CCW positive
+
+        print(
+            f"[mission] Approach for marker {mid} ({wall} wall): "
+            f"pos=({approach_x:.2f}, {approach_y:.2f}, {approach_z:.2f}) "
+            f"yaw={math.degrees(yaw):.1f}°  "
+            f"[marker at ({m_pos[0]:.2f}, {m_pos[1]:.2f}, {m_pos[2]:.2f}), "
+            f"normal=({normal[0]:.0f},{normal[1]:.0f})]"
+        )
+
+        return (float(approach_x), float(approach_y), float(approach_z), float(yaw))
+
+
+# ============================================================
 # Main
 # ============================================================
 
@@ -239,6 +602,14 @@ def main():
 
     enable_motion_input = "--motion-input" in sys.argv
 
+    mission_enabled = "--mission" in sys.argv
+    mission_marker_id = TARGET_MARKER_ID
+    if "--mission-marker" in sys.argv:
+        try:
+            mission_marker_id = int(sys.argv[sys.argv.index("--mission-marker") + 1])
+        except Exception:
+            print("⚠️ Invalid --mission-marker value, using default.")
+
     # --ctrl-target x,y,z   e.g. --ctrl-target 3.0,1.5,1.2
     ctrl_target: Optional[tuple] = None
     if "--ctrl-target" in sys.argv:
@@ -283,6 +654,7 @@ def main():
     print(f"🎯 Ctrl Target: {ctrl_target if ctrl_target else 'none'}")
     print(f"🖥️ Preview Requested: {'YES' if preview_requested else 'NO'}")
     print(f"🖥️ GUI Overlay: {'ON' if gui_enabled else 'OFF'}")
+    print(f"🎯 Autonomous Mission: {'ON (marker ' + str(mission_marker_id) + ')' if mission_enabled else 'OFF'}")
 
     # --------------------------------------------------------
     # Calibration
@@ -318,6 +690,19 @@ def main():
         outlier_pos_thresh=max(0.1, outlier_pos_thresh),
         target_z_pos=target_z_pos,
     )
+
+    # --------------------------------------------------------
+    # Autonomous mission (optional)
+    # --------------------------------------------------------
+    mission: Optional[AutonomousMission] = None
+    if mission_enabled:
+        mission = AutonomousMission(
+            target_marker_id=mission_marker_id,
+            approach_distance=APPROACH_DISTANCE,
+            vision_processor=vision_processor,
+            ctrl_module=ctrl_module,
+            takeoff_height_z=abs(target_z_pos),   # use configured flight height
+        )
 
     # --------------------------------------------------------
     # Rates
@@ -434,6 +819,9 @@ def main():
         if ctrl_target is not None and ctrl_module is not None:
             ctrl_module.set_target(*ctrl_target)
 
+        if mission is not None:
+            mission.start(anafi_drone)
+
     else:
         cap = cv2.VideoCapture(camera_src)
         cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
@@ -445,6 +833,63 @@ def main():
     sock_cmd = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock_cmd.bind(("0.0.0.0", UDP_CMD_PORT))
     sock_cmd.setblocking(False)
+
+    # --------------------------------------------------------
+    # Emergency abort flag + keyboard listener (headless)
+    # Trigger: press ESC in the GUI window, send {"abort":true}
+    # via UDP, or press ESC / 'q' in the terminal (headless).
+    # --------------------------------------------------------
+    _abort_flag   = threading.Event()
+    _confirm_flag = threading.Event()
+
+    def _keyboard_listener():
+        """Non-blocking terminal key listener for headless / no-GUI mode.
+
+        SPACE  → confirm next mission step (_confirm_flag)
+        ESC/q  → emergency abort         (_abort_flag)
+        Uses msvcrt on Windows, select+termios on POSIX.
+        """
+        try:
+            if platform.system().lower() == "windows":
+                import msvcrt
+                while not _abort_flag.is_set():
+                    if msvcrt.kbhit():
+                        ch = msvcrt.getch()
+                        if ch in (b'\x1b', b'q', b'Q'):
+                            print("\n[abort] ESC / q detected in terminal")
+                            _abort_flag.set()
+                            return
+                        if ch == b' ':
+                            print("\n[mission] SPACE – confirm")
+                            _confirm_flag.set()
+                    time.sleep(0.05)
+            else:
+                import select
+                import sys as _sys
+                import tty
+                import termios
+                fd = _sys.stdin.fileno()
+                old = termios.tcgetattr(fd)
+                try:
+                    tty.setraw(fd)
+                    while not _abort_flag.is_set():
+                        r, _, _ = select.select([_sys.stdin], [], [], 0.05)
+                        if r:
+                            ch = _sys.stdin.read(1)
+                            if ch in ('\x1b', 'q', 'Q'):
+                                print("\n[abort] ESC / q detected in terminal")
+                                _abort_flag.set()
+                                return
+                            if ch == ' ':
+                                print("\n[mission] SPACE – confirm")
+                                _confirm_flag.set()
+                finally:
+                    termios.tcsetattr(fd, termios.TCSADRAIN, old)
+        except Exception:
+            pass  # terminal not available (piped / background process) – ignore
+
+    _kb_thread = threading.Thread(target=_keyboard_listener, name="kb_listener", daemon=True)
+    _kb_thread.start()
 
     debug_mode = False
     last_send_time = 0.0
@@ -481,10 +926,29 @@ def main():
                 cmd = json.loads(data.decode())
                 if "debug" in cmd:
                     debug_mode = bool(cmd["debug"])
+                if cmd.get("abort"):
+                    print("[abort] Abort received via UDP command")
+                    _abort_flag.set()
             except BlockingIOError:
                 pass
             except Exception:
                 pass
+
+            # --------------------------------------
+            # Emergency abort check
+            # --------------------------------------
+            if _abort_flag.is_set() and mission is not None and mission.phase not in (
+                MissionPhase.ABORTED, MissionPhase.IDLE
+            ):
+                mission.abort(anafi_drone)
+
+            # --------------------------------------
+            # Manual SPACE confirm
+            # --------------------------------------
+            if _confirm_flag.is_set():
+                _confirm_flag.clear()
+                if mission is not None and mission.waiting_for_confirm:
+                    mission.confirm(drone=anafi_drone)
 
             # --------------------------------------
             # Motion update @ 25 Hz
@@ -616,7 +1080,12 @@ def main():
                 if rc is not None and anafi_drone is not None:
                     ctrl_module.send_pcmd_olympe(anafi_drone, rc)
 
-            
+            # --------------------------------------
+            # Autonomous mission tick
+            # --------------------------------------
+            if mission is not None:
+                mission.tick(last_prediction, last_vision_update, anafi_drone)
+
             # --------------------------------------
             # Outgoing payload
             # Alte Daten beibehalten + neue ergänzen
@@ -680,6 +1149,15 @@ def main():
 
             if ctrl_module is not None:
                 result["ctrl"] = ctrl_module.position_controller.status()
+
+            if mission is not None:
+                result["mission"] = {
+                    "phase": mission.phase,
+                    "target_marker": mission.target_id,
+                    "approach_target": list(mission._approach_target) if mission._approach_target else None,
+                    "waiting_confirm": mission.waiting_for_confirm,
+                    "confirm_prompt": mission.pending_prompt if mission.waiting_for_confirm else None,
+                }
 
             # --------------------------------------
             # Local preview
@@ -759,11 +1237,35 @@ def main():
                         2,
                     )
 
+                if mission is not None:
+                    phase_color = (0, 255, 0) if mission.phase == MissionPhase.HOLD else \
+                                  (0, 0, 255) if mission.phase == MissionPhase.ABORTED else \
+                                  (0, 165, 255)
+                    if mission.waiting_for_confirm:
+                        overlay_txt = f"⏸ {mission.pending_prompt}  [SPACE=confirm  ESC=abort]"
+                        phase_color = (0, 255, 255)   # yellow while waiting
+                    else:
+                        overlay_txt = f"MISSION: {mission.phase.upper()}  [ESC=abort]"
+                    cv2.putText(
+                        preview,
+                        overlay_txt,
+                        (10, preview.shape[0] - 15),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.55,
+                        phase_color,
+                        2,
+                    )
+
                 try:
                     cv2.imshow("aruco_position Preview", preview)
                     key = cv2.waitKey(1) & 0xFF
                     if key == ord("q"):
                         break
+                    if key == 27:   # ESC
+                        print("[abort] ESC pressed in preview window")
+                        _abort_flag.set()
+                    if key == 32:   # SPACE
+                        _confirm_flag.set()
                 except cv2.error:
                     gui_available = False
                     print("\n⚠️ OpenCV HighGUI not available. Disabling local preview window.")
