@@ -504,9 +504,15 @@ def run_mission(
     log(f"Mission start — phase: {phase}")
     log(f"{'='*60}\n")
 
+    _last_tick = time.time()
     try:
         while phase not in (Phase.DONE, Phase.ABORT) and not _abort.is_set():
-            tick_start = time.time()
+            # ── Tick timing (at top so 'continue' never skips it) ───
+            now = time.time()
+            sleep_time = max(0.0, tick_interval - (now - _last_tick))
+            if sleep_time > 0:
+                _abort.wait(sleep_time)
+            _last_tick = time.time()
 
             # ── Global timeout ───────────────────────────────────────
             elapsed = time.time() - mission_start
@@ -782,12 +788,6 @@ def run_mission(
                 log(f"  Land result: {result}")
                 time.sleep(3.0)
                 phase = Phase.DONE
-
-            # ── Tick timing ──────────────────────────────────────────
-            elapsed = time.time() - tick_start
-            sleep_time = max(0.0, tick_interval - elapsed)
-            if sleep_time > 0:
-                _abort.wait(sleep_time)
 
     except KeyboardInterrupt:
         log("\n\nCTRL+C — ABORTING MISSION")
