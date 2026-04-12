@@ -3208,24 +3208,23 @@ def positioning_loop():
                     _pos_annotated_jpeg = jpg2.tobytes()
             # Write frame to recording if active (raw or annotated)
             with _rec_lock:
-                if _rec_enabled and _rec_writer is not None:
+                if _rec_enabled:
                     try:
                         out_frame = frame if _rec_raw else ann
-                        # If writer was created with default resolution before frames
-                        # arrived, recreate it with the actual frame size
                         fh_actual, fw_actual = out_frame.shape[:2]
-                        if _rec_frame_count == 0:
-                            # Check if resolution matches; if not, recreate writer
-                            _check_w = int(_rec_writer.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
-                            _check_h = int(_rec_writer.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
-                            if (_check_w != fw_actual or _check_h != fh_actual) and _check_w > 0:
-                                print(f"[REC] Resolution mismatch: writer={_check_w}x{_check_h}, frame={fw_actual}x{fh_actual}. Recreating.")
-                                _rec_writer.release()
-                                fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-                                fps_t = _pos_fps_current or 5.0
-                                _rec_writer = cv2.VideoWriter(_rec_path, fourcc, fps_t, (fw_actual, fh_actual))
-                        _rec_writer.write(out_frame)
-                        _rec_frame_count += 1
+                        # Lazy-create writer on first frame — guarantees correct resolution
+                        if _rec_writer is None:
+                            fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+                            fps_t = _pos_fps_current or 5.0
+                            _rec_writer = cv2.VideoWriter(_rec_path, fourcc, fps_t, (fw_actual, fh_actual))
+                            if _rec_writer.isOpened():
+                                print(f"[REC] Writer created: {fw_actual}x{fh_actual} @ {fps_t}fps → {_rec_path}")
+                            else:
+                                print(f"[REC] ERROR: Writer failed to open for {fw_actual}x{fh_actual}")
+                                _rec_writer = None
+                        if _rec_writer is not None:
+                            _rec_writer.write(out_frame)
+                            _rec_frame_count += 1
                     except Exception as rec_err:
                         if _rec_frame_count == 0:
                             print(f"[REC] Write error on first frame: {rec_err}")
@@ -3308,21 +3307,15 @@ def api_rec_start():
         rec_dir.mkdir(exist_ok=True)
         full_path = str(rec_dir / fname)
         try:
-            # Use first available frame to get resolution; fall back to 960x720
-            with _pos_st_lock:
-                fw = _pos_st.get("frame_w") or 960
-                fh = _pos_st.get("frame_h") or 720
-            fps_target = _pos_fps_current or 5.0
-            fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-            writer = cv2.VideoWriter(full_path, fourcc, fps_target, (fw, fh))
-            if not writer.isOpened():
-                return jsonify(ok=False, error="VideoWriter failed to open")
-            _rec_writer = writer
+            # Don't create the VideoWriter yet — we create it lazily on the
+            # first frame so we know the actual resolution. This avoids the
+            # resolution mismatch issue (writer at 960x720 vs frame at 1280x720).
+            _rec_writer = None  # created on first frame
             _rec_path = full_path
             _rec_frame_count = 0
             _rec_raw = raw_mode
             _rec_enabled = True
-            print(f"[REC] Recording started ({'raw' if raw_mode else 'annotated'}): {full_path} @ {fw}x{fh} {fps_target}fps")
+            print(f"[REC] Recording armed ({'raw' if raw_mode else 'annotated'}): {full_path} (writer created on first frame)")
             return jsonify(ok=True, path=full_path)
         except Exception as e:
             return jsonify(ok=False, error=str(e))
