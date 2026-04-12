@@ -2815,8 +2815,13 @@ def api_telemetry():
 def api_telemetry_stream():
     def gen():
         while running:
+            now = time.time()
+            age = (now - last_state_seen) if last_state_seen else 9999.0
             with telemetry_lock:
                 payload = dict(telemetry)
+            payload["state_age_s"] = round(age, 3)
+            payload["state_fresh"] = age <= 2.0
+            payload["drone_type"] = drone_type
             yield f"data: {json.dumps(payload)}\n\n"
             time.sleep(0.1)  # 10 Hz — matches telemetry collection rate
     return Response(gen(), mimetype="text/event-stream",
