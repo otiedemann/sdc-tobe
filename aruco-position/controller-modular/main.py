@@ -1077,7 +1077,7 @@ def main():
             # --------------------------------------
 
             if ctrl_module is not None and last_prediction is not None:
-                rc = ctrl_module.update(pred)
+                rc = ctrl_module.update(last_prediction )
                 if rc is not None:
                 ctrl.send_pcmd_olympe(drone, rc)
 
