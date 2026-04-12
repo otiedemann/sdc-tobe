@@ -70,6 +70,24 @@ def pixel_distance_estimate(avg_pixel_size: float) -> float:
     return CALIB_A * avg_pixel_size ** (-CALIB_B)
 
 
+def marker_skew(left_len: float, right_len: float) -> float:
+    """
+    Compute perspective skew from left/right edge lengths of a marker.
+
+    When viewing a marker straight-on, left_len ≈ right_len → skew ≈ 0.
+    When the drone is to the LEFT of the marker normal:
+      - right edge appears longer (closer) → skew > 0 → need to strafe RIGHT
+    When the drone is to the RIGHT:
+      - left edge appears longer → skew < 0 → need to strafe LEFT
+
+    Returns: normalised skew in [-1, +1].  Positive = strafe right needed.
+    """
+    total = left_len + right_len
+    if total < 1.0:
+        return 0.0
+    return (right_len - left_len) / total
+
+
 # ─── Globals ─────────────────────────────────────────────────────────────────
 
 _abort = threading.Event()
@@ -134,7 +152,7 @@ class VideoMarkerTracker:
     def __init__(self, api_base: str):
         self._url = f"{api_base}/api/position/video"
         self._lock = threading.Lock()
-        self._markers: dict = {}  # {id: {"center": [cx,cy], "px_size": float}}
+        self._markers: dict = {}  # {id: {"center": [cx,cy], "px_size": float, "corners": [[x,y]*4], "left_len": float, "right_len": float}}
         self._frame_w: int = 1280
         self._frame_h: int = 720
         self._last_ts: float = 0.0
@@ -245,14 +263,21 @@ class VideoMarkerTracker:
                                 for i, mid_arr in enumerate(ids):
                                     mid = int(mid_arr[0])
                                     pts = corners[i].reshape(4, 2)
+                                    # ArUco corner order: TL(0), TR(1), BR(2), BL(3)
                                     side_lens = [float(np.linalg.norm(
                                         pts[j] - pts[(j + 1) % 4])) for j in range(4)]
                                     px_size = float(np.mean(side_lens))
                                     cx = float(np.mean(pts[:, 0]))
                                     cy = float(np.mean(pts[:, 1]))
+                                    # Left edge: TL→BL (pts[0]→pts[3])
+                                    # Right edge: TR→BR (pts[1]→pts[2])
+                                    left_len = float(np.linalg.norm(pts[0] - pts[3]))
+                                    right_len = float(np.linalg.norm(pts[1] - pts[2]))
                                     new_markers[mid] = {
                                         "center": [round(cx, 1), round(cy, 1)],
                                         "px_size": round(px_size, 2),
+                                        "left_len": round(left_len, 2),
+                                        "right_len": round(right_len, 2),
                                     }
 
                             with self._lock:
@@ -865,35 +890,45 @@ def run_mission(
                 err_y = (mk_cy - img_cy) / img_cy
                 est_dist = pixel_distance_estimate(mk_px_size)
 
-                # Pure yaw to face the marker
+                # Perspective skew: are we looking at the marker from an angle?
+                skew = 0.0
+                if vid_info and "left_len" in vid_info and "right_len" in vid_info:
+                    skew = marker_skew(vid_info["left_len"], vid_info["right_len"])
+
+                # YAW: centre marker horizontally
                 yaw_P = 45.0
                 yaw_rc = _clamp(int(err_x * yaw_P), -35, 35)
 
-                # Also correct altitude to match marker height
+                # LATERAL: strafe to get in front of the marker (correct skew)
+                # Skew > 0 means drone is to the left → strafe right
+                skew_P = 25.0
+                lr = _clamp(int(skew * skew_P), -15, 15)
+
+                # ALTITUDE: match marker height
                 alt_P = 35.0
                 ud = _clamp(int(-err_y * alt_P), -25, 25)
 
-                # No forward/lateral movement during alignment
-                send_rc(0, 0, ud, yaw_rc)
+                send_rc(lr, 0, ud, yaw_rc)
 
-                # Check if centred enough to proceed
-                if abs(err_x) < 0.08 and abs(err_y) < 0.15:
+                # Check if centred AND square (no skew) to proceed
+                aligned = abs(err_x) < 0.08 and abs(err_y) < 0.15 and abs(skew) < 0.06
+                if aligned:
                     _align_centered_ticks += 1
                 else:
                     _align_centered_ticks = 0
 
-                if _align_centered_ticks >= CONTROL_HZ * 1:  # 1s centred
+                if _align_centered_ticks >= CONTROL_HZ * 1:  # 1s centred+square
                     log(f"ALIGNED!  >>> {est_dist:.2f}m <<<  "
-                        f"err_x={err_x:+.3f}  err_y={err_y:+.3f}  "
+                        f"err_x={err_x:+.3f}  skew={skew:+.3f}  "
                         f"— proceeding to approach")
                     phase = Phase.APPROACH
                     phase_start = time.time()
                     _approach_stable_ticks = 0
                 else:
                     log(f"Align:  >>> {est_dist:.2f}m <<<  "
-                        f"err_x={err_x:+.2f} err_y={err_y:+.2f}  "
-                        f"yaw={yaw_rc} ud={ud}  "
-                        f"centered={_align_centered_ticks}/{CONTROL_HZ}  [{data_src}]")
+                        f"err_x={err_x:+.2f} err_y={err_y:+.2f} skew={skew:+.2f}  "
+                        f"RC lr={lr} yaw={yaw_rc} ud={ud}  "
+                        f"ok={_align_centered_ticks}/{CONTROL_HZ}  [{data_src}]")
 
             # ── APPROACH — visual servoing ──────────────────────────────
             #
@@ -985,39 +1020,41 @@ def run_mission(
 
                     est_dist = pixel_distance_estimate(mk_px_size)
 
+                    # Perspective skew: detect if approaching from an angle
+                    skew = 0.0
+                    if vid_info and "left_len" in vid_info and "right_len" in vid_info:
+                        skew = marker_skew(vid_info["left_len"], vid_info["right_len"])
+
                     # YAW: centre marker horizontally → face the marker directly
-                    # Strong P-gain so the drone actively rotates to face it
                     yaw_P = 40.0
                     yaw_rc = _clamp(int(err_x * yaw_P), -30, 30)
 
-                    # LATERAL: strafe to keep marker centred while yaw catches up
-                    # This prevents the drone from arcing — it flies straight at
-                    # the marker instead of curving toward it
-                    lr_P = 15.0
-                    lr = _clamp(int(err_x * lr_P), -12, 12)
+                    # LATERAL: strafe to correct perspective skew
+                    # This moves the drone to be directly in front of the marker
+                    # (not just pointing at it, but positioned in front of it)
+                    skew_P = 20.0
+                    err_x_P = 12.0
+                    lr = _clamp(int(skew * skew_P + err_x * err_x_P), -15, 15)
 
-                    # ALTITUDE: match marker altitude — keep it exactly centred
-                    # vertically. Higher P-gain + wider clamp for strong correction.
+                    # ALTITUDE: match marker altitude
                     alt_P = 35.0
                     ud = _clamp(int(-err_y * alt_P), -25, 25)
 
                     # FORWARD/BACKWARD: proportional distance controller
-                    # Positive dist_err = too far → fly forward
-                    # Negative dist_err = too close → fly backward (away from wall!)
                     dist_err = est_dist - hover_distance
                     dist_P = 8.0
                     fb = _clamp(int(dist_err * dist_P), -approach_speed, approach_speed)
 
                     # Don't fly forward unless well-aligned with marker
-                    if abs(err_x) > 0.15 and fb > 0:
-                        fb = 0  # yaw to re-align first
+                    if (abs(err_x) > 0.15 or abs(skew) > 0.10) and fb > 0:
+                        fb = 0  # align first, then approach
 
-                    # Transition to HOVER once stable near target distance
-                    if abs(dist_err) < 0.3 and abs(err_x) < 0.15:
+                    # Transition to HOVER once stable near target distance + aligned
+                    if abs(dist_err) < 0.3 and abs(err_x) < 0.15 and abs(skew) < 0.08:
                         _approach_stable_ticks += 1
                         if _approach_stable_ticks >= CONTROL_HZ * 1:  # 1s stable
                             log(f"ARRIVED!  >>> {est_dist:.2f}m <<<  "
-                                f"(target {hover_distance}m)  px={mk_px_size:.0f}  "
+                                f"(target {hover_distance}m)  skew={skew:+.3f}  "
                                 f"[{data_src}]")
                             phase = Phase.HOVER
                             phase_start = time.time()
@@ -1027,7 +1064,7 @@ def run_mission(
 
                     send_rc(lr, fb, ud, yaw_rc)
                     log(f"Approach  >>> {est_dist:.2f}m <<<  (target {hover_distance}m)  "
-                        f"px={mk_px_size:.0f}  err_x={err_x:+.2f} err_y={err_y:+.2f}  "
+                        f"px={mk_px_size:.0f}  err_x={err_x:+.2f} skew={skew:+.2f}  "
                         f"RC lr={lr} fb={fb} ud={ud} yaw={yaw_rc}  [{data_src}]")
 
                 else:
@@ -1108,23 +1145,25 @@ def run_mission(
                     err_y = (mk_cy - img_cy) / img_cy
                     est_dist = pixel_distance_estimate(mk_px_size)
 
+                    # Perspective skew
+                    skew = 0.0
+                    if vid_info and "left_len" in vid_info and "right_len" in vid_info:
+                        skew = marker_skew(vid_info["left_len"], vid_info["right_len"])
+
                     # YAW: keep marker centred → drone faces it directly
-                    # Strong P-gain for tight heading lock
                     yaw_P = 35.0
                     yaw_rc = _clamp(int(err_x * yaw_P), -25, 25)
 
-                    # LATERAL: strafe to stay centred on the marker
-                    lr_P = 12.0
-                    lr = _clamp(int(err_x * lr_P), -10, 10)
+                    # LATERAL: correct perspective skew to stay directly in front
+                    skew_P = 18.0
+                    err_x_P = 10.0
+                    lr = _clamp(int(skew * skew_P + err_x * err_x_P), -12, 12)
 
-                    # ALTITUDE: match marker altitude — keep marker exactly
-                    # at vertical centre of image. Strong P-gain.
+                    # ALTITUDE: match marker altitude
                     alt_P = 35.0
                     ud = _clamp(int(-err_y * alt_P), -25, 25)
 
                     # DISTANCE: actively maintain hover_distance
-                    # Positive dist_err = too far → creep forward
-                    # Negative dist_err = too close → back away from wall!
                     dist_err = est_dist - hover_distance
                     dist_P = 8.0
                     fb = _clamp(int(dist_err * dist_P), -15, 10)
@@ -1132,7 +1171,7 @@ def run_mission(
                     send_rc(lr, fb, ud, yaw_rc)
                     hover_dur = time.time() - phase_start
                     log(f"HOVER  >>> {est_dist:.2f}m <<<  (target {hover_distance}m)  "
-                        f"px={mk_px_size:.0f}  err_x={err_x:+.2f} err_y={err_y:+.2f}  "
+                        f"px={mk_px_size:.0f}  err_x={err_x:+.2f} skew={skew:+.2f}  "
                         f"RC lr={lr} fb={fb} ud={ud} yaw={yaw_rc}  "
                         f"ID={target_marker_id}  t={hover_dur:.0f}s  [{data_src}]")
                 else:
