@@ -14,7 +14,8 @@ Designed for Parrot Anafi drones via the flightctrl API servers.
 
 Usage:
     python aruco_seek.py --api http://flightctrl1:8080
-    python aruco_seek.py --api http://flightctrl1:8080 --hover-distance 1.5
+    python aruco_seek.py --api http://flightctrl1:8080 --marker 5
+    python aruco_seek.py --api http://flightctrl1:8080 --hover-distance 1.5 --marker 12
     python aruco_seek.py --api http://flightctrl1:8080 --takeoff-height 1.2
 
 Safety:
@@ -53,6 +54,7 @@ SETTLE_TIME_S = 3.0           # time to wait after takeoff before scanning
 ALTITUDE_TOLERANCE_M = 0.3    # acceptable altitude error
 WALL_SAFE_DISTANCE_M = 1.2   # hard minimum distance from any wall
 WALL_BRAKE_DISTANCE_M = 2.5  # start braking when this close to a wall
+MARKER_SIZE_M = 0.18          # physical marker size (18×18 cm)
 
 # ─── Calibration curve for 18cm ArUco markers ───────────────────────────────
 # Power-law fit from Distanzkalibrierung (calibration chart):
@@ -609,12 +611,15 @@ def run_mission(
     scan_speed: int = SCAN_YAW_SPEED,
     approach_speed: int = APPROACH_SPEED,
     record: bool = False,
+    target_marker: Optional[int] = None,
 ):
     global _api_base
     _api_base = api_base
 
     log(f"ArUco Seek & Approach")
     log(f"  API server:      {api_base}")
+    log(f"  Marker size:     {MARKER_SIZE_M*100:.0f}×{MARKER_SIZE_M*100:.0f} cm")
+    log(f"  Target marker:   {target_marker if target_marker is not None else 'any (first found)'}")
     log(f"  Hover distance:  {hover_distance} m")
     log(f"  Takeoff height:  {takeoff_height} m")
     log(f"  Approach speed:  {approach_speed} (RC %)")
@@ -806,11 +811,22 @@ def run_mission(
                     if mid not in all_detected:
                         all_detected[mid] = {"px_size": 0, "center": None}
 
-                if all_detected:
+                # Filter for specific target marker if requested
+                if target_marker is not None:
+                    candidates = {mid: info for mid, info in all_detected.items()
+                                  if mid == target_marker}
+                    if all_detected and not candidates:
+                        # We see markers but not the one we want — log and keep scanning
+                        other_ids = list(all_detected.keys())
+                        log(f"Scanning... see markers {other_ids} but looking for ID={target_marker}")
+                else:
+                    candidates = all_detected
+
+                if candidates:
                     # Found marker(s)! Pick the largest (closest) one.
                     best_id = None
                     best_px = 0
-                    for mid, info in all_detected.items():
+                    for mid, info in candidates.items():
                         mpx = info.get("px_size", 0) or 0
                         if best_id is None or mpx > best_px:
                             best_id = mid
@@ -818,11 +834,13 @@ def run_mission(
 
                     target_marker_id = best_id
                     send_rc_stop()
-                    best_info = all_detected[best_id]
+                    best_info = candidates[best_id]
                     est_dist = pixel_distance_estimate(best_px) if best_px > 0 else "?"
+                    est_str = f"{est_dist:.2f}m" if isinstance(est_dist, float) else est_dist
                     log(f"MARKER FOUND! ID={target_marker_id}  "
-                        f">>> {est_dist} <<<  "
-                        f"px={best_px:.0f}  center={best_info.get('center', 'N/A')}  "
+                        f">>> {est_str} <<<  "
+                        f"px={best_px:.0f}  marker_size={MARKER_SIZE_M*100:.0f}cm  "
+                        f"center={best_info.get('center', 'N/A')}  "
                         f"[{'vid_tracker' if best_id in vid_all else 'SSE'}]  "
                         f"all_ids={list(all_detected.keys())}")
                     phase = Phase.ALIGN
@@ -963,6 +981,7 @@ def run_mission(
                     _approach_stable_ticks = 0
                 else:
                     log(f"Align:  >>> {est_dist:.2f}m <<<  "
+                        f"px={mk_px_size:.0f} ({MARKER_SIZE_M*100:.0f}cm marker)  "
                         f"err_x={err_x:+.2f} err_y={err_y:+.2f} skew={skew:+.2f}  "
                         f"RC lr={lr} yaw={yaw_rc} ud={ud}  "
                         f"ok={_align_centered_ticks}/{CONTROL_HZ}  [{data_src}]")
@@ -1100,8 +1119,12 @@ def run_mission(
                         _approach_stable_ticks = 0
 
                     send_rc(lr, fb, ud, yaw_rc)
+                    # Expected px size at target distance: invert dist = A * px^(-B)
+                    # → px = (A / dist)^(1/B)
+                    expect_px = (CALIB_A / hover_distance) ** (1.0 / CALIB_B) if hover_distance > 0 else 0
                     log(f"Approach  >>> {est_dist:.2f}m <<<  (target {hover_distance}m)  "
-                        f"px={mk_px_size:.0f}  err_x={err_x:+.2f} skew={skew:+.2f}  "
+                        f"px={mk_px_size:.0f} (expect {expect_px:.0f}px @{hover_distance}m for {MARKER_SIZE_M*100:.0f}cm marker)  "
+                        f"err_x={err_x:+.2f} skew={skew:+.2f}  "
                         f"RC lr={lr} fb={fb} ud={ud} yaw={yaw_rc}  [{data_src}]")
 
                 else:
@@ -1221,8 +1244,10 @@ def run_mission(
 
                     send_rc(lr, fb, ud, yaw_rc)
                     hover_dur = time.time() - phase_start
+                    expect_px = (CALIB_A / hover_distance) ** (1.0 / CALIB_B) if hover_distance > 0 else 0
                     log(f"HOVER  >>> {est_dist:.2f}m <<<  (target {hover_distance}m)  "
-                        f"px={mk_px_size:.0f}  err_x={err_x:+.2f} skew={skew:+.2f}  "
+                        f"px={mk_px_size:.0f} (expect {expect_px:.0f}px for {MARKER_SIZE_M*100:.0f}cm marker)  "
+                        f"err_x={err_x:+.2f} skew={skew:+.2f}  "
                         f"RC lr={lr} fb={fb} ud={ud} yaw={yaw_rc}  "
                         f"ID={target_marker_id}  t={hover_dur:.0f}s  [{data_src}]")
                 else:
@@ -1319,7 +1344,8 @@ def main():
         epilog="""
 Examples:
     %(prog)s --api http://flightctrl1:8080
-    %(prog)s --api http://flightctrl1:8080 --hover-distance 1.5
+    %(prog)s --api http://flightctrl1:8080 --marker 5
+    %(prog)s --api http://flightctrl1:8080 --hover-distance 1.5 --marker 12
     %(prog)s --api http://flightctrl1:8080 --scan-speed 20 --timeout 180
 
 Safety:
@@ -1350,6 +1376,10 @@ Safety:
     parser.add_argument(
         "--timeout", type=float, default=MISSION_TIMEOUT_S,
         help=f"Mission timeout in seconds (default: {MISSION_TIMEOUT_S})",
+    )
+    parser.add_argument(
+        "--marker", type=int, default=None,
+        help="Specific marker ID to approach (default: approach any/closest marker)",
     )
     parser.add_argument(
         "--record", action="store_true",
@@ -1393,6 +1423,7 @@ Safety:
         scan_speed=args.scan_speed,
         approach_speed=args.approach_speed,
         record=args.record,
+        target_marker=args.marker,
     )
 
     sys.exit(0 if success else 1)
