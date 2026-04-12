@@ -225,6 +225,7 @@ def main():
         body_y_positive_is_left=True,
         body_z_positive_is_down=True,
         yaw_positive_is_ccw=True,
+        initial_timestamp=time.monotonic(),
     )
 
     last_motion_state: Optional[MotionState] = motion_estimator.get_current_state()
