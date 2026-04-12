@@ -731,11 +731,6 @@ def main():
     last_vision_update: Optional[Dict[str, Any]] = None
     pending_vision_update: Optional[Dict[str, Any]] = None
     last_fusion_result: Optional[Dict[str, Any]] = None
-
-    # --------------------------------------------------------
-    # init position controller
-    # --------------------------------------------------------
-    controller = PositionController()
     
     # --------------------------------------------------------
     # Video source setup
@@ -1082,24 +1077,9 @@ def main():
             # --------------------------------------
 
             if ctrl_module is not None and last_prediction is not None:
-                current = controller.Pose(
-                    x=last_prediction.x,
-                    y=last_prediction.y,
-                    z=last_prediction.z,
-                    yaw=last_prediction.yaw,
-                )
-                
-                target = controller.TargetPose(
-                    x=last_prediction.x,
-                    y=last_prediction.y,
-                    z=last_prediction.z,
-                    yaw=last_prediction.yaw,
-                )
-                
-                pcmd = controller.compute_pcmd(current, target)
-                # generated pcmd command for olymp
-                print(pcmd)
-                controller.send_pcmd_olympe(pcmd)
+                rc = ctrl_module.update(pred)
+                if rc is not None:
+                ctrl.send_pcmd_olympe(drone, rc)
 
             # --------------------------------------
             # Autonomous mission tick
