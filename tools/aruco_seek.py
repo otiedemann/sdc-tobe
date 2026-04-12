@@ -166,8 +166,14 @@ class VideoMarkerTracker:
     def stop(self):
         self._running = False
 
+    @property
+    def is_active(self) -> bool:
+        """True if the tracker thread is running and has produced at least one frame."""
+        with self._lock:
+            return self._last_ts > 0
+
     def get_marker(self, marker_id: int) -> Optional[dict]:
-        """Return {"center": [cx,cy], "px_size": float} or None."""
+        """Return {"center": [cx,cy], "px_size": float, "left_len": float, "right_len": float} or None."""
         with self._lock:
             return self._markers.get(marker_id)
 
@@ -224,8 +230,10 @@ class VideoMarkerTracker:
                 conn = http.client.HTTPConnection(parsed.hostname, parsed.port or 80, timeout=10)
                 conn.request("GET", parsed.path)
                 resp = conn.getresponse()
+                log(f"[vid-track] Connected to {self._url} (status {resp.status})")
 
                 buf = b""
+                _frames_decoded = 0
                 while self._running and not _abort.is_set():
                     chunk = resp.read(4096)
                     if not chunk:
@@ -285,12 +293,18 @@ class VideoMarkerTracker:
                                 self._frame_w = w
                                 self._frame_h = h
                                 self._last_ts = time.time()
-                        except Exception:
-                            pass
+                            _frames_decoded += 1
+                            if _frames_decoded == 1:
+                                n_ids = len(new_markers)
+                                log(f"[vid-track] First frame decoded: {w}x{h}, {n_ids} markers")
+                        except Exception as e:
+                            if _frames_decoded == 0:
+                                log(f"[vid-track] Frame decode error: {e}")
                 conn.close()
             except Exception as e:
                 if self._running:
-                    time.sleep(1.0)
+                    log(f"[vid-track] Connection error: {e} — retrying in 2s")
+                    time.sleep(2.0)
 
 
 # ─── Position SSE listener ──────────────────────────────────────────────────
@@ -650,8 +664,17 @@ def run_mission(
     hb_thread.start()
     log("  Heartbeat thread started")
 
-    # Wait for first position frame so the server knows the actual resolution
-    time.sleep(1.5)
+    # Wait for first position frame and verify vid_tracker is alive
+    time.sleep(2.0)
+    if vid_tracker.is_active:
+        vw, vh = vid_tracker.frame_size
+        log(f"  vid_tracker OK: receiving {vw}x{vh} frames (age={vid_tracker.age:.1f}s)")
+        vm = vid_tracker.get_all()
+        if vm:
+            log(f"  vid_tracker sees markers: {list(vm.keys())}")
+    else:
+        log("  WARNING: vid_tracker NOT active — client-side ArUco detection not working!")
+        log("  Will rely on server SSE data (may lack pixel info on old server)")
 
     # Start video recording if requested (after position is enabled and frames
     # are flowing so the server knows the actual frame resolution)
@@ -1069,9 +1092,25 @@ def run_mission(
 
                 else:
                     # ── Fallback: no pixel data, but marker in seen_markers ──
-                    # Creep forward slowly — we know the marker is visible
-                    # to the camera but the server doesn't send pixel coords.
-                    # Hold altitude via telemetry, no yaw correction.
+                    # Try vid_tracker one more time (might have data but age > 1s)
+                    # If vid_tracker has any recent data at all, use it for yaw
+                    fb_yaw = 0
+                    fb_lr = 0
+                    fallback_vid = vid_tracker.get_marker(target_marker_id)
+                    if fallback_vid and vid_tracker.age < 3.0:
+                        fw, fh = vid_tracker.frame_size
+                        fcx = fallback_vid["center"][0]
+                        ferr_x = (fcx - fw / 2.0) / (fw / 2.0)
+                        fb_yaw = _clamp(int(ferr_x * 40), -25, 25)
+                        fb_lr = _clamp(int(ferr_x * 12), -10, 10)
+                        log(f"Approach (fallback+vid): marker {target_marker_id}  "
+                            f"err_x={ferr_x:+.2f}  yaw={fb_yaw}  lr={fb_lr}  "
+                            f"vid_age={vid_tracker.age:.1f}s")
+                    else:
+                        log(f"Approach (blind fallback): marker {target_marker_id} "
+                            f"in seen_markers, NO pixel data — creeping forward  "
+                            f"vid_active={vid_tracker.is_active}  vid_age={vid_tracker.age:.1f}s")
+
                     tel = get_telemetry()
                     height_cm = tel.get("height_cm") or 0
                     height_m = height_cm / 100.0
@@ -1079,9 +1118,7 @@ def run_mission(
                     ud = _clamp(int(alt_err * 30), -15, 15)
 
                     fb = approach_speed  # steady creep forward
-                    send_rc(0, fb, ud, 0)
-                    log(f"Approach (no-pixel fallback): marker {target_marker_id} "
-                        f"in seen_markers, creeping fb={fb}  alt={height_m:.2f}m")
+                    send_rc(fb_lr, fb, ud, fb_yaw)
 
             # ── HOVER — hold position facing marker ─────────────────
             elif phase == Phase.HOVER:
@@ -1175,16 +1212,27 @@ def run_mission(
                         f"RC lr={lr} fb={fb} ud={ud} yaw={yaw_rc}  "
                         f"ID={target_marker_id}  t={hover_dur:.0f}s  [{data_src}]")
                 else:
-                    # Fallback hover: just hold position, no pixel data
+                    # Fallback hover — try vid_tracker with relaxed age
+                    fb_yaw = 0
+                    fb_lr = 0
+                    fallback_vid = vid_tracker.get_marker(target_marker_id)
+                    if fallback_vid and vid_tracker.age < 3.0:
+                        fw, fh = vid_tracker.frame_size
+                        fcx = fallback_vid["center"][0]
+                        ferr_x = (fcx - fw / 2.0) / (fw / 2.0)
+                        fb_yaw = _clamp(int(ferr_x * 30), -20, 20)
+                        fb_lr = _clamp(int(ferr_x * 10), -8, 8)
+
                     tel = get_telemetry()
                     height_cm = tel.get("height_cm") or 0
                     height_m = height_cm / 100.0
                     alt_err = takeoff_height - height_m
                     ud = _clamp(int(alt_err * 25), -10, 10)
-                    send_rc(0, 0, ud, 0)
+                    send_rc(fb_lr, 0, ud, fb_yaw)
                     hover_dur = time.time() - phase_start
-                    log(f"HOVER (no-pixel fallback): marker {target_marker_id} visible  "
-                        f"alt={height_m:.2f}m  t={hover_dur:.0f}s  [Ctrl+C to land]")
+                    log(f"HOVER (fallback): marker {target_marker_id}  "
+                        f"yaw={fb_yaw} lr={fb_lr}  alt={height_m:.2f}m  "
+                        f"t={hover_dur:.0f}s  vid_active={vid_tracker.is_active}")
 
             # ── LAND ─────────────────────────────────────────────────
             elif phase == Phase.LAND:
