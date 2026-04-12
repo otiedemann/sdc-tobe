@@ -393,6 +393,7 @@ def run_mission(
     mission_timeout: float = MISSION_TIMEOUT_S,
     scan_speed: int = SCAN_YAW_SPEED,
     approach_speed: int = APPROACH_SPEED,
+    record: bool = False,
 ):
     global _api_base
     _api_base = api_base
@@ -450,6 +451,17 @@ def run_mission(
     else:
         log(f"  WARNING: Video start failed: {vid_result.get('error', '?')}")
         log(f"  ArUco detection may not work without video!")
+
+    # Start video recording if requested
+    _recording = False
+    if record:
+        log("Pre-flight: starting video recording...")
+        rec_result = api_post("/api/video/record/start", {"raw": False})
+        if rec_result.get("ok"):
+            _recording = True
+            log(f"  Recording to: {rec_result.get('path', '?')}")
+        else:
+            log(f"  WARNING: Recording failed: {rec_result.get('error', '?')}")
 
     # Enable position tracking
     log("Pre-flight: enabling position tracking...")
@@ -802,6 +814,17 @@ def run_mission(
     pos_listener.stop()
     _abort.set()
 
+    # Stop recording
+    if _recording:
+        try:
+            rec_stop = api_post("/api/video/record/stop")
+            if rec_stop.get("ok"):
+                log(f"Recording saved: {rec_stop.get('frames', '?')} frames → {rec_stop.get('path', '?')}")
+            else:
+                log(f"Recording stop error: {rec_stop.get('error', '?')}")
+        except Exception:
+            pass
+
     # Stop video stream
     try:
         api_post("/api/video/stop")
@@ -868,6 +891,10 @@ Safety:
         help=f"Mission timeout in seconds (default: {MISSION_TIMEOUT_S})",
     )
     parser.add_argument(
+        "--record", action="store_true",
+        help="Record video (with ArUco overlay) during the mission for debugging",
+    )
+    parser.add_argument(
         "--dry-run", action="store_true",
         help="Print plan without executing (check API connectivity only)",
     )
@@ -904,6 +931,7 @@ Safety:
         mission_timeout=args.timeout,
         scan_speed=args.scan_speed,
         approach_speed=args.approach_speed,
+        record=args.record,
     )
 
     sys.exit(0 if success else 1)
