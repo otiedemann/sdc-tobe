@@ -847,12 +847,26 @@ def main():
     _abort_flag   = threading.Event()
     _confirm_flag = threading.Event()
 
+    # Save terminal state at main-thread level so we can restore it even if
+    # the keyboard thread is killed before its own finally block runs.
+    _saved_term = None
+    if platform.system().lower() != "windows":
+        try:
+            import termios as _termios
+            _saved_term = _termios.tcgetattr(sys.stdin.fileno())
+        except Exception:
+            pass   # stdin not a tty (piped / CI)
+
     def _keyboard_listener():
         """Non-blocking terminal key listener for headless / no-GUI mode.
 
         SPACE  → confirm next mission step (_confirm_flag)
         ESC/q  → emergency abort         (_abort_flag)
-        Uses msvcrt on Windows, select+termios on POSIX.
+
+        Uses msvcrt on Windows (no terminal-mode changes needed).
+        On POSIX, switches to cbreak mode (single-char reads without echo)
+        then restores the saved settings on exit.  The main finally block
+        also restores settings as a guaranteed backstop.
         """
         try:
             if platform.system().lower() == "windows":
@@ -874,11 +888,10 @@ def main():
                 import tty
                 import termios
                 fd = _sys.stdin.fileno()
-                old = termios.tcgetattr(fd)
                 try:
-                    tty.setraw(fd)
+                    tty.setcbreak(fd)   # cbreak: chars available immediately, Ctrl+C still works
                     while not _abort_flag.is_set():
-                        r, _, _ = select.select([_sys.stdin], [], [], 0.05)
+                        r, _, _ = select.select([_sys.stdin], [], [], 0.1)
                         if r:
                             ch = _sys.stdin.read(1)
                             if ch in ('\x1b', 'q', 'Q'):
@@ -889,11 +902,17 @@ def main():
                                 print("\n[mission] SPACE – confirm")
                                 _confirm_flag.set()
                 finally:
-                    termios.tcsetattr(fd, termios.TCSADRAIN, old)
+                    if _saved_term is not None:
+                        try:
+                            termios.tcsetattr(fd, termios.TCSADRAIN, _saved_term)
+                        except Exception:
+                            pass
         except Exception:
-            pass  # terminal not available (piped / background process) – ignore
+            pass   # stdin not a tty (piped / background / non-interactive SSH)
 
-    _kb_thread = threading.Thread(target=_keyboard_listener, name="kb_listener", daemon=True)
+    # Non-daemon so Python waits for it to exit (and restore the terminal)
+    # before shutting down.  We signal it via _abort_flag in the finally block.
+    _kb_thread = threading.Thread(target=_keyboard_listener, name="kb_listener", daemon=False)
     _kb_thread.start()
 
     debug_mode = False
@@ -1371,6 +1390,20 @@ def main():
             try:
                 cv2.destroyAllWindows()
             except cv2.error:
+                pass
+
+        # Signal the keyboard listener to exit its loop, then wait for it to
+        # finish so its finally block can restore the terminal before we return.
+        _abort_flag.set()
+        _kb_thread.join(timeout=1.0)
+
+        # Backstop: restore terminal settings from the main thread in case the
+        # keyboard thread was killed before it could run its own restore.
+        if _saved_term is not None:
+            try:
+                import termios as _termios
+                _termios.tcsetattr(sys.stdin.fileno(), _termios.TCSADRAIN, _saved_term)
+            except Exception:
                 pass
 
 
