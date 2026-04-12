@@ -398,7 +398,7 @@ def main():
                 vz_body = float(motion_sample.get("vz_body", 0.0))
                 yaw_rate = float(motion_sample.get("yaw_rate", 0.0))
 
-                last_motion_state = motion_estimator.update_body_frame(
+                last_motion_state = motion_estimator.update_world_frame(
                     timestamp=ts,
                     vx_body=vx_body,
                     vy_body=vy_body,
