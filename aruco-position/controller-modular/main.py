@@ -218,12 +218,14 @@ class AutonomousMission:
         vision_processor,               # HeadlessAruCoPositioning instance
         ctrl_module,                    # controller module (may be None)
         takeoff_height_z: float = TAKEOFF_HEIGHT_Z,
+        dry_run: bool = False,          # log RC/commands, send nothing to drone
     ) -> None:
         self.target_id        = target_marker_id
         self.approach_dist    = approach_distance
         self.vision           = vision_processor
         self.ctrl             = ctrl_module
         self.takeoff_height_z = takeoff_height_z
+        self.dry_run          = dry_run
 
         self._phase: str               = MissionPhase.IDLE
         self._phase_start: float       = 0.0
@@ -284,6 +286,9 @@ class AutonomousMission:
         self._transition(MissionPhase.ABORTED)
         if self.ctrl is not None:
             self.ctrl.clear_target()
+        if self.dry_run:
+            print("[DRY RUN] Landing skipped")
+            return
         if drone is not None:
             try:
                 from olympe.messages.ardrone3.Piloting import Landing
@@ -432,8 +437,10 @@ class AutonomousMission:
         self._phase = phase
         self._phase_start = time.monotonic()
 
-    @staticmethod
-    def _send_takeoff(drone) -> None:
+    def _send_takeoff(self, drone) -> None:
+        if self.dry_run:
+            print("[DRY RUN] TakeOff skipped – lift drone by hand")
+            return
         if drone is None:
             print("[mission] No drone handle – skipping TakeOff command")
             return
@@ -448,6 +455,8 @@ class AutonomousMission:
 
     def _send_search_yaw(self, drone) -> None:
         """Send a pure yaw PCMD — zero roll, pitch, and gaz — to rotate in place."""
+        if self.dry_run:
+            return   # drone is moved by hand; no PCMD
         try:
             from olympe.messages.ardrone3.Piloting import PCMD
             AutonomousMission._search_seq = (AutonomousMission._search_seq + 1) & 0x7FFFFFFF
@@ -607,7 +616,8 @@ def main():
 
     enable_motion_input = "--motion-input" in sys.argv
 
-    mission_enabled = "--mission" in sys.argv
+    mission_enabled  = "--mission" in sys.argv
+    mission_dry_run  = "--dry-run" in sys.argv
     mission_marker_id = TARGET_MARKER_ID
     if "--mission-marker" in sys.argv:
         try:
@@ -660,6 +670,8 @@ def main():
     print(f"🖥️ Preview Requested: {'YES' if preview_requested else 'NO'}")
     print(f"🖥️ GUI Overlay: {'ON' if gui_enabled else 'OFF'}")
     print(f"🎯 Autonomous Mission: {'ON (marker ' + str(mission_marker_id) + ')' if mission_enabled else 'OFF'}")
+    if mission_dry_run:
+        print("🧪 DRY RUN – no commands sent to drone; move it by hand")
 
     # --------------------------------------------------------
     # Calibration
@@ -707,6 +719,7 @@ def main():
             vision_processor=vision_processor,
             ctrl_module=ctrl_module,
             takeoff_height_z=abs(target_z_pos),   # use configured flight height
+            dry_run=mission_dry_run,
         )
 
     # --------------------------------------------------------
@@ -1095,13 +1108,44 @@ def main():
             )
 
             # --------------------------------------
-            # Drone Position Controller
+            # Drone Position Controller  (cam coordinates only)
             # --------------------------------------
 
-            if ctrl_module is not None and last_prediction is not None:
-                rc = ctrl_module.update(last_prediction)
-                if rc is not None and anafi_drone is not None:
-                    ctrl_module.send_pcmd_olympe(anafi_drone, rc)
+            _ctrl_state = None
+            if last_vision_update is not None:
+                _cam = last_vision_update.get("cam")
+                _dir = last_vision_update.get("dir")
+                if _cam is not None and len(_cam) >= 3:
+                    _yaw = math.atan2(_dir[1], _dir[0]) if (_dir is not None and len(_dir) >= 2) else 0.0
+                    _ctrl_state = {
+                        "x":       float(_cam[0]),
+                        "y":       float(_cam[1]),
+                        "z":       float(_cam[2]),
+                        "yaw":     _yaw,
+                        "vx":      0.0,
+                        "vy":      0.0,
+                        "vz":      0.0,
+                        "std_pos": 0.0,
+                    }
+
+            if ctrl_module is not None and _ctrl_state is not None:
+                rc = ctrl_module.update(_ctrl_state)
+                if rc is not None:
+                    if mission_dry_run:
+                        print(
+                            f"\r[DRY RUN] RC  fb={rc['forward_back']:+4d}  "
+                            f"lr={rc['left_right']:+4d}  "
+                            f"ud={rc['up_down']:+4d}  "
+                            f"yaw={rc['yaw']:+4d}  | "
+                            f"phase={rc.get('_phase','?')}  "
+                            f"err_xy={rc.get('_err_xy',0):.2f}m  "
+                            f"err_z={rc.get('_err_z',0):+.2f}m  "
+                            f"yaw_err={rc.get('_yaw_err_deg',0):+.1f}°"
+                            f"  cam=({_ctrl_state['x']:+.2f},{_ctrl_state['y']:+.2f},{_ctrl_state['z']:+.2f})",
+                            end="",
+                        )
+                    elif anafi_drone is not None:
+                        ctrl_module.send_pcmd_olympe(anafi_drone, rc)
 
             # --------------------------------------
             # Autonomous mission tick
