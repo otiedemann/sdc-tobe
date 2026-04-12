@@ -60,7 +60,13 @@ def save_drones_config(drones: dict):
 
 DRONES = load_drones_config()
 active_drone_id = "1"
-PI_BASE = DRONES[active_drone_id]["base"]
+# PI_API_BASE env var overrides the base URL from drones_config.json
+_env_base = os.getenv("PI_API_BASE")
+if _env_base:
+    PI_BASE = _env_base.rstrip("/")
+    DRONES[active_drone_id]["base"] = PI_BASE
+else:
+    PI_BASE = DRONES[active_drone_id]["base"]
 
 app = Flask(__name__)
 command_log_enabled = os.getenv("REMOTE_COMMAND_LOG", "0") in {"1", "true", "True"}
