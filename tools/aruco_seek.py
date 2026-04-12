@@ -652,6 +652,17 @@ def run_mission(
     log(f"  Calibration: dist = {CALIB_A} * px^(-{CALIB_B})")
     log(f"  Hover distance: {hover_distance}m  approach speed: {approach_speed}")
 
+    # Raise server altitude fence so the drone can reach marker height.
+    # Default MAX_ALTITUDE_M on the server is only 2.0m which blocks climbing.
+    desired_max_alt = 6.0  # enough for markers at z=4.0m + margin
+    log(f"Pre-flight: raising server altitude limit to {desired_max_alt}m...")
+    settings_result = api_post("/api/settings", {"max_altitude_m": desired_max_alt})
+    if settings_result.get("ok"):
+        new_alt = settings_result.get("max_altitude_m", "?")
+        log(f"  Server max altitude set to {new_alt}m")
+    else:
+        log(f"  WARNING: Could not raise altitude limit: {settings_result}")
+
     # Start video stream — required for ArUco detection
     # The positioning loop processes frames from the video callback;
     # without an active video stream, no frames are fed to OpenCV.
@@ -715,6 +726,7 @@ def run_mission(
     scan_total_rotation = 0.0
     scan_last_yaw = None
     target_marker_id: Optional[int] = None
+    target_alt: float = takeoff_height   # will be updated to marker z once found
     approach_start_time = 0.0
     _marker_lost_ticks = 0
     _approach_stable_ticks = 0
@@ -958,10 +970,16 @@ def run_mission(
                 skew_P = 25.0
                 lr = _clamp(int(skew * skew_P), -15, 15)
 
-                # ALTITUDE: match marker height — strong correction to climb/descend
-                # to the marker's altitude. Boost when marker is near top/bottom edge.
-                alt_P = 45.0 * edge_boost(err_y)
-                ud = _clamp(int(-err_y * alt_P), -40, 40)
+                # ALTITUDE: visual servoing — descend/climb to match marker height.
+                # Use strong gain + edge boost.  Also update target_alt for fallback.
+                tel = get_telemetry()
+                height_m = (tel.get("height_cm") or 0) / 100.0
+                alt_P = 60.0 * edge_boost(err_y)
+                ud = _clamp(int(-err_y * alt_P), -50, 50)
+                # Update target_alt estimate from visual: when marker is centred
+                # vertically, the drone is at marker height.
+                if abs(err_y) < 0.10:
+                    target_alt = height_m  # lock in current height as target
 
                 send_rc(lr, 0, ud, yaw_rc)
 
@@ -983,6 +1001,7 @@ def run_mission(
                     log(f"Align:  >>> {est_dist:.2f}m <<<  "
                         f"px={mk_px_size:.0f} ({MARKER_SIZE_M*100:.0f}cm marker)  "
                         f"err_x={err_x:+.2f} err_y={err_y:+.2f} skew={skew:+.2f}  "
+                        f"alt={height_m:.2f}m  "
                         f"RC lr={lr} yaw={yaw_rc} ud={ud}  "
                         f"ok={_align_centered_ticks}/{CONTROL_HZ}  [{data_src}]")
 
@@ -1091,10 +1110,14 @@ def run_mission(
                     err_x_P = 12.0
                     lr = _clamp(int(skew * skew_P + err_x * err_x_P), -15, 15)
 
-                    # ALTITUDE: match marker height — strong correction with
-                    # edge boost to prevent marker leaving top/bottom of frame
-                    alt_P = 45.0 * edge_boost(err_y)
-                    ud = _clamp(int(-err_y * alt_P), -40, 40)
+                    # ALTITUDE: visual servoing to match marker height
+                    tel = get_telemetry()
+                    height_m = (tel.get("height_cm") or 0) / 100.0
+                    alt_P = 60.0 * edge_boost(err_y)
+                    ud = _clamp(int(-err_y * alt_P), -50, 50)
+                    # Update target_alt for fallback ticks
+                    if abs(err_y) < 0.10:
+                        target_alt = height_m
 
                     # FORWARD/BACKWARD: proportional distance controller
                     dist_err = est_dist - hover_distance
@@ -1106,11 +1129,12 @@ def run_mission(
                         fb = 0  # align first, then approach
 
                     # Transition to HOVER once stable near target distance + aligned
-                    if abs(dist_err) < 0.3 and abs(err_x) < 0.15 and abs(skew) < 0.08:
+                    if abs(dist_err) < 0.3 and abs(err_x) < 0.15 and abs(skew) < 0.08 and abs(err_y) < 0.20:
                         _approach_stable_ticks += 1
                         if _approach_stable_ticks >= CONTROL_HZ * 1:  # 1s stable
                             log(f"ARRIVED!  >>> {est_dist:.2f}m <<<  "
                                 f"(target {hover_distance}m)  skew={skew:+.3f}  "
+                                f"alt={height_m:.2f}m  err_y={err_y:+.3f}  "
                                 f"[{data_src}]")
                             phase = Phase.HOVER
                             phase_start = time.time()
@@ -1124,7 +1148,8 @@ def run_mission(
                     expect_px = (CALIB_A / hover_distance) ** (1.0 / CALIB_B) if hover_distance > 0 else 0
                     log(f"Approach  >>> {est_dist:.2f}m <<<  (target {hover_distance}m)  "
                         f"px={mk_px_size:.0f} (expect {expect_px:.0f}px @{hover_distance}m for {MARKER_SIZE_M*100:.0f}cm marker)  "
-                        f"err_x={err_x:+.2f} skew={skew:+.2f}  "
+                        f"err_x={err_x:+.2f} err_y={err_y:+.2f} skew={skew:+.2f}  "
+                        f"alt={height_m:.2f}m  "
                         f"RC lr={lr} fb={fb} ud={ud} yaw={yaw_rc}  [{data_src}]")
 
                 else:
@@ -1151,11 +1176,13 @@ def run_mission(
                     tel = get_telemetry()
                     height_cm = tel.get("height_cm") or 0
                     height_m = height_cm / 100.0
-                    alt_err = takeoff_height - height_m
-                    ud = _clamp(int(alt_err * 30), -15, 15)
+                    # Hold last known good altitude (target_alt tracks visual estimate)
+                    alt_err = target_alt - height_m
+                    ud = _clamp(int(alt_err * 25), -30, 30)
 
                     fb = approach_speed  # steady creep forward
                     send_rc(fb_lr, fb, ud, fb_yaw)
+                    log(f"  fallback alt={height_m:.2f}m (hold {target_alt:.2f}m)  ud={ud}")
 
             # ── HOVER — hold position facing marker ─────────────────
             elif phase == Phase.HOVER:
@@ -1233,9 +1260,13 @@ def run_mission(
                     err_x_P = 10.0
                     lr = _clamp(int(skew * skew_P + err_x * err_x_P), -12, 12)
 
-                    # ALTITUDE: match marker height — boost when near edge
-                    alt_P = 45.0 * edge_boost(err_y)
-                    ud = _clamp(int(-err_y * alt_P), -40, 40)
+                    # ALTITUDE: visual servoing to match marker height
+                    tel = get_telemetry()
+                    height_m = (tel.get("height_cm") or 0) / 100.0
+                    alt_P = 60.0 * edge_boost(err_y)
+                    ud = _clamp(int(-err_y * alt_P), -50, 50)
+                    if abs(err_y) < 0.10:
+                        target_alt = height_m
 
                     # DISTANCE: actively maintain hover_distance
                     dist_err = est_dist - hover_distance
@@ -1247,7 +1278,8 @@ def run_mission(
                     expect_px = (CALIB_A / hover_distance) ** (1.0 / CALIB_B) if hover_distance > 0 else 0
                     log(f"HOVER  >>> {est_dist:.2f}m <<<  (target {hover_distance}m)  "
                         f"px={mk_px_size:.0f} (expect {expect_px:.0f}px for {MARKER_SIZE_M*100:.0f}cm marker)  "
-                        f"err_x={err_x:+.2f} skew={skew:+.2f}  "
+                        f"err_x={err_x:+.2f} err_y={err_y:+.2f} skew={skew:+.2f}  "
+                        f"alt={height_m:.2f}m  "
                         f"RC lr={lr} fb={fb} ud={ud} yaw={yaw_rc}  "
                         f"ID={target_marker_id}  t={hover_dur:.0f}s  [{data_src}]")
                 else:
@@ -1265,12 +1297,12 @@ def run_mission(
                     tel = get_telemetry()
                     height_cm = tel.get("height_cm") or 0
                     height_m = height_cm / 100.0
-                    alt_err = takeoff_height - height_m
-                    ud = _clamp(int(alt_err * 25), -10, 10)
+                    alt_err = target_alt - height_m
+                    ud = _clamp(int(alt_err * 25), -30, 30)
                     send_rc(fb_lr, 0, ud, fb_yaw)
                     hover_dur = time.time() - phase_start
                     log(f"HOVER (fallback): marker {target_marker_id}  "
-                        f"yaw={fb_yaw} lr={fb_lr}  alt={height_m:.2f}m  "
+                        f"yaw={fb_yaw} lr={fb_lr}  alt={height_m:.2f}m (hold {target_alt:.2f}m)  ud={ud}  "
                         f"t={hover_dur:.0f}s  vid_active={vid_tracker.is_active}")
 
             # ── LAND ─────────────────────────────────────────────────
