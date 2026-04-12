@@ -70,6 +70,19 @@ def pixel_distance_estimate(avg_pixel_size: float) -> float:
     return CALIB_A * avg_pixel_size ** (-CALIB_B)
 
 
+def edge_boost(err: float, threshold: float = 0.6) -> float:
+    """
+    Extra gain when marker is near the edge of the image.
+
+    Linear ramp from 1.0 at |err|=threshold to 3.0 at |err|=1.0.
+    Returns a multiplier >= 1.0.  Below threshold, returns 1.0.
+    """
+    a = abs(err)
+    if a <= threshold:
+        return 1.0
+    return 1.0 + 2.0 * (a - threshold) / (1.0 - threshold)
+
+
 def marker_skew(left_len: float, right_len: float) -> float:
     """
     Compute perspective skew from left/right edge lengths of a marker.
@@ -919,17 +932,18 @@ def run_mission(
                     skew = marker_skew(vid_info["left_len"], vid_info["right_len"])
 
                 # YAW: centre marker horizontally
-                yaw_P = 45.0
-                yaw_rc = _clamp(int(err_x * yaw_P), -35, 35)
+                # Boost gain when marker is near image edge to prevent losing it
+                yaw_P = 45.0 * edge_boost(err_x)
+                yaw_rc = _clamp(int(err_x * yaw_P), -50, 50)
 
                 # LATERAL: strafe to get in front of the marker (correct skew)
-                # Skew > 0 means drone is to the left → strafe right
                 skew_P = 25.0
                 lr = _clamp(int(skew * skew_P), -15, 15)
 
-                # ALTITUDE: match marker height
-                alt_P = 35.0
-                ud = _clamp(int(-err_y * alt_P), -25, 25)
+                # ALTITUDE: match marker height — strong correction to climb/descend
+                # to the marker's altitude. Boost when marker is near top/bottom edge.
+                alt_P = 45.0 * edge_boost(err_y)
+                ud = _clamp(int(-err_y * alt_P), -40, 40)
 
                 send_rc(lr, 0, ud, yaw_rc)
 
@@ -1049,19 +1063,19 @@ def run_mission(
                         skew = marker_skew(vid_info["left_len"], vid_info["right_len"])
 
                     # YAW: centre marker horizontally → face the marker directly
-                    yaw_P = 40.0
-                    yaw_rc = _clamp(int(err_x * yaw_P), -30, 30)
+                    # Boost gain when marker nears image edge to keep it in view
+                    yaw_P = 40.0 * edge_boost(err_x)
+                    yaw_rc = _clamp(int(err_x * yaw_P), -50, 50)
 
                     # LATERAL: strafe to correct perspective skew
-                    # This moves the drone to be directly in front of the marker
-                    # (not just pointing at it, but positioned in front of it)
                     skew_P = 20.0
                     err_x_P = 12.0
                     lr = _clamp(int(skew * skew_P + err_x * err_x_P), -15, 15)
 
-                    # ALTITUDE: match marker altitude
-                    alt_P = 35.0
-                    ud = _clamp(int(-err_y * alt_P), -25, 25)
+                    # ALTITUDE: match marker height — strong correction with
+                    # edge boost to prevent marker leaving top/bottom of frame
+                    alt_P = 45.0 * edge_boost(err_y)
+                    ud = _clamp(int(-err_y * alt_P), -40, 40)
 
                     # FORWARD/BACKWARD: proportional distance controller
                     dist_err = est_dist - hover_distance
@@ -1187,18 +1201,18 @@ def run_mission(
                     if vid_info and "left_len" in vid_info and "right_len" in vid_info:
                         skew = marker_skew(vid_info["left_len"], vid_info["right_len"])
 
-                    # YAW: keep marker centred → drone faces it directly
-                    yaw_P = 35.0
-                    yaw_rc = _clamp(int(err_x * yaw_P), -25, 25)
+                    # YAW: keep marker centred — boost when near edge
+                    yaw_P = 35.0 * edge_boost(err_x)
+                    yaw_rc = _clamp(int(err_x * yaw_P), -40, 40)
 
                     # LATERAL: correct perspective skew to stay directly in front
                     skew_P = 18.0
                     err_x_P = 10.0
                     lr = _clamp(int(skew * skew_P + err_x * err_x_P), -12, 12)
 
-                    # ALTITUDE: match marker altitude
-                    alt_P = 35.0
-                    ud = _clamp(int(-err_y * alt_P), -25, 25)
+                    # ALTITUDE: match marker height — boost when near edge
+                    alt_P = 45.0 * edge_boost(err_y)
+                    ud = _clamp(int(-err_y * alt_P), -40, 40)
 
                     # DISTANCE: actively maintain hover_distance
                     dist_err = est_dist - hover_distance
