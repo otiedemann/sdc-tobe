@@ -3128,6 +3128,23 @@ def positioning_loop():
         direction = result.get("dir")
         stale = result.get("stale", True)
 
+        # Compute marker pixel sizes and centers from raw detection
+        # (always available when markers are detected, even without ref pose)
+        raw_pixel_sizes = {}
+        raw_centers = {}
+        raw_seen_ids = []
+        if raw_corners is not None and raw_ids is not None and len(raw_ids) > 0:
+            import numpy as _np
+            for i, mid_arr in enumerate(raw_ids):
+                mid = int(mid_arr[0]) if hasattr(mid_arr, '__len__') else int(mid_arr)
+                raw_seen_ids.append(mid)
+                pts = raw_corners[i].reshape(4, 2)
+                side_lens = [float(_np.linalg.norm(pts[j] - pts[(j + 1) % 4])) for j in range(4)]
+                raw_pixel_sizes[str(mid)] = round(float(_np.mean(side_lens)), 2)
+                cx = round(float(_np.mean(pts[:, 0])), 1)
+                cy = round(float(_np.mean(pts[:, 1])), 1)
+                raw_centers[str(mid)] = [cx, cy]
+
         # FPS tracking
         global _pos_fps_counter, _pos_fps_last_reset, _pos_fps_current
         _pos_fps_counter += 1
@@ -3149,10 +3166,12 @@ def positioning_loop():
             _pos_st["markers"] = {str(k): round(float(v), 4)
                                    for k, v in (result.get("marker_weights") or {}).items()}
             _pos_st["ref_markers"] = list(result.get("ref_markers") or [])
-            _pos_st["seen_markers"] = list(result.get("seen_markers") or [])
-            _pos_st["seen_count"] = int(result.get("seen_count") or 0)
-            _pos_st["marker_pixel_sizes"] = result.get("marker_pixel_sizes") or {}
-            _pos_st["marker_centers"] = result.get("marker_centers") or {}
+            # Use raw detection for seen_markers (always available)
+            _pos_st["seen_markers"] = raw_seen_ids if raw_seen_ids else list(result.get("seen_markers") or [])
+            _pos_st["seen_count"] = len(raw_seen_ids) if raw_seen_ids else int(result.get("seen_count") or 0)
+            # Always use raw-computed pixel data (works even without ref pose)
+            _pos_st["marker_pixel_sizes"] = raw_pixel_sizes
+            _pos_st["marker_centers"] = raw_centers
             _pos_st["stale"] = stale
             _pos_st["dead_reckoning"] = result.get("dead_reckoning", False)
             _pos_st["ts"] = ts
