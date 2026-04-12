@@ -238,11 +238,11 @@ def _olympe_loop() -> None:
 
             if spd and att:
                 try:
-                    speed_x = float(spd.get("speedX", 0.0))
-                    speed_y = float(spd.get("speedY", 0.0))
-                    speed_z = float(spd.get("speedZ", 0.0))
+                    speed_x = float(spd["speedX"])
+                    speed_y = float(spd["speedY"])
+                    speed_z = float(spd["speedZ"])
 
-                    yaw_raw = float(att.get("yaw", 0.0))
+                    yaw_raw = float(att["yaw"])
                     # Olympe AttitudeChanged gives yaw in radians.
                     # If OLYMPE_YAW_CW: yaw is CW (aviation) → use directly.
                     # If not OLYMPE_YAW_CW: yaw is CCW (math) → negate for NED conversion.
@@ -293,10 +293,11 @@ def _http_loop() -> None:
                     raw = _json.loads(resp.read().decode())
 
                 # API returns velocities in cm/s → convert to m/s
-                vgx = float(raw.get("vgx", 0.0)) / 100.0  # forward (NED X approx)
-                vgy = float(raw.get("vgy", 0.0)) / 100.0  # lateral (NED Y approx)
-                vgz = float(raw.get("vgz", 0.0)) / 100.0  # vertical (NED Z approx)
-                yaw_deg = float(raw.get("yaw", 0.0))
+                # Use "or 0.0" to handle None values (sent as JSON null before drone connects)
+                vgx = float(raw.get("vgx") or 0.0) / 100.0  # forward (NED X approx)
+                vgy = float(raw.get("vgy") or 0.0) / 100.0  # lateral (NED Y approx)
+                vgz = float(raw.get("vgz") or 0.0) / 100.0  # vertical (NED Z approx)
+                yaw_deg = float(raw.get("yaw") or 0.0)
                 yaw_rad = math.radians(yaw_deg)
 
                 # The unified API already names vgx/vgy as NED-world-frame speed.
