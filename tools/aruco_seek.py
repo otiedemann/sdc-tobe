@@ -14,7 +14,8 @@ Designed for Parrot Anafi drones via the flightctrl API servers.
 
 Usage:
     python aruco_seek.py --api http://flightctrl1:8080
-    python aruco_seek.py --api http://flightctrl1:8080 --hover-distance 1.5
+    python aruco_seek.py --api http://flightctrl1:8080 --marker 5
+    python aruco_seek.py --api http://flightctrl1:8080 --hover-distance 1.5 --marker 12
     python aruco_seek.py --api http://flightctrl1:8080 --takeoff-height 1.2
 
 Safety:
@@ -53,20 +54,53 @@ SETTLE_TIME_S = 3.0           # time to wait after takeoff before scanning
 ALTITUDE_TOLERANCE_M = 0.3    # acceptable altitude error
 WALL_SAFE_DISTANCE_M = 1.2   # hard minimum distance from any wall
 WALL_BRAKE_DISTANCE_M = 2.5  # start braking when this close to a wall
+MARKER_SIZE_M = 0.18          # physical marker size (18×18 cm)
 
 # ─── Calibration curve for 18cm ArUco markers ───────────────────────────────
-# Empirical power-law fit from Distanzkalibrierung.xlsx:
-#   pixel_size = CALIB_PIX_AT_1M * distance^(-CALIB_EXPONENT)
-# Inverted: distance = (CALIB_PIX_AT_1M / pixel_size)^(1 / CALIB_EXPONENT)
-CALIB_PIX_AT_1M = 126.0     # avg marker size in pixels at 1 m distance
-CALIB_EXPONENT = 1.318       # power-law exponent
+# Power-law fit from Distanzkalibrierung (calibration chart):
+#   distance = CALIB_A * pixel_size ^ (-CALIB_B)
+#   distance = 109.1653 * (1/pixel)^0.8973
+#            = 109.1653 * pixel^(-0.8973)
+CALIB_A = 109.1653           # coefficient
+CALIB_B = 0.8973             # exponent
 
 
 def pixel_distance_estimate(avg_pixel_size: float) -> float:
     """Estimate distance (m) from marker pixel size using calibration curve."""
     if avg_pixel_size <= 0:
         return float("inf")
-    return (CALIB_PIX_AT_1M / avg_pixel_size) ** (1.0 / CALIB_EXPONENT)
+    return CALIB_A * avg_pixel_size ** (-CALIB_B)
+
+
+def edge_boost(err: float, threshold: float = 0.6) -> float:
+    """
+    Extra gain when marker is near the edge of the image.
+
+    Linear ramp from 1.0 at |err|=threshold to 3.0 at |err|=1.0.
+    Returns a multiplier >= 1.0.  Below threshold, returns 1.0.
+    """
+    a = abs(err)
+    if a <= threshold:
+        return 1.0
+    return 1.0 + 2.0 * (a - threshold) / (1.0 - threshold)
+
+
+def marker_skew(left_len: float, right_len: float) -> float:
+    """
+    Compute perspective skew from left/right edge lengths of a marker.
+
+    When viewing a marker straight-on, left_len ≈ right_len → skew ≈ 0.
+    When the drone is to the LEFT of the marker normal:
+      - right edge appears longer (closer) → skew > 0 → need to strafe RIGHT
+    When the drone is to the RIGHT:
+      - left edge appears longer → skew < 0 → need to strafe LEFT
+
+    Returns: normalised skew in [-1, +1].  Positive = strafe right needed.
+    """
+    total = left_len + right_len
+    if total < 1.0:
+        return 0.0
+    return (right_len - left_len) / total
 
 
 # ─── Globals ─────────────────────────────────────────────────────────────────
@@ -119,6 +153,173 @@ def send_rc_stop():
 
 def _clamp(v: int, lo: int = -100, hi: int = 100) -> int:
     return max(lo, min(hi, int(v)))
+
+
+# ─── Client-side ArUco detection from video feed ───────────────────────────
+
+class VideoMarkerTracker:
+    """
+    Background thread that grabs JPEG frames from the MJPEG video stream
+    and runs ArUco detection locally. Provides marker pixel centers and
+    sizes without needing server-side support.
+    """
+
+    def __init__(self, api_base: str):
+        self._url = f"{api_base}/api/position/video"
+        self._lock = threading.Lock()
+        self._markers: dict = {}  # {id: {"center": [cx,cy], "px_size": float, "corners": [[x,y]*4], "left_len": float, "right_len": float}}
+        self._frame_w: int = 1280
+        self._frame_h: int = 720
+        self._last_ts: float = 0.0
+        self._thread = threading.Thread(target=self._run, daemon=True, name="vid-track")
+        self._running = True
+        self._detector = None
+
+    def start(self):
+        self._thread.start()
+
+    def stop(self):
+        self._running = False
+
+    @property
+    def is_active(self) -> bool:
+        """True if the tracker thread is running and has produced at least one frame."""
+        with self._lock:
+            return self._last_ts > 0
+
+    def get_marker(self, marker_id: int) -> Optional[dict]:
+        """Return {"center": [cx,cy], "px_size": float, "left_len": float, "right_len": float} or None."""
+        with self._lock:
+            return self._markers.get(marker_id)
+
+    def get_all(self) -> dict:
+        """Return {id: {"center": ..., "px_size": ...}} for all visible markers."""
+        with self._lock:
+            return dict(self._markers)
+
+    @property
+    def frame_size(self) -> tuple:
+        with self._lock:
+            return self._frame_w, self._frame_h
+
+    @property
+    def age(self) -> float:
+        with self._lock:
+            return time.time() - self._last_ts if self._last_ts > 0 else float("inf")
+
+    def _init_detector(self):
+        try:
+            import cv2
+            aruco = cv2.aruco
+            aruco_dict = aruco.getPredefinedDictionary(aruco.DICT_4X4_100)
+            params = aruco.DetectorParameters()
+            # Relax thresholds for small/distant markers
+            params.adaptiveThreshWinSizeMin = 3
+            params.adaptiveThreshWinSizeMax = 23
+            params.adaptiveThreshWinSizeStep = 5
+            params.minMarkerPerimeterRate = 0.01
+            self._detector = aruco.ArucoDetector(aruco_dict, params)
+            return True
+        except Exception as e:
+            log(f"[vid-track] OpenCV ArUco init failed: {e}")
+            return False
+
+    def _run(self):
+        import http.client
+        from urllib.parse import urlparse
+        try:
+            import cv2
+            import numpy as np
+        except ImportError:
+            log("[vid-track] OpenCV not available — tracker disabled")
+            return
+
+        if not self._init_detector():
+            return
+
+        log("[vid-track] Client-side ArUco tracker started")
+
+        while self._running and not _abort.is_set():
+            try:
+                parsed = urlparse(self._url)
+                conn = http.client.HTTPConnection(parsed.hostname, parsed.port or 80, timeout=10)
+                conn.request("GET", parsed.path)
+                resp = conn.getresponse()
+                log(f"[vid-track] Connected to {self._url} (status {resp.status})")
+
+                buf = b""
+                _frames_decoded = 0
+                while self._running and not _abort.is_set():
+                    chunk = resp.read(4096)
+                    if not chunk:
+                        break
+                    buf += chunk
+
+                    # Find complete JPEG frame in MJPEG stream
+                    while True:
+                        # MJPEG boundary: --frame\r\nContent-Type: image/jpeg\r\n\r\n
+                        hdr_idx = buf.find(b"\r\n\r\n")
+                        if hdr_idx < 0:
+                            break
+                        jpeg_start = hdr_idx + 4
+
+                        # Find next boundary
+                        next_boundary = buf.find(b"--frame", jpeg_start)
+                        if next_boundary < 0:
+                            break  # incomplete frame, need more data
+
+                        jpeg_data = buf[jpeg_start:next_boundary]
+                        buf = buf[next_boundary:]
+
+                        # Decode and detect
+                        try:
+                            arr = np.frombuffer(jpeg_data, dtype=np.uint8)
+                            frame = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+                            if frame is None:
+                                continue
+                            h, w = frame.shape[:2]
+                            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                            corners, ids, _ = self._detector.detectMarkers(gray)
+
+                            new_markers = {}
+                            if ids is not None and len(ids) > 0:
+                                for i, mid_arr in enumerate(ids):
+                                    mid = int(mid_arr[0])
+                                    pts = corners[i].reshape(4, 2)
+                                    # ArUco corner order: TL(0), TR(1), BR(2), BL(3)
+                                    side_lens = [float(np.linalg.norm(
+                                        pts[j] - pts[(j + 1) % 4])) for j in range(4)]
+                                    px_size = float(np.mean(side_lens))
+                                    cx = float(np.mean(pts[:, 0]))
+                                    cy = float(np.mean(pts[:, 1]))
+                                    # Left edge: TL→BL (pts[0]→pts[3])
+                                    # Right edge: TR→BR (pts[1]→pts[2])
+                                    left_len = float(np.linalg.norm(pts[0] - pts[3]))
+                                    right_len = float(np.linalg.norm(pts[1] - pts[2]))
+                                    new_markers[mid] = {
+                                        "center": [round(cx, 1), round(cy, 1)],
+                                        "px_size": round(px_size, 2),
+                                        "left_len": round(left_len, 2),
+                                        "right_len": round(right_len, 2),
+                                    }
+
+                            with self._lock:
+                                self._markers = new_markers
+                                self._frame_w = w
+                                self._frame_h = h
+                                self._last_ts = time.time()
+                            _frames_decoded += 1
+                            if _frames_decoded == 1:
+                                n_ids = len(new_markers)
+                                log(f"[vid-track] First frame decoded: {w}x{h}, {n_ids} markers")
+                        except Exception as e:
+                            if _frames_decoded == 0:
+                                log(f"[vid-track] Frame decode error: {e}")
+                conn.close()
+            except Exception as e:
+                if self._running:
+                    log(f"[vid-track] Connection error: {e} — retrying in 2s")
+                    time.sleep(2.0)
 
 
 # ─── Position SSE listener ──────────────────────────────────────────────────
@@ -392,6 +593,7 @@ class Phase:
     TAKEOFF = "takeoff"
     SETTLE = "settle"
     SCAN = "scan"
+    ALIGN = "align"       # yaw to face marker before approaching
     APPROACH = "approach"
     HOVER = "hover"
     LAND = "land"
@@ -409,12 +611,15 @@ def run_mission(
     scan_speed: int = SCAN_YAW_SPEED,
     approach_speed: int = APPROACH_SPEED,
     record: bool = False,
+    target_marker: Optional[int] = None,
 ):
     global _api_base
     _api_base = api_base
 
     log(f"ArUco Seek & Approach")
     log(f"  API server:      {api_base}")
+    log(f"  Marker size:     {MARKER_SIZE_M*100:.0f}×{MARKER_SIZE_M*100:.0f} cm")
+    log(f"  Target marker:   {target_marker if target_marker is not None else 'any (first found)'}")
     log(f"  Hover distance:  {hover_distance} m")
     log(f"  Takeoff height:  {takeoff_height} m")
     log(f"  Approach speed:  {approach_speed} (RC %)")
@@ -444,7 +649,7 @@ def run_mission(
 
     # Visual servoing mode — no arena config needed
     log("Pre-flight: visual servoing mode (no arena config dependency)")
-    log(f"  Calibration: {CALIB_PIX_AT_1M}px @ 1m, exponent={CALIB_EXPONENT}")
+    log(f"  Calibration: dist = {CALIB_A} * px^(-{CALIB_B})")
     log(f"  Hover distance: {hover_distance}m  approach speed: {approach_speed}")
 
     # Start video stream — required for ArUco detection
@@ -467,13 +672,27 @@ def run_mission(
     pos_listener.start()
     log("  Position SSE listener started")
 
+    # Start client-side video marker tracker (local ArUco detection)
+    vid_tracker = VideoMarkerTracker(api_base)
+    vid_tracker.start()
+    log("  Video marker tracker started (client-side ArUco)")
+
     # Start heartbeat
     hb_thread = threading.Thread(target=_heartbeat_loop, daemon=True, name="heartbeat")
     hb_thread.start()
     log("  Heartbeat thread started")
 
-    # Wait for first position frame so the server knows the actual resolution
-    time.sleep(1.5)
+    # Wait for first position frame and verify vid_tracker is alive
+    time.sleep(2.0)
+    if vid_tracker.is_active:
+        vw, vh = vid_tracker.frame_size
+        log(f"  vid_tracker OK: receiving {vw}x{vh} frames (age={vid_tracker.age:.1f}s)")
+        vm = vid_tracker.get_all()
+        if vm:
+            log(f"  vid_tracker sees markers: {list(vm.keys())}")
+    else:
+        log("  WARNING: vid_tracker NOT active — client-side ArUco detection not working!")
+        log("  Will rely on server SSE data (may lack pixel info on old server)")
 
     # Start video recording if requested (after position is enabled and frames
     # are flowing so the server knows the actual frame resolution)
@@ -498,6 +717,7 @@ def run_mission(
     target_marker_id: Optional[int] = None
     approach_start_time = 0.0
     _marker_lost_ticks = 0
+    _approach_stable_ticks = 0
     tick_interval = 1.0 / CONTROL_HZ
 
     log(f"\n{'='*60}")
@@ -566,35 +786,68 @@ def run_mission(
 
             # ── SCAN — rotate 360 looking for markers ────────────────
             elif phase == Phase.SCAN:
-                # Check if position data sees any markers
+                # Check both SSE data and client-side tracker for markers
                 seen_markers = []
                 if pos_data:
                     seen_markers = pos_data.get("seen_markers", [])
 
-                if seen_markers:
+                # Also check vid_tracker (client-side ArUco detection)
+                vid_all = vid_tracker.get_all()
+
+                # Merge: prefer vid_tracker data (always has pixel info)
+                all_detected = {}  # {id: {"px_size": .., "center": ..}}
+                for mid_str, info in (pos_data or {}).get("marker_pixel_sizes", {}).items():
+                    mid = int(mid_str)
+                    centers = (pos_data or {}).get("marker_centers", {})
+                    all_detected[mid] = {
+                        "px_size": info if isinstance(info, (int, float)) else 0,
+                        "center": centers.get(mid_str),
+                    }
+                # vid_tracker overrides (more reliable pixel data)
+                for mid, info in vid_all.items():
+                    all_detected[mid] = info
+                # Also include SSE seen_markers (may not have pixel info)
+                for mid in seen_markers:
+                    if mid not in all_detected:
+                        all_detected[mid] = {"px_size": 0, "center": None}
+
+                # Filter for specific target marker if requested
+                if target_marker is not None:
+                    candidates = {mid: info for mid, info in all_detected.items()
+                                  if mid == target_marker}
+                    if all_detected and not candidates:
+                        # We see markers but not the one we want — log and keep scanning
+                        other_ids = list(all_detected.keys())
+                        log(f"Scanning... see markers {other_ids} but looking for ID={target_marker}")
+                else:
+                    candidates = all_detected
+
+                if candidates:
                     # Found marker(s)! Pick the largest (closest) one.
-                    px_sizes = pos_data.get("marker_pixel_sizes", {})
-                    best_id = seen_markers[0]
-                    best_px = px_sizes.get(str(best_id), 0)
-                    for mid in seen_markers[1:]:
-                        mpx = px_sizes.get(str(mid), 0)
-                        if mpx > best_px:
+                    best_id = None
+                    best_px = 0
+                    for mid, info in candidates.items():
+                        mpx = info.get("px_size", 0) or 0
+                        if best_id is None or mpx > best_px:
                             best_id = mid
                             best_px = mpx
 
                     target_marker_id = best_id
                     send_rc_stop()
-                    centers = pos_data.get("marker_centers", {})
+                    best_info = candidates[best_id]
                     est_dist = pixel_distance_estimate(best_px) if best_px > 0 else "?"
+                    est_str = f"{est_dist:.2f}m" if isinstance(est_dist, float) else est_dist
                     log(f"MARKER FOUND! ID={target_marker_id}  "
-                        f"px_size={best_px:.0f}  est_dist≈{est_dist}m  "
-                        f"center={centers.get(str(best_id), 'N/A')}  "
-                        f"all_px={px_sizes}")
-                    phase = Phase.APPROACH
+                        f">>> {est_str} <<<  "
+                        f"px={best_px:.0f}  marker_size={MARKER_SIZE_M*100:.0f}cm  "
+                        f"center={best_info.get('center', 'N/A')}  "
+                        f"[{'vid_tracker' if best_id in vid_all else 'SSE'}]  "
+                        f"all_ids={list(all_detected.keys())}")
+                    phase = Phase.ALIGN
                     approach_start_time = time.time()
                     phase_start = time.time()
-                    # Track how many ticks marker was lost during approach
                     _marker_lost_ticks = 0
+                    _align_centered_ticks = 0
                 else:
                     # No markers seen — keep rotating
                     # Track total rotation to detect full 360
@@ -626,6 +879,113 @@ def run_mission(
                         log(f"Scanning... rotated {rot_deg:.0f}/360 deg  "
                             f"alt={height_m:.2f}m  target_alt={takeoff_height:.1f}m")
 
+            # ── ALIGN — yaw to face the marker dead-on before approaching ──
+            #
+            # Pure rotation + altitude: no forward/lateral movement.
+            # Only transitions to APPROACH once marker is centred in image.
+            #
+            elif phase == Phase.ALIGN:
+                # Timeout: if we can't align within 15s, try approaching anyway
+                if time.time() - phase_start > 15.0:
+                    log("ALIGN timeout — proceeding to approach")
+                    phase = Phase.APPROACH
+                    phase_start = time.time()
+                    continue
+
+                # Get marker data (same priority: vid_tracker > SSE)
+                mk_center = None
+                mk_px_size = 0.0
+                frame_w, frame_h = 1280, 720
+                data_src = "none"
+
+                vid_info = vid_tracker.get_marker(target_marker_id)
+                if vid_info and vid_tracker.age < 1.0:
+                    mk_center = vid_info["center"]
+                    mk_px_size = vid_info["px_size"]
+                    frame_w, frame_h = vid_tracker.frame_size
+                    data_src = "vid_tracker"
+                if mk_px_size <= 0 and pos_data:
+                    centers = pos_data.get("marker_centers", {})
+                    px_sizes = pos_data.get("marker_pixel_sizes", {})
+                    sse_center = centers.get(str(target_marker_id))
+                    sse_px = px_sizes.get(str(target_marker_id), 0.0)
+                    if sse_center and sse_px > 0:
+                        mk_center = sse_center
+                        mk_px_size = sse_px
+                        frame_w = pos_data.get("frame_w") or 1280
+                        frame_h = pos_data.get("frame_h") or 720
+                        data_src = "SSE"
+
+                if mk_center is None or mk_px_size <= 0:
+                    # No pixel data — check if marker is at least in seen list
+                    marker_in_seen = pos_data and target_marker_id in pos_data.get("seen_markers", [])
+                    if not marker_in_seen:
+                        _marker_lost_ticks += 1
+                        send_rc_stop()
+                        if _marker_lost_ticks > CONTROL_HZ * 5:
+                            log("ALIGN: marker lost — returning to scan")
+                            phase = Phase.SCAN
+                            phase_start = time.time()
+                            scan_total_rotation = 0.0
+                            scan_last_yaw = None
+                        else:
+                            log(f"ALIGN: marker not visible (lost {_marker_lost_ticks} ticks)")
+                    else:
+                        # Marker visible but no pixel data — skip alignment
+                        log("ALIGN: no pixel data — proceeding to approach")
+                        phase = Phase.APPROACH
+                        phase_start = time.time()
+                    continue
+
+                _marker_lost_ticks = 0
+                mk_cx, mk_cy = mk_center[0], mk_center[1]
+                img_cx, img_cy = frame_w / 2.0, frame_h / 2.0
+                err_x = (mk_cx - img_cx) / img_cx
+                err_y = (mk_cy - img_cy) / img_cy
+                est_dist = pixel_distance_estimate(mk_px_size)
+
+                # Perspective skew: are we looking at the marker from an angle?
+                skew = 0.0
+                if vid_info and "left_len" in vid_info and "right_len" in vid_info:
+                    skew = marker_skew(vid_info["left_len"], vid_info["right_len"])
+
+                # YAW: centre marker horizontally
+                # Boost gain when marker is near image edge to prevent losing it
+                yaw_P = 45.0 * edge_boost(err_x)
+                yaw_rc = _clamp(int(err_x * yaw_P), -50, 50)
+
+                # LATERAL: strafe to get in front of the marker (correct skew)
+                skew_P = 25.0
+                lr = _clamp(int(skew * skew_P), -15, 15)
+
+                # ALTITUDE: match marker height — strong correction to climb/descend
+                # to the marker's altitude. Boost when marker is near top/bottom edge.
+                alt_P = 45.0 * edge_boost(err_y)
+                ud = _clamp(int(-err_y * alt_P), -40, 40)
+
+                send_rc(lr, 0, ud, yaw_rc)
+
+                # Check if centred AND square (no skew) to proceed
+                aligned = abs(err_x) < 0.08 and abs(err_y) < 0.15 and abs(skew) < 0.06
+                if aligned:
+                    _align_centered_ticks += 1
+                else:
+                    _align_centered_ticks = 0
+
+                if _align_centered_ticks >= CONTROL_HZ * 1:  # 1s centred+square
+                    log(f"ALIGNED!  >>> {est_dist:.2f}m <<<  "
+                        f"err_x={err_x:+.3f}  skew={skew:+.3f}  "
+                        f"— proceeding to approach")
+                    phase = Phase.APPROACH
+                    phase_start = time.time()
+                    _approach_stable_ticks = 0
+                else:
+                    log(f"Align:  >>> {est_dist:.2f}m <<<  "
+                        f"px={mk_px_size:.0f} ({MARKER_SIZE_M*100:.0f}cm marker)  "
+                        f"err_x={err_x:+.2f} err_y={err_y:+.2f} skew={skew:+.2f}  "
+                        f"RC lr={lr} yaw={yaw_rc} ud={ud}  "
+                        f"ok={_align_centered_ticks}/{CONTROL_HZ}  [{data_src}]")
+
             # ── APPROACH — visual servoing ──────────────────────────────
             #
             # Strategy: use the marker's position IN THE CAMERA IMAGE to
@@ -635,6 +995,11 @@ def run_mission(
             #   - Marker pixel size → distance estimate → forward speed
             # This works in ANY room, even without arena config.
             #
+            # Data sources (in priority order):
+            #   1. vid_tracker (client-side ArUco on MJPEG frames)
+            #   2. SSE marker_pixel_sizes / marker_centers (server-side)
+            #   3. SSE seen_markers (no pixel data — fallback creep)
+            #
             elif phase == Phase.APPROACH:
                 # Approach timeout
                 if time.time() - approach_start_time > 60.0:
@@ -643,20 +1008,42 @@ def run_mission(
                     phase = Phase.LAND
                     continue
 
-                # Get marker pixel info from position SSE
+                # ── Gather marker data from all sources ──
                 mk_center = None
                 mk_px_size = 0.0
                 marker_in_seen = False
                 frame_w, frame_h = 1280, 720  # defaults
-                if pos_data:
+                data_src = "none"
+
+                # Source 1: vid_tracker (client-side, always has pixel data)
+                vid_info = vid_tracker.get_marker(target_marker_id)
+                if vid_info and vid_tracker.age < 1.0:
+                    mk_center = vid_info["center"]
+                    mk_px_size = vid_info["px_size"]
+                    frame_w, frame_h = vid_tracker.frame_size
+                    marker_in_seen = True
+                    data_src = "vid_tracker"
+
+                # Source 2: SSE pixel data (fallback if vid_tracker has nothing)
+                if mk_px_size <= 0 and pos_data:
                     centers = pos_data.get("marker_centers", {})
                     px_sizes = pos_data.get("marker_pixel_sizes", {})
-                    mk_center = centers.get(str(target_marker_id))
-                    mk_px_size = px_sizes.get(str(target_marker_id), 0.0)
-                    frame_w = pos_data.get("frame_w") or 1280
-                    frame_h = pos_data.get("frame_h") or 720
+                    sse_center = centers.get(str(target_marker_id))
+                    sse_px = px_sizes.get(str(target_marker_id), 0.0)
+                    if sse_center and sse_px > 0:
+                        mk_center = sse_center
+                        mk_px_size = sse_px
+                        frame_w = pos_data.get("frame_w") or 1280
+                        frame_h = pos_data.get("frame_h") or 720
+                        marker_in_seen = True
+                        data_src = "SSE"
+
+                # Source 3: SSE seen_markers (no pixel data)
+                if not marker_in_seen and pos_data:
                     seen = pos_data.get("seen_markers", [])
-                    marker_in_seen = target_marker_id in seen
+                    if target_marker_id in seen:
+                        marker_in_seen = True
+                        data_src = "SSE-seen-only"
 
                 has_pixel_data = mk_center is not None and mk_px_size > 0
 
@@ -679,7 +1066,7 @@ def run_mission(
                 _marker_lost_ticks = 0  # reset — marker is visible
 
                 if has_pixel_data:
-                    # ── Full visual servoing (server has pixel data) ──
+                    # ── Full visual servoing ──
                     mk_cx, mk_cy = mk_center[0], mk_center[1]
                     img_cx, img_cy = frame_w / 2.0, frame_h / 2.0
 
@@ -689,41 +1076,78 @@ def run_mission(
 
                     est_dist = pixel_distance_estimate(mk_px_size)
 
-                    # YAW: centre marker horizontally
-                    yaw_P = 25.0
-                    yaw_rc = _clamp(int(err_x * yaw_P), -20, 20)
+                    # Perspective skew: detect if approaching from an angle
+                    skew = 0.0
+                    if vid_info and "left_len" in vid_info and "right_len" in vid_info:
+                        skew = marker_skew(vid_info["left_len"], vid_info["right_len"])
 
-                    # ALTITUDE: centre marker vertically
-                    alt_P = 20.0
-                    ud = _clamp(int(-err_y * alt_P), -15, 15)
+                    # YAW: centre marker horizontally → face the marker directly
+                    # Boost gain when marker nears image edge to keep it in view
+                    yaw_P = 40.0 * edge_boost(err_x)
+                    yaw_rc = _clamp(int(err_x * yaw_P), -50, 50)
 
-                    # FORWARD: approach based on distance estimate
-                    fb = 0
-                    lr = 0
-                    if abs(err_x) < 0.3:
-                        if est_dist <= hover_distance:
-                            send_rc_stop()
-                            log(f"ARRIVED! est_dist={est_dist:.2f}m "
-                                f"(hover_dist={hover_distance}m, px={mk_px_size:.0f})")
+                    # LATERAL: strafe to correct perspective skew
+                    skew_P = 20.0
+                    err_x_P = 12.0
+                    lr = _clamp(int(skew * skew_P + err_x * err_x_P), -15, 15)
+
+                    # ALTITUDE: match marker height — strong correction with
+                    # edge boost to prevent marker leaving top/bottom of frame
+                    alt_P = 45.0 * edge_boost(err_y)
+                    ud = _clamp(int(-err_y * alt_P), -40, 40)
+
+                    # FORWARD/BACKWARD: proportional distance controller
+                    dist_err = est_dist - hover_distance
+                    dist_P = 8.0
+                    fb = _clamp(int(dist_err * dist_P), -approach_speed, approach_speed)
+
+                    # Don't fly forward unless well-aligned with marker
+                    if (abs(err_x) > 0.15 or abs(skew) > 0.10) and fb > 0:
+                        fb = 0  # align first, then approach
+
+                    # Transition to HOVER once stable near target distance + aligned
+                    if abs(dist_err) < 0.3 and abs(err_x) < 0.15 and abs(skew) < 0.08:
+                        _approach_stable_ticks += 1
+                        if _approach_stable_ticks >= CONTROL_HZ * 1:  # 1s stable
+                            log(f"ARRIVED!  >>> {est_dist:.2f}m <<<  "
+                                f"(target {hover_distance}m)  skew={skew:+.3f}  "
+                                f"[{data_src}]")
                             phase = Phase.HOVER
                             phase_start = time.time()
-                            continue
-                        else:
-                            remaining = est_dist - hover_distance
-                            brake_zone = max(hover_distance, 1.0)
-                            brake = min(1.0, remaining / brake_zone)
-                            fb = _clamp(int(approach_speed * brake), 0, approach_speed)
+                            _approach_stable_ticks = 0
+                    else:
+                        _approach_stable_ticks = 0
 
                     send_rc(lr, fb, ud, yaw_rc)
-                    log(f"Approach: px_dist={est_dist:.2f}m ({mk_px_size:.0f}px)  "
-                        f"img_err=({err_x:+.2f},{err_y:+.2f})  "
-                        f"RC fb={fb} ud={ud} yaw={yaw_rc}")
+                    # Expected px size at target distance: invert dist = A * px^(-B)
+                    # → px = (A / dist)^(1/B)
+                    expect_px = (CALIB_A / hover_distance) ** (1.0 / CALIB_B) if hover_distance > 0 else 0
+                    log(f"Approach  >>> {est_dist:.2f}m <<<  (target {hover_distance}m)  "
+                        f"px={mk_px_size:.0f} (expect {expect_px:.0f}px @{hover_distance}m for {MARKER_SIZE_M*100:.0f}cm marker)  "
+                        f"err_x={err_x:+.2f} skew={skew:+.2f}  "
+                        f"RC lr={lr} fb={fb} ud={ud} yaw={yaw_rc}  [{data_src}]")
 
                 else:
                     # ── Fallback: no pixel data, but marker in seen_markers ──
-                    # Creep forward slowly — we know the marker is visible
-                    # to the camera but the server doesn't send pixel coords.
-                    # Hold altitude via telemetry, no yaw correction.
+                    # Try vid_tracker one more time (might have data but age > 1s)
+                    # If vid_tracker has any recent data at all, use it for yaw
+                    fb_yaw = 0
+                    fb_lr = 0
+                    fallback_vid = vid_tracker.get_marker(target_marker_id)
+                    if fallback_vid and vid_tracker.age < 3.0:
+                        fw, fh = vid_tracker.frame_size
+                        fcx = fallback_vid["center"][0]
+                        ferr_x = (fcx - fw / 2.0) / (fw / 2.0)
+                        fb_yaw = _clamp(int(ferr_x * 40), -25, 25)
+                        fb_lr = _clamp(int(ferr_x * 12), -10, 10)
+                        log(f"Approach (fallback+vid): marker {target_marker_id}  "
+                            f"err_x={ferr_x:+.2f}  yaw={fb_yaw}  lr={fb_lr}  "
+                            f"vid_age={vid_tracker.age:.1f}s")
+                    else:
+                        log(f"Approach (blind fallback): marker {target_marker_id} "
+                            f"in seen_markers, NO pixel data — creeping forward  "
+                            f"vid_active={vid_tracker.is_active}  vid_age={vid_tracker.age:.1f}s")
+
                     tel = get_telemetry()
                     height_cm = tel.get("height_cm") or 0
                     height_m = height_cm / 100.0
@@ -731,26 +1155,46 @@ def run_mission(
                     ud = _clamp(int(alt_err * 30), -15, 15)
 
                     fb = approach_speed  # steady creep forward
-                    send_rc(0, fb, ud, 0)
-                    log(f"Approach (no-pixel fallback): marker {target_marker_id} "
-                        f"in seen_markers, creeping fb={fb}  alt={height_m:.2f}m")
+                    send_rc(fb_lr, fb, ud, fb_yaw)
 
             # ── HOVER — hold position facing marker ─────────────────
             elif phase == Phase.HOVER:
-                # Get marker pixel info
+                # ── Gather marker data from all sources ──
                 mk_center = None
                 mk_px_size = 0.0
                 marker_in_seen = False
                 frame_w, frame_h = 1280, 720
-                if pos_data:
+                data_src = "none"
+
+                # Source 1: vid_tracker
+                vid_info = vid_tracker.get_marker(target_marker_id)
+                if vid_info and vid_tracker.age < 1.0:
+                    mk_center = vid_info["center"]
+                    mk_px_size = vid_info["px_size"]
+                    frame_w, frame_h = vid_tracker.frame_size
+                    marker_in_seen = True
+                    data_src = "vid_tracker"
+
+                # Source 2: SSE pixel data
+                if mk_px_size <= 0 and pos_data:
                     centers = pos_data.get("marker_centers", {})
                     px_sizes = pos_data.get("marker_pixel_sizes", {})
-                    mk_center = centers.get(str(target_marker_id))
-                    mk_px_size = px_sizes.get(str(target_marker_id), 0.0)
-                    frame_w = pos_data.get("frame_w") or 1280
-                    frame_h = pos_data.get("frame_h") or 720
+                    sse_center = centers.get(str(target_marker_id))
+                    sse_px = px_sizes.get(str(target_marker_id), 0.0)
+                    if sse_center and sse_px > 0:
+                        mk_center = sse_center
+                        mk_px_size = sse_px
+                        frame_w = pos_data.get("frame_w") or 1280
+                        frame_h = pos_data.get("frame_h") or 720
+                        marker_in_seen = True
+                        data_src = "SSE"
+
+                # Source 3: SSE seen_markers
+                if not marker_in_seen and pos_data:
                     seen = pos_data.get("seen_markers", [])
-                    marker_in_seen = target_marker_id in seen
+                    if target_marker_id in seen:
+                        marker_in_seen = True
+                        data_src = "SSE-seen-only"
 
                 has_pixel_data = mk_center is not None and mk_px_size > 0
 
@@ -775,35 +1219,59 @@ def run_mission(
                     err_y = (mk_cy - img_cy) / img_cy
                     est_dist = pixel_distance_estimate(mk_px_size)
 
-                    yaw_P = 15.0
-                    yaw_rc = _clamp(int(err_x * yaw_P), -12, 12)
-                    alt_P = 12.0
-                    ud = _clamp(int(-err_y * alt_P), -10, 10)
+                    # Perspective skew
+                    skew = 0.0
+                    if vid_info and "left_len" in vid_info and "right_len" in vid_info:
+                        skew = marker_skew(vid_info["left_len"], vid_info["right_len"])
 
-                    fb = 0
-                    if est_dist < hover_distance * 0.7:
-                        fb = -4
-                    elif est_dist > hover_distance * 1.5:
-                        fb = 3
+                    # YAW: keep marker centred — boost when near edge
+                    yaw_P = 35.0 * edge_boost(err_x)
+                    yaw_rc = _clamp(int(err_x * yaw_P), -40, 40)
 
-                    send_rc(0, fb, ud, yaw_rc)
+                    # LATERAL: correct perspective skew to stay directly in front
+                    skew_P = 18.0
+                    err_x_P = 10.0
+                    lr = _clamp(int(skew * skew_P + err_x * err_x_P), -12, 12)
+
+                    # ALTITUDE: match marker height — boost when near edge
+                    alt_P = 45.0 * edge_boost(err_y)
+                    ud = _clamp(int(-err_y * alt_P), -40, 40)
+
+                    # DISTANCE: actively maintain hover_distance
+                    dist_err = est_dist - hover_distance
+                    dist_P = 8.0
+                    fb = _clamp(int(dist_err * dist_P), -15, 10)
+
+                    send_rc(lr, fb, ud, yaw_rc)
                     hover_dur = time.time() - phase_start
-                    log(f"HOVER: dist={est_dist:.2f}m ({mk_px_size:.0f}px)  "
-                        f"img_err=({err_x:+.2f},{err_y:+.2f})  "
-                        f"RC fb={fb} ud={ud} yaw={yaw_rc}  "
-                        f"marker {target_marker_id}  t={hover_dur:.0f}s  "
-                        f"[Ctrl+C to land]")
+                    expect_px = (CALIB_A / hover_distance) ** (1.0 / CALIB_B) if hover_distance > 0 else 0
+                    log(f"HOVER  >>> {est_dist:.2f}m <<<  (target {hover_distance}m)  "
+                        f"px={mk_px_size:.0f} (expect {expect_px:.0f}px for {MARKER_SIZE_M*100:.0f}cm marker)  "
+                        f"err_x={err_x:+.2f} skew={skew:+.2f}  "
+                        f"RC lr={lr} fb={fb} ud={ud} yaw={yaw_rc}  "
+                        f"ID={target_marker_id}  t={hover_dur:.0f}s  [{data_src}]")
                 else:
-                    # Fallback hover: just hold position, no pixel data
+                    # Fallback hover — try vid_tracker with relaxed age
+                    fb_yaw = 0
+                    fb_lr = 0
+                    fallback_vid = vid_tracker.get_marker(target_marker_id)
+                    if fallback_vid and vid_tracker.age < 3.0:
+                        fw, fh = vid_tracker.frame_size
+                        fcx = fallback_vid["center"][0]
+                        ferr_x = (fcx - fw / 2.0) / (fw / 2.0)
+                        fb_yaw = _clamp(int(ferr_x * 30), -20, 20)
+                        fb_lr = _clamp(int(ferr_x * 10), -8, 8)
+
                     tel = get_telemetry()
                     height_cm = tel.get("height_cm") or 0
                     height_m = height_cm / 100.0
                     alt_err = takeoff_height - height_m
                     ud = _clamp(int(alt_err * 25), -10, 10)
-                    send_rc(0, 0, ud, 0)
+                    send_rc(fb_lr, 0, ud, fb_yaw)
                     hover_dur = time.time() - phase_start
-                    log(f"HOVER (no-pixel fallback): marker {target_marker_id} visible  "
-                        f"alt={height_m:.2f}m  t={hover_dur:.0f}s  [Ctrl+C to land]")
+                    log(f"HOVER (fallback): marker {target_marker_id}  "
+                        f"yaw={fb_yaw} lr={fb_lr}  alt={height_m:.2f}m  "
+                        f"t={hover_dur:.0f}s  vid_active={vid_tracker.is_active}")
 
             # ── LAND ─────────────────────────────────────────────────
             elif phase == Phase.LAND:
@@ -829,6 +1297,7 @@ def run_mission(
         time.sleep(2.0)
 
     pos_listener.stop()
+    vid_tracker.stop()
     _abort.set()
 
     # Stop recording
@@ -875,7 +1344,8 @@ def main():
         epilog="""
 Examples:
     %(prog)s --api http://flightctrl1:8080
-    %(prog)s --api http://flightctrl1:8080 --hover-distance 1.5
+    %(prog)s --api http://flightctrl1:8080 --marker 5
+    %(prog)s --api http://flightctrl1:8080 --hover-distance 1.5 --marker 12
     %(prog)s --api http://flightctrl1:8080 --scan-speed 20 --timeout 180
 
 Safety:
@@ -906,6 +1376,10 @@ Safety:
     parser.add_argument(
         "--timeout", type=float, default=MISSION_TIMEOUT_S,
         help=f"Mission timeout in seconds (default: {MISSION_TIMEOUT_S})",
+    )
+    parser.add_argument(
+        "--marker", type=int, default=None,
+        help="Specific marker ID to approach (default: approach any/closest marker)",
     )
     parser.add_argument(
         "--record", action="store_true",
@@ -949,6 +1423,7 @@ Safety:
         scan_speed=args.scan_speed,
         approach_speed=args.approach_speed,
         record=args.record,
+        target_marker=args.marker,
     )
 
     sys.exit(0 if success else 1)
