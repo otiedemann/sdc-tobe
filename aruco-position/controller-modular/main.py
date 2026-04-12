@@ -733,6 +733,11 @@ def main():
     last_fusion_result: Optional[Dict[str, Any]] = None
 
     # --------------------------------------------------------
+    # init position controller
+    # --------------------------------------------------------
+    controller = PositionController()
+    
+    # --------------------------------------------------------
     # Video source setup
     # --------------------------------------------------------
     use_anafi_stream = _is_anafi_source(camera_src)
@@ -964,7 +969,7 @@ def main():
                 vz_world = float(last_motion_sample.get("vz_world", 0.0))
                 yaw_rate = float(last_motion_sample.get("yaw_rate", 0.0))
 
-                last_motion_state = motion_estimator.update_body_frame(
+                last_motion_state = motion_estimator.update_world_frame(
                     timestamp=ts,
                     vx_world=vx_world,
                     vy_world=vy_world,
@@ -1077,9 +1082,24 @@ def main():
             # --------------------------------------
 
             if ctrl_module is not None and last_prediction is not None:
-                rc = ctrl_module.update(last_prediction)
-                if rc is not None and anafi_drone is not None:
-                    ctrl_module.send_pcmd_olympe(anafi_drone, rc)
+                current = controller.Pose(
+                    x=last_prediction.x,
+                    y=last_prediction.y,
+                    z=last_prediction.z,
+                    yaw=last_prediction.yaw,
+                )
+                
+                target = controller.TargetPose(
+                    x=last_prediction.x,
+                    y=last_prediction.y,
+                    z=last_prediction.z,
+                    yaw=last_prediction.yaw,
+                )
+                
+                pcmd = controller.compute_pcmd(current, target)
+                # generated pcmd command for olymp
+                print(pcmd)
+                controller.send_pcmd_olympe(pcmd)
 
             # --------------------------------------
             # Autonomous mission tick
