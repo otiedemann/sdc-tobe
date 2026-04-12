@@ -41,20 +41,18 @@ from urllib.request import Request, urlopen
 
 DEFAULT_API_BASE = "http://flightctrl1:8080"
 TAKEOFF_HEIGHT_M = 1.0        # altitude to hold during search
-HOVER_DISTANCE_M = 1.0        # stop this far in front of the marker
+HOVER_DISTANCE_M = 1.5        # stop this far in front of the marker
 SCAN_YAW_SPEED = 15           # RC yaw percent during search rotation (0-100)
-APPROACH_MAX_SPEED = 20       # RC percent cap during approach
-APPROACH_MIN_SPEED = 5        # RC percent floor during approach
+APPROACH_SPEED = 8            # RC forward percent during approach (0-100)
 RC_TICK_MS = 200              # RC command duration per tick
 CONTROL_HZ = 5                # main loop frequency
 HEARTBEAT_INTERVAL = 0.4      # seconds between heartbeats
 POSITION_TIMEOUT_S = 5.0      # land if no position for this long
 MISSION_TIMEOUT_S = 120.0     # total mission timeout
 SETTLE_TIME_S = 3.0           # time to wait after takeoff before scanning
-ARRIVAL_RADIUS_M = 0.25       # close enough to target
 ALTITUDE_TOLERANCE_M = 0.3    # acceptable altitude error
-WALL_SAFE_DISTANCE_M = 0.8   # hard minimum distance from any wall
-WALL_BRAKE_DISTANCE_M = 1.5  # start braking when this close to a wall
+WALL_SAFE_DISTANCE_M = 1.2   # hard minimum distance from any wall
+WALL_BRAKE_DISTANCE_M = 2.5  # start braking when this close to a wall
 
 # ─── Globals ─────────────────────────────────────────────────────────────────
 
@@ -394,15 +392,17 @@ def run_mission(
     takeoff_height: float = TAKEOFF_HEIGHT_M,
     mission_timeout: float = MISSION_TIMEOUT_S,
     scan_speed: int = SCAN_YAW_SPEED,
+    approach_speed: int = APPROACH_SPEED,
 ):
     global _api_base
     _api_base = api_base
 
     log(f"ArUco Seek & Approach")
-    log(f"  API server:     {api_base}")
-    log(f"  Hover distance: {hover_distance} m")
-    log(f"  Takeoff height: {takeoff_height} m")
-    log(f"  Timeout:        {mission_timeout} s")
+    log(f"  API server:      {api_base}")
+    log(f"  Hover distance:  {hover_distance} m")
+    log(f"  Takeoff height:  {takeoff_height} m")
+    log(f"  Approach speed:  {approach_speed} (RC %)")
+    log(f"  Timeout:         {mission_timeout} s")
     log(f"  Ctrl+C to abort and land at any time")
     log("")
 
@@ -608,10 +608,15 @@ def run_mission(
                         log(f"Scanning... rotated {rot_deg:.0f}/360 deg  "
                             f"alt={height_m:.2f}m  target_alt={takeoff_height:.1f}m")
 
-            # ── APPROACH — fly toward target position ────────────────
+            # ── APPROACH — face marker, creep forward, stop at hover_distance ─
+            #
+            # Strategy: instead of flying to a world-coordinate waypoint,
+            # continuously yaw to face the marker and move forward in body
+            # frame. This keeps the marker centred in the camera FOV and
+            # avoids sideways drift into adjacent walls.
+            #
             elif phase == Phase.APPROACH:
                 if pos is None or pos_age > POSITION_TIMEOUT_S:
-                    # Position lost
                     send_rc_stop()
                     if pos_age > POSITION_TIMEOUT_S:
                         log(f"POSITION LOST for {pos_age:.1f}s — landing for safety")
@@ -620,127 +625,98 @@ def run_mission(
                         log("Waiting for position fix...")
                     continue
 
-                tx, ty, tz, tyaw = target_pos
                 cx, cy, cz = pos[0], pos[1], pos[2]
 
-                # Position error toward target
-                ex = tx - cx
-                ey = ty - cy
-                ez = tz - cz
-                dist_xy = math.sqrt(ex * ex + ey * ey)
-
-                # ── Wall proximity check ──────────────────────────────
-                # Compute distance to the marker (= distance to wall surface)
-                # This works without arena config since the marker IS on the wall.
-                marker_wall_dist = None
-                if target_marker_id is not None and target_marker_id in marker_positions:
+                # Get marker world position (for distance + bearing)
+                if target_marker_id in marker_positions:
                     mk = marker_positions[target_marker_id]
-                    dmx = mk["x"] - cx
-                    dmy = mk["y"] - cy
-                    marker_wall_dist = math.sqrt(dmx**2 + dmy**2)
+                    mkx, mky, mkz = mk["x"], mk["y"], mk["z"]
+                else:
+                    # Fallback: use the original target_pos
+                    mkx, mky, mkz = target_pos[0], target_pos[1], target_pos[2]
 
-                # Also check arena bounds if available
+                # Vector from drone to marker
+                dmx = mkx - cx
+                dmy = mky - cy
+                dmz = mkz - cz
+                dist_to_marker = math.sqrt(dmx**2 + dmy**2)
+
+                # Desired bearing: face the marker
+                desired_yaw = math.atan2(dmy, dmx)
+
+                # Get current yaw
+                tel = get_telemetry()
+                cur_yaw = math.radians(tel.get("yaw") or 0.0)
+                yaw_err = wrap_pi(desired_yaw - cur_yaw)
+
+                # ── Distance check: close enough? ────────────────────
+                if dist_to_marker <= hover_distance:
+                    send_rc_stop()
+                    log(f"ARRIVED! dist_to_marker={dist_to_marker:.2f}m "
+                        f"(hover_dist={hover_distance}m)")
+                    phase = Phase.HOVER
+                    phase_start = time.time()
+                    # Lock hover target at current position, facing the marker
+                    target_pos = (cx, cy, cz, desired_yaw)
+                    continue
+
+                # ── Hard wall safety (arena bounds) ──────────────────
                 arena_wall_name, arena_wall_dist = "", float("inf")
                 if arena_bounds:
                     arena_wall_name, arena_wall_dist = arena_bounds.nearest_wall(cx, cy)
 
-                # Use the smaller of marker distance and arena wall distance
-                effective_wall_dist = min(
-                    marker_wall_dist if marker_wall_dist is not None else float("inf"),
-                    arena_wall_dist,
-                )
+                effective_wall_dist = min(dist_to_marker, arena_wall_dist)
 
-                # HARD STOP: too close to wall — back away!
                 if effective_wall_dist < WALL_SAFE_DISTANCE_M:
                     send_rc_stop()
-                    log(f"WALL PROXIMITY STOP! dist={effective_wall_dist:.2f}m "
-                        f"(safe={WALL_SAFE_DISTANCE_M}m) — holding position")
-                    # Arrived at safe hover distance from marker/wall
+                    log(f"WALL STOP! effective_dist={effective_wall_dist:.2f}m — hover here")
                     phase = Phase.HOVER
                     phase_start = time.time()
-                    # Update target to current position (don't push closer)
-                    target_pos = (cx, cy, cz, tyaw)
+                    target_pos = (cx, cy, cz, desired_yaw)
                     continue
 
-                # Get current yaw from telemetry
-                tel = get_telemetry()
-                cur_yaw_deg = tel.get("yaw") or 0.0
-                cur_yaw = math.radians(cur_yaw_deg)
-
-                # Check if arrived at target
-                if dist_xy < ARRIVAL_RADIUS_M and abs(ez) < ALTITUDE_TOLERANCE_M:
-                    send_rc_stop()
-                    log(f"ARRIVED at target! dist={dist_xy:.2f}m  alt_err={ez:.2f}m")
-                    phase = Phase.HOVER
-                    phase_start = time.time()
-                    continue
-
-                # Approach timeout (don't get stuck)
+                # Approach timeout
                 if time.time() - approach_start_time > 60.0:
                     send_rc_stop()
                     log("APPROACH TIMEOUT after 60s — landing")
                     phase = Phase.LAND
                     continue
 
-                # Compute RC commands (simplified P controller)
-                kp_xy = 0.6
-                kp_z = 0.5
-                kp_yaw = 1.2
+                # ── Yaw first, then creep forward ────────────────────
+                # Step 1: yaw to face the marker (no forward movement
+                #         until roughly aligned)
+                yaw_rc = _clamp(int(-yaw_err / math.pi * 60), -30, 30)
 
-                vx_sp = kp_xy * ex
-                vy_sp = kp_xy * ey
-                vz_sp = kp_z * ez
+                # Step 2: forward speed — only when yaw is roughly aligned
+                if abs(yaw_err) > 0.3:  # ~17 degrees
+                    # Still turning — don't move forward, no lateral
+                    fb = 0
+                    lr = 0
+                else:
+                    # Aligned — creep forward at approach_speed
+                    # Brake smoothly as we get close to hover_distance
+                    remaining = dist_to_marker - hover_distance
+                    brake_zone = max(hover_distance, 1.0)  # start braking this far out
+                    brake = min(1.0, remaining / brake_zone) if brake_zone > 0 else 0.0
+                    fb = _clamp(int(approach_speed * brake), 0, approach_speed)
 
-                # Clamp horizontal speed
-                max_speed = 0.5  # m/s
-                horiz = math.sqrt(vx_sp**2 + vy_sp**2)
-                if horiz > max_speed:
-                    vx_sp = vx_sp / horiz * max_speed
-                    vy_sp = vy_sp / horiz * max_speed
+                    # No lateral movement — the yaw keeps us aimed at the marker
+                    lr = 0
 
-                # ── Wall proximity braking ────────────────────────────
-                # Smoothly reduce speed as we approach the wall
-                if effective_wall_dist < WALL_BRAKE_DISTANCE_M:
-                    brake = max(0.0, (effective_wall_dist - WALL_SAFE_DISTANCE_M) /
-                                     (WALL_BRAKE_DISTANCE_M - WALL_SAFE_DISTANCE_M))
-                    vx_sp *= brake
-                    vy_sp *= brake
-
-                # Also use arena bounds brake factor (per-axis, direction-aware)
-                if arena_bounds:
-                    arena_brake = arena_bounds.wall_brake_factor(cx, cy, vx_sp, vy_sp)
-                    vx_sp *= arena_brake
-                    vy_sp *= arena_brake
-
-                # Yaw toward target
-                yaw_err = wrap_pi(tyaw - cur_yaw)
-                yaw_rate = kp_yaw * yaw_err
-                yaw_rate = max(-0.6, min(0.6, yaw_rate))
-
-                # Slow down horizontal if yaw misaligned
-                if abs(yaw_err) > 0.4:
-                    vx_sp *= 0.2
-                    vy_sp *= 0.2
-
-                # World to body frame
-                vx_body, vy_body = world_to_body(vx_sp, vy_sp, cur_yaw)
-
-                # Map to RC percent
-                fb = _clamp(int(vx_body / max_speed * APPROACH_MAX_SPEED))
-                lr = _clamp(int(-vy_body / max_speed * APPROACH_MAX_SPEED))
-                ud = _clamp(int(vz_sp / 0.5 * 30), -30, 30)
-                yaw_rc = _clamp(int(-yaw_rate / 0.6 * 25), -30, 30)
+                # Altitude hold
+                height_cm = tel.get("height_cm") or 0
+                height_m = height_cm / 100.0
+                alt_err = mkz - height_m  # try to match marker height
+                ud = _clamp(int(alt_err * 25), -20, 20)
 
                 send_rc(lr, fb, ud, yaw_rc)
 
-                wall_info = f"wall={effective_wall_dist:.2f}m"
-                if arena_wall_dist < float("inf"):
-                    wall_info += f"({arena_wall_name})"
-                log(f"Approach: dist={dist_xy:.2f}m  {wall_info}  alt_err={ez:.2f}m  "
+                log(f"Approach: marker_dist={dist_to_marker:.2f}m  "
                     f"yaw_err={math.degrees(yaw_err):.0f}deg  "
+                    f"wall={effective_wall_dist:.2f}m  "
                     f"RC fb={fb} lr={lr} ud={ud} yaw={yaw_rc}")
 
-            # ── HOVER — hold position in front of marker ─────────────
+            # ── HOVER — hold position facing marker ──────────────────
             elif phase == Phase.HOVER:
                 if pos is None or pos_age > POSITION_TIMEOUT_S:
                     send_rc_stop()
@@ -749,60 +725,49 @@ def run_mission(
                         phase = Phase.LAND
                     continue
 
-                tx, ty, tz, tyaw = target_pos
                 cx, cy, cz = pos[0], pos[1], pos[2]
-                ex, ey, ez = tx - cx, ty - cy, tz - cz
-                dist_xy = math.sqrt(ex**2 + ey**2)
 
-                # Wall proximity check during hover too
-                marker_wall_dist = None
-                if target_marker_id is not None and target_marker_id in marker_positions:
+                # Marker position for distance + bearing
+                if target_marker_id in marker_positions:
                     mk = marker_positions[target_marker_id]
-                    dmx = mk["x"] - cx
-                    dmy = mk["y"] - cy
-                    marker_wall_dist = math.sqrt(dmx**2 + dmy**2)
+                    mkx, mky = mk["x"], mk["y"]
+                else:
+                    mkx, mky = target_pos[0], target_pos[1]
 
-                arena_wall_dist = float("inf")
-                if arena_bounds:
-                    _, arena_wall_dist = arena_bounds.nearest_wall(cx, cy)
+                dmx = mkx - cx
+                dmy = mky - cy
+                dist_to_marker = math.sqrt(dmx**2 + dmy**2)
 
-                effective_wall_dist = min(
-                    marker_wall_dist if marker_wall_dist is not None else float("inf"),
-                    arena_wall_dist,
-                )
-
+                # Keep facing the marker
+                desired_yaw = math.atan2(dmy, dmx)
                 tel = get_telemetry()
                 cur_yaw = math.radians(tel.get("yaw") or 0.0)
+                yaw_err = wrap_pi(desired_yaw - cur_yaw)
 
-                # Light position hold
-                kp = 0.4
-                vx_sp = kp * ex
-                vy_sp = kp * ey
-                vz_sp = 0.3 * ez
-                yaw_err = wrap_pi(tyaw - cur_yaw)
-                yaw_rate = 0.8 * yaw_err
+                # Light yaw correction to keep marker centred
+                yaw_rc = _clamp(int(-yaw_err / math.pi * 40), -15, 15)
 
-                # During hover, never push toward a wall
-                if effective_wall_dist < WALL_SAFE_DISTANCE_M + 0.2:
-                    # Kill any velocity component toward the wall
-                    if arena_bounds:
-                        brake = arena_bounds.wall_brake_factor(cx, cy, vx_sp, vy_sp)
-                        vx_sp *= brake
-                        vy_sp *= brake
+                # If drifting too close to marker/wall, back away
+                fb = 0
+                if dist_to_marker < hover_distance * 0.7:
+                    fb = -5  # gentle reverse
+                elif dist_to_marker > hover_distance * 1.5:
+                    fb = 3   # nudge forward
 
-                vx_body, vy_body = world_to_body(vx_sp, vy_sp, cur_yaw)
+                # Altitude hold at marker height
+                height_cm = tel.get("height_cm") or 0
+                height_m = height_cm / 100.0
+                mkz_h = target_pos[2] if target_pos else cz
+                alt_err = mkz_h - height_m
+                ud = _clamp(int(alt_err * 20), -15, 15)
 
-                fb = _clamp(int(vx_body / 0.5 * 15), -20, 20)
-                lr = _clamp(int(-vy_body / 0.5 * 15), -20, 20)
-                ud = _clamp(int(vz_sp / 0.3 * 15), -20, 20)
-                yaw_rc = _clamp(int(-yaw_rate / 0.6 * 15), -20, 20)
-
-                send_rc(lr, fb, ud, yaw_rc)
+                send_rc(0, fb, ud, yaw_rc)
 
                 hover_dur = time.time() - phase_start
-                log(f"HOVER: ({cx:.2f},{cy:.2f},{cz:.2f}) err_xy={dist_xy:.2f}m  "
-                    f"wall={effective_wall_dist:.2f}m  "
-                    f"facing marker {target_marker_id}  t={hover_dur:.0f}s  "
+                log(f"HOVER: dist_marker={dist_to_marker:.2f}m  "
+                    f"yaw_err={math.degrees(yaw_err):.0f}deg  "
+                    f"alt={height_m:.2f}m  "
+                    f"marker {target_marker_id}  t={hover_dur:.0f}s  "
                     f"[Ctrl+C to land]")
 
             # ── LAND ─────────────────────────────────────────────────
@@ -895,6 +860,10 @@ Safety:
         help=f"Yaw rotation speed during scan, 0-100 (default: {SCAN_YAW_SPEED})",
     )
     parser.add_argument(
+        "--approach-speed", type=int, default=APPROACH_SPEED,
+        help=f"Forward RC percent during approach, 1-100 (default: {APPROACH_SPEED})",
+    )
+    parser.add_argument(
         "--timeout", type=float, default=MISSION_TIMEOUT_S,
         help=f"Mission timeout in seconds (default: {MISSION_TIMEOUT_S})",
     )
@@ -934,6 +903,7 @@ Safety:
         takeoff_height=args.takeoff_height,
         mission_timeout=args.timeout,
         scan_speed=args.scan_speed,
+        approach_speed=args.approach_speed,
     )
 
     sys.exit(0 if success else 1)
