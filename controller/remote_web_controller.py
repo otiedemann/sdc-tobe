@@ -651,7 +651,9 @@ async function refreshTelemetry(){
     apiEl.textContent = 'connected';
     apiEl.style.color = '#22c55e';
 
-    const live = Boolean(t.connected) && Boolean(t.state_fresh);
+    // state_fresh may be absent from older API servers; infer liveness from real data
+  const fresh = (t.state_fresh !== undefined) ? Boolean(t.state_fresh) : (t.battery != null || t.yaw != null);
+  const live = Boolean(t.connected) && fresh;
     droneEl.textContent = live ? 'live' : 'no live telemetry';
     droneEl.style.color = live ? '#22c55e' : '#f59e0b';
 
@@ -825,7 +827,9 @@ function _handleTelemetryData(t) {
   document.getElementById('tel_ay').textContent = hasAccel ? fmt(t.agy) : 'N/A';
   document.getElementById('tel_az').textContent = hasAccel ? fmt(t.agz) : 'N/A';
   apiEl.textContent = 'connected'; apiEl.style.color = '#22c55e';
-  const live = Boolean(t.connected) && Boolean(t.state_fresh);
+  // state_fresh may be absent from older API servers; infer liveness from real data
+  const fresh = (t.state_fresh !== undefined) ? Boolean(t.state_fresh) : (t.battery != null || t.yaw != null);
+  const live = Boolean(t.connected) && fresh;
   droneEl.textContent = live ? 'live' : 'no live telemetry';
   droneEl.style.color = live ? '#22c55e' : '#f59e0b';
   if (!live) {
