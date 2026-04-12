@@ -481,7 +481,7 @@ class AutonomousMission:
 
     def _compute_approach(self, vision_result: Optional[dict]) -> Optional[tuple]:
         """
-        Return (x, y, z, yaw) by flying 5 units forward from the current
+        Return (x, y, z, yaw) by flying 0.5 units forward from the current
         cam position along the camera's current forward direction.
 
         Uses vision_result["cam"] (position) and vision_result["dir"]
@@ -1093,7 +1093,6 @@ def main():
                 fused_state=last_fused_state,
                 now_ts=now,
             )
-
 
             # --------------------------------------
             # Drone Position Controller
