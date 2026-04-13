@@ -1,0 +1,11 @@
+# Large files — don't commit to git
+data/seraphim/
+models/train/
+models/**/*.pt
+models/**/*.onnx
+models/**/*_ncnn_model/
+models/**/*.tflite
+models/**/*.engine
+
+# Keep the dataset YAML config
+!data/drone_dataset.yaml
