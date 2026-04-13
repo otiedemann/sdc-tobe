@@ -32,3 +32,39 @@ main { display: grid; grid-template-columns: 1.25fr 1fr; gap: 16px; padding: 16p
 .video { width: 100%; aspect-ratio: 4 / 3; min-height: auto; background: #000; border-radius: 6px; display:flex; align-items:center; justify-content:center; color:#64748b; }
 img.video { object-fit: cover; }
 .actions button { margin-right: 8px; padding: 6px 10px; cursor: pointer; }
+
+/* ─── Telemetry Graphs Panel ──────────────────────────────────────────── */
+.telemetry-toggle {
+  position: fixed; bottom: 16px; right: 16px; z-index: 1000;
+  padding: 10px 18px; border: 1px solid #334155; border-radius: 8px;
+  background: #1e293b; color: #e2e8f0; font-size: 15px; font-weight: 600;
+  cursor: pointer; box-shadow: 0 4px 12px rgba(0,0,0,0.4);
+}
+.telemetry-toggle:hover { background: #334155; }
+.telemetry-panel {
+  padding: 16px; border-top: 2px solid #334155; background: #0c1222;
+}
+.telemetry-header { display: flex; align-items: center; gap: 16px; flex-wrap: wrap; margin-bottom: 12px; }
+.telemetry-header h2 { margin: 0; font-size: 18px; }
+.telemetry-controls { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.telemetry-controls input[type="text"] {
+  background: #1e293b; border: 1px solid #475569; border-radius: 4px;
+  color: #e2e8f0; padding: 4px 8px; font-size: 13px; width: 220px;
+}
+.telemetry-controls button {
+  padding: 5px 14px; border: 1px solid #475569; border-radius: 4px;
+  background: #1e293b; color: #e2e8f0; cursor: pointer; font-size: 13px;
+}
+.telemetry-controls button:hover { background: #334155; }
+.telemetry-controls button:disabled { opacity: 0.4; cursor: default; }
+.telem-status { font-size: 13px; color: #94a3b8; }
+.telemetry-graphs {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(360px, 1fr));
+  gap: 8px;
+}
+.telem-graph-wrap {
+  background: #0f172a; border: 1px solid #1e293b; border-radius: 6px;
+  overflow: hidden;
+}
+.telem-graph-wrap canvas { display: block; width: 100%; height: auto; }

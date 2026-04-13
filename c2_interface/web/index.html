@@ -67,6 +67,25 @@
       </section>
     </main>
 
+    <!-- Telemetry Graphs Panel -->
+    <div id="telemetryPanel" class="telemetry-panel" style="display:none;">
+      <div class="telemetry-header">
+        <h2>Live Telemetry</h2>
+        <div class="telemetry-controls">
+          <label>API Server:
+            <input id="telemetryApiUrl" type="text" value="http://flightctrl1:8080" placeholder="http://host:port" />
+          </label>
+          <button id="telemetryConnect">Connect</button>
+          <button id="telemetryDisconnect" disabled>Disconnect</button>
+          <span id="telemetryStatus" class="telem-status">disconnected</span>
+        </div>
+      </div>
+      <div id="telemetryGraphs" class="telemetry-graphs"></div>
+    </div>
+
+    <button id="telemetryToggle" class="telemetry-toggle">📊 Telemetry</button>
+
+    <script src="/static/telemetry_graphs.js"></script>
     <script src="/static/app.js"></script>
   </body>
 </html>
