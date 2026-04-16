@@ -1533,56 +1533,63 @@ let ARENA_W_dyn = 20, ARENA_D_dyn = 10;
 // ── Live Telemetry Graphs ─────────────────────────────────────────────
 (function(){
   const WINDOW_S = 10;          // rolling window in seconds
-  const CANVAS_W = 340, CANVAS_H = 120;
-  const COLORS = ['#22d3ee','#f472b6','#a78bfa','#34d399','#fb923c','#facc15','#60a5fa','#f87171'];
+  const SAMPLE_HZ = 20;         // sampling rate (polls lastTelemetry/_lastPos)
+  const CANVAS_W = 340, CANVAS_H = 130;
   const GROUPS = [
     {title:'Altitude (cm)',     keys:['height_cm','tof_cm','barometer_cm'], colors:['#22d3ee','#f472b6','#a78bfa']},
-    {title:'Attitude (°)',      keys:['pitch','roll','yaw'],               colors:['#22d3ee','#f472b6','#a78bfa']},
-    {title:'Velocity (cm/s)',   keys:['vgx','vgy','vgz'],                 colors:['#22d3ee','#f472b6','#a78bfa']},
-    {title:'Acceleration',      keys:['agx','agy','agz'],                 colors:['#22d3ee','#f472b6','#a78bfa']},
-    {title:'Speed',             keys:['speed'],                            colors:['#22d3ee']},
-    {title:'Battery (%)',       keys:['battery'],                          colors:['#34d399']},
-    {title:'Temperature (°C)',  keys:['temperature'],                      colors:['#fb923c']},
-    {title:'Position',          keys:['pos_x','pos_y','pos_z'],            colors:['#22d3ee','#f472b6','#a78bfa']},
+    {title:'Attitude (°)',      keys:['pitch','roll','yaw'],                colors:['#22d3ee','#f472b6','#a78bfa']},
+    {title:'Velocity (cm/s)',   keys:['vgx','vgy','vgz'],                   colors:['#22d3ee','#f472b6','#a78bfa']},
+    {title:'Acceleration',      keys:['agx','agy','agz'],                   colors:['#22d3ee','#f472b6','#a78bfa']},
+    {title:'Speed',             keys:['speed'],                              colors:['#22d3ee']},
+    {title:'Battery (%)',       keys:['battery'],                            colors:['#34d399']},
+    {title:'Temperature (°C)',  keys:['temperature'],                        colors:['#fb923c']},
+    {title:'Position (m)',      keys:['pos_x','pos_y','pos_z'],              colors:['#22d3ee','#f472b6','#a78bfa']},
   ];
-  // per-group: {keys, samples: [{t, vals:{key:v}}], canvas, ctx}
   const graphs = [];
   let graphsVisible = false;
   let rafId = null;
+  let sampleTimer = null;
 
   function initGraphs() {
     const container = document.getElementById('graphs_container');
-    if (!container || graphs.length) return;
+    if (!container) { console.error('[graphs] graphs_container not found'); return; }
+    if (graphs.length) return;
     GROUPS.forEach(g => {
       const wrap = document.createElement('div');
-      wrap.style.cssText = 'background:#0f172a;border:1px solid #1e293b;border-radius:6px;overflow:hidden;padding:6px;';
-      // title row with legend
+      wrap.style.cssText = 'background:#0f172a;border:1px solid #1e293b;border-radius:6px;padding:6px;';
       const hdr = document.createElement('div');
-      hdr.style.cssText = 'font-size:11px;color:#94a3b8;margin-bottom:2px;display:flex;gap:10px;align-items:center;';
+      hdr.style.cssText = 'font-size:11px;color:#94a3b8;margin-bottom:4px;display:flex;gap:10px;align-items:center;flex-wrap:wrap;';
       let html = '<b style="color:#e2e8f0;">' + g.title + '</b>';
       g.keys.forEach((k,i) => { html += '<span style="color:'+g.colors[i]+';">'+k+'</span>'; });
       hdr.innerHTML = html;
       wrap.appendChild(hdr);
       const canvas = document.createElement('canvas');
       canvas.width = CANVAS_W; canvas.height = CANVAS_H;
-      canvas.style.cssText = 'width:100%;height:auto;display:block;';
+      canvas.style.cssText = 'width:100%;height:auto;display:block;background:#020617;border-radius:4px;';
       wrap.appendChild(canvas);
       container.appendChild(wrap);
       graphs.push({keys: g.keys, colors: g.colors, samples: [], canvas, ctx: canvas.getContext('2d')});
     });
+    console.log('[graphs] initialized', graphs.length, 'graphs');
   }
 
-  // Push a telemetry sample into all graphs
-  function pushSample(t, ts) {
+  // Sample current telemetry + position into all graphs
+  function takeSample() {
+    const ts = performance.now();
+    // Build a combined sample object from globals
+    const t = (typeof lastTelemetry === 'object' && lastTelemetry) ? Object.assign({}, lastTelemetry) : {};
+    if (typeof _lastPos !== 'undefined' && Array.isArray(_lastPos)) {
+      t.pos_x = _lastPos[0]; t.pos_y = _lastPos[1]; t.pos_z = _lastPos[2];
+    }
     graphs.forEach(g => {
       const vals = {};
       let hasAny = false;
       g.keys.forEach(k => {
-        let v = t[k];
-        if (v != null && !isNaN(v)) { vals[k] = Number(v); hasAny = true; } else { vals[k] = null; }
+        const v = t[k];
+        if (v != null && !isNaN(v)) { vals[k] = Number(v); hasAny = true; }
+        else { vals[k] = null; }
       });
       if (hasAny) g.samples.push({t: ts, vals});
-      // trim old
       const cutoff = ts - WINDOW_S * 1000;
       while (g.samples.length > 0 && g.samples[0].t < cutoff) g.samples.shift();
     });
@@ -1593,33 +1600,36 @@ let ARENA_W_dyn = 20, ARENA_D_dyn = 10;
     const now = performance.now();
     graphs.forEach(g => {
       const ctx = g.ctx, W = g.canvas.width, H = g.canvas.height;
-      ctx.fillStyle = '#0f172a'; ctx.fillRect(0,0,W,H);
+      ctx.fillStyle = '#020617'; ctx.fillRect(0,0,W,H);
       if (g.samples.length < 2) {
         ctx.fillStyle = '#475569'; ctx.font = '11px sans-serif';
-        ctx.fillText('waiting for data...', W/2-40, H/2);
+        ctx.textAlign = 'center';
+        ctx.fillText('waiting for data...', W/2, H/2);
+        ctx.textAlign = 'left';
         return;
       }
       const tMin = now - WINDOW_S*1000, tMax = now;
-      // compute y range across all keys
       let yMin = Infinity, yMax = -Infinity;
-      g.samples.forEach(s => { g.keys.forEach(k => { if (s.vals[k]!=null) { yMin=Math.min(yMin,s.vals[k]); yMax=Math.max(yMax,s.vals[k]); }}); });
+      g.samples.forEach(s => { g.keys.forEach(k => {
+        if (s.vals[k]!=null) { yMin=Math.min(yMin,s.vals[k]); yMax=Math.max(yMax,s.vals[k]); }
+      }); });
+      if (!isFinite(yMin) || !isFinite(yMax)) return;
       if (yMin === yMax) { yMin -= 1; yMax += 1; }
       const pad = (yMax - yMin) * 0.1 || 1;
       yMin -= pad; yMax += pad;
-      // grid lines
+      // grid
       ctx.strokeStyle = '#1e293b'; ctx.lineWidth = 0.5;
       for (let i=0;i<=4;i++) {
-        const y = H - (i/4)*H;
+        const y = (i/4)*H;
         ctx.beginPath(); ctx.moveTo(0,y); ctx.lineTo(W,y); ctx.stroke();
       }
-      // y-axis labels
-      ctx.fillStyle = '#475569'; ctx.font = '9px sans-serif';
+      // y labels
+      ctx.fillStyle = '#64748b'; ctx.font = '9px monospace';
       for (let i=0;i<=4;i++) {
-        const v = yMin + (i/4)*(yMax-yMin);
-        const y = H - (i/4)*H;
-        ctx.fillText(v.toFixed(1), 2, y - 2);
+        const v = yMin + ((4-i)/4)*(yMax-yMin);
+        ctx.fillText(v.toFixed(1), 2, (i/4)*H + 9);
       }
-      // draw each series
+      // each series
       g.keys.forEach((k, ki) => {
         ctx.strokeStyle = g.colors[ki]; ctx.lineWidth = 1.5; ctx.beginPath();
         let started = false;
@@ -1630,49 +1640,52 @@ let ARENA_W_dyn = 20, ARENA_D_dyn = 10;
           if (!started) { ctx.moveTo(x,y); started = true; } else { ctx.lineTo(x,y); }
         });
         ctx.stroke();
+        // last value label
+        const last = g.samples[g.samples.length - 1];
+        if (last && last.vals[k] != null) {
+          ctx.fillStyle = g.colors[ki]; ctx.font = '10px monospace';
+          ctx.textAlign = 'right';
+          ctx.fillText(last.vals[k].toFixed(1), W - 2, 10 + ki * 11);
+          ctx.textAlign = 'left';
+        }
       });
     });
     rafId = requestAnimationFrame(drawAll);
   }
 
-  // Hook into existing telemetry handler
-  const origHandle = window._handleTelemetryData;
-  window._handleTelemetryData = function(t) {
-    origHandle(t);
-    if (graphsVisible && graphs.length) pushSample(t, performance.now());
-  };
-  // Alias so SSE callback uses the wrapped version
-  _handleTelemetryData = window._handleTelemetryData;
-
-  // Also capture position SSE data
-  let posEvt = null;
-  function startPosSSE() {
-    if (posEvt) { posEvt.close(); posEvt = null; }
-    posEvt = new EventSource('/proxy/position/stream');
-    posEvt.onmessage = (e) => {
-      try {
-        const p = JSON.parse(e.data);
-        if (graphsVisible && graphs.length) {
-          pushSample({pos_x: p.x, pos_y: p.y, pos_z: p.z}, performance.now());
-        }
-      } catch {}
-    };
-    posEvt.onerror = () => { posEvt.close(); posEvt = null; setTimeout(startPosSSE, 2000); };
+  function startGraphs() {
+    initGraphs();
+    if (!sampleTimer) sampleTimer = setInterval(takeSample, 1000 / SAMPLE_HZ);
+    if (!rafId) rafId = requestAnimationFrame(drawAll);
+  }
+  function stopGraphs() {
+    if (sampleTimer) { clearInterval(sampleTimer); sampleTimer = null; }
+    if (rafId) { cancelAnimationFrame(rafId); rafId = null; }
   }
 
-  // Toggle button
-  document.getElementById('graphs_toggle').onclick = function() {
-    graphsVisible = !graphsVisible;
-    this.textContent = graphsVisible ? 'Hide Graphs' : 'Show Graphs';
-    document.getElementById('graphs_panel').style.display = graphsVisible ? 'block' : 'none';
-    if (graphsVisible) {
-      initGraphs();
-      if (!posEvt) startPosSSE();
-      if (!rafId) rafId = requestAnimationFrame(drawAll);
-    } else {
-      if (rafId) { cancelAnimationFrame(rafId); rafId = null; }
+  // Wire toggle button — wait for DOM if needed
+  function wireToggle() {
+    const btn = document.getElementById('graphs_toggle');
+    const panel = document.getElementById('graphs_panel');
+    if (!btn || !panel) {
+      console.warn('[graphs] button or panel not found, retrying...');
+      setTimeout(wireToggle, 100);
+      return;
     }
-  };
+    btn.addEventListener('click', () => {
+      graphsVisible = !graphsVisible;
+      btn.textContent = graphsVisible ? 'Hide Graphs' : 'Show Graphs';
+      panel.style.display = graphsVisible ? 'block' : 'none';
+      console.log('[graphs] toggled', graphsVisible);
+      if (graphsVisible) startGraphs(); else stopGraphs();
+    });
+    console.log('[graphs] toggle wired');
+  }
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', wireToggle);
+  } else {
+    wireToggle();
+  }
 })();
 </script>
 </body>
