@@ -756,6 +756,7 @@ async function refreshTelemetry(){
     if (!r.ok) throw new Error('api_error');
     const t = await r.json();
     lastTelemetry = t;
+    window.lastTelemetry = t;   // expose to standalone scripts (graphs)
 
     // Update telemetry speed/accel in position tracker section
     const fmt = v => (v != null && !isNaN(v)) ? Number(v).toFixed(1) : '—';
@@ -936,6 +937,7 @@ function startTelemetrySSE() {
 // Extract telemetry UI update into reusable function
 function _handleTelemetryData(t) {
   lastTelemetry = t;
+  window.lastTelemetry = t;   // expose to standalone scripts (graphs)
   const apiEl = document.getElementById('api_status');
   const droneEl = document.getElementById('drone_status');
   const fmt = v => (v != null && !isNaN(v)) ? Number(v).toFixed(1) : '\\u2014';
@@ -1215,7 +1217,7 @@ let _lastPos = null, _lastCompPos = null, _lastDir = null, _lastFrameRes = null;
 
 function drawArena(pos, compPos, dir) {
   // Persist last known position so config reloads don't blank it
-  if (pos !== undefined) { _lastPos = pos; _lastCompPos = compPos; _lastDir = dir; }
+  if (pos !== undefined) { _lastPos = pos; _lastCompPos = compPos; _lastDir = dir; window._lastPos = pos; }
   const _pos = _lastPos, _compPos = _lastCompPos, _dir = _lastDir;
 
   const ctx = arenaCtx;
