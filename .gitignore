@@ -212,3 +212,20 @@ __marimo__/
 /aruco-position/S10e/
 /controller/tello_wifi_config.json
 
+# macOS
+.DS_Store
+
+# Office temp lock files
+~$*
+
+# Claude Code worktree state
+.claude/worktrees/
+
+# Recordings (video + telemetry logs)
+*.mp4
+*.avi
+*.mov
+/tools/rec_*.mp4
+/controller_unified/recordings/
+/sim_swarm_API/api_command_log.jsonl
+

@@ -56,6 +56,35 @@ WALL_SAFE_DISTANCE_M = 1.2   # hard minimum distance from any wall
 WALL_BRAKE_DISTANCE_M = 2.5  # start braking when this close to a wall
 MARKER_SIZE_M = 0.18          # physical marker size (18×18 cm)
 
+# ─── HOVER controller tuning ────────────────────────────────────────────────
+# These set how "twitchy" vs "soft" the in-front-of-marker hold is.
+# Defaults tuned for "stay still, follow slowly" rather than "track sharply".
+HOVER_EMA_ALPHA       = 0.30   # 0=no update, 1=no smoothing. Lower = smoother
+HOVER_DEADBAND_X      = 0.05   # |err_x| below this → no yaw command
+HOVER_DEADBAND_Y      = 0.06   # |err_y| below this → no altitude command
+HOVER_DEADBAND_SKEW   = 0.10   # |skew|  below this → no lateral command (large to ignore drone roll)
+HOVER_DEADBAND_DIST_M = 0.20   # |dist err| below this → no fwd/back command
+HOVER_YAW_P           = 10.0   # was 35 — gentle
+HOVER_SKEW_P          = 8.0    # was 18 — gentle, and err_x no longer enters lr
+HOVER_ALT_P           = 25.0   # was 60 — gentle altitude hold
+HOVER_DIST_P          = 4.0    # was 8  — gentle distance hold
+HOVER_YAW_MAX         = 15     # was 40 — clamp magnitude
+HOVER_LR_MAX          = 6      # was 12
+HOVER_UD_MAX          = 25     # was 50
+HOVER_FB_MAX          = 6      # forward clamp
+HOVER_FB_BACK_MAX     = 8      # backward clamp (slightly higher → safer to back off)
+HOVER_RC_MIN          = 2      # |rc| < this → output 0 (kill micro-jitter)
+
+# ── IMU damping (D-term) — opposes actual body motion to kill oscillation ──
+# vgx/vgy/vgz from Anafi are body-frame in cm/s (Parrot NED: x fwd, y right, z down).
+# yaw rate is computed by differencing consecutive yaw samples.
+# Larger D = stronger damping (more sluggish, less overshoot).
+HOVER_D_LR            = 0.40   # RC% per cm/s lateral velocity
+HOVER_D_FB            = 0.40   # RC% per cm/s forward  velocity
+HOVER_D_UD            = 0.50   # RC% per cm/s vertical velocity
+HOVER_D_YAW           = 0.40   # RC% per deg/s yaw rate
+HOVER_VEL_MAX_AGE_S   = 1.0    # ignore IMU velocity older than this
+
 # ─── Calibration curve for 18cm ArUco markers ───────────────────────────────
 # Power-law fit from Distanzkalibrierung (calibration chart):
 #   distance = CALIB_A * pixel_size ^ (-CALIB_B)
@@ -732,6 +761,16 @@ def run_mission(
     _approach_stable_ticks = 0
     tick_interval = 1.0 / CONTROL_HZ
 
+    # HOVER EMA filter state — None means "uninitialised, take next sample as-is"
+    hover_filter_x: Optional[float] = None
+    hover_filter_y: Optional[float] = None
+    hover_filter_skew: Optional[float] = None
+    hover_filter_dist: Optional[float] = None
+    # Yaw-rate tracker (computed from consecutive yaw samples; degrees/sec)
+    hover_prev_yaw_deg: Optional[float] = None
+    hover_prev_yaw_t: float = 0.0
+    hover_yaw_rate_dps: float = 0.0  # EMA-filtered yaw rate
+
     log(f"\n{'='*60}")
     log(f"Mission start — phase: {phase}")
     log(f"{'='*60}\n")
@@ -1139,6 +1178,14 @@ def run_mission(
                             phase = Phase.HOVER
                             phase_start = time.time()
                             _approach_stable_ticks = 0
+                            # Reset HOVER EMA so stale APPROACH errors don't kick the start
+                            hover_filter_x = None
+                            hover_filter_y = None
+                            hover_filter_skew = None
+                            hover_filter_dist = None
+                            hover_prev_yaw_deg = None
+                            hover_prev_yaw_t = 0.0
+                            hover_yaw_rate_dps = 0.0
                     else:
                         _approach_stable_ticks = 0
 
@@ -1242,36 +1289,82 @@ def run_mission(
                 if has_pixel_data:
                     mk_cx, mk_cy = mk_center[0], mk_center[1]
                     img_cx, img_cy = frame_w / 2.0, frame_h / 2.0
-                    err_x = (mk_cx - img_cx) / img_cx
-                    err_y = (mk_cy - img_cy) / img_cy
-                    est_dist = pixel_distance_estimate(mk_px_size)
-
-                    # Perspective skew
-                    skew = 0.0
+                    raw_err_x = (mk_cx - img_cx) / img_cx
+                    raw_err_y = (mk_cy - img_cy) / img_cy
+                    raw_dist = pixel_distance_estimate(mk_px_size)
+                    raw_skew = 0.0
                     if vid_info and "left_len" in vid_info and "right_len" in vid_info:
-                        skew = marker_skew(vid_info["left_len"], vid_info["right_len"])
+                        raw_skew = marker_skew(vid_info["left_len"], vid_info["right_len"])
 
-                    # YAW: keep marker centred — boost when near edge
-                    yaw_P = 35.0 * edge_boost(err_x)
-                    yaw_rc = _clamp(int(err_x * yaw_P), -40, 40)
+                    # ── EMA smoothing on camera measurements ──
+                    a = HOVER_EMA_ALPHA
+                    hover_filter_x    = raw_err_x if hover_filter_x    is None else (1 - a) * hover_filter_x    + a * raw_err_x
+                    hover_filter_y    = raw_err_y if hover_filter_y    is None else (1 - a) * hover_filter_y    + a * raw_err_y
+                    hover_filter_skew = raw_skew  if hover_filter_skew is None else (1 - a) * hover_filter_skew + a * raw_skew
+                    hover_filter_dist = raw_dist  if hover_filter_dist is None else (1 - a) * hover_filter_dist + a * raw_dist
 
-                    # LATERAL: correct perspective skew to stay directly in front
-                    skew_P = 18.0
-                    err_x_P = 10.0
-                    lr = _clamp(int(skew * skew_P + err_x * err_x_P), -12, 12)
+                    err_x    = hover_filter_x
+                    err_y    = hover_filter_y
+                    skew     = hover_filter_skew
+                    est_dist = hover_filter_dist
 
-                    # ALTITUDE: visual servoing to match marker height
+                    # ── Deadbands: within these zones the P-term is silent ──
+                    def _db(e, dz):
+                        if abs(e) < dz: return 0.0
+                        return e - math.copysign(dz, e)
+                    err_x_eff    = _db(err_x, HOVER_DEADBAND_X)
+                    err_y_eff    = _db(err_y, HOVER_DEADBAND_Y)
+                    skew_eff     = _db(skew,  HOVER_DEADBAND_SKEW)
+                    dist_err     = est_dist - hover_distance
+                    dist_err_eff = _db(dist_err, HOVER_DEADBAND_DIST_M)
+
+                    # ── IMU: read body velocity and yaw rate for the D-term ──
+                    # vgx/vgy/vgz come from Anafi SpeedChanged in cm/s (NED body frame:
+                    # x fwd+, y right+, z down+). Use them to OPPOSE current motion.
                     tel = get_telemetry()
-                    height_m = (tel.get("height_cm") or 0) / 100.0
-                    alt_P = 60.0 * edge_boost(err_y)
-                    ud = _clamp(int(-err_y * alt_P), -50, 50)
-                    if abs(err_y) < 0.10:
-                        target_alt = height_m
+                    vx_cms = float(tel.get("vgx") or 0.0)        # forward+
+                    vy_cms = float(tel.get("vgy") or 0.0)        # right+
+                    vz_cms = float(tel.get("vgz") or 0.0)        # down+
+                    # Compute yaw rate from successive yaw samples (deg/s)
+                    yaw_now_deg = float(tel.get("yaw") or 0.0)
+                    t_now = time.time()
+                    if hover_prev_yaw_deg is not None:
+                        dt = t_now - hover_prev_yaw_t
+                        if 0.01 < dt < 1.0:
+                            d_yaw = wrap_pi(math.radians(yaw_now_deg - hover_prev_yaw_deg))
+                            inst_rate = math.degrees(d_yaw) / dt
+                            # EMA-smooth the yaw rate (it's noisy)
+                            hover_yaw_rate_dps = (1 - a) * hover_yaw_rate_dps + a * inst_rate
+                    hover_prev_yaw_deg = yaw_now_deg
+                    hover_prev_yaw_t   = t_now
 
-                    # DISTANCE: actively maintain hover_distance
-                    dist_err = est_dist - hover_distance
-                    dist_P = 8.0
-                    fb = _clamp(int(dist_err * dist_P), -15, 10)
+                    height_m = (tel.get("height_cm") or 0) / 100.0
+
+                    # ── PD on each axis: P from camera, D from IMU ──
+                    # Sign convention for damping (rc - D*velocity_in_rc_direction):
+                    #   lr+  = right →  damp by  -D*vy_cms     (vy+ = right)
+                    #   fb+  = fwd   →  damp by  -D*vx_cms     (vx+ = fwd)
+                    #   ud+  = up    →  damp by  +D*vz_cms     (vz+ = down → push UP to oppose)
+                    #   yaw+ = CW    →  damp by  -D*yaw_rate
+                    yaw_rc_f = err_x_eff * HOVER_YAW_P  - HOVER_D_YAW * hover_yaw_rate_dps
+                    lr_f     = skew_eff  * HOVER_SKEW_P - HOVER_D_LR  * vy_cms
+                    ud_f     = -err_y_eff * HOVER_ALT_P + HOVER_D_UD  * vz_cms
+                    fb_f     = dist_err_eff * HOVER_DIST_P - HOVER_D_FB * vx_cms
+
+                    yaw_rc = _clamp(int(round(yaw_rc_f)), -HOVER_YAW_MAX, HOVER_YAW_MAX)
+                    lr     = _clamp(int(round(lr_f)),     -HOVER_LR_MAX,  HOVER_LR_MAX)
+                    ud     = _clamp(int(round(ud_f)),     -HOVER_UD_MAX,  HOVER_UD_MAX)
+                    fb     = _clamp(int(round(fb_f)),     -HOVER_FB_BACK_MAX, HOVER_FB_MAX)
+
+                    # Kill micro-jitter: outputs below threshold → 0
+                    if abs(yaw_rc) < HOVER_RC_MIN: yaw_rc = 0
+                    if abs(lr)     < HOVER_RC_MIN: lr     = 0
+                    if abs(ud)     < HOVER_RC_MIN: ud     = 0
+                    if abs(fb)     < HOVER_RC_MIN: fb     = 0
+
+                    # Update target_alt fallback when well-centred vertically
+                    if abs(err_y) < 0.08:
+                        target_alt = height_m
 
                     send_rc(lr, fb, ud, yaw_rc)
                     hover_dur = time.time() - phase_start
@@ -1280,29 +1373,52 @@ def run_mission(
                         f"px={mk_px_size:.0f} (expect {expect_px:.0f}px for {MARKER_SIZE_M*100:.0f}cm marker)  "
                         f"err_x={err_x:+.2f} err_y={err_y:+.2f} skew={skew:+.2f}  "
                         f"alt={height_m:.2f}m  "
+                        f"v=({vx_cms:+.0f},{vy_cms:+.0f},{vz_cms:+.0f})cm/s  "
+                        f"yaw_rate={hover_yaw_rate_dps:+.0f}d/s  "
                         f"RC lr={lr} fb={fb} ud={ud} yaw={yaw_rc}  "
                         f"ID={target_marker_id}  t={hover_dur:.0f}s  [{data_src}]")
                 else:
-                    # Fallback hover — try vid_tracker with relaxed age
+                    # ── Fallback hover: NO pixel data → IMU-only "stay still" ──
+                    # We can't see the marker, but the IMU still tells us how we
+                    # are drifting. Pure D-control on velocity holds position.
+                    tel = get_telemetry()
+                    vx_cms = float(tel.get("vgx") or 0.0)
+                    vy_cms = float(tel.get("vgy") or 0.0)
+                    vz_cms = float(tel.get("vgz") or 0.0)
+                    height_m = (tel.get("height_cm") or 0) / 100.0
+
+                    # Tiny optional yaw correction from a stale vid_tracker hit
                     fb_yaw = 0
-                    fb_lr = 0
                     fallback_vid = vid_tracker.get_marker(target_marker_id)
                     if fallback_vid and vid_tracker.age < 3.0:
                         fw, fh = vid_tracker.frame_size
                         fcx = fallback_vid["center"][0]
                         ferr_x = (fcx - fw / 2.0) / (fw / 2.0)
-                        fb_yaw = _clamp(int(ferr_x * 30), -20, 20)
-                        fb_lr = _clamp(int(ferr_x * 10), -8, 8)
+                        if abs(ferr_x) > HOVER_DEADBAND_X:
+                            fb_yaw = _clamp(int(ferr_x * HOVER_YAW_P * 0.5),
+                                            -HOVER_YAW_MAX, HOVER_YAW_MAX)
 
-                    tel = get_telemetry()
-                    height_cm = tel.get("height_cm") or 0
-                    height_m = height_cm / 100.0
+                    # Pure-D damping on lateral and forward (oppose any drift)
+                    lr_f = -HOVER_D_LR * vy_cms
+                    fb_f = -HOVER_D_FB * vx_cms
+                    # Altitude: fall back to the last good visual altitude (target_alt)
                     alt_err = target_alt - height_m
-                    ud = _clamp(int(alt_err * 25), -30, 30)
-                    send_rc(fb_lr, 0, ud, fb_yaw)
+                    ud_f = alt_err * HOVER_ALT_P + HOVER_D_UD * vz_cms
+
+                    lr = _clamp(int(round(lr_f)), -HOVER_LR_MAX, HOVER_LR_MAX)
+                    fb = _clamp(int(round(fb_f)), -HOVER_FB_BACK_MAX, HOVER_FB_MAX)
+                    ud = _clamp(int(round(ud_f)), -HOVER_UD_MAX, HOVER_UD_MAX)
+                    if abs(lr)     < HOVER_RC_MIN: lr     = 0
+                    if abs(fb)     < HOVER_RC_MIN: fb     = 0
+                    if abs(ud)     < HOVER_RC_MIN: ud     = 0
+                    if abs(fb_yaw) < HOVER_RC_MIN: fb_yaw = 0
+
+                    send_rc(lr, fb, ud, fb_yaw)
                     hover_dur = time.time() - phase_start
-                    log(f"HOVER (fallback): marker {target_marker_id}  "
-                        f"yaw={fb_yaw} lr={fb_lr}  alt={height_m:.2f}m (hold {target_alt:.2f}m)  ud={ud}  "
+                    log(f"HOVER (IMU-fallback): marker {target_marker_id}  "
+                        f"v=({vx_cms:+.0f},{vy_cms:+.0f},{vz_cms:+.0f})cm/s  "
+                        f"alt={height_m:.2f}m (hold {target_alt:.2f}m)  "
+                        f"RC lr={lr} fb={fb} ud={ud} yaw={fb_yaw}  "
                         f"t={hover_dur:.0f}s  vid_active={vid_tracker.is_active}")
 
             # ── LAND ─────────────────────────────────────────────────
@@ -1359,6 +1475,229 @@ def run_mission(
     return phase == Phase.DONE
 
 
+# ─── OBSERVE mode — read-only, no takeoff, no RC commands ──────────────────
+
+def run_observe(
+    api_base: str,
+    target_marker: Optional[int] = None,
+    hover_distance: float = HOVER_DISTANCE_M,
+    rate_hz: float = 5.0,
+):
+    """
+    OBSERVE MODE — completely passive.
+
+    Does NOT take off, does NOT send any RC command, does NOT land.
+    The drone stays exactly where it is (hand-held by you, or already
+    flying under phone/RC control).  The script just:
+      1. Subscribes to camera frames + position SSE + telemetry
+      2. Runs the SAME HOVER PD math (camera P + IMU D)
+      3. Prints what it WOULD send, plus all raw inputs
+
+    Use this to tune HOVER_* constants safely, or to verify camera+IMU
+    fusion before flying for real.
+
+    Press Ctrl+C to exit.
+    """
+    global _api_base
+    _api_base = api_base
+
+    log("=" * 70)
+    log("OBSERVE MODE — NO TAKEOFF · NO LAND · NO RC COMMANDS WILL BE SENT")
+    log("=" * 70)
+    log(f"  API server:      {api_base}")
+    log(f"  Target marker:   {target_marker if target_marker is not None else 'auto (largest visible)'}")
+    log(f"  Hover distance:  {hover_distance} m  (used to compute fb_p only)")
+    log(f"  Update rate:     {rate_hz} Hz")
+    log(f"  Move the drone BY HAND to verify camera + IMU response.")
+    log(f"  Ctrl+C to exit.")
+    log("")
+
+    # Pre-flight: API connectivity
+    hb = api_get("/api/heartbeat")
+    if not hb.get("ok"):
+        log(f"FATAL: cannot reach API server at {api_base}")
+        return False
+    log(f"  Drone type:  {hb.get('drone_type', '?')}")
+    log(f"  Connected:   {hb.get('connected')}")
+    log(f"  Flying:      {hb.get('flying')}  (state will NOT be changed)")
+
+    # Start video stream so the marker tracker has frames.
+    # This does NOT make the drone fly — it only enables the camera feed.
+    log("Starting video stream (MJPEG) and position SSE...")
+    api_post("/api/video/start", {"mode": "mjpeg"})
+    api_post("/api/position/config", {"enabled": True})
+
+    pos_listener = PositionListener(api_base)
+    pos_listener.start()
+    vid_tracker = VideoMarkerTracker(api_base)
+    vid_tracker.start()
+    hb_thread = threading.Thread(target=_heartbeat_loop, daemon=True, name="heartbeat")
+    hb_thread.start()
+    log("  Heartbeat / position SSE / video tracker started")
+
+    # Wait for first frame
+    time.sleep(2.0)
+    if vid_tracker.is_active:
+        vw, vh = vid_tracker.frame_size
+        all_seen = vid_tracker.get_all()
+        log(f"  vid_tracker OK: {vw}x{vh}, {len(all_seen)} marker(s) visible: {list(all_seen.keys())}")
+    else:
+        log("  WARNING: vid_tracker NOT active yet — try moving the drone so a marker is visible")
+
+    # ── Observe loop ──
+    tick_interval = 1.0 / max(0.5, rate_hz)
+    last_tick = time.time()
+    filt_x = filt_y = filt_skew = filt_dist = None
+    prev_yaw_deg: Optional[float] = None
+    prev_yaw_t: float = 0.0
+    yaw_rate_dps: float = 0.0
+    chosen_id: Optional[int] = target_marker  # may be None initially → pick largest
+    last_log_summary = ""
+
+    try:
+        while not _abort.is_set():
+            now = time.time()
+            sleep_time = max(0.0, tick_interval - (now - last_tick))
+            if sleep_time > 0:
+                _abort.wait(sleep_time)
+            last_tick = time.time()
+
+            # ── Pick / refresh target marker ──
+            vid_all = vid_tracker.get_all()
+            if not vid_all:
+                msg = (f"OBS: no markers visible "
+                       f"(vid_active={vid_tracker.is_active}, age={vid_tracker.age:.1f}s)")
+                if msg != last_log_summary:
+                    log(msg)
+                    last_log_summary = msg
+                # Still print IMU even when no marker
+                tel = get_telemetry()
+                vx_cms = float(tel.get("vgx") or 0.0)
+                vy_cms = float(tel.get("vgy") or 0.0)
+                vz_cms = float(tel.get("vgz") or 0.0)
+                pitch  = float(tel.get("pitch") or 0.0)
+                roll   = float(tel.get("roll")  or 0.0)
+                yaw_d  = float(tel.get("yaw")   or 0.0)
+                hgt_m  = (tel.get("height_cm") or 0) / 100.0
+                bat    = tel.get("battery", "?")
+                log(f"     IMU: v=({vx_cms:+.0f},{vy_cms:+.0f},{vz_cms:+.0f})cm/s "
+                    f"att=(p{pitch:+.1f},r{roll:+.1f},y{yaw_d:+.1f})  "
+                    f"alt={hgt_m:.2f}m  bat={bat}%")
+                continue
+
+            if chosen_id is None or chosen_id not in vid_all:
+                # No target locked yet, OR previous lock dropped — pick the largest
+                new_id = max(vid_all.items(), key=lambda kv: kv[1].get("px_size", 0))[0]
+                if chosen_id != new_id:
+                    log(f"OBS: tracking marker ID={new_id}  (visible: {sorted(vid_all.keys())})")
+                chosen_id = new_id
+                filt_x = filt_y = filt_skew = filt_dist = None  # reset filters
+
+            vid_info = vid_tracker.get_marker(chosen_id)
+            if not vid_info or vid_tracker.age > 1.0:
+                log(f"OBS: marker {chosen_id} stale "
+                    f"(vid_age={vid_tracker.age:.1f}s; visible IDs={sorted(vid_all.keys())})")
+                continue
+
+            cx, cy = vid_info["center"]
+            px_size = float(vid_info["px_size"])
+            left_len = float(vid_info.get("left_len", 0))
+            right_len = float(vid_info.get("right_len", 0))
+            fw, fh = vid_tracker.frame_size
+
+            # ── Camera measurements ──
+            raw_err_x = (cx - fw / 2.0) / (fw / 2.0)
+            raw_err_y = (cy - fh / 2.0) / (fh / 2.0)
+            raw_dist  = pixel_distance_estimate(px_size)
+            raw_skew  = marker_skew(left_len, right_len)
+
+            # EMA smoothing (same as HOVER)
+            a = HOVER_EMA_ALPHA
+            filt_x    = raw_err_x if filt_x    is None else (1 - a) * filt_x    + a * raw_err_x
+            filt_y    = raw_err_y if filt_y    is None else (1 - a) * filt_y    + a * raw_err_y
+            filt_skew = raw_skew  if filt_skew is None else (1 - a) * filt_skew + a * raw_skew
+            filt_dist = raw_dist  if filt_dist is None else (1 - a) * filt_dist + a * raw_dist
+
+            # Deadbands
+            def _db(e, dz):
+                if abs(e) < dz: return 0.0
+                return e - math.copysign(dz, e)
+            err_x_eff    = _db(filt_x, HOVER_DEADBAND_X)
+            err_y_eff    = _db(filt_y, HOVER_DEADBAND_Y)
+            skew_eff     = _db(filt_skew, HOVER_DEADBAND_SKEW)
+            dist_err     = filt_dist - hover_distance
+            dist_err_eff = _db(dist_err, HOVER_DEADBAND_DIST_M)
+
+            # ── IMU ──
+            tel = get_telemetry()
+            vx_cms  = float(tel.get("vgx") or 0.0)
+            vy_cms  = float(tel.get("vgy") or 0.0)
+            vz_cms  = float(tel.get("vgz") or 0.0)
+            pitch   = float(tel.get("pitch") or 0.0)
+            roll    = float(tel.get("roll")  or 0.0)
+            yaw_now = float(tel.get("yaw")   or 0.0)
+            hgt_m   = (tel.get("height_cm") or 0) / 100.0
+            bat     = tel.get("battery", "?")
+
+            t_now = time.time()
+            if prev_yaw_deg is not None:
+                dt = t_now - prev_yaw_t
+                if 0.01 < dt < 1.0:
+                    d_yaw = wrap_pi(math.radians(yaw_now - prev_yaw_deg))
+                    inst_rate = math.degrees(d_yaw) / dt
+                    yaw_rate_dps = (1 - a) * yaw_rate_dps + a * inst_rate
+            prev_yaw_deg = yaw_now
+            prev_yaw_t   = t_now
+
+            # ── HOVER PD math (camera P + IMU D) ──
+            yaw_p = err_x_eff    * HOVER_YAW_P
+            yaw_d = -HOVER_D_YAW * yaw_rate_dps
+            lr_p  = skew_eff     * HOVER_SKEW_P
+            lr_d  = -HOVER_D_LR  * vy_cms
+            ud_p  = -err_y_eff   * HOVER_ALT_P
+            ud_d  = HOVER_D_UD   * vz_cms
+            fb_p  = dist_err_eff * HOVER_DIST_P
+            fb_d  = -HOVER_D_FB  * vx_cms
+
+            yaw_rc = _clamp(int(round(yaw_p + yaw_d)), -HOVER_YAW_MAX,    HOVER_YAW_MAX)
+            lr     = _clamp(int(round(lr_p  + lr_d)),  -HOVER_LR_MAX,     HOVER_LR_MAX)
+            ud     = _clamp(int(round(ud_p  + ud_d)),  -HOVER_UD_MAX,     HOVER_UD_MAX)
+            fb     = _clamp(int(round(fb_p  + fb_d)),  -HOVER_FB_BACK_MAX, HOVER_FB_MAX)
+            if abs(yaw_rc) < HOVER_RC_MIN: yaw_rc = 0
+            if abs(lr)     < HOVER_RC_MIN: lr     = 0
+            if abs(ud)     < HOVER_RC_MIN: ud     = 0
+            if abs(fb)     < HOVER_RC_MIN: fb     = 0
+
+            # ── Output (3 lines per tick for readability) ──
+            log(f"OBS id={chosen_id}  dist={filt_dist:.2f}m (err {dist_err:+.2f})  "
+                f"px={px_size:.0f}  center=({cx:.0f},{cy:.0f})/{fw}x{fh}  "
+                f"err=({filt_x:+.2f},{filt_y:+.2f})  skew={filt_skew:+.2f}")
+            log(f"     IMU v=({vx_cms:+.0f},{vy_cms:+.0f},{vz_cms:+.0f})cm/s  "
+                f"yaw_rate={yaw_rate_dps:+.0f}d/s  "
+                f"att=(p{pitch:+.1f},r{roll:+.1f},y{yaw_now:+.1f})  "
+                f"alt={hgt_m:.2f}m  bat={bat}%")
+            log(f"     WOULD SEND lr={lr:+3d} (P{lr_p:+5.1f} D{lr_d:+5.1f})  "
+                f"fb={fb:+3d} (P{fb_p:+5.1f} D{fb_d:+5.1f})  "
+                f"ud={ud:+3d} (P{ud_p:+5.1f} D{ud_d:+5.1f})  "
+                f"yaw={yaw_rc:+3d} (P{yaw_p:+5.1f} D{yaw_d:+5.1f})  [NOT SENT]")
+
+    except KeyboardInterrupt:
+        log("\nCtrl+C — exiting observe mode")
+
+    # Cleanup — note we do NOT call /api/land here since we never took off
+    pos_listener.stop()
+    vid_tracker.stop()
+    _abort.set()
+
+    try:
+        api_post("/api/video/stop")
+    except Exception:
+        pass
+
+    log("Observe mode ended cleanly. Drone state was NOT modified.")
+    return True
+
+
 # ─── Signal handlers ─────────────────────────────────────────────────────────
 
 def _signal_handler(sig, frame):
@@ -1379,6 +1718,11 @@ Examples:
     %(prog)s --api http://flightctrl1:8080 --marker 5
     %(prog)s --api http://flightctrl1:8080 --hover-distance 1.5 --marker 12
     %(prog)s --api http://flightctrl1:8080 --scan-speed 20 --timeout 180
+
+    # Observe-only — never takes off / sends RC. Move the drone by hand
+    # and watch what the controller WOULD do. Great for tuning HOVER_*.
+    %(prog)s --api http://flightctrl1:8080 --observe
+    %(prog)s --api http://flightctrl1:8080 --observe --marker 5
 
 Safety:
     Press Ctrl+C at any time to abort and land the drone.
@@ -1421,6 +1765,16 @@ Safety:
         "--dry-run", action="store_true",
         help="Print plan without executing (check API connectivity only)",
     )
+    parser.add_argument(
+        "--observe", action="store_true",
+        help=("Read-only mode: NO takeoff, NO land, NO RC commands sent. "
+              "Subscribes to camera + IMU + position SSE, runs the HOVER PD "
+              "math, and prints what it WOULD send. Move the drone by hand."),
+    )
+    parser.add_argument(
+        "--observe-rate", type=float, default=5.0,
+        help="Observe-mode update rate in Hz (default: 5)",
+    )
 
     args = parser.parse_args()
 
@@ -1446,6 +1800,15 @@ Safety:
         log(f"  Position: {pos}")
         log("DRY RUN complete — no takeoff")
         return
+
+    if args.observe:
+        success = run_observe(
+            api_base=args.api,
+            target_marker=args.marker,
+            hover_distance=args.hover_distance,
+            rate_hz=args.observe_rate,
+        )
+        sys.exit(0 if success else 1)
 
     success = run_mission(
         api_base=args.api,

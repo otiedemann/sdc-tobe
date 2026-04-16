@@ -9,6 +9,15 @@ from pathlib import Path
 import requests
 from flask import Flask, Response, jsonify, request, send_file
 
+# ── ArUco Seek (multi-drone observer / LIVE controller) ────────────────────
+import sys as _sys
+_sys.path.insert(0, str(Path(__file__).resolve().parent))
+from aruco_seek_multi import (  # noqa: E402
+    HoverParams as AsHoverParams,
+    MissionManager,
+    ObserverFleet,
+)
+
 # ── Connection-pooled HTTP session ───────────────────────────────────────────
 # Reuses TCP connections (keep-alive) instead of opening a new one per request.
 # Dramatically reduces per-request latency on LAN (~30-50 ms saved per call).
@@ -85,6 +94,14 @@ else:
     PI_BASE = DRONES[active_drone_id]["base"]
 
 app = Flask(__name__)
+
+# ArUco Seek fleet — one observer per configured drone. LIVE mode is on by
+# default (matches tools/aruco_seek_web.py default); disable with REMOTE_NO_LIVE=1.
+_aruco_allow_live = os.getenv("REMOTE_NO_LIVE", "0") not in {"1", "true", "True"}
+aruco_fleet = ObserverFleet(session=_http_session, allow_live=_aruco_allow_live)
+aruco_fleet.configure(DRONES)
+mission_manager = MissionManager(aruco_fleet)
+
 command_log_enabled = os.getenv("REMOTE_COMMAND_LOG", "0") in {"1", "true", "True"}
 command_log_path = Path(os.getenv("REMOTE_COMMAND_LOG_PATH", "remote_command_log.jsonl"))
 command_log_last: dict[str, float] = {}
@@ -133,6 +150,52 @@ HTML = """
     .pos-cfg label { font-size:12px; color:#94a3b8; }
     .pos-cfg input, .pos-cfg select { height:32px; border-radius:6px; border:1px solid #475569; background:#0f172a; color:#e2e8f0; padding:0 6px; }
     .pos-cfg button { height:32px; font-size:12px; padding:0 10px; }
+    /* ── ArUco Seek panel ─────────────────────────────────────────── */
+    #aruco_panel { margin-top:16px; padding:12px; background:#0b1220; border:1px solid #334155; border-radius:8px; }
+    #aruco_panel h3 { margin:0 0 10px 0; color:#38bdf8; font-size:15px; }
+    #aruco_panel .arc-grid { display:grid; grid-template-columns:minmax(360px,1fr) minmax(420px,1fr); gap:12px; align-items:flex-start; }
+    #aruco_panel canvas.arc-topdown { background:#0b1220; border:1px solid #1e293b; border-radius:4px; display:block; width:100%; max-width:420px; height:auto; }
+    #aruco_panel img.arc-video { width:100%; max-width:480px; background:#0f172a; border-radius:4px; min-height:180px; }
+    #aruco_panel .arc-readout { font-family:'SF Mono','Menlo',monospace; font-size:11px; line-height:1.55; color:#cbd5e1; }
+    #aruco_panel .arc-readout .k { color:#94a3b8; display:inline-block; min-width:80px; }
+    #aruco_panel .arc-readout .pd { color:#64748b; font-size:10px; }
+    #aruco_panel .arc-readout b { color:#38bdf8; font-weight:600; }
+    #aruco_panel .arc-params { max-height:360px; overflow-y:auto; padding-right:6px; }
+    #aruco_panel .arc-row { display:flex; align-items:center; gap:6px; margin-bottom:3px; font-size:11px; }
+    #aruco_panel .arc-row label { width:150px; color:#cbd5e1; flex-shrink:0; font-size:10px; }
+    #aruco_panel .arc-row input[type=range] { flex:1; min-width:80px; }
+    #aruco_panel .arc-row input[type=number] { width:60px; background:#0f172a; color:#e2e8f0; border:1px solid #334155; border-radius:3px; padding:2px 4px; font-size:10px; }
+    #aruco_panel .arc-pgroup { border-top:1px dashed #334155; margin-top:6px; padding-top:4px; }
+    #aruco_panel .arc-pgroup-label { font-size:9px; color:#64748b; text-transform:uppercase; letter-spacing:0.08em; margin-bottom:3px; }
+    #aruco_panel .mode-seg { display:inline-flex; border:1px solid #334155; border-radius:4px; overflow:hidden; vertical-align:middle; }
+    #aruco_panel .mode-seg button { background:transparent; border:0; border-radius:0; padding:5px 12px; font-weight:600; color:#94a3b8; font-size:11px; }
+    #aruco_panel .mode-seg button.active.observe { background:#065f46; color:#ecfdf5; }
+    #aruco_panel .mode-seg button.active.live    { background:#b91c1c; color:#fee2e2; }
+    #aruco_panel .mode-seg button:disabled { opacity:0.45; cursor:not-allowed; }
+    #aruco_panel .arc-manual { display:none; gap:6px; align-items:center; padding:4px 6px; background:#450a0a; border:1px solid #ef4444; border-radius:4px; }
+    #aruco_panel .arc-manual.show { display:inline-flex; }
+    #aruco_panel .arc-manual button { font-size:11px; padding:4px 8px; }
+    #arc_live_banner { display:none; background:#b91c1c; color:#fee2e2; padding:6px 10px; border-radius:4px; font-weight:700; letter-spacing:0.04em; margin-bottom:8px; box-shadow:0 0 0 2px #fbbf24 inset; text-align:center; font-size:12px; }
+    #arc_live_banner.show { display:block; animation:arcpulse 1.6s ease-in-out infinite; }
+    @keyframes arcpulse { 0%,100% { box-shadow:0 0 0 2px #fbbf24 inset; } 50% { box-shadow:0 0 0 4px #fbbf24 inset; } }
+    body.arc-live-mode { box-shadow:0 0 0 4px #b91c1c inset; }
+    .arc-rc-sent { color:#f87171; font-weight:600; }
+    /* ── Special Missions panel ──────────────────────────────────── */
+    #missions_panel { margin-top:16px; padding:12px; background:#0b1220; border:1px solid #334155; border-radius:8px; }
+    #missions_panel h3 { margin:0 0 10px 0; color:#a78bfa; font-size:15px; }
+    #missions_panel .mis-row { display:flex; gap:8px; align-items:center; flex-wrap:wrap; font-size:12px; margin-bottom:6px; }
+    #missions_panel select, #missions_panel input { background:#0f172a; color:#e2e8f0; border:1px solid #334155; border-radius:4px; padding:4px 6px; font-size:12px; }
+    #missions_panel .mis-status { font-family:monospace; font-size:11px; color:#cbd5e1; background:#0f172a; border:1px solid #1e293b; border-radius:4px; padding:8px; max-height:200px; overflow-y:auto; white-space:pre-wrap; }
+    #missions_panel .mis-drone-line { padding:2px 0; border-bottom:1px solid #1e293b; }
+    #missions_panel .mis-drone-line b { color:#38bdf8; }
+    #missions_panel .mis-badge { display:inline-block; padding:1px 6px; border-radius:3px; font-size:10px; font-weight:600; margin-left:6px; }
+    #missions_panel .mis-badge.idle { background:#1e293b; color:#94a3b8; }
+    #missions_panel .mis-badge.scan { background:#1e3a5f; color:#60a5fa; }
+    #missions_panel .mis-badge.approach { background:#164e63; color:#22d3ee; }
+    #missions_panel .mis-badge.hover { background:#065f46; color:#4ade80; }
+    #missions_panel .mis-badge.wait { background:#451a03; color:#fbbf24; }
+    #missions_panel .mis-badge.done { background:#14532d; color:#86efac; }
+    #missions_panel .mis-badge.error { background:#7f1d1d; color:#fca5a5; }
   </style>
 </head>
 <body>
@@ -170,12 +233,6 @@ HTML = """
         <button id=\"safe_takeoff\">Safe Takeoff: OFF</button>
       </div>
       <div style=\"margin-top:8px; display:flex; gap:8px; flex-wrap:wrap;\">
-        <button id=\"flip_l\">Flip L</button>
-        <button id=\"flip_r\">Flip R</button>
-        <button id=\"flip_f\">Flip F</button>
-        <button id=\"flip_b\">Flip B</button>
-      </div>
-      <div style=\"margin-top:8px; display:flex; gap:8px; flex-wrap:wrap;\">
         <button id=\"toggle_log\">Enable Telemetry Log</button>
         <button id=\"download_log\">Download Telemetry Log</button>
         <button id=\"clear_log\">Clear Telemetry Log</button>
@@ -209,13 +266,6 @@ HTML = """
       </div>
       <div class=\"adv\" id=\"anafi_panel\">
         <div class=\"small\" style=\"margin-bottom:6px;\">Anafi / Olympe controls</div>
-        <div class=\"adv-grid\">
-          <button id=\"take_photo\">Take Photo</button>
-          <button id=\"rec_start\">Record Start</button>
-          <button id=\"rec_stop\">Record Stop</button>
-          <button id=\"rth_start\">Return Home</button>
-          <button id=\"rth_cancel\">Cancel RTH</button>
-        </div>
         <div class=\"row\" style=\"margin-top:8px; align-items:center;\">
           <span class=\"small\" style=\"min-width:80px;\">Gimbal tilt</span>
           <input id=\"gimbal_tilt\" type=\"range\" min=\"-90\" max=\"30\" value=\"0\" style=\"flex:1;\" />
@@ -280,6 +330,101 @@ HTML = """
 
   <div id=\"graphs_panel\" style=\"display:none;margin-top:12px;padding:0 16px 16px;\">
     <div style=\"display:grid;grid-template-columns:repeat(auto-fill,minmax(340px,1fr));gap:8px;\" id=\"graphs_container\"></div>
+  </div>
+
+  <!-- ── ArUco Seek — hover in front of a marker (per active drone) ── -->
+  <div id=\"aruco_panel\">
+    <h3>ArUco Seek &mdash; hover in front of marker
+      <span id=\"arc_status\" class=\"small\" style=\"margin-left:8px;color:#94a3b8;font-weight:400;\">stopped</span>
+      <span id=\"arc_drone_label\" class=\"small\" style=\"margin-left:8px;color:#64748b;font-weight:400;\"></span>
+    </h3>
+
+    <div id=\"arc_live_banner\">&#9888; LIVE MODE &mdash; DRONE WILL MOVE &mdash; RC commands are being sent</div>
+
+    <div class=\"mis-row\" style=\"margin-bottom:10px;\">
+      <button id=\"arc_start\" style=\"background:#065f46;border-color:#10b981;\">&#9654; Start</button>
+      <button id=\"arc_stop\" style=\"background:#7f1d1d;border-color:#ef4444;\">&#9632; Stop</button>
+      <span style=\"margin-left:8px;color:#94a3b8;font-size:11px;\">Mode:</span>
+      <span class=\"mode-seg\">
+        <button id=\"arc_mode_observe\" class=\"active observe\" data-mode=\"observe\">OBSERVE</button>
+        <button id=\"arc_mode_live\" data-mode=\"live\">LIVE</button>
+      </span>
+      <span id=\"arc_mode_gate\" style=\"font-size:11px;color:#fbbf24;display:none;\">LIVE disabled (REMOTE_NO_LIVE=1)</span>
+      <span id=\"arc_manual\" class=\"arc-manual\">
+        <button id=\"arc_takeoff\" style=\"background:#065f46;border-color:#10b981;\">&uarr; Takeoff</button>
+        <button id=\"arc_land\">&darr; Land</button>
+        <button id=\"arc_rc_stop\">RC Stop</button>
+        <button id=\"arc_emergency\" style=\"background:#7f1d1d;border-color:#ef4444;\">&#9940; EMERGENCY</button>
+      </span>
+      <span style=\"margin-left:12px;color:#94a3b8;font-size:11px;\">Target marker:</span>
+      <input id=\"arc_target_input\" type=\"number\" min=\"0\" placeholder=\"auto\" style=\"width:70px;\" />
+      <button id=\"arc_target_lock\">Lock</button>
+      <button id=\"arc_target_auto\">Auto</button>
+    </div>
+
+    <div class=\"arc-grid\">
+      <div>
+        <div class=\"small\" style=\"color:#94a3b8;margin-bottom:4px;\">Video feed (drone camera)</div>
+        <img id=\"arc_video\" class=\"arc-video\" alt=\"(press Start to load video)\" />
+        <div class=\"small\" style=\"color:#94a3b8;margin:8px 0 4px 0;\">Top-down &mdash; drone &harr; marker</div>
+        <canvas id=\"arc_topdown\" class=\"arc-topdown\" width=\"420\" height=\"380\"></canvas>
+        <div id=\"arc_readout\" class=\"arc-readout\" style=\"margin-top:8px;\">&mdash;</div>
+      </div>
+      <div>
+        <div class=\"small\" style=\"color:#94a3b8;margin-bottom:4px;\">Live tuning parameters &mdash; applied immediately</div>
+        <div id=\"arc_params\" class=\"arc-params\"></div>
+        <div style=\"margin-top:6px;\"><button id=\"arc_reload\" style=\"font-size:11px;\">&#x21bb; Reload params from server</button></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ── Special Missions — coordinated multi-drone flights ───────── -->
+  <div id=\"missions_panel\">
+    <h3>Special Missions
+      <span id=\"mis_title_status\" class=\"small\" style=\"margin-left:8px;color:#94a3b8;font-weight:400;\">idle</span>
+    </h3>
+
+    <div class=\"mis-row\">
+      <label style=\"color:#94a3b8;\">Mission:</label>
+      <select id=\"mis_type\">
+        <option value=\"scan_all\">Scan all ArUco markers (sequential, collision-aware)</option>
+      </select>
+    </div>
+
+    <div class=\"mis-row\">
+      <label style=\"color:#94a3b8;\">Drones:</label>
+      <span id=\"mis_drones\" style=\"display:flex;gap:10px;flex-wrap:wrap;\"></span>
+    </div>
+
+    <div class=\"mis-row\">
+      <label style=\"color:#94a3b8;\">Target markers:</label>
+      <input id=\"mis_markers\" type=\"text\" value=\"1-12\" placeholder=\"e.g. 1-12 or 1,2,3,7\" style=\"width:220px;\" />
+      <label style=\"color:#94a3b8;margin-left:12px;\">Hover s:</label>
+      <input id=\"mis_hover_s\" type=\"number\" min=\"0.5\" step=\"0.5\" value=\"3\" style=\"width:70px;\" />
+      <label style=\"color:#94a3b8;margin-left:12px;\">Approach tol (m):</label>
+      <input id=\"mis_tol_m\" type=\"number\" min=\"0.1\" step=\"0.05\" value=\"0.35\" style=\"width:70px;\" />
+      <label style=\"color:#94a3b8;margin-left:12px;display:flex;align-items:center;gap:4px;\">
+        <input id=\"mis_auto_takeoff\" type=\"checkbox\" />
+        auto-takeoff
+      </label>
+    </div>
+
+    <div class=\"mis-row\" style=\"margin-top:8px;\">
+      <button id=\"mis_start\" style=\"background:#065f46;border-color:#10b981;\">&#9654; Start mission</button>
+      <button id=\"mis_stop\" style=\"background:#7f1d1d;border-color:#ef4444;\">&#9632; Stop</button>
+      <button id=\"mis_stop_land\" style=\"background:#7f1d1d;border-color:#ef4444;\">&#9632; Stop + Land</button>
+      <span id=\"mis_progress\" style=\"margin-left:12px;color:#38bdf8;font-weight:600;\">—</span>
+    </div>
+
+    <div class=\"mis-row\" style=\"margin-top:6px;\">
+      <label style=\"color:#94a3b8;\">Scanned:</label>
+      <span id=\"mis_scanned\" style=\"color:#4ade80;font-family:monospace;\">—</span>
+      <label style=\"color:#94a3b8;margin-left:12px;\">Remaining:</label>
+      <span id=\"mis_remaining\" style=\"color:#fbbf24;font-family:monospace;\">—</span>
+    </div>
+
+    <div class=\"small\" style=\"color:#94a3b8;margin:10px 0 4px 0;\">Per-drone status</div>
+    <div id=\"mis_status\" class=\"mis-status\">idle — no mission running</div>
   </div>
 
   <script>
@@ -397,6 +542,412 @@ HTML = """
   })();
   </script>
 
+  <!-- ── ArUco Seek client JS ─────────────────────────────────────── -->
+  <script>
+  (function(){
+    const PGROUPS = ['Mission target','Camera filter / deadbands','P gains (camera)','D gains (IMU damping)','Output clamps','Drawing'];
+    const SLIDERS = [
+      ['hover_distance_m','Hover distance (m)',          0.5, 4.0, 0.05, 0],
+      ['ema_alpha',       'EMA α (smoothing)',           0.05,0.95, 0.05, 1],
+      ['deadband_x',      'Deadband err_x',              0.00,0.30, 0.01, 1],
+      ['deadband_y',      'Deadband err_y',              0.00,0.30, 0.01, 1],
+      ['deadband_skew',   'Deadband skew',               0.00,0.30, 0.01, 1],
+      ['deadband_dist_m', 'Deadband distance (m)',       0.00,1.00, 0.05, 1],
+      ['yaw_p',           'P · yaw     (per err_x)',     0, 50, 1, 2],
+      ['skew_p',          'P · lateral (per skew)',      0, 50, 1, 2],
+      ['alt_p',           'P · altitude (per err_y)',    0,100, 1, 2],
+      ['dist_p',          'P · distance',                0, 30, 0.5, 2],
+      ['d_yaw',           'D · yaw     (°/s)',           0,  2, 0.05, 3],
+      ['d_lr',            'D · lateral (cm/s vgy)',      0,  2, 0.05, 3],
+      ['d_ud',            'D · vertical(cm/s vgz)',      0,  2, 0.05, 3],
+      ['d_fb',            'D · fwd/back(cm/s vgx)',      0,  2, 0.05, 3],
+      ['yaw_max',         'Clamp · yaw max',             0, 50, 1, 4],
+      ['lr_max',          'Clamp · lateral max',         0, 30, 1, 4],
+      ['ud_max',          'Clamp · vertical max',        0, 50, 1, 4],
+      ['fb_max',          'Clamp · forward max',         0, 30, 1, 4],
+      ['fb_back_max',     'Clamp · backward max',        0, 30, 1, 4],
+      ['rc_min',          'RC dead-floor',               0, 10, 1, 4],
+      ['cam_hfov_deg',    'Cam HFOV (drawing only)',    30,110, 1, 5],
+    ];
+    let arcParams = {};
+    let arcAllowLive = false;
+    let arcMode = 'observe';
+
+    // Which drone id is the ArUco panel currently tracking? Mirrors the
+    // main UI's active drone, picked up from /proxy/drones on each poll.
+    let arcActiveId = null;
+
+    async function arcLoadParams() {
+      try {
+        const r = await fetch('/proxy/aruco/params');
+        arcParams = await r.json();
+        arcRenderParams();
+      } catch {}
+    }
+    function arcRenderParams() {
+      const cont = document.getElementById('arc_params');
+      cont.innerHTML = '';
+      let curGroup = -1;
+      SLIDERS.forEach(([k,label,mn,mx,st,grp]) => {
+        if (grp !== curGroup) {
+          curGroup = grp;
+          const h = document.createElement('div');
+          h.className = 'arc-pgroup';
+          h.innerHTML = '<div class=\"arc-pgroup-label\">' + PGROUPS[grp] + '</div>';
+          cont.appendChild(h);
+        }
+        const v = arcParams[k] ?? 0;
+        const r = document.createElement('div');
+        r.className = 'arc-row';
+        r.innerHTML =
+          '<label title=\"'+k+'\">'+label+'</label>' +
+          '<input type=\"range\" min=\"'+mn+'\" max=\"'+mx+'\" step=\"'+st+'\" value=\"'+v+'\" data-k=\"'+k+'\" />' +
+          '<input type=\"number\" min=\"'+mn+'\" max=\"'+mx+'\" step=\"'+st+'\" value=\"'+v+'\" data-k=\"'+k+'\" />';
+        cont.appendChild(r);
+      });
+      cont.querySelectorAll('input').forEach(el => {
+        el.addEventListener('input', () => {
+          const k = el.dataset.k;
+          const v = parseFloat(el.value);
+          if (isNaN(v)) return;
+          arcParams[k] = v;
+          cont.querySelectorAll('input[data-k=\"'+k+'\"]').forEach(s => { if (s !== el) s.value = v; });
+        });
+        el.addEventListener('change', () => {
+          const k = el.dataset.k;
+          const v = parseFloat(el.value);
+          if (!isNaN(v)) fetch('/proxy/aruco/params', {method:'POST',
+              headers:{'Content-Type':'application/json'},
+              body: JSON.stringify({[k]: v})});
+        });
+      });
+    }
+
+    function fmt(x, n) { return (x === undefined || x === null || isNaN(x)) ? '—' : Number(x).toFixed(n); }
+
+    function arcApplyModeUI(mode, allow) {
+      arcMode = mode || 'observe';
+      if (typeof allow === 'boolean') arcAllowLive = allow;
+      const bObs  = document.getElementById('arc_mode_observe');
+      const bLive = document.getElementById('arc_mode_live');
+      bObs.classList.toggle('active', arcMode === 'observe');
+      bLive.classList.toggle('active', arcMode === 'live');
+      bLive.classList.toggle('live',   arcMode === 'live');
+      bLive.disabled = !arcAllowLive;
+      document.getElementById('arc_mode_gate').style.display = arcAllowLive ? 'none' : 'inline';
+      const live = (arcMode === 'live');
+      document.getElementById('arc_live_banner').classList.toggle('show', live);
+      document.body.classList.toggle('arc-live-mode', live);
+      document.getElementById('arc_manual').classList.toggle('show', live);
+    }
+
+    function arcRenderReadout(s) {
+      if (!s.running) {
+        document.getElementById('arc_readout').innerHTML = '<span style=\"color:#64748b;\">stopped — press Start</span>';
+        return;
+      }
+      const html =
+        '<b>Marker</b><br>' +
+        '<span class=\"k\">ID:</span>'+(s.marker_id ?? '—')+
+        '&nbsp;&nbsp;<span class=\"k\">visible:</span>'+((s.visible_ids||[]).join(', ')||'—')+'<br>' +
+        '<span class=\"k\">distance:</span>'+fmt(s.distance_m,2)+' m '+
+          '<span class=\"pd\">(raw '+fmt(s.raw_distance_m,2)+', target '+fmt(arcParams.hover_distance_m,2)+')</span><br>' +
+        '<span class=\"k\">err_x:</span>'+fmt(s.err_x,3)+
+          '&nbsp;&nbsp;<span class=\"k\">err_y:</span>'+fmt(s.err_y,3)+
+          '&nbsp;&nbsp;<span class=\"k\">skew:</span>'+fmt(s.skew,3)+'<br>' +
+        '<br><b>IMU</b>  '+
+        '<span class=\"pd\">vgx '+fmt(s.vx_cms,0)+', vgy '+fmt(s.vy_cms,0)+', vgz '+fmt(s.vz_cms,0)+' cm/s; '+
+          'yaw '+fmt(s.yaw,1)+'° @ '+fmt(s.yaw_rate_dps,0)+'°/s; alt '+fmt(s.altitude_m,2)+' m</span><br>' +
+        (s.mode === 'live'
+          ? '<br><b class=\"arc-rc-sent\">RC — SENT to drone</b>'
+          : '<br><b>RC — would-send</b> <span class=\"pd\">(observe — not sent)</span>') + '<br>' +
+        '<span class=\"k\">lr:</span>'+(s.rc_lr ?? '—')+' <span class=\"pd\">(P='+fmt(s.rc_lr_p,1)+' D='+fmt(s.rc_lr_d,1)+')</span>' +
+        '&nbsp; <span class=\"k\">fb:</span>'+(s.rc_fb ?? '—')+' <span class=\"pd\">(P='+fmt(s.rc_fb_p,1)+' D='+fmt(s.rc_fb_d,1)+')</span><br>' +
+        '<span class=\"k\">ud:</span>'+(s.rc_ud ?? '—')+' <span class=\"pd\">(P='+fmt(s.rc_ud_p,1)+' D='+fmt(s.rc_ud_d,1)+')</span>' +
+        '&nbsp; <span class=\"k\">yaw:</span>'+(s.rc_yaw ?? '—')+' <span class=\"pd\">(P='+fmt(s.rc_yaw_p,1)+' D='+fmt(s.rc_yaw_d,1)+')</span><br>' +
+        (s.rc_sent_at ? '<span class=\"k\">last sent:</span><span class=\"arc-rc-sent\">'+((Date.now()/1000 - s.rc_sent_at).toFixed(1))+' s ago</span><br>' : '') +
+        (s.rc_send_error ? '<span class=\"k\">send err:</span><span style=\"color:#fca5a5;\">'+s.rc_send_error+'</span><br>' : '');
+      document.getElementById('arc_readout').innerHTML = html;
+    }
+
+    function arcDrawTopDown(s) {
+      const c = document.getElementById('arc_topdown');
+      const ctx = c.getContext('2d');
+      const W = c.width, H = c.height;
+      ctx.fillStyle = '#0b1220'; ctx.fillRect(0,0,W,H);
+      const cx = W/2;
+      const marker_y = 36;
+      const target = arcParams.hover_distance_m || 1.5;
+      const maxDist = Math.max(target*2.2, 3.0);
+      const ppm = (H-80)/maxDist;
+      ctx.strokeStyle = '#1e293b'; ctx.lineWidth = 1;
+      for (let d=0.5; d<=maxDist; d+=0.5) { ctx.beginPath(); ctx.arc(cx, marker_y, d*ppm, 0, Math.PI, false); ctx.stroke(); }
+      ctx.fillStyle = '#334155'; ctx.font = '9px monospace'; ctx.textAlign = 'left';
+      for (let d=1; d<=maxDist; d+=1) ctx.fillText(d+'m', cx+4, marker_y + d*ppm - 2);
+      ctx.strokeStyle = '#0ea5e9'; ctx.lineWidth = 1.5; ctx.setLineDash([4,4]);
+      ctx.beginPath(); ctx.arc(cx, marker_y, target*ppm, 0, Math.PI, false); ctx.stroke();
+      ctx.setLineDash([]);
+      // marker
+      const mw = 60;
+      ctx.strokeStyle = '#22c55e'; ctx.lineWidth = 6;
+      ctx.beginPath(); ctx.moveTo(cx-mw, marker_y); ctx.lineTo(cx+mw, marker_y); ctx.stroke();
+      ctx.fillStyle = '#22c55e'; ctx.font = '11px sans-serif'; ctx.textAlign = 'left';
+      ctx.fillText('marker '+(s.marker_id ?? '?'), cx+mw+6, marker_y+4);
+      if (!s.running || s.distance_m == null) {
+        ctx.fillStyle = '#475569'; ctx.font = '13px sans-serif'; ctx.textAlign = 'center';
+        ctx.fillText(s.running ? 'no marker visible' : 'stopped', W/2, H/2);
+        return;
+      }
+      const dist = s.distance_m;
+      const lateral_m = -(s.skew || 0) * dist;
+      const drone_x = cx + lateral_m*ppm;
+      const drone_y = marker_y + dist*ppm;
+      const hfov = (arcParams.cam_hfov_deg || 69) * Math.PI / 180;
+      const yaw_off_rad = Math.atan((s.err_x || 0) * Math.tan(hfov/2));
+      const dxv = cx - drone_x, dyv = marker_y - drone_y;
+      const aimAng = Math.atan2(dyv, dxv);
+      const droneAng = aimAng - yaw_off_rad;
+      // LoS
+      ctx.strokeStyle = '#fbbf2470'; ctx.lineWidth = 1.5; ctx.setLineDash([3,3]);
+      ctx.beginPath(); ctx.moveTo(drone_x, drone_y); ctx.lineTo(cx, marker_y); ctx.stroke();
+      ctx.setLineDash([]);
+      // FOV
+      ctx.strokeStyle = '#38bdf833'; ctx.fillStyle = '#38bdf815';
+      const fovLen = ppm * Math.max(2.5, dist+1.0);
+      ctx.save(); ctx.translate(drone_x, drone_y); ctx.rotate(droneAng);
+      ctx.beginPath(); ctx.moveTo(0,0);
+      ctx.lineTo(fovLen*Math.cos(-hfov/2), fovLen*Math.sin(-hfov/2));
+      ctx.lineTo(fovLen*Math.cos( hfov/2), fovLen*Math.sin( hfov/2));
+      ctx.closePath(); ctx.fill(); ctx.stroke();
+      ctx.restore();
+      // drone
+      ctx.save(); ctx.translate(drone_x, drone_y); ctx.rotate(droneAng);
+      ctx.fillStyle = '#fbbf24'; ctx.strokeStyle = '#f59e0b'; ctx.lineWidth = 1.5;
+      ctx.beginPath(); ctx.moveTo(15,0); ctx.lineTo(-10,-10); ctx.lineTo(-10,10); ctx.closePath();
+      ctx.fill(); ctx.stroke();
+      const vx = s.vx_cms||0, vy = s.vy_cms||0;
+      if (Math.hypot(vx,vy) > 2) {
+        ctx.strokeStyle = '#ef4444'; ctx.lineWidth = 2;
+        ctx.beginPath(); ctx.moveTo(0,0); ctx.lineTo(vx*0.7, vy*0.7); ctx.stroke();
+      }
+      ctx.restore();
+      ctx.fillStyle = '#fbbf24'; ctx.font = 'bold 13px monospace'; ctx.textAlign = 'center';
+      ctx.fillText(dist.toFixed(2)+' m', (drone_x+cx)/2+14, (drone_y+marker_y)/2+4);
+      ctx.fillStyle = '#cbd5e1'; ctx.font = '11px monospace'; ctx.textAlign = 'left';
+      ctx.fillText('lateral '+lateral_m.toFixed(2)+' m', 8, H-22);
+      ctx.fillText('dist err '+(dist-target).toFixed(2)+' m', 8, H-6);
+      ctx.textAlign = 'right';
+      ctx.fillText('target '+target.toFixed(2)+' m', W-8, H-22);
+      ctx.fillText('err_x '+(s.err_x||0).toFixed(3), W-8, H-6);
+    }
+
+    async function arcPoll() {
+      try {
+        const r = await fetch('/proxy/aruco/state');
+        const s = await r.json();
+        const st = document.getElementById('arc_status');
+        if (s.running) { st.textContent = '● ' + (s.status_msg || 'running'); st.style.color = '#22c55e'; }
+        else           { st.textContent = '○ stopped';                          st.style.color = '#94a3b8'; }
+        const dl = document.getElementById('arc_drone_label');
+        if (s.drone_id && arcActiveId !== s.drone_id) {
+          arcActiveId = s.drone_id;
+        }
+        if (arcActiveId) dl.textContent = '[drone '+arcActiveId+']';
+        arcApplyModeUI(s.mode || 'observe', s.allow_live);
+        arcRenderReadout(s);
+        arcDrawTopDown(s);
+      } catch(e) {}
+    }
+
+    // Buttons
+    document.getElementById('arc_start').onclick = async () => {
+      await fetch('/proxy/aruco/start', {method:'POST'});
+      document.getElementById('arc_video').src = '/proxy/aruco/video.mjpg?t=' + Date.now();
+      // Reload params for the now-active drone
+      arcLoadParams();
+    };
+    document.getElementById('arc_stop').onclick = async () => {
+      await fetch('/proxy/aruco/stop', {method:'POST'});
+      document.getElementById('arc_video').src = '';
+    };
+    document.getElementById('arc_target_lock').onclick = async () => {
+      const v = document.getElementById('arc_target_input').value;
+      await fetch('/proxy/aruco/target', {method:'POST',
+        headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({marker: v ? parseInt(v) : null})});
+    };
+    document.getElementById('arc_target_auto').onclick = async () => {
+      document.getElementById('arc_target_input').value = '';
+      await fetch('/proxy/aruco/target', {method:'POST',
+        headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({marker: null})});
+    };
+    document.getElementById('arc_reload').onclick = arcLoadParams;
+
+    async function arcSetMode(mode) {
+      const r = await fetch('/proxy/aruco/mode', {method:'POST',
+        headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({mode})});
+      const j = await r.json();
+      if (!j.ok && j.error) alert('Mode change refused: ' + j.error);
+      arcApplyModeUI(j.mode || mode, arcAllowLive);
+    }
+    document.getElementById('arc_mode_observe').onclick = () => arcSetMode('observe');
+    document.getElementById('arc_mode_live').onclick = () => {
+      if (!arcAllowLive) { alert('LIVE mode is disabled (REMOTE_NO_LIVE=1).'); return; }
+      const ok = confirm('⚠ SWITCH TO LIVE MODE?\\n\\nThe drone WILL receive RC commands as soon as a marker is tracked.\\nMake sure the area is clear.\\n\\nClick OK to enable LIVE mode.');
+      if (ok) arcSetMode('live');
+    };
+
+    async function arcPostCmd(path, confirmMsg) {
+      if (confirmMsg && !confirm(confirmMsg)) return;
+      const r = await fetch(path, {method:'POST'});
+      const j = await r.json();
+      if (!j.ok && j.error) alert(path + ' refused: ' + j.error);
+    }
+    document.getElementById('arc_takeoff').onclick   = () => arcPostCmd('/proxy/aruco/takeoff',   'Send TAKEOFF to the active drone?');
+    document.getElementById('arc_land').onclick      = () => arcPostCmd('/proxy/aruco/land',      'Send LAND to the active drone?');
+    document.getElementById('arc_rc_stop').onclick   = () => arcPostCmd('/proxy/aruco/rc_stop',   null);
+    document.getElementById('arc_emergency').onclick = () => arcPostCmd('/proxy/aruco/emergency', '⛔ EMERGENCY STOP — cut motors immediately. Confirm?');
+
+    arcLoadParams();
+    setInterval(arcPoll, 250);
+    arcPoll();
+  })();
+  </script>
+
+  <!-- ── Special Missions client JS ───────────────────────────────── -->
+  <script>
+  (function(){
+    let misDronesKnown = {};
+
+    async function misLoadDrones() {
+      try {
+        const r = await fetch('/proxy/drones');
+        const d = await r.json();
+        misDronesKnown = d.drones || {};
+        const cont = document.getElementById('mis_drones');
+        const prev = {};
+        cont.querySelectorAll('input[type=checkbox]').forEach(cb => { prev[cb.dataset.id] = cb.checked; });
+        cont.innerHTML = '';
+        const ids = Object.keys(misDronesKnown).sort();
+        ids.forEach(id => {
+          const info = misDronesKnown[id];
+          const wrap = document.createElement('label');
+          wrap.style.cssText = 'display:flex;gap:4px;align-items:center;font-size:12px;color:#e2e8f0;cursor:pointer;';
+          const checked = (id in prev) ? prev[id] : true;
+          wrap.innerHTML = '<input type=\"checkbox\" data-id=\"'+id+'\"'+(checked?' checked':'')+' /> '+info.name+' <span style=\"color:#64748b;\">#'+id+'</span>';
+          cont.appendChild(wrap);
+        });
+      } catch {}
+    }
+
+    function misSelectedDroneIds() {
+      return Array.from(document.querySelectorAll('#mis_drones input[type=checkbox]'))
+        .filter(cb => cb.checked).map(cb => cb.dataset.id);
+    }
+
+    function misBadge(phase) {
+      const low = (phase || 'idle').toLowerCase();
+      let cls = 'idle';
+      if (low === 'search') cls = 'scan';
+      else if (low === 'approach') cls = 'approach';
+      else if (low === 'hover') cls = 'hover';
+      else if (low === 'done') cls = 'done';
+      else if (low === 'error') cls = 'error';
+      return '<span class=\"mis-badge '+cls+'\">'+phase+'</span>';
+    }
+
+    function misRenderStatus(st) {
+      const title = document.getElementById('mis_title_status');
+      const prog = document.getElementById('mis_progress');
+      const panel = document.getElementById('mis_status');
+
+      if (!st.has_mission) {
+        title.textContent = 'idle';
+        title.style.color = '#94a3b8';
+        prog.textContent = '—';
+        document.getElementById('mis_scanned').textContent = '—';
+        document.getElementById('mis_remaining').textContent = '—';
+        panel.textContent = 'idle — no mission running';
+        return;
+      }
+      title.textContent = st.active ? '● running' : '○ stopped';
+      title.style.color = st.active ? '#4ade80' : '#94a3b8';
+      prog.textContent = 'Progress: ' + st.progress;
+      document.getElementById('mis_scanned').textContent = (st.scanned || []).join(', ') || '—';
+      document.getElementById('mis_remaining').textContent = (st.remaining || []).join(', ') || '—';
+
+      let html = '';
+      const drones = st.drones || {};
+      Object.keys(drones).sort().forEach(did => {
+        const d = drones[did];
+        const name = (misDronesKnown[did] && misDronesKnown[did].name) || ('Drone '+did);
+        const tgt = d.target != null ? 'target '+d.target : '—';
+        html += '<div class=\"mis-drone-line\"><b>'+name+' #'+did+'</b> '+misBadge(d.phase)+
+                ' <span style=\"color:#64748b;\">['+tgt+']</span> <span style=\"color:#cbd5e1;\">'+(d.note||'')+'</span></div>';
+      });
+      if (st.error) html += '<div style=\"color:#fca5a5;margin-top:6px;\">error: '+st.error+'</div>';
+      panel.innerHTML = html || 'no drones assigned';
+    }
+
+    async function misPoll() {
+      try {
+        const r = await fetch('/proxy/missions/status');
+        misRenderStatus(await r.json());
+      } catch {}
+    }
+
+    document.getElementById('mis_start').onclick = async () => {
+      const drone_ids = misSelectedDroneIds();
+      if (!drone_ids.length) { alert('Select at least one drone.'); return; }
+      const markers = document.getElementById('mis_markers').value;
+      const hover_seconds = parseFloat(document.getElementById('mis_hover_s').value) || 3.0;
+      const tol = parseFloat(document.getElementById('mis_tol_m').value) || 0.35;
+      const auto_takeoff = document.getElementById('mis_auto_takeoff').checked;
+      const payload = {
+        drone_ids, target_markers: markers,
+        hover_seconds, approach_tolerance_m: tol, auto_takeoff,
+      };
+      const warn = 'Start mission \"Scan All Markers\"?\\n\\n' +
+                   'Drones: ' + drone_ids.join(', ') + '\\n' +
+                   'Markers: ' + markers + '\\n' +
+                   'Hover for ' + hover_seconds + 's at each marker.\\n\\n' +
+                   (auto_takeoff ? '⚠ AUTO-TAKEOFF is enabled — drones will launch.\\n\\n' : '') +
+                   'This switches the observers into LIVE mode.';
+      if (!confirm(warn)) return;
+      const r = await fetch('/proxy/missions/scan_all/start', {method:'POST',
+        headers:{'Content-Type':'application/json'},
+        body: JSON.stringify(payload)});
+      const j = await r.json();
+      if (!j.ok) alert('Mission start refused: ' + (j.error || j.message || ''));
+      misPoll();
+    };
+
+    document.getElementById('mis_stop').onclick = async () => {
+      await fetch('/proxy/missions/stop', {method:'POST',
+        headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({land:false})});
+      misPoll();
+    };
+
+    document.getElementById('mis_stop_land').onclick = async () => {
+      if (!confirm('Stop mission AND land all participating drones?')) return;
+      await fetch('/proxy/missions/stop', {method:'POST',
+        headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({land:true})});
+      misPoll();
+    };
+
+    misLoadDrones();
+    // If the drone config changes, the drones list in the ArUco section
+    // repopulates via /proxy/drones poll — mirror that for missions.
+    setInterval(misLoadDrones, 5000);
+    setInterval(misPoll, 500);
+    misPoll();
+  })();
+  </script>
+
   <div class=\"row\" style=\"margin-top:12px;\">
     <div class=\"panel pos-panel\">
       <div style=\"display:flex;align-items:center;gap:10px;margin-bottom:8px;\">
@@ -497,6 +1048,9 @@ HTML = """
         <div class=\"small\" style=\"margin-bottom:4px;color:#94a3b8;\">Marker positions (ID · X · Y · Z · Wall)</div>
         <div id=\"arena_marker_table\" style=\"max-height:280px;overflow-y:auto;font-size:11px;\"></div>
         <div style=\"margin-top:6px;display:flex;gap:8px;flex-wrap:wrap;align-items:center;\">
+          <label class=\"small\" style=\"color:#94a3b8;display:flex;align-items:center;gap:4px;\">ID:
+            <input id=\"arena_new_marker_id\" type=\"number\" min=\"0\" step=\"1\" placeholder=\"auto\" style=\"width:60px;height:26px;border-radius:4px;border:1px solid #475569;background:#0f172a;color:#e2e8f0;padding:0 6px;\" title=\"Marker ID to add (leave blank for next free)\" />
+          </label>
           <button id=\"arena_add_marker\" style=\"padding:4px 10px;font-size:11px;background:#065f46;border-color:#10b981;\">+ Add Marker</button>
           <button id=\"arena_save\" style=\"padding:4px 10px;font-size:11px;background:#1e3a5f;border-color:#3b82f6;\">Save Config</button>
           <button id=\"arena_reset\" style=\"padding:4px 10px;font-size:11px;background:#374151;border-color:#6b7280;\">Reset to Defaults</button>
@@ -606,10 +1160,6 @@ holdButtons.forEach(btn=>{
 document.getElementById('takeoff').onclick = ()=>post('/proxy/takeoff',{});
 document.getElementById('land').onclick = ()=>post('/proxy/land',{});
 document.getElementById('recover').onclick = ()=>post('/proxy/recover',{});
-document.getElementById('flip_l').onclick = ()=>post('/proxy/flip',{dir:'l'});
-document.getElementById('flip_r').onclick = ()=>post('/proxy/flip',{dir:'r'});
-document.getElementById('flip_f').onclick = ()=>post('/proxy/flip',{dir:'f'});
-document.getElementById('flip_b').onclick = ()=>post('/proxy/flip',{dir:'b'});
 
 document.getElementById('safe_takeoff').onclick = async ()=>{
   try {
@@ -661,12 +1211,6 @@ document.getElementById('sdk_send').onclick = ()=>{
 };
 
 // Anafi / Olympe controls
-document.getElementById('take_photo').onclick = ()=>post('/proxy/camera/photo',{});
-document.getElementById('rec_start').onclick = ()=>post('/proxy/camera/record/start',{});
-document.getElementById('rec_stop').onclick = ()=>post('/proxy/camera/record/stop',{});
-document.getElementById('rth_start').onclick = ()=>post('/proxy/rth',{action:'start'});
-document.getElementById('rth_cancel').onclick = ()=>post('/proxy/rth',{action:'cancel'});
-
 const gimbalSlider = document.getElementById('gimbal_tilt');
 const gimbalVal = document.getElementById('gimbal_tilt_val');
 gimbalSlider.oninput = ()=>{ gimbalVal.textContent = gimbalSlider.value + '°'; };
@@ -1529,7 +2073,7 @@ function renderMarkerTable() {
     row.style.cssText = rowStyle;
     const wallOpts = WALLS.map(w => `<option value="${w}" ${m.wall===w?'selected':''}>${w}</option>`).join('');
     row.innerHTML = `
-      <span style="min-width:24px;text-align:right;color:#94a3b8;font-size:11px;">${id}</span>
+      <input type="number" step="1" min="0" value="${id}" data-oldid="${id}" data-rename="1" style="${iStyle}width:52px;text-align:right;" title="Marker ID (editable)" />
       <input type="number" step="0.001" value="${m.pos[0]}" data-id="${id}" data-f="0" style="${iStyle}width:58px;" title="X" />
       <input type="number" step="0.001" value="${m.pos[1]}" data-id="${id}" data-f="1" style="${iStyle}width:58px;" title="Y" />
       <input type="number" step="0.001" value="${m.pos[2]}" data-id="${id}" data-f="2" style="${iStyle}width:52px;" title="Z" />
@@ -1548,6 +2092,23 @@ function renderMarkerTable() {
   tbody.querySelectorAll('select[data-f]').forEach(el => {
     el.addEventListener('change', () => {
       if (arenaMarkers[el.dataset.id]) arenaMarkers[el.dataset.id].wall = el.value;
+    });
+  });
+  tbody.querySelectorAll('input[data-rename]').forEach(el => {
+    el.addEventListener('change', () => {
+      const oldId = el.dataset.oldid;
+      const n = parseInt(el.value, 10);
+      if (isNaN(n) || n < 0) { alert('Marker ID must be a non-negative integer.'); el.value = oldId; return; }
+      const newId = String(n);
+      if (newId === oldId) return;
+      if (arenaMarkers[newId]) {
+        alert('Marker ID ' + newId + ' already exists.');
+        el.value = oldId;
+        return;
+      }
+      arenaMarkers[newId] = arenaMarkers[oldId];
+      delete arenaMarkers[oldId];
+      renderMarkerTable();
     });
   });
   tbody.querySelectorAll('button[data-del]').forEach(btn => {
@@ -1591,9 +2152,24 @@ document.getElementById('arena_cfg_toggle').onclick = function() {
 };
 
 document.getElementById('arena_add_marker').onclick = () => {
-  const ids = Object.keys(arenaMarkers).map(Number).filter(n=>!isNaN(n));
-  const newId = String(ids.length ? Math.max(...ids) + 1 : 30);
+  const input = document.getElementById('arena_new_marker_id');
+  const typed = (input.value || '').trim();
+  let newId;
+  if (typed !== '') {
+    const n = parseInt(typed, 10);
+    if (isNaN(n) || n < 0) { alert('Marker ID must be a non-negative integer.'); return; }
+    newId = String(n);
+    if (arenaMarkers[newId]) {
+      alert('Marker ID ' + newId + ' already exists. Pick a different number or clear the field to auto-assign.');
+      return;
+    }
+  } else {
+    const ids = Object.keys(arenaMarkers).map(Number).filter(n => !isNaN(n));
+    newId = String(ids.length ? Math.max(...ids) + 1 : 1);
+  }
   arenaMarkers[newId] = {pos: [0, 0, 0], wall: 'front'};
+  // Auto-increment the input so repeated clicks add sequential IDs
+  input.value = String(parseInt(newId, 10) + 1);
   renderMarkerTable();
   // Scroll to bottom
   const tb = document.getElementById('arena_marker_table');
@@ -1898,6 +2474,11 @@ def proxy_drones_config_save():
     if active_drone_id in DRONES:
         PI_BASE = DRONES[active_drone_id]["base"]
     save_drones_config(DRONES)
+    # Keep ArUco fleet in sync with drone config
+    try:
+        aruco_fleet.configure(DRONES)
+    except Exception as e:
+        print(f"[ARUCO] fleet reconfigure failed: {e}")
     print(f"[CONFIG] Saved {len(DRONES)} drones to {DRONES_CONFIG_PATH}")
     return jsonify(ok=True, drones=DRONES)
 
@@ -2659,6 +3240,280 @@ def proxy_rec_stop():
         return (r.text, r.status_code, {"Content-Type": r.headers.get("Content-Type", "application/json")})
     except Exception as e:
         return jsonify(ok=False, error=str(e)), 502
+
+
+# ─── ArUco Seek (multi-drone hover-in-front-of-marker) ─────────────────────
+
+
+def _aruco_resolve(drone_id: str | None):
+    """Return observer for the given id, or the active drone if omitted."""
+    did = str(drone_id) if drone_id else active_drone_id
+    obs = aruco_fleet.get(did)
+    if obs is None:
+        return None, did
+    return obs, did
+
+
+@app.get("/proxy/aruco/state")
+def proxy_aruco_state():
+    """Snapshot of ONE observer (query ?id=1, defaults to active drone)."""
+    did = request.args.get("id") or active_drone_id
+    obs, did = _aruco_resolve(did)
+    if obs is None:
+        return jsonify(running=False, drone_id=did, error="unknown drone"), 404
+    return jsonify(obs.get_state())
+
+
+@app.get("/proxy/aruco/fleet")
+def proxy_aruco_fleet():
+    """Snapshot of every observer in the fleet."""
+    return jsonify(active=active_drone_id,
+                   allow_live=aruco_fleet.allow_live,
+                   observers=aruco_fleet.all_states())
+
+
+@app.get("/proxy/aruco/params")
+def proxy_aruco_params_get():
+    did = request.args.get("id") or active_drone_id
+    obs, did = _aruco_resolve(did)
+    if obs is None:
+        return jsonify(asdict_hover_defaults()), 200
+    return jsonify(obs.get_params())
+
+
+def asdict_hover_defaults():
+    from dataclasses import asdict
+    return asdict(AsHoverParams())
+
+
+@app.post("/proxy/aruco/params")
+def proxy_aruco_params_set():
+    data = request.get_json(silent=True) or {}
+    did = str(data.pop("id", "") or request.args.get("id") or active_drone_id)
+    obs, did = _aruco_resolve(did)
+    if obs is None:
+        return jsonify(ok=False, error="unknown drone"), 404
+    applied = obs.update_params(data)
+    return jsonify(ok=True, applied=applied)
+
+
+@app.post("/proxy/aruco/start")
+def proxy_aruco_start():
+    data = request.get_json(silent=True) or {}
+    did = str(data.get("id") or request.args.get("id") or active_drone_id)
+    obs, did = _aruco_resolve(did)
+    if obs is None:
+        return jsonify(ok=False, error="unknown drone"), 404
+    log_command("aruco_start", {"id": did})
+    obs.start()
+    return jsonify(ok=True, drone_id=did)
+
+
+@app.post("/proxy/aruco/stop")
+def proxy_aruco_stop():
+    data = request.get_json(silent=True) or {}
+    did = str(data.get("id") or request.args.get("id") or active_drone_id)
+    obs, did = _aruco_resolve(did)
+    if obs is None:
+        return jsonify(ok=False, error="unknown drone"), 404
+    log_command("aruco_stop", {"id": did})
+    obs.stop()
+    return jsonify(ok=True, drone_id=did)
+
+
+@app.post("/proxy/aruco/target")
+def proxy_aruco_target():
+    data = request.get_json(silent=True) or {}
+    did = str(data.get("id") or request.args.get("id") or active_drone_id)
+    obs, did = _aruco_resolve(did)
+    if obs is None:
+        return jsonify(ok=False, error="unknown drone"), 404
+    mid = data.get("marker")
+    if mid is not None:
+        try:
+            mid = int(mid)
+        except (TypeError, ValueError):
+            mid = None
+    obs.set_target(mid)
+    log_command("aruco_target", {"id": did, "marker": mid})
+    return jsonify(ok=True, drone_id=did, marker=mid)
+
+
+@app.post("/proxy/aruco/mode")
+def proxy_aruco_mode():
+    data = request.get_json(silent=True) or {}
+    did = str(data.get("id") or request.args.get("id") or active_drone_id)
+    obs, did = _aruco_resolve(did)
+    if obs is None:
+        return jsonify(ok=False, error="unknown drone"), 404
+    requested = (data.get("mode") or "").lower()
+    if requested == "live" and not obs.allow_live:
+        return jsonify(ok=False, mode=obs.mode,
+                       error="LIVE mode disabled on this server (REMOTE_NO_LIVE=1)"), 403
+    actual = obs.set_mode(requested)
+    log_command("aruco_mode", {"id": did, "mode": actual})
+    return jsonify(ok=(actual == requested), drone_id=did, mode=actual)
+
+
+def _aruco_require_live(obs):
+    if obs is None:
+        return jsonify(ok=False, error="unknown drone"), 404
+    if obs.mode != "live":
+        return jsonify(ok=False,
+                       error=f"refused — observer mode is '{obs.mode}', switch to 'live' first"), 409
+    return None
+
+
+@app.post("/proxy/aruco/takeoff")
+def proxy_aruco_takeoff():
+    data = request.get_json(silent=True) or {}
+    did = str(data.get("id") or request.args.get("id") or active_drone_id)
+    obs, did = _aruco_resolve(did)
+    err = _aruco_require_live(obs)
+    if err is not None:
+        return err
+    log_command("aruco_takeoff", {"id": did})
+    return jsonify(ok=True, drone_id=did, result=obs.cmd_takeoff())
+
+
+@app.post("/proxy/aruco/land")
+def proxy_aruco_land():
+    data = request.get_json(silent=True) or {}
+    did = str(data.get("id") or request.args.get("id") or active_drone_id)
+    obs, did = _aruco_resolve(did)
+    err = _aruco_require_live(obs)
+    if err is not None:
+        return err
+    log_command("aruco_land", {"id": did})
+    return jsonify(ok=True, drone_id=did, result=obs.cmd_land())
+
+
+@app.post("/proxy/aruco/emergency")
+def proxy_aruco_emergency():
+    # Allowed at any mode — killswitch must always be reachable
+    data = request.get_json(silent=True) or {}
+    did = str(data.get("id") or request.args.get("id") or active_drone_id)
+    obs, did = _aruco_resolve(did)
+    if obs is None:
+        return jsonify(ok=False, error="unknown drone"), 404
+    log_command("aruco_emergency", {"id": did})
+    return jsonify(ok=True, drone_id=did, result=obs.cmd_emergency())
+
+
+@app.post("/proxy/aruco/rc_stop")
+def proxy_aruco_rc_stop():
+    data = request.get_json(silent=True) or {}
+    did = str(data.get("id") or request.args.get("id") or active_drone_id)
+    obs, did = _aruco_resolve(did)
+    if obs is None:
+        return jsonify(ok=False, error="unknown drone"), 404
+    log_command("aruco_rc_stop", {"id": did})
+    return jsonify(ok=True, drone_id=did, result=obs.cmd_rc_stop())
+
+
+@app.get("/proxy/aruco/video.mjpg")
+def proxy_aruco_video():
+    """Pass-through MJPEG for the observer's drone (separate from /proxy/video
+    so the main UI's video stream and the ArUco Seek panel don't collide)."""
+    did = request.args.get("id") or active_drone_id
+    obs, did = _aruco_resolve(did)
+    if obs is None:
+        return Response(b"", status=404)
+    upstream_url = f"{obs.api_base}/api/position/video"
+    try:
+        upstream = requests.get(upstream_url, stream=True, timeout=10)
+    except Exception as e:
+        return Response(f"upstream error: {e}".encode(), status=502, mimetype="text/plain")
+    content_type = upstream.headers.get(
+        "Content-Type", "multipart/x-mixed-replace; boundary=frame"
+    )
+
+    def generate():
+        try:
+            for chunk in upstream.iter_content(chunk_size=8192):
+                if chunk:
+                    yield chunk
+        except (GeneratorExit, requests.exceptions.RequestException):
+            pass
+        finally:
+            try:
+                upstream.close()
+            except Exception:
+                pass
+    return Response(generate(), content_type=content_type)
+
+
+# ─── Special Missions (multi-drone coordinated flight) ────────────────────
+
+
+def _parse_marker_list(raw) -> list[int]:
+    """Parse '1-12' / '1,2,3,5-7' / [1,2,3] into a sorted unique int list."""
+    if isinstance(raw, list):
+        return sorted({int(x) for x in raw if str(x).strip()})
+    if not isinstance(raw, str):
+        return []
+    out: set[int] = set()
+    for tok in raw.replace(";", ",").split(","):
+        tok = tok.strip()
+        if not tok:
+            continue
+        if "-" in tok:
+            a, _, b = tok.partition("-")
+            try:
+                a_i, b_i = int(a), int(b)
+                if a_i > b_i:
+                    a_i, b_i = b_i, a_i
+                for v in range(a_i, b_i + 1):
+                    out.add(v)
+            except ValueError:
+                continue
+        else:
+            try:
+                out.add(int(tok))
+            except ValueError:
+                continue
+    return sorted(out)
+
+
+@app.get("/proxy/missions/status")
+def proxy_missions_status():
+    return jsonify(mission_manager.status())
+
+
+@app.post("/proxy/missions/scan_all/start")
+def proxy_missions_scan_all_start():
+    data = request.get_json(silent=True) or {}
+    drone_ids = data.get("drone_ids") or []
+    if not isinstance(drone_ids, list) or not drone_ids:
+        return jsonify(ok=False, error="drone_ids (non-empty list) required"), 400
+    target_markers = _parse_marker_list(data.get("target_markers", "1-12"))
+    if not target_markers:
+        return jsonify(ok=False, error="target_markers must parse to at least one id"), 400
+    hover_seconds = float(data.get("hover_seconds", 3.0))
+    approach_tolerance_m = float(data.get("approach_tolerance_m", 0.35))
+    auto_takeoff = bool(data.get("auto_takeoff", False))
+    ok, msg = mission_manager.start_scan_all(
+        drone_ids=[str(d) for d in drone_ids],
+        target_markers=target_markers,
+        hover_seconds=hover_seconds,
+        approach_tolerance_m=approach_tolerance_m,
+        auto_takeoff=auto_takeoff,
+    )
+    log_command("mission_scan_all_start", {
+        "drone_ids": drone_ids, "target_markers": target_markers,
+        "hover_seconds": hover_seconds, "ok": ok, "msg": msg,
+    })
+    status = 200 if ok else 409
+    return jsonify(ok=ok, message=msg, status=mission_manager.status()), status
+
+
+@app.post("/proxy/missions/stop")
+def proxy_missions_stop():
+    data = request.get_json(silent=True) or {}
+    land = bool(data.get("land", False))
+    ok = mission_manager.stop(land=land)
+    log_command("mission_stop", {"land": land, "ok": ok})
+    return jsonify(ok=ok, status=mission_manager.status())
 
 
 def main():

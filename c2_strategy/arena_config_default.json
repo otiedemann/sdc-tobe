@@ -1,0 +1,107 @@
+{
+  "_comment": "Default SDC26 arena configuration derived from the Swarm Drone Challenge 2026 regulations v4.0 (30.01.2026). Values with unit suffix _m are meters, _s are seconds. Dimensions are nominal per the ruleset; actual venue may vary slightly. Coordinate frame: origin at (0,0,0) in the front-left-floor corner; x along 20m length, y along 10m width, z along 6m height. Marker 0 sits at the back-wall center and defines the local world frame per the ruleset.",
+  "ruleset_version": "4.0",
+  "ruleset_date": "2026-01-30",
+
+  "width_m": 20.0,
+  "height_m": 10.0,
+  "ceiling_m": 6.0,
+  "field_length_m": 20.0,
+  "field_width_m": 10.0,
+  "field_ceiling_m": 6.0,
+
+  "our_team": "blue",
+  "red_home_zone": [0.0, 0.0, 6.667, 10.0],
+  "neutral_zone": [6.667, 0.0, 13.333, 10.0],
+  "blue_home_zone": [13.333, 0.0, 20.0, 10.0],
+
+  "marker_dict": "DICT_4X4_50",
+  "marker_size_m": 0.5,
+
+  "pillar_markers": {
+    "0": { "marker_id": 0,  "position": { "x": 10.0, "y": 10.0, "z": 2.0 }, "wall": "back",  "role": "origin",   "note": "Local world-frame origin per ruleset section 2.1" },
+
+    "17": { "marker_id": 17, "position": { "x": 2.5,  "y": 10.0, "z": 2.0 }, "wall": "back",  "pillar": "B1", "level": "low"  },
+    "18": { "marker_id": 18, "position": { "x": 2.5,  "y": 10.0, "z": 4.0 }, "wall": "back",  "pillar": "B1", "level": "high" },
+    "19": { "marker_id": 19, "position": { "x": 7.5,  "y": 10.0, "z": 2.0 }, "wall": "back",  "pillar": "B2", "level": "low"  },
+    "20": { "marker_id": 20, "position": { "x": 7.5,  "y": 10.0, "z": 4.0 }, "wall": "back",  "pillar": "B2", "level": "high" },
+    "21": { "marker_id": 21, "position": { "x": 12.5, "y": 10.0, "z": 2.0 }, "wall": "back",  "pillar": "B3", "level": "low"  },
+    "22": { "marker_id": 22, "position": { "x": 12.5, "y": 10.0, "z": 4.0 }, "wall": "back",  "pillar": "B3", "level": "high" },
+    "23": { "marker_id": 23, "position": { "x": 17.5, "y": 10.0, "z": 2.0 }, "wall": "back",  "pillar": "B4", "level": "low"  },
+    "24": { "marker_id": 24, "position": { "x": 17.5, "y": 10.0, "z": 4.0 }, "wall": "back",  "pillar": "B4", "level": "high" },
+
+    "11": { "marker_id": 11, "position": { "x": 2.5,  "y": 0.0,  "z": 2.0 }, "wall": "front", "pillar": "F1", "level": "low"  },
+    "12": { "marker_id": 12, "position": { "x": 2.5,  "y": 0.0,  "z": 4.0 }, "wall": "front", "pillar": "F1", "level": "high" },
+    "9":  { "marker_id": 9,  "position": { "x": 7.5,  "y": 0.0,  "z": 2.0 }, "wall": "front", "pillar": "F2", "level": "low"  },
+    "10": { "marker_id": 10, "position": { "x": 7.5,  "y": 0.0,  "z": 4.0 }, "wall": "front", "pillar": "F2", "level": "high" },
+    "7":  { "marker_id": 7,  "position": { "x": 12.5, "y": 0.0,  "z": 2.0 }, "wall": "front", "pillar": "F3", "level": "low"  },
+    "8":  { "marker_id": 8,  "position": { "x": 12.5, "y": 0.0,  "z": 4.0 }, "wall": "front", "pillar": "F3", "level": "high" },
+    "5":  { "marker_id": 5,  "position": { "x": 17.5, "y": 0.0,  "z": 2.0 }, "wall": "front", "pillar": "F4", "level": "low"  },
+    "6":  { "marker_id": 6,  "position": { "x": 17.5, "y": 0.0,  "z": 4.0 }, "wall": "front", "pillar": "F4", "level": "high" },
+
+    "13": { "marker_id": 13, "position": { "x": 0.0,  "y": 3.333, "z": 2.0 }, "wall": "left",  "pillar": "L1", "level": "low"  },
+    "14": { "marker_id": 14, "position": { "x": 0.0,  "y": 3.333, "z": 4.0 }, "wall": "left",  "pillar": "L1", "level": "high" },
+    "15": { "marker_id": 15, "position": { "x": 0.0,  "y": 6.667, "z": 2.0 }, "wall": "left",  "pillar": "L2", "level": "low"  },
+    "16": { "marker_id": 16, "position": { "x": 0.0,  "y": 6.667, "z": 4.0 }, "wall": "left",  "pillar": "L2", "level": "high" },
+
+    "3":  { "marker_id": 3,  "position": { "x": 20.0, "y": 3.333, "z": 2.0 }, "wall": "right", "pillar": "R1", "level": "low"  },
+    "4":  { "marker_id": 4,  "position": { "x": 20.0, "y": 3.333, "z": 4.0 }, "wall": "right", "pillar": "R1", "level": "high" },
+    "1":  { "marker_id": 1,  "position": { "x": 20.0, "y": 6.667, "z": 2.0 }, "wall": "right", "pillar": "R2", "level": "low"  },
+    "2":  { "marker_id": 2,  "position": { "x": 20.0, "y": 6.667, "z": 4.0 }, "wall": "right", "pillar": "R2", "level": "high" }
+  },
+
+  "target_boxes": {
+    "_comment": "Positions are configured per-match by the judges and are not known ahead of time (ruleset section 1.3 'Target Configuration'). IDs here are placeholders — at runtime, markers attached to target boxes change between the red/blue colors as drones trigger them. Use target_marker_id_min..max to filter candidate IDs during detection.",
+    "count_total": 6,
+    "count_per_zone": 3,
+    "dimensions": {
+      "width_m":  0.575,
+      "depth_m":  0.375,
+      "height_closed_m": 0.55,
+      "height_open_m":   0.73
+    },
+    "nft_detection_height_range_m": [1.0, 2.0],
+    "target_marker_id_min": 25,
+    "target_marker_id_max": 49
+  },
+
+  "capture_rules": {
+    "color_hold_seconds": 5.0,
+    "hover_to_revert_seconds": 2.0,
+    "home_zone_validation_seconds": 5.0,
+    "special_maneuver_all_same_color_seconds": 5.0
+  },
+  "capture_hover_seconds": 2.0,
+
+  "scoring": {
+    "normal_capture_points": 1,
+    "special_capture_points": 5,
+    "simultaneous_capture_bonus": 10,
+    "instant_win_all_same_color_seconds": 5.0
+  },
+  "normal_capture_points": 1,
+  "special_capture_points": 5,
+  "simultaneous_capture_bonus": 10,
+
+  "match": {
+    "match_time_seconds": 600,
+    "min_drones_per_team": 2,
+    "max_drones_per_team": 5
+  },
+
+  "safety": {
+    "max_drone_mtom_kg": 10.0,
+    "c2_loss_autoland_seconds": 2.0,
+    "min_operational_drones_per_team": 2,
+    "protective_sphere_required": true,
+    "rfid_marker_required": true,
+    "kill_switch_required": true,
+    "team_master_stop_required": true
+  },
+
+  "drone_configs": [],
+
+  "battery_return_threshold": 20.0,
+  "approach_tolerance_m": 0.5,
+  "home_zone_tolerance_m": 0.5
+}

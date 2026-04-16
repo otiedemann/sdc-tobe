@@ -1,0 +1,229 @@
+{
+  "width_m": 20.0,
+  "height_m": 10.0,
+  "ceiling_m": 6.0,
+  "our_team": "blue",
+  "red_home_zone": [
+    0.0,
+    0.0,
+    7.0,
+    10.0
+  ],
+  "blue_home_zone": [
+    13.0,
+    0.0,
+    20.0,
+    10.0
+  ],
+  "pillar_markers": {
+    "21": {
+      "marker_id": 21,
+      "position": {
+        "x": 5.0,
+        "y": 0.0,
+        "z": 2.0
+      },
+      "wall": "front"
+    },
+    "22": {
+      "marker_id": 22,
+      "position": {
+        "x": 5.0,
+        "y": 0.0,
+        "z": 4.0
+      },
+      "wall": "front"
+    },
+    "23": {
+      "marker_id": 23,
+      "position": {
+        "x": 10.0,
+        "y": 0.0,
+        "z": 2.0
+      },
+      "wall": "front"
+    },
+    "24": {
+      "marker_id": 24,
+      "position": {
+        "x": 10.0,
+        "y": 0.0,
+        "z": 4.0
+      },
+      "wall": "front"
+    },
+    "25": {
+      "marker_id": 25,
+      "position": {
+        "x": 15.0,
+        "y": 0.0,
+        "z": 2.0
+      },
+      "wall": "front"
+    },
+    "26": {
+      "marker_id": 26,
+      "position": {
+        "x": 15.0,
+        "y": 0.0,
+        "z": 4.0
+      },
+      "wall": "front"
+    },
+    "27": {
+      "marker_id": 27,
+      "position": {
+        "x": 5.0,
+        "y": 10.0,
+        "z": 2.0
+      },
+      "wall": "back"
+    },
+    "28": {
+      "marker_id": 28,
+      "position": {
+        "x": 5.0,
+        "y": 10.0,
+        "z": 4.0
+      },
+      "wall": "back"
+    },
+    "29": {
+      "marker_id": 29,
+      "position": {
+        "x": 10.0,
+        "y": 10.0,
+        "z": 2.0
+      },
+      "wall": "back"
+    },
+    "30": {
+      "marker_id": 30,
+      "position": {
+        "x": 10.0,
+        "y": 10.0,
+        "z": 4.0
+      },
+      "wall": "back"
+    },
+    "31": {
+      "marker_id": 31,
+      "position": {
+        "x": 15.0,
+        "y": 10.0,
+        "z": 2.0
+      },
+      "wall": "back"
+    },
+    "32": {
+      "marker_id": 32,
+      "position": {
+        "x": 15.0,
+        "y": 10.0,
+        "z": 4.0
+      },
+      "wall": "back"
+    },
+    "33": {
+      "marker_id": 33,
+      "position": {
+        "x": 0.0,
+        "y": 3.3,
+        "z": 2.0
+      },
+      "wall": "left"
+    },
+    "34": {
+      "marker_id": 34,
+      "position": {
+        "x": 0.0,
+        "y": 3.3,
+        "z": 4.0
+      },
+      "wall": "left"
+    },
+    "35": {
+      "marker_id": 35,
+      "position": {
+        "x": 0.0,
+        "y": 6.7,
+        "z": 2.0
+      },
+      "wall": "left"
+    },
+    "36": {
+      "marker_id": 36,
+      "position": {
+        "x": 0.0,
+        "y": 6.7,
+        "z": 4.0
+      },
+      "wall": "left"
+    },
+    "37": {
+      "marker_id": 37,
+      "position": {
+        "x": 20.0,
+        "y": 3.3,
+        "z": 2.0
+      },
+      "wall": "right"
+    },
+    "38": {
+      "marker_id": 38,
+      "position": {
+        "x": 20.0,
+        "y": 3.3,
+        "z": 4.0
+      },
+      "wall": "right"
+    },
+    "39": {
+      "marker_id": 39,
+      "position": {
+        "x": 20.0,
+        "y": 6.7,
+        "z": 2.0
+      },
+      "wall": "right"
+    },
+    "40": {
+      "marker_id": 40,
+      "position": {
+        "x": 20.0,
+        "y": 6.7,
+        "z": 4.0
+      },
+      "wall": "right"
+    }
+  },
+  "target_marker_id_min": 1,
+  "target_marker_id_max": 12,
+  "capture_hover_seconds": 2.0,
+  "special_capture_points": 5,
+  "simultaneous_capture_bonus": 10,
+  "normal_capture_points": 1,
+  "drone_configs": [
+    {
+      "drone_id": "drone-1",
+      "api_base_url": "http://localhost:8080",
+      "drone_type": "simulator",
+      "sim_drone_id": "B1"
+    },
+    {
+      "drone_id": "drone-2",
+      "api_base_url": "http://localhost:8080",
+      "drone_type": "simulator",
+      "sim_drone_id": "B2"
+    },
+    {
+      "drone_id": "drone-3",
+      "api_base_url": "http://localhost:8080",
+      "drone_type": "simulator",
+      "sim_drone_id": "B3"
+    }
+  ],
+  "battery_return_threshold": 20.0,
+  "approach_tolerance_m": 0.5,
+  "home_zone_tolerance_m": 0.5
+}
