@@ -1392,11 +1392,11 @@ refreshRecStatus();
 setInterval(refreshRecStatus, 5000);
 
 loadPosConfig();
-loadArenaConfig();   // pre-load markers so canvas shows them before panel is opened
-drawArena();
-
 // ── Arena Configuration ───────────────────────────────────────────────────────
 let arenaMarkers = {};   // {id_str: {pos:[x,y,z], wall:'front'}}
+
+loadArenaConfig();   // pre-load markers so canvas shows them before panel is opened
+drawArena();
 
 const WALLS = ['front','back','left','right'];
 
