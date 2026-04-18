@@ -41,20 +41,20 @@ from typing import Optional
 # ============================================================
 
 # P gains: position error (m) → velocity setpoint (m/s)
-KP_XY: float = 0.8       # horizontal
-KP_Z: float  = 0.6       # vertical
+KP_XY: float = 0.2       # horizontal
+KP_Z: float  = 0.2       # vertical
 
 # P gain: yaw error (rad) → yaw rate setpoint (rad/s)
-KP_YAW: float = 1.5
+KP_YAW: float = 0.15
 
 # Maximum velocity setpoints
-MAX_HORIZ_SPEED: float = 0.1    # m/s  (horizontal)
-MAX_VERT_SPEED: float  = 0.1    # m/s  (vertical)
-MAX_YAW_RATE: float    = 0.8    # rad/s
+MAX_HORIZ_SPEED: float = 0.20    # %  (horizontal)
+MAX_VERT_SPEED: float  = 0.20    # %  (vertical)
+MAX_YAW_RATE: float    = 0.20    # %
 
 # Position acceptance radii (switch to HOVER phase)
-ARRIVE_RADIUS_XY: float = 0.15  # m
-ARRIVE_RADIUS_Z: float  = 0.10  # m
+ARRIVE_RADIUS_XY: float = 0.25  # m
+ARRIVE_RADIUS_Z: float  = 0.25  # mq
 
 # Yaw alignment during transit
 TRANSIT_YAW_MIN_DIST: float    = 0.30  # m: only yaw toward target if farther than this
@@ -63,6 +63,9 @@ YAW_ALIGN_SPEED_FACTOR: float  = 0.20  # fraction of max speed while rotating to
 
 # Uncertainty guard: freeze output if estimated position std > this
 MAX_STD_POS: float = 0.40   # m  (set to math.inf to disable)
+
+# Hard output clamp applied in send_pcmd_olympe before values reach the drone
+PCMD_MAX: int = 20           # absolute maximum RC value sent (-PCMD_MAX .. +PCMD_MAX)
 
 # Hysteresis: leave HOVER only if error grows beyond this
 HOVER_EXIT_RADIUS_XY: float = ARRIVE_RADIUS_XY * 2.0
@@ -245,7 +248,7 @@ class PositionController:
         else:
             # TRANSIT: face the direction of travel when far enough away
             if dist_xy >= TRANSIT_YAW_MIN_DIST:
-                desired_yaw = math.atan2(ey, ex)   # bearing to target in world frame
+                desired_yaw = math.atan2(ex, ey)   # bearing to target in world frame
             else:
                 # Close to target — stop yawing, just translate the last bit
                 desired_yaw = cyaw
@@ -285,10 +288,10 @@ class PositionController:
         #   left_right:   +100 = right   = -vy_body (vy_body is left+)
         #   up_down:      +100 = up      = +vz_sp   (world Z is up)
         #   yaw:          +100 = CW      = -yaw_rate_sp (our yaw_rate is CCW+)
-        fb  = _clamp(vx_body   / MAX_HORIZ_SPEED * 100.0, -100, 100)
-        lr  = _clamp(-vy_body  / MAX_HORIZ_SPEED * 100.0, -100, 100)
-        ud  = _clamp(vz_sp     / MAX_VERT_SPEED  * 100.0, -100, 100)
-        yaw = _clamp(-yaw_rate_sp / MAX_YAW_RATE * 100.0, -100, 100)
+        fb  = _clamp(vx_body * 100.0, -100, 100)
+        lr  = _clamp(-vy_body * 100.0, -100, 100)
+        ud  = _clamp(vz_sp * 100.0, -100, 100)
+        yaw = _clamp(-yaw_rate_sp * 100.0 , -100, 100)
 
         return {
             "forward_back": fb,
@@ -299,6 +302,7 @@ class PositionController:
             "_phase":       self._phase,
             "_err_xy":      round(dist_xy, 3),
             "_err_z":       round(ez, 3),
+            "_desired_yaw": round(math.degrees(desired_yaw), 1),
             "_yaw_err_deg": round(math.degrees(yaw_error), 1),
         }
 
@@ -362,12 +366,17 @@ def send_pcmd_olympe(drone, rc: dict) -> None:
     try:
         from olympe.messages.ardrone3.Piloting import PCMD
         _pcmd_seq = (_pcmd_seq + 1) & 0x7FFFFFFF
+
+        # Hard clamp: never send values beyond ±PCMD_MAX to the drone
+        def _hard_clamp(v: int) -> int:
+            return max(-PCMD_MAX, min(PCMD_MAX, v))
+
         drone(PCMD(
-            1,                      # flag: 1 = active
-            rc["left_right"],       # roll
-            rc["forward_back"],     # pitch
-            rc["yaw"],              # yaw
-            rc["up_down"],          # gaz
+            1,                                    # flag: 1 = active
+            _hard_clamp(rc["left_right"]),        # roll
+            _hard_clamp(rc["forward_back"]),      # pitch
+            _hard_clamp(rc["yaw"]),               # yaw
+            _hard_clamp(rc["up_down"]),           # gaz
             _pcmd_seq,
         ))
     except Exception as exc:

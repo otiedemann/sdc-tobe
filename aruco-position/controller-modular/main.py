@@ -163,7 +163,7 @@ def has_gui():
 # ============================================================
 
 TARGET_MARKER_ID = 15          # ArUco marker to find and approach
-APPROACH_DISTANCE = 0.5        # units to fly forward when marker is found
+APPROACH_DISTANCE = 5.0        # metres to hover in front of the marker face
 TAKEOFF_HEIGHT_Z = 1.2         # world-frame Z (up) to wait for after takeoff
 TAKEOFF_TIMEOUT_S = 15.0       # abort takeoff after this many seconds
 SEARCH_YAW_RATE = 0.3          # rad/s slow rotation during search
@@ -461,7 +461,7 @@ class AutonomousMission:
             from olympe.messages.ardrone3.Piloting import PCMD
             AutonomousMission._search_seq = (AutonomousMission._search_seq + 1) & 0x7FFFFFFF
             yaw_pct = int(SEARCH_YAW_RATE / 0.8 * 100)  # scale: 0.8 rad/s → 100 %
-            drone(PCMD(1, 0, 0, yaw_pct, 0, AutonomousMission._search_seq))
+            drone(PCMD(0, 0, 0, yaw_pct, 0, AutonomousMission._search_seq))
         except Exception:
             pass
 
@@ -490,29 +490,60 @@ class AutonomousMission:
 
     def _compute_approach(self, vision_result: Optional[dict]) -> Optional[tuple]:
         """
-        Return (x, y, z, yaw) by flying 0.5 units forward from the current
-        cam position along the camera's current forward direction.
+        Return (x, y, z, yaw) for hovering APPROACH_DISTANCE metres straight in
+        front of the target marker face.
 
-        Uses vision_result["cam"] (position) and vision_result["dir"]
-        (world-frame forward unit vector) from the vision processor.
+        Primary: uses the marker's known world-frame position (from arena config)
+        and the wall's inward normal to place the hover point perpendicular to the
+        marker face.  Drone yaw is set so it faces toward the marker.
+
+        Fallback (no arena data): fly forward from current cam position along the
+        camera's forward direction (original behaviour).
         """
+        # -- primary: marker world position from arena config --
+        marker_pos = None
+        wall_type  = None
+        if self.vision is not None:
+            mp = getattr(self.vision, "marker_positions", {})
+            wt = getattr(self.vision, "marker_wall_type", {})
+            if self.target_id in mp:
+                marker_pos = mp[self.target_id]
+                wall_type  = wt.get(self.target_id)
+
+        if marker_pos is not None:
+            # Inward wall normal (points from the wall face into the arena).
+            normal = _WALL_NORMALS.get(wall_type, np.array([1.0, 0.0, 0.0]))
+            nx, ny = float(normal[0]), float(normal[1])
+
+            # Hover point: step approach_dist along the inward normal from the marker.
+            target_x = float(marker_pos[0]) + nx * self.approach_dist
+            target_y = float(marker_pos[1]) + ny * self.approach_dist
+            target_z = float(marker_pos[2])   # keep marker's world height
+
+            # Drone yaw: face back toward the marker (opposite of inward normal).
+            yaw = math.atan2(-ny, -nx)
+
+            print(
+                f"[mission] Approach: marker {self.target_id} at "
+                f"({marker_pos[0]:.2f}, {marker_pos[1]:.2f}, {marker_pos[2]:.2f})  "
+                f"wall={wall_type} normal=({nx:+.2f},{ny:+.2f})  "
+                f"hover → ({target_x:.2f}, {target_y:.2f}, {target_z:.2f})  "
+                f"yaw={math.degrees(yaw):.1f}°"
+            )
+            return (float(target_x), float(target_y), float(target_z), float(yaw))
+
+        # -- fallback: no arena config data available --
         cam = self._get_cam_pos(vision_result)
         if cam is None:
             print("[mission] No cam position available – cannot compute approach")
             return None
 
-        # Camera forward direction in world frame (3-element unit vector).
-        raw_dir = None
-        if vision_result is not None:
-            raw_dir = vision_result.get("dir")
-
+        raw_dir = vision_result.get("dir") if vision_result is not None else None
         if raw_dir is not None and len(raw_dir) >= 2:
             dx, dy = float(raw_dir[0]), float(raw_dir[1])
         else:
-            # Fallback: fly along world +X if no direction is available.
             dx, dy = 1.0, 0.0
 
-        # Normalise the horizontal (XY) component.
         mag = math.sqrt(dx * dx + dy * dy)
         if mag < 1e-6:
             dx, dy = 1.0, 0.0
@@ -521,16 +552,16 @@ class AutonomousMission:
 
         target_x = cam[0] + dx * self.approach_dist
         target_y = cam[1] + dy * self.approach_dist
-        target_z = cam[2]                            # keep current height
-        yaw      = math.atan2(dy, dx)               # face direction of travel
+        target_z = cam[2]
+        yaw      = math.atan2(dy, dx)
 
         print(
-            f"[mission] Approach: fly {self.approach_dist} units forward  "
-            f"from ({cam[0]:.2f}, {cam[1]:.2f}, {cam[2]:.2f})  "
+            f"[mission] Approach (fallback – no arena config): "
+            f"fly {self.approach_dist} m forward from cam "
+            f"({cam[0]:.2f}, {cam[1]:.2f}, {cam[2]:.2f})  "
             f"dir=({dx:+.2f}, {dy:+.2f})  "
             f"→ ({target_x:.2f}, {target_y:.2f}, {target_z:.2f})"
         )
-
         return (float(target_x), float(target_y), float(target_z), float(yaw))
 
 
@@ -723,6 +754,16 @@ def main():
         )
 
     # --------------------------------------------------------
+    # Mission log (JSONL, one entry per control tick)
+    # --------------------------------------------------------
+    _log_path = os.path.join(
+        os.path.dirname(os.path.abspath(__file__)),
+        f"mission_{time.strftime('%Y%m%d_%H%M%S')}.jsonl",
+    )
+    _log_file = open(_log_path, "w", encoding="utf-8")
+    print(f"📋 Mission log → {_log_path}")
+
+    # --------------------------------------------------------
     # Rates
     # --------------------------------------------------------
     motion_rate_hz = 25.0
@@ -739,8 +780,6 @@ def main():
         nominal_dt=motion_dt,
         initial_pose=(0.0, 0.0, 0.0, 0.0),
         initial_variance=(0.01, 0.01, 0.01, 0.01),
-        body_y_positive_is_left=True,
-        body_z_positive_is_down=True,
         yaw_positive_is_ccw=True,
     )
 
@@ -748,6 +787,7 @@ def main():
     last_vision_update: Optional[Dict[str, Any]] = None
     pending_vision_update: Optional[Dict[str, Any]] = None
     last_fusion_result: Optional[Dict[str, Any]] = None
+    _last_rc: Optional[Dict] = None
 
     # --------------------------------------------------------
     # Video source setup
@@ -1131,6 +1171,7 @@ def main():
             if ctrl_module is not None and _ctrl_state is not None:
                 rc = ctrl_module.update(_ctrl_state)
                 if rc is not None:
+                    _last_rc = rc
                     if mission_dry_run:
                         print(
                             f"\r[DRY RUN] RC  fb={rc['forward_back']:+4d}  "
@@ -1152,6 +1193,55 @@ def main():
             # --------------------------------------
             if mission is not None:
                 mission.tick(last_prediction, last_vision_update, anafi_drone)
+
+            # --------------------------------------
+            # Mission log entry (written every tick the controller is active)
+            # --------------------------------------
+            if _last_rc is not None or mission is not None:
+                _log_cam = None
+                if _ctrl_state is not None:
+                    _log_cam = {
+                        "x": round(_ctrl_state["x"], 4),
+                        "y": round(_ctrl_state["y"], 4),
+                        "z": round(_ctrl_state["z"], 4),
+                        "yaw_deg": round(math.degrees(_ctrl_state["yaw"]), 2),
+                    }
+
+                _log_tgt = None
+                if mission is not None and mission._approach_target is not None:
+                    tx, ty, tz, tyaw = mission._approach_target
+                    _log_tgt = {
+                        "x": round(tx, 4),
+                        "y": round(ty, 4),
+                        "z": round(tz, 4),
+                        "yaw_deg": round(math.degrees(tyaw), 2),
+                    }
+                elif ctrl_module is not None and ctrl_module.position_controller.target is not None:
+                    t = ctrl_module.position_controller.target
+                    _log_tgt = {
+                        "x": round(t.x, 4),
+                        "y": round(t.y, 4),
+                        "z": round(t.z, 4),
+                        "yaw_deg": round(math.degrees(t.hold_yaw), 2) if t.hold_yaw is not None else None,
+                    }
+
+                _log_entry = {
+                    "ts": round(time.time(), 4),
+                    "mission_phase": mission.phase if mission is not None else None,
+                    "cam": _log_cam,
+                    "target": _log_tgt,
+                    "ctrl_phase": _last_rc.get("_phase") if _last_rc else None,
+                    "err_xy": _last_rc.get("_err_xy") if _last_rc else None,
+                    "err_z": _last_rc.get("_err_z") if _last_rc else None,
+                    "yaw_err_deg": _last_rc.get("_yaw_err_deg") if _last_rc else None,
+                    "rc": {
+                        "forward_back": _last_rc["forward_back"],
+                        "left_right":   _last_rc["left_right"],
+                        "up_down":      _last_rc["up_down"],
+                        "yaw":          _last_rc["yaw"],
+                    } if _last_rc else None,
+                }
+                _log_file.write(json.dumps(_log_entry) + "\n")
 
             # --------------------------------------
             # Outgoing payload
@@ -1248,9 +1338,11 @@ def main():
 
                 cam = result.get("cam")
                 if cam is not None:
+                    _dir = result.get("dir")
+                    _cam_yaw_deg = math.degrees(math.atan2(_dir[1], _dir[0])) if _dir is not None else 0.0
                     cv2.putText(
                         preview,
-                        f"CAM x={cam[0]:+.3f} y={cam[1]:+.3f} z={cam[2]:+.3f}",
+                        f"CAM x={cam[0]:+.3f} y={cam[1]:+.3f} z={cam[2]:+.3f} yaw={_cam_yaw_deg:+.1f}°",
                         (10, 60),
                         cv2.FONT_HERSHEY_SIMPLEX,
                         0.6,
@@ -1301,6 +1393,40 @@ def main():
                         cv2.FONT_HERSHEY_SIMPLEX,
                         0.5,
                         (255, 180, 0),
+                        2,
+                    )
+
+                if _last_rc is not None:
+                    rc_txt = (
+                        f"RC  fb={_last_rc['forward_back']:+4d}  "
+                        f"lr={_last_rc['left_right']:+4d}  "
+                        f"ud={_last_rc['up_down']:+4d}  "
+                        f"yaw={_last_rc['yaw']:+4d}  "
+                        f"| err_xy={_last_rc.get('_err_xy',0):.2f}m  "
+                        f"err_z={_last_rc.get('_err_z',0):+.2f}m  "
+                        f"desired_yaw={_last_rc.get('_desired_yaw',0):+.1f} deg  "
+                        f"yaw_err={_last_rc.get('_yaw_err_deg',0):+.1f} deg  "
+                        f"phase={_last_rc.get('_phase')}"
+                    )
+                    cv2.putText(
+                        preview,
+                        rc_txt,
+                        (10, 170),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.5,
+                        (0, 220, 255),
+                        2,
+                    )
+
+                if mission is not None and mission._approach_target is not None:
+                    tx, ty, tz, tyaw = mission._approach_target
+                    cv2.putText(
+                        preview,
+                        f"TGT x={tx:+.2f} y={ty:+.2f} z={tz:+.2f} yaw={math.degrees(tyaw):+.1f} deg",
+                        (10, 195),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.6,
+                        (255, 100, 255),
                         2,
                     )
 
@@ -1404,6 +1530,12 @@ def main():
             time.sleep(0.001)
 
     finally:
+        try:
+            _log_file.close()
+            print(f"\n📋 Mission log saved → {_log_path}")
+        except Exception:
+            pass
+
         if cap is not None:
             cap.release()
 
