@@ -41,16 +41,16 @@ from typing import Optional
 # ============================================================
 
 # P gains: position error (m) → velocity setpoint (m/s)
-KP_XY: float = 0.2       # horizontal
-KP_Z: float  = 0.2       # vertical
+KP_XY: float = 0.1       # horizontal
+KP_Z: float  = 0.1       # vertical
 
 # P gain: yaw error (rad) → yaw rate setpoint (rad/s)
-KP_YAW: float = 0.15
+KP_YAW: float = 0.1
 
 # Maximum velocity setpoints
-MAX_HORIZ_SPEED: float = 0.20    # %  (horizontal)
-MAX_VERT_SPEED: float  = 0.20    # %  (vertical)
-MAX_YAW_RATE: float    = 0.20    # %
+MAX_HORIZ_SPEED: float = 0.10    # %  (horizontal)
+MAX_VERT_SPEED: float  = 0.10    # %  (vertical)
+MAX_YAW_RATE: float    = 0.10    # %
 
 # Position acceptance radii (switch to HOVER phase)
 ARRIVE_RADIUS_XY: float = 0.25  # m

@@ -23,10 +23,7 @@ import prediction as predict
 from fusion import fuse_delayed_vision_update
 from motion_estimator import MotionEstimator, MotionState
 
-try:
-    import olympe
-except Exception:
-    olympe = None
+import olympe
 
 # --- CONFIGURATION ---
 UDP_DEST_IP = "127.0.0.1"  # Default IP des Laptops (Relay)
@@ -63,8 +60,6 @@ try:
 except Exception:
     ctrl_module = None
 
-_motion_input_enabled: bool = False
-
 # Suppress olympe / arsdk / pdraw log noise (H264/AVCC decoder warnings, etc.)
 logging.getLogger("olympe").setLevel(logging.CRITICAL)
 logging.getLogger("ulog").setLevel(logging.CRITICAL)
@@ -91,12 +86,6 @@ def fallback_get_motion_input() -> Dict[str, Any]:
         "vz_body": 0.0,
         "yaw_rate": 0.0,
     }
-
-
-def get_motion_input() -> Dict[str, Any]:
-    if _motion_input_enabled and input_module is not None and hasattr(input_module, "get_motion_input"):
-        return input_module.get_motion_input()
-    return fallback_get_motion_input()
 
 
 def estimate_velocity_from_history(history: list[MotionState]) -> tuple[float, float, float]:
@@ -801,23 +790,23 @@ def main():
 
     cap = None
 
-    global _motion_input_enabled
-    _motion_input_enabled = enable_motion_input
-
+    motion_listener = None
     if use_anafi_stream:
         if olympe is None:
             raise RuntimeError("Parrot Olympe not installed. Install with: pip install parrot-olympe")
 
         anafi_ip = _parse_anafi_ip(camera_src)
 
-        # Pass resolved IP to the input module before video setup so the
-        # telemetry thread can start connecting in parallel.
-        if enable_motion_input and input_module is not None and hasattr(input_module, "init"):
-            input_module.init(anafi_ip=anafi_ip)
 
         print(f"🛩️ Connecting to Parrot Anafi at {anafi_ip}…")
         anafi_drone = olympe.Drone(anafi_ip)
+
+        if enable_motion_input and input_module is not None:
+            motion_listener = input_module.MotionListener(anafi_drone)
+            motion_listener.subscribe()
+
         anafi_drone.connect()
+
 
         def _anafi_frame_cb(yuv_frame):
             try:
@@ -1032,21 +1021,24 @@ def main():
             # --------------------------------------
             if now >= next_motion_time:
 
-                last_motion_sample = get_motion_input()
+                if enable_motion_input and motion_listener is not None:
+                    last_motion_sample = motion_listener.get_motion_input()
+                else:
+                    last_motion_sample = fallback_get_motion_input()
 
-                ts = float(last_motion_sample.get("timestamp", now))
-                vx_body = float(last_motion_sample.get("vx_body", 0.0))
-                vy_body = float(last_motion_sample.get("vy_body", 0.0))
-                vz_body = float(last_motion_sample.get("vz_body", 0.0))
-                yaw_rate = float(last_motion_sample.get("yaw_rate", 0.0))
-
-                last_motion_state = motion_estimator.update_body_frame(
-                    timestamp=ts,
-                    vx_body=vx_body,
-                    vy_body=vy_body,
-                    vz_body=vz_body,
-                    yaw_rate=yaw_rate,
-                )
+                # ts = float(last_motion_sample.get("timestamp", now))
+                # vx_body = float(last_motion_sample.get("vx_body", 0.0))
+                # vy_body = float(last_motion_sample.get("vy_body", 0.0))
+                # vz_body = float(last_motion_sample.get("vz_body", 0.0))
+                # yaw_rate = float(last_motion_sample.get("yaw_rate", 0.0))
+                #
+                # last_motion_state = motion_estimator.update_body_frame(
+                #     timestamp=ts,
+                #     vx_body=vx_body,
+                #     vy_body=vy_body,
+                #     vz_body=vz_body,
+                #     yaw_rate=yaw_rate,
+                # )
 
                 next_motion_time += motion_dt
                 if now - next_motion_time > motion_dt:
@@ -1554,6 +1546,8 @@ def main():
                     except Exception:
                         pass
             try:
+                if motion_listener is not None:
+                    motion_listener.unsubscribe()
                 anafi_drone.disconnect()
             except Exception:
                 pass
