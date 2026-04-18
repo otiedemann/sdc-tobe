@@ -767,7 +767,7 @@ def main():
     # Rates
     # --------------------------------------------------------
     motion_rate_hz = 25.0
-    vision_rate_hz = 5.0
+    vision_rate_hz = 10.0
 
     motion_dt = 1.0 / motion_rate_hz
     vision_dt = 1.0 / vision_rate_hz
