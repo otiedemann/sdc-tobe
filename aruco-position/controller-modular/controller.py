@@ -41,8 +41,8 @@ from typing import Optional
 # ============================================================
 
 # P gains: position error (m) → velocity setpoint (m/s)
-KP_XY: float = 0.1       # horizontal
-KP_Z: float  = 0.1       # vertical
+KP_XY: float = 0.25       # horizontal
+KP_Z: float  = 0.25       # vertical
 
 # P gain: yaw error (rad) → yaw rate setpoint (rad/s)
 KP_YAW: float = 0.1
