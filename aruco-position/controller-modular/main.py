@@ -235,6 +235,11 @@ class AutonomousMission:
         if self._phase != MissionPhase.IDLE:
             return
         print(f"[mission] Starting – target marker {self.target_id}")
+        if self.dry_run:
+            print("[DRY RUN] Takeoff skipped – jumping straight to SEARCH")
+            self._begin_search(drone)
+            self._transition(MissionPhase.SEARCH)
+            return
         self._transition(MissionPhase.TAKEOFF)
         self._send_takeoff(drone)
 
@@ -332,20 +337,20 @@ class AutonomousMission:
             self._transition(MissionPhase.FAILED)
             return
 
-        # Prefer CAM-derived altitude; fall back to motion-estimator z when
-        # no markers are visible yet (drone still on ground / spinning up).
-        cam = self._get_cam_pos(vision_result)
-        if cam is not None:
-            z = cam[2]
-        elif state_fallback is not None:
-            z = float(state_fallback.get("z", 0.0))
-        else:
+        if drone is None:
             return
 
-        if z >= self.takeoff_height_z * 0.7:
+        try:
+            from olympe.messages.ardrone3.PilotingState import FlyingStateChanged
+            flying = drone.get_state(FlyingStateChanged)["state"]
+            flying_str = flying.name if hasattr(flying, "name") else str(flying)
+        except Exception:
+            return
+
+        if flying_str in ("hovering", "flying"):
             self._queue_confirm(
                 MissionPhase.SEARCH,
-                f"Airborne – cam z={z:.2f} m.  Ready to start SEARCH.",
+                f"Airborne – flying state={flying_str}.  Ready to start SEARCH.",
                 drone,
             )
 
