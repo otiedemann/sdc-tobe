@@ -157,6 +157,7 @@ TAKEOFF_HEIGHT_Z = 1.2         # world-frame Z (up) to wait for after takeoff
 TAKEOFF_TIMEOUT_S = 15.0       # abort takeoff after this many seconds
 SEARCH_YAW_RATE = 0.3          # rad/s slow rotation during search
 HOLD_ARRIVE_RADIUS = 0.25      # m – radius at which HOLD is declared
+MARKER_LOST_TIMEOUT_S = 3.0    # seconds without seeing target before falling back to SEARCH
 
 # Inward wall normals matching arena_config.json:
 #   front wall  at y= 0  → normal +Y
@@ -324,7 +325,7 @@ class AutonomousMission:
             self._tick_approach(vision_result, now, drone)
 
         elif self._phase == MissionPhase.HOLD:
-            self._tick_hold(vision_result, now)
+            self._tick_hold(vision_result, now, drone)
 
     # ------------------------------------------------------------------ #
     # Phase handlers                                                       #
@@ -382,6 +383,15 @@ class AutonomousMission:
         seen = self._seen_markers(vision_result)
         if self.target_id in seen:
             self._last_seen_ts = now
+        elif now - self._last_seen_ts > MARKER_LOST_TIMEOUT_S:
+            print(
+                f"[mission] APPROACH – marker {self.target_id} lost for "
+                f"{now - self._last_seen_ts:.1f} s, falling back to SEARCH"
+            )
+            self._approach_target = None
+            self._begin_search(drone)
+            self._transition(MissionPhase.SEARCH)
+            return
 
         # Primary: controller HOVER phase
         if self.ctrl is not None and hasattr(self.ctrl, "position_controller"):
@@ -406,16 +416,18 @@ class AutonomousMission:
                     drone,
                 )
 
-    def _tick_hold(self, vision_result, now):
-        # Controller holds position; just track marker visibility.
+    def _tick_hold(self, vision_result, now, drone=None):
         seen = self._seen_markers(vision_result)
         if self.target_id in seen:
             self._last_seen_ts = now
-        elif now - self._last_seen_ts > 5.0:
+        elif now - self._last_seen_ts > MARKER_LOST_TIMEOUT_S:
             print(
-                f"[mission] HOLD – marker {self.target_id} not seen for "
-                f"{now - self._last_seen_ts:.1f} s"
+                f"[mission] HOLD – marker {self.target_id} lost for "
+                f"{now - self._last_seen_ts:.1f} s, falling back to SEARCH"
             )
+            self._approach_target = None
+            self._begin_search(drone)
+            self._transition(MissionPhase.SEARCH)
 
     # ------------------------------------------------------------------ #
     # Helpers                                                              #
