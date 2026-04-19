@@ -208,6 +208,7 @@ class AutonomousMission:
         ctrl_module,                    # controller module (may be None)
         takeoff_height_z: float = TAKEOFF_HEIGHT_Z,
         dry_run: bool = False,          # log RC/commands, send nothing to drone
+        auto_confirm: bool = False,     # skip SPACE confirmations, advance automatically
     ) -> None:
         self.target_id        = target_marker_id
         self.approach_dist    = approach_distance
@@ -215,6 +216,7 @@ class AutonomousMission:
         self.ctrl             = ctrl_module
         self.takeoff_height_z = takeoff_height_z
         self.dry_run          = dry_run
+        self.auto_confirm     = auto_confirm
 
         self._phase: str               = MissionPhase.IDLE
         self._phase_start: float       = 0.0
@@ -314,7 +316,7 @@ class AutonomousMission:
             self._tick_search(vision_result, now, drone)
 
         elif self._phase == MissionPhase.APPROACH:
-            self._tick_approach(vision_result, now)
+            self._tick_approach(vision_result, now, drone)
 
         elif self._phase == MissionPhase.HOLD:
             self._tick_hold(vision_result, now)
@@ -344,6 +346,7 @@ class AutonomousMission:
             self._queue_confirm(
                 MissionPhase.SEARCH,
                 f"Airborne – cam z={z:.2f} m.  Ready to start SEARCH.",
+                drone,
             )
 
     def _tick_search(self, vision_result, now, drone):
@@ -358,6 +361,7 @@ class AutonomousMission:
                     f"Marker {self.target_id} found – "
                     f"approach → ({x:.2f}, {y:.2f}, {z:.2f})  "
                     f"yaw={math.degrees(yaw):.1f}°.  Ready to APPROACH.",
+                    drone,
                 )
                 return
 
@@ -365,7 +369,7 @@ class AutonomousMission:
         if drone is not None:
             self._send_search_yaw(drone)
 
-    def _tick_approach(self, vision_result, now):
+    def _tick_approach(self, vision_result, now, drone=None):
         if self._approach_target is None:
             self._transition(MissionPhase.SEARCH)
             return
@@ -381,6 +385,7 @@ class AutonomousMission:
                 self._queue_confirm(
                     MissionPhase.HOLD,
                     "Arrived at approach point.  Ready to HOLD.",
+                    drone,
                 )
             return
 
@@ -393,6 +398,7 @@ class AutonomousMission:
                 self._queue_confirm(
                     MissionPhase.HOLD,
                     f"Arrived (cam dist={dist:.2f} m).  Ready to HOLD.",
+                    drone,
                 )
 
     def _tick_hold(self, vision_result, now):
@@ -410,12 +416,20 @@ class AutonomousMission:
     # Helpers                                                              #
     # ------------------------------------------------------------------ #
 
-    def _queue_confirm(self, next_phase: str, prompt: str) -> None:
-        """Pause mission and wait for SPACE before entering next_phase."""
+    def _queue_confirm(self, next_phase: str, prompt: str, drone=None) -> None:
+        """Pause mission and wait for SPACE before entering next_phase.
+
+        When auto_confirm is True the pause is skipped and the mission
+        transitions immediately (no operator key-press required).
+        """
         if self._pending_phase == next_phase:
             return   # already queued – don't spam the console
         self._pending_phase = next_phase
         self._pending_prompt = prompt
+        if self.auto_confirm:
+            print(f"\n▶  [mission] auto-confirm → {next_phase.upper()}  ({prompt})")
+            self.confirm(drone)
+            return
         print(f"\n⏸  [mission] {prompt}")
         print(f"   → Press SPACE to continue to [{next_phase.upper()}]  (ESC to abort)")
 
@@ -638,6 +652,7 @@ def main():
 
     mission_enabled  = "--mission" in sys.argv
     mission_dry_run  = "--dry-run" in sys.argv
+    mission_auto_confirm = "--yes" in sys.argv or "-y" in sys.argv
     mission_marker_id = TARGET_MARKER_ID
     if "--mission-marker" in sys.argv:
         try:
@@ -740,6 +755,7 @@ def main():
             ctrl_module=ctrl_module,
             takeoff_height_z=abs(target_z_pos),   # use configured flight height
             dry_run=mission_dry_run,
+            auto_confirm=mission_auto_confirm,
         )
 
     # --------------------------------------------------------
