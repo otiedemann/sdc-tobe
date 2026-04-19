@@ -156,6 +156,7 @@ APPROACH_DISTANCE = 5.0        # metres to hover in front of the marker face
 TAKEOFF_HEIGHT_Z = 1.2         # world-frame Z (up) to wait for after takeoff
 TAKEOFF_TIMEOUT_S = 15.0       # abort takeoff after this many seconds
 SEARCH_YAW_RATE = 0.3          # rad/s slow rotation during search
+SEARCH_MAX_YAW_SPEED = 150     # °/s – MaxRotationSpeed sent to drone before search PCMD
 HOLD_ARRIVE_RADIUS = 0.25      # m – radius at which HOLD is declared
 MARKER_LOST_TIMEOUT_S = 3.0    # seconds without seeing target before falling back to SEARCH
 
@@ -507,6 +508,16 @@ class AutonomousMission:
         # nothing and the pure-yaw PCMD is the only command sent to the drone.
         if self.ctrl is not None:
             self.ctrl.clear_target()
+        # Ensure the drone's MaxRotationSpeed is set high enough that the
+        # PCMD yaw percentage actually produces fast turns.  The factory
+        # default is typically 10–30 °/s, which makes even 70 % feel slow.
+        if drone is not None and not self.dry_run:
+            try:
+                from olympe.messages.ardrone3.SpeedSettings import MaxRotationSpeed
+                drone(MaxRotationSpeed(SEARCH_MAX_YAW_SPEED))
+                print(f"[mission] MaxRotationSpeed set to {SEARCH_MAX_YAW_SPEED} °/s")
+            except Exception as exc:
+                print(f"[mission] Could not set MaxRotationSpeed: {exc}")
 
     def _compute_approach(self, vision_result: Optional[dict]) -> Optional[tuple]:
         """
