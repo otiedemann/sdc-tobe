@@ -238,20 +238,24 @@ class PositionController:
                 print(f"[controller] → TRANSIT  (err_xy={dist_xy:.2f} m)")
 
         # ---- yaw setpoint ----
-        if self._phase == Phase.HOVER:
-            # Use explicitly requested yaw, or the heading we arrived with
-            desired_yaw = (
-                tgt.hold_yaw
-                if tgt.hold_yaw is not None
-                else (self._arrival_yaw if self._arrival_yaw is not None else cyaw)
-            )
-        else:
-            # TRANSIT: face the direction of travel when far enough away
-            if dist_xy >= TRANSIT_YAW_MIN_DIST:
-                desired_yaw = math.atan2(ex, ey)   # bearing to target in world frame
-            else:
-                # Close to target — stop yawing, just translate the last bit
-                desired_yaw = cyaw
+
+        # Use explicit requested yaw, or the heading we arrived with
+        desired_yaw = tgt.hold_yaw if tgt.hold_yaw is not None else cyaw
+
+        # if self._phase == Phase.HOVER:
+        #     # Use explicitly requested yaw, or the heading we arrived with
+        #     desired_yaw = (
+        #         tgt.hold_yaw
+        #         if tgt.hold_yaw is not None
+        #         else (self._arrival_yaw if self._arrival_yaw is not None else cyaw)
+        #     )
+        # else:
+        #     # TRANSIT: face the direction of travel when far enough away
+        #     if dist_xy >= TRANSIT_YAW_MIN_DIST:
+        #         desired_yaw = math.atan2(ex, ey)   # bearing to target in world frame
+        #     else:
+        #         # Close to target — stop yawing, just translate the last bit
+        #         desired_yaw = cyaw
 
         yaw_error    = _wrap_pi(desired_yaw - cyaw)
         yaw_rate_sp  = KP_YAW * yaw_error

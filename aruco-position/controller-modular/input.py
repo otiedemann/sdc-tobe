@@ -95,8 +95,6 @@ class MotionListener(olympe.EventListener):
         """
         global _prev_yaw, _prev_yaw_ts
 
-        print(f"[input] AttitudeChanged: {event.args}")
-
         yaw = _wrap_angle_pi(_SIGN_YAW * float(event.args.get("yaw", 0.0)))
         now = time.monotonic()
 
@@ -121,8 +119,6 @@ class MotionListener(olympe.EventListener):
         Fired by olympe whenever SpeedChanged is received from the drone.
         speedX = forward (body), speedY = right (body), speedZ = down (body), all m/s.
         """
-        print(f"[input] SpeedChanged: {event.args}")
-
         args = event.args
         vx = _SIGN_VX * float(args.get("speedX", 0.0))
         vy = _SIGN_VY * float(args.get("speedY", 0.0))
