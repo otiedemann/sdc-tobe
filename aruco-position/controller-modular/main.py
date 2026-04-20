@@ -737,7 +737,8 @@ def main():
             motion_listener.subscribe()
 
         anafi_drone.connect()
-        anafi_drone.set_max_rotation_speed(90)
+        from olympe.messages.ardrone3.SpeedSettings import MaxRotationSpeed
+        anafi_drone(MaxRotationSpeed(150))
 
 
         def _anafi_frame_cb(yuv_frame):
