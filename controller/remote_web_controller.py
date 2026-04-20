@@ -413,6 +413,8 @@ HTML = """
       <input id=\"mis_hover_s\" type=\"number\" min=\"0.5\" step=\"0.5\" value=\"3\" style=\"width:70px;\" />
       <label style=\"color:#94a3b8;margin-left:12px;\">Approach tol (m):</label>
       <input id=\"mis_tol_m\" type=\"number\" min=\"0.1\" step=\"0.05\" value=\"0.35\" style=\"width:70px;\" />
+      <label style=\"color:#94a3b8;margin-left:12px;\" title=\"Max skew before declaring the drone perpendicular. 0.08 ≈ 6° off the marker normal. Lower values force the drone to align straight-on before hovering.\">Skew tol:</label>
+      <input id=\"mis_skew_tol\" type=\"number\" min=\"0.02\" max=\"0.50\" step=\"0.01\" value=\"0.08\" style=\"width:70px;\" />
       <label style=\"color:#94a3b8;margin-left:12px;display:flex;align-items:center;gap:4px;\">
         <input id=\"mis_auto_takeoff\" type=\"checkbox\" />
         auto-takeoff
@@ -896,7 +898,7 @@ HTML = """
     arcPoll();
     // Version marker — if this string doesn't appear in the DOM,
     // you're running stale JS (restart the Python server or hard-refresh).
-    const BUILD = 'ae-search-maneuver';
+    const BUILD = 'af-perpendicular-align';
     console.log('[arc] init complete, build=' + BUILD);
     const ver = document.createElement('span');
     ver.id = 'arc_build_tag';
@@ -1037,10 +1039,14 @@ HTML = """
       const markers = document.getElementById('mis_markers').value;
       const hover_seconds = parseFloat(document.getElementById('mis_hover_s').value) || 3.0;
       const tol = parseFloat(document.getElementById('mis_tol_m').value) || 0.35;
+      const skew_tol_el = document.getElementById('mis_skew_tol');
+      const skew_tol = skew_tol_el ? (parseFloat(skew_tol_el.value) || 0.08) : 0.08;
       const auto_takeoff = document.getElementById('mis_auto_takeoff').checked;
       const payload = {
         drone_ids, target_markers: markers,
-        hover_seconds, approach_tolerance_m: tol, auto_takeoff,
+        hover_seconds, approach_tolerance_m: tol,
+        approach_skew_tol: skew_tol,
+        auto_takeoff,
       };
       const btn = document.getElementById('mis_start');
       const now = Date.now();
@@ -4004,12 +4010,16 @@ def proxy_missions_scan_all_start():
         return jsonify(ok=False, error="target_markers must parse to at least one id"), 400
     hover_seconds = float(data.get("hover_seconds", 3.0))
     approach_tolerance_m = float(data.get("approach_tolerance_m", 0.35))
+    approach_skew_tol   = float(data.get("approach_skew_tol", 0.08))
+    approach_err_x_tol  = float(data.get("approach_err_x_tol", 0.15))
     auto_takeoff = bool(data.get("auto_takeoff", False))
     ok, msg = mission_manager.start_scan_all(
         drone_ids=[str(d) for d in drone_ids],
         target_markers=target_markers,
         hover_seconds=hover_seconds,
         approach_tolerance_m=approach_tolerance_m,
+        approach_skew_tol=approach_skew_tol,
+        approach_err_x_tol=approach_err_x_tol,
         auto_takeoff=auto_takeoff,
     )
     log_command("mission_scan_all_start", {

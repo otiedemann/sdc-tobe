@@ -621,6 +621,8 @@ class ScanAllMarkersMission:
         target_markers: list[int],
         hover_seconds: float = 3.0,
         approach_tolerance_m: float = 0.35,
+        approach_skew_tol: float = 0.08,
+        approach_err_x_tol: float = 0.15,
         auto_takeoff: bool = False,
     ):
         self.fleet = fleet
@@ -628,6 +630,13 @@ class ScanAllMarkersMission:
         self.target_markers = [int(m) for m in target_markers]
         self.hover_seconds = float(hover_seconds)
         self.approach_tolerance_m = float(approach_tolerance_m)
+        # Maximum perspective skew to accept before declaring APPROACH done.
+        # 0.08 ≈ 6° off the marker normal. Below 0.04 we're inside the skew
+        # deadband so the drone stops correcting anyway.
+        self.approach_skew_tol = float(approach_skew_tol)
+        # Maximum horizontal pixel error (normalised) before declaring the
+        # drone is centred on the marker.
+        self.approach_err_x_tol = float(approach_err_x_tol)
         self.auto_takeoff = bool(auto_takeoff)
 
         self._lock = threading.RLock()
@@ -952,13 +961,26 @@ class ScanAllMarkersMission:
                 if distance_m is None:
                     return
                 target_dist = obs.params.hover_distance_m
-                if abs(distance_m - target_dist) <= self.approach_tolerance_m \
-                        and abs(snap.get("err_x", 1)) < 0.15:
+                err_x_mag = abs(snap.get("err_x", 1))
+                skew_mag = abs(snap.get("skew", 1))
+                dist_ok = abs(distance_m - target_dist) <= self.approach_tolerance_m
+                x_ok    = err_x_mag <= self.approach_err_x_tol
+                skew_ok = skew_mag  <= self.approach_skew_tol
+                if dist_ok and x_ok and skew_ok:
                     state["phase"] = "HOVER"
                     state["hover_start"] = time.time()
-                    state["note"] = f"hovering on {target}"
+                    state["note"] = f"hovering on {target} (skew={skew_mag:.2f})"
                 else:
-                    state["note"] = f"approaching {target}: {distance_m:.2f} m → {target_dist:.2f} m"
+                    # Report the specific deficiency so the operator can tune
+                    missing = []
+                    if not dist_ok:
+                        missing.append(f"dist {distance_m:.2f}→{target_dist:.2f}m")
+                    if not x_ok:
+                        missing.append(f"|err_x|={err_x_mag:.2f}>{self.approach_err_x_tol}")
+                    if not skew_ok:
+                        missing.append(f"|skew|={skew_mag:.2f}>{self.approach_skew_tol} "
+                                       "(not perpendicular)")
+                    state["note"] = f"approaching {target}: " + "; ".join(missing)
                 return
 
             if phase == "HOVER":
@@ -1008,6 +1030,8 @@ class MissionManager:
     def start_scan_all(self, drone_ids: list[str], target_markers: list[int],
                        hover_seconds: float = 3.0,
                        approach_tolerance_m: float = 0.35,
+                       approach_skew_tol: float = 0.08,
+                       approach_err_x_tol: float = 0.15,
                        auto_takeoff: bool = False) -> tuple[bool, str]:
         with self._lock:
             if self._current is not None and self._current._active:
@@ -1016,6 +1040,8 @@ class MissionManager:
                 self.fleet, drone_ids, target_markers,
                 hover_seconds=hover_seconds,
                 approach_tolerance_m=approach_tolerance_m,
+                approach_skew_tol=approach_skew_tol,
+                approach_err_x_tol=approach_err_x_tol,
                 auto_takeoff=auto_takeoff,
             )
             ok = m.start()
