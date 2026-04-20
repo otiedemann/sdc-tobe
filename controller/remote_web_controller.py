@@ -1004,6 +1004,12 @@ HTML = """
             <input id=\"pos_latency\" type=\"range\" min=\"0\" max=\"800\" value=\"200\" style=\"width:90px;vertical-align:middle;\" />
             <span id=\"pos_latency_val\" style=\"font-size:11px;color:#94a3b8;\">200</span>
           </label>
+          <label title=\"0 = pure ArUco (vision only), 1 = pure IMU dead-reckoning. Higher = more IMU smoothing, less vision jitter.\" style=\"display:inline-flex;align-items:center;gap:4px;\">
+            <span style=\"font-size:11px;color:#94a3b8;\">ArUco</span>
+            <input id=\"pos_imu_weight\" type=\"range\" min=\"0\" max=\"100\" value=\"30\" style=\"width:110px;vertical-align:middle;accent-color:#06b6d4;\" />
+            <span style=\"font-size:11px;color:#94a3b8;\">IMU</span>
+            <span id=\"pos_imu_weight_val\" style=\"font-size:11px;color:#06b6d4;font-weight:bold;min-width:32px;\">30%</span>
+          </label>
         </div>
         <div style=\"display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:6px;padding:6px;background:#0f172a;border:1px solid #1e293b;border-radius:4px;\">
           <span class=\"small\" style=\"color:#64748b;min-width:70px;\">Filters:</span>
@@ -1949,6 +1955,8 @@ function arenaToCanvas(ax, ay) {
 }
 
 const WALL_COLOR = { front:'#6366f1', back:'#a855f7', left:'#06b6d4', right:'#10b981' };
+let _seenMarkers = new Set();   // IDs currently visible in the drone camera (as strings)
+let _refMarkers  = new Set();   // IDs actually used as world-frame refs this frame
 
 // Track last drawn position so arena config reload doesn't erase the dot
 let _lastPos = null, _lastCompPos = null, _lastDir = null, _lastFrameRes = null;
@@ -2017,6 +2025,8 @@ function drawArena(pos, compPos, dir) {
   ctx.textAlign = 'center'; ctx.fillText('RIGHT', 0, 0); ctx.restore();
 
   // Arena markers — colored square + bold ID pill placed away from the wall
+  // Currently-visible markers get a bright halo; markers used as refs get a
+  // brighter border; unseen markers are dimmed to ~40% for visual separation.
   ctx.font = 'bold 11px monospace';
   ctx.textBaseline = 'middle';
   for (const [id, m] of Object.entries(arenaMarkers)) {
@@ -2024,11 +2034,29 @@ function drawArena(pos, compPos, dir) {
     const [mx, my] = arenaToCanvas(m.pos[0], m.pos[1]);
     if (mx < PAD - 4 || mx > W - PAD + 4 || my < PAD - 4 || my > H - PAD + 4) continue;
 
+    const isSeen = _seenMarkers.has(String(id));
+    const isRef  = _refMarkers.has(String(id));
+    const baseColor = WALL_COLOR[m.wall] || '#94a3b8';
+    const dimColor  = baseColor + '66';   // 40% alpha appended as hex
+
+    // Halo behind seen markers so they visibly pulse against the arena
+    if (isSeen) {
+      ctx.beginPath();
+      ctx.arc(mx, my, 14, 0, Math.PI * 2);
+      ctx.fillStyle = (isRef ? 'rgba(34,197,94,0.28)' : 'rgba(251,191,36,0.28)');
+      ctx.fill();
+      ctx.beginPath();
+      ctx.arc(mx, my, 14, 0, Math.PI * 2);
+      ctx.strokeStyle = (isRef ? '#22c55e' : '#fbbf24');
+      ctx.lineWidth = 1.5; ctx.stroke();
+    }
+
     // Square marker (slightly larger + outlined for visibility)
-    const color = WALL_COLOR[m.wall] || '#94a3b8';
+    const color = isSeen ? baseColor : dimColor;
     ctx.fillStyle = color;
     ctx.fillRect(mx - 5, my - 5, 10, 10);
-    ctx.strokeStyle = 'rgba(15,23,42,0.9)'; ctx.lineWidth = 1;
+    ctx.strokeStyle = isSeen ? '#f8fafc' : 'rgba(15,23,42,0.9)';
+    ctx.lineWidth = isSeen ? 1.5 : 1;
     ctx.strokeRect(mx - 5.5, my - 5.5, 11, 11);
 
     // Position label pill on the side away from the wall (so ID doesn't collide with BACK/FRONT/LEFT/RIGHT)
@@ -2044,14 +2072,15 @@ function drawArena(pos, compPos, dir) {
     else if (wall === 'right') { labelX = mx - 9 - pillW / 2; labelY = my; }
     else                       { labelX = mx; labelY = my - 13; }
 
-    // Dark background pill for legibility
-    ctx.fillStyle = 'rgba(15,23,42,0.9)';
+    // Dark background pill for legibility — brighter for seen markers
+    ctx.fillStyle = isSeen ? 'rgba(15,23,42,0.95)' : 'rgba(15,23,42,0.55)';
     ctx.fillRect(labelX - pillW / 2, labelY - pillH / 2, pillW, pillH);
-    ctx.strokeStyle = color; ctx.lineWidth = 1;
+    ctx.strokeStyle = isSeen ? baseColor : (baseColor + '66');
+    ctx.lineWidth = isSeen ? 1.5 : 1;
     ctx.strokeRect(labelX - pillW / 2 + 0.5, labelY - pillH / 2 + 0.5, pillW - 1, pillH - 1);
 
-    // ID text — color-matched to wall for quick visual association
-    ctx.fillStyle = color;
+    // ID text — color-matched to wall; brighten for seen markers
+    ctx.fillStyle = isSeen ? '#ffffff' : (baseColor + '99');
     ctx.textAlign = 'center';
     ctx.fillText(idText, labelX, labelY + 0.5);
   }
@@ -2167,6 +2196,9 @@ function updatePosUI(d) {
   badge.style.color = !enabled ? '#64748b' : (pos && !d.stale && !dr) ? '#22c55e' : dr ? '#06b6d4' : '#f59e0b';
 
   if (d.frame_w && d.frame_h) _lastFrameRes = `${d.frame_w}x${d.frame_h}`;
+  // Stash visible + reference markers so drawArena can highlight them
+  _seenMarkers = new Set((d.seen_markers || []).map(String));
+  _refMarkers  = new Set((d.ref_markers  || []).map(String));
   if (pos) console.log('[POS] drawArena pos=', pos, 'compPos=', compPos, 'frame=', _lastFrameRes);
   drawArena(pos, compPos, dir);
 }
@@ -2190,6 +2222,11 @@ async function loadPosConfig() {
     document.getElementById('pos_enabled').checked = !!c.enabled;
     if (c.detect_profile) document.getElementById('pos_profile').value = c.detect_profile;
     if (c.fov_deg) document.getElementById('pos_fov').value = c.fov_deg;
+    if (typeof c.imu_weight === 'number') {
+      const pct = Math.round(c.imu_weight * 100);
+      document.getElementById('pos_imu_weight').value = pct;
+      document.getElementById('pos_imu_weight_val').textContent = pct + '%';
+    }
     const latMs = (c.latency_ms != null) ? c.latency_ms
                   : (c.latency_comp_s != null ? Math.round(c.latency_comp_s * 1000) : null);
     if (latMs != null) {
@@ -2257,6 +2294,17 @@ document.getElementById('pos_enabled').onchange = async function() {
 
 document.getElementById('pos_latency').oninput = function() {
   document.getElementById('pos_latency_val').textContent = this.value;
+};
+
+// IMU blend slider — debounced write-through so dragging doesn't spam
+let _imuWeightTimer = null;
+document.getElementById('pos_imu_weight').oninput = function() {
+  document.getElementById('pos_imu_weight_val').textContent = this.value + '%';
+  if (_imuWeightTimer) clearTimeout(_imuWeightTimer);
+  const v = parseFloat(this.value) / 100;
+  _imuWeightTimer = setTimeout(() => {
+    post('/proxy/position/config', { imu_weight: v });
+  }, 150);
 };
 
 document.getElementById('pos_cfg_save').onclick = async () => {
