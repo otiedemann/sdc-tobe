@@ -54,7 +54,11 @@ SETTLE_TIME_S = 3.0           # time to wait after takeoff before scanning
 ALTITUDE_TOLERANCE_M = 0.3    # acceptable altitude error
 WALL_SAFE_DISTANCE_M = 1.2   # hard minimum distance from any wall
 WALL_BRAKE_DISTANCE_M = 2.5  # start braking when this close to a wall
-MARKER_SIZE_M = 0.18          # physical marker size (18×18 cm)
+MARKER_SIZE_M = 0.5           # physical marker size in meters (SDC arena: 0.5m = 50×50cm)
+MARKER_SIZE_CALIB_M = 0.18    # marker size the CALIB_A/CALIB_B power-law was fit for
+                              # — DO NOT change unless you refit the calibration curve.
+                              # Distances for differently-sized markers are auto-scaled
+                              # by (MARKER_SIZE_M / MARKER_SIZE_CALIB_M) ** CALIB_B.
 
 # ─── HOVER controller tuning ────────────────────────────────────────────────
 # These set how "twitchy" vs "soft" the in-front-of-marker hold is.
@@ -85,20 +89,33 @@ HOVER_D_UD            = 0.50   # RC% per cm/s vertical velocity
 HOVER_D_YAW           = 0.40   # RC% per deg/s yaw rate
 HOVER_VEL_MAX_AGE_S   = 1.0    # ignore IMU velocity older than this
 
-# ─── Calibration curve for 18cm ArUco markers ───────────────────────────────
+# ─── Calibration curve (originally fit for 18cm markers) ────────────────────
 # Power-law fit from Distanzkalibrierung (calibration chart):
 #   distance = CALIB_A * pixel_size ^ (-CALIB_B)
 #   distance = 109.1653 * (1/pixel)^0.8973
 #            = 109.1653 * pixel^(-0.8973)
-CALIB_A = 109.1653           # coefficient
+#
+# This was fit with an 18cm marker. For a marker of different physical size S,
+# the same pixel reading corresponds to a distance scaled by (S / 0.18) ** CALIB_B,
+# because pixel_size ∝ physical_size / distance at fixed focal length. We apply
+# that scaling automatically below — so you only need to set MARKER_SIZE_M.
+CALIB_A = 109.1653           # coefficient (calibrated at MARKER_SIZE_CALIB_M)
 CALIB_B = 0.8973             # exponent
 
 
-def pixel_distance_estimate(avg_pixel_size: float) -> float:
-    """Estimate distance (m) from marker pixel size using calibration curve."""
+def pixel_distance_estimate(avg_pixel_size: float, marker_size_m: float = None) -> float:
+    """Estimate distance (m) from marker pixel size using calibration curve.
+
+    The calibration was fit with an 18cm marker. For any other marker size we
+    scale the result by (marker_size_m / MARKER_SIZE_CALIB_M) ** CALIB_B so the
+    same power-law holds. Pass `marker_size_m` explicitly to override the
+    module-level MARKER_SIZE_M at call time (useful for per-drone overrides).
+    """
     if avg_pixel_size <= 0:
         return float("inf")
-    return CALIB_A * avg_pixel_size ** (-CALIB_B)
+    s = MARKER_SIZE_M if marker_size_m is None else float(marker_size_m)
+    scale = (s / MARKER_SIZE_CALIB_M) ** CALIB_B
+    return CALIB_A * scale * avg_pixel_size ** (-CALIB_B)
 
 
 def edge_boost(err: float, threshold: float = 0.6) -> float:
@@ -1738,6 +1755,11 @@ Safety:
         help=f"Distance to hover in front of marker (default: {HOVER_DISTANCE_M}m)",
     )
     parser.add_argument(
+        "--marker-size", type=float, default=MARKER_SIZE_M,
+        help=(f"Physical marker size in meters (default: {MARKER_SIZE_M}m = "
+              f"{MARKER_SIZE_M*100:.0f}cm). Distance calibration auto-scales."),
+    )
+    parser.add_argument(
         "--takeoff-height", type=float, default=TAKEOFF_HEIGHT_M,
         help=f"Takeoff/scan altitude (default: {TAKEOFF_HEIGHT_M}m)",
     )
@@ -1777,6 +1799,13 @@ Safety:
     )
 
     args = parser.parse_args()
+
+    # Apply marker-size override so pixel_distance_estimate uses the right scale
+    if args.marker_size is not None and abs(args.marker_size - MARKER_SIZE_M) > 1e-6:
+        globals()["MARKER_SIZE_M"] = float(args.marker_size)
+        log(f"  Marker size override: {MARKER_SIZE_M*100:.1f}cm "
+            f"(distance scale = (S/{MARKER_SIZE_CALIB_M})^{CALIB_B} "
+            f"= {(MARKER_SIZE_M/MARKER_SIZE_CALIB_M)**CALIB_B:.3f})")
 
     # Install signal handler for clean abort
     signal.signal(signal.SIGINT, _signal_handler)

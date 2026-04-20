@@ -577,6 +577,7 @@ HTML = """
       ['fb_back_max',     'Clamp · backward max',        0, 30, 1, 4],
       ['rc_min',          'RC dead-floor',               0, 10, 1, 4],
       ['cam_hfov_deg',    'Cam HFOV (drawing only)',    30,110, 1, 5],
+      ['marker_size_m',   'Marker physical size (m)',    0.05, 2.0, 0.01, 5],
     ];
     let arcParams = {};
     let arcAllowLive = false;

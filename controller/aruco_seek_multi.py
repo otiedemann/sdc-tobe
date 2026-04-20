@@ -72,6 +72,9 @@ class HoverParams:
     hover_distance_m: float = ASEEK.HOVER_DISTANCE_M
     # Camera HFOV — drawing-only
     cam_hfov_deg: float    = 69.0
+    # Physical marker size in meters — drives distance estimation.
+    # Distance scale auto-adjusts via (marker_size_m / MARKER_SIZE_CALIB_M) ** CALIB_B.
+    marker_size_m: float   = ASEEK.MARKER_SIZE_M
 
 
 def _clamp_int(v: float, lo: int, hi: int) -> int:
@@ -378,7 +381,7 @@ class DroneObserver:
         # Camera measurements
         raw_err_x = (cx - fw / 2.0) / (fw / 2.0)
         raw_err_y = (cy - fh / 2.0) / (fh / 2.0)
-        raw_dist  = pixel_distance_estimate(px_size)
+        raw_dist  = pixel_distance_estimate(px_size, marker_size_m=p.marker_size_m)
         raw_skew  = marker_skew(left_len, right_len) if (left_len + right_len) > 0 else 0.0
 
         # EMA
