@@ -359,6 +359,7 @@ HTML = """
         <button id=\"arc_mode_live\" data-mode=\"live\">LIVE</button>
       </span>
       <span id=\"arc_mode_gate\" style=\"font-size:11px;color:#fbbf24;display:none;\">LIVE disabled (REMOTE_NO_LIVE=1)</span>
+      <span id=\"arc_mode_err\" style=\"display:none;margin-left:10px;padding:4px 10px;font-size:11px;background:#7f1d1d;color:#fecaca;border:1px solid #ef4444;border-radius:4px;font-weight:600;\"></span>
       <span id=\"arc_manual\" class=\"arc-manual\">
         <button id=\"arc_takeoff\" style=\"background:#065f46;border-color:#10b981;\">&uarr; Takeoff</button>
         <button id=\"arc_land\">&darr; Land</button>
@@ -422,6 +423,8 @@ HTML = """
       <button id=\"mis_start\" style=\"background:#065f46;border-color:#10b981;\">&#9654; Start mission</button>
       <button id=\"mis_stop\" style=\"background:#7f1d1d;border-color:#ef4444;\">&#9632; Stop</button>
       <button id=\"mis_stop_land\" style=\"background:#7f1d1d;border-color:#ef4444;\">&#9632; Stop + Land</button>
+      <span id=\"mis_err\" style=\"display:none;margin-left:10px;padding:4px 10px;font-size:11px;background:#7f1d1d;color:#fecaca;border:1px solid #ef4444;border-radius:4px;font-weight:600;\"></span>
+      <span id=\"mis_ok\"  style=\"display:none;margin-left:10px;padding:4px 10px;font-size:11px;background:#064e3b;color:#a7f3d0;border:1px solid #22c55e;border-radius:4px;font-weight:600;\"></span>
       <span id=\"mis_progress\" style=\"margin-left:12px;color:#38bdf8;font-weight:600;\">—</span>
     </div>
 
@@ -798,22 +801,35 @@ HTML = """
     };
     document.getElementById('arc_reload').onclick = arcLoadParams;
 
+    function arcShowModeErr(msg) {
+      const el = document.getElementById('arc_mode_err');
+      if (!el) return;
+      el.textContent = '✗ ' + msg;
+      el.style.display = 'inline';
+      // Clear after 8s so stale errors don't persist forever
+      clearTimeout(arcShowModeErr._t);
+      arcShowModeErr._t = setTimeout(() => { el.style.display = 'none'; }, 8000);
+    }
     async function arcSetMode(mode) {
       console.log('[arc] set-mode request:', mode);
+      // Clear previous error
+      document.getElementById('arc_mode_err').style.display = 'none';
       try {
         const r = await fetch('/proxy/aruco/mode', {method:'POST',
           headers:{'Content-Type':'application/json'},
           body: JSON.stringify({mode})});
-        const j = await r.json();
+        let j;
+        try { j = await r.json(); } catch { j = {}; }
         console.log('[arc] set-mode response:', r.status, j);
         if (!r.ok || !j.ok) {
-          alert('Mode change refused (' + r.status + '): ' + (j.error || r.statusText || 'unknown'));
+          const msg = (j.error || j.message || r.statusText || 'unknown') + ' (HTTP ' + r.status + ')';
+          arcShowModeErr(msg);
           return;
         }
         arcApplyModeUI(j.mode || mode, arcAllowLive);
       } catch (err) {
         console.error('[arc] set-mode failed:', err);
-        alert('Mode change failed: ' + err);
+        arcShowModeErr('network error: ' + err);
       }
     }
     document.getElementById('arc_mode_observe').onclick = () => arcSetMode('observe');
@@ -960,31 +976,38 @@ HTML = """
       if (!confirm(warn)) return;
       const btn = document.getElementById('mis_start');
       const origLabel = btn.textContent;
+      const misErr = document.getElementById('mis_err');
+      const misOk  = document.getElementById('mis_ok');
+      if (misErr) misErr.style.display = 'none';
+      if (misOk)  misOk.style.display  = 'none';
       btn.disabled = true; btn.textContent = '… starting';
-      let j = {};
+      let j = {}; let httpStatus = 0;
       try {
         const r = await fetch('/proxy/missions/scan_all/start', {method:'POST',
           headers:{'Content-Type':'application/json'},
           body: JSON.stringify(payload)});
-        j = await r.json();
+        httpStatus = r.status;
+        try { j = await r.json(); } catch { j = {}; }
       } catch (err) {
-        alert('Mission start failed: ' + err);
+        j = { ok: false, error: 'network error: ' + err };
       } finally {
         btn.disabled = false; btn.textContent = origLabel;
       }
+      console.log('[mission] start response:', httpStatus, j);
       if (!j.ok) {
-        alert('Mission start refused: ' + (j.error || j.message || 'unknown error'));
+        const msg = (j.error || j.message || 'unknown error') + (httpStatus ? ' (HTTP ' + httpStatus + ')' : '');
+        if (misErr) {
+          misErr.textContent = '✗ Mission start refused: ' + msg;
+          misErr.style.display = 'inline-block';
+        }
       } else {
-        // Visible "started" feedback — warning text from the server is attached
-        // to j.status.error (e.g. takeoff errors that didn't abort)
         const msg = j.message || 'mission started';
-        const warn = j.status && j.status.error ? '\\n\\nWarning: ' + j.status.error : '';
+        const warn = j.status && j.status.error ? ' — warning: ' + j.status.error : '';
         console.log('[mission] started:', msg, warn);
-        // Briefly flash a toast via the status readout
-        const se = document.getElementById('mis_start');
-        se.style.boxShadow = '0 0 0 2px #22c55e';
-        setTimeout(() => { se.style.boxShadow = ''; }, 1500);
-        if (warn) alert(msg + warn);
+        if (misOk) {
+          misOk.textContent = '✓ ' + msg + warn;
+          misOk.style.display = 'inline-block';
+        }
       }
       misPoll();
     };
