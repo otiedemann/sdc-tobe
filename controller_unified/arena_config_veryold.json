@@ -20,7 +20,7 @@
     {
       "id": 2,
       "label": "Front Left high",
-      "x": -5.0,
+      "x": -6.666,
       "y": 0.0,
       "z": 4.0,
       "wall": "front"
@@ -28,7 +28,7 @@
     {
       "id": 10,
       "label": "Front Left low",
-      "x": -5.0,
+      "x": -6.666,
       "y": 0.0,
       "z": 2.0,
       "wall": "front"
@@ -52,7 +52,7 @@
     {
       "id": 4,
       "label": "Front Right high",
-      "x": 5.0,
+      "x": 6.666,
       "y": 0.0,
       "z": 4.0,
       "wall": "front"
@@ -60,7 +60,7 @@
     {
       "id": 12,
       "label": "Front Right low",
-      "x": 5.0,
+      "x": 6.666,
       "y": 0.0,
       "z": 2.0,
       "wall": "front"
@@ -84,7 +84,7 @@
     {
       "id": 6,
       "label": "Back Right high",
-      "x": 5.0,
+      "x": 6.666,
       "y": 10.8,
       "z": 4.0,
       "wall": "back"
@@ -92,7 +92,7 @@
     {
       "id": 14,
       "label": "Back Right low",
-      "x": 5.0,
+      "x": 6.666,
       "y": 10.8,
       "z": 2.0,
       "wall": "back"
@@ -116,7 +116,7 @@
     {
       "id": 8,
       "label": "Back Left B high",
-      "x": -5.0,
+      "x": -6.666,
       "y": 10.8,
       "z": 4.0,
       "wall": "back"
@@ -124,7 +124,7 @@
     {
       "id": 16,
       "label": "Back Left B low",
-      "x": -5.0,
+      "x": -6.666,
       "y": 10.8,
       "z": 2.0,
       "wall": "back"
