@@ -202,6 +202,7 @@ HTML = """
   <h2>Drone Remote Controller</h2>
   <div style=\"display:flex;align-items:center;gap:8px;\">
     <div class=\"drone-bar\" id=\"drone_bar\" style=\"flex:1;\"></div>
+    <button id=\"land_all_btn\" style=\"padding:6px 14px;font-size:13px;font-weight:700;background:#7f1d1d;border-color:#ef4444;color:#fee2e2;letter-spacing:0.4px;\" title=\"Land every drone in the fleet safely. Keyboard shortcut: Q\">&#11088; LAND ALL (Q)</button>
     <button id=\"edit_drones_btn\" style=\"padding:4px 12px;font-size:12px;background:#1e3a5f;border-color:#3b82f6;\" title=\"Edit drone fleet config\">Config</button>
   </div>
   <div id=\"drone_config_modal\" style=\"display:none;position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,0.7);z-index:1000;justify-content:center;align-items:center;\">
@@ -898,7 +899,7 @@ HTML = """
     arcPoll();
     // Version marker — if this string doesn't appear in the DOM,
     // you're running stale JS (restart the Python server or hard-refresh).
-    const BUILD = 'af-perpendicular-align';
+    const BUILD = 'ag-land-all-q';
     console.log('[arc] init complete, build=' + BUILD);
     const ver = document.createElement('span');
     ver.id = 'arc_build_tag';
@@ -1484,11 +1485,77 @@ function _isTyping() {
 window.addEventListener('keydown', (e)=>{
   if (_isTyping()) return;
   const k = e.key.toLowerCase();
+  // ── Global panic-button: 'q' lands EVERY drone in the fleet ────────
+  // Intentionally not in the movement keymap so we don't accidentally
+  // eat it during normal flight. Runs regardless of active-drone focus.
+  if (k === 'q') {
+    e.preventDefault();
+    if (window._landAllInFlight) return;    // debounce
+    window._landAllInFlight = true;
+    console.log('[LAND_ALL] Q pressed — landing every drone');
+    landAllDrones('Q hotkey').finally(() => { window._landAllInFlight = false; });
+    return;
+  }
   if (map.has(k)) {
     e.preventDefault();
     pressKey(k === ' ' ? 'space' : k);
   }
 });
+
+// Button wiring for the top-of-page LAND ALL button
+(function(){
+  const b = document.getElementById('land_all_btn');
+  if (!b) return;
+  b.addEventListener('click', () => {
+    if (window._landAllInFlight) return;
+    window._landAllInFlight = true;
+    console.log('[LAND_ALL] button clicked');
+    landAllDrones('button').finally(() => { window._landAllInFlight = false; });
+  });
+})();
+
+// Fleet-wide panic land — used by the 'q' hotkey and the big red
+// LAND ALL button. Shows a banner with per-drone results.
+async function landAllDrones(trigger) {
+  // Visible flash so the operator knows the hotkey fired even before the
+  // server responds — critical for a panic button.
+  showLandAllBanner('⚠ LANDING ALL DRONES (' + trigger + ')…', '#78350f', '#fde68a');
+  try {
+    const r = await fetch('/proxy/land_all', {method:'POST'});
+    const j = await r.json();
+    const summary = (j.landed || 0) + '/' + (j.total || 0) +
+                    ' acknowledged land' +
+                    (j.mission_stopped ? ' (mission stopped)' : '');
+    const color = (j.landed === j.total) ? '#064e3b' : '#7f1d1d';
+    const txt   = (j.landed === j.total) ? '#a7f3d0' : '#fecaca';
+    showLandAllBanner('✓ LAND ALL → ' + summary, color, txt, 6000);
+    console.log('[LAND_ALL] result:', j);
+  } catch (err) {
+    showLandAllBanner('✗ LAND ALL failed: ' + err, '#7f1d1d', '#fecaca', 6000);
+    console.error('[LAND_ALL]', err);
+  }
+}
+
+function showLandAllBanner(msg, bg, fg, autohideMs) {
+  let el = document.getElementById('land_all_banner');
+  if (!el) {
+    el = document.createElement('div');
+    el.id = 'land_all_banner';
+    el.style.cssText = 'position:fixed;top:8px;left:50%;transform:translateX(-50%);' +
+                       'z-index:9999;padding:10px 18px;border-radius:6px;' +
+                       'font-weight:700;font-size:14px;box-shadow:0 4px 14px rgba(0,0,0,0.5);' +
+                       'border:2px solid rgba(255,255,255,0.15);letter-spacing:0.4px;';
+    document.body.appendChild(el);
+  }
+  el.style.background = bg;
+  el.style.color = fg;
+  el.textContent = msg;
+  el.style.display = 'block';
+  clearTimeout(showLandAllBanner._t);
+  if (autohideMs) {
+    showLandAllBanner._t = setTimeout(() => { el.style.display = 'none'; }, autohideMs);
+  }
+}
 window.addEventListener('keyup', (e)=>{
   if (_isTyping()) { releaseAllKeys(); return; }
   const k = e.key.toLowerCase();
@@ -3045,6 +3112,70 @@ def proxy_land():
     log_command("land")
     r = pi_post("/api/land")
     return (r.text, r.status_code, {"Content-Type": r.headers.get("Content-Type", "application/json")})
+
+
+@app.post("/proxy/land_all")
+def proxy_land_all():
+    """Emergency panic-button: land every configured drone and halt any
+    running mission. Used by the 'q' hotkey in the UI. Tolerates
+    individual drones being unreachable — collects per-drone outcomes
+    and always returns 200 so the client can render the summary."""
+    log_command("land_all")
+
+    # 1) Stop any running mission first so its LIVE-mode state machine
+    #    doesn't immediately re-push RC commands that conflict with land.
+    mission_stopped = False
+    try:
+        if mission_manager is not None and mission_manager.current is not None:
+            mission_stopped = mission_manager.stop(land=False)
+    except Exception as e:
+        print(f"[LAND_ALL] mission stop failed: {e}")
+
+    # 2) Send /api/land to every configured drone in parallel-ish
+    #    (sequentially but with a short timeout per drone).
+    results: dict[str, dict] = {}
+    for did, info in DRONES.items():
+        base = (info or {}).get("base")
+        if not base:
+            results[str(did)] = {"ok": False, "error": "no base url"}
+            continue
+        try:
+            resp = _http_session.post(f"{base.rstrip('/')}/api/land",
+                                      json={}, timeout=3.0)
+            try:
+                j = resp.json()
+            except Exception:
+                j = {"raw": resp.text[:120]}
+            results[str(did)] = {
+                "ok": bool(j.get("ok", resp.status_code == 200)),
+                "status": resp.status_code,
+                "msg": j.get("msg") or j.get("error") or "",
+            }
+        except Exception as e:
+            results[str(did)] = {"ok": False, "error": str(e)[:120]}
+
+    # 3) Also put every ArUco observer back into OBSERVE mode and clear
+    #    any lingering search RC so the drones don't fight the land.
+    try:
+        for did, obs in aruco_fleet._obs.items():
+            try:
+                obs.set_search_rc(0, 0, 0, 0)
+                obs.set_mode("observe")
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    ok_count = sum(1 for v in results.values() if v.get("ok"))
+    print(f"[LAND_ALL] {ok_count}/{len(results)} drones acknowledged land "
+          f"(mission_stopped={mission_stopped})")
+    return jsonify(
+        ok=True,
+        landed=ok_count,
+        total=len(results),
+        mission_stopped=mission_stopped,
+        results=results,
+    )
 
 
 @app.post("/proxy/flip")
