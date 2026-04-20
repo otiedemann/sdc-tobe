@@ -1,0 +1,85 @@
+{
+  "marker_size_m": 0.18,
+  "markers": [
+    {
+      "id": 1,
+      "label": "Left A high",
+      "x": -2.0,
+      "y": 0.0,
+      "z": 2.0,
+      "wall": "front"
+    },
+    {
+      "id": 3,
+      "label": "Left A low",
+      "x": -2.0,
+      "y": 0.0,
+      "z": 1.0,
+      "wall": "front"
+    },
+    {
+      "id": 2,
+      "label": "Middle high",
+      "x": 0.0,
+      "y": 0.0,
+      "z": 2.0,
+      "wall": "front"
+    },
+    {
+      "id": 4,
+      "label": "Middle low",
+      "x": 0.0,
+      "y": 0.0,
+      "z": 1.0,
+      "wall": "front"
+    },
+    {
+      "id": 5,
+      "label": "Right A high",
+      "x": 2.0,
+      "y": 0.0,
+      "z": 2.0,
+      "wall": "front"
+    },
+    {
+      "id": 6,
+      "label": "Right A low",
+      "x": 2.0,
+      "y": 0.0,
+      "z": 1.0,
+      "wall": "front"
+    },
+    {
+      "id": 9,
+      "label": " A high",
+      "x": -2.7,
+      "y": 1.0,
+      "z": 2.0,
+      "wall": "left"
+    },
+    {
+      "id": 10,
+      "label": "A low",
+      "x": -2.7,
+      "y": 1.0,
+      "z": 1.0,
+      "wall": "left"
+    },
+    {
+      "id": 7,
+      "label": "Right B high",
+      "x": 2.7,
+      "y": 1.0,
+      "z": 2.0,
+      "wall": "right"
+    },
+    {
+      "id": 8,
+      "label": "Right B low",
+      "x": 10.0,
+      "y": 1.0,
+      "z": 1.0,
+      "wall": "right"
+    }
+  ]
+}
