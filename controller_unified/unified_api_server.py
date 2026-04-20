@@ -83,6 +83,24 @@ if HAS_OLYMPE_SDK:
         HAS_EMERGENCY = True
     except (ImportError, KeyError):
         pass
+    # Diagnostics: why did the Anafi refuse takeoff?
+    # AlertStateChanged: low_battery/too_much_angle/magneto_*/motor_error/etc.
+    # MotorErrorStateChanged: which motor failed and why.
+    try:
+        from olympe.messages.ardrone3.PilotingState import AlertStateChanged
+        HAS_ALERT_STATE = True
+    except (ImportError, KeyError):
+        HAS_ALERT_STATE = False
+    try:
+        from olympe.messages.ardrone3.SettingsState import MotorErrorStateChanged
+        HAS_MOTOR_ERROR = True
+    except (ImportError, KeyError):
+        HAS_MOTOR_ERROR = False
+    try:
+        from olympe.messages.common.CommonState import SensorsStatesListChanged
+        HAS_SENSOR_STATE = True
+    except (ImportError, KeyError):
+        HAS_SENSOR_STATE = False
     try:
         from olympe.messages.camera import start_recording, stop_recording, take_photo
         HAS_CAMERA = True
@@ -1436,6 +1454,17 @@ class OlympeBackend(DroneBackend):
         fs = self._get_state(FlyingStateChanged)
         print(f"[ANAFI] /api/takeoff — flying={flying}, state={fs}")
 
+        # Pre-takeoff diagnostics: log any active alerts so we know why if it refuses
+        pre_alert = self._read_alert_state()
+        pre_motor = self._read_motor_error_state()
+        pre_sensors = self._read_sensors_state()
+        if pre_alert and pre_alert != "none":
+            print(f"[ANAFI] Pre-takeoff ALERT state: {pre_alert}")
+        if pre_motor:
+            print(f"[ANAFI] Pre-takeoff MOTOR state: {pre_motor}")
+        if pre_sensors:
+            print(f"[ANAFI] Pre-takeoff SENSORS: {pre_sensors}")
+
         self._stop_piloting()
         time.sleep(0.2)
         print("[ANAFI] Sending TakeOff command...")
@@ -1460,7 +1489,75 @@ class OlympeBackend(DroneBackend):
                 self._start_piloting()
                 return True, "ok_polled"
         self._start_piloting()
-        return False, "takeoff_failed"
+
+        # Post-failure diagnostics: read alert/motor/sensor state again in case it changed
+        post_alert = self._read_alert_state()
+        post_motor = self._read_motor_error_state()
+        reason_parts = []
+        if post_alert and post_alert != "none":
+            reason_parts.append(f"alert={post_alert}")
+        if post_motor:
+            reason_parts.append(f"motor={post_motor}")
+        reason = "takeoff_failed" + (f" ({', '.join(reason_parts)})" if reason_parts else "")
+        print(f"[ANAFI] takeoff refused — {reason}")
+        return False, reason
+
+    def _read_alert_state(self):
+        """Return the current AlertStateChanged value as a string, or None."""
+        if not HAS_ALERT_STATE:
+            return None
+        try:
+            s = self._get_state(AlertStateChanged)
+            if s is None:
+                return None
+            # Olympe returns an OrderedDict like {'state': <AlertStateChanged_State.low_battery: 3>}
+            v = s.get("state") if hasattr(s, "get") else s
+            if v is None:
+                return None
+            # Extract the enum's name
+            name = getattr(v, "name", None) or str(v)
+            return name
+        except Exception as e:
+            return f"<err:{e}>"
+
+    def _read_motor_error_state(self):
+        """Return the motor error code if any, else None."""
+        if not HAS_MOTOR_ERROR:
+            return None
+        try:
+            s = self._get_state(MotorErrorStateChanged)
+            if s is None:
+                return None
+            # {'motorIds': 0, 'motorError': <MotorError.noError: 0>}
+            err = s.get("motorError") if hasattr(s, "get") else None
+            ids = s.get("motorIds") if hasattr(s, "get") else None
+            if err is None:
+                return None
+            name = getattr(err, "name", None) or str(err)
+            if name in ("noError", "noerror"):
+                return None
+            return f"{name} (motor_mask={ids})"
+        except Exception as e:
+            return f"<err:{e}>"
+
+    def _read_sensors_state(self):
+        """Return a concise string of which sensors report KO, or None."""
+        if not HAS_SENSOR_STATE:
+            return None
+        try:
+            s = self._get_state(SensorsStatesListChanged)
+            if s is None:
+                return None
+            # state is OrderedDict with 'sensorName' -> enum, 'sensorState' -> int (1=OK, 0=KO)
+            name_enum = s.get("sensorName") if hasattr(s, "get") else None
+            state_val = s.get("sensorState") if hasattr(s, "get") else None
+            if name_enum is None:
+                return None
+            name = getattr(name_enum, "name", None) or str(name_enum)
+            ok = (state_val == 1)
+            return None if ok else f"{name}=KO"
+        except Exception as e:
+            return f"<err:{e}>"
 
     def land(self) -> Tuple[bool, str]:
         d = self._d()
