@@ -113,6 +113,10 @@ class DroneObserver:
 
         self.mode: str = "observe"       # "observe" | "live"
         self.allow_live = bool(allow_live)
+        # Search RC — commands the drone sends when in LIVE mode but not
+        # actively tracking a marker (e.g. mission SEARCH maneuver).
+        # Tuple: (lr, fb, ud, yaw) in RC units -100..100. Mission controls this.
+        self._search_rc: tuple = (0, 0, 0, 0)
         # IMPORTANT: include mode + allow_live in the initial state so the
         # client's /proxy/aruco/state poll can enable the LIVE button BEFORE
         # the observer is started. Without these keys the UI stays in
@@ -203,6 +207,15 @@ class DroneObserver:
             self.target_id = mid
             self._chosen_id = None
             self._fx = self._fy = self._fs = self._fd = None
+
+    def set_search_rc(self, lr: int = 0, fb: int = 0, ud: int = 0, yaw: int = 0):
+        """Set the RC commands the drone sends while in LIVE mode with no
+        tracked marker. Used by the mission's SEARCH phase to rotate or
+        move the drone while hunting for the next target. Zero tuple
+        disables the search maneuver (drone just hovers in place)."""
+        with self._lock:
+            self._search_rc = (_clamp_rc(lr), _clamp_rc(fb),
+                               _clamp_rc(ud), _clamp_rc(yaw))
 
     def set_mode(self, mode: str) -> str:
         mode = (mode or "").lower()
@@ -361,6 +374,20 @@ class DroneObserver:
                 except Exception:
                     pass
                 self._chosen_id = None
+            # Apply search RC (mission-driven rotation/translation) if set
+            with self._lock:
+                src = self._search_rc
+            if self.mode == "live" and any(v != 0 for v in src):
+                try:
+                    self._send_rc(*src)
+                    snapshot["rc_sent_at"] = round(t_now, 2)
+                    snapshot["search_rc"] = list(src)
+                    snapshot["status_msg"] = (
+                        f"searching — rc(lr={src[0]}, fb={src[1]}, "
+                        f"ud={src[2]}, yaw={src[3]})"
+                    )
+                except Exception:
+                    pass
             with self._lock:
                 self.latest = snapshot
             return
@@ -372,6 +399,20 @@ class DroneObserver:
         else:
             snapshot["marker_id"] = None
             snapshot["status_msg"] = f"target marker {target_id} not visible"
+            # Apply search RC even when an irrelevant marker IS visible
+            with self._lock:
+                src = self._search_rc
+            if self.mode == "live" and any(v != 0 for v in src):
+                try:
+                    self._send_rc(*src)
+                    snapshot["rc_sent_at"] = round(t_now, 2)
+                    snapshot["search_rc"] = list(src)
+                    snapshot["status_msg"] = (
+                        f"searching (target {target_id} not in sight) — "
+                        f"rc(lr={src[0]}, fb={src[1]}, ud={src[2]}, yaw={src[3]})"
+                    )
+                except Exception:
+                    pass
             with self._lock:
                 self.latest = snapshot
             return
@@ -562,6 +603,16 @@ class ScanAllMarkersMission:
     """
 
     TICK_S = 0.5
+    # Search-maneuver tuning (used when a drone is in SEARCH but no target
+    # marker is visible). The observer's _tick runs at ~5 Hz; we push a fresh
+    # search RC each mission tick and the observer forwards it each frame.
+    SEARCH_IDLE_BEFORE_MOVE_S = 2.0   # hover this long before starting search RC
+    SEARCH_ROTATE_YAW_RC = 25         # RC yaw magnitude during rotation (≈ 37°/s)
+    SEARCH_ROTATION_TIME_S = 12.0     # one full 360° at the above rate
+    SEARCH_CENTER_XY = (0.0, 5.4)     # arena center (SDC field 20×10.8)
+    SEARCH_CENTER_TOL_M = 0.8         # "close enough to centre" threshold
+    SEARCH_CENTER_SPEED_RC = 8        # slow translate speed toward centre
+    SEARCH_MAX_CYCLES = 3             # rotate+centre attempts before error
 
     def __init__(
         self,
@@ -616,6 +667,10 @@ class ScanAllMarkersMission:
                     "hover_start": None,
                     "last_marker_id": None,
                     "note": "",
+                    # Search maneuver state
+                    "search_sub": "idle",     # idle | rotate | center | error
+                    "search_sub_start": None, # wall-clock when sub-phase began
+                    "search_cycles": 0,       # how many rotate+center cycles done
                 }
                 for did in self.drone_ids
             }
@@ -671,6 +726,10 @@ class ScanAllMarkersMission:
                 obs = self.fleet.get(did)
                 if obs is None:
                     continue
+                try:
+                    obs.set_search_rc(0, 0, 0, 0)   # cancel any active search maneuver
+                except Exception:
+                    pass
                 try:
                     obs.set_mode("observe")     # this also pushes RC-stop
                 except Exception:
@@ -779,30 +838,114 @@ class ScanAllMarkersMission:
                         chosen = min(available)
                     self.claimed[did] = chosen
                     obs.set_target(chosen)
+                    obs.set_search_rc(0, 0, 0, 0)   # stop the search maneuver
                     state["phase"] = "APPROACH"
                     state["target"] = chosen
                     state["hover_start"] = None
+                    state["search_sub"] = "idle"
+                    state["search_sub_start"] = None
                     state["note"] = f"approaching marker {chosen}"
-                else:
-                    # No free marker visible — hover in place (observer sends 0-RC
-                    # when no marker is picked, so the drone stays put).
-                    obs.set_target(None)
+                    return
+
+                # No free target marker visible — run the search maneuver.
+                # Observer's set_target(None) keeps it in "pick-largest" mode;
+                # we drive the search RC through it. A step-function state
+                # machine: idle → rotate → center → rotate → center → error
+                obs.set_target(None)
+
+                sub = state.get("search_sub", "idle")
+                sub_start = state.get("search_sub_start")
+                idle_since = state.get("hover_start") or now
+
+                if sub == "idle":
+                    # Quick grace period — maybe a marker pops in within 2s.
+                    if state.get("hover_start") is None:
+                        state["hover_start"] = now
+                        state["note"] = "searching — waiting for markers"
+                    elif (now - state["hover_start"]) >= self.SEARCH_IDLE_BEFORE_MOVE_S:
+                        state["search_sub"] = "rotate"
+                        state["search_sub_start"] = now
+                        state["note"] = "rotating to scan 360°"
+                    obs.set_search_rc(0, 0, 0, 0)
+                elif sub == "rotate":
+                    # Slow yaw rotation for a full 360°
+                    if sub_start is None:
+                        state["search_sub_start"] = now
+                        sub_start = now
+                    obs.set_search_rc(0, 0, 0, self.SEARCH_ROTATE_YAW_RC)
+                    elapsed = now - sub_start
                     state["note"] = (
-                        "waiting — marker claimed by another drone"
-                        if any(m in visible and m in self.claimed.values() for m in visible)
-                        else "searching — no target markers visible"
+                        f"rotating {elapsed:.1f}/{self.SEARCH_ROTATION_TIME_S:.0f}s — "
+                        f"no unclaimed targets visible"
                     )
+                    if elapsed >= self.SEARCH_ROTATION_TIME_S:
+                        # Didn't find anything in 360° → move to arena centre
+                        state["search_sub"] = "center"
+                        state["search_sub_start"] = now
+                        state["search_cycles"] = state.get("search_cycles", 0) + 1
+                        state["note"] = "moving to arena centre to widen search"
+                elif sub == "center":
+                    # Compute translation toward the arena centre.
+                    # NOTE: observer provides drone position in ARENA frame
+                    # via _pos (SSE from /api/position/events). Use it if
+                    # available; otherwise fall back to a blind slow-forward.
+                    pos = snap.get("pos") or snap.get("cam") or None
+                    arena_cx, arena_cy = self.SEARCH_CENTER_XY
+                    if isinstance(pos, (list, tuple)) and len(pos) >= 2:
+                        dx = arena_cx - float(pos[0])
+                        dy = arena_cy - float(pos[1])
+                        dist = (dx * dx + dy * dy) ** 0.5
+                    else:
+                        dx = dy = 0.0
+                        dist = 0.0  # no position → skip centering
+                    if dist < self.SEARCH_CENTER_TOL_M or pos is None:
+                        # At (or near) centre, OR no position known — back to rotate
+                        obs.set_search_rc(0, 0, 0, 0)
+                        state["search_sub"] = "rotate"
+                        state["search_sub_start"] = now
+                        state["note"] = (
+                            f"at arena centre, rotating (cycle "
+                            f"{state.get('search_cycles', 1)})"
+                        )
+                        if state.get("search_cycles", 0) >= self.SEARCH_MAX_CYCLES:
+                            # Give up — drone can't find any target marker
+                            state["search_sub"] = "error"
+                            state["note"] = (
+                                f"exhausted {self.SEARCH_MAX_CYCLES} search cycles"
+                                " — marker(s) unreachable"
+                            )
+                    else:
+                        # Translate toward centre in WORLD frame. lr=east, fb=forward
+                        # For the Anafi with yaw=0 ≈ arena +y, fb maps to +y and
+                        # lr maps to +x. This is a rough approximation — with
+                        # yaw ≠ 0 the drone's body axes differ, but the search
+                        # maneuver doesn't need high precision (we just need to
+                        # move away from the wall and eventually see markers).
+                        scale = min(1.0, dist / 2.0)   # ease out near centre
+                        rc_fb = int(self.SEARCH_CENTER_SPEED_RC * scale * (dy / max(dist, 0.01)))
+                        rc_lr = int(self.SEARCH_CENTER_SPEED_RC * scale * (dx / max(dist, 0.01)))
+                        obs.set_search_rc(rc_lr, rc_fb, 0, 0)
+                        state["note"] = (
+                            f"moving to centre — dist={dist:.2f}m "
+                            f"(dx={dx:+.2f}, dy={dy:+.2f})"
+                        )
+                elif sub == "error":
+                    # Stay parked
+                    obs.set_search_rc(0, 0, 0, 0)
                 return
 
             if phase == "APPROACH":
                 if target is None:
-                    state["phase"] = "SEARCH"
+                    state.update(phase="SEARCH", search_sub="idle",
+                                 search_sub_start=None, hover_start=None)
                     return
                 if marker_id != target:
                     # Lost sight — release claim, go back to searching
                     self.claimed.pop(did, None)
                     obs.set_target(None)
+                    obs.set_search_rc(0, 0, 0, 0)
                     state.update(phase="SEARCH", target=None, hover_start=None,
+                                 search_sub="idle", search_sub_start=None,
                                  note=f"lost sight of {target}, re-searching")
                     return
                 if distance_m is None:
@@ -819,12 +962,15 @@ class ScanAllMarkersMission:
 
             if phase == "HOVER":
                 if target is None:
-                    state["phase"] = "SEARCH"
+                    state.update(phase="SEARCH", search_sub="idle",
+                                 search_sub_start=None, hover_start=None)
                     return
                 if marker_id != target:
                     self.claimed.pop(did, None)
                     obs.set_target(None)
+                    obs.set_search_rc(0, 0, 0, 0)
                     state.update(phase="SEARCH", target=None, hover_start=None,
+                                 search_sub="idle", search_sub_start=None,
                                  note=f"lost sight of {target} during hover, re-searching")
                     return
                 elapsed = time.time() - (state["hover_start"] or time.time())
@@ -833,7 +979,10 @@ class ScanAllMarkersMission:
                     self.scanned.add(target)
                     self.claimed.pop(did, None)
                     obs.set_target(None)
+                    obs.set_search_rc(0, 0, 0, 0)
                     state.update(phase="SEARCH", target=None, hover_start=None,
+                                 search_sub="idle", search_sub_start=None,
+                                 search_cycles=0,
                                  note=f"scanned marker {target}")
                 else:
                     remaining = self.hover_seconds - elapsed
