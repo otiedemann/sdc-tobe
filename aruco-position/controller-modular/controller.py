@@ -41,16 +41,16 @@ from typing import Optional
 # ============================================================
 
 # P gains: position error (m) → velocity setpoint (m/s)
-KP_XY: float = 0.25       # horizontal
-KP_Z: float  = 0.25       # vertical
+KP_XY: float = 0.75       # horizontal
+KP_Z: float  = 0.75       # vertical
 
 # P gain: yaw error (rad) → yaw rate setpoint (rad/s)
 KP_YAW: float = 0.1
 
 # Maximum velocity setpoints
-MAX_HORIZ_SPEED: float = 0.10    # %  (horizontal)
-MAX_VERT_SPEED: float  = 0.10    # %  (vertical)
-MAX_YAW_RATE: float    = 0.10    # %
+MAX_HORIZ_SPEED: float = 0.20    # %  (horizontal)
+MAX_VERT_SPEED: float  = 0.20    # %  (vertical)
+MAX_YAW_RATE: float    = 0.20    # %
 
 # Position acceptance radii (switch to HOVER phase)
 ARRIVE_RADIUS_XY: float = 0.25  # m
@@ -240,22 +240,22 @@ class PositionController:
         # ---- yaw setpoint ----
 
         # Use explicit requested yaw, or the heading we arrived with
-        desired_yaw = tgt.hold_yaw if tgt.hold_yaw is not None else cyaw
+        # desired_yaw = tgt.hold_yaw if tgt.hold_yaw is not None else cyaw
 
-        # if self._phase == Phase.HOVER:
-        #     # Use explicitly requested yaw, or the heading we arrived with
-        #     desired_yaw = (
-        #         tgt.hold_yaw
-        #         if tgt.hold_yaw is not None
-        #         else (self._arrival_yaw if self._arrival_yaw is not None else cyaw)
-        #     )
-        # else:
-        #     # TRANSIT: face the direction of travel when far enough away
-        #     if dist_xy >= TRANSIT_YAW_MIN_DIST:
-        #         desired_yaw = math.atan2(ex, ey)   # bearing to target in world frame
-        #     else:
-        #         # Close to target — stop yawing, just translate the last bit
-        #         desired_yaw = cyaw
+        if self._phase == Phase.HOVER:
+            # Use explicitly requested yaw, or the heading we arrived with
+            desired_yaw = (
+                tgt.hold_yaw
+                if tgt.hold_yaw is not None
+                else (self._arrival_yaw if self._arrival_yaw is not None else cyaw)
+            )
+        else:
+            # TRANSIT: face the direction of travel when far enough away
+            if dist_xy >= TRANSIT_YAW_MIN_DIST:
+                desired_yaw = math.atan2(ex, ey)   # bearing to target in world frame
+            else:
+                # Close to target — stop yawing, just translate the last bit
+                desired_yaw = cyaw
 
         yaw_error    = _wrap_pi(desired_yaw - cyaw)
         yaw_rate_sp  = KP_YAW * yaw_error
