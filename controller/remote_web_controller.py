@@ -846,6 +846,15 @@ HTML = """
     arcLoadParams();
     setInterval(arcPoll, 250);
     arcPoll();
+    // Version marker — if this string doesn't appear in the DOM,
+    // you're running stale JS (restart the Python server or hard-refresh).
+    console.log('[arc] init complete, build=2026-04-20-85eda48');
+    const ver = document.createElement('span');
+    ver.id = 'arc_build_tag';
+    ver.style.cssText = 'font-size:10px;color:#64748b;margin-left:8px;';
+    ver.textContent = 'build 85eda48';
+    const hdr = document.querySelector('#aruco_panel h3');
+    if (hdr) hdr.appendChild(ver);
   })();
   </script>
 
