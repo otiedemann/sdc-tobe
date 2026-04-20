@@ -849,6 +849,7 @@ def main():
         then restores the saved settings on exit.  The main finally block
         also restores settings as a guaranteed backstop.
         """
+        nonlocal _manual_rc_time
         try:
             if platform.system().lower() == "windows":
                 import msvcrt
