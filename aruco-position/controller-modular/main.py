@@ -33,6 +33,7 @@ CAMERA_SOURCE = 0
 HEARTBEAT_INTERVAL = 1.0  # Sekunden: Status senden auch ohne Marker
 TARGET_Z_POS = -1.5  # fixed target height position (internal Z axis)
 MARKER_SIZE = 0.5
+DRY_RUN = False  # True: log RC/commands but send nothing to drone, no takeoff
 
 # Pose robustness settings
 MIN_REF_WEIGHT = 0.00  # Ignore very weak refs, but keep detection usable
@@ -555,7 +556,7 @@ def main():
     enable_motion_input = "--motion-input" in sys.argv
 
     mission_enabled  = "--mission" in sys.argv
-    mission_dry_run  = "--dry-run" in sys.argv
+    mission_dry_run  = DRY_RUN or "--dry-run" in sys.argv
     mission_auto_confirm = "--yes" in sys.argv or "-y" in sys.argv
     mission_fly_to: Optional[tuple] = None
     if "--fly-to" in sys.argv:
