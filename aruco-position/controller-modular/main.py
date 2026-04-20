@@ -1162,8 +1162,27 @@ def main():
                     }
 
             _manual_active = (time.monotonic() - _manual_rc_time < MANUAL_TIMEOUT)
+            if _manual_active:
+                print(f"[debug] manual_active=True  ctrl={ctrl_module is not None}  "
+                      f"ctrl_state={_ctrl_state is not None}  drone={anafi_drone is not None}  "
+                      f"dry={mission_dry_run}  age={time.monotonic()-_manual_rc_time:.3f}s", flush=True)
 
-            if ctrl_module is not None and _ctrl_state is not None:
+            if _manual_active and anafi_drone is not None and not mission_dry_run:
+                # Manual RC takes priority over autonomous controller
+                with _manual_rc_lock:
+                    _mrc = {
+                        "forward_back": _manual_rc["forward_back"],
+                        "left_right":   _manual_rc["left_right"],
+                        "up_down":      0,
+                        "yaw":          _manual_rc["yaw"],
+                    }
+                print(f"[manual] SEND fb={_mrc['forward_back']} lr={_mrc['left_right']} yaw={_mrc['yaw']}", flush=True)
+                if ctrl_module is not None:
+                    ctrl_module.send_pcmd_olympe(anafi_drone, _mrc)
+                else:
+                    from olympe.messages.ardrone3.Piloting import PCMD as _PCMD
+                    anafi_drone(_PCMD(1, _mrc["left_right"], _mrc["forward_back"], _mrc["yaw"], 0, 0))
+            elif ctrl_module is not None and _ctrl_state is not None:
                 rc = ctrl_module.update(_ctrl_state)
                 if rc is not None:
                     _last_rc = rc
@@ -1181,29 +1200,7 @@ def main():
                             end="",
                         )
                     elif anafi_drone is not None:
-                        if _manual_active:
-                            with _manual_rc_lock:
-                                _mrc = dict(rc)
-                                _mrc["forward_back"] = _manual_rc["forward_back"]
-                                _mrc["left_right"]   = _manual_rc["left_right"]
-                                _mrc["yaw"]          = _manual_rc["yaw"]
-                            ctrl_module.send_pcmd_olympe(anafi_drone, _mrc)
-                        else:
-                            ctrl_module.send_pcmd_olympe(anafi_drone, rc)
-            elif _manual_active and anafi_drone is not None and not mission_dry_run:
-                # No vision state available – send manual RC directly
-                with _manual_rc_lock:
-                    _mrc = {
-                        "forward_back": _manual_rc["forward_back"],
-                        "left_right":   _manual_rc["left_right"],
-                        "up_down":      0,
-                        "yaw":          _manual_rc["yaw"],
-                    }
-                if ctrl_module is not None:
-                    ctrl_module.send_pcmd_olympe(anafi_drone, _mrc)
-                else:
-                    from olympe.messages.ardrone3.Piloting import PCMD as _PCMD
-                    anafi_drone(_PCMD(1, _mrc["left_right"], _mrc["forward_back"], _mrc["yaw"], 0, 0))
+                        ctrl_module.send_pcmd_olympe(anafi_drone, rc)
 
             # --------------------------------------
             # Autonomous mission tick
@@ -1468,6 +1465,8 @@ def main():
                 try:
                     cv2.imshow("aruco_position Preview", preview)
                     key = cv2.waitKey(1) & 0xFF
+                    if key != 0xFF:
+                        print(f"[key] cv2 key={key} chr={chr(key) if 32<=key<127 else '?'}", flush=True)
                     if key == 27:   # ESC – emergency land
                         print("[abort] ESC pressed in preview window")
                         _abort_flag.set()
@@ -1477,6 +1476,7 @@ def main():
                         with _manual_rc_lock:
                             _manual_rc.update({"forward_back": MANUAL_SPEED, "left_right": 0, "yaw": 0})
                         _manual_rc_time = time.monotonic()
+                        print(f"[manual] W forward_back={MANUAL_SPEED}", flush=True)
                     elif key in (ord('s'), ord('S')):
                         with _manual_rc_lock:
                             _manual_rc.update({"forward_back": -MANUAL_SPEED, "left_right": 0, "yaw": 0})
