@@ -1005,6 +1005,25 @@ HTML = """
             <span id=\"pos_latency_val\" style=\"font-size:11px;color:#94a3b8;\">200</span>
           </label>
         </div>
+        <div style=\"display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:6px;padding:6px;background:#0f172a;border:1px solid #1e293b;border-radius:4px;\">
+          <span class=\"small\" style=\"color:#64748b;min-width:70px;\">Filters:</span>
+          <label style=\"display:flex;align-items:center;gap:4px;cursor:pointer;\">
+            <input type=\"checkbox\" id=\"pos_kalman\" style=\"accent-color:#3b82f6;\" />
+            <span class=\"small\" style=\"color:#e2e8f0;\">Kalman filter</span>
+          </label>
+          <label class=\"small\" style=\"color:#94a3b8;\">Marker size (m):
+            <input id=\"pos_marker_size\" type=\"number\" min=\"0.05\" max=\"2.0\" step=\"0.01\" value=\"0.5\" style=\"width:64px;\" />
+          </label>
+          <label class=\"small\" style=\"color:#94a3b8;\">Top-K:
+            <input id=\"pos_top_k\" type=\"number\" min=\"0\" max=\"10\" step=\"1\" value=\"0\" style=\"width:50px;\" title=\"0 = auto (4)\" />
+          </label>
+          <label class=\"small\" style=\"color:#94a3b8;\">Outlier (m):
+            <input id=\"pos_outlier\" type=\"number\" min=\"0.1\" max=\"20\" step=\"0.1\" value=\"2.5\" style=\"width:60px;\" />
+          </label>
+          <button id=\"pos_filters_apply\" class=\"pos-cfg\" style=\"height:26px;font-size:11px;padding:0 10px;\">Apply filters</button>
+          <button id=\"pos_filters_reset\" class=\"pos-cfg\" style=\"height:26px;font-size:11px;padding:0 10px;background:#1e2a3a;\" title=\"Restore defaults: Kalman on, marker 0.5m, top-K auto, outlier 2.5m\">Defaults</button>
+          <span id=\"pos_filters_status\" class=\"small\" style=\"color:#64748b;\"></span>
+        </div>
         <div style=\"display:flex;gap:8px;flex-wrap:wrap;align-items:center;\">
           <button id=\"pos_cfg_save\" class=\"pos-cfg\">Apply Config</button>
           <label style=\"cursor:pointer;\">
@@ -2136,19 +2155,69 @@ async function loadPosConfig() {
   try {
     const r = await fetch('/proxy/position/config');
     const d = await r.json();
-    document.getElementById('pos_enabled').checked = !!d.enabled;
-    if (d.detect_profile) document.getElementById('pos_profile').value = d.detect_profile;
-    if (d.fov_deg) document.getElementById('pos_fov').value = d.fov_deg;
-    if (d.latency_ms != null) {
-      document.getElementById('pos_latency').value = d.latency_ms;
-      document.getElementById('pos_latency_val').textContent = Math.round(d.latency_ms);
+    // Server returns {config:{...}, ...} but older endpoints are flat — handle both
+    const c = d.config || d;
+    document.getElementById('pos_enabled').checked = !!c.enabled;
+    if (c.detect_profile) document.getElementById('pos_profile').value = c.detect_profile;
+    if (c.fov_deg) document.getElementById('pos_fov').value = c.fov_deg;
+    const latMs = (c.latency_ms != null) ? c.latency_ms
+                  : (c.latency_comp_s != null ? Math.round(c.latency_comp_s * 1000) : null);
+    if (latMs != null) {
+      document.getElementById('pos_latency').value = latMs;
+      document.getElementById('pos_latency_val').textContent = Math.round(latMs);
     }
+    // ── Populate filter controls ──
+    const kCb = document.getElementById('pos_kalman');
+    if (kCb) kCb.checked = (c.enable_kalman_filter !== false);  // default ON if missing
+    const mSz = document.getElementById('pos_marker_size');
+    if (mSz && c.marker_size_m != null) mSz.value = Number(c.marker_size_m).toFixed(2);
+    const tK = document.getElementById('pos_top_k');
+    if (tK && c.top_k_markers != null) tK.value = c.top_k_markers;
+    const out = document.getElementById('pos_outlier');
+    if (out && c.outlier_reject_m != null) out.value = c.outlier_reject_m;
     const cs = document.getElementById('pos_calib_status');
     cs.textContent = d.has_calibration ? '\\u2713 calibration loaded' : 'no calibration';
     cs.style.color = d.has_calibration ? '#22c55e' : '#94a3b8';
-    if (d.enabled) startPosEvents();
+    if (c.enabled) startPosEvents();
   } catch {}
 }
+
+// ── Filter controls — live-apply to running positioner ──
+(function wireFilterControls(){
+  const statusEl = () => document.getElementById('pos_filters_status');
+  const flash = (msg, col) => {
+    const e = statusEl(); if (!e) return;
+    e.textContent = msg; e.style.color = col || '#64748b';
+    setTimeout(() => { if (e.textContent === msg) e.textContent = ''; }, 2500);
+  };
+  const applyBtn = document.getElementById('pos_filters_apply');
+  if (applyBtn) applyBtn.onclick = async () => {
+    const payload = {
+      enable_kalman_filter: document.getElementById('pos_kalman').checked,
+      marker_size_m: parseFloat(document.getElementById('pos_marker_size').value),
+      top_k_markers: parseInt(document.getElementById('pos_top_k').value, 10),
+      outlier_reject_m: parseFloat(document.getElementById('pos_outlier').value),
+    };
+    try {
+      const r = await fetch('/proxy/position/config', {
+        method: 'POST',
+        headers: {'Content-Type':'application/json'},
+        body: JSON.stringify(payload),
+      });
+      const d = await r.json();
+      if (d.ok) flash('\\u2713 applied', '#22c55e');
+      else flash('error: ' + (d.error || 'unknown'), '#ef4444');
+    } catch (e) { flash('request failed', '#ef4444'); }
+  };
+  const resetBtn = document.getElementById('pos_filters_reset');
+  if (resetBtn) resetBtn.onclick = () => {
+    document.getElementById('pos_kalman').checked = true;
+    document.getElementById('pos_marker_size').value = '0.50';
+    document.getElementById('pos_top_k').value = '0';
+    document.getElementById('pos_outlier').value = '2.5';
+    flash('defaults loaded — click Apply', '#94a3b8');
+  };
+})();
 
 document.getElementById('pos_enabled').onchange = async function() {
   await post('/proxy/position/config', { enabled: this.checked });

@@ -177,6 +177,9 @@ class HeadlessAruCoPositioning:
         self.kf_pos = [KalmanFilter1D() for _ in range(3)]
         self.direction_filter = ExponentialMovingAverage(alpha=0.2)
         self.target_filters = {}
+        # Live-tunable fusion knobs
+        self.top_k_markers = 4           # keep best N of visible refs; 0 = unlimited
+        self.outlier_reject_m = OUTLIER_POS_THRESH  # drop per-marker estimates > this from centroid
 
         # last valid pose cache for temporary marker loss
         self.last_valid_pose = None
@@ -521,9 +524,10 @@ class HeadlessAruCoPositioning:
                 )
             return None
 
-        # Keep only top-4 best reference markers when more are visible
-        if len(weights) > 4:
-            top_idx = np.argsort(weights)[-4:]
+        # Keep only top-K best reference markers when more are visible
+        top_k = int(getattr(self, "top_k_markers", 4) or 0)
+        if top_k > 0 and len(weights) > top_k:
+            top_idx = np.argsort(weights)[-top_k:]
             cam_positions = [cam_positions[i] for i in top_idx]
             cam_dirs = [cam_dirs[i] for i in top_idx]
             rot_mats = [rot_mats[i] for i in top_idx]
@@ -531,8 +535,9 @@ class HeadlessAruCoPositioning:
             ref_marker_ids = [ref_marker_ids[i] for i in top_idx]
 
         # Outlier rejection in position domain
+        outlier_thr = float(getattr(self, "outlier_reject_m", OUTLIER_POS_THRESH))
         center = np.mean(np.array(cam_positions), axis=0)
-        keep = [i for i, p in enumerate(cam_positions) if np.linalg.norm(p - center) <= OUTLIER_POS_THRESH]
+        keep = [i for i, p in enumerate(cam_positions) if np.linalg.norm(p - center) <= outlier_thr]
         if len(keep) >= MIN_REF_COUNT:
             cam_positions = [cam_positions[i] for i in keep]
             cam_dirs = [cam_dirs[i] for i in keep]

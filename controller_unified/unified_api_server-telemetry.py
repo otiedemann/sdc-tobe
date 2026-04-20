@@ -333,9 +333,12 @@ _pos_cfg_lock = threading.Lock()
 _rec_lock = threading.Lock()
 _rec_enabled = False
 _rec_raw = False          # True = record raw frame, False = record annotated frame
-_rec_writer = None        # cv2.VideoWriter
+_rec_writer = None        # cv2.VideoWriter — lazy-created on first frame
 _rec_path: str = ""
 _rec_frame_count = 0
+_rec_fname: str = ""      # requested filename (used when deferring writer creation)
+_rec_fps_target: float = 0.0  # target fps captured at start (fallback 5)
+_rec_writer_size: tuple = (0, 0)  # (w, h) the writer was opened at
 _pos_cfg: dict = {
     "enabled": False,
     "fps": 5,
@@ -345,6 +348,11 @@ _pos_cfg: dict = {
     "telemetry_buffer_s": 5.0,
     "camera_matrix": None,
     "dist_coeffs": None,
+    # Live-tunable filter params (applied to _pos_processor on POST)
+    "enable_kalman_filter": True,
+    "marker_size_m": 0.5,   # overrides arena_config.json marker_size_m when set
+    "top_k_markers": 0,     # 0 = auto (code picks best 4); set to limit further
+    "outlier_reject_m": 2.5,  # max distance from centroid before an estimate is dropped
 }
 
 # Arena config — SDC challenge default layout.
@@ -2059,10 +2067,14 @@ class OlympeBackend(DroneBackend):
                 if _video_frame_count == 1:
                     h, w = cv_frame.shape[:2]
                     print(f"[ANAFI] First video frame: {w}x{h}")
-            # Tap frame for positioning (non-blocking — drop if queue full)
+            # Tap frame for positioning and/or recording (non-blocking — drop if queue full).
+            # Feeding the queue when ONLY recording is active ensures the recorder
+            # still gets frames even if Position Tracker is disabled.
             with _pos_cfg_lock:
                 _pos_enabled = _pos_cfg.get("enabled", False)
-            if _pos_enabled:
+            with _rec_lock:
+                _rec_active = _rec_enabled
+            if _pos_enabled or _rec_active:
                 try:
                     _pos_frame_q.put_nowait((cv_frame.copy(), time.monotonic()))
                 except queue.Full:
@@ -3129,10 +3141,13 @@ def positioning_loop():
     calib_w = calib_h = None
 
     while running:
-        # Check if enabled
+        # Check if positioning and/or recording is active
         with _pos_cfg_lock:
             cfg = dict(_pos_cfg)
-        if not cfg.get("enabled", False):
+        pos_enabled = cfg.get("enabled", False)
+        with _rec_lock:
+            rec_active = _rec_enabled
+        if not pos_enabled and not rec_active:
             time.sleep(0.2)
             processor = None  # reset so it reinitialises on enable
             continue
@@ -3144,6 +3159,12 @@ def positioning_loop():
             continue
 
         h, w = frame.shape[:2]
+
+        # Recording-only fast path: if positioning is disabled but recording is
+        # active, write the raw frame straight to the recorder and skip ArUco.
+        if not pos_enabled:
+            _rec_write_frame(frame)
+            continue
 
         # (Re-)initialise processor if needed
         if processor is None:
@@ -3171,8 +3192,14 @@ def positioning_loop():
                 global _pos_processor
                 with _arena_cfg_lock:
                     init_marker_size = float(_arena_cfg.get("marker_size_m", 0.5))
+                # Runtime overrides from _pos_cfg
+                with _pos_cfg_lock:
+                    cfg_marker = _pos_cfg.get("marker_size_m")
+                    if cfg_marker:
+                        init_marker_size = float(cfg_marker)
+                    init_kalman = bool(_pos_cfg.get("enable_kalman_filter", True))
                 processor = _HeadlessAruCo(cam_mat, dist, detect_profile=profile,
-                                           marker_size=init_marker_size, enable_kalman_filter=True)
+                                           marker_size=init_marker_size, enable_kalman_filter=init_kalman)
                 _apply_arena_cfg_to_processor(processor)
                 _pos_processor = processor
                 print(f"[POS] Processor initialised (profile={profile})")
@@ -3286,13 +3313,7 @@ def positioning_loop():
                 with _pos_annotated_lock:
                     _pos_annotated_jpeg = jpg2.tobytes()
             # Write frame to recording if active (raw or annotated)
-            with _rec_lock:
-                if _rec_enabled and _rec_writer is not None:
-                    try:
-                        _rec_writer.write(frame if _rec_raw else ann)
-                        _rec_frame_count += 1
-                    except Exception:
-                        pass
+            _rec_write_frame(frame if _rec_raw else ann)
         except Exception:
             pass
 
@@ -3351,6 +3372,44 @@ def api_position_video():
                     headers={"Cache-Control": "no-cache"})
 
 
+def _rec_write_frame(bgr_frame):
+    """Write a frame to the active recording, lazy-creating VideoWriter from
+    the actual incoming frame dimensions. Logs errors instead of swallowing
+    them silently."""
+    global _rec_writer, _rec_writer_size, _rec_frame_count
+    if bgr_frame is None:
+        return
+    with _rec_lock:
+        if not _rec_enabled:
+            return
+        h, w = bgr_frame.shape[:2]
+        # Lazy-create writer on first frame, or recreate on dimension change
+        if _rec_writer is None or _rec_writer_size != (w, h):
+            # Close any previous writer (dimension change mid-recording)
+            if _rec_writer is not None:
+                try: _rec_writer.release()
+                except Exception: pass
+                _rec_writer = None
+            try:
+                fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+                writer = cv2.VideoWriter(_rec_path, fourcc, _rec_fps_target, (w, h))
+                if not writer.isOpened():
+                    print(f"[REC] ERROR: VideoWriter failed to open for {_rec_path} @ {w}x{h}")
+                    return
+                _rec_writer = writer
+                _rec_writer_size = (w, h)
+                print(f"[REC] Writer opened: {_rec_path} @ {w}x{h} {_rec_fps_target}fps "
+                      f"({'raw' if _rec_raw else 'annotated'})")
+            except Exception as e:
+                print(f"[REC] ERROR opening writer: {e}")
+                return
+        try:
+            _rec_writer.write(bgr_frame)
+            _rec_frame_count += 1
+        except Exception as e:
+            print(f"[REC] write failed (frame {_rec_frame_count}): {e}")
+
+
 @app.get("/api/video/record/status")
 def api_rec_status():
     with _rec_lock:
@@ -3360,6 +3419,7 @@ def api_rec_status():
 @app.post("/api/video/record/start")
 def api_rec_start():
     global _rec_enabled, _rec_raw, _rec_writer, _rec_path, _rec_frame_count
+    global _rec_fname, _rec_fps_target, _rec_writer_size
     data = request.get_json(silent=True) or {}
     with _rec_lock:
         if _rec_enabled:
@@ -3371,25 +3431,20 @@ def api_rec_start():
         rec_dir = Path(__file__).parent / "recordings"
         rec_dir.mkdir(exist_ok=True)
         full_path = str(rec_dir / fname)
-        try:
-            # Use first available frame to get resolution; fall back to 960x720
-            with _pos_st_lock:
-                fw = _pos_st.get("frame_w") or 960
-                fh = _pos_st.get("frame_h") or 720
-            fps_target = _pos_fps_current or 5.0
-            fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-            writer = cv2.VideoWriter(full_path, fourcc, fps_target, (fw, fh))
-            if not writer.isOpened():
-                return jsonify(ok=False, error="VideoWriter failed to open")
-            _rec_writer = writer
-            _rec_path = full_path
-            _rec_frame_count = 0
-            _rec_raw = raw_mode
-            _rec_enabled = True
-            print(f"[REC] Recording started ({'raw' if raw_mode else 'annotated'}): {full_path} @ {fw}x{fh} {fps_target}fps")
-            return jsonify(ok=True, path=full_path)
-        except Exception as e:
-            return jsonify(ok=False, error=str(e))
+        # DEFER VideoWriter creation to first frame — that way we get the
+        # real frame dimensions (avoids silent write-fails when the writer
+        # was opened at 960x720 but frames arrive at 1280x720, which
+        # produced the old 257-byte empty-MP4 bug).
+        _rec_writer = None
+        _rec_writer_size = (0, 0)
+        _rec_path = full_path
+        _rec_fname = fname
+        _rec_frame_count = 0
+        _rec_raw = raw_mode
+        _rec_fps_target = float(_pos_fps_current or 5.0)
+        _rec_enabled = True
+        print(f"[REC] Recording armed ({'raw' if raw_mode else 'annotated'}): {full_path} — waiting for first frame")
+        return jsonify(ok=True, path=full_path)
 
 
 @app.post("/api/video/record/stop")
@@ -3429,6 +3484,7 @@ def api_pos_config_get():
 @app.post("/api/position/config")
 def api_pos_config_set():
     data = request.get_json(silent=True) or {}
+    apply_marker_size = False
     with _pos_cfg_lock:
         if "enabled" in data:
             _pos_cfg["enabled"] = bool(data["enabled"])
@@ -3442,7 +3498,46 @@ def api_pos_config_set():
             _pos_cfg["sync_max_gap_s"] = max(0.01, min(2.0, float(data["sync_max_gap_s"])))
         if "telemetry_buffer_s" in data:
             _pos_cfg["telemetry_buffer_s"] = max(1.0, min(30.0, float(data["telemetry_buffer_s"])))
+        # Live filter params — applied to _pos_processor below
+        if "enable_kalman_filter" in data:
+            _pos_cfg["enable_kalman_filter"] = bool(data["enable_kalman_filter"])
+        if "marker_size_m" in data:
+            _pos_cfg["marker_size_m"] = max(0.05, min(2.0, float(data["marker_size_m"])))
+            apply_marker_size = True
+        if "top_k_markers" in data:
+            _pos_cfg["top_k_markers"] = max(0, min(10, int(data["top_k_markers"])))
+        if "outlier_reject_m" in data:
+            _pos_cfg["outlier_reject_m"] = max(0.1, min(20.0, float(data["outlier_reject_m"])))
         cfg_snap = dict(_pos_cfg)
+
+    # Apply live filter changes to running processor
+    try:
+        if _pos_processor is not None:
+            if "enable_kalman_filter" in data:
+                _pos_processor.enable_kalman_filter = bool(data["enable_kalman_filter"])
+                # Reset Kalman state so toggling doesn't carry stale history
+                try:
+                    for kf in _pos_processor.kf_pos:
+                        kf.reset()
+                except Exception:
+                    pass
+                print(f"[POS] Kalman filter {'ENABLED' if _pos_processor.enable_kalman_filter else 'DISABLED'} (live)")
+            if apply_marker_size:
+                # Also reflect in arena_cfg so _apply_arena_cfg_to_processor can be used
+                with _arena_cfg_lock:
+                    _arena_cfg["marker_size_m"] = cfg_snap["marker_size_m"]
+                _apply_arena_cfg_to_processor(_pos_processor)
+                print(f"[POS] marker_size_m set to {cfg_snap['marker_size_m']}m (live)")
+            if "top_k_markers" in data:
+                tk = int(cfg_snap["top_k_markers"])
+                _pos_processor.top_k_markers = tk if tk > 0 else 4
+                print(f"[POS] top_k_markers set to {tk if tk > 0 else '4 (auto)'} (live)")
+            if "outlier_reject_m" in data:
+                _pos_processor.outlier_reject_m = float(cfg_snap["outlier_reject_m"])
+                print(f"[POS] outlier_reject_m set to {cfg_snap['outlier_reject_m']}m (live)")
+    except Exception as e:
+        print(f"[POS] live config apply error: {e}")
+
     cfg_snap.pop("camera_matrix", None)
     cfg_snap.pop("dist_coeffs", None)
     try:
