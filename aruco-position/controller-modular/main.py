@@ -1127,13 +1127,12 @@ def main():
                     }
 
                 _log_tgt = None
-                if mission is not None and mission._approach_target is not None:
-                    tx, ty, tz, tyaw = mission._approach_target
+                if mission is not None and mission.fly_to is not None:
+                    tx, ty, tz = mission.fly_to
                     _log_tgt = {
                         "x": round(tx, 4),
                         "y": round(ty, 4),
                         "z": round(tz, 4),
-                        "yaw_deg": round(math.degrees(tyaw), 2),
                     }
                 elif ctrl_module is not None and ctrl_module.position_controller.target is not None:
                     t = ctrl_module.position_controller.target
@@ -1229,8 +1228,8 @@ def main():
             if mission is not None:
                 result["mission"] = {
                     "phase": mission.phase,
-                    "target_marker": mission.target_id,
-                    "approach_target": list(mission._approach_target) if mission._approach_target else None,
+                    "fly_to": list(mission.fly_to),
+                    "recovering": mission._recovering,
                     "waiting_confirm": mission.waiting_for_confirm,
                     "confirm_prompt": mission.pending_prompt if mission.waiting_for_confirm else None,
                 }
@@ -1337,11 +1336,11 @@ def main():
                         2,
                     )
 
-                if mission is not None and mission._approach_target is not None:
-                    tx, ty, tz, tyaw = mission._approach_target
+                if mission is not None and mission.fly_to is not None:
+                    tx, ty, tz = mission.fly_to
                     cv2.putText(
                         preview,
-                        f"TGT x={tx:+.2f} y={ty:+.2f} z={tz:+.2f} yaw={math.degrees(tyaw):+.1f} deg",
+                        f"TGT x={tx:+.2f} y={ty:+.2f} z={tz:+.2f}",
                         (10, 195),
                         cv2.FONT_HERSHEY_SIMPLEX,
                         0.6,
