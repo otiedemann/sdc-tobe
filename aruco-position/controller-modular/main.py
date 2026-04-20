@@ -210,10 +210,6 @@ class AutonomousMission:
         self._recovering: bool         = False        # True while yaw-searching for markers
         self._recovery_seq: int        = 0            # PCMD sequence counter during recovery
 
-        # Set to True by main loop when manual RC keys are active so that
-        # recovery yaw does not override manual input.
-        self.manual_override: bool     = False
-
     # ------------------------------------------------------------------ #
     # Public                                                               #
     # ------------------------------------------------------------------ #
@@ -466,7 +462,7 @@ class AutonomousMission:
 
     def _send_recovery_yaw(self, drone) -> None:
         """Send a pure yaw PCMD — zero roll, pitch, gaz — to rotate in place."""
-        if drone is None or self.dry_run or self.manual_override:
+        if drone is None or self.dry_run:
             return
         try:
             from olympe.messages.ardrone3.Piloting import PCMD
@@ -1213,7 +1209,6 @@ def main():
             # Autonomous mission tick
             # --------------------------------------
             if mission is not None:
-                mission.manual_override = _manual_active
                 mission.tick(last_prediction, last_vision_update, anafi_drone)
 
             # --------------------------------------
