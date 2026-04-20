@@ -737,6 +737,7 @@ def main():
             motion_listener.subscribe()
 
         anafi_drone.connect()
+        anafi_drone.set_max_rotation_speed(90)
 
 
         def _anafi_frame_cb(yuv_frame):
@@ -820,6 +821,12 @@ def main():
     _abort_flag   = threading.Event()
     _confirm_flag = threading.Event()
 
+    MANUAL_SPEED    = 30    # % stick for manual W/A/S/D/Q/E override
+    MANUAL_TIMEOUT  = 0.15  # s: auto-stop when key not pressed for this long
+    _manual_rc_lock = threading.Lock()
+    _manual_rc      = {"forward_back": 0, "left_right": 0, "yaw": 0}
+    _manual_rc_time = 0.0
+
     # Save terminal state at main-thread level so we can restore it even if
     # the keyboard thread is killed before its own finally block runs.
     _saved_term = None
@@ -847,13 +854,37 @@ def main():
                 while not _abort_flag.is_set():
                     if msvcrt.kbhit():
                         ch = msvcrt.getch()
-                        if ch in (b'\x1b', b'q', b'Q'):
-                            print("\n[abort] ESC / q detected in terminal")
+                        if ch == b'\x1b':
+                            print("\n[abort] ESC detected in terminal")
                             _abort_flag.set()
                             return
-                        if ch == b' ':
+                        elif ch == b' ':
                             print("\n[mission] SPACE – confirm")
                             _confirm_flag.set()
+                        elif ch in (b'w', b'W'):
+                            with _manual_rc_lock:
+                                _manual_rc.update({"forward_back": MANUAL_SPEED, "left_right": 0, "yaw": 0})
+                            _manual_rc_time = time.monotonic()
+                        elif ch in (b's', b'S'):
+                            with _manual_rc_lock:
+                                _manual_rc.update({"forward_back": -MANUAL_SPEED, "left_right": 0, "yaw": 0})
+                            _manual_rc_time = time.monotonic()
+                        elif ch in (b'a', b'A'):
+                            with _manual_rc_lock:
+                                _manual_rc.update({"forward_back": 0, "left_right": -MANUAL_SPEED, "yaw": 0})
+                            _manual_rc_time = time.monotonic()
+                        elif ch in (b'd', b'D'):
+                            with _manual_rc_lock:
+                                _manual_rc.update({"forward_back": 0, "left_right": MANUAL_SPEED, "yaw": 0})
+                            _manual_rc_time = time.monotonic()
+                        elif ch in (b'q', b'Q'):
+                            with _manual_rc_lock:
+                                _manual_rc.update({"forward_back": 0, "left_right": 0, "yaw": -MANUAL_SPEED})
+                            _manual_rc_time = time.monotonic()
+                        elif ch in (b'e', b'E'):
+                            with _manual_rc_lock:
+                                _manual_rc.update({"forward_back": 0, "left_right": 0, "yaw": MANUAL_SPEED})
+                            _manual_rc_time = time.monotonic()
                     time.sleep(0.05)
             else:
                 import select
@@ -867,13 +898,37 @@ def main():
                         r, _, _ = select.select([_sys.stdin], [], [], 0.1)
                         if r:
                             ch = _sys.stdin.read(1)
-                            if ch in ('\x1b', 'q', 'Q'):
-                                print("\n[abort] ESC / q detected in terminal")
+                            if ch == '\x1b':
+                                print("\n[abort] ESC detected in terminal")
                                 _abort_flag.set()
                                 return
-                            if ch == ' ':
+                            elif ch == ' ':
                                 print("\n[mission] SPACE – confirm")
                                 _confirm_flag.set()
+                            elif ch in ('w', 'W'):
+                                with _manual_rc_lock:
+                                    _manual_rc.update({"forward_back": MANUAL_SPEED, "left_right": 0, "yaw": 0})
+                                _manual_rc_time = time.monotonic()
+                            elif ch in ('s', 'S'):
+                                with _manual_rc_lock:
+                                    _manual_rc.update({"forward_back": -MANUAL_SPEED, "left_right": 0, "yaw": 0})
+                                _manual_rc_time = time.monotonic()
+                            elif ch in ('a', 'A'):
+                                with _manual_rc_lock:
+                                    _manual_rc.update({"forward_back": 0, "left_right": -MANUAL_SPEED, "yaw": 0})
+                                _manual_rc_time = time.monotonic()
+                            elif ch in ('d', 'D'):
+                                with _manual_rc_lock:
+                                    _manual_rc.update({"forward_back": 0, "left_right": MANUAL_SPEED, "yaw": 0})
+                                _manual_rc_time = time.monotonic()
+                            elif ch in ('q', 'Q'):
+                                with _manual_rc_lock:
+                                    _manual_rc.update({"forward_back": 0, "left_right": 0, "yaw": -MANUAL_SPEED})
+                                _manual_rc_time = time.monotonic()
+                            elif ch in ('e', 'E'):
+                                with _manual_rc_lock:
+                                    _manual_rc.update({"forward_back": 0, "left_right": 0, "yaw": MANUAL_SPEED})
+                                _manual_rc_time = time.monotonic()
                 finally:
                     if _saved_term is not None:
                         try:
@@ -1109,7 +1164,16 @@ def main():
                             end="",
                         )
                     elif anafi_drone is not None:
-                        ctrl_module.send_pcmd_olympe(anafi_drone, rc)
+                        _t_now = time.monotonic()
+                        if _t_now - _manual_rc_time < MANUAL_TIMEOUT:
+                            with _manual_rc_lock:
+                                _mrc = dict(rc)
+                                _mrc["forward_back"] = _manual_rc["forward_back"]
+                                _mrc["left_right"]   = _manual_rc["left_right"]
+                                _mrc["yaw"]          = _manual_rc["yaw"]
+                            ctrl_module.send_pcmd_olympe(anafi_drone, _mrc)
+                        else:
+                            ctrl_module.send_pcmd_olympe(anafi_drone, rc)
 
             # --------------------------------------
             # Autonomous mission tick
