@@ -800,6 +800,7 @@ class ScanAllMarkersMission:
             self._tick_drone(did, obs)
 
     def _tick_drone(self, did: str, obs: "DroneObserver"):
+        now = time.time()
         snap = obs.get_state()
         running = snap.get("running")
         visible = snap.get("visible_ids") or []
