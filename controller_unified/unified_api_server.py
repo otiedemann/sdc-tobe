@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import abc
 import atexit
+from collections import deque
 import json
 import logging
 import math
@@ -159,7 +160,7 @@ CONNECT_RETRY_S = 3.0
 RECONNECT_AFTER_S = 3.0
 VERIFY_RETRY_S = 2.5
 WIFI_RETRY_S = 3.0
-TELEMETRY_HZ = float(os.getenv("TELEMETRY_HZ", "10.0"))
+TELEMETRY_HZ = float(os.getenv("TELEMETRY_HZ", "2.0"))
 KEY_STALE_S = float(os.getenv("KEY_STALE_S", "1.0"))
 SAFE_TAKEOFF_S = float(os.getenv("SAFE_TAKEOFF_S", "3.0"))
 SAFE_TAKEOFF_DEFAULT = os.getenv("SAFE_TAKEOFF_DEFAULT", "0") in {"1", "true", "True"}
@@ -275,12 +276,15 @@ telemetry: Dict = {
     "vgx": None, "vgy": None, "vgz": None,
     "agx": None, "agy": None, "agz": None,
     "speed": None, "flying": False, "connected": False, "updated_at": 0.0,
+    "updated_at_mono": 0.0,
 }
 telemetry_lock = threading.Lock()
 telemetry_log_enabled = TELEMETRY_LOG_DEFAULT
 telemetry_log_path = TELEMETRY_LOG_PATH_DEFAULT
 telemetry_log_lock = threading.Lock()
 command_log_lock = threading.Lock()
+_telemetry_sync_buf = deque(maxlen=3000)
+_telemetry_sync_lock = threading.Lock()
 
 command_lock = threading.Lock()
 discrete_until = 0.0
@@ -313,6 +317,8 @@ _pos_st: dict = {
     "markers": {}, "ref_markers": [],
     "seen_markers": [], "seen_count": 0,
     "stale": True, "ts": 0.0, "fps": None,
+    "tel_vgx": 0.0, "tel_vgy": 0.0, "tel_vgz": 0.0,
+    "sync_quality": "none", "sync_age_ms": None,
 }
 # FPS tracking for positioning loop
 _pos_fps_counter = 0
@@ -327,16 +333,26 @@ _pos_cfg_lock = threading.Lock()
 _rec_lock = threading.Lock()
 _rec_enabled = False
 _rec_raw = False          # True = record raw frame, False = record annotated frame
-_rec_writer = None        # cv2.VideoWriter
+_rec_writer = None        # cv2.VideoWriter — lazy-created on first frame
 _rec_path: str = ""
 _rec_frame_count = 0
+_rec_fname: str = ""      # requested filename (used when deferring writer creation)
+_rec_fps_target: float = 0.0  # target fps captured at start (fallback 5)
+_rec_writer_size: tuple = (0, 0)  # (w, h) the writer was opened at
 _pos_cfg: dict = {
     "enabled": False,
     "fps": 5,
     "detect_profile": "default",
     "latency_comp_s": 0.05,
+    "sync_max_gap_s": 0.20,
+    "telemetry_buffer_s": 5.0,
     "camera_matrix": None,
     "dist_coeffs": None,
+    # Live-tunable filter params (applied to _pos_processor on POST)
+    "enable_kalman_filter": True,
+    "marker_size_m": 0.5,   # overrides arena_config.json marker_size_m when set
+    "top_k_markers": 0,     # 0 = auto (code picks best 4); set to limit further
+    "outlier_reject_m": 2.5,  # max distance from centroid before an estimate is dropped
 }
 
 # Arena config — SDC challenge default layout.
@@ -348,7 +364,7 @@ _ARENA_CONFIG_DEFAULT: dict = {
     "arena_height_m": 10.0,
     "arena_origin_x": -10.0,
     "arena_origin_y": 0.0,
-    "marker_size_m": 0.18,
+    "marker_size_m": 0.5,
     "markers": [
         {"id":  0, "label": "Origin",       "x":   0.0, "y":  0.0,   "z":  0.0, "wall": "front"},
         {"id":  1, "label": "Right A low",  "x":  10.0, "y":  6.667, "z":  2.0, "wall": "right"},
@@ -521,6 +537,96 @@ def start_discrete_window(seconds: float):
     global discrete_until
     with command_lock:
         discrete_until = max(discrete_until, time.time() + max(0.0, seconds))
+
+
+def _telemetry_buffer_retention_s() -> float:
+    with _pos_cfg_lock:
+        v = float(_pos_cfg.get("telemetry_buffer_s", 5.0))
+    return max(1.0, min(30.0, v))
+
+
+def _append_telemetry_sync_sample(sample: dict):
+    ts_mono = float(sample.get("ts_mono", 0.0))
+    if ts_mono <= 0.0:
+        return
+    retention = _telemetry_buffer_retention_s()
+    with _telemetry_sync_lock:
+        _telemetry_sync_buf.append(sample)
+        cutoff = ts_mono - retention
+        while _telemetry_sync_buf and _telemetry_sync_buf[0].get("ts_mono", 0.0) < cutoff:
+            _telemetry_sync_buf.popleft()
+
+
+def _interp_angle_deg(a0: float, a1: float, alpha: float) -> float:
+    d = ((a1 - a0 + 180.0) % 360.0) - 180.0
+    return a0 + alpha * d
+
+
+def _telemetry_at(ts_mono: float, max_gap_s: float | None = None) -> dict:
+    if ts_mono <= 0.0:
+        return {"sample": None, "quality": "none", "age_s": None}
+    if max_gap_s is None:
+        with _pos_cfg_lock:
+            max_gap_s = float(_pos_cfg.get("sync_max_gap_s", 0.20))
+    max_gap_s = max(0.01, min(2.0, max_gap_s))
+
+    with _telemetry_sync_lock:
+        items = list(_telemetry_sync_buf)
+    if not items:
+        return {"sample": None, "quality": "none", "age_s": None}
+
+    prev = None
+    nxt = None
+    for s in items:
+        s_ts = float(s.get("ts_mono", 0.0))
+        if s_ts <= ts_mono:
+            prev = s
+            continue
+        nxt = s
+        break
+
+    if prev is None and nxt is None:
+        return {"sample": None, "quality": "none", "age_s": None}
+
+    if prev is not None and nxt is not None:
+        t0 = float(prev.get("ts_mono", 0.0))
+        t1 = float(nxt.get("ts_mono", 0.0))
+        if t1 <= t0:
+            nearest = prev
+            quality = "nearest"
+        else:
+            alpha = max(0.0, min(1.0, (ts_mono - t0) / (t1 - t0)))
+            interp = {"ts_mono": ts_mono}
+            for key in ("vgx", "vgy", "vgz", "height_cm"):
+                v0 = prev.get(key)
+                v1 = nxt.get(key)
+                if isinstance(v0, (int, float)) and isinstance(v1, (int, float)):
+                    interp[key] = float(v0) + alpha * (float(v1) - float(v0))
+                elif isinstance(v0, (int, float)):
+                    interp[key] = float(v0)
+                elif isinstance(v1, (int, float)):
+                    interp[key] = float(v1)
+            for key in ("yaw", "pitch", "roll"):
+                v0 = prev.get(key)
+                v1 = nxt.get(key)
+                if isinstance(v0, (int, float)) and isinstance(v1, (int, float)):
+                    interp[key] = _interp_angle_deg(float(v0), float(v1), alpha)
+                elif isinstance(v0, (int, float)):
+                    interp[key] = float(v0)
+                elif isinstance(v1, (int, float)):
+                    interp[key] = float(v1)
+            interp["connected"] = bool(prev.get("connected", True) and nxt.get("connected", True))
+            nearest = interp
+            quality = "interpolated"
+    else:
+        nearest = prev if prev is not None else nxt
+        quality = "nearest"
+
+    nearest_ts = float(nearest.get("ts_mono", 0.0))
+    age_s = abs(ts_mono - nearest_ts)
+    if age_s > max_gap_s:
+        return {"sample": nearest, "quality": "stale", "age_s": age_s}
+    return {"sample": nearest, "quality": quality, "age_s": age_s}
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -1961,10 +2067,14 @@ class OlympeBackend(DroneBackend):
                 if _video_frame_count == 1:
                     h, w = cv_frame.shape[:2]
                     print(f"[ANAFI] First video frame: {w}x{h}")
-            # Tap frame for positioning (non-blocking — drop if queue full)
+            # Tap frame for positioning and/or recording (non-blocking — drop if queue full).
+            # Feeding the queue when ONLY recording is active ensures the recorder
+            # still gets frames even if Position Tracker is disabled.
             with _pos_cfg_lock:
                 _pos_enabled = _pos_cfg.get("enabled", False)
-            if _pos_enabled:
+            with _rec_lock:
+                _rec_active = _rec_enabled
+            if _pos_enabled or _rec_active:
                 try:
                     _pos_frame_q.put_nowait((cv_frame.copy(), time.monotonic()))
                 except queue.Full:
@@ -2010,6 +2120,7 @@ backend: Optional[DroneBackend] = None
 def telemetry_loop():
     global flying, last_state_seen
     while running:
+        loop_mono = time.monotonic()
         b = backend
         if b is None:
             time.sleep(0.5)
@@ -2051,7 +2162,22 @@ def telemetry_loop():
             telemetry["flying"] = flying
             telemetry["connected"] = connected_now
             telemetry["updated_at"] = time.time()
+            telemetry["updated_at_mono"] = loop_mono
             snapshot = dict(telemetry)
+
+        _append_telemetry_sync_sample(
+            {
+                "ts_mono": loop_mono,
+                "vgx": snapshot.get("vgx"),
+                "vgy": snapshot.get("vgy"),
+                "vgz": snapshot.get("vgz"),
+                "yaw": snapshot.get("yaw"),
+                "pitch": snapshot.get("pitch"),
+                "roll": snapshot.get("roll"),
+                "height_cm": snapshot.get("height_cm"),
+                "connected": snapshot.get("connected", False),
+            }
+        )
 
         append_telemetry_log(snapshot)
         hz = TELEMETRY_HZ if TELEMETRY_HZ > 0 else 2.0
@@ -2815,17 +2941,11 @@ def api_telemetry():
 def api_telemetry_stream():
     def gen():
         while running:
-            now = time.time()
-            age = (now - last_state_seen) if last_state_seen else 9999.0
             with telemetry_lock:
                 payload = dict(telemetry)
-            payload["state_age_s"] = round(age, 3)
-            payload["state_fresh"] = age <= 2.0
-            payload["drone_type"] = drone_type
             yield f"data: {json.dumps(payload)}\n\n"
-            time.sleep(0.1)  # 10 Hz — matches telemetry collection rate
-    return Response(gen(), mimetype="text/event-stream",
-                    headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+            time.sleep(0.4)
+    return Response(gen(), mimetype="text/event-stream")
 
 
 # --- Safety ---
@@ -2915,19 +3035,17 @@ def api_telemetry_log_clear():
 def _pos_snapshot_to_js(snapshot: dict) -> dict:
     """Convert flat _pos_st snapshot to the nested format the JS updatePosUI expects.
 
-    Velocity is taken from the drone telemetry (cm/s → m/s) and rotated into
-    arena frame using the ArUco heading direction so dead-reckoning is correct.
+    Velocity uses frame-matched telemetry (cm/s -> m/s), then rotates into
+    arena frame using the ArUco heading direction.
     """
     x, y, z = snapshot.get("x"), snapshot.get("y"), snapshot.get("z")
     pos = [x, y, z] if x is not None else None
     dx, dy = snapshot.get("dx"), snapshot.get("dy")
     direction = [dx, dy] if dx is not None else None
 
-    # Pull live velocity from telemetry (Anafi: SpeedChanged cm/s; Tello: same)
-    with telemetry_lock:
-        tel_vx = telemetry.get("vgx") or 0.0   # drone-frame forward, cm/s
-        tel_vy = telemetry.get("vgy") or 0.0   # drone-frame lateral, cm/s
-        tel_vz = telemetry.get("vgz") or 0.0   # vertical, cm/s
+    tel_vx = snapshot.get("tel_vgx") or 0.0   # drone-frame forward, cm/s
+    tel_vy = snapshot.get("tel_vgy") or 0.0   # drone-frame lateral, cm/s
+    tel_vz = snapshot.get("tel_vgz") or 0.0   # vertical, cm/s
 
     # Rotate drone-frame velocity into arena frame using ArUco heading
     fwd = tel_vx / 100.0   # m/s
@@ -2952,9 +3070,10 @@ def _pos_snapshot_to_js(snapshot: dict) -> dict:
         "seen_markers": snapshot.get("seen_markers", []),
         "seen_count": snapshot.get("seen_count", 0),
         "stale": snapshot.get("stale", True),
-        "dead_reckoning": snapshot.get("dead_reckoning", False),
         "enabled": enabled,
         "latency_ms": lat_ms,
+        "sync_quality": snapshot.get("sync_quality", "none"),
+        "sync_age_ms": snapshot.get("sync_age_ms"),
         "frame_w": snapshot.get("frame_w"),
         "frame_h": snapshot.get("frame_h"),
     }
@@ -2989,7 +3108,7 @@ def _apply_arena_cfg_to_processor(processor):
         with _arena_cfg_lock:
             cfg = dict(_arena_cfg)
         markers = cfg.get("markers", [])
-        mk_size = float(cfg.get("marker_size_m", 0.18))
+        mk_size = float(cfg.get("marker_size_m", 0.5))
         if markers:
             new_positions = {}
             new_wall_types = {}
@@ -3022,10 +3141,13 @@ def positioning_loop():
     calib_w = calib_h = None
 
     while running:
-        # Check if enabled
+        # Check if positioning and/or recording is active
         with _pos_cfg_lock:
             cfg = dict(_pos_cfg)
-        if not cfg.get("enabled", False):
+        pos_enabled = cfg.get("enabled", False)
+        with _rec_lock:
+            rec_active = _rec_enabled
+        if not pos_enabled and not rec_active:
             time.sleep(0.2)
             processor = None  # reset so it reinitialises on enable
             continue
@@ -3037,6 +3159,12 @@ def positioning_loop():
             continue
 
         h, w = frame.shape[:2]
+
+        # Recording-only fast path: if positioning is disabled but recording is
+        # active, write the raw frame straight to the recorder and skip ArUco.
+        if not pos_enabled:
+            _rec_write_frame(frame)
+            continue
 
         # (Re-)initialise processor if needed
         if processor is None:
@@ -3063,9 +3191,15 @@ def positioning_loop():
             try:
                 global _pos_processor
                 with _arena_cfg_lock:
-                    init_marker_size = float(_arena_cfg.get("marker_size_m", 0.18))
+                    init_marker_size = float(_arena_cfg.get("marker_size_m", 0.5))
+                # Runtime overrides from _pos_cfg
+                with _pos_cfg_lock:
+                    cfg_marker = _pos_cfg.get("marker_size_m")
+                    if cfg_marker:
+                        init_marker_size = float(cfg_marker)
+                    init_kalman = bool(_pos_cfg.get("enable_kalman_filter", True))
                 processor = _HeadlessAruCo(cam_mat, dist, detect_profile=profile,
-                                           marker_size=init_marker_size, enable_kalman_filter=False)
+                                           marker_size=init_marker_size, enable_kalman_filter=init_kalman)
                 _apply_arena_cfg_to_processor(processor)
                 _pos_processor = processor
                 print(f"[POS] Processor initialised (profile={profile})")
@@ -3087,33 +3221,11 @@ def positioning_loop():
             if _video_frame_count < 5:
                 print(f"[POS] annotation detect error: {ae}")
 
-        # Inject IMU velocity into processor before pose estimation
-        try:
-            with telemetry_lock:
-                tel_vx = telemetry.get("vgx") or 0.0  # drone forward cm/s
-                tel_vy = telemetry.get("vgy") or 0.0  # drone lateral cm/s
-                tel_vz = telemetry.get("vgz") or 0.0  # vertical cm/s
-            fwd = tel_vx / 100.0  # m/s
-            lat = tel_vy / 100.0
-            vz = tel_vz / 100.0
-            # Rotate drone-frame velocity into arena frame using last known heading
-            with _pos_st_lock:
-                dx = _pos_st.get("dx")
-                dy = _pos_st.get("dy")
-            if dx is not None and dy is not None and (dx**2 + dy**2) > 1e-6:
-                heading = math.atan2(dx, dy)
-                arena_vx = fwd * math.sin(heading) + lat * math.cos(heading)
-                arena_vy = fwd * math.cos(heading) - lat * math.sin(heading)
-            else:
-                arena_vx, arena_vy = fwd, lat
-            processor.set_imu_velocity([arena_vx, arena_vy, vz])
-        except Exception:
-            pass
-
         # Run pose estimation (latency-aware)
         try:
             with _pos_cfg_lock:
                 latency_comp_s = max(0.0, float(_pos_cfg.get("latency_comp_s", 0.05)))
+                sync_max_gap_s = max(0.01, float(_pos_cfg.get("sync_max_gap_s", 0.20)))
             result = processor.process_frame(
                 frame,
                 frame_ts=ts,
@@ -3133,24 +3245,18 @@ def positioning_loop():
         direction = result.get("dir")
         stale = result.get("stale", True)
 
-        # Compute marker pixel sizes and centers from raw detection
-        # (always available when markers are detected, even without ref pose)
-        raw_pixel_sizes = {}
-        raw_centers = {}
-        raw_seen_ids = []
-        try:
-            if raw_corners is not None and raw_ids is not None and len(raw_ids) > 0:
-                for i, mid_arr in enumerate(raw_ids):
-                    mid = int(mid_arr[0]) if hasattr(mid_arr, '__len__') else int(mid_arr)
-                    raw_seen_ids.append(mid)
-                    pts = raw_corners[i].reshape(4, 2)
-                    side_lens = [float(np.linalg.norm(pts[j] - pts[(j + 1) % 4])) for j in range(4)]
-                    raw_pixel_sizes[str(mid)] = round(float(np.mean(side_lens)), 2)
-                    cx_px = round(float(np.mean(pts[:, 0])), 1)
-                    cy_px = round(float(np.mean(pts[:, 1])), 1)
-                    raw_centers[str(mid)] = [cx_px, cy_px]
-        except Exception as px_err:
-            print(f"[POS] pixel size computation error: {px_err}")
+        # Match telemetry to this frame timestamp (compensate camera pipeline delay)
+        tel_target_ts = ts - latency_comp_s
+        tel_match = _telemetry_at(tel_target_ts, max_gap_s=sync_max_gap_s)
+        tel_sample = tel_match.get("sample") or {}
+        tel_quality = tel_match.get("quality", "none")
+        tel_age_s = tel_match.get("age_s")
+        if tel_quality in {"none", "stale"}:
+            tel_vgx = tel_vgy = tel_vgz = 0.0
+        else:
+            tel_vgx = float(tel_sample.get("vgx") or 0.0)
+            tel_vgy = float(tel_sample.get("vgy") or 0.0)
+            tel_vgz = float(tel_sample.get("vgz") or 0.0)
 
         # FPS tracking
         global _pos_fps_counter, _pos_fps_last_reset, _pos_fps_current
@@ -3173,15 +3279,15 @@ def positioning_loop():
             _pos_st["markers"] = {str(k): round(float(v), 4)
                                    for k, v in (result.get("marker_weights") or {}).items()}
             _pos_st["ref_markers"] = list(result.get("ref_markers") or [])
-            # Use raw detection for seen_markers (always available)
-            _pos_st["seen_markers"] = raw_seen_ids if raw_seen_ids else list(result.get("seen_markers") or [])
-            _pos_st["seen_count"] = len(raw_seen_ids) if raw_seen_ids else int(result.get("seen_count") or 0)
-            # Always use raw-computed pixel data (works even without ref pose)
-            _pos_st["marker_pixel_sizes"] = raw_pixel_sizes
-            _pos_st["marker_centers"] = raw_centers
+            _pos_st["seen_markers"] = list(result.get("seen_markers") or [])
+            _pos_st["seen_count"] = int(result.get("seen_count") or 0)
             _pos_st["stale"] = stale
-            _pos_st["dead_reckoning"] = result.get("dead_reckoning", False)
             _pos_st["ts"] = ts
+            _pos_st["tel_vgx"] = round(tel_vgx, 3)
+            _pos_st["tel_vgy"] = round(tel_vgy, 3)
+            _pos_st["tel_vgz"] = round(tel_vgz, 3)
+            _pos_st["sync_quality"] = tel_quality
+            _pos_st["sync_age_ms"] = round(float(tel_age_s) * 1000.0, 1) if tel_age_s is not None else None
             _pos_st["fps"] = _pos_fps_current
             _pos_st["frame_w"] = w
             _pos_st["frame_h"] = h
@@ -3207,27 +3313,7 @@ def positioning_loop():
                 with _pos_annotated_lock:
                     _pos_annotated_jpeg = jpg2.tobytes()
             # Write frame to recording if active (raw or annotated)
-            with _rec_lock:
-                if _rec_enabled:
-                    try:
-                        out_frame = frame if _rec_raw else ann
-                        fh_actual, fw_actual = out_frame.shape[:2]
-                        # Lazy-create writer on first frame — guarantees correct resolution
-                        if _rec_writer is None:
-                            fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-                            fps_t = _pos_fps_current or 5.0
-                            _rec_writer = cv2.VideoWriter(_rec_path, fourcc, fps_t, (fw_actual, fh_actual))
-                            if _rec_writer.isOpened():
-                                print(f"[REC] Writer created: {fw_actual}x{fh_actual} @ {fps_t}fps → {_rec_path}")
-                            else:
-                                print(f"[REC] ERROR: Writer failed to open for {fw_actual}x{fh_actual}")
-                                _rec_writer = None
-                        if _rec_writer is not None:
-                            _rec_writer.write(out_frame)
-                            _rec_frame_count += 1
-                    except Exception as rec_err:
-                        if _rec_frame_count == 0:
-                            print(f"[REC] Write error on first frame: {rec_err}")
+            _rec_write_frame(frame if _rec_raw else ann)
         except Exception:
             pass
 
@@ -3286,6 +3372,44 @@ def api_position_video():
                     headers={"Cache-Control": "no-cache"})
 
 
+def _rec_write_frame(bgr_frame):
+    """Write a frame to the active recording, lazy-creating VideoWriter from
+    the actual incoming frame dimensions. Logs errors instead of swallowing
+    them silently."""
+    global _rec_writer, _rec_writer_size, _rec_frame_count
+    if bgr_frame is None:
+        return
+    with _rec_lock:
+        if not _rec_enabled:
+            return
+        h, w = bgr_frame.shape[:2]
+        # Lazy-create writer on first frame, or recreate on dimension change
+        if _rec_writer is None or _rec_writer_size != (w, h):
+            # Close any previous writer (dimension change mid-recording)
+            if _rec_writer is not None:
+                try: _rec_writer.release()
+                except Exception: pass
+                _rec_writer = None
+            try:
+                fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+                writer = cv2.VideoWriter(_rec_path, fourcc, _rec_fps_target, (w, h))
+                if not writer.isOpened():
+                    print(f"[REC] ERROR: VideoWriter failed to open for {_rec_path} @ {w}x{h}")
+                    return
+                _rec_writer = writer
+                _rec_writer_size = (w, h)
+                print(f"[REC] Writer opened: {_rec_path} @ {w}x{h} {_rec_fps_target}fps "
+                      f"({'raw' if _rec_raw else 'annotated'})")
+            except Exception as e:
+                print(f"[REC] ERROR opening writer: {e}")
+                return
+        try:
+            _rec_writer.write(bgr_frame)
+            _rec_frame_count += 1
+        except Exception as e:
+            print(f"[REC] write failed (frame {_rec_frame_count}): {e}")
+
+
 @app.get("/api/video/record/status")
 def api_rec_status():
     with _rec_lock:
@@ -3295,6 +3419,7 @@ def api_rec_status():
 @app.post("/api/video/record/start")
 def api_rec_start():
     global _rec_enabled, _rec_raw, _rec_writer, _rec_path, _rec_frame_count
+    global _rec_fname, _rec_fps_target, _rec_writer_size
     data = request.get_json(silent=True) or {}
     with _rec_lock:
         if _rec_enabled:
@@ -3306,19 +3431,20 @@ def api_rec_start():
         rec_dir = Path(__file__).parent / "recordings"
         rec_dir.mkdir(exist_ok=True)
         full_path = str(rec_dir / fname)
-        try:
-            # Don't create the VideoWriter yet — we create it lazily on the
-            # first frame so we know the actual resolution. This avoids the
-            # resolution mismatch issue (writer at 960x720 vs frame at 1280x720).
-            _rec_writer = None  # created on first frame
-            _rec_path = full_path
-            _rec_frame_count = 0
-            _rec_raw = raw_mode
-            _rec_enabled = True
-            print(f"[REC] Recording armed ({'raw' if raw_mode else 'annotated'}): {full_path} (writer created on first frame)")
-            return jsonify(ok=True, path=full_path)
-        except Exception as e:
-            return jsonify(ok=False, error=str(e))
+        # DEFER VideoWriter creation to first frame — that way we get the
+        # real frame dimensions (avoids silent write-fails when the writer
+        # was opened at 960x720 but frames arrive at 1280x720, which
+        # produced the old 257-byte empty-MP4 bug).
+        _rec_writer = None
+        _rec_writer_size = (0, 0)
+        _rec_path = full_path
+        _rec_fname = fname
+        _rec_frame_count = 0
+        _rec_raw = raw_mode
+        _rec_fps_target = float(_pos_fps_current or 5.0)
+        _rec_enabled = True
+        print(f"[REC] Recording armed ({'raw' if raw_mode else 'annotated'}): {full_path} — waiting for first frame")
+        return jsonify(ok=True, path=full_path)
 
 
 @app.post("/api/video/record/stop")
@@ -3358,6 +3484,7 @@ def api_pos_config_get():
 @app.post("/api/position/config")
 def api_pos_config_set():
     data = request.get_json(silent=True) or {}
+    apply_marker_size = False
     with _pos_cfg_lock:
         if "enabled" in data:
             _pos_cfg["enabled"] = bool(data["enabled"])
@@ -3366,8 +3493,51 @@ def api_pos_config_set():
         if "detect_profile" in data:
             _pos_cfg["detect_profile"] = str(data["detect_profile"])
         if "latency_comp_s" in data:
-            _pos_cfg["latency_comp_s"] = float(data["latency_comp_s"])
+            _pos_cfg["latency_comp_s"] = max(0.0, min(1.0, float(data["latency_comp_s"])))
+        if "sync_max_gap_s" in data:
+            _pos_cfg["sync_max_gap_s"] = max(0.01, min(2.0, float(data["sync_max_gap_s"])))
+        if "telemetry_buffer_s" in data:
+            _pos_cfg["telemetry_buffer_s"] = max(1.0, min(30.0, float(data["telemetry_buffer_s"])))
+        # Live filter params — applied to _pos_processor below
+        if "enable_kalman_filter" in data:
+            _pos_cfg["enable_kalman_filter"] = bool(data["enable_kalman_filter"])
+        if "marker_size_m" in data:
+            _pos_cfg["marker_size_m"] = max(0.05, min(2.0, float(data["marker_size_m"])))
+            apply_marker_size = True
+        if "top_k_markers" in data:
+            _pos_cfg["top_k_markers"] = max(0, min(10, int(data["top_k_markers"])))
+        if "outlier_reject_m" in data:
+            _pos_cfg["outlier_reject_m"] = max(0.1, min(20.0, float(data["outlier_reject_m"])))
         cfg_snap = dict(_pos_cfg)
+
+    # Apply live filter changes to running processor
+    try:
+        if _pos_processor is not None:
+            if "enable_kalman_filter" in data:
+                _pos_processor.enable_kalman_filter = bool(data["enable_kalman_filter"])
+                # Reset Kalman state so toggling doesn't carry stale history
+                try:
+                    for kf in _pos_processor.kf_pos:
+                        kf.reset()
+                except Exception:
+                    pass
+                print(f"[POS] Kalman filter {'ENABLED' if _pos_processor.enable_kalman_filter else 'DISABLED'} (live)")
+            if apply_marker_size:
+                # Also reflect in arena_cfg so _apply_arena_cfg_to_processor can be used
+                with _arena_cfg_lock:
+                    _arena_cfg["marker_size_m"] = cfg_snap["marker_size_m"]
+                _apply_arena_cfg_to_processor(_pos_processor)
+                print(f"[POS] marker_size_m set to {cfg_snap['marker_size_m']}m (live)")
+            if "top_k_markers" in data:
+                tk = int(cfg_snap["top_k_markers"])
+                _pos_processor.top_k_markers = tk if tk > 0 else 4
+                print(f"[POS] top_k_markers set to {tk if tk > 0 else '4 (auto)'} (live)")
+            if "outlier_reject_m" in data:
+                _pos_processor.outlier_reject_m = float(cfg_snap["outlier_reject_m"])
+                print(f"[POS] outlier_reject_m set to {cfg_snap['outlier_reject_m']}m (live)")
+    except Exception as e:
+        print(f"[POS] live config apply error: {e}")
+
     cfg_snap.pop("camera_matrix", None)
     cfg_snap.pop("dist_coeffs", None)
     try:
