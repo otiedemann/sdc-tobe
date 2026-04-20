@@ -279,9 +279,15 @@ key_last_seen: Dict[str, float] = {}
 pressed_lock = threading.Lock()
 
 last_state_seen = 0.0
-conn_state = {"connected": False, "last_reconnect": 0.0, "last_verify": 0.0}
+conn_state = {"connected": False, "last_reconnect": 0.0, "last_verify": 0.0,
+              "consecutive_failures": 0, "last_failure_ts": 0.0, "last_error": ""}
 conn_lock = threading.Lock()
 last_conn_print = None
+# Exponential backoff cap — after this many consecutive failures, we force a
+# hard reset (fully destroy + recreate the Olympe Drone object). Past this,
+# sleep time grows up to RECONNECT_BACKOFF_MAX_S between attempts.
+RECONNECT_HARD_RESET_AFTER = 2
+RECONNECT_BACKOFF_MAX_S = 15.0
 
 rc_override: Optional[Tuple[int, int, int, int]] = None
 rc_override_until = 0.0
@@ -1430,6 +1436,27 @@ class OlympeBackend(DroneBackend):
             except Exception:
                 pass
 
+    def hard_reset(self):
+        """Fully destroy the current Drone object so the next connect() creates
+        a fresh one. Needed when Olympe's internal state is corrupted (video
+        pipeline timed out, piloting interface won't launch, etc.) — reusing
+        the same Drone instance after such failures never recovers."""
+        d = self.drone
+        self.drone = None
+        self._has_piloting_api = None   # re-probe after fresh connect
+        if d is None:
+            return
+        # Best-effort cleanup. Any of these may hang or raise; we catch
+        # everything because the goal is to drop references and let GC/
+        # finalisers handle the rest.
+        try: d.disconnect()
+        except Exception: pass
+        try: d.destroy()
+        except Exception: pass
+        # Small pause to let Olympe's background threads finish cancelling
+        # any pending futures before we recreate the Drone next cycle.
+        time.sleep(0.5)
+
     def is_connected(self) -> bool:
         return self._check_connected(self.drone)
 
@@ -2283,6 +2310,13 @@ def telemetry_loop():
 
 
 def reconnect_loop():
+    """Watchdog: maintain the drone connection. When disconnected, retry with
+    exponential backoff. After a few consecutive failures (or if we detect a
+    corrupted Olympe state), do a HARD RESET — fully destroy and recreate
+    the Drone object so the next connect() starts from a clean slate.
+    Without this, 'Connection reset by peer' errors can leave Olympe stuck
+    forever in 'Unable to launch piloting interface' because pdraw cleanup
+    timed out and the old Drone instance is unusable."""
     global last_conn_print, last_state_seen
     while running:
         b = backend
@@ -2295,11 +2329,17 @@ def reconnect_loop():
             last_try = conn_state["last_reconnect"]
             last_verify = conn_state.get("last_verify", 0.0)
             connected_now = conn_state["connected"]
+            n_fail = conn_state.get("consecutive_failures", 0)
 
         if connected_now != last_conn_print:
             tag = drone_type.upper()
             print(f"[{tag}] Drone connected" if connected_now else f"[{tag}] Drone disconnected (retrying...)")
             last_conn_print = connected_now
+            if connected_now:
+                # Success — reset failure counter
+                with conn_lock:
+                    conn_state["consecutive_failures"] = 0
+                    conn_state["last_error"] = ""
 
         # Health check while connected
         if connected_now:
@@ -2320,11 +2360,17 @@ def reconnect_loop():
                         print("[ANAFI] Connection lost (no telemetry + ping failed)")
                         with conn_lock:
                             conn_state["connected"] = False
+                            conn_state["last_failure_ts"] = now
+                            # Count the drop so the reconnect path can escalate to hard-reset
+                            conn_state["consecutive_failures"] = n_fail + 1
+                            conn_state["last_error"] = "telemetry stale + ping failed"
             time.sleep(2.0)
             continue
 
-        # Retry connect
-        should_retry = (now - last_try) >= CONNECT_RETRY_S
+        # Backoff: grows from CONNECT_RETRY_S up to RECONNECT_BACKOFF_MAX_S
+        backoff = min(CONNECT_RETRY_S * (2 ** max(0, n_fail - 1)),
+                      RECONNECT_BACKOFF_MAX_S)
+        should_retry = (now - last_try) >= backoff
         if drone_type == "tello":
             should_retry = should_retry and _host_reachable(drone_ip)
 
@@ -2332,12 +2378,34 @@ def reconnect_loop():
             with conn_lock:
                 conn_state["last_reconnect"] = now
                 conn_state["connected"] = False
+
+            # HARD RESET: after 2+ consecutive failures, destroy the Drone
+            # object so we don't keep retrying on a corrupted Olympe instance.
+            if drone_type != "tello" and n_fail >= RECONNECT_HARD_RESET_AFTER:
+                hr = getattr(b, "hard_reset", None)
+                if callable(hr):
+                    print(f"[{drone_type.upper()}] Hard-resetting Olympe Drone object "
+                          f"(failure #{n_fail}, backoff={backoff:.1f}s)")
+                    try:
+                        hr()
+                    except Exception as e:
+                        print(f"[{drone_type.upper()}] hard_reset raised: {e}")
+
             try:
+                print(f"[{drone_type.upper()}] Attempting reconnect "
+                      f"(failure #{n_fail}, backoff={backoff:.1f}s)...")
                 ok = b.connect()
                 if ok:
                     b.on_connect()
                     last_state_seen = time.time()  # seed for health check
                     print(f"[{drone_type.upper()}] Connection verified")
+                    with conn_lock:
+                        conn_state["consecutive_failures"] = 0
+                        conn_state["last_error"] = ""
+                else:
+                    with conn_lock:
+                        conn_state["consecutive_failures"] = n_fail + 1
+                        conn_state["last_error"] = "connect() returned False"
                 with conn_lock:
                     conn_state["connected"] = ok
                     conn_state["last_verify"] = now
@@ -2347,6 +2415,8 @@ def reconnect_loop():
                 print(f"[{drone_type.upper()}] Connect failed: {e}")
                 with conn_lock:
                     conn_state["connected"] = False
+                    conn_state["consecutive_failures"] = n_fail + 1
+                    conn_state["last_error"] = str(e)[:120]
 
         time.sleep(1.0)
 
@@ -3028,6 +3098,11 @@ def api_telemetry():
     payload["state_age_s"] = round(age, 3)
     payload["state_fresh"] = age <= 2.0
     payload["drone_type"] = drone_type
+    # Connection watchdog telemetry — lets the C2 show reconnect activity
+    with conn_lock:
+        payload["connected"] = bool(conn_state.get("connected", False))
+        payload["reconnect_failures"] = int(conn_state.get("consecutive_failures", 0))
+        payload["reconnect_last_error"] = conn_state.get("last_error", "") or ""
     resp = jsonify(payload)
     resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
     resp.headers["Pragma"] = "no-cache"
