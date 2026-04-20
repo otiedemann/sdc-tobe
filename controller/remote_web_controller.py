@@ -322,6 +322,15 @@ HTML = """
             <div class=\"meter-track\"><div id=\"battery_bar\" class=\"meter-fill\"></div></div>
           </div>
         </div>
+        <div id=\"compass_wrap\" style=\"display:flex;gap:12px;align-items:center;margin-top:10px;padding:8px;background:#0f172a;border:1px solid #1e293b;border-radius:4px;\">
+          <canvas id=\"compass_canvas\" width=\"96\" height=\"96\" style=\"flex:0 0 96px;display:block;\"></canvas>
+          <div class=\"small\" style=\"flex:1;line-height:1.55;\">
+            <div>Heading: <b style=\"color:#e2e8f0;\"><span id=\"compass_abs\">--</span>°</b> <span style=\"color:#64748b;font-size:11px;\">(mag)</span></div>
+            <div>Takeoff ref: <span id=\"compass_ref\" style=\"color:#94a3b8;\">—</span></div>
+            <div>Relative: <b style=\"color:#3b82f6;\"><span id=\"compass_rel\">--</span>°</b></div>
+            <button id=\"compass_reset\" title=\"Re-capture takeoff heading from current yaw\" style=\"margin-top:4px;height:22px;font-size:11px;padding:0 8px;background:#1e3a5f;border-color:#3b82f6;\">Reset ref</button>
+          </div>
+        </div>
         <div id=\"telemetry\" class=\"small\" style=\"white-space:pre-wrap; margin-top:10px;\">loading...</div>
         <button id=\"graphs_toggle\" onclick=\"window.toggleGraphs && window.toggleGraphs()\" style=\"margin-top:8px;height:32px;font-size:12px;padding:0 14px;background:#1e3a5f;border-color:#3b82f6;\">Show Graphs</button>
       </div>
@@ -1508,7 +1517,173 @@ function _handleTelemetryData(t) {
   setMeter('battery_bar', 'battery_val', battery, '%');
   document.getElementById('telemetry').textContent =
     `battery: ${t.battery ?? '-'} %\\ntemperature: ${t.temperature ?? '-'} °C\\nheight: ${t.height_cm ?? '-'} cm\\ntof: ${t.tof_cm ?? '-'} cm\\nbarometer: ${t.barometer_cm ?? '-'} cm\\nflight time: ${t.flight_time_s ?? '-'} s\\nspeed: ${t.speed ?? '-'}\\nwifi snr: ${t.wifi_snr ?? '-'}\\nattitude p/r/y: ${t.pitch ?? '-'} / ${t.roll ?? '-'} / ${t.yaw ?? '-'}\\nvelocity xyz: ${t.vgx ?? '-'} / ${t.vgy ?? '-'} / ${t.vgz ?? '-'}\\naccel xyz: ${t.agx ?? '-'} / ${t.agy ?? '-'} / ${t.agz ?? '-'}\\nsdk version: ${t.sdk_version ?? '-'}\\nserial number: ${t.serial_number ?? '-'}\\nmission pad mid/x/y/z/mpry: ${t.mid ?? '-'} / ${t.pad_x ?? '-'} / ${t.pad_y ?? '-'} / ${t.pad_z ?? '-'} / ${t.pad_mpry ?? '-'}\\ngps: ${t.gps_lat ?? '-'}, ${t.gps_lon ?? '-'} alt=${t.gps_alt ?? '-'}m\\ngimbal p/r/y: ${t.gimbal_pitch ?? '-'} / ${t.gimbal_roll ?? '-'} / ${t.gimbal_yaw ?? '-'}\\nstate age: ${t.state_age_s ?? '-'} s\\nflying: ${t.flying}\\nconnected: ${t.connected}`;
+
+  // ── Compass + takeoff-heading tracking ──
+  updateCompass(t);
 }
+
+// ── Compass widget: tracks magnetic yaw + takeoff-reference heading ──
+// Anafi AttitudeChanged.yaw is NED yaw in degrees, range -180..+180
+// (positive = nose turned clockwise when viewed from above). Magnetic-north
+// referenced, NOT true north (no declination correction without GPS).
+// Takeoff heading is captured the first time `flying` transitions false → true
+// and on the Reset button. Stored per active drone id.
+let _takeoffHeadingByDrone = {};
+let _wasFlying = false;
+let _lastActiveDroneId = null;
+
+function normDeg(d) {
+  // Normalize any degree to -180..+180
+  while (d >  180) d -= 360;
+  while (d < -180) d += 360;
+  return d;
+}
+
+function updateCompass(t) {
+  const cv = document.getElementById('compass_canvas');
+  if (!cv) return;
+
+  // Detect active-drone change — clear stale state so ref doesn't bleed across drones
+  const activeId = (window.currentDroneId || t.drone_id || 'default');
+  if (activeId !== _lastActiveDroneId) {
+    _lastActiveDroneId = activeId;
+    _wasFlying = Boolean(t.flying);  // don't auto-capture just from switching
+  }
+
+  const yawDeg = (typeof t.yaw === 'number') ? t.yaw : null;
+  const flying = Boolean(t.flying);
+
+  // Capture takeoff heading on false→true transition of `flying`
+  if (flying && !_wasFlying && yawDeg != null) {
+    _takeoffHeadingByDrone[activeId] = yawDeg;
+  }
+  _wasFlying = flying;
+
+  const takeoffRef = _takeoffHeadingByDrone[activeId];
+  const relative = (yawDeg != null && takeoffRef != null)
+    ? normDeg(yawDeg - takeoffRef) : null;
+
+  // Numeric labels
+  document.getElementById('compass_abs').textContent =
+    yawDeg != null ? yawDeg.toFixed(0) : '--';
+  document.getElementById('compass_ref').textContent =
+    takeoffRef != null ? takeoffRef.toFixed(0) + '°' : 'not captured';
+  document.getElementById('compass_rel').textContent =
+    relative != null ? (relative >= 0 ? '+' : '') + relative.toFixed(0) : '--';
+
+  // Draw the compass rose
+  const ctx = cv.getContext('2d');
+  const W = cv.width, H = cv.height;
+  const cx = W / 2, cy = H / 2;
+  const r = Math.min(W, H) / 2 - 6;
+
+  ctx.clearRect(0, 0, W, H);
+
+  // Outer ring
+  ctx.strokeStyle = '#334155';
+  ctx.lineWidth = 1.5;
+  ctx.beginPath();
+  ctx.arc(cx, cy, r, 0, Math.PI * 2);
+  ctx.stroke();
+
+  // Tick marks every 30°
+  ctx.strokeStyle = '#475569';
+  ctx.lineWidth = 1;
+  for (let a = 0; a < 360; a += 30) {
+    const rad = (a - 90) * Math.PI / 180;  // 0° = up = North
+    const isCardinal = (a % 90 === 0);
+    const inner = r - (isCardinal ? 8 : 4);
+    ctx.beginPath();
+    ctx.moveTo(cx + inner * Math.cos(rad), cy + inner * Math.sin(rad));
+    ctx.lineTo(cx + (r - 1) * Math.cos(rad), cy + (r - 1) * Math.sin(rad));
+    ctx.stroke();
+  }
+
+  // Cardinal labels
+  ctx.fillStyle = '#94a3b8';
+  ctx.font = 'bold 10px sans-serif';
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.fillText('N', cx, cy - r + 7);
+  ctx.fillText('S', cx, cy + r - 7);
+  ctx.fillText('E', cx + r - 7, cy);
+  ctx.fillText('W', cx - r + 7, cy);
+
+  // Takeoff-heading marker on the rim (small gray triangle)
+  if (takeoffRef != null) {
+    const radRef = (takeoffRef - 90) * Math.PI / 180;
+    const mx = cx + (r - 2) * Math.cos(radRef);
+    const my = cy + (r - 2) * Math.sin(radRef);
+    const backLen = 6;
+    ctx.fillStyle = '#64748b';
+    ctx.beginPath();
+    ctx.arc(mx, my, 3.5, 0, Math.PI * 2);
+    ctx.fill();
+    // Small "T" label next to it
+    ctx.fillStyle = '#94a3b8';
+    ctx.font = '9px sans-serif';
+    const tx = cx + (r + 6) * Math.cos(radRef);
+    const ty = cy + (r + 6) * Math.sin(radRef);
+    ctx.fillText('T', tx, ty);
+  }
+
+  // Current heading needle — red/blue dual (red=front, blue=tail)
+  if (yawDeg != null) {
+    const rad = (yawDeg - 90) * Math.PI / 180;
+    const nx = cx + (r - 10) * Math.cos(rad);
+    const ny = cy + (r - 10) * Math.sin(rad);
+    const tx = cx - (r - 18) * Math.cos(rad);
+    const ty = cy - (r - 18) * Math.sin(rad);
+    // Tail (blue)
+    ctx.strokeStyle = '#3b82f6';
+    ctx.lineWidth = 2.5;
+    ctx.beginPath();
+    ctx.moveTo(cx, cy);
+    ctx.lineTo(tx, ty);
+    ctx.stroke();
+    // Front (red arrow)
+    ctx.strokeStyle = '#ef4444';
+    ctx.lineWidth = 2.5;
+    ctx.beginPath();
+    ctx.moveTo(cx, cy);
+    ctx.lineTo(nx, ny);
+    ctx.stroke();
+    // Arrowhead
+    const ahLen = 7, ahAngle = 0.35;
+    ctx.fillStyle = '#ef4444';
+    ctx.beginPath();
+    ctx.moveTo(nx, ny);
+    ctx.lineTo(
+      nx - ahLen * Math.cos(rad - ahAngle),
+      ny - ahLen * Math.sin(rad - ahAngle));
+    ctx.lineTo(
+      nx - ahLen * Math.cos(rad + ahAngle),
+      ny - ahLen * Math.sin(rad + ahAngle));
+    ctx.closePath();
+    ctx.fill();
+  }
+
+  // Center pivot
+  ctx.fillStyle = '#e2e8f0';
+  ctx.beginPath();
+  ctx.arc(cx, cy, 2.5, 0, Math.PI * 2);
+  ctx.fill();
+}
+
+// Manual Reset-ref button — re-capture takeoff heading from current yaw
+document.addEventListener('DOMContentLoaded', () => {
+  const btn = document.getElementById('compass_reset');
+  if (btn) btn.addEventListener('click', () => {
+    const t = lastTelemetry || {};
+    const activeId = (activeDroneId || t.drone_id || 'default');
+    if (typeof t.yaw === 'number') {
+      _takeoffHeadingByDrone[activeId] = t.yaw;
+      updateCompass(t);
+    } else {
+      alert('No yaw data available — drone not connected?');
+    }
+  });
+});
 
 startTelemetrySSE();
 // Fallback poll — only triggers if SSE is down (reduced from 700ms to 2000ms since SSE handles real-time)
