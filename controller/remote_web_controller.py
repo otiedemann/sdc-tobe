@@ -322,6 +322,15 @@ HTML = """
             <div class=\"meter-track\"><div id=\"battery_bar\" class=\"meter-fill\"></div></div>
           </div>
         </div>
+        <div id=\"compass_wrap\" style=\"display:flex;gap:12px;align-items:center;margin-top:10px;padding:8px;background:#0f172a;border:1px solid #1e293b;border-radius:4px;\">
+          <canvas id=\"compass_canvas\" width=\"96\" height=\"96\" style=\"flex:0 0 96px;display:block;\"></canvas>
+          <div class=\"small\" style=\"flex:1;line-height:1.55;\">
+            <div>Heading: <b style=\"color:#e2e8f0;\"><span id=\"compass_abs\">--</span>°</b> <span style=\"color:#64748b;font-size:11px;\">(mag)</span></div>
+            <div>Takeoff ref: <span id=\"compass_ref\" style=\"color:#94a3b8;\">—</span></div>
+            <div>Relative: <b style=\"color:#3b82f6;\"><span id=\"compass_rel\">--</span>°</b></div>
+            <button id=\"compass_reset\" title=\"Re-capture takeoff heading from current yaw\" style=\"margin-top:4px;height:22px;font-size:11px;padding:0 8px;background:#1e3a5f;border-color:#3b82f6;\">Reset ref</button>
+          </div>
+        </div>
         <div id=\"telemetry\" class=\"small\" style=\"white-space:pre-wrap; margin-top:10px;\">loading...</div>
         <button id=\"graphs_toggle\" onclick=\"window.toggleGraphs && window.toggleGraphs()\" style=\"margin-top:8px;height:32px;font-size:12px;padding:0 14px;background:#1e3a5f;border-color:#3b82f6;\">Show Graphs</button>
       </div>
@@ -996,6 +1005,25 @@ HTML = """
             <span id=\"pos_latency_val\" style=\"font-size:11px;color:#94a3b8;\">200</span>
           </label>
         </div>
+        <div style=\"display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:6px;padding:6px;background:#0f172a;border:1px solid #1e293b;border-radius:4px;\">
+          <span class=\"small\" style=\"color:#64748b;min-width:70px;\">Filters:</span>
+          <label style=\"display:flex;align-items:center;gap:4px;cursor:pointer;\">
+            <input type=\"checkbox\" id=\"pos_kalman\" style=\"accent-color:#3b82f6;\" />
+            <span class=\"small\" style=\"color:#e2e8f0;\">Kalman filter</span>
+          </label>
+          <label class=\"small\" style=\"color:#94a3b8;\">Marker size (m):
+            <input id=\"pos_marker_size\" type=\"number\" min=\"0.05\" max=\"2.0\" step=\"0.01\" value=\"0.5\" style=\"width:64px;\" />
+          </label>
+          <label class=\"small\" style=\"color:#94a3b8;\">Top-K:
+            <input id=\"pos_top_k\" type=\"number\" min=\"0\" max=\"10\" step=\"1\" value=\"0\" style=\"width:50px;\" title=\"0 = auto (4)\" />
+          </label>
+          <label class=\"small\" style=\"color:#94a3b8;\">Outlier (m):
+            <input id=\"pos_outlier\" type=\"number\" min=\"0.1\" max=\"20\" step=\"0.1\" value=\"2.5\" style=\"width:60px;\" />
+          </label>
+          <button id=\"pos_filters_apply\" class=\"pos-cfg\" style=\"height:26px;font-size:11px;padding:0 10px;\">Apply filters</button>
+          <button id=\"pos_filters_reset\" class=\"pos-cfg\" style=\"height:26px;font-size:11px;padding:0 10px;background:#1e2a3a;\" title=\"Restore defaults: Kalman on, marker 0.5m, top-K auto, outlier 2.5m\">Defaults</button>
+          <span id=\"pos_filters_status\" class=\"small\" style=\"color:#64748b;\"></span>
+        </div>
         <div style=\"display:flex;gap:8px;flex-wrap:wrap;align-items:center;\">
           <button id=\"pos_cfg_save\" class=\"pos-cfg\">Apply Config</button>
           <label style=\"cursor:pointer;\">
@@ -1508,7 +1536,173 @@ function _handleTelemetryData(t) {
   setMeter('battery_bar', 'battery_val', battery, '%');
   document.getElementById('telemetry').textContent =
     `battery: ${t.battery ?? '-'} %\\ntemperature: ${t.temperature ?? '-'} °C\\nheight: ${t.height_cm ?? '-'} cm\\ntof: ${t.tof_cm ?? '-'} cm\\nbarometer: ${t.barometer_cm ?? '-'} cm\\nflight time: ${t.flight_time_s ?? '-'} s\\nspeed: ${t.speed ?? '-'}\\nwifi snr: ${t.wifi_snr ?? '-'}\\nattitude p/r/y: ${t.pitch ?? '-'} / ${t.roll ?? '-'} / ${t.yaw ?? '-'}\\nvelocity xyz: ${t.vgx ?? '-'} / ${t.vgy ?? '-'} / ${t.vgz ?? '-'}\\naccel xyz: ${t.agx ?? '-'} / ${t.agy ?? '-'} / ${t.agz ?? '-'}\\nsdk version: ${t.sdk_version ?? '-'}\\nserial number: ${t.serial_number ?? '-'}\\nmission pad mid/x/y/z/mpry: ${t.mid ?? '-'} / ${t.pad_x ?? '-'} / ${t.pad_y ?? '-'} / ${t.pad_z ?? '-'} / ${t.pad_mpry ?? '-'}\\ngps: ${t.gps_lat ?? '-'}, ${t.gps_lon ?? '-'} alt=${t.gps_alt ?? '-'}m\\ngimbal p/r/y: ${t.gimbal_pitch ?? '-'} / ${t.gimbal_roll ?? '-'} / ${t.gimbal_yaw ?? '-'}\\nstate age: ${t.state_age_s ?? '-'} s\\nflying: ${t.flying}\\nconnected: ${t.connected}`;
+
+  // ── Compass + takeoff-heading tracking ──
+  updateCompass(t);
 }
+
+// ── Compass widget: tracks magnetic yaw + takeoff-reference heading ──
+// Anafi AttitudeChanged.yaw is NED yaw in degrees, range -180..+180
+// (positive = nose turned clockwise when viewed from above). Magnetic-north
+// referenced, NOT true north (no declination correction without GPS).
+// Takeoff heading is captured the first time `flying` transitions false → true
+// and on the Reset button. Stored per active drone id.
+let _takeoffHeadingByDrone = {};
+let _wasFlying = false;
+let _lastActiveDroneId = null;
+
+function normDeg(d) {
+  // Normalize any degree to -180..+180
+  while (d >  180) d -= 360;
+  while (d < -180) d += 360;
+  return d;
+}
+
+function updateCompass(t) {
+  const cv = document.getElementById('compass_canvas');
+  if (!cv) return;
+
+  // Detect active-drone change — clear stale state so ref doesn't bleed across drones
+  const activeId = (window.currentDroneId || t.drone_id || 'default');
+  if (activeId !== _lastActiveDroneId) {
+    _lastActiveDroneId = activeId;
+    _wasFlying = Boolean(t.flying);  // don't auto-capture just from switching
+  }
+
+  const yawDeg = (typeof t.yaw === 'number') ? t.yaw : null;
+  const flying = Boolean(t.flying);
+
+  // Capture takeoff heading on false→true transition of `flying`
+  if (flying && !_wasFlying && yawDeg != null) {
+    _takeoffHeadingByDrone[activeId] = yawDeg;
+  }
+  _wasFlying = flying;
+
+  const takeoffRef = _takeoffHeadingByDrone[activeId];
+  const relative = (yawDeg != null && takeoffRef != null)
+    ? normDeg(yawDeg - takeoffRef) : null;
+
+  // Numeric labels
+  document.getElementById('compass_abs').textContent =
+    yawDeg != null ? yawDeg.toFixed(0) : '--';
+  document.getElementById('compass_ref').textContent =
+    takeoffRef != null ? takeoffRef.toFixed(0) + '°' : 'not captured';
+  document.getElementById('compass_rel').textContent =
+    relative != null ? (relative >= 0 ? '+' : '') + relative.toFixed(0) : '--';
+
+  // Draw the compass rose
+  const ctx = cv.getContext('2d');
+  const W = cv.width, H = cv.height;
+  const cx = W / 2, cy = H / 2;
+  const r = Math.min(W, H) / 2 - 6;
+
+  ctx.clearRect(0, 0, W, H);
+
+  // Outer ring
+  ctx.strokeStyle = '#334155';
+  ctx.lineWidth = 1.5;
+  ctx.beginPath();
+  ctx.arc(cx, cy, r, 0, Math.PI * 2);
+  ctx.stroke();
+
+  // Tick marks every 30°
+  ctx.strokeStyle = '#475569';
+  ctx.lineWidth = 1;
+  for (let a = 0; a < 360; a += 30) {
+    const rad = (a - 90) * Math.PI / 180;  // 0° = up = North
+    const isCardinal = (a % 90 === 0);
+    const inner = r - (isCardinal ? 8 : 4);
+    ctx.beginPath();
+    ctx.moveTo(cx + inner * Math.cos(rad), cy + inner * Math.sin(rad));
+    ctx.lineTo(cx + (r - 1) * Math.cos(rad), cy + (r - 1) * Math.sin(rad));
+    ctx.stroke();
+  }
+
+  // Cardinal labels
+  ctx.fillStyle = '#94a3b8';
+  ctx.font = 'bold 10px sans-serif';
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.fillText('N', cx, cy - r + 7);
+  ctx.fillText('S', cx, cy + r - 7);
+  ctx.fillText('E', cx + r - 7, cy);
+  ctx.fillText('W', cx - r + 7, cy);
+
+  // Takeoff-heading marker on the rim (small gray triangle)
+  if (takeoffRef != null) {
+    const radRef = (takeoffRef - 90) * Math.PI / 180;
+    const mx = cx + (r - 2) * Math.cos(radRef);
+    const my = cy + (r - 2) * Math.sin(radRef);
+    const backLen = 6;
+    ctx.fillStyle = '#64748b';
+    ctx.beginPath();
+    ctx.arc(mx, my, 3.5, 0, Math.PI * 2);
+    ctx.fill();
+    // Small "T" label next to it
+    ctx.fillStyle = '#94a3b8';
+    ctx.font = '9px sans-serif';
+    const tx = cx + (r + 6) * Math.cos(radRef);
+    const ty = cy + (r + 6) * Math.sin(radRef);
+    ctx.fillText('T', tx, ty);
+  }
+
+  // Current heading needle — red/blue dual (red=front, blue=tail)
+  if (yawDeg != null) {
+    const rad = (yawDeg - 90) * Math.PI / 180;
+    const nx = cx + (r - 10) * Math.cos(rad);
+    const ny = cy + (r - 10) * Math.sin(rad);
+    const tx = cx - (r - 18) * Math.cos(rad);
+    const ty = cy - (r - 18) * Math.sin(rad);
+    // Tail (blue)
+    ctx.strokeStyle = '#3b82f6';
+    ctx.lineWidth = 2.5;
+    ctx.beginPath();
+    ctx.moveTo(cx, cy);
+    ctx.lineTo(tx, ty);
+    ctx.stroke();
+    // Front (red arrow)
+    ctx.strokeStyle = '#ef4444';
+    ctx.lineWidth = 2.5;
+    ctx.beginPath();
+    ctx.moveTo(cx, cy);
+    ctx.lineTo(nx, ny);
+    ctx.stroke();
+    // Arrowhead
+    const ahLen = 7, ahAngle = 0.35;
+    ctx.fillStyle = '#ef4444';
+    ctx.beginPath();
+    ctx.moveTo(nx, ny);
+    ctx.lineTo(
+      nx - ahLen * Math.cos(rad - ahAngle),
+      ny - ahLen * Math.sin(rad - ahAngle));
+    ctx.lineTo(
+      nx - ahLen * Math.cos(rad + ahAngle),
+      ny - ahLen * Math.sin(rad + ahAngle));
+    ctx.closePath();
+    ctx.fill();
+  }
+
+  // Center pivot
+  ctx.fillStyle = '#e2e8f0';
+  ctx.beginPath();
+  ctx.arc(cx, cy, 2.5, 0, Math.PI * 2);
+  ctx.fill();
+}
+
+// Manual Reset-ref button — re-capture takeoff heading from current yaw
+document.addEventListener('DOMContentLoaded', () => {
+  const btn = document.getElementById('compass_reset');
+  if (btn) btn.addEventListener('click', () => {
+    const t = lastTelemetry || {};
+    const activeId = (activeDroneId || t.drone_id || 'default');
+    if (typeof t.yaw === 'number') {
+      _takeoffHeadingByDrone[activeId] = t.yaw;
+      updateCompass(t);
+    } else {
+      alert('No yaw data available — drone not connected?');
+    }
+  });
+});
 
 startTelemetrySSE();
 // Fallback poll — only triggers if SSE is down (reduced from 700ms to 2000ms since SSE handles real-time)
@@ -1822,16 +2016,46 @@ function drawArena(pos, compPos, dir) {
   ctx.save(); ctx.translate(ax1 - 10, midAy); ctx.rotate(Math.PI / 2);
   ctx.textAlign = 'center'; ctx.fillText('RIGHT', 0, 0); ctx.restore();
 
-  // Arena markers
+  // Arena markers — colored square + bold ID pill placed away from the wall
+  ctx.font = 'bold 11px monospace';
+  ctx.textBaseline = 'middle';
   for (const [id, m] of Object.entries(arenaMarkers)) {
     if (!m.pos) continue;
     const [mx, my] = arenaToCanvas(m.pos[0], m.pos[1]);
     if (mx < PAD - 4 || mx > W - PAD + 4 || my < PAD - 4 || my > H - PAD + 4) continue;
-    ctx.fillStyle = WALL_COLOR[m.wall] || '#94a3b8';
-    ctx.fillRect(mx - 4, my - 4, 8, 8);
-    ctx.fillStyle = '#cbd5e1'; ctx.font = '9px monospace'; ctx.textAlign = 'center';
-    ctx.fillText(id, mx, my - 6);
+
+    // Square marker (slightly larger + outlined for visibility)
+    const color = WALL_COLOR[m.wall] || '#94a3b8';
+    ctx.fillStyle = color;
+    ctx.fillRect(mx - 5, my - 5, 10, 10);
+    ctx.strokeStyle = 'rgba(15,23,42,0.9)'; ctx.lineWidth = 1;
+    ctx.strokeRect(mx - 5.5, my - 5.5, 11, 11);
+
+    // Position label pill on the side away from the wall (so ID doesn't collide with BACK/FRONT/LEFT/RIGHT)
+    // front=y≈0 → label up, back=y≈max → down, left=x≈0 → right, right=x≈max → left
+    const idText = String(id);
+    const tw = ctx.measureText(idText).width;
+    const pillW = tw + 8, pillH = 15;
+    let labelX, labelY, anchor = 'center';
+    const wall = (m.wall || '').toLowerCase();
+    if (wall === 'front')      { labelX = mx; labelY = my - 13; }
+    else if (wall === 'back')  { labelX = mx; labelY = my + 13; }
+    else if (wall === 'left')  { labelX = mx + 9 + pillW / 2; labelY = my; }
+    else if (wall === 'right') { labelX = mx - 9 - pillW / 2; labelY = my; }
+    else                       { labelX = mx; labelY = my - 13; }
+
+    // Dark background pill for legibility
+    ctx.fillStyle = 'rgba(15,23,42,0.9)';
+    ctx.fillRect(labelX - pillW / 2, labelY - pillH / 2, pillW, pillH);
+    ctx.strokeStyle = color; ctx.lineWidth = 1;
+    ctx.strokeRect(labelX - pillW / 2 + 0.5, labelY - pillH / 2 + 0.5, pillW - 1, pillH - 1);
+
+    // ID text — color-matched to wall for quick visual association
+    ctx.fillStyle = color;
+    ctx.textAlign = 'center';
+    ctx.fillText(idText, labelX, labelY + 0.5);
   }
+  ctx.textBaseline = 'alphabetic';  // restore default so downstream drawing is unaffected
 
   // Debug overlay — large text, dark background box, drawn over everything
   const dbgLines = [
@@ -1961,19 +2185,69 @@ async function loadPosConfig() {
   try {
     const r = await fetch('/proxy/position/config');
     const d = await r.json();
-    document.getElementById('pos_enabled').checked = !!d.enabled;
-    if (d.detect_profile) document.getElementById('pos_profile').value = d.detect_profile;
-    if (d.fov_deg) document.getElementById('pos_fov').value = d.fov_deg;
-    if (d.latency_ms != null) {
-      document.getElementById('pos_latency').value = d.latency_ms;
-      document.getElementById('pos_latency_val').textContent = Math.round(d.latency_ms);
+    // Server returns {config:{...}, ...} but older endpoints are flat — handle both
+    const c = d.config || d;
+    document.getElementById('pos_enabled').checked = !!c.enabled;
+    if (c.detect_profile) document.getElementById('pos_profile').value = c.detect_profile;
+    if (c.fov_deg) document.getElementById('pos_fov').value = c.fov_deg;
+    const latMs = (c.latency_ms != null) ? c.latency_ms
+                  : (c.latency_comp_s != null ? Math.round(c.latency_comp_s * 1000) : null);
+    if (latMs != null) {
+      document.getElementById('pos_latency').value = latMs;
+      document.getElementById('pos_latency_val').textContent = Math.round(latMs);
     }
+    // ── Populate filter controls ──
+    const kCb = document.getElementById('pos_kalman');
+    if (kCb) kCb.checked = (c.enable_kalman_filter !== false);  // default ON if missing
+    const mSz = document.getElementById('pos_marker_size');
+    if (mSz && c.marker_size_m != null) mSz.value = Number(c.marker_size_m).toFixed(2);
+    const tK = document.getElementById('pos_top_k');
+    if (tK && c.top_k_markers != null) tK.value = c.top_k_markers;
+    const out = document.getElementById('pos_outlier');
+    if (out && c.outlier_reject_m != null) out.value = c.outlier_reject_m;
     const cs = document.getElementById('pos_calib_status');
     cs.textContent = d.has_calibration ? '\\u2713 calibration loaded' : 'no calibration';
     cs.style.color = d.has_calibration ? '#22c55e' : '#94a3b8';
-    if (d.enabled) startPosEvents();
+    if (c.enabled) startPosEvents();
   } catch {}
 }
+
+// ── Filter controls — live-apply to running positioner ──
+(function wireFilterControls(){
+  const statusEl = () => document.getElementById('pos_filters_status');
+  const flash = (msg, col) => {
+    const e = statusEl(); if (!e) return;
+    e.textContent = msg; e.style.color = col || '#64748b';
+    setTimeout(() => { if (e.textContent === msg) e.textContent = ''; }, 2500);
+  };
+  const applyBtn = document.getElementById('pos_filters_apply');
+  if (applyBtn) applyBtn.onclick = async () => {
+    const payload = {
+      enable_kalman_filter: document.getElementById('pos_kalman').checked,
+      marker_size_m: parseFloat(document.getElementById('pos_marker_size').value),
+      top_k_markers: parseInt(document.getElementById('pos_top_k').value, 10),
+      outlier_reject_m: parseFloat(document.getElementById('pos_outlier').value),
+    };
+    try {
+      const r = await fetch('/proxy/position/config', {
+        method: 'POST',
+        headers: {'Content-Type':'application/json'},
+        body: JSON.stringify(payload),
+      });
+      const d = await r.json();
+      if (d.ok) flash('\\u2713 applied', '#22c55e');
+      else flash('error: ' + (d.error || 'unknown'), '#ef4444');
+    } catch (e) { flash('request failed', '#ef4444'); }
+  };
+  const resetBtn = document.getElementById('pos_filters_reset');
+  if (resetBtn) resetBtn.onclick = () => {
+    document.getElementById('pos_kalman').checked = true;
+    document.getElementById('pos_marker_size').value = '0.50';
+    document.getElementById('pos_top_k').value = '0';
+    document.getElementById('pos_outlier').value = '2.5';
+    flash('defaults loaded — click Apply', '#94a3b8');
+  };
+})();
 
 document.getElementById('pos_enabled').onchange = async function() {
   await post('/proxy/position/config', { enabled: this.checked });

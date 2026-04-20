@@ -1,208 +1,132 @@
 {
-  "arena_width_m": 20.0,
-  "arena_height_m": 10.0,
-  "arena_origin_x": -10.0,
-  "arena_origin_y": 0.0,
-  "marker_size_m": 0.18,
+  "marker_size_m": 0.495,
   "markers": [
     {
-      "id": 0,
-      "label": "Origin",
-      "x": 0.0,
-      "y": 0.0,
-      "z": 0.0,
-      "wall": "front"
-    },
-    {
       "id": 1,
-      "label": "Right A low",
-      "x": 10.0,
-      "y": 6.667,
-      "z": 2.0,
-      "wall": "right"
-    },
-    {
-      "id": 2,
-      "label": "Right A high",
-      "x": 10.0,
-      "y": 6.667,
+      "label": "Left A hight",
+      "x": -10.0,
+      "y": 5.4,
       "z": 4.0,
-      "wall": "right"
-    },
-    {
-      "id": 3,
-      "label": "Right B low",
-      "x": 10.0,
-      "y": 3.333,
-      "z": 2.0,
-      "wall": "right"
-    },
-    {
-      "id": 4,
-      "label": "Right B high",
-      "x": 10.0,
-      "y": 3.333,
-      "z": 4.0,
-      "wall": "right"
-    },
-    {
-      "id": 5,
-      "label": "Front A low",
-      "x": 6.0,
-      "y": 0.0,
-      "z": 2.0,
-      "wall": "front"
-    },
-    {
-      "id": 6,
-      "label": "Front A high",
-      "x": 6.0,
-      "y": 0.0,
-      "z": 4.0,
-      "wall": "front"
-    },
-    {
-      "id": 7,
-      "label": "Front B low",
-      "x": 2.0,
-      "y": 0.0,
-      "z": 2.0,
-      "wall": "front"
-    },
-    {
-      "id": 8,
-      "label": "Front B high",
-      "x": 2.0,
-      "y": 0.0,
-      "z": 4.0,
-      "wall": "front"
+      "wall": "left"
     },
     {
       "id": 9,
-      "label": "Front C low",
-      "x": -2.0,
-      "y": 0.0,
+      "label": "Left A low",
+      "x": -10.0,
+      "y": 5.4,
       "z": 2.0,
+      "wall": "left"
+    },
+    {
+      "id": 2,
+      "label": "Front Left high",
+      "x": -6.666,
+      "y": 0.0,
+      "z": 4.0,
       "wall": "front"
     },
     {
       "id": 10,
-      "label": "Front C high",
-      "x": -2.0,
+      "label": "Front Left low",
+      "x": -6.666,
+      "y": 0.0,
+      "z": 2.0,
+      "wall": "front"
+    },
+    {
+      "id": 3,
+      "label": "Front Middle high",
+      "x": 0.0,
       "y": 0.0,
       "z": 4.0,
       "wall": "front"
     },
     {
       "id": 11,
-      "label": "Front D low",
-      "x": -6.0,
+      "label": "Front Middle low",
+      "x": 0.0,
       "y": 0.0,
       "z": 2.0,
+      "wall": "front"
+    },
+    {
+      "id": 4,
+      "label": "Front Right high",
+      "x": 6.666,
+      "y": 0.0,
+      "z": 4.0,
       "wall": "front"
     },
     {
       "id": 12,
-      "label": "Front D high",
-      "x": -6.0,
+      "label": "Front Right low",
+      "x": 6.666,
       "y": 0.0,
-      "z": 4.0,
+      "z": 2.0,
       "wall": "front"
     },
     {
+      "id": 5,
+      "label": "Right A high",
+      "x": 10.0,
+      "y": 5.4,
+      "z": 4.0,
+      "wall": "right"
+    },
+    {
       "id": 13,
-      "label": "Left A low",
-      "x": -10.0,
-      "y": 3.333,
+      "label": "Right A low",
+      "x": 10.0,
+      "y": 5.4,
       "z": 2.0,
-      "wall": "left"
+      "wall": "right"
+    },
+    {
+      "id": 6,
+      "label": "Back Right high",
+      "x": 6.666,
+      "y": 10.8,
+      "z": 4.0,
+      "wall": "back"
     },
     {
       "id": 14,
-      "label": "Left A high",
-      "x": -10.0,
-      "y": 3.333,
+      "label": "Back Right low",
+      "x": 6.666,
+      "y": 10.8,
+      "z": 2.0,
+      "wall": "back"
+    },
+    {
+      "id": 7,
+      "label": "Back Middle high",
+      "x": 0.0,
+      "y": 10.8,
       "z": 4.0,
-      "wall": "left"
+      "wall": "back"
     },
     {
       "id": 15,
-      "label": "Left B low",
-      "x": -10.0,
-      "y": 3.33,
+      "label": "Back Middle low",
+      "x": 0.0,
+      "y": 10.8,
       "z": 2.0,
-      "wall": "left"
+      "wall": "back"
+    },
+    {
+      "id": 8,
+      "label": "Back Left B high",
+      "x": -6.666,
+      "y": 10.8,
+      "z": 4.0,
+      "wall": "back"
     },
     {
       "id": 16,
-      "label": "Left B high",
-      "x": -10.0,
-      "y": 6.667,
-      "z": 4.0,
-      "wall": "left"
-    },
-    {
-      "id": 17,
-      "label": "Back A low",
-      "x": -10.0,
-      "y": 6.66,
+      "label": "Back Left B low",
+      "x": -6.666,
+      "y": 10.8,
       "z": 2.0,
-      "wall": "back"
-    },
-    {
-      "id": 18,
-      "label": "Back A high",
-      "x": -10.0,
-      "y": 6.66,
-      "z": 4.0,
-      "wall": "left"
-    },
-    {
-      "id": 19,
-      "label": "Back B low",
-      "x": -5.0,
-      "y": 10.0,
-      "z": 2.0,
-      "wall": "back"
-    },
-    {
-      "id": 20,
-      "label": "Back B high",
-      "x": -5.0,
-      "y": 10.0,
-      "z": 4.0,
-      "wall": "back"
-    },
-    {
-      "id": 21,
-      "label": "Back C low",
-      "x": 0.0,
-      "y": 10.0,
-      "z": 2.0,
-      "wall": "back"
-    },
-    {
-      "id": 22,
-      "label": "Back C high",
-      "x": 0.0,
-      "y": 10.0,
-      "z": 4.0,
-      "wall": "back"
-    },
-    {
-      "id": 23,
-      "label": "Back D low",
-      "x": 5.0,
-      "y": 10.0,
-      "z": 2.0,
-      "wall": "back"
-    },
-    {
-      "id": 24,
-      "label": "Back D high",
-      "x": 5.0,
-      "y": 10.0,
-      "z": 4.0,
       "wall": "back"
     }
   ]
