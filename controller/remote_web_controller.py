@@ -643,7 +643,11 @@ HTML = """
       bObs.classList.toggle('active', arcMode === 'observe');
       bLive.classList.toggle('active', arcMode === 'live');
       bLive.classList.toggle('live',   arcMode === 'live');
-      bLive.disabled = !arcAllowLive;
+      // Keep the button clickable — the server is the source of truth for
+      // allow_live. We just visually hint with the "gate" badge if the
+      // server has REMOTE_NO_LIVE set.
+      bLive.disabled = false;
+      bLive.style.opacity = arcAllowLive ? '1' : '0.7';
       document.getElementById('arc_mode_gate').style.display = arcAllowLive ? 'none' : 'inline';
       const live = (arcMode === 'live');
       document.getElementById('arc_live_banner').classList.toggle('show', live);
@@ -795,19 +799,38 @@ HTML = """
     document.getElementById('arc_reload').onclick = arcLoadParams;
 
     async function arcSetMode(mode) {
-      const r = await fetch('/proxy/aruco/mode', {method:'POST',
-        headers:{'Content-Type':'application/json'},
-        body: JSON.stringify({mode})});
-      const j = await r.json();
-      if (!j.ok && j.error) alert('Mode change refused: ' + j.error);
-      arcApplyModeUI(j.mode || mode, arcAllowLive);
+      console.log('[arc] set-mode request:', mode);
+      try {
+        const r = await fetch('/proxy/aruco/mode', {method:'POST',
+          headers:{'Content-Type':'application/json'},
+          body: JSON.stringify({mode})});
+        const j = await r.json();
+        console.log('[arc] set-mode response:', r.status, j);
+        if (!r.ok || !j.ok) {
+          alert('Mode change refused (' + r.status + '): ' + (j.error || r.statusText || 'unknown'));
+          return;
+        }
+        arcApplyModeUI(j.mode || mode, arcAllowLive);
+      } catch (err) {
+        console.error('[arc] set-mode failed:', err);
+        alert('Mode change failed: ' + err);
+      }
     }
     document.getElementById('arc_mode_observe').onclick = () => arcSetMode('observe');
-    document.getElementById('arc_mode_live').onclick = () => {
-      if (!arcAllowLive) { alert('LIVE mode is disabled (REMOTE_NO_LIVE=1).'); return; }
-      const ok = confirm('⚠ SWITCH TO LIVE MODE?\\n\\nThe drone WILL receive RC commands as soon as a marker is tracked.\\nMake sure the area is clear.\\n\\nClick OK to enable LIVE mode.');
-      if (ok) arcSetMode('live');
-    };
+    // LIVE button: always post to server, let it decide. Client-side arcAllowLive
+    // is now just a UI hint (disabled state) — if somehow wrong, the server
+    // returns 403 with a clear error message.
+    const liveBtn = document.getElementById('arc_mode_live');
+    if (liveBtn) {
+      liveBtn.onclick = () => {
+        console.log('[arc] LIVE clicked, arcAllowLive=', arcAllowLive);
+        const ok = confirm('⚠ SWITCH TO LIVE MODE?\\n\\nThe drone WILL receive RC commands as soon as a marker is tracked.\\nMake sure the area is clear.\\n\\nClick OK to enable LIVE mode.');
+        if (ok) arcSetMode('live');
+      };
+      console.log('[arc] LIVE button click handler attached');
+    } else {
+      console.error('[arc] could not find arc_mode_live button — handler NOT attached');
+    }
 
     async function arcPostCmd(path, confirmMsg) {
       if (confirmMsg && !confirm(confirmMsg)) return;
