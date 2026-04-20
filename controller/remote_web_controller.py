@@ -557,6 +557,9 @@ HTML = """
     const PGROUPS = ['Mission target','Camera filter / deadbands','P gains (camera)','D gains (IMU damping)','Output clamps','Drawing'];
     const SLIDERS = [
       ['hover_distance_m','Hover distance (m)',          0.5, 4.0, 0.05, 0],
+      ['fb_max',          'Approach speed (fwd RC %)',   0,100, 1, 0],
+      ['fb_back_max',     'Retreat speed (back RC %)',   0,100, 1, 0],
+      ['dist_p',          'Approach aggressiveness (P · distance)', 0, 60, 0.5, 0],
       ['ema_alpha',       'EMA α (smoothing)',           0.05,0.95, 0.05, 1],
       ['deadband_x',      'Deadband err_x',              0.00,0.30, 0.01, 1],
       ['deadband_y',      'Deadband err_y',              0.00,0.30, 0.01, 1],
@@ -565,16 +568,13 @@ HTML = """
       ['yaw_p',           'P · yaw     (per err_x)',     0, 50, 1, 2],
       ['skew_p',          'P · lateral (per skew)',      0, 50, 1, 2],
       ['alt_p',           'P · altitude (per err_y)',    0,100, 1, 2],
-      ['dist_p',          'P · distance',                0, 30, 0.5, 2],
       ['d_yaw',           'D · yaw     (°/s)',           0,  2, 0.05, 3],
       ['d_lr',            'D · lateral (cm/s vgy)',      0,  2, 0.05, 3],
       ['d_ud',            'D · vertical(cm/s vgz)',      0,  2, 0.05, 3],
       ['d_fb',            'D · fwd/back(cm/s vgx)',      0,  2, 0.05, 3],
-      ['yaw_max',         'Clamp · yaw max',             0, 50, 1, 4],
-      ['lr_max',          'Clamp · lateral max',         0, 30, 1, 4],
-      ['ud_max',          'Clamp · vertical max',        0, 50, 1, 4],
-      ['fb_max',          'Clamp · forward max',         0, 30, 1, 4],
-      ['fb_back_max',     'Clamp · backward max',        0, 30, 1, 4],
+      ['yaw_max',         'Clamp · yaw max',             0, 80, 1, 4],
+      ['lr_max',          'Clamp · lateral max',         0,100, 1, 4],
+      ['ud_max',          'Clamp · vertical max',        0,100, 1, 4],
       ['rc_min',          'RC dead-floor',               0, 10, 1, 4],
       ['cam_hfov_deg',    'Cam HFOV (drawing only)',    30,110, 1, 5],
       ['marker_size_m',   'Marker physical size (m)',    0.05, 2.0, 0.01, 5],
@@ -2038,13 +2038,12 @@ function drawArena(pos, compPos, dir) {
     const isSeen = _seenMarkers.has(String(id));
     const isRef  = _refMarkers.has(String(id));
     const baseColor = WALL_COLOR[m.wall] || '#94a3b8';
-    const dimColor  = baseColor + '66';   // 40% alpha appended as hex
 
     // Halo behind seen markers so they visibly pulse against the arena
     if (isSeen) {
       ctx.beginPath();
       ctx.arc(mx, my, 14, 0, Math.PI * 2);
-      ctx.fillStyle = (isRef ? 'rgba(34,197,94,0.28)' : 'rgba(251,191,36,0.28)');
+      ctx.fillStyle = (isRef ? 'rgba(34,197,94,0.35)' : 'rgba(251,191,36,0.35)');
       ctx.fill();
       ctx.beginPath();
       ctx.arc(mx, my, 14, 0, Math.PI * 2);
@@ -2052,11 +2051,11 @@ function drawArena(pos, compPos, dir) {
       ctx.lineWidth = 1.5; ctx.stroke();
     }
 
-    // Square marker (slightly larger + outlined for visibility)
-    const color = isSeen ? baseColor : dimColor;
-    ctx.fillStyle = color;
+    // Square marker — always full-opacity so markers never disappear.
+    // Seen markers get a brighter white border to make them pop.
+    ctx.fillStyle = baseColor;
     ctx.fillRect(mx - 5, my - 5, 10, 10);
-    ctx.strokeStyle = isSeen ? '#f8fafc' : 'rgba(15,23,42,0.9)';
+    ctx.strokeStyle = isSeen ? '#ffffff' : 'rgba(15,23,42,0.9)';
     ctx.lineWidth = isSeen ? 1.5 : 1;
     ctx.strokeRect(mx - 5.5, my - 5.5, 11, 11);
 
@@ -2073,15 +2072,15 @@ function drawArena(pos, compPos, dir) {
     else if (wall === 'right') { labelX = mx - 9 - pillW / 2; labelY = my; }
     else                       { labelX = mx; labelY = my - 13; }
 
-    // Dark background pill for legibility — brighter for seen markers
-    ctx.fillStyle = isSeen ? 'rgba(15,23,42,0.95)' : 'rgba(15,23,42,0.55)';
+    // Dark background pill for legibility — always visible
+    ctx.fillStyle = 'rgba(15,23,42,0.9)';
     ctx.fillRect(labelX - pillW / 2, labelY - pillH / 2, pillW, pillH);
-    ctx.strokeStyle = isSeen ? baseColor : (baseColor + '66');
+    ctx.strokeStyle = baseColor;
     ctx.lineWidth = isSeen ? 1.5 : 1;
     ctx.strokeRect(labelX - pillW / 2 + 0.5, labelY - pillH / 2 + 0.5, pillW - 1, pillH - 1);
 
-    // ID text — color-matched to wall; brighten for seen markers
-    ctx.fillStyle = isSeen ? '#ffffff' : (baseColor + '99');
+    // ID text — white for seen markers, wall color for unseen
+    ctx.fillStyle = isSeen ? '#ffffff' : baseColor;
     ctx.textAlign = 'center';
     ctx.fillText(idText, labelX, labelY + 0.5);
   }
