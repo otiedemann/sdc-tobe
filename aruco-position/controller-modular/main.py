@@ -151,46 +151,26 @@ def has_gui():
 # Autonomous Mission
 # ============================================================
 
-TARGET_MARKER_ID = 15          # ArUco marker to find and approach
-APPROACH_DISTANCE = 5.0        # metres to hover in front of the marker face
 TAKEOFF_HEIGHT_Z = 1.2         # world-frame Z (up) to wait for after takeoff
 TAKEOFF_TIMEOUT_S = 15.0       # abort takeoff after this many seconds
-SEARCH_YAW_RATE = 0.1          # rad/s slow rotation during search
-SEARCH_MAX_YAW_SPEED = 150     # °/s – MaxRotationSpeed sent to drone before search PCMD
 HOLD_ARRIVE_RADIUS = 0.25      # m – radius at which HOLD is declared
-MARKER_LOST_TIMEOUT_S = 3.0    # seconds without seeing target before falling back to SEARCH
-
-# Inward wall normals matching arena_config.json:
-#   front wall  at y= 0  → normal +Y
-#   back  wall  at y=10  → normal -Y
-#   right wall  at x=10  → normal -X
-#   left  wall  at x=-10 → normal +X
-_WALL_NORMALS = {
-    "front":  np.array([ 0.0,  1.0, 0.0]),
-    "back":   np.array([ 0.0, -1.0, 0.0]),
-    "left":   np.array([ 1.0,  0.0, 0.0]),
-    "right":  np.array([-1.0,  0.0, 0.0]),
-}
 
 
 class MissionPhase:
-    IDLE     = "idle"
-    TAKEOFF  = "takeoff"
-    SEARCH   = "search"
-    APPROACH = "approach"
-    HOLD     = "hold"
-    FAILED   = "failed"
-    ABORTED  = "aborted"
+    IDLE    = "idle"
+    TAKEOFF = "takeoff"
+    FLY_TO  = "fly_to"
+    HOLD    = "hold"
+    FAILED  = "failed"
+    ABORTED = "aborted"
 
 
 class AutonomousMission:
     """
     State machine that:
       1. Commands the drone to take off.
-      2. Slowly rotates (SEARCH) until ArUco marker <target_marker_id> is seen.
-      3. Flies to <approach_distance> metres in front of the marker at a
-         90-degree angle (perpendicular to the marker face).
-      4. Holds position indefinitely.
+      2. Flies to a given (x, y, z) world-frame coordinate.
+      3. Holds position indefinitely.
 
     Integration in main.py
     ----------------------
@@ -199,22 +179,18 @@ class AutonomousMission:
         mission.tick(last_prediction, last_vision_update, anafi_drone)
 
     The mission drives ctrl_module.set_target() internally and sends
-    Olympe TakeOff / PCMD commands through the drone handle.
+    Olympe TakeOff commands through the drone handle.
     """
 
     def __init__(
         self,
-        target_marker_id: int,
-        approach_distance: float,
-        vision_processor,               # HeadlessAruCoPositioning instance
+        fly_to: tuple,                  # (x, y, z) world-frame target coordinate
         ctrl_module,                    # controller module (may be None)
         takeoff_height_z: float = TAKEOFF_HEIGHT_Z,
         dry_run: bool = False,          # log RC/commands, send nothing to drone
         auto_confirm: bool = False,     # skip SPACE confirmations, advance automatically
     ) -> None:
-        self.target_id        = target_marker_id
-        self.approach_dist    = approach_distance
-        self.vision           = vision_processor
+        self.fly_to           = fly_to  # (x, y, z)
         self.ctrl             = ctrl_module
         self.takeoff_height_z = takeoff_height_z
         self.dry_run          = dry_run
@@ -222,9 +198,6 @@ class AutonomousMission:
 
         self._phase: str               = MissionPhase.IDLE
         self._phase_start: float       = 0.0
-        self._approach_target: Optional[tuple] = None  # (x, y, z, yaw)
-        self._last_seen_ts: float      = 0.0
-        self._search_yaw_sent: bool    = False
         self._pending_phase: Optional[str] = None   # next phase awaiting SPACE confirm
         self._pending_prompt: str      = ""          # message shown while waiting
 
@@ -236,11 +209,12 @@ class AutonomousMission:
         """Call once to kick off the mission (issues TakeOff)."""
         if self._phase != MissionPhase.IDLE:
             return
-        print(f"[mission] Starting – target marker {self.target_id}")
+        x, y, z = self.fly_to
+        print(f"[mission] Starting – fly to ({x:.2f}, {y:.2f}, {z:.2f})")
         if self.dry_run:
-            print("[DRY RUN] Takeoff skipped – jumping straight to SEARCH")
-            self._begin_search(drone)
-            self._transition(MissionPhase.SEARCH)
+            print("[DRY RUN] Takeoff skipped – jumping straight to FLY_TO")
+            self._begin_fly_to(drone)
+            self._transition(MissionPhase.FLY_TO)
             return
         self._transition(MissionPhase.TAKEOFF)
         self._send_takeoff(drone)
@@ -264,12 +238,8 @@ class AutonomousMission:
             return
         phase = self._pending_phase
         # Kick off phase-specific actions before the transition.
-        if phase == MissionPhase.SEARCH:
-            self._begin_search(drone)
-        elif phase == MissionPhase.APPROACH and self._approach_target is not None:
-            x, y, z, yaw = self._approach_target
-            if self.ctrl is not None:
-                self.ctrl.set_target(x, y, z, hold_yaw=yaw)
+        if phase == MissionPhase.FLY_TO:
+            self._begin_fly_to(drone)
         print(f"[mission] Confirmed → {phase}")
         self._transition(phase)
 
@@ -319,14 +289,11 @@ class AutonomousMission:
         if self._phase == MissionPhase.TAKEOFF:
             self._tick_takeoff(vision_result, state, now, drone)
 
-        elif self._phase == MissionPhase.SEARCH:
-            self._tick_search(vision_result, now, drone)
-
-        elif self._phase == MissionPhase.APPROACH:
-            self._tick_approach(vision_result, now, drone)
+        elif self._phase == MissionPhase.FLY_TO:
+            self._tick_fly_to(vision_result, now, drone)
 
         elif self._phase == MissionPhase.HOLD:
-            self._tick_hold(vision_result, now, drone)
+            self._tick_hold(now)
 
     # ------------------------------------------------------------------ #
     # Phase handlers                                                       #
@@ -350,65 +317,30 @@ class AutonomousMission:
             return
 
         if flying_str in ("hovering", "flying"):
+            x, y, z = self.fly_to
             self._queue_confirm(
-                MissionPhase.SEARCH,
-                f"Airborne – flying state={flying_str}.  Ready to start SEARCH.",
+                MissionPhase.FLY_TO,
+                f"Airborne – flying state={flying_str}.  "
+                f"Ready to fly to ({x:.2f}, {y:.2f}, {z:.2f}).",
                 drone,
             )
 
-    def _tick_search(self, vision_result, now, drone):
-        seen = self._seen_markers(vision_result)
-        if self.target_id in seen:
-            approach = self._compute_approach(vision_result)
-            if approach is not None:
-                self._approach_target = approach
-                x, y, z, yaw = approach
-                self._queue_confirm(
-                    MissionPhase.APPROACH,
-                    f"Marker {self.target_id} found – "
-                    f"approach → ({x:.2f}, {y:.2f}, {z:.2f})  "
-                    f"yaw={math.degrees(yaw):.1f}°.  Ready to APPROACH.",
-                    drone,
-                )
-                return
-
-        # Rotate in place: pure yaw PCMD only — no position controller target.
-        if drone is not None:
-            self._send_search_yaw(drone)
-
-    def _tick_approach(self, vision_result, now, drone=None):
-        if self._approach_target is None:
-            self._transition(MissionPhase.SEARCH)
-            return
-
-        seen = self._seen_markers(vision_result)
-        if self.target_id in seen:
-            self._last_seen_ts = now
-        elif now - self._last_seen_ts > MARKER_LOST_TIMEOUT_S:
-            print(
-                f"[mission] APPROACH – marker {self.target_id} lost for "
-                f"{now - self._last_seen_ts:.1f} s, falling back to SEARCH"
-            )
-            self._approach_target = None
-            self._begin_search(drone)
-            self._transition(MissionPhase.SEARCH)
-            return
-
-        # Primary: controller HOVER phase
+    def _tick_fly_to(self, vision_result, now, drone=None):
+        # Primary: controller HOVER phase signals arrival
         if self.ctrl is not None and hasattr(self.ctrl, "position_controller"):
             from controller import Phase
             if self.ctrl.position_controller.phase == Phase.HOVER:
                 self._queue_confirm(
                     MissionPhase.HOLD,
-                    "Arrived at approach point.  Ready to HOLD.",
+                    "Arrived at target coordinate.  Ready to HOLD.",
                     drone,
                 )
             return
 
         # Fallback: distance check using cam position
         cam = self._get_cam_pos(vision_result)
-        if cam is not None and self._approach_target is not None:
-            tx, ty, tz, _ = self._approach_target
+        if cam is not None:
+            tx, ty, tz = self.fly_to
             dist = math.sqrt((tx - cam[0])**2 + (ty - cam[1])**2 + (tz - cam[2])**2)
             if dist < HOLD_ARRIVE_RADIUS:
                 self._queue_confirm(
@@ -417,18 +349,8 @@ class AutonomousMission:
                     drone,
                 )
 
-    def _tick_hold(self, vision_result, now, drone=None):
-        seen = self._seen_markers(vision_result)
-        if self.target_id in seen:
-            self._last_seen_ts = now
-        elif now - self._last_seen_ts > MARKER_LOST_TIMEOUT_S:
-            print(
-                f"[mission] HOLD – marker {self.target_id} lost for "
-                f"{now - self._last_seen_ts:.1f} s, falling back to SEARCH"
-            )
-            self._approach_target = None
-            self._begin_search(drone)
-            self._transition(MissionPhase.SEARCH)
+    def _tick_hold(self, now):
+        pass  # Hold position indefinitely; controller keeps target active
 
     # ------------------------------------------------------------------ #
     # Helpers                                                              #
@@ -472,20 +394,6 @@ class AutonomousMission:
         except Exception as exc:
             print(f"[mission] TakeOff failed: {exc}")
 
-    _search_seq: int = 0   # class-level PCMD sequence counter for search
-
-    def _send_search_yaw(self, drone) -> None:
-        """Send a pure yaw PCMD — zero roll, pitch, and gaz — to rotate in place."""
-        if self.dry_run:
-            return   # drone is moved by hand; no PCMD
-        try:
-            from olympe.messages.ardrone3.Piloting import PCMD
-            AutonomousMission._search_seq = (AutonomousMission._search_seq + 1) & 0x7FFFFFFF
-            yaw_pct = int(SEARCH_YAW_RATE / 0.8 * 100)  # scale: 0.8 rad/s → 100 %
-            drone(PCMD(0, 0, 0, yaw_pct, 0, AutonomousMission._search_seq))
-        except Exception:
-            pass
-
     @staticmethod
     def _get_cam_pos(vision_result: Optional[dict]) -> Optional[list]:
         """Return [x, y, z] from vision_result['cam'], or None if unavailable."""
@@ -496,104 +404,11 @@ class AutonomousMission:
             return None
         return [float(cam[0]), float(cam[1]), float(cam[2])]
 
-    @staticmethod
-    def _seen_markers(vision_result: Optional[dict]):
-        if vision_result is None:
-            return set()
-        return set(int(m) for m in vision_result.get("seen_markers", []))
-
-    def _begin_search(self, drone) -> None:
-        print(f"[mission] SEARCH – yaw-rotating to find marker {self.target_id}")
-        # Clear any active controller target so the position controller outputs
-        # nothing and the pure-yaw PCMD is the only command sent to the drone.
+    def _begin_fly_to(self, drone) -> None:
+        x, y, z = self.fly_to
+        print(f"[mission] FLY_TO – heading to ({x:.2f}, {y:.2f}, {z:.2f})")
         if self.ctrl is not None:
-            self.ctrl.clear_target()
-        # Ensure the drone's MaxRotationSpeed is set high enough that the
-        # PCMD yaw percentage actually produces fast turns.  The factory
-        # default is typically 10–30 °/s, which makes even 70 % feel slow.
-        if drone is not None and not self.dry_run:
-            try:
-                from olympe.messages.ardrone3.SpeedSettings import MaxRotationSpeed
-                drone(MaxRotationSpeed(SEARCH_MAX_YAW_SPEED))
-                print(f"[mission] MaxRotationSpeed set to {SEARCH_MAX_YAW_SPEED} °/s")
-            except Exception as exc:
-                print(f"[mission] Could not set MaxRotationSpeed: {exc}")
-
-    def _compute_approach(self, vision_result: Optional[dict]) -> Optional[tuple]:
-        """
-        Return (x, y, z, yaw) for hovering APPROACH_DISTANCE metres straight in
-        front of the target marker face.
-
-        Primary: uses the marker's known world-frame position (from arena config)
-        and the wall's inward normal to place the hover point perpendicular to the
-        marker face.  Drone yaw is set so it faces toward the marker.
-
-        Fallback (no arena data): fly forward from current cam position along the
-        camera's forward direction (original behaviour).
-        """
-        # -- primary: marker world position from arena config --
-        marker_pos = None
-        wall_type  = None
-        if self.vision is not None:
-            mp = getattr(self.vision, "marker_positions", {})
-            wt = getattr(self.vision, "marker_wall_type", {})
-            if self.target_id in mp:
-                marker_pos = mp[self.target_id]
-                wall_type  = wt.get(self.target_id)
-
-        if marker_pos is not None:
-            # Inward wall normal (points from the wall face into the arena).
-            normal = _WALL_NORMALS.get(wall_type, np.array([1.0, 0.0, 0.0]))
-            nx, ny = float(normal[0]), float(normal[1])
-
-            # Hover point: step approach_dist along the inward normal from the marker.
-            target_x = float(marker_pos[0]) + nx * self.approach_dist
-            target_y = float(marker_pos[1]) + ny * self.approach_dist
-            target_z = float(marker_pos[2])   # keep marker's world height
-
-            # Drone yaw: face back toward the marker (opposite of inward normal).
-            yaw = math.atan2(-ny, -nx)
-
-            print(
-                f"[mission] Approach: marker {self.target_id} at "
-                f"({marker_pos[0]:.2f}, {marker_pos[1]:.2f}, {marker_pos[2]:.2f})  "
-                f"wall={wall_type} normal=({nx:+.2f},{ny:+.2f})  "
-                f"hover → ({target_x:.2f}, {target_y:.2f}, {target_z:.2f})  "
-                f"yaw={math.degrees(yaw):.1f}°"
-            )
-            return (float(target_x), float(target_y), float(target_z), float(yaw))
-
-        # -- fallback: no arena config data available --
-        cam = self._get_cam_pos(vision_result)
-        if cam is None:
-            print("[mission] No cam position available – cannot compute approach")
-            return None
-
-        raw_dir = vision_result.get("dir") if vision_result is not None else None
-        if raw_dir is not None and len(raw_dir) >= 2:
-            dx, dy = float(raw_dir[0]), float(raw_dir[1])
-        else:
-            dx, dy = 1.0, 0.0
-
-        mag = math.sqrt(dx * dx + dy * dy)
-        if mag < 1e-6:
-            dx, dy = 1.0, 0.0
-        else:
-            dx, dy = dx / mag, dy / mag
-
-        target_x = cam[0] + dx * self.approach_dist
-        target_y = cam[1] + dy * self.approach_dist
-        target_z = cam[2]
-        yaw      = math.atan2(dy, dx)
-
-        print(
-            f"[mission] Approach (fallback – no arena config): "
-            f"fly {self.approach_dist} m forward from cam "
-            f"({cam[0]:.2f}, {cam[1]:.2f}, {cam[2]:.2f})  "
-            f"dir=({dx:+.2f}, {dy:+.2f})  "
-            f"→ ({target_x:.2f}, {target_y:.2f}, {target_z:.2f})"
-        )
-        return (float(target_x), float(target_y), float(target_z), float(yaw))
+            self.ctrl.set_target(x, y, z)
 
 
 # ============================================================
@@ -681,12 +496,17 @@ def main():
     mission_enabled  = "--mission" in sys.argv
     mission_dry_run  = "--dry-run" in sys.argv
     mission_auto_confirm = "--yes" in sys.argv or "-y" in sys.argv
-    mission_marker_id = TARGET_MARKER_ID
-    if "--mission-marker" in sys.argv:
+    mission_fly_to: Optional[tuple] = None
+    if "--fly-to" in sys.argv:
         try:
-            mission_marker_id = int(sys.argv[sys.argv.index("--mission-marker") + 1])
+            raw = sys.argv[sys.argv.index("--fly-to") + 1]
+            parts = [float(v) for v in raw.split(",")]
+            if len(parts) == 3:
+                mission_fly_to = (parts[0], parts[1], parts[2])
+            else:
+                print("⚠️ --fly-to expects x,y,z  e.g. 3.0,2.0,1.5")
         except Exception:
-            print("⚠️ Invalid --mission-marker value, using default.")
+            print("⚠️ Invalid --fly-to value.")
 
     # --ctrl-target x,y,z   e.g. --ctrl-target 3.0,1.5,1.2
     ctrl_target: Optional[tuple] = None
@@ -732,7 +552,8 @@ def main():
     print(f"🎯 Ctrl Target: {ctrl_target if ctrl_target else 'none'}")
     print(f"🖥️ Preview Requested: {'YES' if preview_requested else 'NO'}")
     print(f"🖥️ GUI Overlay: {'ON' if gui_enabled else 'OFF'}")
-    print(f"🎯 Autonomous Mission: {'ON (marker ' + str(mission_marker_id) + ')' if mission_enabled else 'OFF'}")
+    fly_to_str = f"({mission_fly_to[0]:.2f}, {mission_fly_to[1]:.2f}, {mission_fly_to[2]:.2f})" if mission_fly_to else "not set"
+    print(f"🎯 Autonomous Mission: {'ON fly-to ' + fly_to_str if mission_enabled else 'OFF'}")
     if mission_dry_run:
         print("🧪 DRY RUN – no commands sent to drone; move it by hand")
 
@@ -776,10 +597,11 @@ def main():
     # --------------------------------------------------------
     mission: Optional[AutonomousMission] = None
     if mission_enabled:
+        if mission_fly_to is None:
+            print("❌ --mission requires --fly-to x,y,z  e.g. --fly-to 3.0,2.0,1.5")
+            return
         mission = AutonomousMission(
-            target_marker_id=mission_marker_id,
-            approach_distance=APPROACH_DISTANCE,
-            vision_processor=vision_processor,
+            fly_to=mission_fly_to,
             ctrl_module=ctrl_module,
             takeoff_height_z=abs(target_z_pos),   # use configured flight height
             dry_run=mission_dry_run,
