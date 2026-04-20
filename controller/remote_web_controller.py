@@ -899,7 +899,7 @@ HTML = """
     arcPoll();
     // Version marker — if this string doesn't appear in the DOM,
     // you're running stale JS (restart the Python server or hard-refresh).
-    const BUILD = 'ah-land-all-zero';
+    const BUILD = 'ai-autostart-mjpeg';
     console.log('[arc] init complete, build=' + BUILD);
     const ver = document.createElement('span');
     ver.id = 'arc_build_tag';
@@ -1695,6 +1695,42 @@ const videoContainer = document.getElementById('video_container');
 const videoImg = document.getElementById('video_img');
 let videoActive = false;
 
+// Shared video-start logic — used by the manual toggle AND by the
+// auto-start path that fires as soon as the page loads. Both paths
+// assume Way 1 (MJPEG) unless the user has manually picked forward.
+async function startVideoStream(mode) {
+  mode = mode || videoMode.value || 'mjpeg';
+  if (mode === 'off') return false;
+  try {
+    const r = await fetch('/proxy/video/start', {method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({mode})});
+    const d = await r.json();
+    if (!d.ok) {
+      videoStatus.textContent = 'Error: ' + (d.error || 'unknown');
+      return false;
+    }
+    videoActive = true;
+    videoToggle.textContent = 'Stop Video';
+    videoStatus.textContent = 'Mode: ' + d.mode;
+    videoContainer.style.display = '';
+    if (d.mode === 'mjpeg') {
+      videoImg.src = '/proxy/video?' + Date.now();
+      videoUrl.style.display = '';
+      videoUrl.innerHTML = 'Direct: <b>' + (d.stream_url || '') + '</b>';
+    } else if (d.mode === 'forward') {
+      videoImg.src = '/proxy/video/forward_stream?' + Date.now();
+      videoUrl.style.display = '';
+      videoUrl.innerHTML = 'UDP → C2 decode → MJPEG';
+    }
+    videoMode.value = d.mode;
+    return true;
+  } catch (e) {
+    videoStatus.textContent = 'Error: ' + e;
+    return false;
+  }
+}
+
 videoToggle.onclick = async () => {
   if (videoActive) {
     await post('/proxy/video/stop', {});
@@ -1706,36 +1742,40 @@ videoToggle.onclick = async () => {
     videoStatus.textContent = 'Mode: off';
     return;
   }
-  const mode = videoMode.value;
-  if (mode === 'off') return;
-  const body = {mode};
-  // For forward mode, target_host is auto-detected by the web controller server
+  await startVideoStream(videoMode.value);
+};
+
+// Auto-start Way 1 (MJPEG) on page load. refreshVideoStatus() below will
+// detect if the server reports an already-running stream and skip, so
+// reloading the page won't restart the stream unnecessarily.
+async function autoStartVideo() {
   try {
-    const r = await fetch('/proxy/video/start', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(body)});
+    const r = await fetch('/proxy/video/status', {cache:'no-store'});
     const d = await r.json();
-    if (d.ok) {
+    if (d && d.mode && d.mode !== 'off') {
+      // Already running — adopt existing state without restarting
       videoActive = true;
+      videoMode.value = d.mode;
       videoToggle.textContent = 'Stop Video';
-      videoStatus.textContent = 'Mode: ' + d.mode;
-      // Both modes show video via MJPEG in the browser
       videoContainer.style.display = '';
+      videoStatus.textContent = 'Mode: ' + d.mode + ' (existing)';
       if (d.mode === 'mjpeg') {
         videoImg.src = '/proxy/video?' + Date.now();
-        videoUrl.style.display = '';
-        videoUrl.innerHTML = 'Direct: <b>' + (d.stream_url || '') + '</b>';
       } else if (d.mode === 'forward') {
-        // Forward mode: C2 receives UDP, decodes, serves as MJPEG
         videoImg.src = '/proxy/video/forward_stream?' + Date.now();
-        videoUrl.style.display = '';
-        videoUrl.innerHTML = 'UDP → C2 decode → MJPEG';
       }
-    } else {
-      videoStatus.textContent = 'Error: ' + (d.error || 'unknown');
+      console.log('[video] adopted existing stream:', d.mode);
+      return;
     }
-  } catch(e) {
-    videoStatus.textContent = 'Error: ' + e;
-  }
-};
+  } catch {}
+  // Nothing running — start Way 1 (MJPEG, decoded on the flight controller).
+  videoMode.value = 'mjpeg';
+  console.log('[video] auto-starting MJPEG (Way 1)');
+  const ok = await startVideoStream('mjpeg');
+  if (!ok) console.warn('[video] auto-start failed, click Start Video manually');
+}
+// Fire a bit after page load so /proxy/heartbeat has time to succeed first
+setTimeout(autoStartVideo, 300);
 
 // Poll video status
 async function refreshVideoStatus() {
