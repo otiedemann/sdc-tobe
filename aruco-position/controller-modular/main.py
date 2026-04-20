@@ -565,9 +565,15 @@ def main():
             if len(parts) == 3:
                 mission_fly_to = (parts[0], parts[1], parts[2])
             else:
-                print("⚠️ --fly-to expects x,y,z  e.g. 3.0,2.0,1.5")
+                print("❌ --fly-to expects x,y,z  e.g. --fly-to 3.0,2.0,1.5")
+                sys.exit(1)
         except Exception:
-            print("⚠️ Invalid --fly-to value.")
+            print("❌ Invalid --fly-to value.  Expected x,y,z  e.g. --fly-to 3.0,2.0,1.5")
+            sys.exit(1)
+
+    if mission_enabled and mission_fly_to is None:
+        print("❌ --mission requires --fly-to x,y,z  e.g.:  python main.py --mission --fly-to 3.0,2.0,1.5")
+        sys.exit(1)
 
     # --ctrl-target x,y,z   e.g. --ctrl-target 3.0,1.5,1.2
     ctrl_target: Optional[tuple] = None
@@ -658,9 +664,6 @@ def main():
     # --------------------------------------------------------
     mission: Optional[AutonomousMission] = None
     if mission_enabled:
-        if mission_fly_to is None:
-            print("❌ --mission requires --fly-to x,y,z  e.g. --fly-to 3.0,2.0,1.5")
-            return
         mission = AutonomousMission(
             fly_to=mission_fly_to,
             ctrl_module=ctrl_module,
