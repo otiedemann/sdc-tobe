@@ -154,6 +154,9 @@ def has_gui():
 TAKEOFF_HEIGHT_Z = 1.2         # world-frame Z (up) to wait for after takeoff
 TAKEOFF_TIMEOUT_S = 15.0       # abort takeoff after this many seconds
 HOLD_ARRIVE_RADIUS = 0.25      # m – radius at which HOLD is declared
+CAM_LOST_TIMEOUT_S = 2.0       # seconds without cam position before entering recovery yaw
+RECOVERY_YAW_RATE = 0.1        # rad/s slow yaw rotation during recovery
+RECOVERY_MAX_YAW_SPEED = 150   # °/s – MaxRotationSpeed sent to drone before recovery PCMD
 
 
 class MissionPhase:
@@ -200,6 +203,11 @@ class AutonomousMission:
         self._phase_start: float       = 0.0
         self._pending_phase: Optional[str] = None   # next phase awaiting SPACE confirm
         self._pending_prompt: str      = ""          # message shown while waiting
+
+        # FLY_TO recovery state
+        self._last_cam_ts: float       = 0.0         # monotonic timestamp of last valid cam pos
+        self._recovering: bool         = False        # True while yaw-searching for markers
+        self._recovery_seq: int        = 0            # PCMD sequence counter during recovery
 
     # ------------------------------------------------------------------ #
     # Public                                                               #
@@ -326,20 +334,30 @@ class AutonomousMission:
             )
 
     def _tick_fly_to(self, vision_result, now, drone=None):
-        # Primary: controller HOVER phase signals arrival
-        if self.ctrl is not None and hasattr(self.ctrl, "position_controller"):
-            from controller import Phase
-            if self.ctrl.position_controller.phase == Phase.HOVER:
-                self._queue_confirm(
-                    MissionPhase.HOLD,
-                    "Arrived at target coordinate.  Ready to HOLD.",
-                    drone,
-                )
-            return
-
-        # Fallback: distance check using cam position
         cam = self._get_cam_pos(vision_result)
+
         if cam is not None:
+            # Position visible — update timestamp.
+            self._last_cam_ts = now
+
+            # If we were recovering, resume flying to target.
+            if self._recovering:
+                self._recovering = False
+                print("[mission] Cam position regained – resuming FLY_TO")
+                self._begin_fly_to(drone)
+
+            # Primary: controller HOVER phase signals arrival.
+            if self.ctrl is not None and hasattr(self.ctrl, "position_controller"):
+                from controller import Phase
+                if self.ctrl.position_controller.phase == Phase.HOVER:
+                    self._queue_confirm(
+                        MissionPhase.HOLD,
+                        "Arrived at target coordinate.  Ready to HOLD.",
+                        drone,
+                    )
+                return
+
+            # Fallback: distance check.
             tx, ty, tz = self.fly_to
             dist = math.sqrt((tx - cam[0])**2 + (ty - cam[1])**2 + (tz - cam[2])**2)
             if dist < HOLD_ARRIVE_RADIUS:
@@ -348,6 +366,25 @@ class AutonomousMission:
                     f"Arrived (cam dist={dist:.2f} m).  Ready to HOLD.",
                     drone,
                 )
+            return
+
+        # No cam position — check if timeout exceeded.
+        lost_for = now - self._last_cam_ts
+        if lost_for < CAM_LOST_TIMEOUT_S:
+            return  # brief dropout, keep flying
+
+        # Timeout exceeded: enter/continue recovery yaw.
+        if not self._recovering:
+            self._recovering = True
+            print(
+                f"[mission] FLY_TO – cam lost for {lost_for:.1f} s, "
+                "stopping and yaw-searching for position markers"
+            )
+            if self.ctrl is not None:
+                self.ctrl.clear_target()
+            self._set_recovery_yaw_speed(drone)
+
+        self._send_recovery_yaw(drone)
 
     def _tick_hold(self, now):
         pass  # Hold position indefinitely; controller keeps target active
@@ -407,8 +444,32 @@ class AutonomousMission:
     def _begin_fly_to(self, drone) -> None:
         x, y, z = self.fly_to
         print(f"[mission] FLY_TO – heading to ({x:.2f}, {y:.2f}, {z:.2f})")
+        self._last_cam_ts = time.monotonic()  # reset so timeout doesn't fire immediately
+        self._recovering = False
         if self.ctrl is not None:
             self.ctrl.set_target(x, y, z)
+
+    def _set_recovery_yaw_speed(self, drone) -> None:
+        """Set drone MaxRotationSpeed once when entering recovery so yaw PCMD is effective."""
+        if drone is None or self.dry_run:
+            return
+        try:
+            from olympe.messages.ardrone3.SpeedSettings import MaxRotationSpeed
+            drone(MaxRotationSpeed(RECOVERY_MAX_YAW_SPEED))
+        except Exception:
+            pass
+
+    def _send_recovery_yaw(self, drone) -> None:
+        """Send a pure yaw PCMD — zero roll, pitch, gaz — to rotate in place."""
+        if drone is None or self.dry_run:
+            return
+        try:
+            from olympe.messages.ardrone3.Piloting import PCMD
+            self._recovery_seq = (self._recovery_seq + 1) & 0x7FFFFFFF
+            yaw_pct = int(RECOVERY_YAW_RATE / 0.8 * 100)  # 0.8 rad/s → 100 %
+            drone(PCMD(0, 0, 0, yaw_pct, 0, self._recovery_seq))
+        except Exception:
+            pass
 
 
 # ============================================================
