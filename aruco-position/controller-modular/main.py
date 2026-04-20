@@ -1161,6 +1161,8 @@ def main():
                         "std_pos": 0.0,
                     }
 
+            _manual_active = (time.monotonic() - _manual_rc_time < MANUAL_TIMEOUT)
+
             if ctrl_module is not None and _ctrl_state is not None:
                 rc = ctrl_module.update(_ctrl_state)
                 if rc is not None:
@@ -1179,8 +1181,7 @@ def main():
                             end="",
                         )
                     elif anafi_drone is not None:
-                        _t_now = time.monotonic()
-                        if _t_now - _manual_rc_time < MANUAL_TIMEOUT:
+                        if _manual_active:
                             with _manual_rc_lock:
                                 _mrc = dict(rc)
                                 _mrc["forward_back"] = _manual_rc["forward_back"]
@@ -1189,6 +1190,20 @@ def main():
                             ctrl_module.send_pcmd_olympe(anafi_drone, _mrc)
                         else:
                             ctrl_module.send_pcmd_olympe(anafi_drone, rc)
+            elif _manual_active and anafi_drone is not None and not mission_dry_run:
+                # No vision state available – send manual RC directly
+                with _manual_rc_lock:
+                    _mrc = {
+                        "forward_back": _manual_rc["forward_back"],
+                        "left_right":   _manual_rc["left_right"],
+                        "up_down":      0,
+                        "yaw":          _manual_rc["yaw"],
+                    }
+                if ctrl_module is not None:
+                    ctrl_module.send_pcmd_olympe(anafi_drone, _mrc)
+                else:
+                    from olympe.messages.ardrone3.Piloting import PCMD as _PCMD
+                    anafi_drone(_PCMD(1, _mrc["left_right"], _mrc["forward_back"], _mrc["yaw"], 0, 0))
 
             # --------------------------------------
             # Autonomous mission tick
