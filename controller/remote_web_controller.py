@@ -864,13 +864,35 @@ HTML = """
     arcPoll();
     // Version marker — if this string doesn't appear in the DOM,
     // you're running stale JS (restart the Python server or hard-refresh).
-    console.log('[arc] init complete, build=2026-04-20-85eda48');
+    const BUILD = 'ab-click-counter';
+    console.log('[arc] init complete, build=' + BUILD);
     const ver = document.createElement('span');
     ver.id = 'arc_build_tag';
-    ver.style.cssText = 'font-size:10px;color:#64748b;margin-left:8px;';
-    ver.textContent = 'build 85eda48';
+    ver.style.cssText = 'font-size:10px;color:#10b981;margin-left:8px;font-weight:700;';
+    ver.textContent = 'build ' + BUILD;
     const hdr = document.querySelector('#aruco_panel h3');
     if (hdr) hdr.appendChild(ver);
+
+    // Immediate visible click counter — proves the button event fires, even
+    // if the subsequent fetch hangs or the server is wedged. Counts every
+    // LIVE / OBSERVE / Takeoff / Land / RC-stop / Emergency press.
+    let _arcClicks = 0;
+    const clickTag = document.createElement('span');
+    clickTag.id = 'arc_click_counter';
+    clickTag.style.cssText = 'font-size:10px;color:#fbbf24;margin-left:8px;';
+    clickTag.textContent = 'clicks: 0';
+    if (hdr) hdr.appendChild(clickTag);
+    function arcBumpClicks(src) {
+      _arcClicks += 1;
+      clickTag.textContent = 'clicks: ' + _arcClicks + ' (' + src + ')';
+      console.log('[arc] click #' + _arcClicks + ' from ' + src);
+    }
+    // Wire onto the existing buttons defensively. We use addEventListener so
+    // we don't overwrite the onclick handlers that actually do the work.
+    ['arc_mode_observe','arc_mode_live','arc_takeoff','arc_land','arc_rc_stop','arc_emergency','arc_start','arc_stop'].forEach(id => {
+      const el = document.getElementById(id);
+      if (el) el.addEventListener('click', () => arcBumpClicks(id));
+    });
   })();
   </script>
 
@@ -1033,6 +1055,27 @@ HTML = """
     setInterval(misLoadDrones, 5000);
     setInterval(misPoll, 500);
     misPoll();
+
+    // Mission panel click counter — same idea as the ArUco one. Proves the
+    // Start / Stop buttons receive the click event, independent of what
+    // the server does with the request afterwards.
+    const misHdr = document.querySelector('#missions_panel h3');
+    if (misHdr) {
+      const misClickTag = document.createElement('span');
+      misClickTag.id = 'mis_click_counter';
+      misClickTag.style.cssText = 'font-size:10px;color:#fbbf24;margin-left:8px;font-weight:400;';
+      misClickTag.textContent = 'clicks: 0';
+      misHdr.appendChild(misClickTag);
+      let _misClicks = 0;
+      ['mis_start','mis_stop','mis_stop_land'].forEach(id => {
+        const el = document.getElementById(id);
+        if (el) el.addEventListener('click', () => {
+          _misClicks += 1;
+          misClickTag.textContent = 'clicks: ' + _misClicks + ' (' + id + ')';
+          console.log('[mission] click #' + _misClicks + ' from ' + id);
+        });
+      });
+    }
   })();
   </script>
 
