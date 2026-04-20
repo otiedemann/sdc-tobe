@@ -740,7 +740,6 @@ def main():
         from olympe.messages.ardrone3.SpeedSettings import MaxRotationSpeed
         anafi_drone(MaxRotationSpeed(150))
 
-
         def _anafi_frame_cb(yuv_frame):
             try:
                 yuv_frame.ref()
@@ -889,56 +888,70 @@ def main():
                             _manual_rc_time = time.monotonic()
                     time.sleep(0.05)
             else:
-                import select
-                import sys as _sys
+                import select as _select
                 import tty
                 import termios
-                fd = _sys.stdin.fileno()
+                # Open /dev/tty directly so keyboard works even when stdin is
+                # redirected, piped, or running over SSH without a PTY.
+                _tty_fd   = None
+                _tty_file = None
+                _orig_attrs = None
                 try:
-                    tty.setcbreak(fd)   # cbreak: chars available immediately, Ctrl+C still works
+                    _tty_fd = os.open('/dev/tty', os.O_RDONLY)
+                    _orig_attrs = termios.tcgetattr(_tty_fd)
+                    tty.setcbreak(_tty_fd)
+                    _tty_file = os.fdopen(_tty_fd, 'rb', buffering=0)
+                    print("[keyboard] Ready – ESC=land  SPACE=confirm  W/S=fwd/back  A/D=left/right  Q/E=yaw")
                     while not _abort_flag.is_set():
-                        r, _, _ = select.select([_sys.stdin], [], [], 0.1)
+                        r, _, _ = _select.select([_tty_file], [], [], 0.1)
                         if r:
-                            ch = _sys.stdin.read(1)
-                            if ch == '\x1b':
-                                print("\n[abort] ESC detected in terminal")
+                            ch = _tty_file.read(1)
+                            if ch == b'\x1b':
+                                print("\n[abort] ESC – landing now")
                                 _abort_flag.set()
                                 return
-                            elif ch == ' ':
+                            elif ch == b' ':
                                 print("\n[mission] SPACE – confirm")
                                 _confirm_flag.set()
-                            elif ch in ('w', 'W'):
+                            elif ch in (b'w', b'W'):
                                 with _manual_rc_lock:
                                     _manual_rc.update({"forward_back": MANUAL_SPEED, "left_right": 0, "yaw": 0})
                                 _manual_rc_time = time.monotonic()
-                            elif ch in ('s', 'S'):
+                            elif ch in (b's', b'S'):
                                 with _manual_rc_lock:
                                     _manual_rc.update({"forward_back": -MANUAL_SPEED, "left_right": 0, "yaw": 0})
                                 _manual_rc_time = time.monotonic()
-                            elif ch in ('a', 'A'):
+                            elif ch in (b'a', b'A'):
                                 with _manual_rc_lock:
                                     _manual_rc.update({"forward_back": 0, "left_right": -MANUAL_SPEED, "yaw": 0})
                                 _manual_rc_time = time.monotonic()
-                            elif ch in ('d', 'D'):
+                            elif ch in (b'd', b'D'):
                                 with _manual_rc_lock:
                                     _manual_rc.update({"forward_back": 0, "left_right": MANUAL_SPEED, "yaw": 0})
                                 _manual_rc_time = time.monotonic()
-                            elif ch in ('q', 'Q'):
+                            elif ch in (b'q', b'Q'):
                                 with _manual_rc_lock:
                                     _manual_rc.update({"forward_back": 0, "left_right": 0, "yaw": -MANUAL_SPEED})
                                 _manual_rc_time = time.monotonic()
-                            elif ch in ('e', 'E'):
+                            elif ch in (b'e', b'E'):
                                 with _manual_rc_lock:
                                     _manual_rc.update({"forward_back": 0, "left_right": 0, "yaw": MANUAL_SPEED})
                                 _manual_rc_time = time.monotonic()
+                except Exception as _kb_err:
+                    print(f"[keyboard] Not available: {_kb_err}")
                 finally:
-                    if _saved_term is not None:
+                    if _orig_attrs is not None and _tty_fd is not None:
                         try:
-                            termios.tcsetattr(fd, termios.TCSADRAIN, _saved_term)
+                            termios.tcsetattr(_tty_fd, termios.TCSADRAIN, _orig_attrs)
                         except Exception:
                             pass
-        except Exception:
-            pass   # stdin not a tty (piped / background / non-interactive SSH)
+                    if _tty_file is not None:
+                        try:
+                            _tty_file.close()
+                        except Exception:
+                            pass
+        except Exception as _outer_kb_err:
+            print(f"[keyboard] Thread error: {_outer_kb_err}")
 
     # Non-daemon so Python waits for it to exit (and restore the terminal)
     # before shutting down.  We signal it via _abort_flag in the finally block.
@@ -1440,13 +1453,35 @@ def main():
                 try:
                     cv2.imshow("aruco_position Preview", preview)
                     key = cv2.waitKey(1) & 0xFF
-                    if key == ord("q"):
-                        break
-                    if key == 27:   # ESC
+                    if key == 27:   # ESC – emergency land
                         print("[abort] ESC pressed in preview window")
                         _abort_flag.set()
-                    if key == 32:   # SPACE
+                    elif key == 32:   # SPACE
                         _confirm_flag.set()
+                    elif key in (ord('w'), ord('W')):
+                        with _manual_rc_lock:
+                            _manual_rc.update({"forward_back": MANUAL_SPEED, "left_right": 0, "yaw": 0})
+                        _manual_rc_time = time.monotonic()
+                    elif key in (ord('s'), ord('S')):
+                        with _manual_rc_lock:
+                            _manual_rc.update({"forward_back": -MANUAL_SPEED, "left_right": 0, "yaw": 0})
+                        _manual_rc_time = time.monotonic()
+                    elif key in (ord('a'), ord('A')):
+                        with _manual_rc_lock:
+                            _manual_rc.update({"forward_back": 0, "left_right": -MANUAL_SPEED, "yaw": 0})
+                        _manual_rc_time = time.monotonic()
+                    elif key in (ord('d'), ord('D')):
+                        with _manual_rc_lock:
+                            _manual_rc.update({"forward_back": 0, "left_right": MANUAL_SPEED, "yaw": 0})
+                        _manual_rc_time = time.monotonic()
+                    elif key in (ord('q'), ord('Q')):
+                        with _manual_rc_lock:
+                            _manual_rc.update({"forward_back": 0, "left_right": 0, "yaw": -MANUAL_SPEED})
+                        _manual_rc_time = time.monotonic()
+                    elif key in (ord('e'), ord('E')):
+                        with _manual_rc_lock:
+                            _manual_rc.update({"forward_back": 0, "left_right": 0, "yaw": MANUAL_SPEED})
+                        _manual_rc_time = time.monotonic()
                 except cv2.error:
                     gui_available = False
                     print("\n⚠️ OpenCV HighGUI not available. Disabling local preview window.")
