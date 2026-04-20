@@ -21,49 +21,49 @@
       "id": 2,
       "label": "Front Left high",
       "x": -5.0,
-      "y": 0.0,
+      "y": 10.8,
       "z": 4.0,
-      "wall": "front"
+      "wall": "back"
     },
     {
       "id": 10,
       "label": "Front Left low",
       "x": -5.0,
-      "y": 0.0,
+      "y": 10.8,
       "z": 2.0,
-      "wall": "front"
+      "wall": "back"
     },
     {
       "id": 3,
       "label": "Front Middle high",
       "x": 0.0,
-      "y": 0.0,
+      "y": 10.8,
       "z": 4.0,
-      "wall": "front"
+      "wall": "back"
     },
     {
       "id": 11,
       "label": "Front Middle low",
       "x": 0.0,
-      "y": 0.0,
+      "y": 10.8,
       "z": 2.0,
-      "wall": "front"
+      "wall": "back"
     },
     {
       "id": 4,
       "label": "Front Right high",
       "x": 5.0,
-      "y": 0.0,
+      "y": 10.8,
       "z": 4.0,
-      "wall": "front"
+      "wall": "back"
     },
     {
       "id": 12,
       "label": "Front Right low",
       "x": 5.0,
-      "y": 0.0,
+      "y": 10.8,
       "z": 2.0,
-      "wall": "front"
+      "wall": "back"
     },
     {
       "id": 5,
@@ -85,49 +85,49 @@
       "id": 6,
       "label": "Back Right high",
       "x": 5.0,
-      "y": 10.8,
+      "y": 0.0,
       "z": 4.0,
-      "wall": "back"
+      "wall": "front"
     },
     {
       "id": 14,
       "label": "Back Right low",
       "x": 5.0,
-      "y": 10.8,
+      "y": 0.0,
       "z": 2.0,
-      "wall": "back"
+      "wall": "front"
     },
     {
       "id": 7,
       "label": "Back Middle high",
       "x": 0.0,
-      "y": 10.8,
+      "y": 0.0,
       "z": 4.0,
-      "wall": "back"
+      "wall": "front"
     },
     {
       "id": 15,
       "label": "Back Middle low",
       "x": 0.0,
-      "y": 10.8,
+      "y": 0.0,
       "z": 2.0,
-      "wall": "back"
+      "wall": "front"
     },
     {
       "id": 8,
       "label": "Back Left B high",
       "x": -5.0,
-      "y": 10.8,
+      "y": 0.0,
       "z": 4.0,
-      "wall": "back"
+      "wall": "front"
     },
     {
       "id": 16,
       "label": "Back Left B low",
       "x": -5.0,
-      "y": 10.8,
+      "y": 0.0,
       "z": 2.0,
-      "wall": "back"
+      "wall": "front"
     }
   ]
 }
