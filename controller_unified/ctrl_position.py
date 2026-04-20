@@ -154,6 +154,7 @@ class HeadlessAruCoPositioning:
         detect_profile="balanced",
         marker_size=None,
         enable_kalman_filter=True,
+        imu_weight=0.3,
     ):
         self.camera_matrix = camera_matrix
         self.dist_coeffs = dist_coeffs
@@ -192,10 +193,58 @@ class HeadlessAruCoPositioning:
         self.state_vel = np.zeros(3, dtype=float)
         self.state_ts = None
 
+        # ── IMU fusion ───────────────────────────────────────────────────
+        # IMU velocity in ARENA frame (m/s), set externally via set_imu_velocity()
+        # before process_frame. imu_weight controls how much we trust it vs vision:
+        #   0.0 → pure ArUco (vision-only velocity)
+        #   1.0 → pure IMU (marker fix only updates position, never velocity)
+        #   0.3 → default: 70% vision, 30% IMU
+        self.imu_vel = np.zeros(3, dtype=float)
+        self.imu_vel_ts = 0.0
+        self.imu_weight = float(np.clip(imu_weight, 0.0, 1.0))
+
+    def set_imu_velocity(self, vel_arena, ts=None):
+        """
+        Set the latest IMU-derived velocity in ARENA frame (m/s).
+        Call this before each process_frame() so the motion model can fuse it.
+
+        Args:
+            vel_arena: 3-element vector [vx, vy, vz] in m/s, ARENA frame
+            ts: capture timestamp (wall-clock seconds). Defaults to time.time().
+        """
+        if vel_arena is None:
+            return
+        self.imu_vel = np.asarray(vel_arena, dtype=float)
+        self.imu_vel_ts = float(ts) if ts is not None else time.time()
+
+    def set_imu_weight(self, weight):
+        """Live-tune the IMU-vs-ArUco velocity blend (0=pure vision, 1=pure IMU)."""
+        self.imu_weight = float(np.clip(weight, 0.0, 1.0))
+
+    def _predict_imu(self, target_ts):
+        """
+        Dead-reckon position from last known state using IMU velocity only.
+        Used when ArUco markers are briefly lost. Returns None if state is stale
+        (>2s since last vision update) — don't blindly integrate forever.
+        """
+        if self.state_pos is None or self.state_ts is None:
+            return None
+        dt = float(target_ts) - float(self.state_ts)
+        if dt <= 0.0 or dt > 2.0:
+            return None
+        pos = self.state_pos + self.imu_vel * dt
+        # Update state so subsequent dead-reckoning accumulates from this point
+        self.state_pos = pos.copy()
+        self.state_vel = self.imu_vel.copy()
+        self.state_ts = target_ts
+        return pos
+
     def _reset_motion_state(self):
         self.state_pos = None
         self.state_vel = np.zeros(3, dtype=float)
         self.state_ts = None
+        self.imu_vel = np.zeros(3, dtype=float)
+        self.imu_vel_ts = 0.0
 
     def _predict_state(self, target_ts):
         if self.state_pos is None or self.state_ts is None:
@@ -226,9 +275,13 @@ class HeadlessAruCoPositioning:
             dt = meas_ts - float(self.state_ts)
             if 1e-3 < dt <= MAX_STATE_DT:
                 inst_vel = (fused - self.state_pos) / dt
-                self.state_vel = (1.0 - VEL_BLEND) * self.state_vel + VEL_BLEND * inst_vel
+                # Blend vision-derived velocity with IMU velocity for smoother estimate
+                # imu_weight=0 → pure vision, 1 → pure IMU
+                blended_vel = (1.0 - self.imu_weight) * inst_vel + self.imu_weight * self.imu_vel
+                self.state_vel = (1.0 - VEL_BLEND) * self.state_vel + VEL_BLEND * blended_vel
             elif dt > MAX_STATE_DT:
-                self.state_vel = np.zeros(3, dtype=float)
+                # Vision gap too large — fall back to IMU velocity instead of zeroing
+                self.state_vel = self.imu_vel.copy()
         self.state_pos = fused.copy()
         self.state_ts = meas_ts
         return fused
@@ -437,6 +490,31 @@ class HeadlessAruCoPositioning:
             # short hold to avoid immediate dropouts
             if self.last_valid_pose is not None and (now_wall - self.last_valid_ts) <= POSE_HOLD_SEC:
                 return _stale_payload()
+            # Extended IMU dead-reckoning: if markers lost but IMU velocity is
+            # fresh and we're moving, keep outputting a live position by
+            # integrating IMU velocity forward from the last known state.
+            imu_fresh = (now_wall - self.imu_vel_ts) < 0.5
+            imu_moving = float(np.linalg.norm(self.imu_vel)) > 0.01
+            if imu_fresh and imu_moving:
+                dr_pos = self._predict_imu(eval_ts)
+                if dr_pos is not None:
+                    return {
+                        "cam": dr_pos.tolist(),
+                        "dir": (self.last_valid_dir.tolist()
+                                if self.last_valid_dir is not None else [0.0, 1.0, 0.0]),
+                        "targets": {},
+                        "ref_markers": [],
+                        "marker_weights": {},
+                        "marker_pixel_sizes": {},
+                        "marker_centers": {},
+                        "seen_markers": [],
+                        "seen_count": 0,
+                        "capture_ts": capture_ts,
+                        "eval_ts": eval_ts,
+                        "state_vel": self.state_vel.tolist(),
+                        "stale": False,
+                        "dead_reckoning": True,
+                    }
             for kf in self.kf_pos:
                 kf.reset()
             self.direction_filter.reset()

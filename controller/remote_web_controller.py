@@ -359,6 +359,7 @@ HTML = """
         <button id=\"arc_mode_live\" data-mode=\"live\">LIVE</button>
       </span>
       <span id=\"arc_mode_gate\" style=\"font-size:11px;color:#fbbf24;display:none;\">LIVE disabled (REMOTE_NO_LIVE=1)</span>
+      <span id=\"arc_mode_err\" style=\"display:none;margin-left:10px;padding:4px 10px;font-size:11px;background:#7f1d1d;color:#fecaca;border:1px solid #ef4444;border-radius:4px;font-weight:600;\"></span>
       <span id=\"arc_manual\" class=\"arc-manual\">
         <button id=\"arc_takeoff\" style=\"background:#065f46;border-color:#10b981;\">&uarr; Takeoff</button>
         <button id=\"arc_land\">&darr; Land</button>
@@ -422,6 +423,8 @@ HTML = """
       <button id=\"mis_start\" style=\"background:#065f46;border-color:#10b981;\">&#9654; Start mission</button>
       <button id=\"mis_stop\" style=\"background:#7f1d1d;border-color:#ef4444;\">&#9632; Stop</button>
       <button id=\"mis_stop_land\" style=\"background:#7f1d1d;border-color:#ef4444;\">&#9632; Stop + Land</button>
+      <span id=\"mis_err\" style=\"display:none;margin-left:10px;padding:4px 10px;font-size:11px;background:#7f1d1d;color:#fecaca;border:1px solid #ef4444;border-radius:4px;font-weight:600;\"></span>
+      <span id=\"mis_ok\"  style=\"display:none;margin-left:10px;padding:4px 10px;font-size:11px;background:#064e3b;color:#a7f3d0;border:1px solid #22c55e;border-radius:4px;font-weight:600;\"></span>
       <span id=\"mis_progress\" style=\"margin-left:12px;color:#38bdf8;font-weight:600;\">—</span>
     </div>
 
@@ -557,6 +560,9 @@ HTML = """
     const PGROUPS = ['Mission target','Camera filter / deadbands','P gains (camera)','D gains (IMU damping)','Output clamps','Drawing'];
     const SLIDERS = [
       ['hover_distance_m','Hover distance (m)',          0.5, 4.0, 0.05, 0],
+      ['fb_max',          'Approach speed (fwd RC %)',   0,100, 1, 0],
+      ['fb_back_max',     'Retreat speed (back RC %)',   0,100, 1, 0],
+      ['dist_p',          'Approach aggressiveness (P · distance)', 0, 60, 0.5, 0],
       ['ema_alpha',       'EMA α (smoothing)',           0.05,0.95, 0.05, 1],
       ['deadband_x',      'Deadband err_x',              0.00,0.30, 0.01, 1],
       ['deadband_y',      'Deadband err_y',              0.00,0.30, 0.01, 1],
@@ -565,18 +571,16 @@ HTML = """
       ['yaw_p',           'P · yaw     (per err_x)',     0, 50, 1, 2],
       ['skew_p',          'P · lateral (per skew)',      0, 50, 1, 2],
       ['alt_p',           'P · altitude (per err_y)',    0,100, 1, 2],
-      ['dist_p',          'P · distance',                0, 30, 0.5, 2],
       ['d_yaw',           'D · yaw     (°/s)',           0,  2, 0.05, 3],
       ['d_lr',            'D · lateral (cm/s vgy)',      0,  2, 0.05, 3],
       ['d_ud',            'D · vertical(cm/s vgz)',      0,  2, 0.05, 3],
       ['d_fb',            'D · fwd/back(cm/s vgx)',      0,  2, 0.05, 3],
-      ['yaw_max',         'Clamp · yaw max',             0, 50, 1, 4],
-      ['lr_max',          'Clamp · lateral max',         0, 30, 1, 4],
-      ['ud_max',          'Clamp · vertical max',        0, 50, 1, 4],
-      ['fb_max',          'Clamp · forward max',         0, 30, 1, 4],
-      ['fb_back_max',     'Clamp · backward max',        0, 30, 1, 4],
+      ['yaw_max',         'Clamp · yaw max',             0, 80, 1, 4],
+      ['lr_max',          'Clamp · lateral max',         0,100, 1, 4],
+      ['ud_max',          'Clamp · vertical max',        0,100, 1, 4],
       ['rc_min',          'RC dead-floor',               0, 10, 1, 4],
       ['cam_hfov_deg',    'Cam HFOV (drawing only)',    30,110, 1, 5],
+      ['marker_size_m',   'Marker physical size (m)',    0.05, 2.0, 0.01, 5],
     ];
     let arcParams = {};
     let arcAllowLive = false;
@@ -642,7 +646,11 @@ HTML = """
       bObs.classList.toggle('active', arcMode === 'observe');
       bLive.classList.toggle('active', arcMode === 'live');
       bLive.classList.toggle('live',   arcMode === 'live');
-      bLive.disabled = !arcAllowLive;
+      // Keep the button clickable — the server is the source of truth for
+      // allow_live. We just visually hint with the "gate" badge if the
+      // server has REMOTE_NO_LIVE set.
+      bLive.disabled = false;
+      bLive.style.opacity = arcAllowLive ? '1' : '0.7';
       document.getElementById('arc_mode_gate').style.display = arcAllowLive ? 'none' : 'inline';
       const live = (arcMode === 'live');
       document.getElementById('arc_live_banner').classList.toggle('show', live);
@@ -793,20 +801,52 @@ HTML = """
     };
     document.getElementById('arc_reload').onclick = arcLoadParams;
 
+    function arcShowModeErr(msg) {
+      const el = document.getElementById('arc_mode_err');
+      if (!el) return;
+      el.textContent = '✗ ' + msg;
+      el.style.display = 'inline';
+      // Clear after 8s so stale errors don't persist forever
+      clearTimeout(arcShowModeErr._t);
+      arcShowModeErr._t = setTimeout(() => { el.style.display = 'none'; }, 8000);
+    }
     async function arcSetMode(mode) {
-      const r = await fetch('/proxy/aruco/mode', {method:'POST',
-        headers:{'Content-Type':'application/json'},
-        body: JSON.stringify({mode})});
-      const j = await r.json();
-      if (!j.ok && j.error) alert('Mode change refused: ' + j.error);
-      arcApplyModeUI(j.mode || mode, arcAllowLive);
+      console.log('[arc] set-mode request:', mode);
+      // Clear previous error
+      document.getElementById('arc_mode_err').style.display = 'none';
+      try {
+        const r = await fetch('/proxy/aruco/mode', {method:'POST',
+          headers:{'Content-Type':'application/json'},
+          body: JSON.stringify({mode})});
+        let j;
+        try { j = await r.json(); } catch { j = {}; }
+        console.log('[arc] set-mode response:', r.status, j);
+        if (!r.ok || !j.ok) {
+          const msg = (j.error || j.message || r.statusText || 'unknown') + ' (HTTP ' + r.status + ')';
+          arcShowModeErr(msg);
+          return;
+        }
+        arcApplyModeUI(j.mode || mode, arcAllowLive);
+      } catch (err) {
+        console.error('[arc] set-mode failed:', err);
+        arcShowModeErr('network error: ' + err);
+      }
     }
     document.getElementById('arc_mode_observe').onclick = () => arcSetMode('observe');
-    document.getElementById('arc_mode_live').onclick = () => {
-      if (!arcAllowLive) { alert('LIVE mode is disabled (REMOTE_NO_LIVE=1).'); return; }
-      const ok = confirm('⚠ SWITCH TO LIVE MODE?\\n\\nThe drone WILL receive RC commands as soon as a marker is tracked.\\nMake sure the area is clear.\\n\\nClick OK to enable LIVE mode.');
-      if (ok) arcSetMode('live');
-    };
+    // LIVE button: always post to server, let it decide. Client-side arcAllowLive
+    // is now just a UI hint (disabled state) — if somehow wrong, the server
+    // returns 403 with a clear error message.
+    const liveBtn = document.getElementById('arc_mode_live');
+    if (liveBtn) {
+      liveBtn.onclick = () => {
+        console.log('[arc] LIVE clicked, arcAllowLive=', arcAllowLive);
+        const ok = confirm('⚠ SWITCH TO LIVE MODE?\\n\\nThe drone WILL receive RC commands as soon as a marker is tracked.\\nMake sure the area is clear.\\n\\nClick OK to enable LIVE mode.');
+        if (ok) arcSetMode('live');
+      };
+      console.log('[arc] LIVE button click handler attached');
+    } else {
+      console.error('[arc] could not find arc_mode_live button — handler NOT attached');
+    }
 
     async function arcPostCmd(path, confirmMsg) {
       if (confirmMsg && !confirm(confirmMsg)) return;
@@ -822,6 +862,15 @@ HTML = """
     arcLoadParams();
     setInterval(arcPoll, 250);
     arcPoll();
+    // Version marker — if this string doesn't appear in the DOM,
+    // you're running stale JS (restart the Python server or hard-refresh).
+    console.log('[arc] init complete, build=2026-04-20-85eda48');
+    const ver = document.createElement('span');
+    ver.id = 'arc_build_tag';
+    ver.style.cssText = 'font-size:10px;color:#64748b;margin-left:8px;';
+    ver.textContent = 'build 85eda48';
+    const hdr = document.querySelector('#aruco_panel h3');
+    if (hdr) hdr.appendChild(ver);
   })();
   </script>
 
@@ -925,11 +974,41 @@ HTML = """
                    (auto_takeoff ? '⚠ AUTO-TAKEOFF is enabled — drones will launch.\\n\\n' : '') +
                    'This switches the observers into LIVE mode.';
       if (!confirm(warn)) return;
-      const r = await fetch('/proxy/missions/scan_all/start', {method:'POST',
-        headers:{'Content-Type':'application/json'},
-        body: JSON.stringify(payload)});
-      const j = await r.json();
-      if (!j.ok) alert('Mission start refused: ' + (j.error || j.message || ''));
+      const btn = document.getElementById('mis_start');
+      const origLabel = btn.textContent;
+      const misErr = document.getElementById('mis_err');
+      const misOk  = document.getElementById('mis_ok');
+      if (misErr) misErr.style.display = 'none';
+      if (misOk)  misOk.style.display  = 'none';
+      btn.disabled = true; btn.textContent = '… starting';
+      let j = {}; let httpStatus = 0;
+      try {
+        const r = await fetch('/proxy/missions/scan_all/start', {method:'POST',
+          headers:{'Content-Type':'application/json'},
+          body: JSON.stringify(payload)});
+        httpStatus = r.status;
+        try { j = await r.json(); } catch { j = {}; }
+      } catch (err) {
+        j = { ok: false, error: 'network error: ' + err };
+      } finally {
+        btn.disabled = false; btn.textContent = origLabel;
+      }
+      console.log('[mission] start response:', httpStatus, j);
+      if (!j.ok) {
+        const msg = (j.error || j.message || 'unknown error') + (httpStatus ? ' (HTTP ' + httpStatus + ')' : '');
+        if (misErr) {
+          misErr.textContent = '✗ Mission start refused: ' + msg;
+          misErr.style.display = 'inline-block';
+        }
+      } else {
+        const msg = j.message || 'mission started';
+        const warn = j.status && j.status.error ? ' — warning: ' + j.status.error : '';
+        console.log('[mission] started:', msg, warn);
+        if (misOk) {
+          misOk.textContent = '✓ ' + msg + warn;
+          misOk.style.display = 'inline-block';
+        }
+      }
       misPoll();
     };
 
@@ -1003,6 +1082,12 @@ HTML = """
           <label>Latency ms:
             <input id=\"pos_latency\" type=\"range\" min=\"0\" max=\"800\" value=\"200\" style=\"width:90px;vertical-align:middle;\" />
             <span id=\"pos_latency_val\" style=\"font-size:11px;color:#94a3b8;\">200</span>
+          </label>
+          <label title=\"0 = pure ArUco (vision only), 1 = pure IMU dead-reckoning. Higher = more IMU smoothing, less vision jitter.\" style=\"display:inline-flex;align-items:center;gap:4px;\">
+            <span style=\"font-size:11px;color:#94a3b8;\">ArUco</span>
+            <input id=\"pos_imu_weight\" type=\"range\" min=\"0\" max=\"100\" value=\"30\" style=\"width:110px;vertical-align:middle;accent-color:#06b6d4;\" />
+            <span style=\"font-size:11px;color:#94a3b8;\">IMU</span>
+            <span id=\"pos_imu_weight_val\" style=\"font-size:11px;color:#06b6d4;font-weight:bold;min-width:32px;\">30%</span>
           </label>
         </div>
         <div style=\"display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:6px;padding:6px;background:#0f172a;border:1px solid #1e293b;border-radius:4px;\">
@@ -1949,6 +2034,8 @@ function arenaToCanvas(ax, ay) {
 }
 
 const WALL_COLOR = { front:'#6366f1', back:'#a855f7', left:'#06b6d4', right:'#10b981' };
+let _seenMarkers = new Set();   // IDs currently visible in the drone camera (as strings)
+let _refMarkers  = new Set();   // IDs actually used as world-frame refs this frame
 
 // Track last drawn position so arena config reload doesn't erase the dot
 let _lastPos = null, _lastCompPos = null, _lastDir = null, _lastFrameRes = null;
@@ -2017,6 +2104,8 @@ function drawArena(pos, compPos, dir) {
   ctx.textAlign = 'center'; ctx.fillText('RIGHT', 0, 0); ctx.restore();
 
   // Arena markers — colored square + bold ID pill placed away from the wall
+  // Currently-visible markers get a bright halo; markers used as refs get a
+  // brighter border; unseen markers are dimmed to ~40% for visual separation.
   ctx.font = 'bold 11px monospace';
   ctx.textBaseline = 'middle';
   for (const [id, m] of Object.entries(arenaMarkers)) {
@@ -2024,11 +2113,28 @@ function drawArena(pos, compPos, dir) {
     const [mx, my] = arenaToCanvas(m.pos[0], m.pos[1]);
     if (mx < PAD - 4 || mx > W - PAD + 4 || my < PAD - 4 || my > H - PAD + 4) continue;
 
-    // Square marker (slightly larger + outlined for visibility)
-    const color = WALL_COLOR[m.wall] || '#94a3b8';
-    ctx.fillStyle = color;
+    const isSeen = _seenMarkers.has(String(id));
+    const isRef  = _refMarkers.has(String(id));
+    const baseColor = WALL_COLOR[m.wall] || '#94a3b8';
+
+    // Halo behind seen markers so they visibly pulse against the arena
+    if (isSeen) {
+      ctx.beginPath();
+      ctx.arc(mx, my, 14, 0, Math.PI * 2);
+      ctx.fillStyle = (isRef ? 'rgba(34,197,94,0.35)' : 'rgba(251,191,36,0.35)');
+      ctx.fill();
+      ctx.beginPath();
+      ctx.arc(mx, my, 14, 0, Math.PI * 2);
+      ctx.strokeStyle = (isRef ? '#22c55e' : '#fbbf24');
+      ctx.lineWidth = 1.5; ctx.stroke();
+    }
+
+    // Square marker — always full-opacity so markers never disappear.
+    // Seen markers get a brighter white border to make them pop.
+    ctx.fillStyle = baseColor;
     ctx.fillRect(mx - 5, my - 5, 10, 10);
-    ctx.strokeStyle = 'rgba(15,23,42,0.9)'; ctx.lineWidth = 1;
+    ctx.strokeStyle = isSeen ? '#ffffff' : 'rgba(15,23,42,0.9)';
+    ctx.lineWidth = isSeen ? 1.5 : 1;
     ctx.strokeRect(mx - 5.5, my - 5.5, 11, 11);
 
     // Position label pill on the side away from the wall (so ID doesn't collide with BACK/FRONT/LEFT/RIGHT)
@@ -2044,14 +2150,15 @@ function drawArena(pos, compPos, dir) {
     else if (wall === 'right') { labelX = mx - 9 - pillW / 2; labelY = my; }
     else                       { labelX = mx; labelY = my - 13; }
 
-    // Dark background pill for legibility
+    // Dark background pill for legibility — always visible
     ctx.fillStyle = 'rgba(15,23,42,0.9)';
     ctx.fillRect(labelX - pillW / 2, labelY - pillH / 2, pillW, pillH);
-    ctx.strokeStyle = color; ctx.lineWidth = 1;
+    ctx.strokeStyle = baseColor;
+    ctx.lineWidth = isSeen ? 1.5 : 1;
     ctx.strokeRect(labelX - pillW / 2 + 0.5, labelY - pillH / 2 + 0.5, pillW - 1, pillH - 1);
 
-    // ID text — color-matched to wall for quick visual association
-    ctx.fillStyle = color;
+    // ID text — white for seen markers, wall color for unseen
+    ctx.fillStyle = isSeen ? '#ffffff' : baseColor;
     ctx.textAlign = 'center';
     ctx.fillText(idText, labelX, labelY + 0.5);
   }
@@ -2167,6 +2274,9 @@ function updatePosUI(d) {
   badge.style.color = !enabled ? '#64748b' : (pos && !d.stale && !dr) ? '#22c55e' : dr ? '#06b6d4' : '#f59e0b';
 
   if (d.frame_w && d.frame_h) _lastFrameRes = `${d.frame_w}x${d.frame_h}`;
+  // Stash visible + reference markers so drawArena can highlight them
+  _seenMarkers = new Set((d.seen_markers || []).map(String));
+  _refMarkers  = new Set((d.ref_markers  || []).map(String));
   if (pos) console.log('[POS] drawArena pos=', pos, 'compPos=', compPos, 'frame=', _lastFrameRes);
   drawArena(pos, compPos, dir);
 }
@@ -2190,6 +2300,11 @@ async function loadPosConfig() {
     document.getElementById('pos_enabled').checked = !!c.enabled;
     if (c.detect_profile) document.getElementById('pos_profile').value = c.detect_profile;
     if (c.fov_deg) document.getElementById('pos_fov').value = c.fov_deg;
+    if (typeof c.imu_weight === 'number') {
+      const pct = Math.round(c.imu_weight * 100);
+      document.getElementById('pos_imu_weight').value = pct;
+      document.getElementById('pos_imu_weight_val').textContent = pct + '%';
+    }
     const latMs = (c.latency_ms != null) ? c.latency_ms
                   : (c.latency_comp_s != null ? Math.round(c.latency_comp_s * 1000) : null);
     if (latMs != null) {
@@ -2257,6 +2372,17 @@ document.getElementById('pos_enabled').onchange = async function() {
 
 document.getElementById('pos_latency').oninput = function() {
   document.getElementById('pos_latency_val').textContent = this.value;
+};
+
+// IMU blend slider — debounced write-through so dragging doesn't spam
+let _imuWeightTimer = null;
+document.getElementById('pos_imu_weight').oninput = function() {
+  document.getElementById('pos_imu_weight_val').textContent = this.value + '%';
+  if (_imuWeightTimer) clearTimeout(_imuWeightTimer);
+  const v = parseFloat(this.value) / 100;
+  _imuWeightTimer = setTimeout(() => {
+    post('/proxy/position/config', { imu_weight: v });
+  }, 150);
 };
 
 document.getElementById('pos_cfg_save').onclick = async () => {

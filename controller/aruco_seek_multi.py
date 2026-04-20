@@ -72,6 +72,9 @@ class HoverParams:
     hover_distance_m: float = ASEEK.HOVER_DISTANCE_M
     # Camera HFOV — drawing-only
     cam_hfov_deg: float    = 69.0
+    # Physical marker size in meters — drives distance estimation.
+    # Distance scale auto-adjusts via (marker_size_m / MARKER_SIZE_CALIB_M) ** CALIB_B.
+    marker_size_m: float   = ASEEK.MARKER_SIZE_M
 
 
 def _clamp_int(v: float, lo: int, hi: int) -> int:
@@ -107,10 +110,20 @@ class DroneObserver:
         self.params = HoverParams()
         self.target_id: Optional[int] = None    # None = auto-pick largest
         self._chosen_id: Optional[int] = None
-        self.latest: dict = {"running": False, "drone_id": drone_id}
 
         self.mode: str = "observe"       # "observe" | "live"
         self.allow_live = bool(allow_live)
+        # IMPORTANT: include mode + allow_live in the initial state so the
+        # client's /proxy/aruco/state poll can enable the LIVE button BEFORE
+        # the observer is started. Without these keys the UI stays in
+        # "LIVE disabled" mode until _tick() fires for the first time.
+        self.latest: dict = {
+            "running": False,
+            "drone_id": drone_id,
+            "mode": self.mode,
+            "allow_live": self.allow_live,
+            "params": asdict(self.params),
+        }
         self._last_send_t: float = 0.0
 
         self._vid: Optional[VideoMarkerTracker] = None
@@ -378,7 +391,7 @@ class DroneObserver:
         # Camera measurements
         raw_err_x = (cx - fw / 2.0) / (fw / 2.0)
         raw_err_y = (cy - fh / 2.0) / (fh / 2.0)
-        raw_dist  = pixel_distance_estimate(px_size)
+        raw_dist  = pixel_distance_estimate(px_size, marker_size_m=p.marker_size_m)
         raw_skew  = marker_skew(left_len, right_len) if (left_len + right_len) > 0 else 0.0
 
         # EMA
@@ -607,17 +620,40 @@ class ScanAllMarkersMission:
                 for did in self.drone_ids
             }
             # Start each observer, flip to LIVE
+            failed_live = []
+            takeoff_errs = []
             for did in self.drone_ids:
                 obs = self.fleet.get(did)
                 assert obs is not None
                 obs.set_target(None)          # auto-pick until we claim one
                 obs.start()
-                obs.set_mode("live")
+                resulting_mode = obs.set_mode("live")
+                if resulting_mode != "live":
+                    failed_live.append(did)
                 if self.auto_takeoff:
                     try:
-                        obs.cmd_takeoff()
-                    except Exception:
-                        pass
+                        r = obs.cmd_takeoff()
+                        if isinstance(r, dict) and r.get("ok") is False:
+                            takeoff_errs.append(f"{did}:{r.get('error') or r.get('status_code') or 'unknown'}")
+                    except Exception as e:
+                        takeoff_errs.append(f"{did}:{e}")
+            if failed_live:
+                # Roll back: stop observers we just started
+                for did in self.drone_ids:
+                    obs = self.fleet.get(did)
+                    if obs is not None:
+                        try: obs.set_mode("observe")
+                        except Exception: pass
+                self._active = False
+                self.error = (f"could not switch {','.join(failed_live)} to LIVE — "
+                              "check REMOTE_NO_LIVE env var, observer allow_live, "
+                              "or that the drone API is reachable")
+                return False
+            if takeoff_errs:
+                # Takeoff failures don't abort the mission — the mission can still
+                # run if the user takes off manually — but surface the errors
+                # so they appear in the UI as a warning.
+                self.error = "takeoff issues: " + "; ".join(takeoff_errs)
             self._thread = threading.Thread(target=self._run, daemon=True,
                                              name="mission-scan-all")
             self._thread.start()

@@ -371,6 +371,7 @@ _pos_cfg: dict = {
     "marker_size_m": 0.5,   # overrides arena_config.json marker_size_m when set
     "top_k_markers": 0,     # 0 = auto (code picks best 4); set to limit further
     "outlier_reject_m": 2.5,  # max distance from centroid before an estimate is dropped
+    "imu_weight": 0.3,      # 0.0 = pure ArUco, 1.0 = pure IMU dead-reckoning
 }
 
 # Arena config — SDC challenge default layout.
@@ -3318,11 +3319,36 @@ def positioning_loop():
             if _video_frame_count < 5:
                 print(f"[POS] annotation detect error: {ae}")
 
+        # Match telemetry FIRST so we can feed IMU velocity to the processor
+        # before pose estimation. This gives the motion model a fresh prediction
+        # to blend against the upcoming vision measurement.
+        with _pos_cfg_lock:
+            latency_comp_s = max(0.0, float(_pos_cfg.get("latency_comp_s", 0.05)))
+            sync_max_gap_s = max(0.01, float(_pos_cfg.get("sync_max_gap_s", 0.20)))
+            imu_weight_cfg = float(_pos_cfg.get("imu_weight", 0.3))
+        tel_target_ts = ts - latency_comp_s
+        tel_match_pre = _telemetry_at(tel_target_ts, max_gap_s=sync_max_gap_s)
+        tel_sample_pre = tel_match_pre.get("sample") or {}
+        if tel_match_pre.get("quality") not in {"none", "stale"}:
+            # Anafi telemetry: vgx/vgy/vgz in body-frame cm/s (Parrot NED: x=fwd, y=right, z=down)
+            # Rotate by drone yaw (deg) to get approximate arena-frame m/s.
+            # NOTE: assumes arena +y ≈ magnetic north. If the arena is rotated relative
+            # to magnetic north, a per-arena yaw offset should be added to tel_yaw here.
+            tel_vgx_pre = float(tel_sample_pre.get("vgx") or 0.0) / 100.0   # m/s forward
+            tel_vgy_pre = float(tel_sample_pre.get("vgy") or 0.0) / 100.0   # m/s right
+            tel_vgz_pre = float(tel_sample_pre.get("vgz") or 0.0) / 100.0   # m/s down
+            tel_yaw_pre = float(tel_sample_pre.get("yaw") or 0.0)
+            yaw_rad = math.radians(tel_yaw_pre)
+            # Body→world yaw rotation: forward axis maps to +y when yaw=0
+            v_world_x =  tel_vgx_pre * math.sin(yaw_rad) + tel_vgy_pre * math.cos(yaw_rad)
+            v_world_y =  tel_vgx_pre * math.cos(yaw_rad) - tel_vgy_pre * math.sin(yaw_rad)
+            v_world_z = -tel_vgz_pre  # NED → Z-up
+            processor.set_imu_velocity([v_world_x, v_world_y, v_world_z], ts=ts)
+        # Apply live IMU/ArUco blend from UI slider
+        processor.set_imu_weight(imu_weight_cfg)
+
         # Run pose estimation (latency-aware)
         try:
-            with _pos_cfg_lock:
-                latency_comp_s = max(0.0, float(_pos_cfg.get("latency_comp_s", 0.05)))
-                sync_max_gap_s = max(0.01, float(_pos_cfg.get("sync_max_gap_s", 0.20)))
             result = processor.process_frame(
                 frame,
                 frame_ts=ts,
@@ -3605,6 +3631,8 @@ def api_pos_config_set():
             _pos_cfg["top_k_markers"] = max(0, min(10, int(data["top_k_markers"])))
         if "outlier_reject_m" in data:
             _pos_cfg["outlier_reject_m"] = max(0.1, min(20.0, float(data["outlier_reject_m"])))
+        if "imu_weight" in data:
+            _pos_cfg["imu_weight"] = max(0.0, min(1.0, float(data["imu_weight"])))
         cfg_snap = dict(_pos_cfg)
 
     # Apply live filter changes to running processor
