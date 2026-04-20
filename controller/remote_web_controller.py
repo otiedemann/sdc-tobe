@@ -801,14 +801,20 @@ HTML = """
     };
     document.getElementById('arc_reload').onclick = arcLoadParams;
 
-    function arcShowModeErr(msg) {
+    function arcShowModeErr(msg, kind) {
       const el = document.getElementById('arc_mode_err');
       if (!el) return;
-      el.textContent = '✗ ' + msg;
-      el.style.display = 'inline';
-      // Clear after 8s so stale errors don't persist forever
       clearTimeout(arcShowModeErr._t);
-      arcShowModeErr._t = setTimeout(() => { el.style.display = 'none'; }, 8000);
+      if (!msg) { el.style.display = 'none'; return; }
+      // kind: 'warn' = amber, default = red
+      const warn = (kind === 'warn') || msg.startsWith('⚠');
+      el.textContent = warn ? msg : ('✗ ' + msg);
+      el.style.background = warn ? '#78350f' : '#7f1d1d';
+      el.style.color      = warn ? '#fde68a' : '#fecaca';
+      el.style.borderColor = warn ? '#f59e0b' : '#ef4444';
+      el.style.display = 'inline';
+      // Auto-hide warnings in 3s, errors in 8s
+      arcShowModeErr._t = setTimeout(() => { el.style.display = 'none'; }, warn ? 3200 : 8000);
     }
     async function arcSetMode(mode) {
       console.log('[arc] set-mode request:', mode);
@@ -836,12 +842,38 @@ HTML = """
     // LIVE button: always post to server, let it decide. Client-side arcAllowLive
     // is now just a UI hint (disabled state) — if somehow wrong, the server
     // returns 403 with a clear error message.
+    // LIVE button: double-click / re-click confirmation (no browser confirm()).
+    // First click arms — button pulses + warning shows.
+    // Second click within 3 seconds → switches mode.
+    // Keeps us off native confirm() dialogs which some browsers auto-dismiss.
     const liveBtn = document.getElementById('arc_mode_live');
+    let _arcArmedUntil = 0;
     if (liveBtn) {
       liveBtn.onclick = () => {
-        console.log('[arc] LIVE clicked, arcAllowLive=', arcAllowLive);
-        const ok = confirm('⚠ SWITCH TO LIVE MODE?\\n\\nThe drone WILL receive RC commands as soon as a marker is tracked.\\nMake sure the area is clear.\\n\\nClick OK to enable LIVE mode.');
-        if (ok) arcSetMode('live');
+        const now = Date.now();
+        console.log('[arc] LIVE clicked, arcAllowLive=', arcAllowLive, 'armed=', (now < _arcArmedUntil));
+        if (now < _arcArmedUntil) {
+          // Armed → actually switch
+          _arcArmedUntil = 0;
+          liveBtn.style.animation = '';
+          liveBtn.textContent = 'LIVE';
+          arcShowModeErr(''); // hides
+          arcSetMode('live');
+          return;
+        }
+        // First click — arm for 3s
+        _arcArmedUntil = now + 3000;
+        liveBtn.style.animation = 'arcpulse 0.6s ease-in-out infinite';
+        liveBtn.textContent = 'LIVE — click again';
+        arcShowModeErr('⚠ Click LIVE again within 3 s to confirm');
+        setTimeout(() => {
+          if (Date.now() >= _arcArmedUntil) {
+            _arcArmedUntil = 0;
+            liveBtn.style.animation = '';
+            liveBtn.textContent = 'LIVE';
+            arcShowModeErr('');
+          }
+        }, 3100);
       };
       console.log('[arc] LIVE button click handler attached');
     } else {
@@ -864,13 +896,35 @@ HTML = """
     arcPoll();
     // Version marker — if this string doesn't appear in the DOM,
     // you're running stale JS (restart the Python server or hard-refresh).
-    console.log('[arc] init complete, build=2026-04-20-85eda48');
+    const BUILD = 'ae-search-maneuver';
+    console.log('[arc] init complete, build=' + BUILD);
     const ver = document.createElement('span');
     ver.id = 'arc_build_tag';
-    ver.style.cssText = 'font-size:10px;color:#64748b;margin-left:8px;';
-    ver.textContent = 'build 85eda48';
+    ver.style.cssText = 'font-size:10px;color:#10b981;margin-left:8px;font-weight:700;';
+    ver.textContent = 'build ' + BUILD;
     const hdr = document.querySelector('#aruco_panel h3');
     if (hdr) hdr.appendChild(ver);
+
+    // Immediate visible click counter — proves the button event fires, even
+    // if the subsequent fetch hangs or the server is wedged. Counts every
+    // LIVE / OBSERVE / Takeoff / Land / RC-stop / Emergency press.
+    let _arcClicks = 0;
+    const clickTag = document.createElement('span');
+    clickTag.id = 'arc_click_counter';
+    clickTag.style.cssText = 'font-size:10px;color:#fbbf24;margin-left:8px;';
+    clickTag.textContent = 'clicks: 0';
+    if (hdr) hdr.appendChild(clickTag);
+    function arcBumpClicks(src) {
+      _arcClicks += 1;
+      clickTag.textContent = 'clicks: ' + _arcClicks + ' (' + src + ')';
+      console.log('[arc] click #' + _arcClicks + ' from ' + src);
+    }
+    // Wire onto the existing buttons defensively. We use addEventListener so
+    // we don't overwrite the onclick handlers that actually do the work.
+    ['arc_mode_observe','arc_mode_live','arc_takeoff','arc_land','arc_rc_stop','arc_emergency','arc_start','arc_stop'].forEach(id => {
+      const el = document.getElementById(id);
+      if (el) el.addEventListener('click', () => arcBumpClicks(id));
+    });
   })();
   </script>
 
@@ -956,9 +1010,30 @@ HTML = """
       } catch {}
     }
 
+    // Click-to-arm pattern for Start Mission — no native confirm() dialog
+    // (some browsers auto-dismiss rapid-fire dialogs, making the mission
+    // never start with no visible feedback).
+    let _misArmedUntil = 0;
     document.getElementById('mis_start').onclick = async () => {
       const drone_ids = misSelectedDroneIds();
-      if (!drone_ids.length) { alert('Select at least one drone.'); return; }
+      const misErr = document.getElementById('mis_err');
+      const misOk  = document.getElementById('mis_ok');
+      function misShowWarn(msg) {
+        if (!misErr) return;
+        misErr.textContent = msg;
+        misErr.style.background = '#78350f';
+        misErr.style.color = '#fde68a';
+        misErr.style.borderColor = '#f59e0b';
+        misErr.style.display = 'inline-block';
+      }
+      function misClearMsgs() {
+        if (misErr) misErr.style.display = 'none';
+        if (misOk)  misOk.style.display  = 'none';
+      }
+      if (!drone_ids.length) {
+        misShowWarn('✗ Select at least one drone first');
+        return;
+      }
       const markers = document.getElementById('mis_markers').value;
       const hover_seconds = parseFloat(document.getElementById('mis_hover_s').value) || 3.0;
       const tol = parseFloat(document.getElementById('mis_tol_m').value) || 0.35;
@@ -967,19 +1042,36 @@ HTML = """
         drone_ids, target_markers: markers,
         hover_seconds, approach_tolerance_m: tol, auto_takeoff,
       };
-      const warn = 'Start mission \"Scan All Markers\"?\\n\\n' +
-                   'Drones: ' + drone_ids.join(', ') + '\\n' +
-                   'Markers: ' + markers + '\\n' +
-                   'Hover for ' + hover_seconds + 's at each marker.\\n\\n' +
-                   (auto_takeoff ? '⚠ AUTO-TAKEOFF is enabled — drones will launch.\\n\\n' : '') +
-                   'This switches the observers into LIVE mode.';
-      if (!confirm(warn)) return;
       const btn = document.getElementById('mis_start');
+      const now = Date.now();
+      if (now >= _misArmedUntil) {
+        // First click — arm for 3s, show summary inline
+        _misArmedUntil = now + 3000;
+        const origLabel = btn.textContent;
+        btn._origLabel = origLabel;
+        btn.textContent = '⚠ Click again to launch';
+        btn.style.animation = 'arcpulse 0.6s ease-in-out infinite';
+        const summary = 'Drones: ' + drone_ids.join(', ') +
+                        '   •   Markers: ' + markers +
+                        '   •   Hover ' + hover_seconds + 's' +
+                        (auto_takeoff ? '   •   ⚠ AUTO-TAKEOFF' : '');
+        misShowWarn('⚠ Starting mission — ' + summary + '. Click Start again within 3 s.');
+        setTimeout(() => {
+          if (Date.now() >= _misArmedUntil) {
+            _misArmedUntil = 0;
+            btn.textContent = btn._origLabel || '▶ Start mission';
+            btn.style.animation = '';
+            misClearMsgs();
+          }
+        }, 3100);
+        return;
+      }
+      // Armed — proceed with launch
+      _misArmedUntil = 0;
+      btn.style.animation = '';
+      btn.textContent = btn._origLabel || '▶ Start mission';
+      misClearMsgs();
       const origLabel = btn.textContent;
-      const misErr = document.getElementById('mis_err');
-      const misOk  = document.getElementById('mis_ok');
-      if (misErr) misErr.style.display = 'none';
-      if (misOk)  misOk.style.display  = 'none';
       btn.disabled = true; btn.textContent = '… starting';
       let j = {}; let httpStatus = 0;
       try {
@@ -1033,6 +1125,27 @@ HTML = """
     setInterval(misLoadDrones, 5000);
     setInterval(misPoll, 500);
     misPoll();
+
+    // Mission panel click counter — same idea as the ArUco one. Proves the
+    // Start / Stop buttons receive the click event, independent of what
+    // the server does with the request afterwards.
+    const misHdr = document.querySelector('#missions_panel h3');
+    if (misHdr) {
+      const misClickTag = document.createElement('span');
+      misClickTag.id = 'mis_click_counter';
+      misClickTag.style.cssText = 'font-size:10px;color:#fbbf24;margin-left:8px;font-weight:400;';
+      misClickTag.textContent = 'clicks: 0';
+      misHdr.appendChild(misClickTag);
+      let _misClicks = 0;
+      ['mis_start','mis_stop','mis_stop_land'].forEach(id => {
+        const el = document.getElementById(id);
+        if (el) el.addEventListener('click', () => {
+          _misClicks += 1;
+          misClickTag.textContent = 'clicks: ' + _misClicks + ' (' + id + ')';
+          console.log('[mission] click #' + _misClicks + ' from ' + id);
+        });
+      });
+    }
   })();
   </script>
 
