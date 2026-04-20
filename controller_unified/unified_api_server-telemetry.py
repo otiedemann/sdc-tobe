@@ -356,7 +356,7 @@ _ARENA_CONFIG_DEFAULT: dict = {
     "arena_height_m": 10.0,
     "arena_origin_x": -10.0,
     "arena_origin_y": 0.0,
-    "marker_size_m": 0.18,
+    "marker_size_m": 0.5,
     "markers": [
         {"id":  0, "label": "Origin",       "x":   0.0, "y":  0.0,   "z":  0.0, "wall": "front"},
         {"id":  1, "label": "Right A low",  "x":  10.0, "y":  6.667, "z":  2.0, "wall": "right"},
@@ -3096,7 +3096,7 @@ def _apply_arena_cfg_to_processor(processor):
         with _arena_cfg_lock:
             cfg = dict(_arena_cfg)
         markers = cfg.get("markers", [])
-        mk_size = float(cfg.get("marker_size_m", 0.18))
+        mk_size = float(cfg.get("marker_size_m", 0.5))
         if markers:
             new_positions = {}
             new_wall_types = {}
@@ -3170,9 +3170,9 @@ def positioning_loop():
             try:
                 global _pos_processor
                 with _arena_cfg_lock:
-                    init_marker_size = float(_arena_cfg.get("marker_size_m", 0.18))
+                    init_marker_size = float(_arena_cfg.get("marker_size_m", 0.5))
                 processor = _HeadlessAruCo(cam_mat, dist, detect_profile=profile,
-                                           marker_size=init_marker_size, enable_kalman_filter=False)
+                                           marker_size=init_marker_size, enable_kalman_filter=True)
                 _apply_arena_cfg_to_processor(processor)
                 _pos_processor = processor
                 print(f"[POS] Processor initialised (profile={profile})")

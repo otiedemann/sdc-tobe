@@ -631,6 +631,7 @@ class HeadlessAruCoPositioning:
             "capture_ts": capture_ts,
             "eval_ts": eval_ts,
             "state_vel": self.state_vel.tolist(),
+            "stale": False,
         }
 
 
