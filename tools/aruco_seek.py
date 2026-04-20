@@ -210,8 +210,14 @@ class VideoMarkerTracker:
     sizes without needing server-side support.
     """
 
-    def __init__(self, api_base: str):
-        self._url = f"{api_base}/api/position/video"
+    def __init__(self, api_base: str, endpoint: str = "/api/video"):
+        # IMPORTANT: default to the RAW video feed, not /api/position/video.
+        # The position feed is annotated (drawDetectedMarkers overlays green
+        # lines on the marker borders and puts text inside the marker body),
+        # which corrupts the marker pattern and breaks local re-detection.
+        # Consume the raw camera stream so our client-side detector sees
+        # uncorrupted marker images.
+        self._url = f"{api_base}{endpoint}"
         self._lock = threading.Lock()
         self._markers: dict = {}  # {id: {"center": [cx,cy], "px_size": float, "corners": [[x,y]*4], "left_len": float, "right_len": float}}
         self._frame_w: int = 1280
