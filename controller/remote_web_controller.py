@@ -926,11 +926,34 @@ HTML = """
                    (auto_takeoff ? '⚠ AUTO-TAKEOFF is enabled — drones will launch.\\n\\n' : '') +
                    'This switches the observers into LIVE mode.';
       if (!confirm(warn)) return;
-      const r = await fetch('/proxy/missions/scan_all/start', {method:'POST',
-        headers:{'Content-Type':'application/json'},
-        body: JSON.stringify(payload)});
-      const j = await r.json();
-      if (!j.ok) alert('Mission start refused: ' + (j.error || j.message || ''));
+      const btn = document.getElementById('mis_start');
+      const origLabel = btn.textContent;
+      btn.disabled = true; btn.textContent = '… starting';
+      let j = {};
+      try {
+        const r = await fetch('/proxy/missions/scan_all/start', {method:'POST',
+          headers:{'Content-Type':'application/json'},
+          body: JSON.stringify(payload)});
+        j = await r.json();
+      } catch (err) {
+        alert('Mission start failed: ' + err);
+      } finally {
+        btn.disabled = false; btn.textContent = origLabel;
+      }
+      if (!j.ok) {
+        alert('Mission start refused: ' + (j.error || j.message || 'unknown error'));
+      } else {
+        // Visible "started" feedback — warning text from the server is attached
+        // to j.status.error (e.g. takeoff errors that didn't abort)
+        const msg = j.message || 'mission started';
+        const warn = j.status && j.status.error ? '\\n\\nWarning: ' + j.status.error : '';
+        console.log('[mission] started:', msg, warn);
+        // Briefly flash a toast via the status readout
+        const se = document.getElementById('mis_start');
+        se.style.boxShadow = '0 0 0 2px #22c55e';
+        setTimeout(() => { se.style.boxShadow = ''; }, 1500);
+        if (warn) alert(msg + warn);
+      }
       misPoll();
     };
 
