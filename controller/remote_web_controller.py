@@ -202,7 +202,7 @@ HTML = """
   <h2>Drone Remote Controller</h2>
   <div style=\"display:flex;align-items:center;gap:8px;\">
     <div class=\"drone-bar\" id=\"drone_bar\" style=\"flex:1;\"></div>
-    <button id=\"land_all_btn\" style=\"padding:6px 14px;font-size:13px;font-weight:700;background:#7f1d1d;border-color:#ef4444;color:#fee2e2;letter-spacing:0.4px;\" title=\"Land every drone in the fleet safely. Keyboard shortcut: Q\">&#11088; LAND ALL (Q)</button>
+    <button id=\"land_all_btn\" style=\"padding:6px 14px;font-size:13px;font-weight:700;background:#7f1d1d;border-color:#ef4444;color:#fee2e2;letter-spacing:0.4px;\" title=\"Land every drone in the fleet safely. Keyboard shortcut: 0 (zero)\">&#11088; LAND ALL (0)</button>
     <button id=\"edit_drones_btn\" style=\"padding:4px 12px;font-size:12px;background:#1e3a5f;border-color:#3b82f6;\" title=\"Edit drone fleet config\">Config</button>
   </div>
   <div id=\"drone_config_modal\" style=\"display:none;position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,0.7);z-index:1000;justify-content:center;align-items:center;\">
@@ -899,7 +899,7 @@ HTML = """
     arcPoll();
     // Version marker — if this string doesn't appear in the DOM,
     // you're running stale JS (restart the Python server or hard-refresh).
-    const BUILD = 'ag-land-all-q';
+    const BUILD = 'ah-land-all-zero';
     console.log('[arc] init complete, build=' + BUILD);
     const ver = document.createElement('span');
     ver.id = 'arc_build_tag';
@@ -1485,15 +1485,16 @@ function _isTyping() {
 window.addEventListener('keydown', (e)=>{
   if (_isTyping()) return;
   const k = e.key.toLowerCase();
-  // ── Global panic-button: 'q' lands EVERY drone in the fleet ────────
-  // Intentionally not in the movement keymap so we don't accidentally
-  // eat it during normal flight. Runs regardless of active-drone focus.
-  if (k === 'q') {
+  // ── Global panic-button: '0' lands EVERY drone in the fleet ────────
+  // Using the zero key because it's not in the movement keymap (Q is
+  // yaw-CCW, W/A/S/D are translation, R/F are altitude, so letters are
+  // risky). '0' is far from the flight grid and easy to hit one-handed.
+  if (k === '0') {
     e.preventDefault();
     if (window._landAllInFlight) return;    // debounce
     window._landAllInFlight = true;
-    console.log('[LAND_ALL] Q pressed — landing every drone');
-    landAllDrones('Q hotkey').finally(() => { window._landAllInFlight = false; });
+    console.log('[LAND_ALL] 0 pressed — landing every drone');
+    landAllDrones('0 hotkey').finally(() => { window._landAllInFlight = false; });
     return;
   }
   if (map.has(k)) {
