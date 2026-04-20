@@ -2016,16 +2016,46 @@ function drawArena(pos, compPos, dir) {
   ctx.save(); ctx.translate(ax1 - 10, midAy); ctx.rotate(Math.PI / 2);
   ctx.textAlign = 'center'; ctx.fillText('RIGHT', 0, 0); ctx.restore();
 
-  // Arena markers
+  // Arena markers — colored square + bold ID pill placed away from the wall
+  ctx.font = 'bold 11px monospace';
+  ctx.textBaseline = 'middle';
   for (const [id, m] of Object.entries(arenaMarkers)) {
     if (!m.pos) continue;
     const [mx, my] = arenaToCanvas(m.pos[0], m.pos[1]);
     if (mx < PAD - 4 || mx > W - PAD + 4 || my < PAD - 4 || my > H - PAD + 4) continue;
-    ctx.fillStyle = WALL_COLOR[m.wall] || '#94a3b8';
-    ctx.fillRect(mx - 4, my - 4, 8, 8);
-    ctx.fillStyle = '#cbd5e1'; ctx.font = '9px monospace'; ctx.textAlign = 'center';
-    ctx.fillText(id, mx, my - 6);
+
+    // Square marker (slightly larger + outlined for visibility)
+    const color = WALL_COLOR[m.wall] || '#94a3b8';
+    ctx.fillStyle = color;
+    ctx.fillRect(mx - 5, my - 5, 10, 10);
+    ctx.strokeStyle = 'rgba(15,23,42,0.9)'; ctx.lineWidth = 1;
+    ctx.strokeRect(mx - 5.5, my - 5.5, 11, 11);
+
+    // Position label pill on the side away from the wall (so ID doesn't collide with BACK/FRONT/LEFT/RIGHT)
+    // front=y≈0 → label up, back=y≈max → down, left=x≈0 → right, right=x≈max → left
+    const idText = String(id);
+    const tw = ctx.measureText(idText).width;
+    const pillW = tw + 8, pillH = 15;
+    let labelX, labelY, anchor = 'center';
+    const wall = (m.wall || '').toLowerCase();
+    if (wall === 'front')      { labelX = mx; labelY = my - 13; }
+    else if (wall === 'back')  { labelX = mx; labelY = my + 13; }
+    else if (wall === 'left')  { labelX = mx + 9 + pillW / 2; labelY = my; }
+    else if (wall === 'right') { labelX = mx - 9 - pillW / 2; labelY = my; }
+    else                       { labelX = mx; labelY = my - 13; }
+
+    // Dark background pill for legibility
+    ctx.fillStyle = 'rgba(15,23,42,0.9)';
+    ctx.fillRect(labelX - pillW / 2, labelY - pillH / 2, pillW, pillH);
+    ctx.strokeStyle = color; ctx.lineWidth = 1;
+    ctx.strokeRect(labelX - pillW / 2 + 0.5, labelY - pillH / 2 + 0.5, pillW - 1, pillH - 1);
+
+    // ID text — color-matched to wall for quick visual association
+    ctx.fillStyle = color;
+    ctx.textAlign = 'center';
+    ctx.fillText(idText, labelX, labelY + 0.5);
   }
+  ctx.textBaseline = 'alphabetic';  // restore default so downstream drawing is unaffected
 
   // Debug overlay — large text, dark background box, drawn over everything
   const dbgLines = [
