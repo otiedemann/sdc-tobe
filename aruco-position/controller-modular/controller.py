@@ -41,8 +41,8 @@ from typing import Optional
 # ============================================================
 
 # P gains: position error (m) → velocity setpoint (m/s)
-KP_XY: float = 0.75       # horizontal
-KP_Z: float  = 0.75       # vertical
+KP_XY: float = 0.50       # horizontal
+KP_Z: float  = 0.50       # vertical
 
 # Maximum velocity setpoints
 MAX_HORIZ_SPEED: float = 0.1    # %  (horizontal)
