@@ -413,9 +413,9 @@ HTML = """
       <label style=\"color:#94a3b8;margin-left:12px;\">Hover s:</label>
       <input id=\"mis_hover_s\" type=\"number\" min=\"0.5\" step=\"0.5\" value=\"3\" style=\"width:70px;\" />
       <label style=\"color:#94a3b8;margin-left:12px;\">Approach tol (m):</label>
-      <input id=\"mis_tol_m\" type=\"number\" min=\"0.1\" step=\"0.05\" value=\"0.30\" style=\"width:70px;\" title=\"Drone transitions from APPROACH to HOVER once within this many metres of the hover distance (horizontal alignment / perpendicularity are not required).\" />
+      <input id=\"mis_tol_m\" type=\"number\" min=\"0.1\" step=\"0.05\" value=\"0.30\" style=\"width:70px;\" title=\"Drone transitions from APPROACH to HOVER once within this many metres of the hover distance AND sufficiently perpendicular (see Skew tol).\" />
       <label style=\"color:#94a3b8;margin-left:12px;\" title=\"Max skew before declaring the drone perpendicular. 0.08 ≈ 6° off the marker normal. Lower values force the drone to align straight-on before hovering.\">Skew tol:</label>
-      <input id=\"mis_skew_tol\" type=\"number\" min=\"0.02\" max=\"0.50\" step=\"0.01\" value=\"0.08\" style=\"width:70px;\" />
+      <input id=\"mis_skew_tol\" type=\"number\" min=\"0.02\" max=\"0.50\" step=\"0.01\" value=\"0.12\" style=\"width:70px;\" title=\"Max perspective skew to accept for HOVER. 0.12 ≈ 9° off the marker normal. Lower = stricter perpendicular (longer to converge).\" />
       <label style=\"color:#94a3b8;margin-left:12px;display:flex;align-items:center;gap:4px;\">
         <input id=\"mis_auto_takeoff\" type=\"checkbox\" />
         auto-takeoff
@@ -904,7 +904,7 @@ HTML = """
     arcPoll();
     // Version marker — if this string doesn't appear in the DOM,
     // you're running stale JS (restart the Python server or hard-refresh).
-    const BUILD = 'am-mission-trace-log';
+    const BUILD = 'an-aggressive-headon-approach';
     console.log('[arc] init complete, build=' + BUILD);
     const ver = document.createElement('span');
     ver.id = 'arc_build_tag';
@@ -4276,7 +4276,7 @@ def proxy_missions_scan_all_start():
         return jsonify(ok=False, error="target_markers must parse to at least one id"), 400
     hover_seconds = float(data.get("hover_seconds", 3.0))
     approach_tolerance_m = float(data.get("approach_tolerance_m", 0.30))
-    approach_skew_tol   = float(data.get("approach_skew_tol", 0.08))
+    approach_skew_tol   = float(data.get("approach_skew_tol", 0.12))
     approach_err_x_tol  = float(data.get("approach_err_x_tol", 0.15))
     auto_takeoff = bool(data.get("auto_takeoff", False))
     ok, msg = mission_manager.start_scan_all(

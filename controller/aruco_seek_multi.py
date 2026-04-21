@@ -677,7 +677,7 @@ class ScanAllMarkersMission:
         target_markers: list[int],
         hover_seconds: float = 3.0,
         approach_tolerance_m: float = 0.30,
-        approach_skew_tol: float = 0.08,
+        approach_skew_tol: float = 0.12,
         approach_err_x_tol: float = 0.15,
         auto_takeoff: bool = False,
     ):
@@ -1113,11 +1113,17 @@ class ScanAllMarkersMission:
                 # and a hard err_x/skew gate kept drones stuck "approaching"
                 # forever when the scene had marginal conditions.
                 dist_ok = abs(distance_m - target_dist) <= self.approach_tolerance_m
-                if dist_ok:
+                skew_ok = skew_mag <= self.approach_skew_tol
+                # Only commit to HOVER when the drone is both at the right
+                # distance AND roughly head-on. The observer's PD loop is
+                # now aggressive enough (dist_p=15, fb_back_max=30) to
+                # actively back up and strafe into the marker's normal,
+                # so this gate is reachable in reasonable time.
+                if dist_ok and skew_ok:
                     state["phase"] = "HOVER"
                     state["hover_start"] = time.time()
                     state["note"] = (f"hovering on {target} "
-                                     f"(err_x={err_x_mag:.2f}, skew={skew_mag:.2f})")
+                                     f"(dist={distance_m:.2f}m, skew={skew_mag:.2f})")
                     if self._trace:
                         self._trace.write("phase_change", {
                             "drone": did, "from": "APPROACH", "to": "HOVER",
@@ -1128,10 +1134,20 @@ class ScanAllMarkersMission:
                             "skew": round(skew_mag, 3),
                         })
                 else:
-                    state["note"] = (f"approaching {target}: dist "
-                                     f"{distance_m:.2f}→{target_dist:.2f}m "
-                                     f"(±{self.approach_tolerance_m:.2f})  "
-                                     f"err_x={err_x_mag:.2f}  skew={skew_mag:.2f}")
+                    # Narrate the specific blocker so the operator can tune if
+                    # we get stuck. "not perpendicular" means the drone needs
+                    # to strafe / back-up to set up a head-on approach.
+                    blockers = []
+                    if not dist_ok:
+                        blockers.append(
+                            f"dist {distance_m:.2f}→{target_dist:.2f}m "
+                            f"(tol ±{self.approach_tolerance_m:.2f})")
+                    if not skew_ok:
+                        blockers.append(
+                            f"|skew|={skew_mag:.2f}>{self.approach_skew_tol} "
+                            "(not perpendicular — strafing)")
+                    state["note"] = (f"approaching {target}: "
+                                     + "; ".join(blockers))
                 return
 
             if phase == "HOVER":
@@ -1196,7 +1212,7 @@ class MissionManager:
     def start_scan_all(self, drone_ids: list[str], target_markers: list[int],
                        hover_seconds: float = 3.0,
                        approach_tolerance_m: float = 0.30,
-                       approach_skew_tol: float = 0.08,
+                       approach_skew_tol: float = 0.12,
                        approach_err_x_tol: float = 0.15,
                        auto_takeoff: bool = False) -> tuple[bool, str]:
         with self._lock:
