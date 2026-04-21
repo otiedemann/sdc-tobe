@@ -29,6 +29,14 @@ from pathlib import Path
 from typing import Dict, Optional, Set, Tuple
 
 from flask import Flask, Response, jsonify, request, send_file
+try:
+    from flask.json.provider import DefaultJSONProvider
+    _HAS_JSON_PROVIDER = True
+except ImportError:
+    # Flask < 2.2 exposes app.json_encoder instead
+    DefaultJSONProvider = None
+    _HAS_JSON_PROVIDER = False
+import json as _json
 
 # ---------------------------------------------------------------------------
 # Architecture detection — skip Olympe on Raspberry Pi (ARM)
@@ -397,6 +405,52 @@ def detect_drone_type() -> Tuple[str, str]:
 # Global state (shared across backends)
 # ---------------------------------------------------------------------------
 app = Flask(__name__)
+
+
+# Enum-aware JSON encoder. Olympe returns enum instances (class `band`,
+# `selection_type`, etc.) in its state dicts; Flask's stock encoder raises
+# "Object of type band is not JSON serializable" for these. Install a
+# global provider so EVERY jsonify() in this app handles them.
+def _enum_to_jsonable(obj):
+    name = getattr(obj, "name", None)
+    if isinstance(name, str):
+        return name
+    # ArsdkEnum sometimes exposes .value as the serializable form
+    val = getattr(obj, "value", None)
+    if isinstance(val, (str, int, float, bool)):
+        return val
+    return str(obj)
+
+
+if _HAS_JSON_PROVIDER:
+    class _EnumAwareJSONProvider(DefaultJSONProvider):
+        def default(self, obj):
+            try:
+                return super().default(obj)
+            except TypeError:
+                return _enum_to_jsonable(obj)
+    app.json = _EnumAwareJSONProvider(app)
+else:
+    # Flask < 2.2 path
+    class _EnumAwareJSONEncoder(_json.JSONEncoder):
+        def default(self, obj):
+            try:
+                return super().default(obj)
+            except TypeError:
+                return _enum_to_jsonable(obj)
+    app.json_encoder = _EnumAwareJSONEncoder
+
+
+# Build marker — GET /api/version returns this so the operator can verify
+# which commit the flight controller is actually running.
+BUILD_TAG = "wifi-enum-global-json-provider"
+BUILD_AT = time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime())
+
+
+@app.get("/api/version")
+def api_version():
+    return jsonify(ok=True, build=BUILD_TAG, build_at=BUILD_AT,
+                   file=__file__)
 running = True
 flying = False
 drone_type = "unknown"
