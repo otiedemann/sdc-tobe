@@ -48,9 +48,9 @@ KP_Z: float  = 0.75       # vertical
 KP_YAW: float = 0.1
 
 # Maximum velocity setpoints
-MAX_HORIZ_SPEED: float = 0.20    # %  (horizontal)
-MAX_VERT_SPEED: float  = 0.20    # %  (vertical)
-MAX_YAW_RATE: float    = 0.20    # %
+MAX_HORIZ_SPEED: float = 0.15    # %  (horizontal)
+MAX_VERT_SPEED: float  = 0.15    # %  (vertical)
+MAX_YAW_RATE: float    = 0.15    # %
 
 # Position acceptance radii (switch to HOVER phase)
 ARRIVE_RADIUS_XY: float = 0.25  # m
