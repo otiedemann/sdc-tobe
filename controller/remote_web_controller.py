@@ -196,6 +196,65 @@ HTML = """
     #missions_panel .mis-badge.wait { background:#451a03; color:#fbbf24; }
     #missions_panel .mis-badge.done { background:#14532d; color:#86efac; }
     #missions_panel .mis-badge.error { background:#7f1d1d; color:#fca5a5; }
+    /* ── Takeoff error banner ───────────────────────────────────── */
+    #takeoff_err { display:none; background:#7f1d1d; border:1px solid #ef4444; color:#fee2e2;
+                   padding:10px 14px; border-radius:8px; margin-top:10px; font-size:13px; line-height:1.5; }
+    #takeoff_err.show { display:block; animation:takeoffpulse 1.2s ease-in-out 2; }
+    #takeoff_err .hdr { font-weight:700; letter-spacing:0.02em; margin-bottom:4px; font-size:14px; }
+    #takeoff_err .reason { font-family:monospace; font-size:12px; color:#fecaca; margin-bottom:6px; word-break:break-word; }
+    #takeoff_err .actions { display:flex; gap:8px; flex-wrap:wrap; margin-top:6px; }
+    #takeoff_err .actions button { height:32px; padding:0 12px; font-size:12px; font-weight:600; }
+    #takeoff_err .actions .magneto { background:#1e3a5f; border-color:#3b82f6; color:#dbeafe; }
+    #takeoff_err .actions .dismiss { background:#374151; border-color:#6b7280; }
+    @keyframes takeoffpulse { 0%,100% { box-shadow:0 0 0 2px #fbbf24 inset; } 50% { box-shadow:0 0 0 4px #fbbf24 inset; } }
+    /* ── Magnetometer recalibration wizard ──────────────────────── */
+    #mag_modal { display:none; position:fixed; inset:0; background:rgba(0,0,0,0.78); z-index:1100;
+                 justify-content:center; align-items:center; }
+    #mag_modal.show { display:flex; }
+    #mag_modal .card { background:#0b1220; border:1px solid #334155; border-radius:10px;
+                       padding:18px; width:min(720px,95vw); max-height:92vh; overflow-y:auto;
+                       box-shadow:0 10px 40px rgba(0,0,0,0.5); }
+    #mag_modal h3 { margin:0 0 4px 0; color:#60a5fa; font-size:18px; }
+    #mag_modal .sub { color:#94a3b8; font-size:12px; margin-bottom:12px; }
+    #mag_modal .steps { display:grid; grid-template-columns:1fr; gap:6px; margin-bottom:12px; }
+    .mag-step { display:flex; align-items:center; gap:10px; padding:8px 10px; background:#0f172a;
+                border:1px solid #1e293b; border-radius:6px; transition:all .2s ease; }
+    .mag-step.active { border-color:#3b82f6; background:#0f1e33; box-shadow:0 0 0 1px #3b82f6 inset; }
+    .mag-step.ok { border-color:#10b981; background:#052e1b; }
+    .mag-step.fail { border-color:#ef4444; background:#2a0a0a; }
+    .mag-step .num { flex:0 0 26px; height:26px; border-radius:50%; background:#1e293b;
+                     color:#94a3b8; font-weight:700; font-size:13px; display:flex;
+                     align-items:center; justify-content:center; border:1px solid #334155; }
+    .mag-step.active .num { background:#3b82f6; color:#eff6ff; border-color:#3b82f6; }
+    .mag-step.ok .num { background:#10b981; color:#052e1b; border-color:#10b981; }
+    .mag-step.fail .num { background:#ef4444; color:#450a0a; border-color:#ef4444; }
+    .mag-step .title { flex:1; font-size:13px; color:#e2e8f0; }
+    .mag-step .info { font-size:11px; color:#94a3b8; font-family:monospace; }
+    #mag_axes { display:grid; grid-template-columns:repeat(3,1fr); gap:8px; margin:10px 0; }
+    .mag-axis { background:#0f172a; border:1px solid #1e293b; border-radius:6px; padding:10px;
+                text-align:center; transition:all .2s ease; }
+    .mag-axis.active { border-color:#fbbf24; box-shadow:0 0 0 1px #fbbf24 inset;
+                       animation:magpulse 1s ease-in-out infinite; }
+    .mag-axis.ok { border-color:#10b981; background:#052e1b; }
+    .mag-axis .ax-name { font-weight:700; font-size:13px; color:#e2e8f0; letter-spacing:0.04em; }
+    .mag-axis .ax-hint { font-size:10px; color:#94a3b8; margin-top:2px; }
+    .mag-axis .ax-state { font-size:18px; margin-top:4px; }
+    @keyframes magpulse { 0%,100% { background:#0f172a; } 50% { background:#1a2740; } }
+    #mag_instructions { background:#0f172a; border:1px solid #334155; border-radius:6px;
+                        padding:10px; margin:10px 0; font-size:12px; color:#cbd5e1; line-height:1.55; }
+    #mag_instructions b { color:#fbbf24; }
+    #mag_log { max-height:140px; overflow-y:auto; background:#0f172a; border:1px solid #1e293b;
+               border-radius:6px; padding:8px; font-family:monospace; font-size:11px;
+               color:#94a3b8; white-space:pre-wrap; margin-bottom:10px; }
+    #mag_result { display:none; padding:10px; border-radius:6px; margin-bottom:10px;
+                  font-weight:600; font-size:13px; }
+    #mag_result.ok { display:block; background:#052e1b; border:1px solid #10b981; color:#86efac; }
+    #mag_result.fail { display:block; background:#2a0a0a; border:1px solid #ef4444; color:#fca5a5; }
+    #mag_modal .btnrow { display:flex; gap:8px; flex-wrap:wrap; justify-content:flex-end; }
+    #mag_modal .btnrow button { height:36px; padding:0 14px; font-size:12px; font-weight:600; }
+    #mag_start_btn { background:#065f46; border-color:#10b981; }
+    #mag_retry_btn { background:#1e3a5f; border-color:#3b82f6; display:none; }
+    #mag_close_btn { background:#374151; border-color:#6b7280; }
   </style>
 </head>
 <body>
@@ -217,6 +276,68 @@ HTML = """
       </div>
     </div>
   </div>
+  <div id=\"mag_modal\" role=\"dialog\" aria-labelledby=\"mag_title\">
+    <div class=\"card\">
+      <h3 id=\"mag_title\">Magnetometer Recalibration</h3>
+      <div class=\"sub\">
+        Anafi requires a figure-8 dance around each axis whenever it is moved
+        between locations or power-cycled. Keep the drone on a flat,
+        non-metallic surface; no cables or phones nearby.
+      </div>
+      <div class=\"steps\" id=\"mag_steps\">
+        <div class=\"mag-step\" data-step=\"heartbeat\">
+          <div class=\"num\">1</div>
+          <div class=\"title\">Pre-check — drone connected &amp; on the ground</div>
+          <div class=\"info\" data-role=\"info\"></div>
+        </div>
+        <div class=\"mag-step\" data-step=\"pre_status\">
+          <div class=\"num\">2</div>
+          <div class=\"title\">Read current magnetometer status</div>
+          <div class=\"info\" data-role=\"info\"></div>
+        </div>
+        <div class=\"mag-step\" data-step=\"start\">
+          <div class=\"num\">3</div>
+          <div class=\"title\">Start calibration command</div>
+          <div class=\"info\" data-role=\"info\"></div>
+        </div>
+        <div class=\"mag-step\" data-step=\"poll\">
+          <div class=\"num\">4</div>
+          <div class=\"title\">Figure-8 around each axis until all axes confirm</div>
+          <div class=\"info\" data-role=\"info\"></div>
+        </div>
+      </div>
+      <div id=\"mag_instructions\">
+        <b>How to perform the dance:</b> hold the drone firmly and rotate it
+        slowly (~2 s per full turn) around each body axis in turn — roll (X),
+        pitch (Y), yaw (Z) — tracing a smooth figure-8. Each axis panel below
+        lights green once its bit flips.
+      </div>
+      <div id=\"mag_axes\">
+        <div class=\"mag-axis\" data-axis=\"x\">
+          <div class=\"ax-name\">X (roll)</div>
+          <div class=\"ax-hint\">tilt left/right repeatedly</div>
+          <div class=\"ax-state\" data-role=\"state\">&#9675;</div>
+        </div>
+        <div class=\"mag-axis\" data-axis=\"y\">
+          <div class=\"ax-name\">Y (pitch)</div>
+          <div class=\"ax-hint\">tilt nose up/down</div>
+          <div class=\"ax-state\" data-role=\"state\">&#9675;</div>
+        </div>
+        <div class=\"mag-axis\" data-axis=\"z\">
+          <div class=\"ax-name\">Z (yaw)</div>
+          <div class=\"ax-hint\">rotate around vertical</div>
+          <div class=\"ax-state\" data-role=\"state\">&#9675;</div>
+        </div>
+      </div>
+      <div id=\"mag_result\"></div>
+      <div id=\"mag_log\">ready.</div>
+      <div class=\"btnrow\">
+        <button id=\"mag_start_btn\">Start Recalibration</button>
+        <button id=\"mag_retry_btn\">Retry</button>
+        <button id=\"mag_close_btn\">Close</button>
+      </div>
+    </div>
+  </div>
   <div class=\"small\">Active: <span id=\"pi\"></span></div>
   <div class=\"small\">API status: <span id=\"api_status\">checking...</span></div>
   <div class=\"small\">Drone telemetry status: <span id=\"drone_status\">checking...</span></div>
@@ -232,6 +353,15 @@ HTML = """
         <button id=\"land\">Land (L)</button>
         <button id=\"recover\">Recover</button>
         <button id=\"safe_takeoff\">Safe Takeoff: OFF</button>
+      </div>
+      <div id=\"takeoff_err\" role=\"alert\">
+        <div class=\"hdr\">&#9888; Cannot take off</div>
+        <div class=\"reason\" id=\"takeoff_err_reason\">—</div>
+        <div class=\"small\" id=\"takeoff_err_hint\" style=\"color:#fecaca;\"></div>
+        <div class=\"actions\">
+          <button class=\"magneto\" id=\"takeoff_err_mag\" style=\"display:none;\">Recalibrate Magnetometer</button>
+          <button class=\"dismiss\" id=\"takeoff_err_dismiss\">Dismiss</button>
+        </div>
       </div>
       <div style=\"margin-top:8px; display:flex; gap:8px; flex-wrap:wrap;\">
         <button id=\"toggle_log\">Enable Telemetry Log</button>
@@ -274,6 +404,11 @@ HTML = """
           <button id=\"gimbal_set\">Set</button>
           <button id=\"gimbal_down\">Down (-90)</button>
           <button id=\"gimbal_fwd\">Forward (0)</button>
+        </div>
+        <div class=\"row\" style=\"margin-top:8px; align-items:center; padding-top:8px; border-top:1px solid #1e293b;\">
+          <span class=\"small\" style=\"min-width:80px;\">Magnetometer</span>
+          <span id=\"mag_status\" class=\"small\" style=\"color:#94a3b8;font-family:monospace;flex:1;\">—</span>
+          <button id=\"mag_open\" style=\"background:#1e3a5f;border-color:#3b82f6;height:32px;padding:0 12px;font-size:12px;\" title=\"Walk through the figure-8 recalibration wizard\">Recalibrate Magnetometer</button>
         </div>
         <div class=\"row\" style=\"margin-top:8px; align-items:center;\">
           <span class=\"small\" style=\"min-width:80px;\">Max altitude (m)</span>
@@ -1498,7 +1633,55 @@ holdButtons.forEach(btn=>{
   btn.addEventListener('pointercancel',e=>{ e.preventDefault(); btn.classList.remove('active'); releaseKey(k); });
 });
 
-document.getElementById('takeoff').onclick = ()=>post('/proxy/takeoff',{});
+// Takeoff + surface any server-side refusal (magneto / sensors / battery / …).
+// /api/takeoff on Anafi returns a message like
+//   "takeoff_failed (magneto=REQUIRED, axes=x0y0z0)"
+// so we parse it, show it, and offer the magneto wizard if that's the cause.
+async function tryTakeoff(){
+  hideTakeoffError();
+  let resp, body;
+  try {
+    resp = await fetch('/proxy/takeoff', {method:'POST',
+                       headers:{'Content-Type':'application/json'}, body:'{}'});
+    body = await resp.json().catch(()=>({ok:false, error:'non-JSON response'}));
+  } catch (e) {
+    showTakeoffError('network error contacting drone: ' + e, '');
+    return;
+  }
+  if (!resp.ok || body.ok === false) {
+    const err = (body && body.error) || ('HTTP ' + resp.status);
+    let hint = '';
+    if (/magneto/i.test(err))
+      hint = 'Magnetometer needs figure-8 calibration before the drone will arm.';
+    else if (/sensor/i.test(err))
+      hint = 'A sensor check failed — verify GPS lock (outdoor mode), battery, and motor state.';
+    else if (/battery|low/i.test(err))
+      hint = 'Battery too low for takeoff.';
+    else if (/motor/i.test(err))
+      hint = 'Motor fault — inspect props and power-cycle the drone.';
+    else if (/not.?ready|not.?connected/i.test(err))
+      hint = 'Controller is not connected. Check Wi-Fi link and API server logs.';
+    else if (/angle|tilt|level/i.test(err))
+      hint = 'Drone is not level — place on a flat surface and retry.';
+    showTakeoffError(err, hint);
+  }
+}
+
+function showTakeoffError(reason, hint){
+  const box = document.getElementById('takeoff_err');
+  document.getElementById('takeoff_err_reason').textContent = reason;
+  document.getElementById('takeoff_err_hint').textContent = hint || '';
+  document.getElementById('takeoff_err_mag').style.display =
+    /magneto/i.test(reason) ? '' : 'none';
+  box.classList.add('show');
+}
+function hideTakeoffError(){
+  document.getElementById('takeoff_err').classList.remove('show');
+}
+
+document.getElementById('takeoff').onclick = tryTakeoff;
+document.getElementById('takeoff_err_dismiss').onclick = hideTakeoffError;
+document.getElementById('takeoff_err_mag').onclick = ()=>{ hideTakeoffError(); openMagnetoWizard(); };
 document.getElementById('land').onclick = ()=>post('/proxy/land',{});
 document.getElementById('recover').onclick = ()=>post('/proxy/recover',{});
 
@@ -2323,6 +2506,169 @@ refreshTelemetry();
 refreshLogStatus();
 refreshSafeTakeoff();
 refreshCommandLogStatus();
+
+// --- Magnetometer recalibration wizard ---
+// Drives /proxy/magneto/recalibrate/stream (SSE) and updates the step list,
+// per-axis panels, and result banner live as the server emits events.
+const magModal = document.getElementById('mag_modal');
+let magEventSource = null;
+
+function magLog(line){
+  const el = document.getElementById('mag_log');
+  const t = new Date().toLocaleTimeString();
+  el.textContent += `[${t}] ${line}\\n`;
+  el.scrollTop = el.scrollHeight;
+}
+
+function magResetUI(){
+  document.querySelectorAll('#mag_steps .mag-step').forEach(s=>{
+    s.classList.remove('active','ok','fail');
+    s.querySelector('[data-role="info"]').textContent = '';
+  });
+  document.querySelectorAll('#mag_axes .mag-axis').forEach(a=>{
+    a.classList.remove('active','ok');
+    a.querySelector('[data-role="state"]').innerHTML = '&#9675;';
+  });
+  const res = document.getElementById('mag_result');
+  res.className = '';
+  res.textContent = '';
+  res.style.display = 'none';
+  document.getElementById('mag_log').textContent = '';
+  document.getElementById('mag_retry_btn').style.display = 'none';
+}
+
+function magSetStep(name, state, info){
+  const el = document.querySelector(`#mag_steps .mag-step[data-step="${name}"]`);
+  if (!el) return;
+  document.querySelectorAll('#mag_steps .mag-step').forEach(s=>{
+    if (s !== el && s.classList.contains('active')) s.classList.remove('active');
+  });
+  el.classList.remove('active','ok','fail');
+  if (state) el.classList.add(state);
+  if (info !== undefined) el.querySelector('[data-role="info"]').textContent = info;
+}
+
+function magSetAxes(axes){
+  if (!axes) return;
+  ['x','y','z'].forEach(ax=>{
+    const el = document.querySelector(`#mag_axes .mag-axis[data-axis="${ax}"]`);
+    if (!el) return;
+    const stateEl = el.querySelector('[data-role="state"]');
+    el.classList.remove('active','ok');
+    if (axes[ax] === 1) {
+      el.classList.add('ok');
+      stateEl.innerHTML = '&#10004;';
+    } else {
+      if (axes[ax] === 0 || axes[ax] === null) {
+        if (!axes.done && !axes.failed) el.classList.add('active');
+      }
+      stateEl.innerHTML = '&#9675;';
+    }
+  });
+}
+
+function magShowResult(ok, msg){
+  const res = document.getElementById('mag_result');
+  res.className = ok ? 'ok' : 'fail';
+  res.textContent = msg || (ok ? 'Calibration complete.' : 'Calibration failed.');
+  res.style.display = 'block';
+  document.getElementById('mag_start_btn').disabled = false;
+  document.getElementById('mag_retry_btn').style.display = ok ? 'none' : '';
+}
+
+function openMagnetoWizard(){
+  magResetUI();
+  magModal.classList.add('show');
+  refreshMagStatus();
+}
+
+function closeMagnetoWizard(){
+  magModal.classList.remove('show');
+  if (magEventSource) { magEventSource.close(); magEventSource = null; }
+}
+
+async function refreshMagStatus(){
+  try {
+    const r = await fetch('/proxy/magneto');
+    const j = await r.json();
+    const txt = j.status || '(no report)';
+    document.getElementById('mag_status').textContent = txt;
+    document.getElementById('mag_status').style.color =
+      j.required ? '#f87171' : (j.status ? '#86efac' : '#94a3b8');
+    return j;
+  } catch (e) {
+    document.getElementById('mag_status').textContent = 'unreachable';
+    document.getElementById('mag_status').style.color = '#f87171';
+    return null;
+  }
+}
+
+function runMagnetoWizard(){
+  if (magEventSource) { magEventSource.close(); magEventSource = null; }
+  magResetUI();
+  document.getElementById('mag_start_btn').disabled = true;
+  magLog('connecting to recalibration stream…');
+  // Use SSE so every step flip shows up the instant the server observes it.
+  // timeout_s=60 covers a patient operator; poll_s=1.0 is plenty.
+  magEventSource = new EventSource('/proxy/magneto/recalibrate/stream?timeout_s=60&poll_s=1.0');
+
+  magEventSource.onmessage = (ev) => {
+    let msg;
+    try { msg = JSON.parse(ev.data); } catch { return; }
+    if (msg.kind === 'step') {
+      const state = msg.ok ? 'ok' : (msg.step === 'poll' ? 'fail' : 'active');
+      let info = '';
+      if (msg.step === 'heartbeat')
+        info = `connected=${msg.connected} flying=${msg.flying}`;
+      else if (msg.step === 'pre_status')
+        info = msg.status || '(not reported)';
+      else if (msg.step === 'start')
+        info = msg.message || msg.error || '';
+      else if (msg.step === 'poll')
+        info = msg.final_status || (msg.timed_out ? 'timed out' : '');
+      magSetStep(msg.step, msg.ok ? 'ok' : 'fail', info);
+      magLog(`step ${msg.step}: ${msg.ok ? 'OK' : 'FAIL'} ${info}`);
+      if (!msg.ok && msg.step !== 'poll') {
+        // Hard failure before the dance even started — stop the wizard.
+        magShowResult(false,
+          (msg.error ? 'Error: ' + msg.error : 'Step failed: ' + msg.step));
+        if (magEventSource) { magEventSource.close(); magEventSource = null; }
+      }
+      if (msg.step === 'start' && msg.ok) magSetStep('poll', 'active');
+    } else if (msg.kind === 'status') {
+      magSetAxes(msg.axes);
+      magLog(`status: ${msg.status || '(no report)'}`);
+    } else if (msg.kind === 'final') {
+      if (msg.post && msg.post.status) magSetAxes(
+        (function(){ const s = (msg.post.status||'').toLowerCase().replace(/\\s+/g,'');
+          const m = s.match(/axes=x(\\d)y(\\d)z(\\d)/);
+          return { x: m?+m[1]:null, y: m?+m[2]:null, z: m?+m[3]:null,
+                   done: s.indexOf('all-axes-ok')>=0,
+                   failed: s.indexOf('failed')>=0 }; })()
+      );
+      magShowResult(msg.ok, msg.message || msg.error || '');
+      magLog(msg.ok ? 'DONE.' : 'FINISHED (with errors).');
+      refreshMagStatus();
+      if (magEventSource) { magEventSource.close(); magEventSource = null; }
+    }
+  };
+
+  magEventSource.onerror = () => {
+    magLog('stream closed.');
+    document.getElementById('mag_start_btn').disabled = false;
+    if (magEventSource) { magEventSource.close(); magEventSource = null; }
+  };
+}
+
+document.getElementById('mag_open').onclick = openMagnetoWizard;
+document.getElementById('mag_close_btn').onclick = closeMagnetoWizard;
+document.getElementById('mag_start_btn').onclick = runMagnetoWizard;
+document.getElementById('mag_retry_btn').onclick = runMagnetoWizard;
+magModal.addEventListener('click', (e)=>{ if (e.target === magModal) closeMagnetoWizard(); });
+
+// Refresh magneto status in the Anafi panel every 10s (lightweight).
+setInterval(refreshMagStatus, 10000);
+refreshMagStatus();
 
 // --- Mission Planner ---
 let missionRunning = false;
@@ -4611,6 +4957,222 @@ def proxy_wifi_scan():
                 {"Content-Type": r.headers.get("Content-Type", "application/json")})
     except Exception as e:
         return jsonify(ok=False, error=str(e)), 502
+
+
+# ── Magnetometer (Anafi) ────────────────────────────────────────────────────
+# Parrot Anafi requires a figure-8 magnetometer calibration whenever the drone
+# is moved between locations or re-powered. unified_api_server.py exposes the
+# raw GET /api/magneto and POST /api/magneto/calibrate; here we expose a
+# higher-level /proxy/magneto/recalibrate that drives the full cycle.
+
+@app.get("/proxy/magneto")
+def proxy_magneto_status():
+    """Current magnetometer calibration status for the active drone."""
+    try:
+        r = pi_get("/api/magneto", timeout=TIMEOUT_STATUS)
+        return (r.text, r.status_code,
+                {"Content-Type": r.headers.get("Content-Type", "application/json")})
+    except Exception as e:
+        return jsonify(ok=False, error=str(e)), 502
+
+
+@app.post("/proxy/magneto/calibrate")
+def proxy_magneto_calibrate():
+    """One-shot: send the StartMagnetoCalibration command and return.
+    The caller is then responsible for the figure-8 dance and for polling
+    /proxy/magneto until all axes report ok."""
+    log_command("magneto_calibrate")
+    try:
+        r = pi_post("/api/magneto/calibrate", timeout=TIMEOUT_CMD)
+        return (r.text, r.status_code,
+                {"Content-Type": r.headers.get("Content-Type", "application/json")})
+    except Exception as e:
+        return jsonify(ok=False, error=str(e)), 502
+
+
+def _parse_magneto_axes(status: str | None) -> dict:
+    """Extract per-axis calibration bits from a status string like
+    'REQUIRED, axes=x0y1z0, in-progress'. Returns {x, y, z, failed, done,
+    in_progress, required} with sensible defaults when the drone hasn't
+    reported yet."""
+    s = (status or "").lower()
+    out = {"x": None, "y": None, "z": None,
+           "failed": False, "done": False,
+           "in_progress": False, "required": None}
+    compact = s.replace(" ", "")
+    import re
+    m = re.search(r"axes=x(\d)y(\d)z(\d)", compact)
+    if m:
+        out["x"] = int(m.group(1))
+        out["y"] = int(m.group(2))
+        out["z"] = int(m.group(3))
+    out["failed"] = "failed" in s
+    out["done"] = "all-axes-ok" in s or (
+        out["x"] == 1 and out["y"] == 1 and out["z"] == 1
+    )
+    out["in_progress"] = "in-progress" in s
+    if "not-required" in s:
+        out["required"] = False
+    elif "required" in s:
+        out["required"] = True
+    return out
+
+
+def _magneto_cycle(timeout_s: float, poll_s: float):
+    """Generator that drives one full magnetometer recalibration cycle.
+
+    Yields dicts of shape:
+      {"kind": "step", "step": <name>, "ok": bool, ...extra}
+      {"kind": "status", "status": str, "axes": {x,y,z,...}}   # during polling
+      {"kind": "final", "ok": bool, "pre": ..., "post": ..., ...}
+
+    The caller is responsible for transport (blocking JSON or SSE)."""
+    steps: list[dict] = []
+
+    def step(name: str, ok: bool, **info):
+        entry = {"kind": "step", "step": name, "ok": ok, **info}
+        steps.append({k: v for k, v in entry.items() if k != "kind"})
+        print(f"[MAGNETO] {'OK' if ok else 'FAIL'} {name} {info}")
+        return entry
+
+    # 1) Heartbeat
+    try:
+        hb = pi_get("/api/heartbeat", timeout=TIMEOUT_STATUS).json()
+    except Exception as e:
+        yield step("heartbeat", False, error=str(e))
+        yield {"kind": "final", "ok": False, "fatal": "unreachable",
+               "error": f"drone unreachable: {e}", "steps": steps}
+        return
+    connected = bool(hb.get("connected"))
+    flying = bool(hb.get("flying"))
+    yield step("heartbeat", connected and not flying,
+               connected=connected, flying=flying,
+               drone_type=hb.get("drone_type"))
+    if not connected:
+        yield {"kind": "final", "ok": False, "fatal": "not_connected",
+               "error": "drone not connected", "steps": steps}
+        return
+    if flying:
+        yield {"kind": "final", "ok": False, "fatal": "flying",
+               "error": "refuse to recalibrate while flying — land first",
+               "steps": steps}
+        return
+
+    # 2) Pre-calibration snapshot
+    try:
+        pre = pi_get("/api/magneto", timeout=TIMEOUT_STATUS).json()
+    except Exception as e:
+        pre = {"ok": False, "error": str(e)}
+    yield step("pre_status", bool(pre.get("ok")),
+               status=pre.get("status"), required=pre.get("required"))
+
+    # 3) Trigger calibration
+    try:
+        r = pi_post("/api/magneto/calibrate", timeout=TIMEOUT_CMD)
+        start = r.json() if r.headers.get("Content-Type",
+                                          "").startswith("application/json") else {}
+    except Exception as e:
+        yield step("start", False, error=str(e))
+        yield {"kind": "final", "ok": False, "fatal": "start_failed",
+               "error": f"start failed: {e}", "steps": steps, "pre": pre}
+        return
+    started = bool(start.get("ok"))
+    yield step("start", started, http_status=r.status_code,
+               message=start.get("message"), error=start.get("error"))
+    if not started:
+        yield {"kind": "final", "ok": False, "fatal": "start_refused",
+               "error": start.get("error", "calibration not started"),
+               "steps": steps, "pre": pre, "start": start}
+        return
+
+    # 4) Poll status — emit per-axis progress as it flips.
+    deadline = time.time() + timeout_s
+    post = {"ok": False, "status": None, "required": None}
+    finished = False
+    failed = False
+    last_axes = None
+    while time.time() < deadline:
+        try:
+            post = pi_get("/api/magneto", timeout=TIMEOUT_STATUS).json()
+        except Exception as e:
+            post = {"ok": False, "error": str(e)}
+        axes = _parse_magneto_axes(post.get("status"))
+        if axes != last_axes:
+            yield {"kind": "status", "status": post.get("status"),
+                   "axes": axes, "required": post.get("required")}
+            last_axes = axes
+        if axes["failed"]:
+            failed = True
+            break
+        if axes["done"]:
+            finished = True
+            break
+        time.sleep(poll_s)
+
+    timed_out = not (finished or failed)
+    yield step("poll", finished and not failed,
+               final_status=post.get("status"),
+               required=post.get("required"), timed_out=timed_out)
+
+    ok = finished and not failed
+    if ok:
+        msg = "magnetometer calibrated"
+    elif failed:
+        msg = "magnetometer calibration FAILED — retry the figure-8 dance"
+    else:
+        msg = ("magnetometer calibration timed out — perform the figure-8 "
+               "dance around each axis and retry")
+    yield {"kind": "final", "ok": ok, "pre": pre, "post": post,
+           "steps": steps, "failed": failed, "timed_out": timed_out,
+           "message": msg}
+
+
+@app.post("/proxy/magneto/recalibrate")
+def proxy_magneto_recalibrate():
+    """Blocking orchestrator: runs the full recalibration cycle and returns a
+    single summary JSON. See /proxy/magneto/recalibrate/stream for live
+    per-step progress.
+
+    Body (optional):
+      { "timeout_s": 60, "poll_s": 1.0 }"""
+    data = request.get_json(silent=True) or {}
+    try:
+        timeout_s = max(5.0, float(data.get("timeout_s", 60)))
+        poll_s = max(0.25, float(data.get("poll_s", 1.0)))
+    except (TypeError, ValueError):
+        return jsonify(ok=False, error="timeout_s/poll_s must be numeric"), 400
+
+    log_command("magneto_recalibrate", {"timeout_s": timeout_s, "poll_s": poll_s})
+
+    final = {"ok": False, "error": "no final event"}
+    for ev in _magneto_cycle(timeout_s, poll_s):
+        if ev.get("kind") == "final":
+            final = {k: v for k, v in ev.items() if k != "kind"}
+    return jsonify(final), 200
+
+
+@app.get("/proxy/magneto/recalibrate/stream")
+def proxy_magneto_recalibrate_stream():
+    """SSE stream of the recalibration cycle. Used by the wizard GUI to light
+    up each step + per-axis indicator as it happens.
+
+    Query params: timeout_s (default 60), poll_s (default 1.0)."""
+    try:
+        timeout_s = max(5.0, float(request.args.get("timeout_s", 60)))
+        poll_s = max(0.25, float(request.args.get("poll_s", 1.0)))
+    except (TypeError, ValueError):
+        return jsonify(ok=False, error="timeout_s/poll_s must be numeric"), 400
+
+    log_command("magneto_recalibrate_stream",
+                {"timeout_s": timeout_s, "poll_s": poll_s})
+
+    def generate():
+        for ev in _magneto_cycle(timeout_s, poll_s):
+            yield f"data: {json.dumps(ev)}\n\n".encode()
+
+    return Response(generate(), mimetype="text/event-stream",
+                    headers={"Cache-Control": "no-cache",
+                             "X-Accel-Buffering": "no"})
 
 
 def main():
