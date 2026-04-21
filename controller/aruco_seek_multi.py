@@ -16,7 +16,9 @@ Re-uses VideoMarkerTracker + PositionListener from tools/aruco_seek.py
 
 from __future__ import annotations
 
+import json
 import math
+import os
 import sys
 import threading
 import time
@@ -25,6 +27,60 @@ from pathlib import Path
 from typing import Optional
 
 import requests
+
+
+# ─── Mission trace logger ───────────────────────────────────────────────────
+
+class MissionTraceLogger:
+    """Append-only JSONL logger for mission state. Each line is a single
+    JSON object. Used by ScanAllMarkersMission to record every FSM tick,
+    phase transition, claim/release, and scan event, so post-flight
+    debugging can reconstruct exactly what each drone thought was happening.
+    """
+
+    def __init__(self, path: Path, mission_name: str):
+        self.path = Path(path)
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._lock = threading.Lock()
+        self._fh = open(self.path, "a", buffering=1)     # line-buffered
+        self.mission_name = mission_name
+        self._closed = False
+        self.write("trace_open", {
+            "mission": mission_name,
+            "started_at_wall": time.time(),
+            "started_at_iso": time.strftime("%Y-%m-%dT%H:%M:%S"),
+            "host": os.uname().nodename if hasattr(os, "uname") else "unknown",
+        })
+
+    def write(self, event: str, payload: Optional[dict] = None):
+        if self._closed:
+            return
+        rec = {"t": round(time.time(), 3), "event": event}
+        if payload:
+            rec.update(payload)
+        try:
+            with self._lock:
+                self._fh.write(json.dumps(rec, default=str) + "\n")
+        except Exception:
+            pass
+
+    def close(self):
+        with self._lock:
+            if self._closed:
+                return
+            self._closed = True
+            try:
+                self._fh.write(json.dumps({
+                    "t": round(time.time(), 3), "event": "trace_close"
+                }) + "\n")
+                self._fh.flush()
+                self._fh.close()
+            except Exception:
+                pass
+
+
+# Default on-disk location for mission traces
+MISSION_LOG_DIR = Path(__file__).resolve().parent / "logs"
 
 # Pull in the stateless parts of aruco_seek (trackers + pure helpers)
 _TOOLS = Path(__file__).resolve().parent.parent / "tools"
@@ -620,7 +676,7 @@ class ScanAllMarkersMission:
         drone_ids: list[str],
         target_markers: list[int],
         hover_seconds: float = 3.0,
-        approach_tolerance_m: float = 0.35,
+        approach_tolerance_m: float = 0.30,
         approach_skew_tol: float = 0.08,
         approach_err_x_tol: float = 0.15,
         auto_takeoff: bool = False,
@@ -648,6 +704,9 @@ class ScanAllMarkersMission:
         self.started_at: Optional[float] = None
         self.ended_at: Optional[float] = None
         self.error: Optional[str] = None
+        # Trace logger — created on start(), closed on stop().
+        self._trace: Optional[MissionTraceLogger] = None
+        self.trace_path: Optional[str] = None
 
     # ── Lifecycle ──
     def start(self):
@@ -669,6 +728,25 @@ class ScanAllMarkersMission:
             self.error = None
             self.scanned.clear()
             self.claimed.clear()
+            # Open mission trace log
+            ts_tag = time.strftime("%Y%m%d_%H%M%S")
+            log_path = MISSION_LOG_DIR / f"mission_scan_all_{ts_tag}.jsonl"
+            try:
+                self._trace = MissionTraceLogger(log_path, "scan_all_markers")
+                self.trace_path = str(log_path)
+                self._trace.write("mission_start", {
+                    "drone_ids": list(self.drone_ids),
+                    "target_markers": list(self.target_markers),
+                    "hover_seconds": self.hover_seconds,
+                    "approach_tolerance_m": self.approach_tolerance_m,
+                    "approach_err_x_tol": self.approach_err_x_tol,
+                    "approach_skew_tol": self.approach_skew_tol,
+                    "auto_takeoff": self.auto_takeoff,
+                })
+                print(f"[MISSION] Trace logging to {log_path}")
+            except Exception as e:
+                print(f"[MISSION] Trace log init failed: {e}")
+                self._trace = None
             self.drones = {
                 did: {
                     "phase": "SEARCH",
@@ -729,6 +807,14 @@ class ScanAllMarkersMission:
             was_active = self._active
             self._active = False
             self.ended_at = time.time()
+            if self._trace:
+                self._trace.write("mission_stop", {
+                    "land": bool(land),
+                    "scanned": sorted(self.scanned),
+                    "scanned_count": len(self.scanned),
+                    "target_count": len(self.target_markers),
+                    "claimed": dict(self.claimed),
+                })
         # Out of the lock — these can block on HTTP
         if was_active:
             for did in self.drone_ids:
@@ -750,6 +836,14 @@ class ScanAllMarkersMission:
                         obs.set_mode("observe")
                     except Exception:
                         pass
+        # Close the trace file last so all the per-drone shutdown events
+        # above have a chance to flush first.
+        if self._trace:
+            try:
+                self._trace.close()
+            except Exception:
+                pass
+            self._trace = None
 
     # ── Status snapshot ──
     def get_status(self) -> dict:
@@ -769,6 +863,7 @@ class ScanAllMarkersMission:
                 "started_at": self.started_at,
                 "ended_at": self.ended_at,
                 "error": self.error,
+                "trace_path": self.trace_path,
             }
 
     # ── FSM tick loop ──
@@ -818,8 +913,42 @@ class ScanAllMarkersMission:
 
         with self._lock:
             state = self.drones[did]
-            phase = state["phase"]
+            phase_before = state["phase"]
+            phase = phase_before
             target = state["target"]
+
+            # Trace every tick — this is what you hand back to diagnose
+            # "drone hovered but never transitioned". Includes everything
+            # the FSM decision path reads.
+            if self._trace:
+                self._trace.write("tick", {
+                    "drone": did,
+                    "phase": phase,
+                    "target": target,
+                    "marker_id": marker_id,
+                    "distance_m": distance_m,
+                    "err_x": snap.get("err_x"),
+                    "err_y": snap.get("err_y"),
+                    "skew":  snap.get("skew"),
+                    "visible": list(visible),
+                    "running": bool(running),
+                    "mode": snap.get("mode"),
+                    "hover_start": state.get("hover_start"),
+                    "hover_elapsed": (now - state["hover_start"])
+                        if state.get("hover_start") else None,
+                    "hover_target_s": self.hover_seconds,
+                    "search_sub": state.get("search_sub"),
+                    "search_sub_elapsed": (now - state["search_sub_start"])
+                        if state.get("search_sub_start") else None,
+                    "search_cycles": state.get("search_cycles", 0),
+                    "scanned": sorted(self.scanned),
+                    "claimed": dict(self.claimed),
+                    "note": state.get("note", ""),
+                    "pos": snap.get("pos") or snap.get("cam"),
+                    "yaw":  snap.get("yaw"),
+                    "battery": snap.get("battery"),
+                    "altitude_m": snap.get("altitude_m"),
+                })
 
             # Observer not running? Try to recover
             if not running:
@@ -829,6 +958,11 @@ class ScanAllMarkersMission:
                 except Exception as e:
                     state["note"] = f"restart failed: {e}"
                     state["phase"] = "ERROR"
+                    if self._trace:
+                        self._trace.write("phase_change", {
+                            "drone": did, "from": phase_before,
+                            "to": "ERROR", "reason": f"observer restart failed: {e}",
+                        })
                 return
 
             if phase == "SEARCH":
@@ -855,6 +989,14 @@ class ScanAllMarkersMission:
                     state["search_sub"] = "idle"
                     state["search_sub_start"] = None
                     state["note"] = f"approaching marker {chosen}"
+                    if self._trace:
+                        self._trace.write("marker_claimed", {
+                            "drone": did, "marker": chosen, "visible": list(visible),
+                        })
+                        self._trace.write("phase_change", {
+                            "drone": did, "from": "SEARCH", "to": "APPROACH",
+                            "target": chosen,
+                        })
                     return
 
                 # No free target marker visible — run the search maneuver.
@@ -962,25 +1104,34 @@ class ScanAllMarkersMission:
                     return
                 target_dist = obs.params.hover_distance_m
                 err_x_mag = abs(snap.get("err_x", 1))
-                skew_mag = abs(snap.get("skew", 1))
+                skew_mag  = abs(snap.get("skew", 1))
+                # APPROACH → HOVER: the ONLY hard requirement is distance within
+                # ±approach_tolerance_m. Horizontal alignment (err_x) and
+                # perpendicularity (skew) are nice-to-have indicators shown in
+                # the status line, but they don't block the transition — the
+                # observer's PD loop keeps correcting them once HOVER starts,
+                # and a hard err_x/skew gate kept drones stuck "approaching"
+                # forever when the scene had marginal conditions.
                 dist_ok = abs(distance_m - target_dist) <= self.approach_tolerance_m
-                x_ok    = err_x_mag <= self.approach_err_x_tol
-                skew_ok = skew_mag  <= self.approach_skew_tol
-                if dist_ok and x_ok and skew_ok:
+                if dist_ok:
                     state["phase"] = "HOVER"
                     state["hover_start"] = time.time()
-                    state["note"] = f"hovering on {target} (skew={skew_mag:.2f})"
+                    state["note"] = (f"hovering on {target} "
+                                     f"(err_x={err_x_mag:.2f}, skew={skew_mag:.2f})")
+                    if self._trace:
+                        self._trace.write("phase_change", {
+                            "drone": did, "from": "APPROACH", "to": "HOVER",
+                            "target": target,
+                            "distance_m": round(distance_m, 3),
+                            "target_dist_m": target_dist,
+                            "err_x": round(err_x_mag, 3),
+                            "skew": round(skew_mag, 3),
+                        })
                 else:
-                    # Report the specific deficiency so the operator can tune
-                    missing = []
-                    if not dist_ok:
-                        missing.append(f"dist {distance_m:.2f}→{target_dist:.2f}m")
-                    if not x_ok:
-                        missing.append(f"|err_x|={err_x_mag:.2f}>{self.approach_err_x_tol}")
-                    if not skew_ok:
-                        missing.append(f"|skew|={skew_mag:.2f}>{self.approach_skew_tol} "
-                                       "(not perpendicular)")
-                    state["note"] = f"approaching {target}: " + "; ".join(missing)
+                    state["note"] = (f"approaching {target}: dist "
+                                     f"{distance_m:.2f}→{target_dist:.2f}m "
+                                     f"(±{self.approach_tolerance_m:.2f})  "
+                                     f"err_x={err_x_mag:.2f}  skew={skew_mag:.2f}")
                 return
 
             if phase == "HOVER":
@@ -998,15 +1149,30 @@ class ScanAllMarkersMission:
                     return
                 elapsed = time.time() - (state["hover_start"] or time.time())
                 if elapsed >= self.hover_seconds:
-                    # Scanned!
+                    # Scanned! Go directly into the rotate sub-phase so the
+                    # drone immediately starts looking for the next marker,
+                    # skipping the usual 2-second idle grace.
                     self.scanned.add(target)
                     self.claimed.pop(did, None)
                     obs.set_target(None)
-                    obs.set_search_rc(0, 0, 0, 0)
                     state.update(phase="SEARCH", target=None, hover_start=None,
-                                 search_sub="idle", search_sub_start=None,
+                                 search_sub="rotate", search_sub_start=now,
                                  search_cycles=0,
-                                 note=f"scanned marker {target}")
+                                 note=f"scanned marker {target} — rotating to find next")
+                    # Kick off rotation immediately (the next SEARCH tick would
+                    # do this anyway, but setting it here avoids a 0.5s gap).
+                    obs.set_search_rc(0, 0, 0, self.SEARCH_ROTATE_YAW_RC)
+                    if self._trace:
+                        self._trace.write("marker_scanned", {
+                            "drone": did, "marker": target,
+                            "hover_elapsed": round(elapsed, 3),
+                            "scanned_count": len(self.scanned),
+                            "remaining": sorted(set(self.target_markers) - self.scanned),
+                        })
+                        self._trace.write("phase_change", {
+                            "drone": did, "from": "HOVER", "to": "SEARCH",
+                            "sub": "rotate", "reason": "scan_complete",
+                        })
                 else:
                     remaining = self.hover_seconds - elapsed
                     state["note"] = f"hovering on {target}: {remaining:.1f}s left"
@@ -1029,7 +1195,7 @@ class MissionManager:
 
     def start_scan_all(self, drone_ids: list[str], target_markers: list[int],
                        hover_seconds: float = 3.0,
-                       approach_tolerance_m: float = 0.35,
+                       approach_tolerance_m: float = 0.30,
                        approach_skew_tol: float = 0.08,
                        approach_err_x_tol: float = 0.15,
                        auto_takeoff: bool = False) -> tuple[bool, str]:

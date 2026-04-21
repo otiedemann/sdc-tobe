@@ -413,7 +413,7 @@ HTML = """
       <label style=\"color:#94a3b8;margin-left:12px;\">Hover s:</label>
       <input id=\"mis_hover_s\" type=\"number\" min=\"0.5\" step=\"0.5\" value=\"3\" style=\"width:70px;\" />
       <label style=\"color:#94a3b8;margin-left:12px;\">Approach tol (m):</label>
-      <input id=\"mis_tol_m\" type=\"number\" min=\"0.1\" step=\"0.05\" value=\"0.35\" style=\"width:70px;\" />
+      <input id=\"mis_tol_m\" type=\"number\" min=\"0.1\" step=\"0.05\" value=\"0.30\" style=\"width:70px;\" title=\"Drone transitions from APPROACH to HOVER once within this many metres of the hover distance (horizontal alignment / perpendicularity are not required).\" />
       <label style=\"color:#94a3b8;margin-left:12px;\" title=\"Max skew before declaring the drone perpendicular. 0.08 ≈ 6° off the marker normal. Lower values force the drone to align straight-on before hovering.\">Skew tol:</label>
       <input id=\"mis_skew_tol\" type=\"number\" min=\"0.02\" max=\"0.50\" step=\"0.01\" value=\"0.08\" style=\"width:70px;\" />
       <label style=\"color:#94a3b8;margin-left:12px;display:flex;align-items:center;gap:4px;\">
@@ -426,6 +426,7 @@ HTML = """
       <button id=\"mis_start\" style=\"background:#065f46;border-color:#10b981;\">&#9654; Start mission</button>
       <button id=\"mis_stop\" style=\"background:#7f1d1d;border-color:#ef4444;\">&#9632; Stop</button>
       <button id=\"mis_stop_land\" style=\"background:#7f1d1d;border-color:#ef4444;\">&#9632; Stop + Land</button>
+      <a id=\"mis_trace_download\" href=\"/proxy/missions/trace\" download style=\"margin-left:10px;color:#93c5fd;text-decoration:underline;font-size:12px;\" title=\"Download the JSONL trace log of the current (or most recent) mission\">⤓ Download trace</a>
       <span id=\"mis_err\" style=\"display:none;margin-left:10px;padding:4px 10px;font-size:11px;background:#7f1d1d;color:#fecaca;border:1px solid #ef4444;border-radius:4px;font-weight:600;\"></span>
       <span id=\"mis_ok\"  style=\"display:none;margin-left:10px;padding:4px 10px;font-size:11px;background:#064e3b;color:#a7f3d0;border:1px solid #22c55e;border-radius:4px;font-weight:600;\"></span>
       <span id=\"mis_progress\" style=\"margin-left:12px;color:#38bdf8;font-weight:600;\">—</span>
@@ -782,13 +783,17 @@ HTML = """
     // Buttons
     document.getElementById('arc_start').onclick = async () => {
       await fetch('/proxy/aruco/start', {method:'POST'});
-      document.getElementById('arc_video').src = '/proxy/aruco/video.mjpg?t=' + Date.now();
+      const av = document.getElementById('arc_video');
+      av.src = '/proxy/aruco/video.mjpg?t=' + Date.now();
+      av.setAttribute('data-active', '1');
       // Reload params for the now-active drone
       arcLoadParams();
     };
     document.getElementById('arc_stop').onclick = async () => {
       await fetch('/proxy/aruco/stop', {method:'POST'});
-      document.getElementById('arc_video').src = '';
+      const av = document.getElementById('arc_video');
+      av.src = '';
+      av.removeAttribute('data-active');
     };
     document.getElementById('arc_target_lock').onclick = async () => {
       const v = document.getElementById('arc_target_input').value;
@@ -899,7 +904,7 @@ HTML = """
     arcPoll();
     // Version marker — if this string doesn't appear in the DOM,
     // you're running stale JS (restart the Python server or hard-refresh).
-    const BUILD = 'ai-autostart-mjpeg';
+    const BUILD = 'am-mission-trace-log';
     console.log('[arc] init complete, build=' + BUILD);
     const ver = document.createElement('span');
     ver.id = 'arc_build_tag';
@@ -1311,12 +1316,18 @@ async function loadDrones() {
 function renderDroneBar() {
   const bar = document.getElementById('drone_bar');
   bar.innerHTML = '';
+  let slot = 1;
   for (const [id, info] of Object.entries(drones)) {
     const btn = document.createElement('button');
     btn.className = 'drone-btn' + (id === activeDroneId ? ' selected' : '');
-    btn.innerHTML = `${info.name}<span class="drone-type">${info.type}</span>`;
+    const slotBadge = (slot <= 5)
+      ? `<span style="background:#1e3a5f;color:#93c5fd;padding:0 4px;margin-right:4px;border-radius:3px;font-size:10px;font-weight:700;">${slot}</span>`
+      : '';
+    btn.innerHTML = `${slotBadge}${info.name}<span class="drone-type">${info.type}</span>`;
+    btn.title = (slot <= 5) ? `Hotkey: ${slot}` : '';
     btn.onclick = () => switchDrone(id);
     bar.appendChild(btn);
+    slot += 1;
   }
   // Show/hide Anafi panel based on drone type
   const anafiPanel = document.getElementById('anafi_panel');
@@ -1339,6 +1350,58 @@ async function switchDrone(id) {
     startTelemetrySSE();
     if (document.getElementById('pos_enabled').checked) startPosEvents();
     refreshTelemetry();
+    // ── Video feed must also switch to the new drone ───────────────
+    // /proxy/video, /proxy/position/video and /proxy/aruco/video.mjpg
+    // all proxy to the ACTIVE drone on the server. The browser's
+    // existing <img> MJPEG connections are pinned to the OLD drone
+    // (long-lived HTTP, established when src was set), so we have to
+    // tear them down and re-establish. Be aggressive: always do this,
+    // regardless of videoActive/src-empty flags.
+    try {
+      // 1) Guarantee Way-1 MJPEG is running on the new drone.
+      //    Fire-and-forget; if it's already running, the server returns ok.
+      fetch('/proxy/video/start', {method:'POST',
+        headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({mode:'mjpeg'})}).catch(()=>{});
+
+      // 2) Force every <img> to drop its current MJPEG connection.
+      //    'about:blank' is more aggressive than an empty string; it
+      //    actually tears down the existing HTTP socket.
+      const elements = [
+        { el: document.getElementById('video_img'),     src: '/proxy/video?' },
+        { el: document.getElementById('pos_video_img'), src: '/proxy/position/video?' },
+        { el: document.getElementById('arc_video'),     src: '/proxy/aruco/video.mjpg?t=' },
+      ];
+      elements.forEach(({el}) => { if (el) el.src = 'about:blank'; });
+
+      // 3) After the browser has had time to close the old connections
+      //    (browsers process src changes async — 300 ms is a safe
+      //    upper bound), reconnect every feed with a fresh cache-buster.
+      //    Main feed is always reconnected (even if user hadn't pressed
+      //    Start Video on the old drone, the new drone should also
+      //    show its feed). Position and ArUco feeds only reconnect
+      //    if they had been displayed on the previous drone.
+      const posVisible = document.getElementById('pos_video_img') &&
+        document.getElementById('pos_video_img').parentElement &&
+        document.getElementById('pos_video_img').parentElement.style.display !== 'none';
+      const arcVisible = document.getElementById('arc_video') &&
+        document.getElementById('arc_video').getAttribute('data-active') === '1';
+      setTimeout(() => {
+        const ts = Date.now();
+        const mainImg = document.getElementById('video_img');
+        if (mainImg) { mainImg.src = '/proxy/video?' + ts; videoActive = true; }
+        if (posVisible) {
+          document.getElementById('pos_video_img').src = '/proxy/position/video?' + ts;
+        }
+        if (arcVisible) {
+          document.getElementById('arc_video').src = '/proxy/aruco/video.mjpg?t=' + ts;
+        }
+        console.log('[drone-switch] video reconnected → drone', id,
+                    ' main=yes pos=', posVisible, ' arc=', arcVisible);
+      }, 300);
+    } catch (err) {
+      console.warn('[drone-switch] video reconnect failed:', err);
+    }
   } catch {}
 }
 
@@ -1495,6 +1558,37 @@ window.addEventListener('keydown', (e)=>{
     window._landAllInFlight = true;
     console.log('[LAND_ALL] 0 pressed — landing every drone');
     landAllDrones('0 hotkey').finally(() => { window._landAllInFlight = false; });
+    return;
+  }
+  // ── Drone switch hotkey: digits 1-5 select the Nth drone in the bar ──
+  // Order follows Object.entries(drones) insertion order, same as the
+  // drone-bar buttons top→bottom. '1' = first drone, '2' = second, etc.
+  // Accept both the top-row digit key and the numpad digit; e.key is '1'
+  // in both cases so simple string comparison works, but also use e.code
+  // as a fallback when an exotic layout remaps the character.
+  const isDigit15 = /^[1-5]$/.test(k) ||
+                    /^(Digit|Numpad)[1-5]$/.test(e.code || '');
+  if (isDigit15) {
+    e.preventDefault();
+    const slot = parseInt(k, 10) || parseInt((e.code || '').slice(-1), 10);
+    const idx  = slot - 1;
+    const ids  = Object.keys(drones || {});
+    console.log('[drone-switch] hotkey', slot, 'fleet=', ids,
+                'active=', activeDroneId);
+    if (ids.length === 0) {
+      console.warn('[drone-switch] drones dict is empty — did loadDrones run?');
+      return;
+    }
+    if (idx < ids.length) {
+      const targetId = ids[idx];
+      if (targetId !== activeDroneId) {
+        switchDrone(targetId);
+      } else {
+        console.log('[drone-switch] already on', targetId);
+      }
+    } else {
+      console.log('[drone-switch] no drone at slot', slot, '(have', ids.length, ')');
+    }
     return;
   }
   if (map.has(k)) {
@@ -4181,7 +4275,7 @@ def proxy_missions_scan_all_start():
     if not target_markers:
         return jsonify(ok=False, error="target_markers must parse to at least one id"), 400
     hover_seconds = float(data.get("hover_seconds", 3.0))
-    approach_tolerance_m = float(data.get("approach_tolerance_m", 0.35))
+    approach_tolerance_m = float(data.get("approach_tolerance_m", 0.30))
     approach_skew_tol   = float(data.get("approach_skew_tol", 0.08))
     approach_err_x_tol  = float(data.get("approach_err_x_tol", 0.15))
     auto_takeoff = bool(data.get("auto_takeoff", False))
@@ -4209,6 +4303,56 @@ def proxy_missions_stop():
     ok = mission_manager.stop(land=land)
     log_command("mission_stop", {"land": land, "ok": ok})
     return jsonify(ok=ok, status=mission_manager.status())
+
+
+@app.get("/proxy/missions/trace")
+def proxy_missions_trace():
+    """Download the trace log for the most recent mission. The mission
+    class writes a JSONL file per run; we return the current one (or the
+    most recent if no mission is active)."""
+    from pathlib import Path as _P
+    import glob as _glob
+    path = None
+    try:
+        cur = mission_manager.current
+        if cur is not None and getattr(cur, "trace_path", None):
+            path = cur.trace_path
+    except Exception:
+        pass
+    if not path:
+        # Fall back to newest file in the logs dir
+        try:
+            from aruco_seek_multi import MISSION_LOG_DIR
+            files = sorted(_glob.glob(str(MISSION_LOG_DIR / "mission_*.jsonl")))
+            if files:
+                path = files[-1]
+        except Exception:
+            pass
+    if not path or not _P(path).exists():
+        return jsonify(ok=False, error="no trace available yet"), 404
+    return send_file(path, mimetype="application/x-ndjson",
+                     as_attachment=True,
+                     download_name=_P(path).name)
+
+
+@app.get("/proxy/missions/traces")
+def proxy_missions_traces():
+    """List all mission trace files on disk with size and mtime."""
+    import glob as _glob
+    from aruco_seek_multi import MISSION_LOG_DIR
+    files = []
+    try:
+        for f in sorted(_glob.glob(str(MISSION_LOG_DIR / "mission_*.jsonl"))):
+            p = Path(f)
+            st = p.stat()
+            files.append({
+                "name": p.name,
+                "size": st.st_size,
+                "mtime": st.st_mtime,
+            })
+    except Exception as e:
+        return jsonify(ok=False, error=str(e)), 500
+    return jsonify(ok=True, files=files)
 
 
 def main():

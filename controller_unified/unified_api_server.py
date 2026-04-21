@@ -29,6 +29,14 @@ from pathlib import Path
 from typing import Dict, Optional, Set, Tuple
 
 from flask import Flask, Response, jsonify, request, send_file
+try:
+    from flask.json.provider import DefaultJSONProvider
+    _HAS_JSON_PROVIDER = True
+except ImportError:
+    # Flask < 2.2 exposes app.json_encoder instead
+    DefaultJSONProvider = None
+    _HAS_JSON_PROVIDER = False
+import json as _json
 
 # ---------------------------------------------------------------------------
 # Architecture detection — skip Olympe on Raspberry Pi (ARM)
@@ -124,6 +132,111 @@ if HAS_OLYMPE_SDK:
         HAS_MAGNETO_CALIB_CMD = True
     except (ImportError, KeyError):
         HAS_MAGNETO_CALIB_CMD = False
+
+
+# ─── Optional Wi-Fi control messages ────────────────────────────────────────
+# The Anafi is dual-band 2.4/5 GHz 802.11n. Olympe exposes AP-channel
+# config, but the exact Python symbol names drift between Olympe versions
+# (set_ap_channel vs SetApChannel vs Command.SetApChannel, etc.).
+# We probe the module and log every import error so the operator can
+# see what's actually available. Everything downstream is guarded by
+# HAS_WIFI_CTRL.
+HAS_WIFI_CTRL = False
+WifiSetApChannel = WifiScan = None
+WifiApChannelChanged = WifiAuthorizedChannel = WifiRssiChanged = None
+WifiBand = WifiSelectionType = None
+_WIFI_IMPORT_ERRORS: list[str] = []   # populated for /api/wifi/debug
+
+if HAS_OLYMPE_SDK:
+    # Candidate message paths. Try each; first one that binds wins.
+    _WIFI_CANDIDATES = [
+        # (label, module_path, set_attr, scan_attr, chan_evt, auth_evt, rssi_evt)
+        ("wifi.<snake>", "olympe.messages.wifi",
+            "set_ap_channel", "scan",
+            "ap_channel_changed", "authorized_channel", "rssi_changed"),
+        ("wifi.<Camel>", "olympe.messages.wifi",
+            "SetApChannel", "ScanChannels",
+            "ApChannelChanged", "AuthorizedChannel", "Rssi_changed"),
+        ("wifi.Command", "olympe.messages.wifi.Command",
+            "SetApChannel", "ScanChannels",
+            None, None, None),   # events not under Command
+    ]
+    import importlib as _importlib
+    for label, mod_path, set_name, scan_name, chan_name, auth_name, rssi_name in _WIFI_CANDIDATES:
+        try:
+            mod = _importlib.import_module(mod_path)
+            s = getattr(mod, set_name, None)
+            sc = getattr(mod, scan_name, None)
+            if not (s and sc):
+                _WIFI_IMPORT_ERRORS.append(
+                    f"{label}: {mod_path}.{set_name}={bool(s)}, "
+                    f".{scan_name}={bool(sc)}")
+                continue
+            WifiSetApChannel = s
+            WifiScan = sc
+            if chan_name:
+                WifiApChannelChanged = getattr(mod, chan_name, None) or \
+                    getattr(_importlib.import_module("olympe.messages.wifi"), chan_name, None)
+            if auth_name:
+                WifiAuthorizedChannel = getattr(mod, auth_name, None) or \
+                    getattr(_importlib.import_module("olympe.messages.wifi"), auth_name, None)
+            if rssi_name:
+                WifiRssiChanged = getattr(mod, rssi_name, None) or \
+                    getattr(_importlib.import_module("olympe.messages.wifi"), rssi_name, None)
+            print(f"[WIFI] Using Olympe Wi-Fi bindings from {label} ({mod_path})")
+            HAS_WIFI_CTRL = True
+            break
+        except Exception as _e:
+            _WIFI_IMPORT_ERRORS.append(f"{label}: {type(_e).__name__}: {_e}")
+
+    # Enums. Olympe 7.x uses lowercase names (band, selection_type),
+    # older 1.x used CamelCase (Band, SelectionType). Accept either.
+    for ep in ("olympe.enums.wifi", "olympe.messages.wifi"):
+        try:
+            em = _importlib.import_module(ep)
+            WifiBand = (getattr(em, "band", None)
+                        or getattr(em, "Band", None)
+                        or WifiBand)
+            WifiSelectionType = (getattr(em, "selection_type", None)
+                                 or getattr(em, "SelectionType", None)
+                                 or getattr(em, "Type", None)
+                                 or WifiSelectionType)
+            if WifiBand and WifiSelectionType:
+                print(f"[WIFI] Band/SelectionType enums loaded from {ep} "
+                      f"(band={WifiBand.__name__ if hasattr(WifiBand,'__name__') else WifiBand}, "
+                      f"sel={WifiSelectionType.__name__ if hasattr(WifiSelectionType,'__name__') else WifiSelectionType})")
+                break
+        except Exception as _e:
+            _WIFI_IMPORT_ERRORS.append(f"enums from {ep}: {type(_e).__name__}: {_e}")
+
+    if HAS_WIFI_CTRL:
+        print(f"[WIFI] Control ready — band={bool(WifiBand)}, "
+              f"sel_type={bool(WifiSelectionType)}")
+    else:
+        print("[WIFI] Control NOT available. Errors:")
+        for err in _WIFI_IMPORT_ERRORS:
+            print(f"[WIFI]   {err}")
+
+
+def _magneto_needs_calibration(status: Optional[str]) -> bool:
+    """Return True only when the magnetometer really needs recalibration.
+
+    The status string from _read_magnetometer_state() is a comma-separated
+    list of tokens like "REQUIRED", "not-required", "all-axes-ok", "FAILED",
+    "axes=x1y1z1", "in-progress". Our earlier substring check matched
+    "REQUIRED" inside "not-required" and produced a false warning — fix
+    by splitting on commas and comparing token-by-token.
+    """
+    if not status:
+        return False
+    tokens = [t.strip().lower() for t in status.split(",")]
+    if "required" in tokens:      # exact token, not a substring
+        return True
+    for t in tokens:
+        # Accepts "failed", "calibrationfailed", "fail", etc.
+        if t.startswith("fail") or t == "failed":
+            return True
+    return False
     try:
         from olympe.messages.camera import start_recording, stop_recording, take_photo
         HAS_CAMERA = True
@@ -292,6 +405,64 @@ def detect_drone_type() -> Tuple[str, str]:
 # Global state (shared across backends)
 # ---------------------------------------------------------------------------
 app = Flask(__name__)
+
+
+# Enum-aware JSON encoder. Olympe returns enum instances (class `band`,
+# `selection_type`, etc.) in its state dicts; Flask's stock encoder raises
+# "Object of type band is not JSON serializable" for these. Install a
+# global provider so EVERY jsonify() in this app handles them.
+def _enum_to_jsonable(obj):
+    name = getattr(obj, "name", None)
+    if isinstance(name, str):
+        return name
+    # ArsdkEnum sometimes exposes .value as the serializable form
+    val = getattr(obj, "value", None)
+    if isinstance(val, (str, int, float, bool)):
+        return val
+    return str(obj)
+
+
+try:
+    if _HAS_JSON_PROVIDER and hasattr(app, "json"):
+        # Flask 2.2+: app.json is a JSONProvider INSTANCE with a callable
+        # `.default` attribute (a staticmethod on DefaultJSONProvider).
+        # Wrap the existing default so we fall back to enum-naming.
+        _orig_default = getattr(app.json, "default", None)
+        def _enum_aware_default(obj, _orig=_orig_default):
+            if _orig is not None:
+                try:
+                    return _orig(obj)
+                except TypeError:
+                    pass
+            return _enum_to_jsonable(obj)
+        app.json.default = _enum_aware_default
+        print("[JSON] Enum-aware default installed on app.json")
+    else:
+        # Flask < 2.2
+        class _EnumAwareJSONEncoder(_json.JSONEncoder):
+            def default(self, obj):
+                try:
+                    return super().default(obj)
+                except TypeError:
+                    return _enum_to_jsonable(obj)
+        app.json_encoder = _EnumAwareJSONEncoder
+        print("[JSON] Enum-aware encoder installed on app.json_encoder")
+except Exception as _e:
+    # If the Flask version has an even different API, don't crash the
+    # whole server. Fall back to per-endpoint _jsonable wrapping.
+    print(f"[JSON] Could not install enum-aware encoder: {type(_e).__name__}: {_e}")
+
+
+# Build marker — GET /api/version returns this so the operator can verify
+# which commit the flight controller is actually running.
+BUILD_TAG = "wifi-scan-v3-with-scanned-item"
+BUILD_AT = time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime())
+
+
+@app.get("/api/version")
+def api_version():
+    return jsonify(ok=True, build=BUILD_TAG, build_at=BUILD_AT,
+                   file=__file__)
 running = True
 flying = False
 drone_type = "unknown"
@@ -1502,7 +1673,7 @@ class OlympeBackend(DroneBackend):
             # "takeoff refused" on the Anafi is a stale magnetometer.
             mag = self._read_magnetometer_state()
             if mag:
-                if "REQUIRED" in mag.upper() or "FAIL" in mag.upper():
+                if _magneto_needs_calibration(mag):
                     print(f"[ANAFI] ⚠ MAGNETOMETER CALIBRATION NEEDED: {mag}")
                     print("[ANAFI]   → use FreeFlight 7 app to run the figure-8")
                     print("[ANAFI]     calibration dance, or POST /api/magneto/calibrate")
@@ -1573,8 +1744,7 @@ class OlympeBackend(DroneBackend):
             reason_parts.append(f"sensors={post_sensors}")
         # The magnetometer is the top recurring cause of Anafi takeoff refusals
         # in this project — surface it prominently.
-        if post_magneto and ("REQUIRED" in post_magneto.upper() or
-                             "FAIL" in post_magneto.upper()):
+        if _magneto_needs_calibration(post_magneto):
             reason_parts.append(f"magneto={post_magneto}")
         reason = "takeoff_failed" + (f" ({', '.join(reason_parts)})" if reason_parts else "")
         print(f"[ANAFI] takeoff refused — {reason}")
@@ -2737,7 +2907,7 @@ def api_magneto_get():
             mag = reader()
         except Exception as e:
             mag = f"err:{e}"
-    required = bool(mag and ("REQUIRED" in mag.upper() or "FAIL" in mag.upper()))
+    required = _magneto_needs_calibration(mag)
     return jsonify(ok=True, status=mag, required=required, drone_type=drone_type)
 
 
@@ -2761,6 +2931,309 @@ def api_magneto_calibrate():
         print("[ANAFI] Magnetometer calibration REQUESTED — operator must "
               "rotate drone in figure-8 around each axis.")
         return jsonify(ok=True, message="calibration started — rotate drone in figure-8")
+    except Exception as e:
+        return jsonify(ok=False, error=str(e)), 500
+
+
+# ─── Wi-Fi control (Anafi is dual-band 2.4/5 GHz) ───────────────────────────
+
+def _anafi_backend():
+    """Return the active OlympeBackend or None."""
+    b = backend
+    if b is None or not isinstance(b, OlympeBackend):
+        return None
+    if b.drone is None:
+        return None
+    return b
+
+
+@app.get("/api/wifi/debug")
+def api_wifi_debug():
+    """Introspect what's actually available in olympe.messages.wifi on this
+    flight controller. Use this when /api/wifi/channel returns 'not
+    supported' — the response shows what symbol names this Olympe build
+    exposes, so we can fix the imports in HAS_WIFI_CTRL."""
+    import importlib
+    out = {"has_olympe_sdk": HAS_OLYMPE_SDK, "has_wifi_ctrl": HAS_WIFI_CTRL,
+           "import_errors": list(_WIFI_IMPORT_ERRORS)}
+    for path in ("olympe.messages.wifi", "olympe.enums.wifi"):
+        try:
+            m = importlib.import_module(path)
+            names = sorted(n for n in dir(m) if not n.startswith("_"))
+            out[path] = names
+        except Exception as e:
+            out[path] = f"import failed: {type(e).__name__}: {e}"
+    try:
+        cmd_mod = importlib.import_module("olympe.messages.wifi.Command")
+        out["olympe.messages.wifi.Command"] = sorted(
+            n for n in dir(cmd_mod) if not n.startswith("_"))
+    except Exception as e:
+        out["olympe.messages.wifi.Command"] = f"not importable: {e}"
+    # Resolved bindings
+    out["resolved"] = {
+        "WifiSetApChannel":       getattr(WifiSetApChannel, "__name__", str(WifiSetApChannel)),
+        "WifiScan":               getattr(WifiScan, "__name__", str(WifiScan)),
+        "WifiBand":               getattr(WifiBand, "__name__", str(WifiBand)),
+        "WifiSelectionType":      getattr(WifiSelectionType, "__name__", str(WifiSelectionType)),
+        "WifiApChannelChanged":   getattr(WifiApChannelChanged, "__name__", str(WifiApChannelChanged)),
+        "WifiAuthorizedChannel":  getattr(WifiAuthorizedChannel, "__name__", str(WifiAuthorizedChannel)),
+        "WifiRssiChanged":        getattr(WifiRssiChanged, "__name__", str(WifiRssiChanged)),
+    }
+    # If Band has enum members, list them so the user knows what "5_GHz" to pass
+    if WifiBand is not None:
+        try:
+            out["WifiBand_members"] = [m.name for m in WifiBand]
+        except Exception:
+            try:
+                out["WifiBand_members"] = [k for k in WifiBand.__dict__.keys()
+                                           if not k.startswith("_")]
+            except Exception:
+                pass
+    if WifiSelectionType is not None:
+        try:
+            out["WifiSelectionType_members"] = [m.name for m in WifiSelectionType]
+        except Exception:
+            try:
+                out["WifiSelectionType_members"] = [k for k in WifiSelectionType.__dict__.keys()
+                                                    if not k.startswith("_")]
+            except Exception:
+                pass
+    return jsonify(out)
+
+
+def _jsonable(v):
+    """Recursively convert Olympe state values into JSON-safe Python types.
+    Olympe state dicts often contain ArsdkEnum instances (e.g. Band.5_GHz,
+    Type.manual) which aren't serializable by Flask's jsonify. Convert
+    enums to 'name' (or str(v) as fallback), and recurse into dict/list."""
+    if v is None or isinstance(v, (str, int, float, bool)):
+        return v
+    # ArsdkEnum / IntEnum / any enum-like object
+    name = getattr(v, "name", None)
+    if name and isinstance(name, str):
+        return name
+    if isinstance(v, dict):
+        return {k: _jsonable(x) for k, x in v.items()}
+    if isinstance(v, (list, tuple, set)):
+        return [_jsonable(x) for x in v]
+    try:
+        return str(v)
+    except Exception:
+        return None
+
+
+@app.get("/api/wifi/status")
+def api_wifi_status():
+    """Report the current AP channel + band the Anafi is broadcasting on."""
+    if not HAS_WIFI_CTRL:
+        return jsonify(ok=False, error="Wi-Fi control not supported by this "
+                                        "Olympe build"), 501
+    b = _anafi_backend()
+    if b is None:
+        return jsonify(ok=False, error="drone not connected"), 503
+    try:
+        st = b._get_state(WifiApChannelChanged) if WifiApChannelChanged else None
+        if st is None:
+            return jsonify(ok=True, status="not-reported")
+        return jsonify(ok=True, status=_jsonable(dict(st)))
+    except Exception as e:
+        return jsonify(ok=False, error=str(e)), 500
+
+
+def _wifi_band_enum(s: str):
+    """Map a user-supplied band string → the Olympe enum member.
+    Accepts '2.4', '2.4ghz', '2_4_ghz', '5', '5ghz', '5_ghz', 'all'.
+    Falls back to the raw string if WifiBand isn't an enum (Olympe 1.x)."""
+    key = str(s).lower().replace("ghz", "").replace(".", "_").strip(" _")
+    alias = {"2": "2_4_ghz", "2_4": "2_4_ghz", "24": "2_4_ghz",
+             "5": "5_ghz",
+             "": "all", "all": "all"}.get(key, key)
+    if WifiBand is None:
+        return alias
+    # Try every casing Olympe might use
+    for attempt in (alias, alias.lower(), alias.upper(),
+                    alias.replace("_ghz", "_GHz"),
+                    alias.replace("2_4", "2_4").upper()):
+        if hasattr(WifiBand, attempt):
+            return getattr(WifiBand, attempt)
+    # Final fallback: iterate members, match by .name
+    try:
+        for m in WifiBand:
+            if m.name.lower() == alias.lower():
+                return m
+    except Exception:
+        pass
+    return alias
+
+
+def _wifi_sel_type_enum(which: str):
+    """which is 'auto_all' | 'auto_2_4' | 'auto_5' | 'manual'.
+    Returns the corresponding Olympe enum member (or the string if the
+    enum isn't exposed)."""
+    key = str(which).lower()
+    # Candidate names across Olympe versions
+    candidates = {
+        "auto_all":  ["auto_all", "auto"],
+        "auto_2_4":  ["auto_2_4_ghz", "auto_2_4Ghz", "auto_2_4GHz", "auto_2.4"],
+        "auto_5":    ["auto_5_ghz", "auto_5GHz", "auto_5"],
+        "manual":    ["manual", "fixed"],
+    }.get(key, [key])
+    if WifiSelectionType is None:
+        return candidates[0]
+    for name in candidates:
+        if hasattr(WifiSelectionType, name):
+            return getattr(WifiSelectionType, name)
+    try:
+        for m in WifiSelectionType:
+            if m.name.lower() in [c.lower() for c in candidates]:
+                return m
+    except Exception:
+        pass
+    return candidates[0]
+
+
+@app.post("/api/wifi/scan")
+def api_wifi_scan():
+    """Scan Wi-Fi channels in the requested band and return authorized
+    channels with their measured RSSI. Pass {"band": "2_4_GHz"} or
+    {"band": "5_GHz"} or {"band": "all"} (default).
+
+    Olympe's scan trigger returns quickly but the interesting data comes
+    asynchronously as 'scanned_item' events (one per detected AP) and
+    'update_authorized_channels' events (with the final authorised
+    channel list including occupancy). We subscribe, trigger the scan,
+    wait a few seconds, then harvest everything we saw."""
+    if not HAS_WIFI_CTRL:
+        return jsonify(ok=False, error="Wi-Fi control not supported"), 501
+    b = _anafi_backend()
+    if b is None:
+        return jsonify(ok=False, error="drone not connected"), 503
+    data = request.get_json(silent=True) or {}
+    band_str = str(data.get("band", "all")).lower()
+    band = _wifi_band_enum(band_str)
+    wait_s = float(data.get("wait_s", 4.0))
+
+    # Import the per-item events defensively — they weren't probed in
+    # the HAS_WIFI_CTRL block because they're additive.
+    import importlib
+    try:
+        wifi_mod = importlib.import_module("olympe.messages.wifi")
+        ScannedItem = getattr(wifi_mod, "scanned_item", None) \
+                      or getattr(wifi_mod, "ScannedItem", None)
+        UpdateAuthCh = getattr(wifi_mod, "update_authorized_channels", None) \
+                      or getattr(wifi_mod, "UpdateAuthorizedChannels", None)
+    except Exception:
+        ScannedItem = UpdateAuthCh = None
+
+    scanned_items: list[dict] = []
+    auth_updates: list[dict] = []
+
+    def _on_scanned_item(evt, *_):
+        try:
+            scanned_items.append(dict(evt.args))
+        except Exception:
+            scanned_items.append({"raw": str(evt)})
+
+    def _on_auth_update(evt, *_):
+        try:
+            auth_updates.append(dict(evt.args))
+        except Exception:
+            auth_updates.append({"raw": str(evt)})
+
+    subs = []
+    try:
+        # Subscribe to the event firehose FIRST so we don't miss early
+        # emissions from the scan trigger.
+        if ScannedItem is not None:
+            subs.append(b.drone.subscribe(_on_scanned_item, ScannedItem()))
+        if UpdateAuthCh is not None:
+            subs.append(b.drone.subscribe(_on_auth_update, UpdateAuthCh()))
+
+        with command_lock:
+            b.drone(WifiScan(band=band)).wait(_timeout=2)
+
+        # Let async events arrive
+        time.sleep(max(0.5, min(wait_s, 10.0)))
+
+        # As a fallback, also read the per-channel state (some Olympe
+        # builds populate a dict keyed by channel number)
+        channels_state = []
+        try:
+            st = b.drone.get_state(WifiAuthorizedChannel)
+            if isinstance(st, dict):
+                channels_state = list(st.values())
+            elif isinstance(st, list):
+                channels_state = st
+        except Exception:
+            pass
+
+        return jsonify(ok=True,
+                       band=band_str,
+                       band_resolved=_jsonable(band),
+                       wait_s=wait_s,
+                       scanned_items=_jsonable(scanned_items),
+                       scanned_count=len(scanned_items),
+                       authorized_updates=_jsonable(auth_updates),
+                       channels=_jsonable(channels_state))
+    except Exception as e:
+        return jsonify(ok=False, error=str(e)), 500
+    finally:
+        for h in subs:
+            try: h.unsubscribe()
+            except Exception: pass
+
+
+@app.post("/api/wifi/channel")
+def api_wifi_channel():
+    """Set the Anafi's AP channel. Two modes:
+
+    - Automatic (recommended): {"auto": true, "band": "5_GHz"} — drone
+      scans and picks the cleanest channel in the requested band.
+    - Manual: {"auto": false, "band": "5_GHz", "channel": 36} — pin to
+      a specific channel. Valid channels: 1–13 for 2.4 GHz, 36/40/44/48/
+      149/153/157/161/165 for 5 GHz (region-dependent).
+
+    IMPORTANT: changing the AP channel momentarily drops the Wi-Fi
+    connection (drone re-associates on the new channel). The watchdog
+    will reconnect within a few seconds. Only issue this command when
+    the drone is ON THE GROUND.
+    """
+    if not HAS_WIFI_CTRL:
+        return jsonify(ok=False, error="Wi-Fi control not supported"), 501
+    b = _anafi_backend()
+    if b is None:
+        return jsonify(ok=False, error="drone not connected"), 503
+    data = request.get_json(silent=True) or {}
+    auto_mode = bool(data.get("auto", True))
+    band_str  = str(data.get("band", "5_GHz")).lower()
+    channel   = int(data.get("channel", 0))
+
+    band = _wifi_band_enum(band_str)
+    if auto_mode:
+        if band_str.startswith("5"):
+            sel = _wifi_sel_type_enum("auto_5")
+        elif band_str.startswith("2"):
+            sel = _wifi_sel_type_enum("auto_2_4")
+        else:
+            sel = _wifi_sel_type_enum("auto_all")
+    else:
+        sel = _wifi_sel_type_enum("manual")
+
+    try:
+        with command_lock:
+            b.drone(WifiSetApChannel(type=sel, band=band,
+                                     channel=0 if auto_mode else channel)).wait(_timeout=5)
+        mode = "auto" if auto_mode else "manual"
+        print(f"[ANAFI] Wi-Fi: {mode.upper()} → band={band_str}, "
+              f"channel={'any' if auto_mode else channel} "
+              f"(sel={_jsonable(sel)})")
+        resp = {"ok": True, "mode": mode, "band": band_str,
+                "type_resolved": _jsonable(sel),
+                "band_resolved": _jsonable(band),
+                "message": f"channel change submitted; connection will drop briefly"}
+        if not auto_mode:
+            resp["channel"] = channel
+        return jsonify(resp)
     except Exception as e:
         return jsonify(ok=False, error=str(e)), 500
 
@@ -3263,9 +3736,7 @@ def api_telemetry():
         if callable(reader):
             mag = reader()
             payload["magneto_status"] = mag
-            payload["magneto_required"] = bool(
-                mag and ("REQUIRED" in mag.upper() or "FAIL" in mag.upper())
-            )
+            payload["magneto_required"] = _magneto_needs_calibration(mag)
     except Exception:
         pass
     resp = jsonify(payload)
