@@ -34,8 +34,9 @@ HEARTBEAT_INTERVAL = 1.0  # Sekunden: Status senden auch ohne Marker
 TARGET_Z_POS = -1.5  # fixed target height position (internal Z axis)
 MARKER_SIZE = 0.5
 DRY_RUN = False  # True: log RC/commands but send nothing to drone, no takeoff
-WIFI_AUTO_CHANNEL = True   # Set WiFi channel automatically after connect
+WIFI_AUTO_CHANNEL = False   # Set WiFi channel automatically after connect
 WIFI_BAND = "5_GHz"        # "5_GHz" | "2_4_GHz" | "all"
+WIFI_CHANNEL = 124
 
 # Pose robustness settings
 MIN_REF_WEIGHT = 0.00  # Ignore very weak refs, but keep detection usable
@@ -1016,7 +1017,7 @@ def main():
 
         anafi_drone.connect()
         if WIFI_AUTO_CHANNEL and not DRY_RUN:
-            _set_wifi_channel(anafi_drone, band_str=WIFI_BAND, channel=123)
+            _set_wifi_channel(anafi_drone, band_str=WIFI_BAND, channel=WIFI_CHANNEL)
         from olympe.messages.ardrone3.SpeedSettings import MaxRotationSpeed
         anafi_drone(MaxRotationSpeed(150))
 
