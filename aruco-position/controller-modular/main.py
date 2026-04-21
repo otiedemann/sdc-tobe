@@ -160,12 +160,14 @@ RECOVERY_MAX_YAW_SPEED = 150   # °/s – MaxRotationSpeed sent to drone before 
 
 
 class MissionPhase:
-    IDLE    = "idle"
-    TAKEOFF = "takeoff"
-    FLY_TO  = "fly_to"
-    HOLD    = "hold"
-    FAILED  = "failed"
-    ABORTED = "aborted"
+    IDLE        = "idle"
+    TAKEOFF     = "takeoff"
+    FLY_TO      = "fly_to"
+    HOLD        = "hold"
+    RETURN_HOME = "return_home"
+    LANDING     = "landing"
+    FAILED      = "failed"
+    ABORTED     = "aborted"
 
 
 class AutonomousMission:
@@ -173,7 +175,12 @@ class AutonomousMission:
     State machine that:
       1. Commands the drone to take off.
       2. Flies to a given (x, y, z) world-frame coordinate.
-      3. Holds position indefinitely.
+      3. Holds position (locks home on first cam fix during FLY_TO).
+      4. Returns to the home coordinate.
+      5. Lands.
+
+    Phase sequence: TAKEOFF → FLY_TO → HOLD → RETURN_HOME → LANDING → IDLE
+    Each → transition requires a SPACE keypress (skipped when auto_confirm=True).
 
     Integration in main.py
     ----------------------
@@ -182,7 +189,7 @@ class AutonomousMission:
         mission.tick(last_prediction, last_vision_update, anafi_drone)
 
     The mission drives ctrl_module.set_target() internally and sends
-    Olympe TakeOff commands through the drone handle.
+    Olympe TakeOff / Landing commands through the drone handle.
     """
 
     def __init__(
@@ -204,10 +211,13 @@ class AutonomousMission:
         self._pending_phase: Optional[str] = None   # next phase awaiting SPACE confirm
         self._pending_prompt: str      = ""          # message shown while waiting
 
-        # FLY_TO recovery state
+        # FLY_TO / RETURN_HOME recovery state
         self._last_cam_ts: float       = 0.0         # monotonic timestamp of last valid cam pos
         self._recovering: bool         = False        # True while yaw-searching for markers
         self._recovery_seq: int        = 0            # PCMD sequence counter during recovery
+
+        # Home position: cam coords captured on first position fix during FLY_TO
+        self.home: Optional[tuple]     = None         # (x, y, z) world frame
 
     # ------------------------------------------------------------------ #
     # Public                                                               #
@@ -252,6 +262,24 @@ class AutonomousMission:
             # Reset cam timestamp so _tick_hold() doesn't immediately see a
             # stale timeout from the time spent waiting for SPACE confirm.
             self._last_cam_ts = time.monotonic()
+        elif phase == MissionPhase.RETURN_HOME:
+            self._begin_return_home(drone)
+        elif phase == MissionPhase.LANDING:
+            # Send landing command and jump straight to IDLE — no tick needed.
+            if self.ctrl is not None:
+                self.ctrl.clear_target()
+            if drone is not None and not self.dry_run:
+                try:
+                    from olympe.messages.ardrone3.Piloting import Landing
+                    drone(Landing())
+                    print("[mission] Landing command sent – mission complete")
+                except Exception as exc:
+                    print(f"[mission] Landing failed: {exc}")
+            elif self.dry_run:
+                print("[DRY RUN] Landing skipped – mission complete")
+            print("[mission] Confirmed → idle")
+            self._transition(MissionPhase.IDLE)
+            return  # skip the generic _transition below
         print(f"[mission] Confirmed → {phase}")
         self._transition(phase)
 
@@ -324,6 +352,9 @@ class AutonomousMission:
         elif self._phase == MissionPhase.HOLD:
             self._tick_hold(vision_result, now, drone)
 
+        elif self._phase == MissionPhase.RETURN_HOME:
+            self._tick_return_home(vision_result, now, drone)
+
     # ------------------------------------------------------------------ #
     # Phase handlers                                                       #
     # ------------------------------------------------------------------ #
@@ -360,6 +391,11 @@ class AutonomousMission:
         if cam is not None:
             # Position visible — update timestamp.
             self._last_cam_ts = now
+
+            # Lock home on the very first position fix of this mission.
+            if self.home is None:
+                self.home = (cam[0], cam[1], cam[2])
+                print(f"[mission] Home locked → ({cam[0]:.2f}, {cam[1]:.2f}, {cam[2]:.2f})")
 
             # If we were recovering, resume flying to target.
             if self._recovering:
@@ -418,6 +454,15 @@ class AutonomousMission:
                 if self.ctrl is not None:
                     x, y, z = self.fly_to
                     self.ctrl.set_target(x, y, z)
+            else:
+                # Stable hold with valid cam — prompt to return home.
+                home_str = (f"({self.home[0]:.2f}, {self.home[1]:.2f}, {self.home[2]:.2f})"
+                            if self.home else "origin")
+                self._queue_confirm(
+                    MissionPhase.RETURN_HOME,
+                    f"Holding at target.  Ready to return home {home_str}.",
+                    drone,
+                )
             return
 
         lost_for = now - self._last_cam_ts
@@ -429,6 +474,61 @@ class AutonomousMission:
             self._recovering = True
             print(
                 f"[mission] HOLD – cam lost for {lost_for:.1f} s, "
+                "stopping and yaw-searching for position markers"
+            )
+            if self.ctrl is not None:
+                self.ctrl.clear_target()
+            self._set_recovery_yaw_speed(drone)
+
+        self._send_recovery_yaw(drone)
+
+    def _tick_return_home(self, vision_result, now, drone=None):
+        cam = self._get_cam_pos(vision_result)
+
+        if cam is not None:
+            self._last_cam_ts = now
+
+            # If we were recovering, resume flying home.
+            if self._recovering:
+                self._recovering = False
+                print("[mission] Cam position regained – resuming RETURN_HOME")
+                self._begin_return_home(drone)
+
+            # Primary: controller HOVER phase signals arrival at home.
+            if self.ctrl is not None and hasattr(self.ctrl, "position_controller"):
+                from controller import Phase
+                if self.ctrl.position_controller.phase == Phase.HOVER:
+                    self._queue_confirm(
+                        MissionPhase.LANDING,
+                        "Returned home.  Ready to land.",
+                        drone,
+                    )
+                return
+
+            # Fallback: distance check.
+            if self.home is not None:
+                hx, hy, hz = self.home
+                dist = math.sqrt(
+                    (hx - cam[0])**2 + (hy - cam[1])**2 + (hz - cam[2])**2
+                )
+                if dist < HOLD_ARRIVE_RADIUS:
+                    self._queue_confirm(
+                        MissionPhase.LANDING,
+                        f"Returned home (dist={dist:.2f} m).  Ready to land.",
+                        drone,
+                    )
+            return
+
+        # No cam position — check if timeout exceeded.
+        lost_for = now - self._last_cam_ts
+        if lost_for < CAM_LOST_TIMEOUT_S:
+            return  # brief dropout, keep flying
+
+        # Timeout exceeded: enter/continue recovery yaw.
+        if not self._recovering:
+            self._recovering = True
+            print(
+                f"[mission] RETURN_HOME – cam lost for {lost_for:.1f} s, "
                 "stopping and yaw-searching for position markers"
             )
             if self.ctrl is not None:
@@ -496,6 +596,17 @@ class AutonomousMission:
         self._recovering = False
         if self.ctrl is not None:
             self.ctrl.set_target(x, y, z)
+
+    def _begin_return_home(self, drone) -> None:
+        if self.home is None:
+            print("[mission] RETURN_HOME – no home position recorded, staying in place")
+            return
+        hx, hy, hz = self.home
+        print(f"[mission] RETURN_HOME – heading to ({hx:.2f}, {hy:.2f}, {hz:.2f})")
+        self._last_cam_ts = time.monotonic()
+        self._recovering = False
+        if self.ctrl is not None:
+            self.ctrl.set_target(hx, hy, hz)
 
     def _set_recovery_yaw_speed(self, drone) -> None:
         """Set drone MaxRotationSpeed once when entering recovery so yaw PCMD is effective."""
