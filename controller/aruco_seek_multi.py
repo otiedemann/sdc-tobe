@@ -451,6 +451,32 @@ class DroneObserver:
         if target_id is not None and target_id in vid_all:
             chosen = target_id
         elif target_id is None:
+            # If the mission is actively driving a search maneuver, DO NOT
+            # auto-pick the largest visible marker — that would lock the
+            # observer into PD control on an already-scanned or
+            # unwanted marker and override the mission's rotation/move RC.
+            # The scenario: mission scans marker N, transitions to SEARCH/
+            # rotate, sets search_rc=(0,0,0,yaw). Without this guard, the
+            # observer sees marker N still in frame, picks it as 'chosen',
+            # and holds position on it — the drone never rotates.
+            with self._lock:
+                src = self._search_rc
+            if self.mode == "live" and any(v != 0 for v in src):
+                try:
+                    self._send_rc(*src)
+                    snapshot["rc_sent_at"] = round(t_now, 2)
+                    snapshot["search_rc"] = list(src)
+                    snapshot["marker_id"] = None
+                    snapshot["status_msg"] = (
+                        f"searching (overriding PD on visible markers) — "
+                        f"rc(lr={src[0]}, fb={src[1]}, ud={src[2]}, yaw={src[3]})"
+                    )
+                except Exception:
+                    pass
+                self._chosen_id = None
+                with self._lock:
+                    self.latest = snapshot
+                return
             chosen = max(vid_all.items(), key=lambda kv: kv[1].get("px_size", 0))[0]
         else:
             snapshot["marker_id"] = None
