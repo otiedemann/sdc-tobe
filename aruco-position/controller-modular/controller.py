@@ -65,7 +65,7 @@ YAW_ALIGN_SPEED_FACTOR: float  = 0.20  # fraction of max speed while rotating to
 MAX_STD_POS: float = 0.40   # m  (set to math.inf to disable)
 
 # Hard output clamp applied in send_pcmd_olympe before values reach the drone
-PCMD_MAX: int = 20           # absolute maximum RC value sent (-PCMD_MAX .. +PCMD_MAX)
+PCMD_MAX: int = 30           # absolute maximum RC value sent (-PCMD_MAX .. +PCMD_MAX)
 
 # Hysteresis: leave HOVER only if error grows beyond this
 HOVER_EXIT_RADIUS_XY: float = ARRIVE_RADIUS_XY * 2.0
@@ -375,12 +375,17 @@ def send_pcmd_olympe(drone, rc: dict) -> None:
         def _hard_clamp(v: int) -> int:
             return max(-PCMD_MAX, min(PCMD_MAX, v))
 
+        roll  = _hard_clamp(rc["left_right"])
+        pitch = _hard_clamp(rc["forward_back"])
+        yaw   = _hard_clamp(rc["yaw"])
+        gaz   = _hard_clamp(rc["up_down"])
+        print(f"[PCMD] roll={roll:+4d}  pitch={pitch:+4d}  yaw={yaw:+4d}  gaz={gaz:+4d}  seq={_pcmd_seq}", flush=True)
         drone(PCMD(
-            1,                                    # flag: 1 = active
-            _hard_clamp(rc["left_right"]),        # roll
-            _hard_clamp(rc["forward_back"]),      # pitch
-            _hard_clamp(rc["yaw"]),               # yaw
-            _hard_clamp(rc["up_down"]),           # gaz
+            1,      # flag: 1 = active
+            roll,   # roll
+            pitch,  # pitch
+            yaw,    # yaw
+            gaz,    # gaz
             _pcmd_seq,
         ))
     except Exception as exc:

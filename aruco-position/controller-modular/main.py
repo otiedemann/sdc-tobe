@@ -824,7 +824,7 @@ def main():
     MANUAL_SPEED    = 30    # % stick for manual W/A/S/D/Q/E override
     MANUAL_TIMEOUT  = 0.15  # s: auto-stop when key not pressed for this long
     _manual_rc_lock = threading.Lock()
-    _manual_rc      = {"forward_back": 0, "left_right": 0, "yaw": 0}
+    _manual_rc      = {"forward_back": 0, "left_right": 0, "yaw": 0, "up_down": 0}
     _manual_rc_time = 0.0
 
     # Save terminal state at main-thread level so we can restore it even if
@@ -864,27 +864,35 @@ def main():
                             _confirm_flag.set()
                         elif ch in (b'w', b'W'):
                             with _manual_rc_lock:
-                                _manual_rc.update({"forward_back": MANUAL_SPEED, "left_right": 0, "yaw": 0})
+                                _manual_rc.update({"forward_back": MANUAL_SPEED, "left_right": 0, "yaw": 0, "up_down": 0})
                             _manual_rc_time = time.monotonic()
                         elif ch in (b's', b'S'):
                             with _manual_rc_lock:
-                                _manual_rc.update({"forward_back": -MANUAL_SPEED, "left_right": 0, "yaw": 0})
+                                _manual_rc.update({"forward_back": -MANUAL_SPEED, "left_right": 0, "yaw": 0, "up_down": 0})
                             _manual_rc_time = time.monotonic()
                         elif ch in (b'a', b'A'):
                             with _manual_rc_lock:
-                                _manual_rc.update({"forward_back": 0, "left_right": -MANUAL_SPEED, "yaw": 0})
+                                _manual_rc.update({"forward_back": 0, "left_right": -MANUAL_SPEED, "yaw": 0, "up_down": 0})
                             _manual_rc_time = time.monotonic()
                         elif ch in (b'd', b'D'):
                             with _manual_rc_lock:
-                                _manual_rc.update({"forward_back": 0, "left_right": MANUAL_SPEED, "yaw": 0})
+                                _manual_rc.update({"forward_back": 0, "left_right": MANUAL_SPEED, "yaw": 0, "up_down": 0})
                             _manual_rc_time = time.monotonic()
                         elif ch in (b'q', b'Q'):
                             with _manual_rc_lock:
-                                _manual_rc.update({"forward_back": 0, "left_right": 0, "yaw": -MANUAL_SPEED})
+                                _manual_rc.update({"forward_back": 0, "left_right": 0, "yaw": -MANUAL_SPEED, "up_down": 0})
                             _manual_rc_time = time.monotonic()
                         elif ch in (b'e', b'E'):
                             with _manual_rc_lock:
-                                _manual_rc.update({"forward_back": 0, "left_right": 0, "yaw": MANUAL_SPEED})
+                                _manual_rc.update({"forward_back": 0, "left_right": 0, "yaw": MANUAL_SPEED, "up_down": 0})
+                            _manual_rc_time = time.monotonic()
+                        elif ch in (b'r', b'R'):
+                            with _manual_rc_lock:
+                                _manual_rc.update({"forward_back": 0, "left_right": 0, "yaw": 0, "up_down": MANUAL_SPEED})
+                            _manual_rc_time = time.monotonic()
+                        elif ch in (b'f', b'F'):
+                            with _manual_rc_lock:
+                                _manual_rc.update({"forward_back": 0, "left_right": 0, "yaw": 0, "up_down": -MANUAL_SPEED})
                             _manual_rc_time = time.monotonic()
                     time.sleep(0.05)
             else:
@@ -915,27 +923,35 @@ def main():
                                 _confirm_flag.set()
                             elif ch in (b'w', b'W'):
                                 with _manual_rc_lock:
-                                    _manual_rc.update({"forward_back": MANUAL_SPEED, "left_right": 0, "yaw": 0})
+                                    _manual_rc.update({"forward_back": MANUAL_SPEED, "left_right": 0, "yaw": 0, "up_down": 0})
                                 _manual_rc_time = time.monotonic()
                             elif ch in (b's', b'S'):
                                 with _manual_rc_lock:
-                                    _manual_rc.update({"forward_back": -MANUAL_SPEED, "left_right": 0, "yaw": 0})
+                                    _manual_rc.update({"forward_back": -MANUAL_SPEED, "left_right": 0, "yaw": 0, "up_down": 0})
                                 _manual_rc_time = time.monotonic()
                             elif ch in (b'a', b'A'):
                                 with _manual_rc_lock:
-                                    _manual_rc.update({"forward_back": 0, "left_right": -MANUAL_SPEED, "yaw": 0})
+                                    _manual_rc.update({"forward_back": 0, "left_right": -MANUAL_SPEED, "yaw": 0, "up_down": 0})
                                 _manual_rc_time = time.monotonic()
                             elif ch in (b'd', b'D'):
                                 with _manual_rc_lock:
-                                    _manual_rc.update({"forward_back": 0, "left_right": MANUAL_SPEED, "yaw": 0})
+                                    _manual_rc.update({"forward_back": 0, "left_right": MANUAL_SPEED, "yaw": 0, "up_down": 0})
                                 _manual_rc_time = time.monotonic()
                             elif ch in (b'q', b'Q'):
                                 with _manual_rc_lock:
-                                    _manual_rc.update({"forward_back": 0, "left_right": 0, "yaw": -MANUAL_SPEED})
+                                    _manual_rc.update({"forward_back": 0, "left_right": 0, "yaw": -MANUAL_SPEED, "up_down": 0})
                                 _manual_rc_time = time.monotonic()
                             elif ch in (b'e', b'E'):
                                 with _manual_rc_lock:
-                                    _manual_rc.update({"forward_back": 0, "left_right": 0, "yaw": MANUAL_SPEED})
+                                    _manual_rc.update({"forward_back": 0, "left_right": 0, "yaw": MANUAL_SPEED, "up_down": 0})
+                                _manual_rc_time = time.monotonic()
+                            elif ch in (b'r', b'R'):
+                                with _manual_rc_lock:
+                                    _manual_rc.update({"forward_back": 0, "left_right": 0, "yaw": 0, "up_down": MANUAL_SPEED})
+                                _manual_rc_time = time.monotonic()
+                            elif ch in (b'f', b'F'):
+                                with _manual_rc_lock:
+                                    _manual_rc.update({"forward_back": 0, "left_right": 0, "yaw": 0, "up_down": -MANUAL_SPEED})
                                 _manual_rc_time = time.monotonic()
                 except Exception as _kb_err:
                     print(f"[keyboard] Not available: {_kb_err}")
@@ -1162,10 +1178,10 @@ def main():
                     }
 
             _manual_active = (time.monotonic() - _manual_rc_time < MANUAL_TIMEOUT)
-            if _manual_active:
-                print(f"[debug] manual_active=True  ctrl={ctrl_module is not None}  "
-                      f"ctrl_state={_ctrl_state is not None}  drone={anafi_drone is not None}  "
-                      f"dry={mission_dry_run}  age={time.monotonic()-_manual_rc_time:.3f}s", flush=True)
+            # if _manual_active:
+            #     print(f"[debug] manual_active=True  ctrl={ctrl_module is not None}  "
+            #           f"ctrl_state={_ctrl_state is not None}  drone={anafi_drone is not None}  "
+            #           f"dry={mission_dry_run}  age={time.monotonic()-_manual_rc_time:.3f}s", flush=True)
 
             if _manual_active and anafi_drone is not None and not mission_dry_run:
                 # Manual RC takes priority over autonomous controller
@@ -1173,10 +1189,9 @@ def main():
                     _mrc = {
                         "forward_back": _manual_rc["forward_back"],
                         "left_right":   _manual_rc["left_right"],
-                        "up_down":      0,
+                        "up_down":      _manual_rc["up_down"],
                         "yaw":          _manual_rc["yaw"],
                     }
-                print(f"[manual] SEND fb={_mrc['forward_back']} lr={_mrc['left_right']} yaw={_mrc['yaw']}", flush=True)
                 if ctrl_module is not None:
                     ctrl_module.send_pcmd_olympe(anafi_drone, _mrc)
                 else:
@@ -1474,28 +1489,35 @@ def main():
                         _confirm_flag.set()
                     elif key in (ord('w'), ord('W')):
                         with _manual_rc_lock:
-                            _manual_rc.update({"forward_back": MANUAL_SPEED, "left_right": 0, "yaw": 0})
+                            _manual_rc.update({"forward_back": MANUAL_SPEED, "left_right": 0, "yaw": 0, "up_down": 0})
                         _manual_rc_time = time.monotonic()
-                        print(f"[manual] W forward_back={MANUAL_SPEED}", flush=True)
                     elif key in (ord('s'), ord('S')):
                         with _manual_rc_lock:
-                            _manual_rc.update({"forward_back": -MANUAL_SPEED, "left_right": 0, "yaw": 0})
+                            _manual_rc.update({"forward_back": -MANUAL_SPEED, "left_right": 0, "yaw": 0, "up_down": 0})
                         _manual_rc_time = time.monotonic()
                     elif key in (ord('a'), ord('A')):
                         with _manual_rc_lock:
-                            _manual_rc.update({"forward_back": 0, "left_right": -MANUAL_SPEED, "yaw": 0})
+                            _manual_rc.update({"forward_back": 0, "left_right": -MANUAL_SPEED, "yaw": 0, "up_down": 0})
                         _manual_rc_time = time.monotonic()
                     elif key in (ord('d'), ord('D')):
                         with _manual_rc_lock:
-                            _manual_rc.update({"forward_back": 0, "left_right": MANUAL_SPEED, "yaw": 0})
+                            _manual_rc.update({"forward_back": 0, "left_right": MANUAL_SPEED, "yaw": 0, "up_down": 0})
                         _manual_rc_time = time.monotonic()
                     elif key in (ord('q'), ord('Q')):
                         with _manual_rc_lock:
-                            _manual_rc.update({"forward_back": 0, "left_right": 0, "yaw": -MANUAL_SPEED})
+                            _manual_rc.update({"forward_back": 0, "left_right": 0, "yaw": -MANUAL_SPEED, "up_down": 0})
                         _manual_rc_time = time.monotonic()
                     elif key in (ord('e'), ord('E')):
                         with _manual_rc_lock:
-                            _manual_rc.update({"forward_back": 0, "left_right": 0, "yaw": MANUAL_SPEED})
+                            _manual_rc.update({"forward_back": 0, "left_right": 0, "yaw": MANUAL_SPEED, "up_down": 0})
+                        _manual_rc_time = time.monotonic()
+                    elif key in (ord('r'), ord('R')):
+                        with _manual_rc_lock:
+                            _manual_rc.update({"forward_back": 0, "left_right": 0, "yaw": 0, "up_down": MANUAL_SPEED})
+                        _manual_rc_time = time.monotonic()
+                    elif key in (ord('f'), ord('F')):
+                        with _manual_rc_lock:
+                            _manual_rc.update({"forward_back": 0, "left_right": 0, "yaw": 0, "up_down": -MANUAL_SPEED})
                         _manual_rc_time = time.monotonic()
                 except cv2.error:
                     gui_available = False
