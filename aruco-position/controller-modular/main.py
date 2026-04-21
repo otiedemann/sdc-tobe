@@ -33,6 +33,7 @@ CAMERA_SOURCE = 0
 HEARTBEAT_INTERVAL = 1.0  # Sekunden: Status senden auch ohne Marker
 TARGET_Z_POS = -1.5  # fixed target height position (internal Z axis)
 MARKER_SIZE = 0.5
+DRY_RUN = False  # True: log RC/commands but send nothing to drone, no takeoff
 
 # Pose robustness settings
 MIN_REF_WEIGHT = 0.00  # Ignore very weak refs, but keep detection usable
@@ -55,10 +56,7 @@ try:
 except Exception:
     input_module = None
 
-try:
-    import controller as ctrl_module
-except Exception:
-    ctrl_module = None
+import controller as ctrl_module
 
 # Suppress olympe / arsdk / pdraw log noise (H264/AVCC decoder warnings, etc.)
 logging.getLogger("olympe").setLevel(logging.CRITICAL)
@@ -151,46 +149,29 @@ def has_gui():
 # Autonomous Mission
 # ============================================================
 
-TARGET_MARKER_ID = 15          # ArUco marker to find and approach
-APPROACH_DISTANCE = 5.0        # metres to hover in front of the marker face
 TAKEOFF_HEIGHT_Z = 1.2         # world-frame Z (up) to wait for after takeoff
 TAKEOFF_TIMEOUT_S = 15.0       # abort takeoff after this many seconds
-SEARCH_YAW_RATE = 0.1          # rad/s slow rotation during search
-SEARCH_MAX_YAW_SPEED = 150     # °/s – MaxRotationSpeed sent to drone before search PCMD
 HOLD_ARRIVE_RADIUS = 0.25      # m – radius at which HOLD is declared
-MARKER_LOST_TIMEOUT_S = 3.0    # seconds without seeing target before falling back to SEARCH
-
-# Inward wall normals matching arena_config.json:
-#   front wall  at y= 0  → normal +Y
-#   back  wall  at y=10  → normal -Y
-#   right wall  at x=10  → normal -X
-#   left  wall  at x=-10 → normal +X
-_WALL_NORMALS = {
-    "front":  np.array([ 0.0,  1.0, 0.0]),
-    "back":   np.array([ 0.0, -1.0, 0.0]),
-    "left":   np.array([ 1.0,  0.0, 0.0]),
-    "right":  np.array([-1.0,  0.0, 0.0]),
-}
+CAM_LOST_TIMEOUT_S = 2.0       # seconds without cam position before entering recovery yaw
+RECOVERY_YAW_RATE = 0.1        # rad/s slow yaw rotation during recovery
+RECOVERY_MAX_YAW_SPEED = 150   # °/s – MaxRotationSpeed sent to drone before recovery PCMD
 
 
 class MissionPhase:
-    IDLE     = "idle"
-    TAKEOFF  = "takeoff"
-    SEARCH   = "search"
-    APPROACH = "approach"
-    HOLD     = "hold"
-    FAILED   = "failed"
-    ABORTED  = "aborted"
+    IDLE    = "idle"
+    TAKEOFF = "takeoff"
+    FLY_TO  = "fly_to"
+    HOLD    = "hold"
+    FAILED  = "failed"
+    ABORTED = "aborted"
 
 
 class AutonomousMission:
     """
     State machine that:
       1. Commands the drone to take off.
-      2. Slowly rotates (SEARCH) until ArUco marker <target_marker_id> is seen.
-      3. Flies to <approach_distance> metres in front of the marker at a
-         90-degree angle (perpendicular to the marker face).
-      4. Holds position indefinitely.
+      2. Flies to a given (x, y, z) world-frame coordinate.
+      3. Holds position indefinitely.
 
     Integration in main.py
     ----------------------
@@ -199,22 +180,18 @@ class AutonomousMission:
         mission.tick(last_prediction, last_vision_update, anafi_drone)
 
     The mission drives ctrl_module.set_target() internally and sends
-    Olympe TakeOff / PCMD commands through the drone handle.
+    Olympe TakeOff commands through the drone handle.
     """
 
     def __init__(
         self,
-        target_marker_id: int,
-        approach_distance: float,
-        vision_processor,               # HeadlessAruCoPositioning instance
+        fly_to: tuple,                  # (x, y, z) world-frame target coordinate
         ctrl_module,                    # controller module (may be None)
         takeoff_height_z: float = TAKEOFF_HEIGHT_Z,
         dry_run: bool = False,          # log RC/commands, send nothing to drone
         auto_confirm: bool = False,     # skip SPACE confirmations, advance automatically
     ) -> None:
-        self.target_id        = target_marker_id
-        self.approach_dist    = approach_distance
-        self.vision           = vision_processor
+        self.fly_to           = fly_to  # (x, y, z)
         self.ctrl             = ctrl_module
         self.takeoff_height_z = takeoff_height_z
         self.dry_run          = dry_run
@@ -222,11 +199,13 @@ class AutonomousMission:
 
         self._phase: str               = MissionPhase.IDLE
         self._phase_start: float       = 0.0
-        self._approach_target: Optional[tuple] = None  # (x, y, z, yaw)
-        self._last_seen_ts: float      = 0.0
-        self._search_yaw_sent: bool    = False
         self._pending_phase: Optional[str] = None   # next phase awaiting SPACE confirm
         self._pending_prompt: str      = ""          # message shown while waiting
+
+        # FLY_TO recovery state
+        self._last_cam_ts: float       = 0.0         # monotonic timestamp of last valid cam pos
+        self._recovering: bool         = False        # True while yaw-searching for markers
+        self._recovery_seq: int        = 0            # PCMD sequence counter during recovery
 
     # ------------------------------------------------------------------ #
     # Public                                                               #
@@ -236,11 +215,12 @@ class AutonomousMission:
         """Call once to kick off the mission (issues TakeOff)."""
         if self._phase != MissionPhase.IDLE:
             return
-        print(f"[mission] Starting – target marker {self.target_id}")
+        x, y, z = self.fly_to
+        print(f"[mission] Starting – fly to ({x:.2f}, {y:.2f}, {z:.2f})")
         if self.dry_run:
-            print("[DRY RUN] Takeoff skipped – jumping straight to SEARCH")
-            self._begin_search(drone)
-            self._transition(MissionPhase.SEARCH)
+            print("[DRY RUN] Takeoff skipped – jumping straight to FLY_TO")
+            self._begin_fly_to(drone)
+            self._transition(MissionPhase.FLY_TO)
             return
         self._transition(MissionPhase.TAKEOFF)
         self._send_takeoff(drone)
@@ -264,14 +244,23 @@ class AutonomousMission:
             return
         phase = self._pending_phase
         # Kick off phase-specific actions before the transition.
-        if phase == MissionPhase.SEARCH:
-            self._begin_search(drone)
-        elif phase == MissionPhase.APPROACH and self._approach_target is not None:
-            x, y, z, yaw = self._approach_target
-            if self.ctrl is not None:
-                self.ctrl.set_target(x, y, z, hold_yaw=yaw)
+        if phase == MissionPhase.FLY_TO:
+            self._begin_fly_to(drone)
         print(f"[mission] Confirmed → {phase}")
         self._transition(phase)
+
+    def cancel(self) -> None:
+        """
+        Manual override: stop the mission and clear controller target without
+        sending any flight command.  The drone will simply hover in place.
+        Safe to call from any thread.
+        """
+        if self._phase in (MissionPhase.IDLE, MissionPhase.ABORTED):
+            return
+        print("\n[mission] CANCELLED – manual override, hovering")
+        self._transition(MissionPhase.ABORTED)
+        if self.ctrl is not None:
+            self.ctrl.clear_target()
 
     def abort(self, drone) -> None:
         """
@@ -319,14 +308,11 @@ class AutonomousMission:
         if self._phase == MissionPhase.TAKEOFF:
             self._tick_takeoff(vision_result, state, now, drone)
 
-        elif self._phase == MissionPhase.SEARCH:
-            self._tick_search(vision_result, now, drone)
-
-        elif self._phase == MissionPhase.APPROACH:
-            self._tick_approach(vision_result, now, drone)
+        elif self._phase == MissionPhase.FLY_TO:
+            self._tick_fly_to(vision_result, now, drone)
 
         elif self._phase == MissionPhase.HOLD:
-            self._tick_hold(vision_result, now, drone)
+            self._tick_hold(now)
 
     # ------------------------------------------------------------------ #
     # Phase handlers                                                       #
@@ -350,65 +336,40 @@ class AutonomousMission:
             return
 
         if flying_str in ("hovering", "flying"):
+            x, y, z = self.fly_to
             self._queue_confirm(
-                MissionPhase.SEARCH,
-                f"Airborne – flying state={flying_str}.  Ready to start SEARCH.",
+                MissionPhase.FLY_TO,
+                f"Airborne – flying state={flying_str}.  "
+                f"Ready to fly to ({x:.2f}, {y:.2f}, {z:.2f}).",
                 drone,
             )
 
-    def _tick_search(self, vision_result, now, drone):
-        seen = self._seen_markers(vision_result)
-        if self.target_id in seen:
-            approach = self._compute_approach(vision_result)
-            if approach is not None:
-                self._approach_target = approach
-                x, y, z, yaw = approach
-                self._queue_confirm(
-                    MissionPhase.APPROACH,
-                    f"Marker {self.target_id} found – "
-                    f"approach → ({x:.2f}, {y:.2f}, {z:.2f})  "
-                    f"yaw={math.degrees(yaw):.1f}°.  Ready to APPROACH.",
-                    drone,
-                )
+    def _tick_fly_to(self, vision_result, now, drone=None):
+        cam = self._get_cam_pos(vision_result)
+
+        if cam is not None:
+            # Position visible — update timestamp.
+            self._last_cam_ts = now
+
+            # If we were recovering, resume flying to target.
+            if self._recovering:
+                self._recovering = False
+                print("[mission] Cam position regained – resuming FLY_TO")
+                self._begin_fly_to(drone)
+
+            # Primary: controller HOVER phase signals arrival.
+            if self.ctrl is not None and hasattr(self.ctrl, "position_controller"):
+                from controller import Phase
+                if self.ctrl.position_controller.phase == Phase.HOVER:
+                    self._queue_confirm(
+                        MissionPhase.HOLD,
+                        "Arrived at target coordinate.  Ready to HOLD.",
+                        drone,
+                    )
                 return
 
-        # Rotate in place: pure yaw PCMD only — no position controller target.
-        if drone is not None:
-            self._send_search_yaw(drone)
-
-    def _tick_approach(self, vision_result, now, drone=None):
-        if self._approach_target is None:
-            self._transition(MissionPhase.SEARCH)
-            return
-
-        seen = self._seen_markers(vision_result)
-        if self.target_id in seen:
-            self._last_seen_ts = now
-        elif now - self._last_seen_ts > MARKER_LOST_TIMEOUT_S:
-            print(
-                f"[mission] APPROACH – marker {self.target_id} lost for "
-                f"{now - self._last_seen_ts:.1f} s, falling back to SEARCH"
-            )
-            self._approach_target = None
-            self._begin_search(drone)
-            self._transition(MissionPhase.SEARCH)
-            return
-
-        # Primary: controller HOVER phase
-        if self.ctrl is not None and hasattr(self.ctrl, "position_controller"):
-            from controller import Phase
-            if self.ctrl.position_controller.phase == Phase.HOVER:
-                self._queue_confirm(
-                    MissionPhase.HOLD,
-                    "Arrived at approach point.  Ready to HOLD.",
-                    drone,
-                )
-            return
-
-        # Fallback: distance check using cam position
-        cam = self._get_cam_pos(vision_result)
-        if cam is not None and self._approach_target is not None:
-            tx, ty, tz, _ = self._approach_target
+            # Fallback: distance check.
+            tx, ty, tz = self.fly_to
             dist = math.sqrt((tx - cam[0])**2 + (ty - cam[1])**2 + (tz - cam[2])**2)
             if dist < HOLD_ARRIVE_RADIUS:
                 self._queue_confirm(
@@ -416,19 +377,28 @@ class AutonomousMission:
                     f"Arrived (cam dist={dist:.2f} m).  Ready to HOLD.",
                     drone,
                 )
+            return
 
-    def _tick_hold(self, vision_result, now, drone=None):
-        seen = self._seen_markers(vision_result)
-        if self.target_id in seen:
-            self._last_seen_ts = now
-        elif now - self._last_seen_ts > MARKER_LOST_TIMEOUT_S:
+        # No cam position — check if timeout exceeded.
+        lost_for = now - self._last_cam_ts
+        if lost_for < CAM_LOST_TIMEOUT_S:
+            return  # brief dropout, keep flying
+
+        # Timeout exceeded: enter/continue recovery yaw.
+        if not self._recovering:
+            self._recovering = True
             print(
-                f"[mission] HOLD – marker {self.target_id} lost for "
-                f"{now - self._last_seen_ts:.1f} s, falling back to SEARCH"
+                f"[mission] FLY_TO – cam lost for {lost_for:.1f} s, "
+                "stopping and yaw-searching for position markers"
             )
-            self._approach_target = None
-            self._begin_search(drone)
-            self._transition(MissionPhase.SEARCH)
+            if self.ctrl is not None:
+                self.ctrl.clear_target()
+            self._set_recovery_yaw_speed(drone)
+
+        self._send_recovery_yaw(drone)
+
+    def _tick_hold(self, now):
+        pass  # Hold position indefinitely; controller keeps target active
 
     # ------------------------------------------------------------------ #
     # Helpers                                                              #
@@ -472,20 +442,6 @@ class AutonomousMission:
         except Exception as exc:
             print(f"[mission] TakeOff failed: {exc}")
 
-    _search_seq: int = 0   # class-level PCMD sequence counter for search
-
-    def _send_search_yaw(self, drone) -> None:
-        """Send a pure yaw PCMD — zero roll, pitch, and gaz — to rotate in place."""
-        if self.dry_run:
-            return   # drone is moved by hand; no PCMD
-        try:
-            from olympe.messages.ardrone3.Piloting import PCMD
-            AutonomousMission._search_seq = (AutonomousMission._search_seq + 1) & 0x7FFFFFFF
-            yaw_pct = int(SEARCH_YAW_RATE / 0.8 * 100)  # scale: 0.8 rad/s → 100 %
-            drone(PCMD(0, 0, 0, yaw_pct, 0, AutonomousMission._search_seq))
-        except Exception:
-            pass
-
     @staticmethod
     def _get_cam_pos(vision_result: Optional[dict]) -> Optional[list]:
         """Return [x, y, z] from vision_result['cam'], or None if unavailable."""
@@ -496,104 +452,35 @@ class AutonomousMission:
             return None
         return [float(cam[0]), float(cam[1]), float(cam[2])]
 
-    @staticmethod
-    def _seen_markers(vision_result: Optional[dict]):
-        if vision_result is None:
-            return set()
-        return set(int(m) for m in vision_result.get("seen_markers", []))
-
-    def _begin_search(self, drone) -> None:
-        print(f"[mission] SEARCH – yaw-rotating to find marker {self.target_id}")
-        # Clear any active controller target so the position controller outputs
-        # nothing and the pure-yaw PCMD is the only command sent to the drone.
+    def _begin_fly_to(self, drone) -> None:
+        x, y, z = self.fly_to
+        print(f"[mission] FLY_TO – heading to ({x:.2f}, {y:.2f}, {z:.2f})")
+        self._last_cam_ts = time.monotonic()  # reset so timeout doesn't fire immediately
+        self._recovering = False
         if self.ctrl is not None:
-            self.ctrl.clear_target()
-        # Ensure the drone's MaxRotationSpeed is set high enough that the
-        # PCMD yaw percentage actually produces fast turns.  The factory
-        # default is typically 10–30 °/s, which makes even 70 % feel slow.
-        if drone is not None and not self.dry_run:
-            try:
-                from olympe.messages.ardrone3.SpeedSettings import MaxRotationSpeed
-                drone(MaxRotationSpeed(SEARCH_MAX_YAW_SPEED))
-                print(f"[mission] MaxRotationSpeed set to {SEARCH_MAX_YAW_SPEED} °/s")
-            except Exception as exc:
-                print(f"[mission] Could not set MaxRotationSpeed: {exc}")
+            self.ctrl.set_target(x, y, z)
 
-    def _compute_approach(self, vision_result: Optional[dict]) -> Optional[tuple]:
-        """
-        Return (x, y, z, yaw) for hovering APPROACH_DISTANCE metres straight in
-        front of the target marker face.
+    def _set_recovery_yaw_speed(self, drone) -> None:
+        """Set drone MaxRotationSpeed once when entering recovery so yaw PCMD is effective."""
+        if drone is None or self.dry_run:
+            return
+        try:
+            from olympe.messages.ardrone3.SpeedSettings import MaxRotationSpeed
+            drone(MaxRotationSpeed(RECOVERY_MAX_YAW_SPEED))
+        except Exception:
+            pass
 
-        Primary: uses the marker's known world-frame position (from arena config)
-        and the wall's inward normal to place the hover point perpendicular to the
-        marker face.  Drone yaw is set so it faces toward the marker.
-
-        Fallback (no arena data): fly forward from current cam position along the
-        camera's forward direction (original behaviour).
-        """
-        # -- primary: marker world position from arena config --
-        marker_pos = None
-        wall_type  = None
-        if self.vision is not None:
-            mp = getattr(self.vision, "marker_positions", {})
-            wt = getattr(self.vision, "marker_wall_type", {})
-            if self.target_id in mp:
-                marker_pos = mp[self.target_id]
-                wall_type  = wt.get(self.target_id)
-
-        if marker_pos is not None:
-            # Inward wall normal (points from the wall face into the arena).
-            normal = _WALL_NORMALS.get(wall_type, np.array([1.0, 0.0, 0.0]))
-            nx, ny = float(normal[0]), float(normal[1])
-
-            # Hover point: step approach_dist along the inward normal from the marker.
-            target_x = float(marker_pos[0]) + nx * self.approach_dist
-            target_y = float(marker_pos[1]) + ny * self.approach_dist
-            target_z = float(marker_pos[2])   # keep marker's world height
-
-            # Drone yaw: face back toward the marker (opposite of inward normal).
-            yaw = math.atan2(-ny, -nx)
-
-            print(
-                f"[mission] Approach: marker {self.target_id} at "
-                f"({marker_pos[0]:.2f}, {marker_pos[1]:.2f}, {marker_pos[2]:.2f})  "
-                f"wall={wall_type} normal=({nx:+.2f},{ny:+.2f})  "
-                f"hover → ({target_x:.2f}, {target_y:.2f}, {target_z:.2f})  "
-                f"yaw={math.degrees(yaw):.1f}°"
-            )
-            return (float(target_x), float(target_y), float(target_z), float(yaw))
-
-        # -- fallback: no arena config data available --
-        cam = self._get_cam_pos(vision_result)
-        if cam is None:
-            print("[mission] No cam position available – cannot compute approach")
-            return None
-
-        raw_dir = vision_result.get("dir") if vision_result is not None else None
-        if raw_dir is not None and len(raw_dir) >= 2:
-            dx, dy = float(raw_dir[0]), float(raw_dir[1])
-        else:
-            dx, dy = 1.0, 0.0
-
-        mag = math.sqrt(dx * dx + dy * dy)
-        if mag < 1e-6:
-            dx, dy = 1.0, 0.0
-        else:
-            dx, dy = dx / mag, dy / mag
-
-        target_x = cam[0] + dx * self.approach_dist
-        target_y = cam[1] + dy * self.approach_dist
-        target_z = cam[2]
-        yaw      = math.atan2(dy, dx)
-
-        print(
-            f"[mission] Approach (fallback – no arena config): "
-            f"fly {self.approach_dist} m forward from cam "
-            f"({cam[0]:.2f}, {cam[1]:.2f}, {cam[2]:.2f})  "
-            f"dir=({dx:+.2f}, {dy:+.2f})  "
-            f"→ ({target_x:.2f}, {target_y:.2f}, {target_z:.2f})"
-        )
-        return (float(target_x), float(target_y), float(target_z), float(yaw))
+    def _send_recovery_yaw(self, drone) -> None:
+        """Send a pure yaw PCMD — zero roll, pitch, gaz — to rotate in place."""
+        if drone is None or self.dry_run:
+            return
+        try:
+            from olympe.messages.ardrone3.Piloting import PCMD
+            self._recovery_seq = (self._recovery_seq + 1) & 0x7FFFFFFF
+            yaw_pct = int(RECOVERY_YAW_RATE / 0.8 * 100)  # 0.8 rad/s → 100 %
+            drone(PCMD(0, 0, 0, yaw_pct, 0, self._recovery_seq))
+        except Exception:
+            pass
 
 
 # ============================================================
@@ -679,14 +566,25 @@ def main():
     enable_motion_input = "--motion-input" in sys.argv
 
     mission_enabled  = "--mission" in sys.argv
-    mission_dry_run  = "--dry-run" in sys.argv
+    mission_dry_run  = DRY_RUN or "--dry-run" in sys.argv
     mission_auto_confirm = "--yes" in sys.argv or "-y" in sys.argv
-    mission_marker_id = TARGET_MARKER_ID
-    if "--mission-marker" in sys.argv:
+    mission_fly_to: Optional[tuple] = None
+    if "--fly-to" in sys.argv:
         try:
-            mission_marker_id = int(sys.argv[sys.argv.index("--mission-marker") + 1])
+            raw = sys.argv[sys.argv.index("--fly-to") + 1]
+            parts = [float(v) for v in raw.split(",")]
+            if len(parts) == 3:
+                mission_fly_to = (parts[0], parts[1], parts[2])
+            else:
+                print("❌ --fly-to expects x,y,z  e.g. --fly-to 3.0,2.0,1.5")
+                sys.exit(1)
         except Exception:
-            print("⚠️ Invalid --mission-marker value, using default.")
+            print("❌ Invalid --fly-to value.  Expected x,y,z  e.g. --fly-to 3.0,2.0,1.5")
+            sys.exit(1)
+
+    if mission_enabled and mission_fly_to is None:
+        print("❌ --mission requires --fly-to x,y,z  e.g.:  python main.py --mission --fly-to 3.0,2.0,1.5")
+        sys.exit(1)
 
     # --ctrl-target x,y,z   e.g. --ctrl-target 3.0,1.5,1.2
     ctrl_target: Optional[tuple] = None
@@ -732,7 +630,8 @@ def main():
     print(f"🎯 Ctrl Target: {ctrl_target if ctrl_target else 'none'}")
     print(f"🖥️ Preview Requested: {'YES' if preview_requested else 'NO'}")
     print(f"🖥️ GUI Overlay: {'ON' if gui_enabled else 'OFF'}")
-    print(f"🎯 Autonomous Mission: {'ON (marker ' + str(mission_marker_id) + ')' if mission_enabled else 'OFF'}")
+    fly_to_str = f"({mission_fly_to[0]:.2f}, {mission_fly_to[1]:.2f}, {mission_fly_to[2]:.2f})" if mission_fly_to else "not set"
+    print(f"🎯 Autonomous Mission: {'ON fly-to ' + fly_to_str if mission_enabled else 'OFF'}")
     if mission_dry_run:
         print("🧪 DRY RUN – no commands sent to drone; move it by hand")
 
@@ -777,9 +676,7 @@ def main():
     mission: Optional[AutonomousMission] = None
     if mission_enabled:
         mission = AutonomousMission(
-            target_marker_id=mission_marker_id,
-            approach_distance=APPROACH_DISTANCE,
-            vision_processor=vision_processor,
+            fly_to=mission_fly_to,
             ctrl_module=ctrl_module,
             takeoff_height_z=abs(target_z_pos),   # use configured flight height
             dry_run=mission_dry_run,
@@ -850,7 +747,8 @@ def main():
             motion_listener.subscribe()
 
         anafi_drone.connect()
-
+        from olympe.messages.ardrone3.SpeedSettings import MaxRotationSpeed
+        anafi_drone(MaxRotationSpeed(150))
 
         def _anafi_frame_cb(yuv_frame):
             try:
@@ -907,7 +805,7 @@ def main():
         time.sleep(0.2)
         print("✅ Anafi videostream active")
 
-        if ctrl_target is not None and ctrl_module is not None:
+        if ctrl_target is not None:
             ctrl_module.set_target(*ctrl_target)
 
         if mission is not None:
@@ -933,6 +831,12 @@ def main():
     _abort_flag   = threading.Event()
     _confirm_flag = threading.Event()
 
+    MANUAL_SPEED    = 30    # % stick for manual W/A/S/D/Q/E override
+    MANUAL_TIMEOUT  = 0.15  # s: auto-stop when key not pressed for this long
+    _manual_rc_lock = threading.Lock()
+    _manual_rc      = {"forward_back": 0, "left_right": 0, "yaw": 0, "up_down": 0}
+    _manual_rc_time = 0.0
+
     # Save terminal state at main-thread level so we can restore it even if
     # the keyboard thread is killed before its own finally block runs.
     _saved_term = None
@@ -954,47 +858,126 @@ def main():
         then restores the saved settings on exit.  The main finally block
         also restores settings as a guaranteed backstop.
         """
+        nonlocal _manual_rc_time
         try:
             if platform.system().lower() == "windows":
                 import msvcrt
                 while not _abort_flag.is_set():
                     if msvcrt.kbhit():
                         ch = msvcrt.getch()
-                        if ch in (b'\x1b', b'q', b'Q'):
-                            print("\n[abort] ESC / q detected in terminal")
+                        if ch == b'\x1b':
+                            print("\n[abort] ESC detected in terminal")
                             _abort_flag.set()
                             return
-                        if ch == b' ':
+                        elif ch == b' ':
                             print("\n[mission] SPACE – confirm")
                             _confirm_flag.set()
+                        elif ch in (b'w', b'W'):
+                            with _manual_rc_lock:
+                                _manual_rc.update({"forward_back": MANUAL_SPEED, "left_right": 0, "yaw": 0, "up_down": 0})
+                            _manual_rc_time = time.monotonic()
+                        elif ch in (b's', b'S'):
+                            with _manual_rc_lock:
+                                _manual_rc.update({"forward_back": -MANUAL_SPEED, "left_right": 0, "yaw": 0, "up_down": 0})
+                            _manual_rc_time = time.monotonic()
+                        elif ch in (b'a', b'A'):
+                            with _manual_rc_lock:
+                                _manual_rc.update({"forward_back": 0, "left_right": -MANUAL_SPEED, "yaw": 0, "up_down": 0})
+                            _manual_rc_time = time.monotonic()
+                        elif ch in (b'd', b'D'):
+                            with _manual_rc_lock:
+                                _manual_rc.update({"forward_back": 0, "left_right": MANUAL_SPEED, "yaw": 0, "up_down": 0})
+                            _manual_rc_time = time.monotonic()
+                        elif ch in (b'q', b'Q'):
+                            with _manual_rc_lock:
+                                _manual_rc.update({"forward_back": 0, "left_right": 0, "yaw": -MANUAL_SPEED, "up_down": 0})
+                            _manual_rc_time = time.monotonic()
+                        elif ch in (b'e', b'E'):
+                            with _manual_rc_lock:
+                                _manual_rc.update({"forward_back": 0, "left_right": 0, "yaw": MANUAL_SPEED, "up_down": 0})
+                            _manual_rc_time = time.monotonic()
+                        elif ch in (b'r', b'R'):
+                            with _manual_rc_lock:
+                                _manual_rc.update({"forward_back": 0, "left_right": 0, "yaw": 0, "up_down": MANUAL_SPEED})
+                            _manual_rc_time = time.monotonic()
+                        elif ch in (b'f', b'F'):
+                            with _manual_rc_lock:
+                                _manual_rc.update({"forward_back": 0, "left_right": 0, "yaw": 0, "up_down": -MANUAL_SPEED})
+                            _manual_rc_time = time.monotonic()
                     time.sleep(0.05)
             else:
-                import select
-                import sys as _sys
+                import select as _select
                 import tty
                 import termios
-                fd = _sys.stdin.fileno()
+                # Open /dev/tty directly so keyboard works even when stdin is
+                # redirected, piped, or running over SSH without a PTY.
+                _tty_fd   = None
+                _tty_file = None
+                _orig_attrs = None
                 try:
-                    tty.setcbreak(fd)   # cbreak: chars available immediately, Ctrl+C still works
+                    _tty_fd = os.open('/dev/tty', os.O_RDONLY)
+                    _orig_attrs = termios.tcgetattr(_tty_fd)
+                    tty.setcbreak(_tty_fd)
+                    _tty_file = os.fdopen(_tty_fd, 'rb', buffering=0)
+                    print("[keyboard] Ready – ESC=land  SPACE=confirm  W/S=fwd/back  A/D=left/right  Q/E=yaw")
                     while not _abort_flag.is_set():
-                        r, _, _ = select.select([_sys.stdin], [], [], 0.1)
+                        r, _, _ = _select.select([_tty_file], [], [], 0.1)
                         if r:
-                            ch = _sys.stdin.read(1)
-                            if ch in ('\x1b', 'q', 'Q'):
-                                print("\n[abort] ESC / q detected in terminal")
+                            ch = _tty_file.read(1)
+                            if ch == b'\x1b':
+                                print("\n[abort] ESC – landing now")
                                 _abort_flag.set()
                                 return
-                            if ch == ' ':
+                            elif ch == b' ':
                                 print("\n[mission] SPACE – confirm")
                                 _confirm_flag.set()
+                            elif ch in (b'w', b'W'):
+                                with _manual_rc_lock:
+                                    _manual_rc.update({"forward_back": MANUAL_SPEED, "left_right": 0, "yaw": 0, "up_down": 0})
+                                _manual_rc_time = time.monotonic()
+                            elif ch in (b's', b'S'):
+                                with _manual_rc_lock:
+                                    _manual_rc.update({"forward_back": -MANUAL_SPEED, "left_right": 0, "yaw": 0, "up_down": 0})
+                                _manual_rc_time = time.monotonic()
+                            elif ch in (b'a', b'A'):
+                                with _manual_rc_lock:
+                                    _manual_rc.update({"forward_back": 0, "left_right": -MANUAL_SPEED, "yaw": 0, "up_down": 0})
+                                _manual_rc_time = time.monotonic()
+                            elif ch in (b'd', b'D'):
+                                with _manual_rc_lock:
+                                    _manual_rc.update({"forward_back": 0, "left_right": MANUAL_SPEED, "yaw": 0, "up_down": 0})
+                                _manual_rc_time = time.monotonic()
+                            elif ch in (b'q', b'Q'):
+                                with _manual_rc_lock:
+                                    _manual_rc.update({"forward_back": 0, "left_right": 0, "yaw": -MANUAL_SPEED, "up_down": 0})
+                                _manual_rc_time = time.monotonic()
+                            elif ch in (b'e', b'E'):
+                                with _manual_rc_lock:
+                                    _manual_rc.update({"forward_back": 0, "left_right": 0, "yaw": MANUAL_SPEED, "up_down": 0})
+                                _manual_rc_time = time.monotonic()
+                            elif ch in (b'r', b'R'):
+                                with _manual_rc_lock:
+                                    _manual_rc.update({"forward_back": 0, "left_right": 0, "yaw": 0, "up_down": MANUAL_SPEED})
+                                _manual_rc_time = time.monotonic()
+                            elif ch in (b'f', b'F'):
+                                with _manual_rc_lock:
+                                    _manual_rc.update({"forward_back": 0, "left_right": 0, "yaw": 0, "up_down": -MANUAL_SPEED})
+                                _manual_rc_time = time.monotonic()
+                except Exception as _kb_err:
+                    print(f"[keyboard] Not available: {_kb_err}")
                 finally:
-                    if _saved_term is not None:
+                    if _orig_attrs is not None and _tty_fd is not None:
                         try:
-                            termios.tcsetattr(fd, termios.TCSADRAIN, _saved_term)
+                            termios.tcsetattr(_tty_fd, termios.TCSADRAIN, _orig_attrs)
                         except Exception:
                             pass
-        except Exception:
-            pass   # stdin not a tty (piped / background / non-interactive SSH)
+                    if _tty_file is not None:
+                        try:
+                            _tty_file.close()
+                        except Exception:
+                            pass
+        except Exception as _outer_kb_err:
+            print(f"[keyboard] Thread error: {_outer_kb_err}")
 
     # Non-daemon so Python waits for it to exit (and restore the terminal)
     # before shutting down.  We signal it via _abort_flag in the finally block.
@@ -1006,6 +989,8 @@ def main():
     last_img_time = 0.0
     last_heartbeat_time = 0.0
     last_motion_sample: Optional[Dict] = None
+    _manual_was_active = False
+    _mission_manually_overridden = False
 
     next_motion_time = time.monotonic()
     next_vision_time = time.monotonic()
@@ -1204,7 +1189,36 @@ def main():
                         "std_pos": 0.0,
                     }
 
-            if ctrl_module is not None and _ctrl_state is not None:
+            _manual_active = (time.monotonic() - _manual_rc_time < MANUAL_TIMEOUT)
+            # if _manual_active:
+            #     print(f"[debug] manual_active=True  ctrl={ctrl_module is not None}  "
+            #           f"ctrl_state={_ctrl_state is not None}  drone={anafi_drone is not None}  "
+            #           f"dry={mission_dry_run}  age={time.monotonic()-_manual_rc_time:.3f}s", flush=True)
+
+            # First keypress during FLY_TO: cancel mission, switch to hover-only mode.
+            if _manual_active and not _manual_was_active and not _mission_manually_overridden:
+                if mission is not None and mission.phase == MissionPhase.FLY_TO:
+                    mission.cancel()
+                    _mission_manually_overridden = True
+
+            if not _manual_active and _manual_was_active and anafi_drone is not None and not mission_dry_run:
+                # Key released: send one explicit stop command (all axes zero)
+                ctrl_module.send_pcmd_olympe(anafi_drone, {"forward_back": 0, "left_right": 0, "up_down": 0, "yaw": 0})
+                with _manual_rc_lock:
+                    _manual_rc.update({"forward_back": 0, "left_right": 0, "yaw": 0, "up_down": 0})
+            _manual_was_active = _manual_active
+
+            if _manual_active and anafi_drone is not None and not mission_dry_run:
+                # Manual RC takes priority over autonomous controller
+                with _manual_rc_lock:
+                    _mrc = {
+                        "forward_back": _manual_rc["forward_back"],
+                        "left_right":   _manual_rc["left_right"],
+                        "up_down":      _manual_rc["up_down"],
+                        "yaw":          _manual_rc["yaw"],
+                    }
+                ctrl_module.send_pcmd_olympe(anafi_drone, _mrc)
+            elif not _mission_manually_overridden and _ctrl_state is not None:
                 rc = ctrl_module.update(_ctrl_state)
                 if rc is not None:
                     _last_rc = rc
@@ -1244,15 +1258,14 @@ def main():
                     }
 
                 _log_tgt = None
-                if mission is not None and mission._approach_target is not None:
-                    tx, ty, tz, tyaw = mission._approach_target
+                if mission is not None and mission.fly_to is not None:
+                    tx, ty, tz = mission.fly_to
                     _log_tgt = {
                         "x": round(tx, 4),
                         "y": round(ty, 4),
                         "z": round(tz, 4),
-                        "yaw_deg": round(math.degrees(tyaw), 2),
                     }
-                elif ctrl_module is not None and ctrl_module.position_controller.target is not None:
+                elif ctrl_module.position_controller.target is not None:
                     t = ctrl_module.position_controller.target
                     _log_tgt = {
                         "x": round(t.x, 4),
@@ -1340,14 +1353,13 @@ def main():
                     "innovation": last_fusion_result.get("innovation"),
                 }
 
-            if ctrl_module is not None:
-                result["ctrl"] = ctrl_module.position_controller.status()
+            result["ctrl"] = ctrl_module.position_controller.status()
 
             if mission is not None:
                 result["mission"] = {
                     "phase": mission.phase,
-                    "target_marker": mission.target_id,
-                    "approach_target": list(mission._approach_target) if mission._approach_target else None,
+                    "fly_to": list(mission.fly_to),
+                    "recovering": mission._recovering,
                     "waiting_confirm": mission.waiting_for_confirm,
                     "confirm_prompt": mission.pending_prompt if mission.waiting_for_confirm else None,
                 }
@@ -1454,11 +1466,11 @@ def main():
                         2,
                     )
 
-                if mission is not None and mission._approach_target is not None:
-                    tx, ty, tz, tyaw = mission._approach_target
+                if mission is not None and mission.fly_to is not None:
+                    tx, ty, tz = mission.fly_to
                     cv2.putText(
                         preview,
-                        f"TGT x={tx:+.2f} y={ty:+.2f} z={tz:+.2f} yaw={math.degrees(tyaw):+.1f} deg",
+                        f"TGT x={tx:+.2f} y={ty:+.2f} z={tz:+.2f}",
                         (10, 195),
                         cv2.FONT_HERSHEY_SIMPLEX,
                         0.6,
@@ -1488,13 +1500,45 @@ def main():
                 try:
                     cv2.imshow("aruco_position Preview", preview)
                     key = cv2.waitKey(1) & 0xFF
-                    if key == ord("q"):
-                        break
-                    if key == 27:   # ESC
+                    if key != 0xFF:
+                        print(f"[key] cv2 key={key} chr={chr(key) if 32<=key<127 else '?'}", flush=True)
+                    if key == 27:   # ESC – emergency land
                         print("[abort] ESC pressed in preview window")
                         _abort_flag.set()
-                    if key == 32:   # SPACE
+                    elif key == 32:   # SPACE
                         _confirm_flag.set()
+                    elif key in (ord('w'), ord('W')):
+                        with _manual_rc_lock:
+                            _manual_rc.update({"forward_back": MANUAL_SPEED, "left_right": 0, "yaw": 0, "up_down": 0})
+                        _manual_rc_time = time.monotonic()
+                    elif key in (ord('s'), ord('S')):
+                        with _manual_rc_lock:
+                            _manual_rc.update({"forward_back": -MANUAL_SPEED, "left_right": 0, "yaw": 0, "up_down": 0})
+                        _manual_rc_time = time.monotonic()
+                    elif key in (ord('a'), ord('A')):
+                        with _manual_rc_lock:
+                            _manual_rc.update({"forward_back": 0, "left_right": -MANUAL_SPEED, "yaw": 0, "up_down": 0})
+                        _manual_rc_time = time.monotonic()
+                    elif key in (ord('d'), ord('D')):
+                        with _manual_rc_lock:
+                            _manual_rc.update({"forward_back": 0, "left_right": MANUAL_SPEED, "yaw": 0, "up_down": 0})
+                        _manual_rc_time = time.monotonic()
+                    elif key in (ord('q'), ord('Q')):
+                        with _manual_rc_lock:
+                            _manual_rc.update({"forward_back": 0, "left_right": 0, "yaw": -MANUAL_SPEED, "up_down": 0})
+                        _manual_rc_time = time.monotonic()
+                    elif key in (ord('e'), ord('E')):
+                        with _manual_rc_lock:
+                            _manual_rc.update({"forward_back": 0, "left_right": 0, "yaw": MANUAL_SPEED, "up_down": 0})
+                        _manual_rc_time = time.monotonic()
+                    elif key in (ord('r'), ord('R')):
+                        with _manual_rc_lock:
+                            _manual_rc.update({"forward_back": 0, "left_right": 0, "yaw": 0, "up_down": MANUAL_SPEED})
+                        _manual_rc_time = time.monotonic()
+                    elif key in (ord('f'), ord('F')):
+                        with _manual_rc_lock:
+                            _manual_rc.update({"forward_back": 0, "left_right": 0, "yaw": 0, "up_down": -MANUAL_SPEED})
+                        _manual_rc_time = time.monotonic()
                 except cv2.error:
                     gui_available = False
                     print("\n⚠️ OpenCV HighGUI not available. Disabling local preview window.")
