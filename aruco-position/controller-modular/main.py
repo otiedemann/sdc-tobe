@@ -976,6 +976,7 @@ def main():
     last_img_time = 0.0
     last_heartbeat_time = 0.0
     last_motion_sample: Optional[Dict] = None
+    _manual_was_active = False
 
     next_motion_time = time.monotonic()
     next_vision_time = time.monotonic()
@@ -1179,6 +1180,13 @@ def main():
             #     print(f"[debug] manual_active=True  ctrl={ctrl_module is not None}  "
             #           f"ctrl_state={_ctrl_state is not None}  drone={anafi_drone is not None}  "
             #           f"dry={mission_dry_run}  age={time.monotonic()-_manual_rc_time:.3f}s", flush=True)
+
+            if not _manual_active and _manual_was_active and anafi_drone is not None and not mission_dry_run:
+                # Key released: send one explicit stop command (all axes zero)
+                ctrl_module.send_pcmd_olympe(anafi_drone, {"forward_back": 0, "left_right": 0, "up_down": 0, "yaw": 0})
+                with _manual_rc_lock:
+                    _manual_rc.update({"forward_back": 0, "left_right": 0, "yaw": 0, "up_down": 0})
+            _manual_was_active = _manual_active
 
             if _manual_active and anafi_drone is not None and not mission_dry_run:
                 # Manual RC takes priority over autonomous controller

@@ -352,12 +352,42 @@ def is_active() -> bool:
 # Olympe PCMD helper (optional — call from main.py)
 # ============================================================
 
+# None = not yet tested, True = native API works, False = use raw PCMD fallback
+_has_piloting_api: Optional[bool] = None
 _pcmd_seq: int = 0
+
+
+def _detect_piloting_api(drone) -> bool:
+    """
+    Test whether the native Olympe piloting API (start_piloting /
+    piloting_pcmd / stop_piloting) actually works on this drone object.
+
+    Result is cached after the first successful or failed probe.
+    """
+    global _has_piloting_api
+    if _has_piloting_api is not None:
+        return _has_piloting_api
+    if not callable(getattr(drone, "start_piloting", None)):
+        _has_piloting_api = False
+        print("[controller] Native piloting API not found — using raw d(PCMD(...))")
+        return False
+    try:
+        drone.start_piloting()
+        _has_piloting_api = True
+        print("[controller] Native piloting API active (start_piloting / piloting_pcmd)")
+        return True
+    except Exception as exc:
+        _has_piloting_api = False
+        print(f"[controller] Native piloting API failed ({exc}) — using raw d(PCMD(...))")
+        return False
 
 
 def send_pcmd_olympe(drone, rc: dict) -> None:
     """
-    Send an RC dict to the drone via a raw Olympe PCMD message.
+    Send an RC dict to the drone via Olympe.
+
+    Prefers the native ``drone.piloting_pcmd()`` API (Olympe ≥ 7).
+    Falls back to a raw ``drone(PCMD(...))`` message for older builds.
 
     Call this from main.py after calling update() when using
     an olympe.Drone object directly (no unified API server needed).
@@ -367,26 +397,29 @@ def send_pcmd_olympe(drone, rc: dict) -> None:
         rc:    Dict returned by update(), must contain the four RC keys.
     """
     global _pcmd_seq
+
+    # Hard clamp: never send values beyond ±PCMD_MAX to the drone
+    def _hard_clamp(v: int) -> int:
+        return max(-PCMD_MAX, min(PCMD_MAX, v))
+
+    roll  = _hard_clamp(rc["left_right"])
+    pitch = _hard_clamp(rc["forward_back"])
+    yaw   = _hard_clamp(rc["yaw"])
+    gaz   = _hard_clamp(rc["up_down"])
+
+    print(f"[PCMD] roll={roll:+4d}  pitch={pitch:+4d}  yaw={yaw:+4d}  gaz={gaz:+4d}", flush=True)
+
+    if _detect_piloting_api(drone):
+        try:
+            drone.piloting_pcmd(roll, pitch, yaw, gaz, 0)
+            return
+        except Exception as exc:
+            print(f"[controller] piloting_pcmd failed: {exc}")
+
+    # Fallback: raw PCMD message
     try:
         from olympe.messages.ardrone3.Piloting import PCMD
         _pcmd_seq = (_pcmd_seq + 1) & 0x7FFFFFFF
-
-        # Hard clamp: never send values beyond ±PCMD_MAX to the drone
-        def _hard_clamp(v: int) -> int:
-            return max(-PCMD_MAX, min(PCMD_MAX, v))
-
-        roll  = _hard_clamp(rc["left_right"])
-        pitch = _hard_clamp(rc["forward_back"])
-        yaw   = _hard_clamp(rc["yaw"])
-        gaz   = _hard_clamp(rc["up_down"])
-        print(f"[PCMD] roll={roll:+4d}  pitch={pitch:+4d}  yaw={yaw:+4d}  gaz={gaz:+4d}  seq={_pcmd_seq}", flush=True)
-        drone(PCMD(
-            1,      # flag: 1 = active
-            roll,   # roll
-            pitch,  # pitch
-            yaw,    # yaw
-            gaz,    # gaz
-            _pcmd_seq,
-        ))
+        drone(PCMD(1, roll, pitch, yaw, gaz, _pcmd_seq))
     except Exception as exc:
         print(f"[controller] PCMD send failed: {exc}")
