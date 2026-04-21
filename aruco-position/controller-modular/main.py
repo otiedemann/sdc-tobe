@@ -249,6 +249,19 @@ class AutonomousMission:
         print(f"[mission] Confirmed → {phase}")
         self._transition(phase)
 
+    def cancel(self) -> None:
+        """
+        Manual override: stop the mission and clear controller target without
+        sending any flight command.  The drone will simply hover in place.
+        Safe to call from any thread.
+        """
+        if self._phase in (MissionPhase.IDLE, MissionPhase.ABORTED):
+            return
+        print("\n[mission] CANCELLED – manual override, hovering")
+        self._transition(MissionPhase.ABORTED)
+        if self.ctrl is not None:
+            self.ctrl.clear_target()
+
     def abort(self, drone) -> None:
         """
         Emergency abort: stop the mission, command the drone to land, and
@@ -977,6 +990,7 @@ def main():
     last_heartbeat_time = 0.0
     last_motion_sample: Optional[Dict] = None
     _manual_was_active = False
+    _mission_manually_overridden = False
 
     next_motion_time = time.monotonic()
     next_vision_time = time.monotonic()
@@ -1181,6 +1195,12 @@ def main():
             #           f"ctrl_state={_ctrl_state is not None}  drone={anafi_drone is not None}  "
             #           f"dry={mission_dry_run}  age={time.monotonic()-_manual_rc_time:.3f}s", flush=True)
 
+            # First keypress during FLY_TO: cancel mission, switch to hover-only mode.
+            if _manual_active and not _manual_was_active and not _mission_manually_overridden:
+                if mission is not None and mission.phase == MissionPhase.FLY_TO:
+                    mission.cancel()
+                    _mission_manually_overridden = True
+
             if not _manual_active and _manual_was_active and anafi_drone is not None and not mission_dry_run:
                 # Key released: send one explicit stop command (all axes zero)
                 ctrl_module.send_pcmd_olympe(anafi_drone, {"forward_back": 0, "left_right": 0, "up_down": 0, "yaw": 0})
@@ -1198,7 +1218,7 @@ def main():
                         "yaw":          _manual_rc["yaw"],
                     }
                 ctrl_module.send_pcmd_olympe(anafi_drone, _mrc)
-            elif _ctrl_state is not None:
+            elif not _mission_manually_overridden and _ctrl_state is not None:
                 rc = ctrl_module.update(_ctrl_state)
                 if rc is not None:
                     _last_rc = rc

@@ -252,7 +252,7 @@ class PositionController:
         else:
             # TRANSIT: face the direction of travel when far enough away
             if dist_xy >= TRANSIT_YAW_MIN_DIST:
-                desired_yaw = math.atan2(ex, ey)   # bearing to target in world frame
+                desired_yaw = math.atan2(ey, ex)   # bearing to target in world frame
             else:
                 # Close to target — stop yawing, just translate the last bit
                 desired_yaw = cyaw
