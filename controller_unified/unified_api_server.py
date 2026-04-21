@@ -3022,6 +3022,80 @@ def _jsonable(v):
         return None
 
 
+@app.get("/api/environment")
+def api_environment_get():
+    """Read the drone's current flight environment setting (indoor / outdoor).
+    Indoor mode relaxes some GPS-based pre-arm checks and is recommended
+    for hangar flying."""
+    if not HAS_OLYMPE_SDK:
+        return jsonify(ok=False, error="Olympe not available"), 501
+    b = _anafi_backend()
+    if b is None:
+        return jsonify(ok=False, error="drone not connected"), 503
+    try:
+        import importlib
+        wifi_mod = importlib.import_module("olympe.messages.wifi")
+        EnvCh = (getattr(wifi_mod, "environment_changed", None)
+                 or getattr(wifi_mod, "environement_changed", None)
+                 or getattr(wifi_mod, "EnvironmentChanged", None))
+        if EnvCh is None:
+            return jsonify(ok=False, error="environment state message missing"), 501
+        st = b._get_state(EnvCh)
+        return jsonify(ok=True, status=_jsonable(dict(st) if st else None))
+    except Exception as e:
+        return jsonify(ok=False, error=str(e)), 500
+
+
+@app.post("/api/environment")
+def api_environment_set():
+    """Set the drone's flight environment. Body: {"mode": "indoor" | "outdoor"}.
+    Indoor relaxes GPS-related pre-arm checks; outdoor is the factory default."""
+    if not HAS_OLYMPE_SDK:
+        return jsonify(ok=False, error="Olympe not available"), 501
+    b = _anafi_backend()
+    if b is None:
+        return jsonify(ok=False, error="drone not connected"), 503
+    data = request.get_json(silent=True) or {}
+    mode = str(data.get("mode", "indoor")).lower()
+    if mode not in ("indoor", "outdoor"):
+        return jsonify(ok=False, error="mode must be 'indoor' or 'outdoor'"), 400
+    try:
+        import importlib
+        wifi_mod = importlib.import_module("olympe.messages.wifi")
+        SetEnv = (getattr(wifi_mod, "set_environment", None)
+                  or getattr(wifi_mod, "SetEnvironment", None))
+        if SetEnv is None:
+            return jsonify(ok=False, error="set_environment not exposed by this Olympe build"), 501
+        # Resolve the enum member for the requested mode
+        env_enum = None
+        try:
+            enums_mod = importlib.import_module("olympe.enums.wifi")
+            env_cls = (getattr(enums_mod, "environment", None)
+                       or getattr(enums_mod, "Environment", None))
+            if env_cls is not None:
+                env_enum = (getattr(env_cls, mode, None)
+                            or getattr(env_cls, mode.upper(), None)
+                            or getattr(env_cls, mode.capitalize(), None))
+        except Exception:
+            pass
+        arg = env_enum if env_enum is not None else mode
+        with command_lock:
+            b.drone(SetEnv(environement=arg)).wait(_timeout=3)
+        print(f"[ANAFI] Environment set to {mode} (arg={_jsonable(arg)})")
+        return jsonify(ok=True, mode=mode, arg=_jsonable(arg))
+    except TypeError:
+        # Some Olympe versions spell the parameter "environment" (no typo)
+        try:
+            with command_lock:
+                b.drone(SetEnv(environment=arg)).wait(_timeout=3)
+            print(f"[ANAFI] Environment set to {mode} (arg={_jsonable(arg)}) [fallback kwarg]")
+            return jsonify(ok=True, mode=mode, arg=_jsonable(arg))
+        except Exception as e2:
+            return jsonify(ok=False, error=str(e2)), 500
+    except Exception as e:
+        return jsonify(ok=False, error=str(e)), 500
+
+
 @app.get("/api/wifi/status")
 def api_wifi_status():
     """Report the current AP channel + band the Anafi is broadcasting on."""
