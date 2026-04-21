@@ -229,3 +229,7 @@ __marimo__/
 /controller_unified/recordings/
 /sim_swarm_API/api_command_log.jsonl
 
+# Mission trace logs (one JSONL per mission run)
+/controller/logs/
+!/controller/logs/.gitkeep
+
