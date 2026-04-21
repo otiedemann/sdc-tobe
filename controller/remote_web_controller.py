@@ -284,6 +284,45 @@ HTML = """
           <input id=\"set_tilt\" type=\"number\" min=\"1\" max=\"35\" step=\"1\" value=\"15\" style=\"width:70px;\" />
           <button id=\"apply_settings\">Apply Settings</button>
         </div>
+        <!-- ── Environment (indoor/outdoor) ─────────────────────── -->
+        <div class=\"row\" style=\"margin-top:10px; align-items:center; padding-top:8px; border-top:1px solid #1e293b;\">
+          <span class=\"small\" style=\"min-width:80px;\">Environment</span>
+          <select id=\"env_mode\" style=\"background:#0f172a;color:#e2e8f0;border:1px solid #334155;border-radius:4px;padding:4px 6px;font-size:12px;\">
+            <option value=\"indoor\">Indoor (GPS-less, relaxed checks)</option>
+            <option value=\"outdoor\">Outdoor (GPS-required, default)</option>
+          </select>
+          <button id=\"env_apply\" style=\"background:#1e3a5f;border-color:#3b82f6;\">Apply</button>
+          <span id=\"env_status\" class=\"small\" style=\"color:#94a3b8;\">—</span>
+        </div>
+        <!-- ── Wi-Fi band + channel ─────────────────────────────── -->
+        <div class=\"row\" style=\"margin-top:8px; align-items:center;\">
+          <span class=\"small\" style=\"min-width:80px;\">Wi-Fi band</span>
+          <select id=\"wifi_band\" style=\"background:#0f172a;color:#e2e8f0;border:1px solid #334155;border-radius:4px;padding:4px 6px;font-size:12px;\">
+            <option value=\"5_GHz\">5 GHz (recommended)</option>
+            <option value=\"2_4_GHz\">2.4 GHz</option>
+          </select>
+          <span class=\"small\" style=\"min-width:56px;\">Channel</span>
+          <select id=\"wifi_channel\" style=\"background:#0f172a;color:#e2e8f0;border:1px solid #334155;border-radius:4px;padding:4px 6px;font-size:12px;min-width:130px;\">
+            <option value=\"auto\">Auto (drone picks)</option>
+            <!-- 5 GHz non-DFS -->
+            <option value=\"36\">36 (5 GHz UNII-1)</option>
+            <option value=\"40\">40 (5 GHz UNII-1)</option>
+            <option value=\"44\">44 (5 GHz UNII-1)</option>
+            <option value=\"48\">48 (5 GHz UNII-1)</option>
+            <option value=\"149\">149 (5 GHz UNII-3)</option>
+            <option value=\"153\">153 (5 GHz UNII-3)</option>
+            <option value=\"157\">157 (5 GHz UNII-3)</option>
+            <option value=\"161\">161 (5 GHz UNII-3)</option>
+            <option value=\"165\">165 (5 GHz UNII-3)</option>
+            <!-- 2.4 GHz -->
+            <option value=\"1\">1 (2.4 GHz)</option>
+            <option value=\"6\">6 (2.4 GHz)</option>
+            <option value=\"11\">11 (2.4 GHz)</option>
+          </select>
+          <button id=\"wifi_apply\" style=\"background:#1e3a5f;border-color:#3b82f6;\" title=\"Apply band+channel. Drone on ground only. Wi-Fi link drops briefly while re-associating.\">Apply Wi-Fi</button>
+          <button id=\"wifi_scan\" style=\"background:#374151;border-color:#6b7280;\" title=\"Scan the selected band for in-use channels\">Scan</button>
+          <span id=\"wifi_status\" class=\"small\" style=\"color:#94a3b8;margin-left:6px;\">—</span>
+        </div>
       </div>
       <div class=\"adv\" id=\"mission_panel\">
         <div class=\"small\" style=\"margin-bottom:6px;\"><b>Mission Planner</b> — enter one command per line</div>
@@ -413,9 +452,9 @@ HTML = """
       <label style=\"color:#94a3b8;margin-left:12px;\">Hover s:</label>
       <input id=\"mis_hover_s\" type=\"number\" min=\"0.5\" step=\"0.5\" value=\"3\" style=\"width:70px;\" />
       <label style=\"color:#94a3b8;margin-left:12px;\">Approach tol (m):</label>
-      <input id=\"mis_tol_m\" type=\"number\" min=\"0.1\" step=\"0.05\" value=\"0.30\" style=\"width:70px;\" title=\"Drone transitions from APPROACH to HOVER once within this many metres of the hover distance (horizontal alignment / perpendicularity are not required).\" />
+      <input id=\"mis_tol_m\" type=\"number\" min=\"0.1\" step=\"0.05\" value=\"0.30\" style=\"width:70px;\" title=\"Drone transitions from APPROACH to HOVER once within this many metres of the hover distance AND sufficiently perpendicular (see Skew tol).\" />
       <label style=\"color:#94a3b8;margin-left:12px;\" title=\"Max skew before declaring the drone perpendicular. 0.08 ≈ 6° off the marker normal. Lower values force the drone to align straight-on before hovering.\">Skew tol:</label>
-      <input id=\"mis_skew_tol\" type=\"number\" min=\"0.02\" max=\"0.50\" step=\"0.01\" value=\"0.08\" style=\"width:70px;\" />
+      <input id=\"mis_skew_tol\" type=\"number\" min=\"0.02\" max=\"0.50\" step=\"0.01\" value=\"0.12\" style=\"width:70px;\" title=\"Max perspective skew to accept for HOVER. 0.12 ≈ 9° off the marker normal. Lower = stricter perpendicular (longer to converge).\" />
       <label style=\"color:#94a3b8;margin-left:12px;display:flex;align-items:center;gap:4px;\">
         <input id=\"mis_auto_takeoff\" type=\"checkbox\" />
         auto-takeoff
@@ -904,7 +943,7 @@ HTML = """
     arcPoll();
     // Version marker — if this string doesn't appear in the DOM,
     // you're running stale JS (restart the Python server or hard-refresh).
-    const BUILD = 'am-mission-trace-log';
+    const BUILD = 'ao-env-wifi-ui';
     console.log('[arc] init complete, build=' + BUILD);
     const ver = document.createElement('span');
     ver.id = 'arc_build_tag';
@@ -1402,6 +1441,12 @@ async function switchDrone(id) {
     } catch (err) {
       console.warn('[drone-switch] video reconnect failed:', err);
     }
+    // Refresh the environment + Wi-Fi status for the newly selected drone.
+    // Both readouts are per-drone so they need to re-fetch after the switch.
+    try {
+      if (typeof envRefresh  === 'function') setTimeout(envRefresh,  400);
+      if (typeof wifiRefresh === 'function') setTimeout(wifiRefresh, 400);
+    } catch (e) {}
   } catch {}
 }
 
@@ -1520,6 +1565,162 @@ document.getElementById('apply_settings').onclick = ()=>{
   const tilt = Number(document.getElementById('set_tilt').value);
   post('/proxy/settings', {max_altitude_m:alt, max_vertical_speed:vs, max_tilt:tilt});
 };
+
+// ── Environment (indoor / outdoor) ──────────────────────────────────
+async function envRefresh() {
+  const lbl = document.getElementById('env_status');
+  if (!lbl) return;
+  try {
+    const r = await fetch('/proxy/environment', {cache:'no-store'});
+    const d = await r.json();
+    if (d.ok && d.status) {
+      const cur = (d.status.environement || d.status.environment || '').toString();
+      lbl.textContent = 'current: ' + (cur || 'unknown');
+      lbl.style.color = cur.toLowerCase().includes('indoor') ? '#22c55e' : '#94a3b8';
+      // Sync dropdown
+      const sel = document.getElementById('env_mode');
+      if (sel && cur) {
+        const v = cur.toLowerCase().includes('indoor') ? 'indoor' : 'outdoor';
+        if (sel.value !== v) sel.value = v;
+      }
+    } else {
+      lbl.textContent = d.error || 'unavailable';
+      lbl.style.color = '#f59e0b';
+    }
+  } catch (e) { lbl.textContent = 'error'; lbl.style.color = '#ef4444'; }
+}
+(function(){
+  const btn = document.getElementById('env_apply');
+  if (!btn) return;
+  btn.onclick = async () => {
+    const mode = document.getElementById('env_mode').value;
+    const lbl = document.getElementById('env_status');
+    lbl.textContent = '… applying';
+    lbl.style.color = '#fbbf24';
+    try {
+      const r = await fetch('/proxy/environment', {method:'POST',
+        headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({mode})});
+      const d = await r.json();
+      if (d.ok) {
+        lbl.textContent = '✓ set to ' + mode;
+        lbl.style.color = '#22c55e';
+        setTimeout(envRefresh, 800);
+      } else {
+        lbl.textContent = '✗ ' + (d.error || 'unknown');
+        lbl.style.color = '#ef4444';
+      }
+    } catch(e) { lbl.textContent = '✗ '+e; lbl.style.color = '#ef4444'; }
+  };
+})();
+// Initial read + refresh when the user switches drones
+setTimeout(envRefresh, 800);
+
+// ── Wi-Fi band + channel ────────────────────────────────────────────
+async function wifiRefresh() {
+  const lbl = document.getElementById('wifi_status');
+  if (!lbl) return;
+  try {
+    const r = await fetch('/proxy/wifi/status', {cache:'no-store'});
+    const d = await r.json();
+    if (d.ok && d.status && typeof d.status === 'object') {
+      const band = (d.status.band || '').toString();
+      const ch   = d.status.channel;
+      const typ  = d.status.type || '';
+      lbl.textContent = `band=${band}  ch=${ch}  (${typ})`;
+      const is5 = band.toLowerCase().includes('5');
+      lbl.style.color = is5 ? '#22c55e' : '#fbbf24';
+      // Sync dropdowns
+      const bandSel = document.getElementById('wifi_band');
+      if (bandSel) bandSel.value = is5 ? '5_GHz' : '2_4_GHz';
+      const chSel = document.getElementById('wifi_channel');
+      if (chSel && ch != null) {
+        // Prefer auto when type=auto_*
+        if (typ.toLowerCase().includes('auto')) {
+          chSel.value = 'auto';
+        } else if (Array.from(chSel.options).some(o => o.value == String(ch))) {
+          chSel.value = String(ch);
+        }
+      }
+    } else {
+      lbl.textContent = d.error || d.status || 'unavailable';
+      lbl.style.color = '#f59e0b';
+    }
+  } catch(e) { lbl.textContent = 'error'; lbl.style.color = '#ef4444'; }
+}
+(function(){
+  const apply = document.getElementById('wifi_apply');
+  if (!apply) return;
+  apply.onclick = async () => {
+    const band = document.getElementById('wifi_band').value;
+    const chStr = document.getElementById('wifi_channel').value;
+    const lbl = document.getElementById('wifi_status');
+    const auto = (chStr === 'auto');
+    const body = auto
+      ? {auto: true, band}
+      : {auto: false, band, channel: Number(chStr)};
+    if (!confirm('⚠ Wi-Fi change will disconnect the drone for ~5-10 s.\\n\\n' +
+                 'Drone MUST be on the ground. Continue?')) return;
+    lbl.textContent = '… applying  (wait ~10 s for reconnect)';
+    lbl.style.color = '#fbbf24';
+    try {
+      const r = await fetch('/proxy/wifi/channel', {method:'POST',
+        headers:{'Content-Type':'application/json'},
+        body: JSON.stringify(body)});
+      const d = await r.json();
+      if (d.ok) {
+        lbl.textContent = `✓ ${d.mode}: ${band}${auto ? '' : ' ch ' + body.channel} — reconnecting…`;
+        lbl.style.color = '#22c55e';
+        // Poll status a few times while the watchdog reconnects
+        let n = 0;
+        const poll = setInterval(() => {
+          wifiRefresh();
+          if (++n > 8) clearInterval(poll);
+        }, 2000);
+      } else {
+        lbl.textContent = '✗ ' + (d.error || 'unknown');
+        lbl.style.color = '#ef4444';
+      }
+    } catch(e) { lbl.textContent = '✗ '+e; lbl.style.color = '#ef4444'; }
+  };
+})();
+(function(){
+  const scan = document.getElementById('wifi_scan');
+  if (!scan) return;
+  scan.onclick = async () => {
+    const band = document.getElementById('wifi_band').value;
+    const lbl = document.getElementById('wifi_status');
+    lbl.textContent = '… scanning ' + band;
+    lbl.style.color = '#fbbf24';
+    try {
+      const r = await fetch('/proxy/wifi/scan', {method:'POST',
+        headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({band, wait_s: 4})});
+      const d = await r.json();
+      if (!d.ok) {
+        lbl.textContent = '✗ ' + (d.error || 'scan failed');
+        lbl.style.color = '#ef4444';
+        return;
+      }
+      const items = d.scanned_items || [];
+      // Aggregate per channel
+      const perCh = {};
+      items.forEach(it => {
+        const ch = it.channel;
+        if (ch == null) return;
+        if (!perCh[ch]) perCh[ch] = 0;
+        perCh[ch] += 1;
+      });
+      const summary = Object.keys(perCh)
+        .sort((a,b)=>Number(a)-Number(b))
+        .map(c => `ch${c}:${perCh[c]}`).join(' ');
+      lbl.textContent = summary ? `scan: ${summary}` : 'scan: no APs seen';
+      lbl.style.color = '#22c55e';
+      console.log('[wifi-scan]', d);
+    } catch(e) { lbl.textContent = '✗ '+e; lbl.style.color = '#ef4444'; }
+  };
+})();
+setTimeout(wifiRefresh, 1200);
 
 document.getElementById('toggle_cmd_log').onclick = async ()=>{
   try {
@@ -4276,7 +4477,7 @@ def proxy_missions_scan_all_start():
         return jsonify(ok=False, error="target_markers must parse to at least one id"), 400
     hover_seconds = float(data.get("hover_seconds", 3.0))
     approach_tolerance_m = float(data.get("approach_tolerance_m", 0.30))
-    approach_skew_tol   = float(data.get("approach_skew_tol", 0.08))
+    approach_skew_tol   = float(data.get("approach_skew_tol", 0.12))
     approach_err_x_tol  = float(data.get("approach_err_x_tol", 0.15))
     auto_takeoff = bool(data.get("auto_takeoff", False))
     ok, msg = mission_manager.start_scan_all(
@@ -4353,6 +4554,63 @@ def proxy_missions_traces():
     except Exception as e:
         return jsonify(ok=False, error=str(e)), 500
     return jsonify(ok=True, files=files)
+
+
+# ─── Environment & Wi-Fi control — pass-through to active drone ─────────────
+
+@app.get("/proxy/environment")
+def proxy_environment_get():
+    try:
+        r = _http_session.get(f"{PI_BASE}/api/environment", timeout=3)
+        return (r.text, r.status_code,
+                {"Content-Type": r.headers.get("Content-Type", "application/json")})
+    except Exception as e:
+        return jsonify(ok=False, error=str(e)), 502
+
+
+@app.post("/proxy/environment")
+def proxy_environment_set():
+    data = request.get_json(silent=True) or {}
+    log_command("environment_set", data)
+    try:
+        r = _http_session.post(f"{PI_BASE}/api/environment", json=data, timeout=4)
+        return (r.text, r.status_code,
+                {"Content-Type": r.headers.get("Content-Type", "application/json")})
+    except Exception as e:
+        return jsonify(ok=False, error=str(e)), 502
+
+
+@app.get("/proxy/wifi/status")
+def proxy_wifi_status():
+    try:
+        r = _http_session.get(f"{PI_BASE}/api/wifi/status", timeout=3)
+        return (r.text, r.status_code,
+                {"Content-Type": r.headers.get("Content-Type", "application/json")})
+    except Exception as e:
+        return jsonify(ok=False, error=str(e)), 502
+
+
+@app.post("/proxy/wifi/channel")
+def proxy_wifi_channel():
+    data = request.get_json(silent=True) or {}
+    log_command("wifi_channel_set", data)
+    try:
+        r = _http_session.post(f"{PI_BASE}/api/wifi/channel", json=data, timeout=8)
+        return (r.text, r.status_code,
+                {"Content-Type": r.headers.get("Content-Type", "application/json")})
+    except Exception as e:
+        return jsonify(ok=False, error=str(e)), 502
+
+
+@app.post("/proxy/wifi/scan")
+def proxy_wifi_scan():
+    data = request.get_json(silent=True) or {}
+    try:
+        r = _http_session.post(f"{PI_BASE}/api/wifi/scan", json=data, timeout=10)
+        return (r.text, r.status_code,
+                {"Content-Type": r.headers.get("Content-Type", "application/json")})
+    except Exception as e:
+        return jsonify(ok=False, error=str(e)), 502
 
 
 def main():

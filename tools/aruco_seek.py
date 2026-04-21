@@ -42,7 +42,7 @@ from urllib.request import Request, urlopen
 
 DEFAULT_API_BASE = "http://flightctrl1:8080"
 TAKEOFF_HEIGHT_M = 1.0        # altitude to hold during search
-HOVER_DISTANCE_M = 1.5        # stop this far in front of the marker
+HOVER_DISTANCE_M = 2.0        # stop this far in front of the marker (SDC ops default)
 SCAN_YAW_SPEED = 15           # RC yaw percent during search rotation (0-100)
 APPROACH_SPEED = 8            # RC forward percent during approach (0-100)
 RC_TICK_MS = 200              # RC command duration per tick
@@ -77,14 +77,21 @@ HOVER_SKEW_P          = 25.0   # lateral gain per unit of perspective skew. Stro
                               # 8.0 was too weak — at skew=0.2 it only produced 1.6 RC which
                               # was below rc_min, so the drone stayed sideways forever.
 HOVER_ALT_P           = 25.0   # was 60 — gentle altitude hold
-HOVER_DIST_P          = 4.0    # was 8  — gentle distance hold
+HOVER_DIST_P          = 15.0   # aggressive: at dist_err=4m this produces 60 RC, clamped
+                              # to fb_max below → drone flies full-speed when far, eases
+                              # off naturally as it closes in (dist_err shrinks → fb_p
+                              # shrinks proportionally). Much stronger than the old 4.0
+                              # which needed 15m of error to saturate fb_max=6.
 HOVER_YAW_MAX         = 15     # was 40 — clamp magnitude
-HOVER_LR_MAX          = 15     # RC% cap on lateral correction. Raised from 6 so the drone
-                              # has enough authority to actually translate sideways for
-                              # perpendicular alignment in reasonable time.
+HOVER_LR_MAX          = 20     # RC% cap on lateral correction — enough authority to
+                              # actively strafe into the marker's normal while approaching.
 HOVER_UD_MAX          = 25     # was 50
-HOVER_FB_MAX          = 6      # forward clamp
-HOVER_FB_BACK_MAX     = 8      # backward clamp (slightly higher → safer to back off)
+HOVER_FB_MAX          = 30     # aggressive forward — full cruise speed when far from marker.
+                              # PD naturally slows as dist_err shrinks, so this is a cap on
+                              # fast-approach only; near the target it is not reached.
+HOVER_FB_BACK_MAX     = 30     # matching backward authority so the drone can back up when
+                              # it overshoots target distance, or to set up a clean approach
+                              # angle by retreating and coming back in perpendicular.
 HOVER_RC_MIN          = 2      # |rc| < this → output 0 (kill micro-jitter)
 
 # ── IMU damping (D-term) — opposes actual body motion to kill oscillation ──
