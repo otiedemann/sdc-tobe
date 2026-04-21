@@ -202,6 +202,7 @@ HTML = """
   <h2>Drone Remote Controller</h2>
   <div style=\"display:flex;align-items:center;gap:8px;\">
     <div class=\"drone-bar\" id=\"drone_bar\" style=\"flex:1;\"></div>
+    <button id=\"land_all_btn\" style=\"padding:6px 14px;font-size:13px;font-weight:700;background:#7f1d1d;border-color:#ef4444;color:#fee2e2;letter-spacing:0.4px;\" title=\"Land every drone in the fleet safely. Keyboard shortcut: 0 (zero)\">&#11088; LAND ALL (0)</button>
     <button id=\"edit_drones_btn\" style=\"padding:4px 12px;font-size:12px;background:#1e3a5f;border-color:#3b82f6;\" title=\"Edit drone fleet config\">Config</button>
   </div>
   <div id=\"drone_config_modal\" style=\"display:none;position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,0.7);z-index:1000;justify-content:center;align-items:center;\">
@@ -413,6 +414,8 @@ HTML = """
       <input id=\"mis_hover_s\" type=\"number\" min=\"0.5\" step=\"0.5\" value=\"3\" style=\"width:70px;\" />
       <label style=\"color:#94a3b8;margin-left:12px;\">Approach tol (m):</label>
       <input id=\"mis_tol_m\" type=\"number\" min=\"0.1\" step=\"0.05\" value=\"0.35\" style=\"width:70px;\" />
+      <label style=\"color:#94a3b8;margin-left:12px;\" title=\"Max skew before declaring the drone perpendicular. 0.08 ≈ 6° off the marker normal. Lower values force the drone to align straight-on before hovering.\">Skew tol:</label>
+      <input id=\"mis_skew_tol\" type=\"number\" min=\"0.02\" max=\"0.50\" step=\"0.01\" value=\"0.08\" style=\"width:70px;\" />
       <label style=\"color:#94a3b8;margin-left:12px;display:flex;align-items:center;gap:4px;\">
         <input id=\"mis_auto_takeoff\" type=\"checkbox\" />
         auto-takeoff
@@ -896,7 +899,7 @@ HTML = """
     arcPoll();
     // Version marker — if this string doesn't appear in the DOM,
     // you're running stale JS (restart the Python server or hard-refresh).
-    const BUILD = 'ae-search-maneuver';
+    const BUILD = 'ai-autostart-mjpeg';
     console.log('[arc] init complete, build=' + BUILD);
     const ver = document.createElement('span');
     ver.id = 'arc_build_tag';
@@ -1037,10 +1040,14 @@ HTML = """
       const markers = document.getElementById('mis_markers').value;
       const hover_seconds = parseFloat(document.getElementById('mis_hover_s').value) || 3.0;
       const tol = parseFloat(document.getElementById('mis_tol_m').value) || 0.35;
+      const skew_tol_el = document.getElementById('mis_skew_tol');
+      const skew_tol = skew_tol_el ? (parseFloat(skew_tol_el.value) || 0.08) : 0.08;
       const auto_takeoff = document.getElementById('mis_auto_takeoff').checked;
       const payload = {
         drone_ids, target_markers: markers,
-        hover_seconds, approach_tolerance_m: tol, auto_takeoff,
+        hover_seconds, approach_tolerance_m: tol,
+        approach_skew_tol: skew_tol,
+        auto_takeoff,
       };
       const btn = document.getElementById('mis_start');
       const now = Date.now();
@@ -1478,11 +1485,78 @@ function _isTyping() {
 window.addEventListener('keydown', (e)=>{
   if (_isTyping()) return;
   const k = e.key.toLowerCase();
+  // ── Global panic-button: '0' lands EVERY drone in the fleet ────────
+  // Using the zero key because it's not in the movement keymap (Q is
+  // yaw-CCW, W/A/S/D are translation, R/F are altitude, so letters are
+  // risky). '0' is far from the flight grid and easy to hit one-handed.
+  if (k === '0') {
+    e.preventDefault();
+    if (window._landAllInFlight) return;    // debounce
+    window._landAllInFlight = true;
+    console.log('[LAND_ALL] 0 pressed — landing every drone');
+    landAllDrones('0 hotkey').finally(() => { window._landAllInFlight = false; });
+    return;
+  }
   if (map.has(k)) {
     e.preventDefault();
     pressKey(k === ' ' ? 'space' : k);
   }
 });
+
+// Button wiring for the top-of-page LAND ALL button
+(function(){
+  const b = document.getElementById('land_all_btn');
+  if (!b) return;
+  b.addEventListener('click', () => {
+    if (window._landAllInFlight) return;
+    window._landAllInFlight = true;
+    console.log('[LAND_ALL] button clicked');
+    landAllDrones('button').finally(() => { window._landAllInFlight = false; });
+  });
+})();
+
+// Fleet-wide panic land — used by the 'q' hotkey and the big red
+// LAND ALL button. Shows a banner with per-drone results.
+async function landAllDrones(trigger) {
+  // Visible flash so the operator knows the hotkey fired even before the
+  // server responds — critical for a panic button.
+  showLandAllBanner('⚠ LANDING ALL DRONES (' + trigger + ')…', '#78350f', '#fde68a');
+  try {
+    const r = await fetch('/proxy/land_all', {method:'POST'});
+    const j = await r.json();
+    const summary = (j.landed || 0) + '/' + (j.total || 0) +
+                    ' acknowledged land' +
+                    (j.mission_stopped ? ' (mission stopped)' : '');
+    const color = (j.landed === j.total) ? '#064e3b' : '#7f1d1d';
+    const txt   = (j.landed === j.total) ? '#a7f3d0' : '#fecaca';
+    showLandAllBanner('✓ LAND ALL → ' + summary, color, txt, 6000);
+    console.log('[LAND_ALL] result:', j);
+  } catch (err) {
+    showLandAllBanner('✗ LAND ALL failed: ' + err, '#7f1d1d', '#fecaca', 6000);
+    console.error('[LAND_ALL]', err);
+  }
+}
+
+function showLandAllBanner(msg, bg, fg, autohideMs) {
+  let el = document.getElementById('land_all_banner');
+  if (!el) {
+    el = document.createElement('div');
+    el.id = 'land_all_banner';
+    el.style.cssText = 'position:fixed;top:8px;left:50%;transform:translateX(-50%);' +
+                       'z-index:9999;padding:10px 18px;border-radius:6px;' +
+                       'font-weight:700;font-size:14px;box-shadow:0 4px 14px rgba(0,0,0,0.5);' +
+                       'border:2px solid rgba(255,255,255,0.15);letter-spacing:0.4px;';
+    document.body.appendChild(el);
+  }
+  el.style.background = bg;
+  el.style.color = fg;
+  el.textContent = msg;
+  el.style.display = 'block';
+  clearTimeout(showLandAllBanner._t);
+  if (autohideMs) {
+    showLandAllBanner._t = setTimeout(() => { el.style.display = 'none'; }, autohideMs);
+  }
+}
 window.addEventListener('keyup', (e)=>{
   if (_isTyping()) { releaseAllKeys(); return; }
   const k = e.key.toLowerCase();
@@ -1621,6 +1695,42 @@ const videoContainer = document.getElementById('video_container');
 const videoImg = document.getElementById('video_img');
 let videoActive = false;
 
+// Shared video-start logic — used by the manual toggle AND by the
+// auto-start path that fires as soon as the page loads. Both paths
+// assume Way 1 (MJPEG) unless the user has manually picked forward.
+async function startVideoStream(mode) {
+  mode = mode || videoMode.value || 'mjpeg';
+  if (mode === 'off') return false;
+  try {
+    const r = await fetch('/proxy/video/start', {method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({mode})});
+    const d = await r.json();
+    if (!d.ok) {
+      videoStatus.textContent = 'Error: ' + (d.error || 'unknown');
+      return false;
+    }
+    videoActive = true;
+    videoToggle.textContent = 'Stop Video';
+    videoStatus.textContent = 'Mode: ' + d.mode;
+    videoContainer.style.display = '';
+    if (d.mode === 'mjpeg') {
+      videoImg.src = '/proxy/video?' + Date.now();
+      videoUrl.style.display = '';
+      videoUrl.innerHTML = 'Direct: <b>' + (d.stream_url || '') + '</b>';
+    } else if (d.mode === 'forward') {
+      videoImg.src = '/proxy/video/forward_stream?' + Date.now();
+      videoUrl.style.display = '';
+      videoUrl.innerHTML = 'UDP → C2 decode → MJPEG';
+    }
+    videoMode.value = d.mode;
+    return true;
+  } catch (e) {
+    videoStatus.textContent = 'Error: ' + e;
+    return false;
+  }
+}
+
 videoToggle.onclick = async () => {
   if (videoActive) {
     await post('/proxy/video/stop', {});
@@ -1632,36 +1742,40 @@ videoToggle.onclick = async () => {
     videoStatus.textContent = 'Mode: off';
     return;
   }
-  const mode = videoMode.value;
-  if (mode === 'off') return;
-  const body = {mode};
-  // For forward mode, target_host is auto-detected by the web controller server
+  await startVideoStream(videoMode.value);
+};
+
+// Auto-start Way 1 (MJPEG) on page load. refreshVideoStatus() below will
+// detect if the server reports an already-running stream and skip, so
+// reloading the page won't restart the stream unnecessarily.
+async function autoStartVideo() {
   try {
-    const r = await fetch('/proxy/video/start', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(body)});
+    const r = await fetch('/proxy/video/status', {cache:'no-store'});
     const d = await r.json();
-    if (d.ok) {
+    if (d && d.mode && d.mode !== 'off') {
+      // Already running — adopt existing state without restarting
       videoActive = true;
+      videoMode.value = d.mode;
       videoToggle.textContent = 'Stop Video';
-      videoStatus.textContent = 'Mode: ' + d.mode;
-      // Both modes show video via MJPEG in the browser
       videoContainer.style.display = '';
+      videoStatus.textContent = 'Mode: ' + d.mode + ' (existing)';
       if (d.mode === 'mjpeg') {
         videoImg.src = '/proxy/video?' + Date.now();
-        videoUrl.style.display = '';
-        videoUrl.innerHTML = 'Direct: <b>' + (d.stream_url || '') + '</b>';
       } else if (d.mode === 'forward') {
-        // Forward mode: C2 receives UDP, decodes, serves as MJPEG
         videoImg.src = '/proxy/video/forward_stream?' + Date.now();
-        videoUrl.style.display = '';
-        videoUrl.innerHTML = 'UDP → C2 decode → MJPEG';
       }
-    } else {
-      videoStatus.textContent = 'Error: ' + (d.error || 'unknown');
+      console.log('[video] adopted existing stream:', d.mode);
+      return;
     }
-  } catch(e) {
-    videoStatus.textContent = 'Error: ' + e;
-  }
-};
+  } catch {}
+  // Nothing running — start Way 1 (MJPEG, decoded on the flight controller).
+  videoMode.value = 'mjpeg';
+  console.log('[video] auto-starting MJPEG (Way 1)');
+  const ok = await startVideoStream('mjpeg');
+  if (!ok) console.warn('[video] auto-start failed, click Start Video manually');
+}
+// Fire a bit after page load so /proxy/heartbeat has time to succeed first
+setTimeout(autoStartVideo, 300);
 
 // Poll video status
 async function refreshVideoStatus() {
@@ -3041,6 +3155,70 @@ def proxy_land():
     return (r.text, r.status_code, {"Content-Type": r.headers.get("Content-Type", "application/json")})
 
 
+@app.post("/proxy/land_all")
+def proxy_land_all():
+    """Emergency panic-button: land every configured drone and halt any
+    running mission. Used by the 'q' hotkey in the UI. Tolerates
+    individual drones being unreachable — collects per-drone outcomes
+    and always returns 200 so the client can render the summary."""
+    log_command("land_all")
+
+    # 1) Stop any running mission first so its LIVE-mode state machine
+    #    doesn't immediately re-push RC commands that conflict with land.
+    mission_stopped = False
+    try:
+        if mission_manager is not None and mission_manager.current is not None:
+            mission_stopped = mission_manager.stop(land=False)
+    except Exception as e:
+        print(f"[LAND_ALL] mission stop failed: {e}")
+
+    # 2) Send /api/land to every configured drone in parallel-ish
+    #    (sequentially but with a short timeout per drone).
+    results: dict[str, dict] = {}
+    for did, info in DRONES.items():
+        base = (info or {}).get("base")
+        if not base:
+            results[str(did)] = {"ok": False, "error": "no base url"}
+            continue
+        try:
+            resp = _http_session.post(f"{base.rstrip('/')}/api/land",
+                                      json={}, timeout=3.0)
+            try:
+                j = resp.json()
+            except Exception:
+                j = {"raw": resp.text[:120]}
+            results[str(did)] = {
+                "ok": bool(j.get("ok", resp.status_code == 200)),
+                "status": resp.status_code,
+                "msg": j.get("msg") or j.get("error") or "",
+            }
+        except Exception as e:
+            results[str(did)] = {"ok": False, "error": str(e)[:120]}
+
+    # 3) Also put every ArUco observer back into OBSERVE mode and clear
+    #    any lingering search RC so the drones don't fight the land.
+    try:
+        for did, obs in aruco_fleet._obs.items():
+            try:
+                obs.set_search_rc(0, 0, 0, 0)
+                obs.set_mode("observe")
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    ok_count = sum(1 for v in results.values() if v.get("ok"))
+    print(f"[LAND_ALL] {ok_count}/{len(results)} drones acknowledged land "
+          f"(mission_stopped={mission_stopped})")
+    return jsonify(
+        ok=True,
+        landed=ok_count,
+        total=len(results),
+        mission_stopped=mission_stopped,
+        results=results,
+    )
+
+
 @app.post("/proxy/flip")
 def proxy_flip():
     data = request.get_json(silent=True) or {}
@@ -4004,12 +4182,16 @@ def proxy_missions_scan_all_start():
         return jsonify(ok=False, error="target_markers must parse to at least one id"), 400
     hover_seconds = float(data.get("hover_seconds", 3.0))
     approach_tolerance_m = float(data.get("approach_tolerance_m", 0.35))
+    approach_skew_tol   = float(data.get("approach_skew_tol", 0.08))
+    approach_err_x_tol  = float(data.get("approach_err_x_tol", 0.15))
     auto_takeoff = bool(data.get("auto_takeoff", False))
     ok, msg = mission_manager.start_scan_all(
         drone_ids=[str(d) for d in drone_ids],
         target_markers=target_markers,
         hover_seconds=hover_seconds,
         approach_tolerance_m=approach_tolerance_m,
+        approach_skew_tol=approach_skew_tol,
+        approach_err_x_tol=approach_err_x_tol,
         auto_takeoff=auto_takeoff,
     )
     log_command("mission_scan_all_start", {

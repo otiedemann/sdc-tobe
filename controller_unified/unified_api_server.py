@@ -101,6 +101,29 @@ if HAS_OLYMPE_SDK:
         HAS_SENSOR_STATE = True
     except (ImportError, KeyError):
         HAS_SENSOR_STATE = False
+    # Magnetometer calibration: if the Anafi has been moved between locations
+    # or re-powered, it often needs a figure-8 calibration before it will
+    # arm. These state messages tell us:
+    #   MagnetoCalibrationRequiredState: bool — "does it need re-calibration?"
+    #   MagnetoCalibrationStateChanged: per-axis calibration done (xAxisCalibration,
+    #                                    yAxisCalibration, zAxisCalibration, calibrationFailed)
+    #   MagnetoCalibrationStartedChanged: whether the drone is currently in
+    #                                    calibration mode
+    #   StartCalibration: command to trigger calibration
+    try:
+        from olympe.messages.common.CalibrationState import (
+            MagnetoCalibrationRequiredState,
+            MagnetoCalibrationStateChanged,
+            MagnetoCalibrationStartedChanged,
+        )
+        HAS_MAGNETO_CALIB = True
+    except (ImportError, KeyError):
+        HAS_MAGNETO_CALIB = False
+    try:
+        from olympe.messages.common.Calibration import MagnetoCalibration as StartMagnetoCalibration
+        HAS_MAGNETO_CALIB_CMD = True
+    except (ImportError, KeyError):
+        HAS_MAGNETO_CALIB_CMD = False
     try:
         from olympe.messages.camera import start_recording, stop_recording, take_photo
         HAS_CAMERA = True
@@ -1473,6 +1496,20 @@ class OlympeBackend(DroneBackend):
         if d:
             self._apply_flight_limits(d)
             self._start_piloting()
+            # Log magnetometer calibration state at connect time so the
+            # operator knows BEFORE attempting takeoff whether a figure-8
+            # calibration is needed. The single most common cause of
+            # "takeoff refused" on the Anafi is a stale magnetometer.
+            mag = self._read_magnetometer_state()
+            if mag:
+                if "REQUIRED" in mag.upper() or "FAIL" in mag.upper():
+                    print(f"[ANAFI] ⚠ MAGNETOMETER CALIBRATION NEEDED: {mag}")
+                    print("[ANAFI]   → use FreeFlight 7 app to run the figure-8")
+                    print("[ANAFI]     calibration dance, or POST /api/magneto/calibrate")
+                else:
+                    print(f"[ANAFI] Magnetometer: {mag}")
+            else:
+                print("[ANAFI] Magnetometer: state not yet reported by drone")
 
     # --- Flight ---
     def takeoff(self) -> Tuple[bool, str]:
@@ -1482,16 +1519,19 @@ class OlympeBackend(DroneBackend):
         fs = self._get_state(FlyingStateChanged)
         print(f"[ANAFI] /api/takeoff — flying={flying}, state={fs}")
 
-        # Pre-takeoff diagnostics: log any active alerts so we know why if it refuses
-        pre_alert = self._read_alert_state()
-        pre_motor = self._read_motor_error_state()
-        pre_sensors = self._read_sensors_state()
-        if pre_alert and pre_alert != "none":
-            print(f"[ANAFI] Pre-takeoff ALERT state: {pre_alert}")
-        if pre_motor:
-            print(f"[ANAFI] Pre-takeoff MOTOR state: {pre_motor}")
-        if pre_sensors:
-            print(f"[ANAFI] Pre-takeoff SENSORS: {pre_sensors}")
+        # Pre-takeoff diagnostics — ALWAYS print the current state of every
+        # relevant subsystem so we know WHY when a takeoff refuses. Previous
+        # version only printed problems, but some states return None when
+        # they're fine, which left the log ambiguous.
+        pre_alert    = self._read_alert_state()
+        pre_motor    = self._read_motor_error_state()
+        pre_sensors  = self._read_sensors_state()
+        pre_magneto  = self._read_magnetometer_state()
+        print(f"[ANAFI] Pre-takeoff diagnostics:")
+        print(f"[ANAFI]   alert      = {pre_alert if pre_alert is not None else '(not available)'}")
+        print(f"[ANAFI]   motor      = {pre_motor  if pre_motor  is not None else '(no issue)'}")
+        print(f"[ANAFI]   sensors    = {pre_sensors if pre_sensors else '(all OK)'}")
+        print(f"[ANAFI]   magneto    = {pre_magneto if pre_magneto else '(not available)'}")
 
         self._stop_piloting()
         time.sleep(0.2)
@@ -1518,16 +1558,34 @@ class OlympeBackend(DroneBackend):
                 return True, "ok_polled"
         self._start_piloting()
 
-        # Post-failure diagnostics: read alert/motor/sensor state again in case it changed
-        post_alert = self._read_alert_state()
-        post_motor = self._read_motor_error_state()
+        # Post-failure diagnostics: read alert/motor/sensor/magneto state again
+        # in case it changed as a result of the attempt.
+        post_alert   = self._read_alert_state()
+        post_motor   = self._read_motor_error_state()
+        post_sensors = self._read_sensors_state()
+        post_magneto = self._read_magnetometer_state()
         reason_parts = []
         if post_alert and post_alert != "none":
             reason_parts.append(f"alert={post_alert}")
         if post_motor:
             reason_parts.append(f"motor={post_motor}")
+        if post_sensors:
+            reason_parts.append(f"sensors={post_sensors}")
+        # The magnetometer is the top recurring cause of Anafi takeoff refusals
+        # in this project — surface it prominently.
+        if post_magneto and ("REQUIRED" in post_magneto.upper() or
+                             "FAIL" in post_magneto.upper()):
+            reason_parts.append(f"magneto={post_magneto}")
         reason = "takeoff_failed" + (f" ({', '.join(reason_parts)})" if reason_parts else "")
         print(f"[ANAFI] takeoff refused — {reason}")
+        if post_magneto:
+            print(f"[ANAFI] Post-takeoff magneto status: {post_magneto}")
+        if not reason_parts:
+            # No single state flagged — print a generic tip so operators know
+            # the recommended recovery path.
+            print("[ANAFI] No specific fault flagged by Olympe. Common causes: "
+                  "magnetometer needs figure-8 calibration via FreeFlight app; "
+                  "drone not level; battery too low; motors recently stalled.")
         return False, reason
 
     def _read_alert_state(self):
@@ -1586,6 +1644,57 @@ class OlympeBackend(DroneBackend):
             return None if ok else f"{name}=KO"
         except Exception as e:
             return f"<err:{e}>"
+
+    def _read_magnetometer_state(self):
+        """Return a human-readable magnetometer calibration status, or None.
+
+        Parrot exposes three separate messages for magnetometer state:
+          - MagnetoCalibrationRequiredState: {required: 0|1}
+          - MagnetoCalibrationStateChanged: per-axis calibration done bits
+          - MagnetoCalibrationStartedChanged: {started: 0|1}
+        We aggregate them into one string like:
+          "REQUIRED" | "in-progress" | "axes=X/Y/Z, no-fail" | "calibrated"
+        so a single log line tells the operator whether the figure-8 dance
+        is needed before this drone will arm."""
+        if not HAS_MAGNETO_CALIB or self.drone is None:
+            return None
+        parts = []
+        try:
+            req_state = self._get_state(MagnetoCalibrationRequiredState)
+            if req_state is not None:
+                # {'required': 0 | 1}
+                req = req_state.get("required") if hasattr(req_state, "get") else None
+                if req == 1 or req is True:
+                    parts.append("REQUIRED")
+                elif req == 0 or req is False:
+                    parts.append("not-required")
+        except Exception as e:
+            parts.append(f"req_err:{e}")
+        try:
+            st_state = self._get_state(MagnetoCalibrationStateChanged)
+            if st_state is not None:
+                # {'xAxisCalibration': 1, 'yAxisCalibration': 1,
+                #  'zAxisCalibration': 1, 'calibrationFailed': 0}
+                x = st_state.get("xAxisCalibration", 0)
+                y = st_state.get("yAxisCalibration", 0)
+                z = st_state.get("zAxisCalibration", 0)
+                failed = st_state.get("calibrationFailed", 0)
+                parts.append(f"axes=x{int(x)}y{int(y)}z{int(z)}")
+                if failed:
+                    parts.append("FAILED")
+                elif x and y and z:
+                    parts.append("all-axes-ok")
+        except Exception as e:
+            parts.append(f"state_err:{e}")
+        try:
+            started_state = self._get_state(MagnetoCalibrationStartedChanged)
+            if started_state is not None:
+                started = started_state.get("started", 0)
+                if started:
+                    parts.append("in-progress")
+        except Exception as e:
+            parts.append(f"started_err:{e}")
+        return ", ".join(parts) if parts else None
 
     def land(self) -> Tuple[bool, str]:
         d = self._d()
@@ -2614,6 +2723,48 @@ def api_heartbeat():
     return jsonify(ok=True, flying=flying, connected=connected, drone_type=drone_type, t=time.time())
 
 
+@app.get("/api/magneto")
+def api_magneto_get():
+    """Return the current magnetometer calibration status for this drone.
+    Returns {ok, status} where status is a human-readable string like
+    'REQUIRED, axes=x0y0z0' or 'not-required, all-axes-ok'. Returns None
+    for status if the drone isn't Anafi or the state hasn't been reported."""
+    b = backend
+    mag = None
+    reader = getattr(b, "_read_magnetometer_state", None) if b else None
+    if callable(reader):
+        try:
+            mag = reader()
+        except Exception as e:
+            mag = f"err:{e}"
+    required = bool(mag and ("REQUIRED" in mag.upper() or "FAIL" in mag.upper()))
+    return jsonify(ok=True, status=mag, required=required, drone_type=drone_type)
+
+
+@app.post("/api/magneto/calibrate")
+def api_magneto_calibrate():
+    """Trigger magnetometer calibration on the drone. After calling this,
+    the operator must rotate the drone in a figure-8 motion around each
+    axis (≈ 30 seconds total) until the drone confirms completion via
+    MagnetoCalibrationStateChanged. Safer to do this via the FreeFlight
+    app where the drone's LEDs give visual feedback on each axis."""
+    if not HAS_OLYMPE_SDK or not HAS_MAGNETO_CALIB_CMD:
+        return jsonify(ok=False, error="magnetometer calibration not supported "
+                                        "by this Olympe build"), 400
+    b = backend
+    if b is None or getattr(b, "drone", None) is None:
+        return jsonify(ok=False, error="drone not connected"), 503
+    try:
+        # '1' = start calibration
+        with command_lock:
+            b.drone(StartMagnetoCalibration(1)).wait(_timeout=2)
+        print("[ANAFI] Magnetometer calibration REQUESTED — operator must "
+              "rotate drone in figure-8 around each axis.")
+        return jsonify(ok=True, message="calibration started — rotate drone in figure-8")
+    except Exception as e:
+        return jsonify(ok=False, error=str(e)), 500
+
+
 @app.get("/api/capabilities")
 def api_capabilities():
     b = backend
@@ -3103,6 +3254,20 @@ def api_telemetry():
         payload["connected"] = bool(conn_state.get("connected", False))
         payload["reconnect_failures"] = int(conn_state.get("consecutive_failures", 0))
         payload["reconnect_last_error"] = conn_state.get("last_error", "") or ""
+    # Magnetometer calibration status (Anafi only) so the C2 can show a
+    # "CAL NEEDED" indicator. Read defensively because older Olympe versions
+    # may not have the calibration messages at all.
+    try:
+        b = backend
+        reader = getattr(b, "_read_magnetometer_state", None) if b else None
+        if callable(reader):
+            mag = reader()
+            payload["magneto_status"] = mag
+            payload["magneto_required"] = bool(
+                mag and ("REQUIRED" in mag.upper() or "FAIL" in mag.upper())
+            )
+    except Exception:
+        pass
     resp = jsonify(payload)
     resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
     resp.headers["Pragma"] = "no-cache"

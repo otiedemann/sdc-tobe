@@ -66,14 +66,22 @@ MARKER_SIZE_CALIB_M = 0.18    # marker size the CALIB_A/CALIB_B power-law was fi
 HOVER_EMA_ALPHA       = 0.30   # 0=no update, 1=no smoothing. Lower = smoother
 HOVER_DEADBAND_X      = 0.05   # |err_x| below this → no yaw command
 HOVER_DEADBAND_Y      = 0.06   # |err_y| below this → no altitude command
-HOVER_DEADBAND_SKEW   = 0.10   # |skew|  below this → no lateral command (large to ignore drone roll)
+HOVER_DEADBAND_SKEW   = 0.04   # |skew| below this → no lateral command. Small value so the
+                              # drone corrects for perspective distortion and ends up
+                              # perpendicular to the marker face. Raise to 0.10+ if drone
+                              # roll introduces too much noise.
 HOVER_DEADBAND_DIST_M = 0.20   # |dist err| below this → no fwd/back command
 HOVER_YAW_P           = 10.0   # was 35 — gentle
-HOVER_SKEW_P          = 8.0    # was 18 — gentle, and err_x no longer enters lr
+HOVER_SKEW_P          = 25.0   # lateral gain per unit of perspective skew. Strong enough to
+                              # actually drive the drone perpendicular to the marker. Previous
+                              # 8.0 was too weak — at skew=0.2 it only produced 1.6 RC which
+                              # was below rc_min, so the drone stayed sideways forever.
 HOVER_ALT_P           = 25.0   # was 60 — gentle altitude hold
 HOVER_DIST_P          = 4.0    # was 8  — gentle distance hold
 HOVER_YAW_MAX         = 15     # was 40 — clamp magnitude
-HOVER_LR_MAX          = 6      # was 12
+HOVER_LR_MAX          = 15     # RC% cap on lateral correction. Raised from 6 so the drone
+                              # has enough authority to actually translate sideways for
+                              # perpendicular alignment in reasonable time.
 HOVER_UD_MAX          = 25     # was 50
 HOVER_FB_MAX          = 6      # forward clamp
 HOVER_FB_BACK_MAX     = 8      # backward clamp (slightly higher → safer to back off)
