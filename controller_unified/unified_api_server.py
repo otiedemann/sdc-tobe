@@ -124,6 +124,27 @@ if HAS_OLYMPE_SDK:
         HAS_MAGNETO_CALIB_CMD = True
     except (ImportError, KeyError):
         HAS_MAGNETO_CALIB_CMD = False
+
+
+def _magneto_needs_calibration(status: Optional[str]) -> bool:
+    """Return True only when the magnetometer really needs recalibration.
+
+    The status string from _read_magnetometer_state() is a comma-separated
+    list of tokens like "REQUIRED", "not-required", "all-axes-ok", "FAILED",
+    "axes=x1y1z1", "in-progress". Our earlier substring check matched
+    "REQUIRED" inside "not-required" and produced a false warning — fix
+    by splitting on commas and comparing token-by-token.
+    """
+    if not status:
+        return False
+    tokens = [t.strip().lower() for t in status.split(",")]
+    if "required" in tokens:      # exact token, not a substring
+        return True
+    for t in tokens:
+        # Accepts "failed", "calibrationfailed", "fail", etc.
+        if t.startswith("fail") or t == "failed":
+            return True
+    return False
     try:
         from olympe.messages.camera import start_recording, stop_recording, take_photo
         HAS_CAMERA = True
@@ -1502,7 +1523,7 @@ class OlympeBackend(DroneBackend):
             # "takeoff refused" on the Anafi is a stale magnetometer.
             mag = self._read_magnetometer_state()
             if mag:
-                if "REQUIRED" in mag.upper() or "FAIL" in mag.upper():
+                if _magneto_needs_calibration(mag):
                     print(f"[ANAFI] ⚠ MAGNETOMETER CALIBRATION NEEDED: {mag}")
                     print("[ANAFI]   → use FreeFlight 7 app to run the figure-8")
                     print("[ANAFI]     calibration dance, or POST /api/magneto/calibrate")
@@ -1573,8 +1594,7 @@ class OlympeBackend(DroneBackend):
             reason_parts.append(f"sensors={post_sensors}")
         # The magnetometer is the top recurring cause of Anafi takeoff refusals
         # in this project — surface it prominently.
-        if post_magneto and ("REQUIRED" in post_magneto.upper() or
-                             "FAIL" in post_magneto.upper()):
+        if _magneto_needs_calibration(post_magneto):
             reason_parts.append(f"magneto={post_magneto}")
         reason = "takeoff_failed" + (f" ({', '.join(reason_parts)})" if reason_parts else "")
         print(f"[ANAFI] takeoff refused — {reason}")
@@ -2737,7 +2757,7 @@ def api_magneto_get():
             mag = reader()
         except Exception as e:
             mag = f"err:{e}"
-    required = bool(mag and ("REQUIRED" in mag.upper() or "FAIL" in mag.upper()))
+    required = _magneto_needs_calibration(mag)
     return jsonify(ok=True, status=mag, required=required, drone_type=drone_type)
 
 
@@ -3263,9 +3283,7 @@ def api_telemetry():
         if callable(reader):
             mag = reader()
             payload["magneto_status"] = mag
-            payload["magneto_required"] = bool(
-                mag and ("REQUIRED" in mag.upper() or "FAIL" in mag.upper())
-            )
+            payload["magneto_required"] = _magneto_needs_calibration(mag)
     except Exception:
         pass
     resp = jsonify(payload)
