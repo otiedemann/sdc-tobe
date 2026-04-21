@@ -861,7 +861,13 @@ HTML = """
         '<span class=\"k\">ud:</span>'+(s.rc_ud ?? '—')+' <span class=\"pd\">(P='+fmt(s.rc_ud_p,1)+' D='+fmt(s.rc_ud_d,1)+')</span>' +
         '&nbsp; <span class=\"k\">yaw:</span>'+(s.rc_yaw ?? '—')+' <span class=\"pd\">(P='+fmt(s.rc_yaw_p,1)+' D='+fmt(s.rc_yaw_d,1)+')</span><br>' +
         (s.rc_sent_at ? '<span class=\"k\">last sent:</span><span class=\"arc-rc-sent\">'+((Date.now()/1000 - s.rc_sent_at).toFixed(1))+' s ago</span><br>' : '') +
-        (s.rc_send_error ? '<span class=\"k\">send err:</span><span style=\"color:#fca5a5;\">'+s.rc_send_error+'</span><br>' : '');
+        (s.rc_send_error ? '<span class=\"k\">send err:</span><span style=\"color:#fca5a5;\">'+s.rc_send_error+'</span><br>' : '') +
+        // Arena safety guard banner — red when active, grey when idle.
+        (s.guard && s.guard.active
+          ? '<br><b style=\"color:#fca5a5;background:#7f1d1d;padding:2px 6px;border-radius:3px;\">⛔ SAFETY GUARD</b> '
+              + '<span class=\"pd\">' + (s.guard.actions||[]).join(', ')
+              + '  pos=('+ (s.guard.pos||[]).join(',') +')</span>'
+          : '');
       document.getElementById('arc_readout').innerHTML = html;
     }
 
@@ -1078,7 +1084,7 @@ HTML = """
     arcPoll();
     // Version marker — if this string doesn't appear in the DOM,
     // you're running stale JS (restart the Python server or hard-refresh).
-    const BUILD = 'ar-smooth-rc';
+    const BUILD = 'as-arena-safety-guard';
     console.log('[arc] init complete, build=' + BUILD);
     const ver = document.createElement('span');
     ver.id = 'arc_build_tag';

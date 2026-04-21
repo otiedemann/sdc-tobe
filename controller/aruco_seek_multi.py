@@ -180,6 +180,17 @@ class DroneObserver:
 
         self.mode: str = "observe"       # "observe" | "live"
         self.allow_live = bool(allow_live)
+        # ── Arena safety bounds (world frame, metres) ────────────────
+        # Drone must never leave this box. Default per SDC26 ruleset
+        # (20 × 10.8 × 6 m field). Configurable via set_arena_bounds().
+        # safety_margin_m is how close to a wall we start braking.
+        self._arena_bounds = {
+            "x_min": -10.0, "x_max": 10.0,
+            "y_min":   0.0, "y_max": 10.8,
+            "z_min":   0.3, "z_max":  5.0,   # some ceiling headroom
+        }
+        self._safety_margin_m = 1.0
+        self._last_guard_info = {}   # diagnostics for state snapshot
         # Search RC — commands the drone sends when in LIVE mode but not
         # actively tracking a marker (e.g. mission SEARCH maneuver).
         # Tuple: (lr, fb, ud, yaw) in RC units -100..100. Mission controls this.
@@ -231,7 +242,124 @@ class DroneObserver:
         except Exception as e:
             return {"ok": False, "error": str(e)}
 
+    def set_arena_bounds(self, bounds: dict, safety_margin_m: float = None):
+        """Override the arena safety box. `bounds` keys: x_min, x_max,
+        y_min, y_max, z_min, z_max (all metres, world frame)."""
+        with self._lock:
+            self._arena_bounds.update({k: float(v) for k, v in bounds.items()
+                                       if k in self._arena_bounds})
+            if safety_margin_m is not None:
+                self._safety_margin_m = float(safety_margin_m)
+
+    def _apply_boundary_guard(self, lr: int, fb: int, ud: int, yaw_rc: int):
+        """Return (lr, fb, ud, yaw_rc) clamped so the drone won't be
+        pushed past the arena margin. When already inside the margin,
+        REVERSES the offending component to actively retreat (hard brake
+        + push back). Yaw and altitude are treated independently from
+        xy translation.
+
+        Body-frame → world-frame conversion uses the drone's current yaw:
+            world_dx = cos(yaw)·lr + sin(yaw)·fb
+            world_dy = -sin(yaw)·lr + cos(yaw)·fb
+        (Anafi yaw=0 → nose points +y, positive yaw rotates CW.)
+        """
+        with self._lock:
+            snap = self.latest
+            bounds = dict(self._arena_bounds)
+            margin = self._safety_margin_m
+        pos = snap.get("pos") or snap.get("cam")
+        if not isinstance(pos, (list, tuple)) or len(pos) < 2:
+            self._last_guard_info = {"active": False, "reason": "no-pos"}
+            return lr, fb, ud, yaw_rc
+        px = float(pos[0])
+        py = float(pos[1])
+        pz = float(pos[2]) if len(pos) >= 3 else 1.0
+
+        yaw_deg = snap.get("yaw", 0.0) or 0.0
+        yaw_rad = math.radians(float(yaw_deg))
+        cy, sy = math.cos(yaw_rad), math.sin(yaw_rad)
+
+        # Body-frame RC → world-frame intended velocity direction
+        wdx =  cy * lr + sy * fb
+        wdy = -sy * lr + cy * fb
+
+        # How deep inside each wall's margin are we? Positive = still
+        # outside the danger zone, negative = already past the margin.
+        clearance = {
+            "x_max": bounds["x_max"] - px - margin,   # space left before +x wall
+            "x_min": (px - bounds["x_min"]) - margin, # space left before -x wall
+            "y_max": bounds["y_max"] - py - margin,
+            "y_min": (py - bounds["y_min"]) - margin,
+            "z_max": bounds["z_max"] - pz - margin,
+            "z_min": (pz - bounds["z_min"]) - margin,
+        }
+
+        # Retreat-RC magnitude. Modest so we don't overshoot in the opposite
+        # direction. The PD loop's normal authority is higher so it can
+        # override this when heading back toward center is the correct thing.
+        RETREAT_RC = 15
+        guard_info = {"active": False, "actions": [], "clearance": {
+            k: round(v, 2) for k, v in clearance.items()
+        }, "pos": [round(px, 2), round(py, 2), round(pz, 2)]}
+
+        # X axis (world)
+        if clearance["x_max"] <= 0 and wdx >= 0:
+            wdx = -abs(wdx) * 0.0 - RETREAT_RC    # force negative (retreat)
+            guard_info["actions"].append("retreat-x_max")
+        elif clearance["x_max"] < margin and wdx > 0:
+            wdx = min(wdx, int(RETREAT_RC * clearance["x_max"] / margin))
+            guard_info["actions"].append("clamp-x_max")
+        if clearance["x_min"] <= 0 and wdx <= 0:
+            wdx = RETREAT_RC
+            guard_info["actions"].append("retreat-x_min")
+        elif clearance["x_min"] < margin and wdx < 0:
+            wdx = max(wdx, -int(RETREAT_RC * clearance["x_min"] / margin))
+            guard_info["actions"].append("clamp-x_min")
+
+        # Y axis (world)
+        if clearance["y_max"] <= 0 and wdy >= 0:
+            wdy = -RETREAT_RC
+            guard_info["actions"].append("retreat-y_max")
+        elif clearance["y_max"] < margin and wdy > 0:
+            wdy = min(wdy, int(RETREAT_RC * clearance["y_max"] / margin))
+            guard_info["actions"].append("clamp-y_max")
+        if clearance["y_min"] <= 0 and wdy <= 0:
+            wdy = RETREAT_RC
+            guard_info["actions"].append("retreat-y_min")
+        elif clearance["y_min"] < margin and wdy < 0:
+            wdy = max(wdy, -int(RETREAT_RC * clearance["y_min"] / margin))
+            guard_info["actions"].append("clamp-y_min")
+
+        # Convert world-frame intent back to body frame
+        new_lr =  cy * wdx - sy * wdy
+        new_fb =  sy * wdx + cy * wdy
+
+        # Altitude (already world-frame)
+        new_ud = ud
+        if clearance["z_max"] <= 0 and ud >= 0:
+            new_ud = -RETREAT_RC
+            guard_info["actions"].append("retreat-z_max")
+        elif clearance["z_max"] < margin and ud > 0:
+            new_ud = min(ud, int(RETREAT_RC * clearance["z_max"] / margin))
+            guard_info["actions"].append("clamp-z_max")
+        if clearance["z_min"] <= 0 and new_ud <= 0:
+            new_ud = RETREAT_RC
+            guard_info["actions"].append("retreat-z_min")
+        elif clearance["z_min"] < margin and new_ud < 0:
+            new_ud = max(new_ud, -int(RETREAT_RC * clearance["z_min"] / margin))
+            guard_info["actions"].append("clamp-z_min")
+
+        if guard_info["actions"]:
+            guard_info["active"] = True
+        self._last_guard_info = guard_info
+        return (int(round(new_lr)), int(round(new_fb)),
+                int(round(new_ud)), int(yaw_rc))
+
     def _send_rc(self, lr: int = 0, fb: int = 0, ud: int = 0, yaw: int = 0) -> dict:
+        # Boundary guard clamps/reverses RC to keep the drone inside the
+        # arena safety box. If we're moving into a wall we already passed
+        # the margin for, the drone is actively pushed back to center.
+        lr, fb, ud, yaw = self._apply_boundary_guard(lr, fb, ud, yaw)
         return self._api_post("/api/rc", {
             "lr": _clamp_rc(lr), "fb": _clamp_rc(fb),
             "ud": _clamp_rc(ud), "yaw": _clamp_rc(yaw),
@@ -437,6 +565,10 @@ class DroneObserver:
             "altitude_m": round(height_m, 2),
             "battery": bat,
         })
+        # Surface the most recent boundary-guard decision so UI + trace
+        # can visualise when the safety net is actively braking/retreating.
+        if self._last_guard_info:
+            snapshot["guard"] = dict(self._last_guard_info)
 
         if not vid_all:
             snapshot["marker_id"] = None
@@ -998,6 +1130,7 @@ class ScanAllMarkersMission:
                     "yaw":  snap.get("yaw"),
                     "battery": snap.get("battery"),
                     "altitude_m": snap.get("altitude_m"),
+                    "guard": snap.get("guard"),
                 })
 
             # Observer not running? Try to recover
