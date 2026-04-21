@@ -152,7 +152,7 @@ def has_gui():
 TAKEOFF_HEIGHT_Z = 1.2         # world-frame Z (up) to wait for after takeoff
 TAKEOFF_TIMEOUT_S = 15.0       # abort takeoff after this many seconds
 HOLD_ARRIVE_RADIUS = 0.25      # m – radius at which HOLD is declared
-CAM_LOST_TIMEOUT_S = 2.0       # seconds without cam position before entering recovery yaw
+CAM_LOST_TIMEOUT_S = 0.5       # seconds without cam position before entering recovery yaw
 RECOVERY_YAW_RATE = 0.1        # rad/s slow yaw rotation during recovery
 RECOVERY_MAX_YAW_SPEED = 150   # °/s – MaxRotationSpeed sent to drone before recovery PCMD
 
@@ -312,7 +312,7 @@ class AutonomousMission:
             self._tick_fly_to(vision_result, now, drone)
 
         elif self._phase == MissionPhase.HOLD:
-            self._tick_hold(now)
+            self._tick_hold(vision_result, now, drone)
 
     # ------------------------------------------------------------------ #
     # Phase handlers                                                       #
@@ -397,8 +397,35 @@ class AutonomousMission:
 
         self._send_recovery_yaw(drone)
 
-    def _tick_hold(self, now):
-        pass  # Hold position indefinitely; controller keeps target active
+    def _tick_hold(self, vision_result, now, drone=None):
+        cam = self._get_cam_pos(vision_result)
+
+        if cam is not None:
+            self._last_cam_ts = now
+            if self._recovering:
+                self._recovering = False
+                print("[mission] Cam position regained during HOLD – resuming position hold")
+                if self.ctrl is not None:
+                    x, y, z = self.fly_to
+                    self.ctrl.set_target(x, y, z)
+            return
+
+        lost_for = now - self._last_cam_ts
+        if lost_for < CAM_LOST_TIMEOUT_S:
+            return  # brief dropout, keep holding
+
+        # Timeout exceeded: enter/continue recovery yaw.
+        if not self._recovering:
+            self._recovering = True
+            print(
+                f"[mission] HOLD – cam lost for {lost_for:.1f} s, "
+                "stopping and yaw-searching for position markers"
+            )
+            if self.ctrl is not None:
+                self.ctrl.clear_target()
+            self._set_recovery_yaw_speed(drone)
+
+        self._send_recovery_yaw(drone)
 
     # ------------------------------------------------------------------ #
     # Helpers                                                              #
@@ -1254,6 +1281,14 @@ def main():
                         )
                     elif anafi_drone is not None:
                         ctrl_module.send_pcmd_olympe(anafi_drone, rc)
+            elif not _mission_manually_overridden and _ctrl_state is None \
+                    and anafi_drone is not None and not mission_dry_run:
+                # No cam position and no manual input — stop all movement so the drone
+                # does not drift while the mission's recovery yaw-search takes over.
+                ctrl_module.send_pcmd_olympe(
+                    anafi_drone,
+                    {"forward_back": 0, "left_right": 0, "up_down": 0, "yaw": 0},
+                )
 
             # --------------------------------------
             # Autonomous mission tick
@@ -1650,6 +1685,11 @@ def main():
                         anafi_drone.stop_video_streaming()
                     except Exception:
                         pass
+            # Give Olympe's event loop time to flush _media_removed callbacks
+            # before disconnect tears down the connection.  Without this pause the
+            # background callback raises TimeoutError waiting on a future that is
+            # never resolved because the socket is already closed.
+            time.sleep(1.0)
             try:
                 if motion_listener is not None:
                     motion_listener.unsubscribe()
