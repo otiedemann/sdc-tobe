@@ -211,6 +211,18 @@ class PositionController:
                 self._phase = Phase.TRANSIT
                 print(f"[controller] → TRANSIT  (err_xy={dist_xy:.2f} m)")
 
+        # ---- arrived: stop all movement ----
+        if self._phase == Phase.HOVER:
+            return {
+                "forward_back": 0,
+                "left_right":   0,
+                "up_down":      0,
+                "yaw":          0,
+                "_phase":       self._phase,
+                "_err_xy":      round(dist_xy, 3),
+                "_err_z":       round(ez, 3),
+            }
+
         # ---- horizontal velocity setpoint (world frame) ----
         vx_sp = KP_XY * ex
         vy_sp = KP_XY * ey
