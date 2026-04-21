@@ -126,6 +126,43 @@ if HAS_OLYMPE_SDK:
         HAS_MAGNETO_CALIB_CMD = False
 
 
+# ─── Optional Wi-Fi control messages ────────────────────────────────────────
+# The Anafi is dual-band 2.4/5 GHz 802.11n. The drone exposes AP-channel
+# config via Olympe. Only imported on systems where Olympe is available;
+# everything that uses these is guarded by HAS_WIFI_CTRL.
+HAS_WIFI_CTRL = False
+if HAS_OLYMPE_SDK:
+    try:
+        from olympe.messages.wifi import (
+            set_ap_channel as WifiSetApChannel,
+            scan as WifiScan,
+            rssi_changed as WifiRssiChanged,
+            authorized_channel as WifiAuthorizedChannel,
+            ap_channel_changed as WifiApChannelChanged,
+            country_changed as WifiCountryChanged,
+            environement_changed as WifiEnvironmentChanged,
+        )
+        from olympe.enums.wifi import (
+            SelectionType as WifiSelectionType,
+            Band as WifiBand,
+        )
+        HAS_WIFI_CTRL = True
+    except (ImportError, KeyError, AttributeError) as _e:
+        # Older Olympe versions have slightly different paths. Try a
+        # fallback via the .Command submodule.
+        try:
+            from olympe.messages.wifi import Command as _WifiCmd
+            WifiSetApChannel = getattr(_WifiCmd, "SetApChannel", None)
+            WifiScan = getattr(_WifiCmd, "ScanChannels", None)
+            from olympe.messages import wifi as _wifi_events
+            WifiApChannelChanged = getattr(_wifi_events, "ApChannelChanged", None)
+            WifiAuthorizedChannel = getattr(_wifi_events, "AuthorizedChannel", None)
+            WifiRssiChanged = getattr(_wifi_events, "Rssi_changed", None)
+            HAS_WIFI_CTRL = bool(WifiSetApChannel and WifiScan)
+        except Exception:
+            HAS_WIFI_CTRL = False
+
+
 def _magneto_needs_calibration(status: Optional[str]) -> bool:
     """Return True only when the magnetometer really needs recalibration.
 
@@ -2781,6 +2818,145 @@ def api_magneto_calibrate():
         print("[ANAFI] Magnetometer calibration REQUESTED — operator must "
               "rotate drone in figure-8 around each axis.")
         return jsonify(ok=True, message="calibration started — rotate drone in figure-8")
+    except Exception as e:
+        return jsonify(ok=False, error=str(e)), 500
+
+
+# ─── Wi-Fi control (Anafi is dual-band 2.4/5 GHz) ───────────────────────────
+
+def _anafi_backend():
+    """Return the active OlympeBackend or None."""
+    b = backend
+    if b is None or not isinstance(b, OlympeBackend):
+        return None
+    if b.drone is None:
+        return None
+    return b
+
+
+@app.get("/api/wifi/status")
+def api_wifi_status():
+    """Report the current AP channel + band the Anafi is broadcasting on."""
+    if not HAS_WIFI_CTRL:
+        return jsonify(ok=False, error="Wi-Fi control not supported by this "
+                                        "Olympe build"), 501
+    b = _anafi_backend()
+    if b is None:
+        return jsonify(ok=False, error="drone not connected"), 503
+    try:
+        st = b._get_state(WifiApChannelChanged) if WifiApChannelChanged else None
+        if st is None:
+            return jsonify(ok=True, status="not-reported")
+        return jsonify(ok=True, status=dict(st))
+    except Exception as e:
+        return jsonify(ok=False, error=str(e)), 500
+
+
+@app.post("/api/wifi/scan")
+def api_wifi_scan():
+    """Scan Wi-Fi channels in the requested band and return authorized
+    channels with their measured RSSI. Pass {"band": "2_4_GHz"} or
+    {"band": "5_GHz"} or {"band": "all"} (default).
+
+    The scan takes ~2-3 seconds. Results come from multiple
+    AuthorizedChannel events that Olympe collects in response."""
+    if not HAS_WIFI_CTRL:
+        return jsonify(ok=False, error="Wi-Fi control not supported"), 501
+    b = _anafi_backend()
+    if b is None:
+        return jsonify(ok=False, error="drone not connected"), 503
+    data = request.get_json(silent=True) or {}
+    band_str = str(data.get("band", "all")).lower()
+    try:
+        band = {
+            "2_4_ghz": getattr(WifiBand, "2_4_GHz", None) if "WifiBand" in globals() else "2_4_GHz",
+            "2.4":     getattr(WifiBand, "2_4_GHz", None) if "WifiBand" in globals() else "2_4_GHz",
+            "5_ghz":   getattr(WifiBand, "5_GHz",   None) if "WifiBand" in globals() else "5_GHz",
+            "5":       getattr(WifiBand, "5_GHz",   None) if "WifiBand" in globals() else "5_GHz",
+            "all":     getattr(WifiBand, "all",     None) if "WifiBand" in globals() else "all",
+        }.get(band_str, band_str)
+        with command_lock:
+            b.drone(WifiScan(band=band)).wait(_timeout=5)
+        # Harvest the authorized-channel events. Olympe's state dict keeps
+        # the latest per channel, so we pull them all.
+        channels = []
+        try:
+            # AuthorizedChannel is a multi-valued state. Try state() to get
+            # all known channels, but API varies by Olympe version.
+            all_ch = b.drone.get_state(WifiAuthorizedChannel)
+            if isinstance(all_ch, dict):
+                channels = list(all_ch.values())
+            elif isinstance(all_ch, list):
+                channels = all_ch
+        except Exception:
+            pass
+        return jsonify(ok=True, band=str(band), channels=channels)
+    except Exception as e:
+        return jsonify(ok=False, error=str(e)), 500
+
+
+@app.post("/api/wifi/channel")
+def api_wifi_channel():
+    """Set the Anafi's AP channel. Two modes:
+
+    - Automatic (recommended): {"auto": true, "band": "5_GHz"} — drone
+      scans and picks the cleanest channel in the requested band.
+    - Manual: {"auto": false, "band": "5_GHz", "channel": 36} — pin to
+      a specific channel. Valid channels: 1–13 for 2.4 GHz, 36/40/44/48/
+      149/153/157/161/165 for 5 GHz (region-dependent).
+
+    IMPORTANT: changing the AP channel momentarily drops the Wi-Fi
+    connection (drone re-associates on the new channel). The watchdog
+    will reconnect within a few seconds. Only issue this command when
+    the drone is ON THE GROUND.
+    """
+    if not HAS_WIFI_CTRL:
+        return jsonify(ok=False, error="Wi-Fi control not supported"), 501
+    b = _anafi_backend()
+    if b is None:
+        return jsonify(ok=False, error="drone not connected"), 503
+    data = request.get_json(silent=True) or {}
+    auto_mode = bool(data.get("auto", True))
+    band_str  = str(data.get("band", "5_GHz")).lower()
+    channel   = int(data.get("channel", 0))
+
+    try:
+        # Map string → enum (defensive against naming drift between Olympe versions)
+        band = {
+            "2_4_ghz": getattr(WifiBand, "2_4_GHz", None) if "WifiBand" in globals() else "2_4_GHz",
+            "2.4":     getattr(WifiBand, "2_4_GHz", None) if "WifiBand" in globals() else "2_4_GHz",
+            "5_ghz":   getattr(WifiBand, "5_GHz",   None) if "WifiBand" in globals() else "5_GHz",
+            "5":       getattr(WifiBand, "5_GHz",   None) if "WifiBand" in globals() else "5_GHz",
+        }.get(band_str, band_str)
+        if auto_mode:
+            # Auto on this band — channel=0 means "pick the best one"
+            sel_type = getattr(WifiSelectionType, "auto_all",
+                         getattr(WifiSelectionType, "auto_2_4_ghz", "auto_all")) \
+                       if "WifiSelectionType" in globals() else "auto"
+            if band_str in ("5_ghz", "5"):
+                sel_type = getattr(WifiSelectionType, "auto_5_ghz",
+                                   getattr(WifiSelectionType, "auto_all", "auto_5_ghz")) \
+                           if "WifiSelectionType" in globals() else "auto"
+            elif band_str in ("2_4_ghz", "2.4"):
+                sel_type = getattr(WifiSelectionType, "auto_2_4_ghz",
+                                   getattr(WifiSelectionType, "auto_all", "auto_2_4_ghz")) \
+                           if "WifiSelectionType" in globals() else "auto"
+            with command_lock:
+                b.drone(WifiSetApChannel(type=sel_type, band=band, channel=0)).wait(_timeout=5)
+            print(f"[ANAFI] Wi-Fi: AUTO channel selection in band {band_str}")
+            return jsonify(ok=True, mode="auto", band=band_str,
+                           message=f"drone picks best {band_str} channel; "
+                                   "connection will drop briefly")
+        else:
+            manual_type = getattr(WifiSelectionType, "manual", "manual") \
+                          if "WifiSelectionType" in globals() else "manual"
+            with command_lock:
+                b.drone(WifiSetApChannel(type=manual_type, band=band,
+                                         channel=channel)).wait(_timeout=5)
+            print(f"[ANAFI] Wi-Fi: MANUAL → band={band_str}, channel={channel}")
+            return jsonify(ok=True, mode="manual", band=band_str, channel=channel,
+                           message=f"channel set to {channel}; connection will "
+                                   "drop briefly")
     except Exception as e:
         return jsonify(ok=False, error=str(e)), 500
 
