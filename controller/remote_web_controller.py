@@ -899,7 +899,7 @@ HTML = """
     arcPoll();
     // Version marker — if this string doesn't appear in the DOM,
     // you're running stale JS (restart the Python server or hard-refresh).
-    const BUILD = 'aj-scan-and-rotate';
+    const BUILD = 'ak-drone-switch-hotkeys';
     console.log('[arc] init complete, build=' + BUILD);
     const ver = document.createElement('span');
     ver.id = 'arc_build_tag';
@@ -1311,12 +1311,18 @@ async function loadDrones() {
 function renderDroneBar() {
   const bar = document.getElementById('drone_bar');
   bar.innerHTML = '';
+  let slot = 1;
   for (const [id, info] of Object.entries(drones)) {
     const btn = document.createElement('button');
     btn.className = 'drone-btn' + (id === activeDroneId ? ' selected' : '');
-    btn.innerHTML = `${info.name}<span class="drone-type">${info.type}</span>`;
+    const slotBadge = (slot <= 5)
+      ? `<span style="background:#1e3a5f;color:#93c5fd;padding:0 4px;margin-right:4px;border-radius:3px;font-size:10px;font-weight:700;">${slot}</span>`
+      : '';
+    btn.innerHTML = `${slotBadge}${info.name}<span class="drone-type">${info.type}</span>`;
+    btn.title = (slot <= 5) ? `Hotkey: ${slot}` : '';
     btn.onclick = () => switchDrone(id);
     bar.appendChild(btn);
+    slot += 1;
   }
   // Show/hide Anafi panel based on drone type
   const anafiPanel = document.getElementById('anafi_panel');
@@ -1339,6 +1345,40 @@ async function switchDrone(id) {
     startTelemetrySSE();
     if (document.getElementById('pos_enabled').checked) startPosEvents();
     refreshTelemetry();
+    // ── Video feed must also switch to the new drone ───────────────
+    // /proxy/video, /proxy/position/video and /proxy/aruco/video.mjpg
+    // all proxy to the ACTIVE drone on the server. After switch, the
+    // server-side PI_BASE now points at the new drone — but the
+    // browser's existing MJPEG connections are still streaming from
+    // the OLD drone. Force a reconnect by nulling then resetting src
+    // (plus a fresh cache-buster), and POST a /proxy/video/start so
+    // the new drone is guaranteed to have MJPEG running.
+    try {
+      // Guarantee Way-1 MJPEG is active on the newly-selected drone.
+      // Fire-and-forget; if already running the server returns ok.
+      fetch('/proxy/video/start', {method:'POST',
+        headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({mode:'mjpeg'})}).catch(()=>{});
+      const mainImg = document.getElementById('video_img');
+      if (mainImg && videoActive) {
+        mainImg.src = '';
+        // Small delay so the browser cleanly drops the old connection
+        setTimeout(() => { mainImg.src = '/proxy/video?' + Date.now(); }, 150);
+      }
+      const posImg = document.getElementById('pos_video_img');
+      if (posImg && posImg.src) {
+        posImg.src = '';
+        setTimeout(() => { posImg.src = '/proxy/position/video?' + Date.now(); }, 150);
+      }
+      const arcImg = document.getElementById('arc_video');
+      if (arcImg && arcImg.src) {
+        arcImg.src = '';
+        setTimeout(() => { arcImg.src = '/proxy/aruco/video.mjpg?t=' + Date.now(); }, 150);
+      }
+      console.log('[drone-switch] video feeds reconnected to drone', id);
+    } catch (e) {
+      console.warn('[drone-switch] video reconnect failed:', e);
+    }
   } catch {}
 }
 
@@ -1495,6 +1535,24 @@ window.addEventListener('keydown', (e)=>{
     window._landAllInFlight = true;
     console.log('[LAND_ALL] 0 pressed — landing every drone');
     landAllDrones('0 hotkey').finally(() => { window._landAllInFlight = false; });
+    return;
+  }
+  // ── Drone switch hotkey: digits 1-5 select the Nth drone in the bar ──
+  // Order follows Object.entries(drones) insertion order, same as the
+  // drone-bar buttons top→bottom. '1' = first drone, '2' = second, etc.
+  if (k >= '1' && k <= '5') {
+    e.preventDefault();
+    const idx = parseInt(k, 10) - 1;
+    const ids = Object.keys(drones);
+    if (idx < ids.length) {
+      const targetId = ids[idx];
+      if (targetId !== activeDroneId) {
+        console.log('[drone-switch] hotkey', k, '→', targetId);
+        switchDrone(targetId);
+      }
+    } else {
+      console.log('[drone-switch] no drone at slot', k, '(have', ids.length, ')');
+    }
     return;
   }
   if (map.has(k)) {
