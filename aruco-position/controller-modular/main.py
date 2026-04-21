@@ -157,6 +157,8 @@ HOLD_ARRIVE_RADIUS = 0.25      # m – radius at which HOLD is declared
 CAM_LOST_TIMEOUT_S = 0.5       # seconds without cam position before entering recovery yaw
 RECOVERY_YAW_RATE = 0.1        # rad/s slow yaw rotation during recovery
 RECOVERY_MAX_YAW_SPEED = 150   # °/s – MaxRotationSpeed sent to drone before recovery PCMD
+RETURN_HOME_MIN_Z = 1.5        # m – minimum height enforced during return-home leg
+RETURN_HOME_ARRIVE_RADIUS_XY = 0.30  # m – XY-only radius to trigger landing on return
 
 
 class MissionPhase:
@@ -265,21 +267,8 @@ class AutonomousMission:
         elif phase == MissionPhase.RETURN_HOME:
             self._begin_return_home(drone)
         elif phase == MissionPhase.LANDING:
-            # Send landing command and jump straight to IDLE — no tick needed.
-            if self.ctrl is not None:
-                self.ctrl.clear_target()
-            if drone is not None and not self.dry_run:
-                try:
-                    from olympe.messages.ardrone3.Piloting import Landing
-                    drone(Landing())
-                    print("[mission] Landing command sent – mission complete")
-                except Exception as exc:
-                    print(f"[mission] Landing failed: {exc}")
-            elif self.dry_run:
-                print("[DRY RUN] Landing skipped – mission complete")
-            print("[mission] Confirmed → idle")
-            self._transition(MissionPhase.IDLE)
-            return  # skip the generic _transition below
+            self._do_land(drone)
+            return  # _do_land() already called _transition(IDLE)
         print(f"[mission] Confirmed → {phase}")
         self._transition(phase)
 
@@ -494,29 +483,14 @@ class AutonomousMission:
                 print("[mission] Cam position regained – resuming RETURN_HOME")
                 self._begin_return_home(drone)
 
-            # Primary: controller HOVER phase signals arrival at home.
-            if self.ctrl is not None and hasattr(self.ctrl, "position_controller"):
-                from controller import Phase
-                if self.ctrl.position_controller.phase == Phase.HOVER:
-                    self._queue_confirm(
-                        MissionPhase.LANDING,
-                        "Returned home.  Ready to land.",
-                        drone,
-                    )
-                return
-
-            # Fallback: distance check.
+            # Arrival check: XY only — land immediately when over home footprint.
             if self.home is not None:
-                hx, hy, hz = self.home
-                dist = math.sqrt(
-                    (hx - cam[0])**2 + (hy - cam[1])**2 + (hz - cam[2])**2
-                )
-                if dist < HOLD_ARRIVE_RADIUS:
-                    self._queue_confirm(
-                        MissionPhase.LANDING,
-                        f"Returned home (dist={dist:.2f} m).  Ready to land.",
-                        drone,
-                    )
+                hx, hy, _hz = self.home
+                dist_xy = math.sqrt((hx - cam[0])**2 + (hy - cam[1])**2)
+                if dist_xy < RETURN_HOME_ARRIVE_RADIUS_XY:
+                    print(f"[mission] Reached home XY (dist_xy={dist_xy:.2f} m) – landing")
+                    self._do_land(drone)
+                    return
             return
 
         # No cam position — check if timeout exceeded.
@@ -597,16 +571,33 @@ class AutonomousMission:
         if self.ctrl is not None:
             self.ctrl.set_target(x, y, z)
 
+    def _do_land(self, drone) -> None:
+        """Clear controller, send Landing command, and transition to IDLE."""
+        if self.ctrl is not None:
+            self.ctrl.clear_target()
+        if drone is not None and not self.dry_run:
+            try:
+                from olympe.messages.ardrone3.Piloting import Landing
+                drone(Landing())
+                print("[mission] Landing command sent – mission complete")
+            except Exception as exc:
+                print(f"[mission] Landing failed: {exc}")
+        elif self.dry_run:
+            print("[DRY RUN] Landing skipped – mission complete")
+        self._transition(MissionPhase.IDLE)
+
     def _begin_return_home(self, drone) -> None:
         if self.home is None:
             print("[mission] RETURN_HOME – no home position recorded, staying in place")
             return
         hx, hy, hz = self.home
-        print(f"[mission] RETURN_HOME – heading to ({hx:.2f}, {hy:.2f}, {hz:.2f})")
+        safe_z = max(hz, RETURN_HOME_MIN_Z)  # enforce minimum height
+        print(f"[mission] RETURN_HOME – heading to ({hx:.2f}, {hy:.2f}, {safe_z:.2f})"
+              + (f"  [z clamped: {hz:.2f} → {safe_z:.2f}]" if safe_z != hz else ""))
         self._last_cam_ts = time.monotonic()
         self._recovering = False
         if self.ctrl is not None:
-            self.ctrl.set_target(hx, hy, hz)
+            self.ctrl.set_target(hx, hy, safe_z)
 
     def _set_recovery_yaw_speed(self, drone) -> None:
         """Set drone MaxRotationSpeed once when entering recovery so yaw PCMD is effective."""
