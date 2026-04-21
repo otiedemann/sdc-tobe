@@ -34,6 +34,8 @@ HEARTBEAT_INTERVAL = 1.0  # Sekunden: Status senden auch ohne Marker
 TARGET_Z_POS = -1.5  # fixed target height position (internal Z axis)
 MARKER_SIZE = 0.5
 DRY_RUN = False  # True: log RC/commands but send nothing to drone, no takeoff
+WIFI_AUTO_CHANNEL = True   # Set WiFi channel automatically after connect
+WIFI_BAND = "5_GHz"        # "5_GHz" | "2_4_GHz" | "all"
 
 # Pose robustness settings
 MIN_REF_WEIGHT = 0.00  # Ignore very weak refs, but keep detection usable
@@ -522,6 +524,104 @@ class AutonomousMission:
 # Main
 # ============================================================
 
+def _set_wifi_channel(drone, band_str: str = "5_GHz", auto: bool = False, channel = 0) -> None:
+    """Set the Anafi's AP channel directly via Olympe after connecting.
+
+    Mirrors the logic in unified_api_server.py /api/wifi/channel:
+    - Probes the three known Olympe import paths for WifiSetApChannel.
+    - Resolves WifiBand / WifiSelectionType enums across Olympe 1.x / 7.x.
+    - auto=True (recommended): drone scans and picks the cleanest channel.
+    - auto=False + band_str + channel: pin to a specific channel number.
+
+    Non-fatal — a warning is printed and flight continues if the command fails.
+    NOTE: changing the AP channel drops the Wi-Fi link briefly.
+    """
+    import importlib
+
+    # --- locate WifiSetApChannel across Olympe builds ---
+    _candidates = [
+        ("olympe.messages.wifi",         "set_ap_channel"),
+        ("olympe.messages.wifi",         "SetApChannel"),
+        ("olympe.messages.wifi.Command", "SetApChannel"),
+    ]
+    WifiSetApChannel = None
+    for mod_path, attr in _candidates:
+        try:
+            WifiSetApChannel = getattr(importlib.import_module(mod_path), attr, None)
+            if WifiSetApChannel:
+                break
+        except Exception:
+            pass
+    if WifiSetApChannel is None:
+        print("[wifi] WifiSetApChannel not found in this Olympe build — skipping")
+        return
+
+    # --- resolve WifiBand enum ---
+    WifiBand = None
+    for ep in ("olympe.enums.wifi", "olympe.messages.wifi"):
+        try:
+            em = importlib.import_module(ep)
+            WifiBand = getattr(em, "band", None) or getattr(em, "Band", None)
+            if WifiBand:
+                break
+        except Exception:
+            pass
+
+    def _band(s: str):
+        key = s.lower().replace("ghz", "").replace(".", "_").strip(" _")
+        alias = {"2": "2_4_ghz", "2_4": "2_4_ghz", "5": "5_ghz"}.get(key, key)
+        if WifiBand is None:
+            return alias
+        for attempt in (alias, alias.upper(), alias.replace("_ghz", "_GHz")):
+            if hasattr(WifiBand, attempt):
+                return getattr(WifiBand, attempt)
+        try:
+            for m in WifiBand:
+                if m.name.lower() == alias.lower():
+                    return m
+        except Exception:
+            pass
+        return alias
+
+    # --- resolve WifiSelectionType enum ---
+    WifiSelectionType = None
+    for ep in ("olympe.enums.wifi", "olympe.messages.wifi"):
+        try:
+            em = importlib.import_module(ep)
+            WifiSelectionType = (getattr(em, "selection_type", None)
+                                 or getattr(em, "SelectionType", None))
+            if WifiSelectionType:
+                break
+        except Exception:
+            pass
+
+    def _sel(which: str):
+        _map = {
+            "auto_5":   ["auto_5_ghz", "auto_5GHz", "auto_5"],
+            "auto_2_4": ["auto_2_4_ghz", "auto_2_4GHz", "auto_2_4"],
+            "auto_all": ["auto_all", "auto"],
+            "manual":   ["manual", "fixed"],
+        }
+        for name in _map.get(which, [which]):
+            if WifiSelectionType is not None and hasattr(WifiSelectionType, name):
+                return getattr(WifiSelectionType, name)
+        return _map.get(which, [which])[0]  # fallback: raw string
+
+    band = _band(band_str)
+    if auto:
+        sel = _sel("auto_5" if band_str.startswith("5") else
+                   "auto_2_4" if band_str.startswith("2") else "auto_all")
+    else:
+        sel = _sel("manual")
+
+    try:
+        drone(WifiSetApChannel(type=sel, band=band, channel=channel)).wait(_timeout=5)
+        mode = "AUTO" if auto else "MANUAL"
+        print(f"[wifi] {mode} channel set → band={band_str} (sel={sel}, band={band})")
+    except Exception as exc:
+        print(f"[wifi] Channel set failed (non-fatal): {exc}")
+
+
 def _install_olympe_thread_excepthook() -> None:
     """Suppress known Olympe shutdown race conditions from background threads.
 
@@ -813,6 +913,8 @@ def main():
             motion_listener.subscribe()
 
         anafi_drone.connect()
+        if WIFI_AUTO_CHANNEL and not DRY_RUN:
+            _set_wifi_channel(anafi_drone, band_str=WIFI_BAND, channel=123)
         from olympe.messages.ardrone3.SpeedSettings import MaxRotationSpeed
         anafi_drone(MaxRotationSpeed(150))
 
