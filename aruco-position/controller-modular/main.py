@@ -56,10 +56,7 @@ try:
 except Exception:
     input_module = None
 
-try:
-    import controller as ctrl_module
-except Exception:
-    ctrl_module = None
+import controller as ctrl_module
 
 # Suppress olympe / arsdk / pdraw log noise (H264/AVCC decoder warnings, etc.)
 logging.getLogger("olympe").setLevel(logging.CRITICAL)
@@ -795,7 +792,7 @@ def main():
         time.sleep(0.2)
         print("✅ Anafi videostream active")
 
-        if ctrl_target is not None and ctrl_module is not None:
+        if ctrl_target is not None:
             ctrl_module.set_target(*ctrl_target)
 
         if mission is not None:
@@ -1192,12 +1189,8 @@ def main():
                         "up_down":      _manual_rc["up_down"],
                         "yaw":          _manual_rc["yaw"],
                     }
-                if ctrl_module is not None:
-                    ctrl_module.send_pcmd_olympe(anafi_drone, _mrc)
-                else:
-                    from olympe.messages.ardrone3.Piloting import PCMD as _PCMD
-                    anafi_drone(_PCMD(1, _mrc["left_right"], _mrc["forward_back"], _mrc["yaw"], 0, 0))
-            elif ctrl_module is not None and _ctrl_state is not None:
+                ctrl_module.send_pcmd_olympe(anafi_drone, _mrc)
+            elif _ctrl_state is not None:
                 rc = ctrl_module.update(_ctrl_state)
                 if rc is not None:
                     _last_rc = rc
@@ -1244,7 +1237,7 @@ def main():
                         "y": round(ty, 4),
                         "z": round(tz, 4),
                     }
-                elif ctrl_module is not None and ctrl_module.position_controller.target is not None:
+                elif ctrl_module.position_controller.target is not None:
                     t = ctrl_module.position_controller.target
                     _log_tgt = {
                         "x": round(t.x, 4),
@@ -1332,8 +1325,7 @@ def main():
                     "innovation": last_fusion_result.get("innovation"),
                 }
 
-            if ctrl_module is not None:
-                result["ctrl"] = ctrl_module.position_controller.status()
+            result["ctrl"] = ctrl_module.position_controller.status()
 
             if mission is not None:
                 result["mission"] = {
