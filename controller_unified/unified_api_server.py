@@ -455,7 +455,7 @@ except Exception as _e:
 
 # Build marker — GET /api/version returns this so the operator can verify
 # which commit the flight controller is actually running.
-BUILD_TAG = "wifi-enum-global-json-provider-v2"
+BUILD_TAG = "wifi-scan-v3-with-scanned-item"
 BUILD_AT = time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime())
 
 
@@ -3098,8 +3098,11 @@ def api_wifi_scan():
     channels with their measured RSSI. Pass {"band": "2_4_GHz"} or
     {"band": "5_GHz"} or {"band": "all"} (default).
 
-    The scan takes ~2-3 seconds. Results come from multiple
-    AuthorizedChannel events that Olympe collects in response."""
+    Olympe's scan trigger returns quickly but the interesting data comes
+    asynchronously as 'scanned_item' events (one per detected AP) and
+    'update_authorized_channels' events (with the final authorised
+    channel list including occupancy). We subscribe, trigger the scan,
+    wait a few seconds, then harvest everything we saw."""
     if not HAS_WIFI_CTRL:
         return jsonify(ok=False, error="Wi-Fi control not supported"), 501
     b = _anafi_backend()
@@ -3108,22 +3111,76 @@ def api_wifi_scan():
     data = request.get_json(silent=True) or {}
     band_str = str(data.get("band", "all")).lower()
     band = _wifi_band_enum(band_str)
+    wait_s = float(data.get("wait_s", 4.0))
+
+    # Import the per-item events defensively — they weren't probed in
+    # the HAS_WIFI_CTRL block because they're additive.
+    import importlib
     try:
-        with command_lock:
-            b.drone(WifiScan(band=band)).wait(_timeout=5)
-        channels = []
+        wifi_mod = importlib.import_module("olympe.messages.wifi")
+        ScannedItem = getattr(wifi_mod, "scanned_item", None) \
+                      or getattr(wifi_mod, "ScannedItem", None)
+        UpdateAuthCh = getattr(wifi_mod, "update_authorized_channels", None) \
+                      or getattr(wifi_mod, "UpdateAuthorizedChannels", None)
+    except Exception:
+        ScannedItem = UpdateAuthCh = None
+
+    scanned_items: list[dict] = []
+    auth_updates: list[dict] = []
+
+    def _on_scanned_item(evt, *_):
         try:
-            all_ch = b.drone.get_state(WifiAuthorizedChannel)
-            if isinstance(all_ch, dict):
-                channels = list(all_ch.values())
-            elif isinstance(all_ch, list):
-                channels = all_ch
+            scanned_items.append(dict(evt.args))
+        except Exception:
+            scanned_items.append({"raw": str(evt)})
+
+    def _on_auth_update(evt, *_):
+        try:
+            auth_updates.append(dict(evt.args))
+        except Exception:
+            auth_updates.append({"raw": str(evt)})
+
+    subs = []
+    try:
+        # Subscribe to the event firehose FIRST so we don't miss early
+        # emissions from the scan trigger.
+        if ScannedItem is not None:
+            subs.append(b.drone.subscribe(_on_scanned_item, ScannedItem()))
+        if UpdateAuthCh is not None:
+            subs.append(b.drone.subscribe(_on_auth_update, UpdateAuthCh()))
+
+        with command_lock:
+            b.drone(WifiScan(band=band)).wait(_timeout=2)
+
+        # Let async events arrive
+        time.sleep(max(0.5, min(wait_s, 10.0)))
+
+        # As a fallback, also read the per-channel state (some Olympe
+        # builds populate a dict keyed by channel number)
+        channels_state = []
+        try:
+            st = b.drone.get_state(WifiAuthorizedChannel)
+            if isinstance(st, dict):
+                channels_state = list(st.values())
+            elif isinstance(st, list):
+                channels_state = st
         except Exception:
             pass
-        return jsonify(ok=True, band=band_str, band_resolved=_jsonable(band),
-                       channels=_jsonable(channels))
+
+        return jsonify(ok=True,
+                       band=band_str,
+                       band_resolved=_jsonable(band),
+                       wait_s=wait_s,
+                       scanned_items=_jsonable(scanned_items),
+                       scanned_count=len(scanned_items),
+                       authorized_updates=_jsonable(auth_updates),
+                       channels=_jsonable(channels_state))
     except Exception as e:
         return jsonify(ok=False, error=str(e)), 500
+    finally:
+        for h in subs:
+            try: h.unsubscribe()
+            except Exception: pass
 
 
 @app.post("/api/wifi/channel")
