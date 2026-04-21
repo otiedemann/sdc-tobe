@@ -152,7 +152,18 @@ class DroneObserver:
     never touches aruco_seek module globals, so many can run in parallel.
     """
 
-    RC_TICK_MS = 100
+    # RC_TICK_MS is the duration_ms we send with each /api/rc packet. The
+    # server's rc_loop zeros rc_override the moment it expires, so if this
+    # is too close to our tick-interval the drone sees brief gaps of
+    # zero-stick between our packets → stutters forward in visible steps.
+    #
+    # Keep this comfortably longer than the worst-case tick-to-tick time
+    # (HTTP roundtrip + ArUco detection + PD math ≈ 20-150ms at 10Hz tick).
+    # Each subsequent tick supersedes the previous override, so a long
+    # duration here is "expiration as safety ceiling", not actual setpoint
+    # lifetime. If the observer thread dies, the server auto-zeros the
+    # stick after this many milliseconds.
+    RC_TICK_MS = 400
 
     def __init__(self, drone_id: str, api_base: str, name: str = "",
                  session: Optional[requests.Session] = None,
@@ -359,13 +370,22 @@ class DroneObserver:
 
     def _run(self):
         time.sleep(1.0)  # let trackers warm up
+        TICK_PERIOD_S = 0.05   # 20 Hz — matches the server's PCMD loop rate
+                               # so every server tick has a fresh setpoint.
+                               # Combined with RC_TICK_MS=400, the drone
+                               # never experiences a zero-stick gap.
         while self._running:
+            t0 = time.time()
             try:
                 self._tick()
             except Exception as e:
                 with self._lock:
                     self.latest["error"] = repr(e)
-            time.sleep(0.1)  # 10 Hz update
+            # Sleep for the REMAINDER of the tick period so slow ticks
+            # don't pile up (if _tick takes 80 ms, we sleep 20 ms, not
+            # a fixed 50 ms which would drift out to ~130 ms/tick).
+            elapsed = time.time() - t0
+            time.sleep(max(0.005, TICK_PERIOD_S - elapsed))
 
     def _tick(self):
         if self._vid is None:
