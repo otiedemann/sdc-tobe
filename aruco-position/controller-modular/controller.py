@@ -2,8 +2,8 @@
 Position controller for the Anafi drone.
 
 Computes PCMD-compatible RC commands to fly the drone to a target (x, y, z)
-in world frame and hold it there.  During transit, the drone yaws to face the
-direction of travel before or while translating.
+in world frame and hold it there.  Yaw is always zero — heading control is
+handled exclusively by the ArUco recovery search in main.py.
 
 World-frame conventions (match MotionEstimator / main.py):
   +X  forward at start / yaw = 0
@@ -15,7 +15,7 @@ RC output dict (matches /api/rc endpoint and Olympe PCMD argument order):
   forward_back : int  -100..100   +100 = forward (pitch forward)
   left_right   : int  -100..100   +100 = right   (roll right)
   up_down      : int  -100..100   +100 = up       (gaz up)
-  yaw          : int  -100..100   +100 = CW
+  yaw          : int  always 0    (yaw controlled only by ArUco search)
 
 Usage from main.py::
 
@@ -44,22 +44,13 @@ from typing import Optional
 KP_XY: float = 0.75       # horizontal
 KP_Z: float  = 0.75       # vertical
 
-# P gain: yaw error (rad) → yaw rate setpoint (rad/s)
-KP_YAW: float = 0.1
-
 # Maximum velocity setpoints
-MAX_HORIZ_SPEED: float = 0.15    # %  (horizontal)
-MAX_VERT_SPEED: float  = 0.15    # %  (vertical)
-MAX_YAW_RATE: float    = 0.15    # %
+MAX_HORIZ_SPEED: float = 0.1    # %  (horizontal)
+MAX_VERT_SPEED: float  = 0.1    # %  (vertical)
 
 # Position acceptance radii (switch to HOVER phase)
 ARRIVE_RADIUS_XY: float = 0.25  # m
-ARRIVE_RADIUS_Z: float  = 0.25  # mq
-
-# Yaw alignment during transit
-TRANSIT_YAW_MIN_DIST: float    = 0.30  # m: only yaw toward target if farther than this
-YAW_ALIGN_THRESHOLD: float     = 0.35  # rad: slow translation if |yaw_error| > this
-YAW_ALIGN_SPEED_FACTOR: float  = 0.20  # fraction of max speed while rotating to align
+ARRIVE_RADIUS_Z: float  = 0.25  # m
 
 # Uncertainty guard: freeze output if estimated position std > this
 MAX_STD_POS: float = 0.40   # m  (set to math.inf to disable)
@@ -74,15 +65,6 @@ HOVER_EXIT_RADIUS_XY: float = ARRIVE_RADIUS_XY * 2.0
 # ============================================================
 # Internal helpers
 # ============================================================
-
-def _wrap_pi(angle: float) -> float:
-    """Wrap angle to [-π, π]."""
-    while angle >  math.pi:
-        angle -= 2.0 * math.pi
-    while angle < -math.pi:
-        angle += 2.0 * math.pi
-    return angle
-
 
 def _clamp(value: float, lo: float, hi: float) -> int:
     """Clamp to [lo, hi] and return as int."""
@@ -124,7 +106,6 @@ class _Target:
     x: float
     y: float
     z: float
-    hold_yaw: Optional[float]  # rad, None = lock to arrival yaw
 
 
 class PositionController:
@@ -140,7 +121,6 @@ class PositionController:
     def __init__(self) -> None:
         self._target: Optional[_Target] = None
         self._phase: str = Phase.IDLE
-        self._arrival_yaw: Optional[float] = None   # locked when HOVER entered
         self._last_ts: Optional[float] = None
 
     # ------------------------------------------------------------------
@@ -152,27 +132,23 @@ class PositionController:
         x: float,
         y: float,
         z: float,
-        hold_yaw: Optional[float] = None,
+        hold_yaw: Optional[float] = None,  # kept for API compatibility, ignored
     ) -> None:
         """
         Set the target position and activate the controller.
 
         Args:
             x, y, z:   Target in world frame (metres).
-            hold_yaw:  Desired heading at the target (radians, CCW positive).
-                       None = keep the heading the drone has when it arrives.
+            hold_yaw:  Ignored — yaw is always 0 (controlled by ArUco search).
         """
-        self._target = _Target(x=x, y=y, z=z, hold_yaw=hold_yaw)
+        self._target = _Target(x=x, y=y, z=z)
         self._phase = Phase.TRANSIT
-        self._arrival_yaw = None
-        print(f"[controller] Target set → x={x:.2f} y={y:.2f} z={z:.2f}"
-              + (f" yaw={math.degrees(hold_yaw):.1f}°" if hold_yaw is not None else ""))
+        print(f"[controller] Target set → x={x:.2f} y={y:.2f} z={z:.2f}")
 
     def clear_target(self) -> None:
         """Deactivate the controller (outputs zero RC)."""
         self._target = None
         self._phase = Phase.IDLE
-        self._arrival_yaw = None
         print("[controller] Target cleared — idle")
 
     @property
@@ -228,38 +204,12 @@ class PositionController:
         if self._phase == Phase.TRANSIT:
             if dist_xy <= ARRIVE_RADIUS_XY and abs(ez) <= ARRIVE_RADIUS_Z:
                 self._phase = Phase.HOVER
-                self._arrival_yaw = cyaw
                 print(f"[controller] → HOVER  (err_xy={dist_xy:.2f} m)")
 
         elif self._phase == Phase.HOVER:
             if dist_xy > HOVER_EXIT_RADIUS_XY:
                 self._phase = Phase.TRANSIT
-                self._arrival_yaw = None
                 print(f"[controller] → TRANSIT  (err_xy={dist_xy:.2f} m)")
-
-        # ---- yaw setpoint ----
-
-        # Use explicit requested yaw, or the heading we arrived with
-        # desired_yaw = tgt.hold_yaw if tgt.hold_yaw is not None else cyaw
-
-        if self._phase == Phase.HOVER:
-            # Use explicitly requested yaw, or the heading we arrived with
-            desired_yaw = (
-                tgt.hold_yaw
-                if tgt.hold_yaw is not None
-                else (self._arrival_yaw if self._arrival_yaw is not None else cyaw)
-            )
-        else:
-            # TRANSIT: face the direction of travel when far enough away
-            if dist_xy >= TRANSIT_YAW_MIN_DIST:
-                desired_yaw = math.atan2(ey, ex)   # bearing to target in world frame
-            else:
-                # Close to target — stop yawing, just translate the last bit
-                desired_yaw = cyaw
-
-        yaw_error    = _wrap_pi(desired_yaw - cyaw)
-        yaw_rate_sp  = KP_YAW * yaw_error
-        yaw_rate_sp  = max(-MAX_YAW_RATE, min(MAX_YAW_RATE, yaw_rate_sp))
 
         # ---- horizontal velocity setpoint (world frame) ----
         vx_sp = KP_XY * ex
@@ -267,13 +217,6 @@ class PositionController:
         # Subtract current velocity for implicit damping
         vx_sp -= cvx
         vy_sp -= cvy
-        # Scale down while rotating to align
-        if self._phase == Phase.TRANSIT and abs(yaw_error) > YAW_ALIGN_THRESHOLD:
-            scale = YAW_ALIGN_SPEED_FACTOR
-        else:
-            scale = 1.0
-        vx_sp *= scale
-        vy_sp *= scale
         # Clamp magnitude
         horiz_sp = math.sqrt(vx_sp * vx_sp + vy_sp * vy_sp)
         if horiz_sp > MAX_HORIZ_SPEED:
@@ -291,23 +234,20 @@ class PositionController:
         #   forward_back: +100 = forward = +vx_body
         #   left_right:   +100 = right   = -vy_body (vy_body is left+)
         #   up_down:      +100 = up      = +vz_sp   (world Z is up)
-        #   yaw:          +100 = CW      = -yaw_rate_sp (our yaw_rate is CCW+)
+        #   yaw:          always 0 — heading is controlled by ArUco search only
         fb  = _clamp(vx_body * 100.0, -100, 100)
         lr  = _clamp(-vy_body * 100.0, -100, 100)
         ud  = _clamp(vz_sp * 100.0, -100, 100)
-        yaw = _clamp(-yaw_rate_sp * 100.0 , -100, 100)
 
         return {
             "forward_back": fb,
             "left_right":   lr,
             "up_down":      ud,
-            "yaw":          yaw,
+            "yaw":          0,
             # debug extras (not sent to drone)
             "_phase":       self._phase,
             "_err_xy":      round(dist_xy, 3),
             "_err_z":       round(ez, 3),
-            "_desired_yaw": round(math.degrees(desired_yaw), 1),
-            "_yaw_err_deg": round(math.degrees(yaw_error), 1),
         }
 
     def status(self) -> dict:
@@ -327,8 +267,8 @@ position_controller = PositionController()
 
 
 def set_target(x: float, y: float, z: float, hold_yaw: Optional[float] = None) -> None:
-    """Activate the controller with the given world-frame target."""
-    position_controller.set_target(x, y, z, hold_yaw)
+    """Activate the controller with the given world-frame target. hold_yaw is ignored."""
+    position_controller.set_target(x, y, z)
 
 
 def clear_target() -> None:
