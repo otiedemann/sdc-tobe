@@ -1308,8 +1308,9 @@ def main():
                     MissionPhase.ABORTED, MissionPhase.IDLE
                 ):
                     mission.abort(anafi_drone)
-                elif anafi_drone is not None and not mission_dry_run:
-                    # No active mission – still stop and land immediately
+                # Always send zero PCMD + Landing regardless of mission state,
+                # so the drone stops immediately in every phase of the mission.
+                if anafi_drone is not None and not mission_dry_run:
                     try:
                         ctrl_module.send_pcmd_olympe(
                             anafi_drone,
@@ -1320,7 +1321,7 @@ def main():
                     try:
                         from olympe.messages.ardrone3.Piloting import Landing
                         anafi_drone(Landing())
-                        print("[abort] Emergency landing (no active mission)")
+                        print("[abort] Emergency landing command sent")
                     except Exception as _land_err:
                         print(f"[abort] Landing command failed: {_land_err}")
                 break  # exit main loop immediately; finally block handles cleanup
@@ -1803,6 +1804,7 @@ def main():
                     if key == 27:   # ESC – emergency land
                         print("[abort] ESC pressed in preview window")
                         _abort_flag.set()
+                        continue  # restart loop immediately so abort check fires at top
                     elif key == 32:   # SPACE
                         _confirm_flag.set()
                     elif key in (ord('w'), ord('W')):
@@ -1918,6 +1920,22 @@ def main():
             cap.release()
 
         if anafi_drone is not None:
+            # Safety net: zero PCMD + Landing before tearing down the connection,
+            # in case the abort block's commands were lost or finally ran without abort.
+            if not mission_dry_run:
+                try:
+                    ctrl_module.send_pcmd_olympe(
+                        anafi_drone,
+                        {"forward_back": 0, "left_right": 0, "up_down": 0, "yaw": 0},
+                    )
+                except Exception:
+                    pass
+                try:
+                    from olympe.messages.ardrone3.Piloting import Landing
+                    anafi_drone(Landing())
+                    print("[finally] Safety landing command sent")
+                except Exception:
+                    pass
             try:
                 if anafi_stream_api == "modern":
                     anafi_drone.streaming.stop()
