@@ -1032,10 +1032,27 @@ def main():
             # --------------------------------------
             # Emergency abort check
             # --------------------------------------
-            if _abort_flag.is_set() and mission is not None and mission.phase not in (
-                MissionPhase.ABORTED, MissionPhase.IDLE
-            ):
-                mission.abort(anafi_drone)
+            if _abort_flag.is_set():
+                if mission is not None and mission.phase not in (
+                    MissionPhase.ABORTED, MissionPhase.IDLE
+                ):
+                    mission.abort(anafi_drone)
+                elif anafi_drone is not None and not mission_dry_run:
+                    # No active mission – still stop and land immediately
+                    try:
+                        ctrl_module.send_pcmd_olympe(
+                            anafi_drone,
+                            {"forward_back": 0, "left_right": 0, "up_down": 0, "yaw": 0},
+                        )
+                    except Exception:
+                        pass
+                    try:
+                        from olympe.messages.ardrone3.Piloting import Landing
+                        anafi_drone(Landing())
+                        print("[abort] Emergency landing (no active mission)")
+                    except Exception as _land_err:
+                        print(f"[abort] Landing command failed: {_land_err}")
+                break  # exit main loop immediately; finally block handles cleanup
 
             # --------------------------------------
             # Manual SPACE confirm
