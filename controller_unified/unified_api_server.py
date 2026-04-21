@@ -422,28 +422,40 @@ def _enum_to_jsonable(obj):
     return str(obj)
 
 
-if _HAS_JSON_PROVIDER:
-    class _EnumAwareJSONProvider(DefaultJSONProvider):
-        def default(self, obj):
-            try:
-                return super().default(obj)
-            except TypeError:
-                return _enum_to_jsonable(obj)
-    app.json = _EnumAwareJSONProvider(app)
-else:
-    # Flask < 2.2 path
-    class _EnumAwareJSONEncoder(_json.JSONEncoder):
-        def default(self, obj):
-            try:
-                return super().default(obj)
-            except TypeError:
-                return _enum_to_jsonable(obj)
-    app.json_encoder = _EnumAwareJSONEncoder
+try:
+    if _HAS_JSON_PROVIDER and hasattr(app, "json"):
+        # Flask 2.2+: app.json is a JSONProvider INSTANCE with a callable
+        # `.default` attribute (a staticmethod on DefaultJSONProvider).
+        # Wrap the existing default so we fall back to enum-naming.
+        _orig_default = getattr(app.json, "default", None)
+        def _enum_aware_default(obj, _orig=_orig_default):
+            if _orig is not None:
+                try:
+                    return _orig(obj)
+                except TypeError:
+                    pass
+            return _enum_to_jsonable(obj)
+        app.json.default = _enum_aware_default
+        print("[JSON] Enum-aware default installed on app.json")
+    else:
+        # Flask < 2.2
+        class _EnumAwareJSONEncoder(_json.JSONEncoder):
+            def default(self, obj):
+                try:
+                    return super().default(obj)
+                except TypeError:
+                    return _enum_to_jsonable(obj)
+        app.json_encoder = _EnumAwareJSONEncoder
+        print("[JSON] Enum-aware encoder installed on app.json_encoder")
+except Exception as _e:
+    # If the Flask version has an even different API, don't crash the
+    # whole server. Fall back to per-endpoint _jsonable wrapping.
+    print(f"[JSON] Could not install enum-aware encoder: {type(_e).__name__}: {_e}")
 
 
 # Build marker — GET /api/version returns this so the operator can verify
 # which commit the flight controller is actually running.
-BUILD_TAG = "wifi-enum-global-json-provider"
+BUILD_TAG = "wifi-enum-global-json-provider-v2"
 BUILD_AT = time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime())
 
 
