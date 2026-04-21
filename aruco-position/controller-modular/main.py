@@ -522,8 +522,39 @@ class AutonomousMission:
 # Main
 # ============================================================
 
+def _install_olympe_thread_excepthook() -> None:
+    """Suppress known Olympe shutdown race conditions from background threads.
+
+    During drone disconnect, Olympe's internal pomp thread may raise:
+      - TimeoutError          (_media_removed callback waiting on a future that
+                               is never resolved because the socket closed first)
+      - InvalidStateError     (async task completing after its future was already
+                               cancelled, i.e. CANCELLED_AND_NOTIFIED)
+
+    Both are cosmetic cleanup artifacts — they don't affect the flight or data
+    and cannot be caught with try/except in the main thread.  We install a
+    threading.excepthook that silently drops them when they originate from an
+    Olympe-owned thread, so they don't pollute the terminal output.
+    """
+    import concurrent.futures
+    import threading
+
+    _orig = threading.excepthook
+
+    def _hook(args):
+        if args.exc_type in (TimeoutError, concurrent.futures.InvalidStateError):
+            thread_name = args.thread.name if args.thread else ""
+            if "olympe" in thread_name.lower() or "pomp" in thread_name.lower():
+                return  # silently suppress known Olympe shutdown noise
+        _orig(args)
+
+    threading.excepthook = _hook
+
+
 def main():
     import sys
+
+    _install_olympe_thread_excepthook()
 
     # --------------------------------------------------------
     # CLI args
@@ -1695,11 +1726,12 @@ def main():
                         anafi_drone.stop_video_streaming()
                     except Exception:
                         pass
-            # Give Olympe's event loop time to flush _media_removed callbacks
-            # before disconnect tears down the connection.  Without this pause the
-            # background callback raises TimeoutError waiting on a future that is
-            # never resolved because the socket is already closed.
-            time.sleep(1.0)
+            # Give Olympe's event loop time to flush _media_removed callbacks and
+            # pending async tasks before disconnect tears down the connection.
+            # Without this pause, Olympe's background threads raise TimeoutError
+            # or InvalidStateError (CANCELLED_AND_NOTIFIED) as futures are
+            # cancelled mid-flight when the socket closes.
+            time.sleep(2.0)
             try:
                 if motion_listener is not None:
                     motion_listener.unsubscribe()

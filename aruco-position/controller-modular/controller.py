@@ -295,6 +295,7 @@ def is_active() -> bool:
 # None = not yet tested, True = native API works, False = use raw PCMD fallback
 _has_piloting_api: Optional[bool] = None
 _pcmd_seq: int = 0
+_last_pcmd: Optional[tuple] = None   # (roll, pitch, yaw, gaz) of last sent command
 
 
 def _detect_piloting_api(drone) -> bool:
@@ -329,6 +330,9 @@ def send_pcmd_olympe(drone, rc: dict) -> None:
     Prefers the native ``drone.piloting_pcmd()`` API (Olympe ≥ 7).
     Falls back to a raw ``drone(PCMD(...))`` message for older builds.
 
+    Skips the actual send when all four clamped values are identical to the
+    previous call, avoiding unnecessary Olympe API traffic at 25 Hz.
+
     Call this from main.py after calling update() when using
     an olympe.Drone object directly (no unified API server needed).
 
@@ -336,7 +340,7 @@ def send_pcmd_olympe(drone, rc: dict) -> None:
         drone: olympe.Drone instance (already connected).
         rc:    Dict returned by update(), must contain the four RC keys.
     """
-    global _pcmd_seq
+    global _pcmd_seq, _last_pcmd
 
     # Hard clamp: never send values beyond ±PCMD_MAX to the drone
     def _hard_clamp(v: int) -> int:
@@ -346,6 +350,11 @@ def send_pcmd_olympe(drone, rc: dict) -> None:
     pitch = _hard_clamp(rc["forward_back"])
     yaw   = _hard_clamp(rc["yaw"])
     gaz   = _hard_clamp(rc["up_down"])
+
+    current = (roll, pitch, yaw, gaz)
+    if current == _last_pcmd:
+        return  # nothing changed — skip to avoid unnecessary API calls
+    _last_pcmd = current
 
     print(f"[PCMD] roll={roll:+4d}  pitch={pitch:+4d}  yaw={yaw:+4d}  gaz={gaz:+4d}", flush=True)
 
