@@ -77,21 +77,19 @@ HOVER_SKEW_P          = 25.0   # lateral gain per unit of perspective skew. Stro
                               # 8.0 was too weak — at skew=0.2 it only produced 1.6 RC which
                               # was below rc_min, so the drone stayed sideways forever.
 HOVER_ALT_P           = 25.0   # was 60 — gentle altitude hold
-HOVER_DIST_P          = 15.0   # aggressive: at dist_err=4m this produces 60 RC, clamped
-                              # to fb_max below → drone flies full-speed when far, eases
-                              # off naturally as it closes in (dist_err shrinks → fb_p
-                              # shrinks proportionally). Much stronger than the old 4.0
-                              # which needed 15m of error to saturate fb_max=6.
+HOVER_DIST_P          = 20.0   # aggressive: at dist_err=2m this already produces 40 RC,
+                              # clamped to fb_max=45 → near-full-speed even at moderate
+                              # distances. Drone eases off as dist_err shrinks below 1m.
 HOVER_YAW_MAX         = 15     # was 40 — clamp magnitude
 HOVER_LR_MAX          = 20     # RC% cap on lateral correction — enough authority to
                               # actively strafe into the marker's normal while approaching.
 HOVER_UD_MAX          = 25     # was 50
-HOVER_FB_MAX          = 30     # aggressive forward — full cruise speed when far from marker.
-                              # PD naturally slows as dist_err shrinks, so this is a cap on
-                              # fast-approach only; near the target it is not reached.
-HOVER_FB_BACK_MAX     = 30     # matching backward authority so the drone can back up when
-                              # it overshoots target distance, or to set up a clean approach
-                              # angle by retreating and coming back in perpendicular.
+HOVER_FB_MAX          = 45     # full-cruise RC when far. PD naturally slows the drone as
+                              # dist_err shrinks below ~1m so this isn't a "final hover"
+                              # speed — it's the cap during long approaches across the
+                              # arena.
+HOVER_FB_BACK_MAX     = 45     # matching backward authority for overshoot recovery / setting
+                              # up a head-on approach by retreating and coming back in.
 HOVER_RC_MIN          = 2      # |rc| < this → output 0 (kill micro-jitter)
 
 # ── IMU damping (D-term) — opposes actual body motion to kill oscillation ──

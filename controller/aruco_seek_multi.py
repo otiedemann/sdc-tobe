@@ -152,7 +152,18 @@ class DroneObserver:
     never touches aruco_seek module globals, so many can run in parallel.
     """
 
-    RC_TICK_MS = 100
+    # RC_TICK_MS is the duration_ms we send with each /api/rc packet. The
+    # server's rc_loop zeros rc_override the moment it expires, so if this
+    # is too close to our tick-interval the drone sees brief gaps of
+    # zero-stick between our packets → stutters forward in visible steps.
+    #
+    # Keep this comfortably longer than the worst-case tick-to-tick time
+    # (HTTP roundtrip + ArUco detection + PD math ≈ 20-150ms at 10Hz tick).
+    # Each subsequent tick supersedes the previous override, so a long
+    # duration here is "expiration as safety ceiling", not actual setpoint
+    # lifetime. If the observer thread dies, the server auto-zeros the
+    # stick after this many milliseconds.
+    RC_TICK_MS = 400
 
     def __init__(self, drone_id: str, api_base: str, name: str = "",
                  session: Optional[requests.Session] = None,
@@ -169,6 +180,17 @@ class DroneObserver:
 
         self.mode: str = "observe"       # "observe" | "live"
         self.allow_live = bool(allow_live)
+        # ── Arena safety bounds (world frame, metres) ────────────────
+        # Drone must never leave this box. Default per SDC26 ruleset
+        # (20 × 10.8 × 6 m field). Configurable via set_arena_bounds().
+        # safety_margin_m is how close to a wall we start braking.
+        self._arena_bounds = {
+            "x_min": -10.0, "x_max": 10.0,
+            "y_min":   0.0, "y_max": 10.8,
+            "z_min":   0.3, "z_max":  5.0,   # some ceiling headroom
+        }
+        self._safety_margin_m = 1.0
+        self._last_guard_info = {}   # diagnostics for state snapshot
         # Search RC — commands the drone sends when in LIVE mode but not
         # actively tracking a marker (e.g. mission SEARCH maneuver).
         # Tuple: (lr, fb, ud, yaw) in RC units -100..100. Mission controls this.
@@ -220,7 +242,124 @@ class DroneObserver:
         except Exception as e:
             return {"ok": False, "error": str(e)}
 
+    def set_arena_bounds(self, bounds: dict, safety_margin_m: float = None):
+        """Override the arena safety box. `bounds` keys: x_min, x_max,
+        y_min, y_max, z_min, z_max (all metres, world frame)."""
+        with self._lock:
+            self._arena_bounds.update({k: float(v) for k, v in bounds.items()
+                                       if k in self._arena_bounds})
+            if safety_margin_m is not None:
+                self._safety_margin_m = float(safety_margin_m)
+
+    def _apply_boundary_guard(self, lr: int, fb: int, ud: int, yaw_rc: int):
+        """Return (lr, fb, ud, yaw_rc) clamped so the drone won't be
+        pushed past the arena margin. When already inside the margin,
+        REVERSES the offending component to actively retreat (hard brake
+        + push back). Yaw and altitude are treated independently from
+        xy translation.
+
+        Body-frame → world-frame conversion uses the drone's current yaw:
+            world_dx = cos(yaw)·lr + sin(yaw)·fb
+            world_dy = -sin(yaw)·lr + cos(yaw)·fb
+        (Anafi yaw=0 → nose points +y, positive yaw rotates CW.)
+        """
+        with self._lock:
+            snap = self.latest
+            bounds = dict(self._arena_bounds)
+            margin = self._safety_margin_m
+        pos = snap.get("pos") or snap.get("cam")
+        if not isinstance(pos, (list, tuple)) or len(pos) < 2:
+            self._last_guard_info = {"active": False, "reason": "no-pos"}
+            return lr, fb, ud, yaw_rc
+        px = float(pos[0])
+        py = float(pos[1])
+        pz = float(pos[2]) if len(pos) >= 3 else 1.0
+
+        yaw_deg = snap.get("yaw", 0.0) or 0.0
+        yaw_rad = math.radians(float(yaw_deg))
+        cy, sy = math.cos(yaw_rad), math.sin(yaw_rad)
+
+        # Body-frame RC → world-frame intended velocity direction
+        wdx =  cy * lr + sy * fb
+        wdy = -sy * lr + cy * fb
+
+        # How deep inside each wall's margin are we? Positive = still
+        # outside the danger zone, negative = already past the margin.
+        clearance = {
+            "x_max": bounds["x_max"] - px - margin,   # space left before +x wall
+            "x_min": (px - bounds["x_min"]) - margin, # space left before -x wall
+            "y_max": bounds["y_max"] - py - margin,
+            "y_min": (py - bounds["y_min"]) - margin,
+            "z_max": bounds["z_max"] - pz - margin,
+            "z_min": (pz - bounds["z_min"]) - margin,
+        }
+
+        # Retreat-RC magnitude. Modest so we don't overshoot in the opposite
+        # direction. The PD loop's normal authority is higher so it can
+        # override this when heading back toward center is the correct thing.
+        RETREAT_RC = 15
+        guard_info = {"active": False, "actions": [], "clearance": {
+            k: round(v, 2) for k, v in clearance.items()
+        }, "pos": [round(px, 2), round(py, 2), round(pz, 2)]}
+
+        # X axis (world)
+        if clearance["x_max"] <= 0 and wdx >= 0:
+            wdx = -abs(wdx) * 0.0 - RETREAT_RC    # force negative (retreat)
+            guard_info["actions"].append("retreat-x_max")
+        elif clearance["x_max"] < margin and wdx > 0:
+            wdx = min(wdx, int(RETREAT_RC * clearance["x_max"] / margin))
+            guard_info["actions"].append("clamp-x_max")
+        if clearance["x_min"] <= 0 and wdx <= 0:
+            wdx = RETREAT_RC
+            guard_info["actions"].append("retreat-x_min")
+        elif clearance["x_min"] < margin and wdx < 0:
+            wdx = max(wdx, -int(RETREAT_RC * clearance["x_min"] / margin))
+            guard_info["actions"].append("clamp-x_min")
+
+        # Y axis (world)
+        if clearance["y_max"] <= 0 and wdy >= 0:
+            wdy = -RETREAT_RC
+            guard_info["actions"].append("retreat-y_max")
+        elif clearance["y_max"] < margin and wdy > 0:
+            wdy = min(wdy, int(RETREAT_RC * clearance["y_max"] / margin))
+            guard_info["actions"].append("clamp-y_max")
+        if clearance["y_min"] <= 0 and wdy <= 0:
+            wdy = RETREAT_RC
+            guard_info["actions"].append("retreat-y_min")
+        elif clearance["y_min"] < margin and wdy < 0:
+            wdy = max(wdy, -int(RETREAT_RC * clearance["y_min"] / margin))
+            guard_info["actions"].append("clamp-y_min")
+
+        # Convert world-frame intent back to body frame
+        new_lr =  cy * wdx - sy * wdy
+        new_fb =  sy * wdx + cy * wdy
+
+        # Altitude (already world-frame)
+        new_ud = ud
+        if clearance["z_max"] <= 0 and ud >= 0:
+            new_ud = -RETREAT_RC
+            guard_info["actions"].append("retreat-z_max")
+        elif clearance["z_max"] < margin and ud > 0:
+            new_ud = min(ud, int(RETREAT_RC * clearance["z_max"] / margin))
+            guard_info["actions"].append("clamp-z_max")
+        if clearance["z_min"] <= 0 and new_ud <= 0:
+            new_ud = RETREAT_RC
+            guard_info["actions"].append("retreat-z_min")
+        elif clearance["z_min"] < margin and new_ud < 0:
+            new_ud = max(new_ud, -int(RETREAT_RC * clearance["z_min"] / margin))
+            guard_info["actions"].append("clamp-z_min")
+
+        if guard_info["actions"]:
+            guard_info["active"] = True
+        self._last_guard_info = guard_info
+        return (int(round(new_lr)), int(round(new_fb)),
+                int(round(new_ud)), int(yaw_rc))
+
     def _send_rc(self, lr: int = 0, fb: int = 0, ud: int = 0, yaw: int = 0) -> dict:
+        # Boundary guard clamps/reverses RC to keep the drone inside the
+        # arena safety box. If we're moving into a wall we already passed
+        # the margin for, the drone is actively pushed back to center.
+        lr, fb, ud, yaw = self._apply_boundary_guard(lr, fb, ud, yaw)
         return self._api_post("/api/rc", {
             "lr": _clamp_rc(lr), "fb": _clamp_rc(fb),
             "ud": _clamp_rc(ud), "yaw": _clamp_rc(yaw),
@@ -359,13 +498,22 @@ class DroneObserver:
 
     def _run(self):
         time.sleep(1.0)  # let trackers warm up
+        TICK_PERIOD_S = 0.05   # 20 Hz — matches the server's PCMD loop rate
+                               # so every server tick has a fresh setpoint.
+                               # Combined with RC_TICK_MS=400, the drone
+                               # never experiences a zero-stick gap.
         while self._running:
+            t0 = time.time()
             try:
                 self._tick()
             except Exception as e:
                 with self._lock:
                     self.latest["error"] = repr(e)
-            time.sleep(0.1)  # 10 Hz update
+            # Sleep for the REMAINDER of the tick period so slow ticks
+            # don't pile up (if _tick takes 80 ms, we sleep 20 ms, not
+            # a fixed 50 ms which would drift out to ~130 ms/tick).
+            elapsed = time.time() - t0
+            time.sleep(max(0.005, TICK_PERIOD_S - elapsed))
 
     def _tick(self):
         if self._vid is None:
@@ -417,6 +565,10 @@ class DroneObserver:
             "altitude_m": round(height_m, 2),
             "battery": bat,
         })
+        # Surface the most recent boundary-guard decision so UI + trace
+        # can visualise when the safety net is actively braking/retreating.
+        if self._last_guard_info:
+            snapshot["guard"] = dict(self._last_guard_info)
 
         if not vid_all:
             snapshot["marker_id"] = None
@@ -451,6 +603,32 @@ class DroneObserver:
         if target_id is not None and target_id in vid_all:
             chosen = target_id
         elif target_id is None:
+            # If the mission is actively driving a search maneuver, DO NOT
+            # auto-pick the largest visible marker — that would lock the
+            # observer into PD control on an already-scanned or
+            # unwanted marker and override the mission's rotation/move RC.
+            # The scenario: mission scans marker N, transitions to SEARCH/
+            # rotate, sets search_rc=(0,0,0,yaw). Without this guard, the
+            # observer sees marker N still in frame, picks it as 'chosen',
+            # and holds position on it — the drone never rotates.
+            with self._lock:
+                src = self._search_rc
+            if self.mode == "live" and any(v != 0 for v in src):
+                try:
+                    self._send_rc(*src)
+                    snapshot["rc_sent_at"] = round(t_now, 2)
+                    snapshot["search_rc"] = list(src)
+                    snapshot["marker_id"] = None
+                    snapshot["status_msg"] = (
+                        f"searching (overriding PD on visible markers) — "
+                        f"rc(lr={src[0]}, fb={src[1]}, ud={src[2]}, yaw={src[3]})"
+                    )
+                except Exception:
+                    pass
+                self._chosen_id = None
+                with self._lock:
+                    self.latest = snapshot
+                return
             chosen = max(vid_all.items(), key=lambda kv: kv[1].get("px_size", 0))[0]
         else:
             snapshot["marker_id"] = None
@@ -663,8 +841,12 @@ class ScanAllMarkersMission:
     # marker is visible). The observer's _tick runs at ~5 Hz; we push a fresh
     # search RC each mission tick and the observer forwards it each frame.
     SEARCH_IDLE_BEFORE_MOVE_S = 2.0   # hover this long before starting search RC
-    SEARCH_ROTATE_YAW_RC = 25         # RC yaw magnitude during rotation (≈ 37°/s)
-    SEARCH_ROTATION_TIME_S = 12.0     # one full 360° at the above rate
+    SEARCH_ROTATE_YAW_RC = 40         # RC yaw magnitude during rotation (≈ 60°/s).
+                                      # Raised from 25 for faster scan cycles.
+                                      # If drone can't detect markers mid-rotation
+                                      # (motion blur) drop back to 25–30.
+    SEARCH_ROTATION_TIME_S = 7.0      # one full 360° at the above rate
+                                      # (7s × 60°/s ≈ 420°, some margin for deceleration)
     SEARCH_CENTER_XY = (0.0, 5.4)     # arena center (SDC field 20×10.8)
     SEARCH_CENTER_TOL_M = 0.8         # "close enough to centre" threshold
     SEARCH_CENTER_SPEED_RC = 8        # slow translate speed toward centre
@@ -675,7 +857,7 @@ class ScanAllMarkersMission:
         fleet: "ObserverFleet",
         drone_ids: list[str],
         target_markers: list[int],
-        hover_seconds: float = 3.0,
+        hover_seconds: float = 1.5,
         approach_tolerance_m: float = 0.30,
         approach_skew_tol: float = 0.12,
         approach_err_x_tol: float = 0.15,
@@ -948,6 +1130,7 @@ class ScanAllMarkersMission:
                     "yaw":  snap.get("yaw"),
                     "battery": snap.get("battery"),
                     "altitude_m": snap.get("altitude_m"),
+                    "guard": snap.get("guard"),
                 })
 
             # Observer not running? Try to recover
@@ -1165,30 +1348,69 @@ class ScanAllMarkersMission:
                     return
                 elapsed = time.time() - (state["hover_start"] or time.time())
                 if elapsed >= self.hover_seconds:
-                    # Scanned! Go directly into the rotate sub-phase so the
-                    # drone immediately starts looking for the next marker,
-                    # skipping the usual 2-second idle grace.
+                    # Scanned! Record the success, then CONTINUOUS-FLIGHT:
+                    # if another unclaimed target is already in view, skip
+                    # the rotate sub-phase entirely and go straight to
+                    # APPROACH on the next marker. No stop, no rotation,
+                    # seamless flow from one marker to the next.
                     self.scanned.add(target)
                     self.claimed.pop(did, None)
-                    obs.set_target(None)
-                    state.update(phase="SEARCH", target=None, hover_start=None,
-                                 search_sub="rotate", search_sub_start=now,
-                                 search_cycles=0,
-                                 note=f"scanned marker {target} — rotating to find next")
-                    # Kick off rotation immediately (the next SEARCH tick would
-                    # do this anyway, but setting it here avoids a 0.5s gap).
-                    obs.set_search_rc(0, 0, 0, self.SEARCH_ROTATE_YAW_RC)
+
+                    next_available = [
+                        m for m in visible
+                        if m in self.target_markers
+                        and m not in self.scanned
+                        and m not in self.claimed.values()
+                        and m != target          # never re-chain the just-scanned one
+                    ]
+
                     if self._trace:
                         self._trace.write("marker_scanned", {
                             "drone": did, "marker": target,
                             "hover_elapsed": round(elapsed, 3),
                             "scanned_count": len(self.scanned),
                             "remaining": sorted(set(self.target_markers) - self.scanned),
+                            "next_available": next_available,
                         })
-                        self._trace.write("phase_change", {
-                            "drone": did, "from": "HOVER", "to": "SEARCH",
-                            "sub": "rotate", "reason": "scan_complete",
-                        })
+
+                    if next_available:
+                        # Prefer the marker currently centred in view if it's in
+                        # our candidate set; otherwise lowest id.
+                        if marker_id in next_available:
+                            chosen = marker_id
+                        else:
+                            chosen = min(next_available)
+                        self.claimed[did] = chosen
+                        obs.set_target(chosen)
+                        obs.set_search_rc(0, 0, 0, 0)  # cancel any pending search RC
+                        state.update(phase="APPROACH", target=chosen,
+                                     hover_start=None,
+                                     search_sub="idle", search_sub_start=None,
+                                     search_cycles=0,
+                                     note=f"scanned {target}, chaining → {chosen}")
+                        if self._trace:
+                            self._trace.write("marker_claimed", {
+                                "drone": did, "marker": chosen,
+                                "visible": list(visible),
+                                "chained_from": target,
+                            })
+                            self._trace.write("phase_change", {
+                                "drone": did, "from": "HOVER", "to": "APPROACH",
+                                "target": chosen, "reason": "chained_from_hover",
+                            })
+                    else:
+                        # No next target visible → start rotating to find one.
+                        obs.set_target(None)
+                        state.update(phase="SEARCH", target=None, hover_start=None,
+                                     search_sub="rotate", search_sub_start=now,
+                                     search_cycles=0,
+                                     note=f"scanned marker {target} — rotating to find next")
+                        obs.set_search_rc(0, 0, 0, self.SEARCH_ROTATE_YAW_RC)
+                        if self._trace:
+                            self._trace.write("phase_change", {
+                                "drone": did, "from": "HOVER", "to": "SEARCH",
+                                "sub": "rotate", "reason": "scan_complete",
+                            })
                 else:
                     remaining = self.hover_seconds - elapsed
                     state["note"] = f"hovering on {target}: {remaining:.1f}s left"
@@ -1210,7 +1432,7 @@ class MissionManager:
         return self._current
 
     def start_scan_all(self, drone_ids: list[str], target_markers: list[int],
-                       hover_seconds: float = 3.0,
+                       hover_seconds: float = 1.5,
                        approach_tolerance_m: float = 0.30,
                        approach_skew_tol: float = 0.12,
                        approach_err_x_tol: float = 0.15,
