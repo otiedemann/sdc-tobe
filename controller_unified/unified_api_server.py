@@ -181,16 +181,22 @@ if HAS_OLYMPE_SDK:
         except Exception as _e:
             _WIFI_IMPORT_ERRORS.append(f"{label}: {type(_e).__name__}: {_e}")
 
-    # Enums. Multiple possible paths.
+    # Enums. Olympe 7.x uses lowercase names (band, selection_type),
+    # older 1.x used CamelCase (Band, SelectionType). Accept either.
     for ep in ("olympe.enums.wifi", "olympe.messages.wifi"):
         try:
             em = _importlib.import_module(ep)
-            WifiBand = getattr(em, "Band", None) or WifiBand
-            WifiSelectionType = (getattr(em, "SelectionType", None)
+            WifiBand = (getattr(em, "band", None)
+                        or getattr(em, "Band", None)
+                        or WifiBand)
+            WifiSelectionType = (getattr(em, "selection_type", None)
+                                 or getattr(em, "SelectionType", None)
                                  or getattr(em, "Type", None)
                                  or WifiSelectionType)
             if WifiBand and WifiSelectionType:
-                print(f"[WIFI] Band/SelectionType enums loaded from {ep}")
+                print(f"[WIFI] Band/SelectionType enums loaded from {ep} "
+                      f"(band={WifiBand.__name__ if hasattr(WifiBand,'__name__') else WifiBand}, "
+                      f"sel={WifiSelectionType.__name__ if hasattr(WifiSelectionType,'__name__') else WifiSelectionType})")
                 break
         except Exception as _e:
             _WIFI_IMPORT_ERRORS.append(f"enums from {ep}: {type(_e).__name__}: {_e}")
@@ -2929,6 +2935,27 @@ def api_wifi_debug():
     return jsonify(out)
 
 
+def _jsonable(v):
+    """Recursively convert Olympe state values into JSON-safe Python types.
+    Olympe state dicts often contain ArsdkEnum instances (e.g. Band.5_GHz,
+    Type.manual) which aren't serializable by Flask's jsonify. Convert
+    enums to 'name' (or str(v) as fallback), and recurse into dict/list."""
+    if v is None or isinstance(v, (str, int, float, bool)):
+        return v
+    # ArsdkEnum / IntEnum / any enum-like object
+    name = getattr(v, "name", None)
+    if name and isinstance(name, str):
+        return name
+    if isinstance(v, dict):
+        return {k: _jsonable(x) for k, x in v.items()}
+    if isinstance(v, (list, tuple, set)):
+        return [_jsonable(x) for x in v]
+    try:
+        return str(v)
+    except Exception:
+        return None
+
+
 @app.get("/api/wifi/status")
 def api_wifi_status():
     """Report the current AP channel + band the Anafi is broadcasting on."""
@@ -2942,9 +2969,61 @@ def api_wifi_status():
         st = b._get_state(WifiApChannelChanged) if WifiApChannelChanged else None
         if st is None:
             return jsonify(ok=True, status="not-reported")
-        return jsonify(ok=True, status=dict(st))
+        return jsonify(ok=True, status=_jsonable(dict(st)))
     except Exception as e:
         return jsonify(ok=False, error=str(e)), 500
+
+
+def _wifi_band_enum(s: str):
+    """Map a user-supplied band string → the Olympe enum member.
+    Accepts '2.4', '2.4ghz', '2_4_ghz', '5', '5ghz', '5_ghz', 'all'.
+    Falls back to the raw string if WifiBand isn't an enum (Olympe 1.x)."""
+    key = str(s).lower().replace("ghz", "").replace(".", "_").strip(" _")
+    alias = {"2": "2_4_ghz", "2_4": "2_4_ghz", "24": "2_4_ghz",
+             "5": "5_ghz",
+             "": "all", "all": "all"}.get(key, key)
+    if WifiBand is None:
+        return alias
+    # Try every casing Olympe might use
+    for attempt in (alias, alias.lower(), alias.upper(),
+                    alias.replace("_ghz", "_GHz"),
+                    alias.replace("2_4", "2_4").upper()):
+        if hasattr(WifiBand, attempt):
+            return getattr(WifiBand, attempt)
+    # Final fallback: iterate members, match by .name
+    try:
+        for m in WifiBand:
+            if m.name.lower() == alias.lower():
+                return m
+    except Exception:
+        pass
+    return alias
+
+
+def _wifi_sel_type_enum(which: str):
+    """which is 'auto_all' | 'auto_2_4' | 'auto_5' | 'manual'.
+    Returns the corresponding Olympe enum member (or the string if the
+    enum isn't exposed)."""
+    key = str(which).lower()
+    # Candidate names across Olympe versions
+    candidates = {
+        "auto_all":  ["auto_all", "auto"],
+        "auto_2_4":  ["auto_2_4_ghz", "auto_2_4Ghz", "auto_2_4GHz", "auto_2.4"],
+        "auto_5":    ["auto_5_ghz", "auto_5GHz", "auto_5"],
+        "manual":    ["manual", "fixed"],
+    }.get(key, [key])
+    if WifiSelectionType is None:
+        return candidates[0]
+    for name in candidates:
+        if hasattr(WifiSelectionType, name):
+            return getattr(WifiSelectionType, name)
+    try:
+        for m in WifiSelectionType:
+            if m.name.lower() in [c.lower() for c in candidates]:
+                return m
+    except Exception:
+        pass
+    return candidates[0]
 
 
 @app.post("/api/wifi/scan")
@@ -2962,22 +3041,12 @@ def api_wifi_scan():
         return jsonify(ok=False, error="drone not connected"), 503
     data = request.get_json(silent=True) or {}
     band_str = str(data.get("band", "all")).lower()
+    band = _wifi_band_enum(band_str)
     try:
-        band = {
-            "2_4_ghz": getattr(WifiBand, "2_4_GHz", None) if "WifiBand" in globals() else "2_4_GHz",
-            "2.4":     getattr(WifiBand, "2_4_GHz", None) if "WifiBand" in globals() else "2_4_GHz",
-            "5_ghz":   getattr(WifiBand, "5_GHz",   None) if "WifiBand" in globals() else "5_GHz",
-            "5":       getattr(WifiBand, "5_GHz",   None) if "WifiBand" in globals() else "5_GHz",
-            "all":     getattr(WifiBand, "all",     None) if "WifiBand" in globals() else "all",
-        }.get(band_str, band_str)
         with command_lock:
             b.drone(WifiScan(band=band)).wait(_timeout=5)
-        # Harvest the authorized-channel events. Olympe's state dict keeps
-        # the latest per channel, so we pull them all.
         channels = []
         try:
-            # AuthorizedChannel is a multi-valued state. Try state() to get
-            # all known channels, but API varies by Olympe version.
             all_ch = b.drone.get_state(WifiAuthorizedChannel)
             if isinstance(all_ch, dict):
                 channels = list(all_ch.values())
@@ -2985,7 +3054,8 @@ def api_wifi_scan():
                 channels = all_ch
         except Exception:
             pass
-        return jsonify(ok=True, band=str(band), channels=channels)
+        return jsonify(ok=True, band=band_str, band_resolved=_jsonable(band),
+                       channels=_jsonable(channels))
     except Exception as e:
         return jsonify(ok=False, error=str(e)), 500
 
@@ -3015,43 +3085,32 @@ def api_wifi_channel():
     band_str  = str(data.get("band", "5_GHz")).lower()
     channel   = int(data.get("channel", 0))
 
-    try:
-        # Map string → enum (defensive against naming drift between Olympe versions)
-        band = {
-            "2_4_ghz": getattr(WifiBand, "2_4_GHz", None) if "WifiBand" in globals() else "2_4_GHz",
-            "2.4":     getattr(WifiBand, "2_4_GHz", None) if "WifiBand" in globals() else "2_4_GHz",
-            "5_ghz":   getattr(WifiBand, "5_GHz",   None) if "WifiBand" in globals() else "5_GHz",
-            "5":       getattr(WifiBand, "5_GHz",   None) if "WifiBand" in globals() else "5_GHz",
-        }.get(band_str, band_str)
-        if auto_mode:
-            # Auto on this band — channel=0 means "pick the best one"
-            sel_type = getattr(WifiSelectionType, "auto_all",
-                         getattr(WifiSelectionType, "auto_2_4_ghz", "auto_all")) \
-                       if "WifiSelectionType" in globals() else "auto"
-            if band_str in ("5_ghz", "5"):
-                sel_type = getattr(WifiSelectionType, "auto_5_ghz",
-                                   getattr(WifiSelectionType, "auto_all", "auto_5_ghz")) \
-                           if "WifiSelectionType" in globals() else "auto"
-            elif band_str in ("2_4_ghz", "2.4"):
-                sel_type = getattr(WifiSelectionType, "auto_2_4_ghz",
-                                   getattr(WifiSelectionType, "auto_all", "auto_2_4_ghz")) \
-                           if "WifiSelectionType" in globals() else "auto"
-            with command_lock:
-                b.drone(WifiSetApChannel(type=sel_type, band=band, channel=0)).wait(_timeout=5)
-            print(f"[ANAFI] Wi-Fi: AUTO channel selection in band {band_str}")
-            return jsonify(ok=True, mode="auto", band=band_str,
-                           message=f"drone picks best {band_str} channel; "
-                                   "connection will drop briefly")
+    band = _wifi_band_enum(band_str)
+    if auto_mode:
+        if band_str.startswith("5"):
+            sel = _wifi_sel_type_enum("auto_5")
+        elif band_str.startswith("2"):
+            sel = _wifi_sel_type_enum("auto_2_4")
         else:
-            manual_type = getattr(WifiSelectionType, "manual", "manual") \
-                          if "WifiSelectionType" in globals() else "manual"
-            with command_lock:
-                b.drone(WifiSetApChannel(type=manual_type, band=band,
-                                         channel=channel)).wait(_timeout=5)
-            print(f"[ANAFI] Wi-Fi: MANUAL → band={band_str}, channel={channel}")
-            return jsonify(ok=True, mode="manual", band=band_str, channel=channel,
-                           message=f"channel set to {channel}; connection will "
-                                   "drop briefly")
+            sel = _wifi_sel_type_enum("auto_all")
+    else:
+        sel = _wifi_sel_type_enum("manual")
+
+    try:
+        with command_lock:
+            b.drone(WifiSetApChannel(type=sel, band=band,
+                                     channel=0 if auto_mode else channel)).wait(_timeout=5)
+        mode = "auto" if auto_mode else "manual"
+        print(f"[ANAFI] Wi-Fi: {mode.upper()} → band={band_str}, "
+              f"channel={'any' if auto_mode else channel} "
+              f"(sel={_jsonable(sel)})")
+        resp = {"ok": True, "mode": mode, "band": band_str,
+                "type_resolved": _jsonable(sel),
+                "band_resolved": _jsonable(band),
+                "message": f"channel change submitted; connection will drop briefly"}
+        if not auto_mode:
+            resp["channel"] = channel
+        return jsonify(resp)
     except Exception as e:
         return jsonify(ok=False, error=str(e)), 500
 
