@@ -620,7 +620,7 @@ class ScanAllMarkersMission:
         drone_ids: list[str],
         target_markers: list[int],
         hover_seconds: float = 3.0,
-        approach_tolerance_m: float = 0.35,
+        approach_tolerance_m: float = 0.30,
         approach_skew_tol: float = 0.08,
         approach_err_x_tol: float = 0.15,
         auto_takeoff: bool = False,
@@ -962,25 +962,25 @@ class ScanAllMarkersMission:
                     return
                 target_dist = obs.params.hover_distance_m
                 err_x_mag = abs(snap.get("err_x", 1))
-                skew_mag = abs(snap.get("skew", 1))
+                skew_mag  = abs(snap.get("skew", 1))
+                # APPROACH → HOVER: the ONLY hard requirement is distance within
+                # ±approach_tolerance_m. Horizontal alignment (err_x) and
+                # perpendicularity (skew) are nice-to-have indicators shown in
+                # the status line, but they don't block the transition — the
+                # observer's PD loop keeps correcting them once HOVER starts,
+                # and a hard err_x/skew gate kept drones stuck "approaching"
+                # forever when the scene had marginal conditions.
                 dist_ok = abs(distance_m - target_dist) <= self.approach_tolerance_m
-                x_ok    = err_x_mag <= self.approach_err_x_tol
-                skew_ok = skew_mag  <= self.approach_skew_tol
-                if dist_ok and x_ok and skew_ok:
+                if dist_ok:
                     state["phase"] = "HOVER"
                     state["hover_start"] = time.time()
-                    state["note"] = f"hovering on {target} (skew={skew_mag:.2f})"
+                    state["note"] = (f"hovering on {target} "
+                                     f"(err_x={err_x_mag:.2f}, skew={skew_mag:.2f})")
                 else:
-                    # Report the specific deficiency so the operator can tune
-                    missing = []
-                    if not dist_ok:
-                        missing.append(f"dist {distance_m:.2f}→{target_dist:.2f}m")
-                    if not x_ok:
-                        missing.append(f"|err_x|={err_x_mag:.2f}>{self.approach_err_x_tol}")
-                    if not skew_ok:
-                        missing.append(f"|skew|={skew_mag:.2f}>{self.approach_skew_tol} "
-                                       "(not perpendicular)")
-                    state["note"] = f"approaching {target}: " + "; ".join(missing)
+                    state["note"] = (f"approaching {target}: dist "
+                                     f"{distance_m:.2f}→{target_dist:.2f}m "
+                                     f"(±{self.approach_tolerance_m:.2f})  "
+                                     f"err_x={err_x_mag:.2f}  skew={skew_mag:.2f}")
                 return
 
             if phase == "HOVER":
@@ -998,15 +998,19 @@ class ScanAllMarkersMission:
                     return
                 elapsed = time.time() - (state["hover_start"] or time.time())
                 if elapsed >= self.hover_seconds:
-                    # Scanned!
+                    # Scanned! Go directly into the rotate sub-phase so the
+                    # drone immediately starts looking for the next marker,
+                    # skipping the usual 2-second idle grace.
                     self.scanned.add(target)
                     self.claimed.pop(did, None)
                     obs.set_target(None)
-                    obs.set_search_rc(0, 0, 0, 0)
                     state.update(phase="SEARCH", target=None, hover_start=None,
-                                 search_sub="idle", search_sub_start=None,
+                                 search_sub="rotate", search_sub_start=now,
                                  search_cycles=0,
-                                 note=f"scanned marker {target}")
+                                 note=f"scanned marker {target} — rotating to find next")
+                    # Kick off rotation immediately (the next SEARCH tick would
+                    # do this anyway, but setting it here avoids a 0.5s gap).
+                    obs.set_search_rc(0, 0, 0, self.SEARCH_ROTATE_YAW_RC)
                 else:
                     remaining = self.hover_seconds - elapsed
                     state["note"] = f"hovering on {target}: {remaining:.1f}s left"
@@ -1029,7 +1033,7 @@ class MissionManager:
 
     def start_scan_all(self, drone_ids: list[str], target_markers: list[int],
                        hover_seconds: float = 3.0,
-                       approach_tolerance_m: float = 0.35,
+                       approach_tolerance_m: float = 0.30,
                        approach_skew_tol: float = 0.08,
                        approach_err_x_tol: float = 0.15,
                        auto_takeoff: bool = False) -> tuple[bool, str]:
