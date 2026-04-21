@@ -689,8 +689,12 @@ class ScanAllMarkersMission:
     # marker is visible). The observer's _tick runs at ~5 Hz; we push a fresh
     # search RC each mission tick and the observer forwards it each frame.
     SEARCH_IDLE_BEFORE_MOVE_S = 2.0   # hover this long before starting search RC
-    SEARCH_ROTATE_YAW_RC = 25         # RC yaw magnitude during rotation (≈ 37°/s)
-    SEARCH_ROTATION_TIME_S = 12.0     # one full 360° at the above rate
+    SEARCH_ROTATE_YAW_RC = 40         # RC yaw magnitude during rotation (≈ 60°/s).
+                                      # Raised from 25 for faster scan cycles.
+                                      # If drone can't detect markers mid-rotation
+                                      # (motion blur) drop back to 25–30.
+    SEARCH_ROTATION_TIME_S = 7.0      # one full 360° at the above rate
+                                      # (7s × 60°/s ≈ 420°, some margin for deceleration)
     SEARCH_CENTER_XY = (0.0, 5.4)     # arena center (SDC field 20×10.8)
     SEARCH_CENTER_TOL_M = 0.8         # "close enough to centre" threshold
     SEARCH_CENTER_SPEED_RC = 8        # slow translate speed toward centre
@@ -701,7 +705,7 @@ class ScanAllMarkersMission:
         fleet: "ObserverFleet",
         drone_ids: list[str],
         target_markers: list[int],
-        hover_seconds: float = 3.0,
+        hover_seconds: float = 1.5,
         approach_tolerance_m: float = 0.30,
         approach_skew_tol: float = 0.12,
         approach_err_x_tol: float = 0.15,
@@ -1191,30 +1195,69 @@ class ScanAllMarkersMission:
                     return
                 elapsed = time.time() - (state["hover_start"] or time.time())
                 if elapsed >= self.hover_seconds:
-                    # Scanned! Go directly into the rotate sub-phase so the
-                    # drone immediately starts looking for the next marker,
-                    # skipping the usual 2-second idle grace.
+                    # Scanned! Record the success, then CONTINUOUS-FLIGHT:
+                    # if another unclaimed target is already in view, skip
+                    # the rotate sub-phase entirely and go straight to
+                    # APPROACH on the next marker. No stop, no rotation,
+                    # seamless flow from one marker to the next.
                     self.scanned.add(target)
                     self.claimed.pop(did, None)
-                    obs.set_target(None)
-                    state.update(phase="SEARCH", target=None, hover_start=None,
-                                 search_sub="rotate", search_sub_start=now,
-                                 search_cycles=0,
-                                 note=f"scanned marker {target} — rotating to find next")
-                    # Kick off rotation immediately (the next SEARCH tick would
-                    # do this anyway, but setting it here avoids a 0.5s gap).
-                    obs.set_search_rc(0, 0, 0, self.SEARCH_ROTATE_YAW_RC)
+
+                    next_available = [
+                        m for m in visible
+                        if m in self.target_markers
+                        and m not in self.scanned
+                        and m not in self.claimed.values()
+                        and m != target          # never re-chain the just-scanned one
+                    ]
+
                     if self._trace:
                         self._trace.write("marker_scanned", {
                             "drone": did, "marker": target,
                             "hover_elapsed": round(elapsed, 3),
                             "scanned_count": len(self.scanned),
                             "remaining": sorted(set(self.target_markers) - self.scanned),
+                            "next_available": next_available,
                         })
-                        self._trace.write("phase_change", {
-                            "drone": did, "from": "HOVER", "to": "SEARCH",
-                            "sub": "rotate", "reason": "scan_complete",
-                        })
+
+                    if next_available:
+                        # Prefer the marker currently centred in view if it's in
+                        # our candidate set; otherwise lowest id.
+                        if marker_id in next_available:
+                            chosen = marker_id
+                        else:
+                            chosen = min(next_available)
+                        self.claimed[did] = chosen
+                        obs.set_target(chosen)
+                        obs.set_search_rc(0, 0, 0, 0)  # cancel any pending search RC
+                        state.update(phase="APPROACH", target=chosen,
+                                     hover_start=None,
+                                     search_sub="idle", search_sub_start=None,
+                                     search_cycles=0,
+                                     note=f"scanned {target}, chaining → {chosen}")
+                        if self._trace:
+                            self._trace.write("marker_claimed", {
+                                "drone": did, "marker": chosen,
+                                "visible": list(visible),
+                                "chained_from": target,
+                            })
+                            self._trace.write("phase_change", {
+                                "drone": did, "from": "HOVER", "to": "APPROACH",
+                                "target": chosen, "reason": "chained_from_hover",
+                            })
+                    else:
+                        # No next target visible → start rotating to find one.
+                        obs.set_target(None)
+                        state.update(phase="SEARCH", target=None, hover_start=None,
+                                     search_sub="rotate", search_sub_start=now,
+                                     search_cycles=0,
+                                     note=f"scanned marker {target} — rotating to find next")
+                        obs.set_search_rc(0, 0, 0, self.SEARCH_ROTATE_YAW_RC)
+                        if self._trace:
+                            self._trace.write("phase_change", {
+                                "drone": did, "from": "HOVER", "to": "SEARCH",
+                                "sub": "rotate", "reason": "scan_complete",
+                            })
                 else:
                     remaining = self.hover_seconds - elapsed
                     state["note"] = f"hovering on {target}: {remaining:.1f}s left"
@@ -1236,7 +1279,7 @@ class MissionManager:
         return self._current
 
     def start_scan_all(self, drone_ids: list[str], target_markers: list[int],
-                       hover_seconds: float = 3.0,
+                       hover_seconds: float = 1.5,
                        approach_tolerance_m: float = 0.30,
                        approach_skew_tol: float = 0.12,
                        approach_err_x_tol: float = 0.15,

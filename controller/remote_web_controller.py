@@ -585,7 +585,7 @@ HTML = """
       <label style=\"color:#94a3b8;\">Target markers:</label>
       <input id=\"mis_markers\" type=\"text\" value=\"1-12\" placeholder=\"e.g. 1-12 or 1,2,3,7\" style=\"width:220px;\" />
       <label style=\"color:#94a3b8;margin-left:12px;\">Hover s:</label>
-      <input id=\"mis_hover_s\" type=\"number\" min=\"0.5\" step=\"0.5\" value=\"3\" style=\"width:70px;\" />
+      <input id=\"mis_hover_s\" type=\"number\" min=\"0.5\" step=\"0.5\" value=\"1.5\" style=\"width:70px;\" title=\"How long the drone hovers in front of each marker before moving on. 1.5s scans cleanly; raise if the score validation needs longer.\" />
       <label style=\"color:#94a3b8;margin-left:12px;\">Approach tol (m):</label>
       <input id=\"mis_tol_m\" type=\"number\" min=\"0.1\" step=\"0.05\" value=\"0.30\" style=\"width:70px;\" title=\"Drone transitions from APPROACH to HOVER once within this many metres of the hover distance AND sufficiently perpendicular (see Skew tol).\" />
       <label style=\"color:#94a3b8;margin-left:12px;\" title=\"Max skew before declaring the drone perpendicular. 0.08 ≈ 6° off the marker normal. Lower values force the drone to align straight-on before hovering.\">Skew tol:</label>
@@ -1078,7 +1078,7 @@ HTML = """
     arcPoll();
     // Version marker — if this string doesn't appear in the DOM,
     // you're running stale JS (restart the Python server or hard-refresh).
-    const BUILD = 'ap-search-rc-overrides-autopick';
+    const BUILD = 'aq-continuous-flight';
     console.log('[arc] init complete, build=' + BUILD);
     const ver = document.createElement('span');
     ver.id = 'arc_build_tag';
