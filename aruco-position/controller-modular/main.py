@@ -246,6 +246,10 @@ class AutonomousMission:
         # Kick off phase-specific actions before the transition.
         if phase == MissionPhase.FLY_TO:
             self._begin_fly_to(drone)
+        elif phase == MissionPhase.HOLD:
+            # Reset cam timestamp so _tick_hold() doesn't immediately see a
+            # stale timeout from the time spent waiting for SPACE confirm.
+            self._last_cam_ts = time.monotonic()
         print(f"[mission] Confirmed → {phase}")
         self._transition(phase)
 
@@ -299,11 +303,15 @@ class AutonomousMission:
         if self._phase in (MissionPhase.IDLE, MissionPhase.FAILED, MissionPhase.ABORTED):
             return
 
-        # Paused: waiting for operator to press SPACE before the next step.
-        if self._pending_phase is not None:
-            return
-
         now = time.monotonic()
+
+        # Paused: waiting for operator to press SPACE before the next step.
+        # Still update _last_cam_ts so the timeout doesn't fire immediately
+        # after confirm() is called if the operator took a while to press SPACE.
+        if self._pending_phase is not None:
+            if self._get_cam_pos(vision_result) is not None:
+                self._last_cam_ts = now
+            return
 
         if self._phase == MissionPhase.TAKEOFF:
             self._tick_takeoff(vision_result, state, now, drone)
@@ -501,13 +509,13 @@ class AutonomousMission:
         """Send a pure yaw PCMD — zero roll, pitch, gaz — to rotate in place."""
         if drone is None or self.dry_run:
             return
-        try:
-            from olympe.messages.ardrone3.Piloting import PCMD
-            self._recovery_seq = (self._recovery_seq + 1) & 0x7FFFFFFF
-            yaw_pct = int(RECOVERY_YAW_RATE / 0.8 * 100)  # 0.8 rad/s → 100 %
-            drone(PCMD(0, 0, 0, yaw_pct, 0, self._recovery_seq))
-        except Exception:
-            pass
+        yaw_pct = int(RECOVERY_YAW_RATE / 0.8 * 100)  # 0.8 rad/s → 100 %
+        # Use the same piloting API (piloting_pcmd or raw PCMD with flag=1)
+        # as the rest of the controller so commands are not silently ignored.
+        self.ctrl.send_pcmd_olympe(
+            drone,
+            {"forward_back": 0, "left_right": 0, "up_down": 0, "yaw": yaw_pct},
+        )
 
 
 # ============================================================
@@ -1282,9 +1290,11 @@ def main():
                     elif anafi_drone is not None:
                         ctrl_module.send_pcmd_olympe(anafi_drone, rc)
             elif not _mission_manually_overridden and _ctrl_state is None \
-                    and anafi_drone is not None and not mission_dry_run:
-                # No cam position and no manual input — stop all movement so the drone
-                # does not drift while the mission's recovery yaw-search takes over.
+                    and anafi_drone is not None and not mission_dry_run \
+                    and not (mission is not None and mission._recovering):
+                # No cam position and no manual input — stop all movement.
+                # Skip when mission recovery is active: the mission sends its own
+                # yaw PCMD via _send_recovery_yaw() and must not be overwritten here.
                 ctrl_module.send_pcmd_olympe(
                     anafi_drone,
                     {"forward_back": 0, "left_right": 0, "up_down": 0, "yaw": 0},
