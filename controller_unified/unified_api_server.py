@@ -127,40 +127,81 @@ if HAS_OLYMPE_SDK:
 
 
 # ─── Optional Wi-Fi control messages ────────────────────────────────────────
-# The Anafi is dual-band 2.4/5 GHz 802.11n. The drone exposes AP-channel
-# config via Olympe. Only imported on systems where Olympe is available;
-# everything that uses these is guarded by HAS_WIFI_CTRL.
+# The Anafi is dual-band 2.4/5 GHz 802.11n. Olympe exposes AP-channel
+# config, but the exact Python symbol names drift between Olympe versions
+# (set_ap_channel vs SetApChannel vs Command.SetApChannel, etc.).
+# We probe the module and log every import error so the operator can
+# see what's actually available. Everything downstream is guarded by
+# HAS_WIFI_CTRL.
 HAS_WIFI_CTRL = False
+WifiSetApChannel = WifiScan = None
+WifiApChannelChanged = WifiAuthorizedChannel = WifiRssiChanged = None
+WifiBand = WifiSelectionType = None
+_WIFI_IMPORT_ERRORS: list[str] = []   # populated for /api/wifi/debug
+
 if HAS_OLYMPE_SDK:
-    try:
-        from olympe.messages.wifi import (
-            set_ap_channel as WifiSetApChannel,
-            scan as WifiScan,
-            rssi_changed as WifiRssiChanged,
-            authorized_channel as WifiAuthorizedChannel,
-            ap_channel_changed as WifiApChannelChanged,
-            country_changed as WifiCountryChanged,
-            environement_changed as WifiEnvironmentChanged,
-        )
-        from olympe.enums.wifi import (
-            SelectionType as WifiSelectionType,
-            Band as WifiBand,
-        )
-        HAS_WIFI_CTRL = True
-    except (ImportError, KeyError, AttributeError) as _e:
-        # Older Olympe versions have slightly different paths. Try a
-        # fallback via the .Command submodule.
+    # Candidate message paths. Try each; first one that binds wins.
+    _WIFI_CANDIDATES = [
+        # (label, module_path, set_attr, scan_attr, chan_evt, auth_evt, rssi_evt)
+        ("wifi.<snake>", "olympe.messages.wifi",
+            "set_ap_channel", "scan",
+            "ap_channel_changed", "authorized_channel", "rssi_changed"),
+        ("wifi.<Camel>", "olympe.messages.wifi",
+            "SetApChannel", "ScanChannels",
+            "ApChannelChanged", "AuthorizedChannel", "Rssi_changed"),
+        ("wifi.Command", "olympe.messages.wifi.Command",
+            "SetApChannel", "ScanChannels",
+            None, None, None),   # events not under Command
+    ]
+    import importlib as _importlib
+    for label, mod_path, set_name, scan_name, chan_name, auth_name, rssi_name in _WIFI_CANDIDATES:
         try:
-            from olympe.messages.wifi import Command as _WifiCmd
-            WifiSetApChannel = getattr(_WifiCmd, "SetApChannel", None)
-            WifiScan = getattr(_WifiCmd, "ScanChannels", None)
-            from olympe.messages import wifi as _wifi_events
-            WifiApChannelChanged = getattr(_wifi_events, "ApChannelChanged", None)
-            WifiAuthorizedChannel = getattr(_wifi_events, "AuthorizedChannel", None)
-            WifiRssiChanged = getattr(_wifi_events, "Rssi_changed", None)
-            HAS_WIFI_CTRL = bool(WifiSetApChannel and WifiScan)
-        except Exception:
-            HAS_WIFI_CTRL = False
+            mod = _importlib.import_module(mod_path)
+            s = getattr(mod, set_name, None)
+            sc = getattr(mod, scan_name, None)
+            if not (s and sc):
+                _WIFI_IMPORT_ERRORS.append(
+                    f"{label}: {mod_path}.{set_name}={bool(s)}, "
+                    f".{scan_name}={bool(sc)}")
+                continue
+            WifiSetApChannel = s
+            WifiScan = sc
+            if chan_name:
+                WifiApChannelChanged = getattr(mod, chan_name, None) or \
+                    getattr(_importlib.import_module("olympe.messages.wifi"), chan_name, None)
+            if auth_name:
+                WifiAuthorizedChannel = getattr(mod, auth_name, None) or \
+                    getattr(_importlib.import_module("olympe.messages.wifi"), auth_name, None)
+            if rssi_name:
+                WifiRssiChanged = getattr(mod, rssi_name, None) or \
+                    getattr(_importlib.import_module("olympe.messages.wifi"), rssi_name, None)
+            print(f"[WIFI] Using Olympe Wi-Fi bindings from {label} ({mod_path})")
+            HAS_WIFI_CTRL = True
+            break
+        except Exception as _e:
+            _WIFI_IMPORT_ERRORS.append(f"{label}: {type(_e).__name__}: {_e}")
+
+    # Enums. Multiple possible paths.
+    for ep in ("olympe.enums.wifi", "olympe.messages.wifi"):
+        try:
+            em = _importlib.import_module(ep)
+            WifiBand = getattr(em, "Band", None) or WifiBand
+            WifiSelectionType = (getattr(em, "SelectionType", None)
+                                 or getattr(em, "Type", None)
+                                 or WifiSelectionType)
+            if WifiBand and WifiSelectionType:
+                print(f"[WIFI] Band/SelectionType enums loaded from {ep}")
+                break
+        except Exception as _e:
+            _WIFI_IMPORT_ERRORS.append(f"enums from {ep}: {type(_e).__name__}: {_e}")
+
+    if HAS_WIFI_CTRL:
+        print(f"[WIFI] Control ready — band={bool(WifiBand)}, "
+              f"sel_type={bool(WifiSelectionType)}")
+    else:
+        print("[WIFI] Control NOT available. Errors:")
+        for err in _WIFI_IMPORT_ERRORS:
+            print(f"[WIFI]   {err}")
 
 
 def _magneto_needs_calibration(status: Optional[str]) -> bool:
@@ -2832,6 +2873,60 @@ def _anafi_backend():
     if b.drone is None:
         return None
     return b
+
+
+@app.get("/api/wifi/debug")
+def api_wifi_debug():
+    """Introspect what's actually available in olympe.messages.wifi on this
+    flight controller. Use this when /api/wifi/channel returns 'not
+    supported' — the response shows what symbol names this Olympe build
+    exposes, so we can fix the imports in HAS_WIFI_CTRL."""
+    import importlib
+    out = {"has_olympe_sdk": HAS_OLYMPE_SDK, "has_wifi_ctrl": HAS_WIFI_CTRL,
+           "import_errors": list(_WIFI_IMPORT_ERRORS)}
+    for path in ("olympe.messages.wifi", "olympe.enums.wifi"):
+        try:
+            m = importlib.import_module(path)
+            names = sorted(n for n in dir(m) if not n.startswith("_"))
+            out[path] = names
+        except Exception as e:
+            out[path] = f"import failed: {type(e).__name__}: {e}"
+    try:
+        cmd_mod = importlib.import_module("olympe.messages.wifi.Command")
+        out["olympe.messages.wifi.Command"] = sorted(
+            n for n in dir(cmd_mod) if not n.startswith("_"))
+    except Exception as e:
+        out["olympe.messages.wifi.Command"] = f"not importable: {e}"
+    # Resolved bindings
+    out["resolved"] = {
+        "WifiSetApChannel":       getattr(WifiSetApChannel, "__name__", str(WifiSetApChannel)),
+        "WifiScan":               getattr(WifiScan, "__name__", str(WifiScan)),
+        "WifiBand":               getattr(WifiBand, "__name__", str(WifiBand)),
+        "WifiSelectionType":      getattr(WifiSelectionType, "__name__", str(WifiSelectionType)),
+        "WifiApChannelChanged":   getattr(WifiApChannelChanged, "__name__", str(WifiApChannelChanged)),
+        "WifiAuthorizedChannel":  getattr(WifiAuthorizedChannel, "__name__", str(WifiAuthorizedChannel)),
+        "WifiRssiChanged":        getattr(WifiRssiChanged, "__name__", str(WifiRssiChanged)),
+    }
+    # If Band has enum members, list them so the user knows what "5_GHz" to pass
+    if WifiBand is not None:
+        try:
+            out["WifiBand_members"] = [m.name for m in WifiBand]
+        except Exception:
+            try:
+                out["WifiBand_members"] = [k for k in WifiBand.__dict__.keys()
+                                           if not k.startswith("_")]
+            except Exception:
+                pass
+    if WifiSelectionType is not None:
+        try:
+            out["WifiSelectionType_members"] = [m.name for m in WifiSelectionType]
+        except Exception:
+            try:
+                out["WifiSelectionType_members"] = [k for k in WifiSelectionType.__dict__.keys()
+                                                    if not k.startswith("_")]
+            except Exception:
+                pass
+    return jsonify(out)
 
 
 @app.get("/api/wifi/status")
