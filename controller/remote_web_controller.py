@@ -782,13 +782,17 @@ HTML = """
     // Buttons
     document.getElementById('arc_start').onclick = async () => {
       await fetch('/proxy/aruco/start', {method:'POST'});
-      document.getElementById('arc_video').src = '/proxy/aruco/video.mjpg?t=' + Date.now();
+      const av = document.getElementById('arc_video');
+      av.src = '/proxy/aruco/video.mjpg?t=' + Date.now();
+      av.setAttribute('data-active', '1');
       // Reload params for the now-active drone
       arcLoadParams();
     };
     document.getElementById('arc_stop').onclick = async () => {
       await fetch('/proxy/aruco/stop', {method:'POST'});
-      document.getElementById('arc_video').src = '';
+      const av = document.getElementById('arc_video');
+      av.src = '';
+      av.removeAttribute('data-active');
     };
     document.getElementById('arc_target_lock').onclick = async () => {
       const v = document.getElementById('arc_target_input').value;
@@ -899,7 +903,7 @@ HTML = """
     arcPoll();
     // Version marker — if this string doesn't appear in the DOM,
     // you're running stale JS (restart the Python server or hard-refresh).
-    const BUILD = 'ak-drone-switch-hotkeys';
+    const BUILD = 'al-drone-switch-v2';
     console.log('[arc] init complete, build=' + BUILD);
     const ver = document.createElement('span');
     ver.id = 'arc_build_tag';
@@ -1347,37 +1351,55 @@ async function switchDrone(id) {
     refreshTelemetry();
     // ── Video feed must also switch to the new drone ───────────────
     // /proxy/video, /proxy/position/video and /proxy/aruco/video.mjpg
-    // all proxy to the ACTIVE drone on the server. After switch, the
-    // server-side PI_BASE now points at the new drone — but the
-    // browser's existing MJPEG connections are still streaming from
-    // the OLD drone. Force a reconnect by nulling then resetting src
-    // (plus a fresh cache-buster), and POST a /proxy/video/start so
-    // the new drone is guaranteed to have MJPEG running.
+    // all proxy to the ACTIVE drone on the server. The browser's
+    // existing <img> MJPEG connections are pinned to the OLD drone
+    // (long-lived HTTP, established when src was set), so we have to
+    // tear them down and re-establish. Be aggressive: always do this,
+    // regardless of videoActive/src-empty flags.
     try {
-      // Guarantee Way-1 MJPEG is active on the newly-selected drone.
-      // Fire-and-forget; if already running the server returns ok.
+      // 1) Guarantee Way-1 MJPEG is running on the new drone.
+      //    Fire-and-forget; if it's already running, the server returns ok.
       fetch('/proxy/video/start', {method:'POST',
         headers:{'Content-Type':'application/json'},
         body: JSON.stringify({mode:'mjpeg'})}).catch(()=>{});
-      const mainImg = document.getElementById('video_img');
-      if (mainImg && videoActive) {
-        mainImg.src = '';
-        // Small delay so the browser cleanly drops the old connection
-        setTimeout(() => { mainImg.src = '/proxy/video?' + Date.now(); }, 150);
-      }
-      const posImg = document.getElementById('pos_video_img');
-      if (posImg && posImg.src) {
-        posImg.src = '';
-        setTimeout(() => { posImg.src = '/proxy/position/video?' + Date.now(); }, 150);
-      }
-      const arcImg = document.getElementById('arc_video');
-      if (arcImg && arcImg.src) {
-        arcImg.src = '';
-        setTimeout(() => { arcImg.src = '/proxy/aruco/video.mjpg?t=' + Date.now(); }, 150);
-      }
-      console.log('[drone-switch] video feeds reconnected to drone', id);
-    } catch (e) {
-      console.warn('[drone-switch] video reconnect failed:', e);
+
+      // 2) Force every <img> to drop its current MJPEG connection.
+      //    'about:blank' is more aggressive than an empty string; it
+      //    actually tears down the existing HTTP socket.
+      const elements = [
+        { el: document.getElementById('video_img'),     src: '/proxy/video?' },
+        { el: document.getElementById('pos_video_img'), src: '/proxy/position/video?' },
+        { el: document.getElementById('arc_video'),     src: '/proxy/aruco/video.mjpg?t=' },
+      ];
+      elements.forEach(({el}) => { if (el) el.src = 'about:blank'; });
+
+      // 3) After the browser has had time to close the old connections
+      //    (browsers process src changes async — 300 ms is a safe
+      //    upper bound), reconnect every feed with a fresh cache-buster.
+      //    Main feed is always reconnected (even if user hadn't pressed
+      //    Start Video on the old drone, the new drone should also
+      //    show its feed). Position and ArUco feeds only reconnect
+      //    if they had been displayed on the previous drone.
+      const posVisible = document.getElementById('pos_video_img') &&
+        document.getElementById('pos_video_img').parentElement &&
+        document.getElementById('pos_video_img').parentElement.style.display !== 'none';
+      const arcVisible = document.getElementById('arc_video') &&
+        document.getElementById('arc_video').getAttribute('data-active') === '1';
+      setTimeout(() => {
+        const ts = Date.now();
+        const mainImg = document.getElementById('video_img');
+        if (mainImg) { mainImg.src = '/proxy/video?' + ts; videoActive = true; }
+        if (posVisible) {
+          document.getElementById('pos_video_img').src = '/proxy/position/video?' + ts;
+        }
+        if (arcVisible) {
+          document.getElementById('arc_video').src = '/proxy/aruco/video.mjpg?t=' + ts;
+        }
+        console.log('[drone-switch] video reconnected → drone', id,
+                    ' main=yes pos=', posVisible, ' arc=', arcVisible);
+      }, 300);
+    } catch (err) {
+      console.warn('[drone-switch] video reconnect failed:', err);
     }
   } catch {}
 }
@@ -1540,18 +1562,31 @@ window.addEventListener('keydown', (e)=>{
   // ── Drone switch hotkey: digits 1-5 select the Nth drone in the bar ──
   // Order follows Object.entries(drones) insertion order, same as the
   // drone-bar buttons top→bottom. '1' = first drone, '2' = second, etc.
-  if (k >= '1' && k <= '5') {
+  // Accept both the top-row digit key and the numpad digit; e.key is '1'
+  // in both cases so simple string comparison works, but also use e.code
+  // as a fallback when an exotic layout remaps the character.
+  const isDigit15 = /^[1-5]$/.test(k) ||
+                    /^(Digit|Numpad)[1-5]$/.test(e.code || '');
+  if (isDigit15) {
     e.preventDefault();
-    const idx = parseInt(k, 10) - 1;
-    const ids = Object.keys(drones);
+    const slot = parseInt(k, 10) || parseInt((e.code || '').slice(-1), 10);
+    const idx  = slot - 1;
+    const ids  = Object.keys(drones || {});
+    console.log('[drone-switch] hotkey', slot, 'fleet=', ids,
+                'active=', activeDroneId);
+    if (ids.length === 0) {
+      console.warn('[drone-switch] drones dict is empty — did loadDrones run?');
+      return;
+    }
     if (idx < ids.length) {
       const targetId = ids[idx];
       if (targetId !== activeDroneId) {
-        console.log('[drone-switch] hotkey', k, '→', targetId);
         switchDrone(targetId);
+      } else {
+        console.log('[drone-switch] already on', targetId);
       }
     } else {
-      console.log('[drone-switch] no drone at slot', k, '(have', ids.length, ')');
+      console.log('[drone-switch] no drone at slot', slot, '(have', ids.length, ')');
     }
     return;
   }
