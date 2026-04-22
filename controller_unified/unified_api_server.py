@@ -243,6 +243,11 @@ def _magneto_needs_calibration(status: Optional[str]) -> bool:
     except (ImportError, KeyError):
         pass
     try:
+        from olympe.messages.camera import set_zoom_target as _CameraSetZoom
+        HAS_CAMERA_ZOOM = True
+    except (ImportError, KeyError):
+        HAS_CAMERA_ZOOM = False
+    try:
         from olympe.messages.gimbal import set_target, attitude as gimbal_attitude
         HAS_GIMBAL = True
     except (ImportError, KeyError):
@@ -354,6 +359,48 @@ FLIGHT_CONFIG_PATH   = Path(__file__).with_name("flight_config.json")
 def _host_reachable(host: str) -> bool:
     r = subprocess.run(["ping", "-c", "1", "-W", "1", host], capture_output=True, text=True)
     return r.returncode == 0
+
+
+def _ping_rtt_ms(host: str, timeout_s: float = 0.8) -> Optional[float]:
+    """Return the round-trip time in milliseconds to `host`, or None on
+    failure. Uses a single ICMP echo. Parses `time=XX.X ms` from the
+    `ping` output — works on both macOS and Linux.
+    """
+    try:
+        # -c 1: one packet; -W ms or s depending on OS. BSD ping uses
+        # -W ms (integer), Linux ping uses -W seconds (integer). Use
+        # large enough timeout for both: -W 1 second is portable.
+        r = subprocess.run(
+            ["ping", "-c", "1", "-W", "1", host],
+            capture_output=True, text=True, timeout=timeout_s)
+        if r.returncode != 0:
+            return None
+        import re as _re
+        m = _re.search(r"time[=<]([\d.]+)\s*ms", r.stdout)
+        return float(m.group(1)) if m else None
+    except Exception:
+        return None
+
+
+# Background ping sampler — keeps a rolling RTT to drone_ip so /api/drone_ping
+# can return the current value instantly (ping takes ~1s so we don't want the
+# web request to block on it).
+_drone_ping_state = {"rtt_ms": None, "last_update": 0.0, "host": ""}
+_drone_ping_lock = threading.Lock()
+
+
+def _drone_ping_loop():
+    """Runs in the background. Pings the drone once per second and
+    caches the latest RTT so /api/drone_ping returns immediately."""
+    while running:
+        host = drone_ip
+        if host:
+            rtt = _ping_rtt_ms(host, timeout_s=1.2)
+            with _drone_ping_lock:
+                _drone_ping_state["rtt_ms"] = rtt
+                _drone_ping_state["last_update"] = time.time()
+                _drone_ping_state["host"] = host
+        time.sleep(1.0)
 
 
 def detect_drone_type() -> Tuple[str, str]:
@@ -2893,6 +2940,21 @@ def api_heartbeat():
     return jsonify(ok=True, flying=flying, connected=connected, drone_type=drone_type, t=time.time())
 
 
+@app.get("/api/drone_ping")
+def api_drone_ping():
+    """Return the flight-controller → drone ICMP ping RTT in milliseconds.
+    The value is sampled once per second by a background thread
+    (_drone_ping_loop) so this endpoint returns immediately with the
+    most recent measurement. None means the last ping timed out."""
+    with _drone_ping_lock:
+        st = dict(_drone_ping_state)
+    age_s = time.time() - st["last_update"] if st.get("last_update") else None
+    return jsonify(ok=True,
+                   rtt_ms=st.get("rtt_ms"),
+                   host=st.get("host") or drone_ip,
+                   sample_age_s=round(age_s, 2) if age_s is not None else None)
+
+
 @app.get("/api/magneto")
 def api_magneto_get():
     """Return the current magnetometer calibration status for this drone.
@@ -3657,6 +3719,35 @@ def api_camera_record_stop():
         return jsonify(ok=False, error="controller not ready"), 503
     ok, msg = b.camera_record_stop()
     return jsonify(ok=ok, recording=False) if ok else (jsonify(ok=False, error=msg), 501 if msg == "not_supported" else 500)
+
+
+@app.post("/api/camera/zoom")
+def api_camera_zoom():
+    """Set the Anafi's digital camera zoom.
+    Body: {"zoom": 1.0..3.0}  (1.0 = no zoom, 3.0 = max 3× digital).
+    Implemented via Olympe's camera.set_zoom_target with control_mode=level.
+    """
+    if not HAS_CAMERA_ZOOM:
+        return jsonify(ok=False, error="camera zoom not supported "
+                                        "by this Olympe build"), 501
+    b = backend
+    if b is None or not isinstance(b, OlympeBackend) or b.drone is None:
+        return jsonify(ok=False, error="drone not connected"), 503
+    data = request.get_json(silent=True) or {}
+    try:
+        z = float(data.get("zoom", 1.0))
+    except Exception:
+        return jsonify(ok=False, error="zoom must be numeric"), 400
+    # Clamp — Anafi digital zoom range is 1.0..3.0.
+    z = max(1.0, min(3.0, z))
+    try:
+        with command_lock:
+            # control_mode="level" = absolute zoom level; "velocity" = rate.
+            b.drone(_CameraSetZoom(cam_id=0, control_mode="level",
+                                    target=z)).wait(_timeout=2)
+        return jsonify(ok=True, zoom=z)
+    except Exception as e:
+        return jsonify(ok=False, error=str(e)), 500
 
 
 @app.post("/api/gimbal")
@@ -4572,6 +4663,8 @@ def main():
     threading.Thread(target=reconnect_loop, daemon=True).start()
     threading.Thread(target=rc_loop, daemon=True).start()
     threading.Thread(target=watchdog_loop, daemon=True).start()
+    threading.Thread(target=_drone_ping_loop, daemon=True,
+                     name="drone-ping").start()
 
     # Load persisted flight limits
     _load_flight_config()

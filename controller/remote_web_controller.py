@@ -191,6 +191,31 @@ HTML = """
     #arc_live_banner { display:none; background:#b91c1c; color:#fee2e2; padding:6px 10px; border-radius:4px; font-weight:700; letter-spacing:0.04em; margin-bottom:8px; box-shadow:0 0 0 2px #fbbf24 inset; text-align:center; font-size:12px; }
     #arc_live_banner.show { display:block; animation:arcpulse 1.6s ease-in-out infinite; }
     @keyframes arcpulse { 0%,100% { box-shadow:0 0 0 2px #fbbf24 inset; } 50% { box-shadow:0 0 0 4px #fbbf24 inset; } }
+
+    /* Collapsible panels — click the header to toggle. State persists in
+       localStorage so each operator keeps their preferred layout. */
+    .collapsible-toggle {
+      cursor: pointer; user-select: none;
+      display: flex; align-items: center; gap: 8px;
+      padding: 2px 0;
+    }
+    .collapsible-toggle:hover { color: #60a5fa; }
+    .collapsible-toggle:before {
+      content: '▾'; transition: transform 0.15s;
+      display: inline-block; font-size: 11px; color: #94a3b8; width: 10px;
+    }
+    .collapsible.collapsed > .collapsible-toggle:before {
+      transform: rotate(-90deg);
+    }
+    .collapsible.collapsed > .collapsible-body {
+      display: none !important;
+    }
+    /* Video panel special case: keep the <img> alive (= still decoding
+       MJPEG) but not visually rendered when the panel is collapsed. */
+    #video_panel.collapsible.collapsed > .collapsible-body {
+      display: block !important;
+      height: 0; overflow: hidden; margin: 0; padding: 0;
+    }
     body.arc-live-mode { box-shadow:0 0 0 4px #b91c1c inset; }
     .arc-rc-sent { color:#f87171; font-weight:600; }
     /* ── Special Missions panel ──────────────────────────────────── */
@@ -354,6 +379,25 @@ HTML = """
   <div class=\"small\">Active: <span id=\"pi\"></span></div>
   <div class=\"small\">API status: <span id=\"api_status\">checking...</span></div>
   <div class=\"small\">Drone telemetry status: <span id=\"drone_status\">checking...</span></div>
+  <!-- Latency indicator (live ms). Click the toggle to auto-push the total
+       into the position-tracker's latency_ms slider. Video-decode offset
+       slider lets the operator add the C2-side processing time that isn't
+       captured by either ping. -->
+  <div class=\"small\" id=\"latency_widget\" style=\"display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-top:4px;padding:4px 8px;background:#0f172a;border:1px solid #1e293b;border-radius:4px;\">
+    <b style=\"color:#e2e8f0;\">Latency:</b>
+    <span id=\"lat_total\" style=\"font-weight:700;color:#22c55e;min-width:60px;\">—</span>
+    <span class=\"small\" style=\"color:#64748b;\">=
+      c2→fc <span id=\"lat_c2fc\" style=\"color:#93c5fd;\">—</span> +
+      fc→drone <span id=\"lat_fcdr\" style=\"color:#fbbf24;\">—</span> +
+      video <span id=\"lat_vid\" style=\"color:#c4b5fd;\">—</span>
+    </span>
+    <label style=\"display:flex;align-items:center;gap:4px;color:#94a3b8;cursor:pointer;\" title=\"Add this many ms for local video-frame processing/decoding on the C2. Not measured by either ping.\">
+      video +<input id=\"lat_video_offset\" type=\"number\" min=\"0\" max=\"500\" step=\"5\" value=\"30\" style=\"width:55px;\" /> ms
+    </label>
+    <label style=\"display:flex;align-items:center;gap:4px;color:#94a3b8;cursor:pointer;\" title=\"Auto-push the total into the Position Tracker latency slider every poll.\">
+      <input type=\"checkbox\" id=\"lat_auto_apply\" /> auto-set latency
+    </label>
+  </div>
   <div class=\"row\" style=\"margin-top:10px;\">
     <div class=\"panel\">
       <div class=\"grid\" id=\"grid\">
@@ -497,6 +541,15 @@ HTML = """
         </div>
         <div class=\"video-status\" id=\"video_status\">Mode: off</div>
         <div class=\"video-url\" id=\"video_url\" style=\"display:none;\"></div>
+        <!-- Anafi camera zoom. Digital zoom 1.0–3.0×. Slider writes to
+             /proxy/camera/zoom, which forwards to Olympe's set_zoom_target
+             on the Pi. Value updates live as you drag. -->
+        <div class=\"video-controls\" style=\"margin-top:8px;\">
+          <span class=\"small\" style=\"min-width:52px;\">Zoom</span>
+          <input id=\"video_zoom\" type=\"range\" min=\"1.0\" max=\"3.0\" step=\"0.05\" value=\"1.0\" style=\"flex:1;max-width:200px;\" />
+          <span id=\"video_zoom_val\" class=\"small\" style=\"min-width:40px;\">1.00×</span>
+          <button id=\"video_zoom_reset\" style=\"padding:2px 8px;font-size:11px;\">Reset</button>
+        </div>
         <div id=\"video_container\" style=\"margin-top:8px;display:none;\">
           <img id=\"video_img\" src=\"\" alt=\"video stream\" style=\"width:480px;height:auto;\" />
         </div>
@@ -1124,7 +1177,7 @@ HTML = """
     arcPoll();
     // Version marker — if this string doesn't appear in the DOM,
     // you're running stale JS (restart the Python server or hard-refresh).
-    const BUILD = 'av-boxes-on-map-tight-view';
+    const BUILD = 'aw-collapsible-panels';
     console.log('[arc] init complete, build=' + BUILD);
     const ver = document.createElement('span');
     ver.id = 'arc_build_tag';
@@ -2394,6 +2447,169 @@ async function autoStartVideo() {
 }
 // Fire a bit after page load so /proxy/heartbeat has time to succeed first
 setTimeout(autoStartVideo, 300);
+
+// ── Anafi camera zoom slider ─────────────────────────────────────────
+(function(){
+  const sl  = document.getElementById('video_zoom');
+  const lbl = document.getElementById('video_zoom_val');
+  const rst = document.getElementById('video_zoom_reset');
+  if (!sl || !lbl) return;
+  let _zoomTimer = null;
+  function sendZoom(v) {
+    fetch('/proxy/camera/zoom', {method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({zoom: v})}).catch(()=>{});
+  }
+  sl.addEventListener('input', () => {
+    const v = Number(sl.value);
+    lbl.textContent = v.toFixed(2) + '×';
+    // Debounce — don't spam the drone with 100+ posts per drag
+    if (_zoomTimer) clearTimeout(_zoomTimer);
+    _zoomTimer = setTimeout(() => sendZoom(v), 80);
+  });
+  if (rst) rst.addEventListener('click', () => {
+    sl.value = 1.0;
+    lbl.textContent = '1.00×';
+    sendZoom(1.0);
+  });
+})();
+
+// ── Latency measurement ──────────────────────────────────────────────
+// Polls /proxy/latency every 2s. Total displayed = c2_to_fc + fc_to_drone
+// + video_offset (operator-configurable). When the "auto-set latency"
+// checkbox is ticked, the total is pushed into the Position Tracker's
+// latency_ms slider each poll so position fusion stays in sync with the
+// actual comm-stack delay.
+async function latPoll() {
+  try {
+    const r = await fetch('/proxy/latency', {cache:'no-store'});
+    const d = await r.json();
+    const fm = (x) => (x == null) ? '—' : Math.round(x) + ' ms';
+    const c2fc = d.c2_to_fc_ms;
+    const fcdr = d.fc_to_drone_ms;
+    const videoEl = document.getElementById('lat_video_offset');
+    const videoMs = videoEl ? (parseInt(videoEl.value, 10) || 0) : 0;
+    const totalMs = (c2fc || 0) + (fcdr || 0) + videoMs;
+    document.getElementById('lat_c2fc').textContent = fm(c2fc);
+    document.getElementById('lat_fcdr').textContent = fm(fcdr);
+    document.getElementById('lat_vid').textContent = fm(videoMs);
+    const tEl = document.getElementById('lat_total');
+    tEl.textContent = Math.round(totalMs) + ' ms';
+    // Colour total: <80ms green, <200ms amber, else red
+    tEl.style.color = (totalMs < 80) ? '#22c55e'
+                    : (totalMs < 200) ? '#fbbf24' : '#ef4444';
+    // Auto-push into Position Tracker slider if toggle on
+    const auto = document.getElementById('lat_auto_apply');
+    if (auto && auto.checked && c2fc != null && fcdr != null) {
+      const slider = document.getElementById('pos_latency');
+      const lbl = document.getElementById('pos_latency_val');
+      if (slider) {
+        slider.value = Math.round(totalMs);
+        if (lbl) lbl.textContent = Math.round(totalMs);
+        // Mirror to server so the positioning pipeline uses this too
+        fetch('/proxy/position/config', {method:'POST',
+          headers:{'Content-Type':'application/json'},
+          body: JSON.stringify({latency_ms: Math.round(totalMs)})}).catch(()=>{});
+      }
+    }
+  } catch {}
+}
+setInterval(latPoll, 2000);
+setTimeout(latPoll, 800);
+
+// ── Collapsible panels ───────────────────────────────────────────────
+// Wrap a panel's existing content under a click-to-toggle header.
+// If the panel already contains an h2/h3 as its first significant
+// child, reuse it as the toggle; otherwise inject a new header with
+// `defaultTitle`. State persists in localStorage per `storageKey` so
+// each operator keeps their preferred layout across page reloads.
+function makeCollapsible(el, defaultTitle, storageKey, startCollapsed) {
+  if (!el || el.classList.contains('collapsible')) return;
+  // Prefer an existing h2/h3 as the toggle header
+  let header = el.querySelector(':scope > h2, :scope > h3');
+  let body;
+  if (header) {
+    body = document.createElement('div');
+    body.className = 'collapsible-body';
+    const siblings = Array.from(el.children).filter(c => c !== header);
+    siblings.forEach(c => body.appendChild(c));
+    el.appendChild(body);
+  } else {
+    body = document.createElement('div');
+    body.className = 'collapsible-body';
+    while (el.firstChild) body.appendChild(el.firstChild);
+    header = document.createElement('div');
+    header.innerHTML = '<b>' + defaultTitle + '</b>';
+    el.appendChild(header);
+    el.appendChild(body);
+  }
+  header.classList.add('collapsible-toggle');
+  el.classList.add('collapsible');
+  header.addEventListener('click', (e) => {
+    // Don't toggle if the click was on an interactive child
+    const t = e.target;
+    if (t !== header && (t.tagName === 'INPUT' || t.tagName === 'BUTTON' ||
+                         t.tagName === 'SELECT' || t.tagName === 'A' ||
+                         t.tagName === 'TEXTAREA')) return;
+    el.classList.toggle('collapsed');
+    try { localStorage.setItem(storageKey,
+          el.classList.contains('collapsed') ? '1' : '0'); } catch {}
+  });
+  // Load persisted state (fall back to startCollapsed default)
+  let saved = null;
+  try { saved = localStorage.getItem(storageKey); } catch {}
+  const shouldCollapse = (saved === null) ? Boolean(startCollapsed)
+                                           : (saved === '1');
+  if (shouldCollapse) el.classList.add('collapsed');
+}
+
+// Find a .panel that contains a <b> with the given exact text.
+function _panelByBoldTitle(title) {
+  const panels = Array.from(document.querySelectorAll('.panel'));
+  for (const p of panels) {
+    const b = p.querySelector('b');
+    if (b && b.textContent.trim() === title) return p;
+  }
+  return null;
+}
+
+// Run after the DOM is settled — some panels are only fully populated
+// after the first polls (e.g. drone bar) but their structure is fixed.
+setTimeout(() => {
+  // id-addressable panels
+  makeCollapsible(document.getElementById('mission_panel'),    'Mission Planner',       'collapsed_mission_planner',  true);
+  makeCollapsible(document.getElementById('anafi_panel'),      'Anafi / Olympe controls','collapsed_anafi',           true);
+  makeCollapsible(document.getElementById('video_panel'),      'Video stream',          'collapsed_video',            false);
+  makeCollapsible(document.getElementById('aruco_panel'),      'ArUco Seek',            'collapsed_aruco',            true);
+  makeCollapsible(document.getElementById('missions_panel'),   'Special Missions',      'collapsed_missions',         true);
+
+  // Panels addressed by their <b>-wrapped title
+  makeCollapsible(_panelByBoldTitle('Telemetry'),          'Telemetry',          'collapsed_telemetry',  false);
+  makeCollapsible(_panelByBoldTitle('Position Tracker'),   'Position Tracker',   'collapsed_pos_tracker', false);
+  makeCollapsible(_panelByBoldTitle('Arena Configuration'),'Arena Configuration','collapsed_arena_cfg',  true);
+
+  // WASD grid panel — first .panel that contains a .grid
+  (function wrapKeyPanel() {
+    const p = document.querySelector('.panel:has(> .grid)') ||
+              Array.from(document.querySelectorAll('.panel')).find(
+                x => x.querySelector(':scope > .grid'));
+    if (p) makeCollapsible(p, 'WASD Key controls', 'collapsed_keys', false);
+  })();
+
+  // Advanced SDK controls — .adv block with the "Advanced SDK controls" label
+  (function wrapAdvPanel() {
+    const advs = document.querySelectorAll('.adv');
+    for (const a of advs) {
+      const lbl = a.querySelector(':scope > .small');
+      if (lbl && lbl.textContent.trim().startsWith('Advanced SDK controls')) {
+        // Replace the tiny 'small' label with a proper header
+        lbl.remove();
+        makeCollapsible(a, 'Advanced SDK controls', 'collapsed_adv_sdk', true);
+        return;
+      }
+    }
+  })();
+}, 150);
 
 // Poll video status
 async function refreshVideoStatus() {
@@ -4844,6 +5060,17 @@ def proxy_video_forward_stream():
     return Response(gen(), mimetype="multipart/x-mixed-replace; boundary=frame")
 
 
+@app.post("/proxy/camera/zoom")
+def proxy_camera_zoom():
+    data = request.get_json(silent=True) or {}
+    try:
+        r = _http_session.post(f"{PI_BASE}/api/camera/zoom", json=data, timeout=1.5)
+        return (r.text, r.status_code,
+                {"Content-Type": r.headers.get("Content-Type", "application/json")})
+    except Exception as e:
+        return jsonify(ok=False, error=str(e)), 502
+
+
 @app.get("/proxy/heartbeat")
 def proxy_heartbeat():
     """Send heartbeat to ALL drones in parallel to keep their watchdogs alive."""
@@ -4858,6 +5085,42 @@ def proxy_heartbeat():
     futures = list(_heartbeat_pool.map(_ping, DRONES.items()))
     results = dict(futures)
     return jsonify(ok=True, drones=results)
+
+
+# ─── Latency ping (C2 → flight controller + flight controller → drone) ──────
+@app.get("/proxy/latency")
+def proxy_latency():
+    """Returns the three-leg latency picture for the ACTIVE drone:
+      c2_to_fc_ms     — fresh HTTP round-trip to /api/heartbeat on the Pi
+      fc_to_drone_ms  — cached flight-controller-to-drone ICMP ping from /api/drone_ping
+      sample_age_s    — age of the fc_to_drone sample
+    The client adds these together (plus a user-tuned video-processing
+    offset) to get the total command-loop latency."""
+    t0 = time.time()
+    c2_rtt = None
+    fc = None
+    try:
+        r = _http_session.get(f"{PI_BASE}/api/heartbeat", timeout=1.0)
+        c2_rtt = (time.time() - t0) * 1000.0
+        fc_ok = (r.status_code == 200)
+    except Exception:
+        fc_ok = False
+    try:
+        r2 = _http_session.get(f"{PI_BASE}/api/drone_ping", timeout=1.0)
+        if r2.ok:
+            fc = r2.json()
+    except Exception:
+        pass
+    resp = {
+        "ok": True,
+        "c2_to_fc_ms": round(c2_rtt, 2) if c2_rtt is not None else None,
+        "fc_reachable": fc_ok,
+        "fc_to_drone_ms": (fc.get("rtt_ms") if fc else None),
+        "fc_to_drone_host": (fc.get("host") if fc else None),
+        "fc_to_drone_sample_age_s": (fc.get("sample_age_s") if fc else None),
+        "pi_base": PI_BASE,
+    }
+    return jsonify(resp)
 
 
 @app.get("/proxy/telemetry")
