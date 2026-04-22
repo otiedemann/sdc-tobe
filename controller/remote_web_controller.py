@@ -296,6 +296,11 @@ HTML = """
   </style>
 </head>
 <body>
+  <img id=\"team_logo\" src=\"/logo.png\" alt=\"Team logo\"
+       title=\"Team To Be Defined — SDC26\"
+       style=\"position:fixed;top:10px;right:12px;width:64px;height:64px;z-index:100;
+              filter:drop-shadow(0 2px 6px rgba(0,0,0,0.6));\"
+       onerror=\"this.style.display='none'\" />
   <h2>Drone Remote Controller</h2>
   <div style=\"display:flex;align-items:center;gap:8px;\">
     <div class=\"drone-bar\" id=\"drone_bar\" style=\"flex:1;\"></div>
@@ -398,6 +403,31 @@ HTML = """
       <input type=\"checkbox\" id=\"lat_auto_apply\" /> auto-set latency
     </label>
   </div>
+  <!-- ── Tuning Parameters — one place for all live-tunable knobs ──
+       The Observer PD gains (approach speed, skew correction, IMU damping,
+       clamps, etc.) AND the Position Tracker config (profile, FOV, latency,
+       IMU/ArUco blend, Kalman, marker size, top-K, outlier) all live here
+       so operators don't have to hunt for the right slider. Content is
+       relocated at runtime from the ArUco Seek and Position Tracker panels
+       via JS to keep existing IDs and handlers intact. -->
+  <div id=\"tuning_panel\" class=\"panel\" style=\"margin-top:10px;\">
+    <h3 style=\"margin:0 0 8px 0;color:#38bdf8;\">Tuning Parameters <span class=\"small\" style=\"color:#64748b;font-weight:400;\">— all live-adjustable knobs in one place</span></h3>
+    <div style=\"display:flex;flex-wrap:wrap;gap:16px;align-items:flex-start;\">
+      <div style=\"flex:1;min-width:360px;\">
+        <div class=\"small\" style=\"color:#a78bfa;margin-bottom:4px;font-weight:600;\">
+          Observer PD — visual-servo gains (hover in front of markers, used by missions)
+        </div>
+        <div id=\"tuning_observer_slot\" style=\"min-height:10px;\"></div>
+      </div>
+      <div style=\"flex:1;min-width:360px;\">
+        <div class=\"small\" style=\"color:#22d3ee;margin-bottom:4px;font-weight:600;\">
+          Position Tracker — absolute arena-frame pose fusion (all missions + boundary guard)
+        </div>
+        <div id=\"tuning_position_slot\" style=\"min-height:10px;\"></div>
+      </div>
+    </div>
+  </div>
+
   <div class=\"row\" style=\"margin-top:10px;\">
     <div class=\"panel\">
       <div class=\"grid\" id=\"grid\">
@@ -1177,7 +1207,7 @@ HTML = """
     arcPoll();
     // Version marker — if this string doesn't appear in the DOM,
     // you're running stale JS (restart the Python server or hard-refresh).
-    const BUILD = 'aw-collapsible-panels';
+    const BUILD = 'ax-tuning-panel-logo';
     console.log('[arc] init complete, build=' + BUILD);
     const ver = document.createElement('span');
     ver.id = 'arc_build_tag';
@@ -2575,8 +2605,41 @@ function _panelByBoldTitle(title) {
 
 // Run after the DOM is settled — some panels are only fully populated
 // after the first polls (e.g. drone bar) but their structure is fixed.
+// ── Relocate tuning controls into the new unified Tuning Parameters
+// panel. Runs BEFORE makeCollapsible so the panel's starting state is
+// set correctly. Keeps existing DOM nodes intact (IDs, handlers, all
+// event bindings) — we just re-parent them. The original ArUco Seek
+// panel keeps only the live readout; the Position Tracker panel keeps
+// only the canvas + coordinate readouts. Everything else moves here.
+function relocateTuningControls() {
+  const obsSlot = document.getElementById('tuning_observer_slot');
+  const posSlot = document.getElementById('tuning_position_slot');
+  if (!obsSlot || !posSlot) return;
+
+  // Observer PD — the slider grid + Reload button container
+  const arcParamsWrap = document.getElementById('arc_params');
+  if (arcParamsWrap && arcParamsWrap.parentElement) {
+    // The adjacent 'Live tuning parameters' label + Reload button are
+    // siblings of #arc_params inside the same wrapper <div>. Move the
+    // whole wrapper for convenience.
+    const wrap = arcParamsWrap.parentElement;
+    obsSlot.appendChild(wrap);
+  }
+
+  // Position Tracker — the .pos-cfg div holding all the fusion sliders.
+  // The tracker panel keeps its canvas + numeric readouts; the config
+  // rows (Profile / FOV / Latency / IMU blend / Kalman / Marker size /
+  // Top-K / Outlier / Apply Config) move over.
+  const posCfgWrap = document.querySelector('#pos_panel .pos-cfg') ||
+                     Array.from(document.querySelectorAll('.pos-cfg'))
+                       .find(el => el.querySelector('#pos_profile'));
+  if (posCfgWrap) posSlot.appendChild(posCfgWrap);
+}
+relocateTuningControls();
+
 setTimeout(() => {
   // id-addressable panels
+  makeCollapsible(document.getElementById('tuning_panel'),     'Tuning Parameters',     'collapsed_tuning',           true);
   makeCollapsible(document.getElementById('mission_panel'),    'Mission Planner',       'collapsed_mission_planner',  true);
   makeCollapsible(document.getElementById('anafi_panel'),      'Anafi / Olympe controls','collapsed_anafi',           true);
   makeCollapsible(document.getElementById('video_panel'),      'Video stream',          'collapsed_video',            false);
@@ -4454,6 +4517,17 @@ def pi_get(path: str, timeout: float | None = None):
 @app.get("/")
 def index():
     return Response(HTML, mimetype="text/html")
+
+
+@app.get("/logo.png")
+def serve_logo():
+    """Serve the team logo for the top-right corner of the UI."""
+    from pathlib import Path as _P
+    p = _P(__file__).resolve().parent.parent / "1_Doc" / "team_logo.png"
+    if not p.exists():
+        return jsonify(ok=False, error="logo not found"), 404
+    return send_file(str(p), mimetype="image/png",
+                     max_age=86400)   # cache-1-day
 
 
 @app.get("/proxy/drones")
