@@ -593,10 +593,13 @@ HTML = """
     <div id=\"mis_capture_rows\" style=\"display:none;\">
       <div class=\"mis-row\">
         <label style=\"color:#94a3b8;\" title=\"One JSON object per target box. Use the Blue team's 3 enemy boxes (the red-home boxes) for standard play.\">Target boxes (JSON):</label>
-        <textarea id=\"mis_boxes_json\" rows=\"3\" style=\"width:100%;max-width:520px;background:#0f172a;color:#e2e8f0;border:1px solid #334155;border-radius:4px;padding:6px;font-family:monospace;font-size:11px;\">[
-  {\"id\": 1, \"x\": -5.0, \"y\": 2.0},
-  {\"id\": 2, \"x\":  0.0, \"y\": 2.0},
-  {\"id\": 3, \"x\":  5.0, \"y\": 2.0}
+        <textarea id=\"mis_boxes_json\" rows=\"8\" style=\"width:100%;max-width:520px;background:#0f172a;color:#e2e8f0;border:1px solid #334155;border-radius:4px;padding:6px;font-family:monospace;font-size:11px;\">[
+  {\"id\": 1, \"x\": -7.0, \"y\": 2.5, \"home_team\": \"red\"},
+  {\"id\": 2, \"x\": -5.0, \"y\": 5.4, \"home_team\": \"red\"},
+  {\"id\": 3, \"x\": -7.0, \"y\": 8.3, \"home_team\": \"red\"},
+  {\"id\": 4, \"x\":  7.0, \"y\": 2.5, \"home_team\": \"blue\"},
+  {\"id\": 5, \"x\":  5.0, \"y\": 5.4, \"home_team\": \"blue\"},
+  {\"id\": 6, \"x\":  7.0, \"y\": 8.3, \"home_team\": \"blue\"}
 ]</textarea>
       </div>
       <div class=\"mis-row\">
@@ -1121,7 +1124,7 @@ HTML = """
     arcPoll();
     // Version marker — if this string doesn't appear in the DOM,
     // you're running stale JS (restart the Python server or hard-refresh).
-    const BUILD = 'au-capture-targets-mission';
+    const BUILD = 'av-boxes-on-map-tight-view';
     console.log('[arc] init complete, build=' + BUILD);
     const ver = document.createElement('span');
     ver.id = 'arc_build_tag';
@@ -1231,9 +1234,46 @@ HTML = """
     async function misPoll() {
       try {
         const r = await fetch('/proxy/missions/status');
-        misRenderStatus(await r.json());
+        const st = await r.json();
+        misRenderStatus(st);
+        // If a capture-targets mission is running, pull its boxes into the
+        // global so the arena views (2D + 3D) can render them.
+        if (st && st.has_mission && st.target_boxes &&
+            Array.isArray(st.target_boxes) && st.target_boxes.length) {
+          window._targetBoxes = st.target_boxes;
+        }
+        // Capture state → colour the boxes in the arena view
+        window._missionClaimedBoxes = (st && st.claimed) || {};
+        window._missionCapturedBoxes = (st && st.captured) || [];
       } catch {}
     }
+
+    // Parse the mission's target-boxes JSON textarea live and expose it
+    // globally. Both the 2D canvas drawArena() and the Three.js scene
+    // read window._targetBoxes to render the boxes on the floor even
+    // before the mission starts.
+    function _parseTargetBoxesInput() {
+      const el = document.getElementById('mis_boxes_json');
+      if (!el) return;
+      try {
+        const v = JSON.parse(el.value);
+        if (Array.isArray(v)) {
+          window._targetBoxes = v;
+          el.style.borderColor = '#334155';
+        } else {
+          el.style.borderColor = '#ef4444';
+        }
+      } catch {
+        el.style.borderColor = '#ef4444';
+      }
+    }
+    (function(){
+      const el = document.getElementById('mis_boxes_json');
+      if (el) {
+        el.addEventListener('input', _parseTargetBoxesInput);
+        _parseTargetBoxesInput();  // initial parse so defaults render
+      }
+    })();
 
     // Click-to-arm pattern for Start Mission — no native confirm() dialog
     // (some browsers auto-dismiss rapid-fire dialogs, making the mission
@@ -2978,10 +3018,11 @@ const arenaCanvas = document.getElementById('arena_canvas');
 const arenaCtx = arenaCanvas.getContext('2d');
 
 // World dimensions — updated when arena config loads
-let arenaW = 20, arenaD = 10, arenaOX = -10, arenaOY = 0;
-// View adds a margin around arena so out-of-bounds positions are still visible
-const VIEW_MARGIN = 5;  // metres
-let viewOX = -15, viewOY = -5, viewW = 30, viewD = 20;
+let arenaW = 20, arenaD = 10.8, arenaOX = -10, arenaOY = 0;
+// Tight 1 m border around the arena — the arena fills most of the view,
+// and out-of-bounds positions beyond 1 m get clamped with an OOB arrow.
+const VIEW_MARGIN = 1;  // metres
+let viewOX = -11, viewOY = -1, viewW = 22, viewD = 12.8;
 
 function _updateView() {
   viewOX = arenaOX - VIEW_MARGIN;
@@ -3027,6 +3068,22 @@ function drawArena(pos, compPos, dir) {
   // Dim margin zone outside arena, brighter inside
   ctx.fillStyle = 'rgba(0,0,0,0.4)'; ctx.fillRect(PAD, PAD, W - 2*PAD, H - 2*PAD);
   ctx.fillStyle = '#0f172a'; ctx.fillRect(ax0, ay0, ax1 - ax0, ay1 - ay0);
+
+  // ── Team-zone shading (SDC26: red home zone LEFT, blue home zone RIGHT,
+  //    neutral middle). Splits the 20 m length into three equal thirds.
+  (function shadeZones() {
+    const thirdW = (arenaW) / 3;
+    // Red zone: x ∈ [arenaOX, arenaOX + thirdW]
+    const [rx0] = arenaToCanvas(arenaOX, arenaOY);
+    const [rx1] = arenaToCanvas(arenaOX + thirdW, arenaOY);
+    ctx.fillStyle = 'rgba(239,68,68,0.06)';
+    ctx.fillRect(rx0, ay0, rx1 - rx0, ay1 - ay0);
+    // Blue zone: x ∈ [arenaOX + 2·thirdW, arenaOX + arenaW]
+    const [bx0] = arenaToCanvas(arenaOX + 2 * thirdW, arenaOY);
+    const [bx1] = arenaToCanvas(arenaOX + arenaW, arenaOY);
+    ctx.fillStyle = 'rgba(59,130,246,0.06)';
+    ctx.fillRect(bx0, ay0, bx1 - bx0, ay1 - ay0);
+  })();
 
   // Grid lines — fine 1 m grid (subtle) + major 5 m grid (brighter)
   // so the user can read position to the metre at a glance.
@@ -3148,6 +3205,58 @@ function drawArena(pos, compPos, dir) {
   ctx.fillStyle = 'rgba(0,0,0,0.75)'; ctx.fillRect(PAD, PAD, dbgW, dbgLines.length * 16 + 6);
   ctx.fillStyle = '#22d3ee'; ctx.textAlign = 'left';
   dbgLines.forEach((l, i) => ctx.fillText(l, PAD + 5, PAD + 15 + i * 16));
+
+  // ── Target boxes (from the capture-targets mission config) ──
+  // Drawn on the floor as a labelled square with a diamond marker.
+  // Colour indicates capture state when a mission is running:
+  //   grey   = not yet visited
+  //   yellow = currently claimed by a drone
+  //   green  = captured
+  const boxes = window._targetBoxes;
+  if (Array.isArray(boxes) && boxes.length) {
+    const claimed = (window._missionClaimedBoxes || {});
+    const captured = new Set(window._missionCapturedBoxes || []);
+    boxes.forEach((b, i) => {
+      if (b == null || b.x == null || b.y == null) return;
+      const [bx, by] = arenaToCanvas(Number(b.x), Number(b.y));
+      const idx = (typeof b.idx === 'number') ? b.idx : i;
+      const isCap = captured.has(idx);
+      const isClaimed = Object.values(claimed).includes(idx);
+      const team = (b.home_team || '').toLowerCase();
+      // Default colour is the team the box BELONGS to (red/blue start colour
+      // from the SDC26 rules). While being approached by us → yellow.
+      // After capture → green (ours).
+      const fill = isCap     ? 'rgba(34,197,94,0.55)'
+                 : isClaimed ? 'rgba(250,204,21,0.55)'
+                 : team === 'red'  ? 'rgba(239,68,68,0.55)'
+                 : team === 'blue' ? 'rgba(59,130,246,0.55)'
+                                   : 'rgba(148,163,184,0.45)';
+      const stroke = isCap     ? '#16a34a'
+                   : isClaimed ? '#eab308'
+                   : team === 'red'  ? '#dc2626'
+                   : team === 'blue' ? '#2563eb'
+                                     : '#64748b';
+      // Box body: 20 px diamond-ish square
+      const s = 18;
+      ctx.save();
+      ctx.translate(bx, by);
+      ctx.rotate(Math.PI / 4);
+      ctx.fillStyle = fill;
+      ctx.fillRect(-s/2, -s/2, s, s);
+      ctx.strokeStyle = stroke; ctx.lineWidth = 2;
+      ctx.strokeRect(-s/2, -s/2, s, s);
+      ctx.restore();
+      // Label: box id + status
+      const label = `#${b.id ?? idx+1}` +
+                    (isCap ? ' ✓' : (isClaimed ? ' ⏱' : ''));
+      ctx.font = 'bold 11px monospace'; ctx.textAlign = 'center';
+      ctx.fillStyle = 'rgba(0,0,0,0.75)';
+      const tw = ctx.measureText(label).width;
+      ctx.fillRect(bx - tw/2 - 3, by + 14, tw + 6, 13);
+      ctx.fillStyle = stroke;
+      ctx.fillText(label, bx, by + 24);
+    });
+  }
 
   // Drone positions
   if (!_pos) return;
@@ -3284,6 +3393,7 @@ async function fleetPoll() {
       // Feed positions into the Three.js scene if active
       if (window._arena3d && window._arena3d.updateDrones) {
         window._arena3d.updateDrones(d.observers);
+        if (window._arena3d.syncTargetBoxes) window._arena3d.syncTargetBoxes();
       }
     }
   } catch {}
@@ -3904,12 +4014,92 @@ let ARENA_W_dyn = 20, ARENA_D_dyn = 10;
       renderer.setSize(w, h);
     });
 
+    // Render the initial set of target boxes as soon as the scene opens
+    syncTargetBoxes();
+
     function loop() {
       controls.update();
       renderer.render(scene, camera);
       rafId = requestAnimationFrame(loop);
     }
     loop();
+  }
+
+  // ── Target-box 3D rendering ────────────────────────────────────
+  // Kept separately so we can call it both at scene-init AND every
+  // time the textarea / mission status updates the list.
+  const targetBoxMeshes = {};   // index → THREE.Mesh
+  function syncTargetBoxes() {
+    if (!scene) return;
+    const boxes = window._targetBoxes || [];
+    const claimed = window._missionClaimedBoxes || {};
+    const captured = new Set(window._missionCapturedBoxes || []);
+    const seen = new Set();
+    boxes.forEach((b, i) => {
+      if (!b || b.x == null || b.y == null) return;
+      const idx = (typeof b.idx === 'number') ? b.idx : i;
+      seen.add(idx);
+      const isCap = captured.has(idx);
+      const isClaimed = Object.values(claimed).includes(idx);
+      const team = (b.home_team || '').toLowerCase();
+      const col = isCap     ? 0x22c55e
+                : isClaimed ? 0xfacc15
+                : team === 'red'  ? 0xef4444
+                : team === 'blue' ? 0x3b82f6
+                                  : 0x94a3b8;
+      let mesh = targetBoxMeshes[idx];
+      if (!mesh) {
+        const group = new THREE.Group();
+        // SDC box dimensions (rules §1.2): 57.5×37.5×55 cm closed,
+        // up to 73 cm when open. We render 0.575×0.55×0.375 as an
+        // approximation sitting on the floor.
+        const body = new THREE.Mesh(
+          new THREE.BoxGeometry(0.575, 0.55, 0.375),
+          new THREE.MeshStandardMaterial({color: col, transparent:true, opacity:0.85}));
+        body.position.y = 0.275;
+        group.add(body);
+        const ring = new THREE.Mesh(
+          new THREE.TorusGeometry(0.42, 0.04, 8, 24),
+          new THREE.MeshStandardMaterial({color: col, transparent:true, opacity:0.55}));
+        ring.rotation.x = Math.PI / 2;
+        ring.position.y = 0.02;
+        group.add(ring);
+        // Label
+        const canvas = document.createElement('canvas');
+        canvas.width = 128; canvas.height = 36;
+        const c = canvas.getContext('2d');
+        c.fillStyle = 'rgba(0,0,0,0.7)'; c.fillRect(0,0,128,36);
+        c.fillStyle = '#fff'; c.font = 'bold 20px monospace';
+        c.fillText('BOX ' + (b.id ?? idx+1), 6, 25);
+        const tex = new THREE.CanvasTexture(canvas);
+        const sprite = new THREE.Sprite(
+          new THREE.SpriteMaterial({map: tex, transparent: true}));
+        sprite.scale.set(1.1, 0.32, 1);
+        sprite.position.set(0, 0.95, 0);
+        group.add(sprite);
+        group.userData.body = body;
+        group.userData.ring = ring;
+        scene.add(group);
+        targetBoxMeshes[idx] = group;
+        mesh = group;
+      }
+      // Update position + colour every frame in case they moved or state changed
+      mesh.position.set(Number(b.x), 0, Number(b.y));
+      if (mesh.userData.body) {
+        mesh.userData.body.material.color.setHex(col);
+        mesh.userData.body.material.opacity = isCap ? 0.55 : 0.85;
+      }
+      if (mesh.userData.ring) {
+        mesh.userData.ring.material.color.setHex(col);
+      }
+    });
+    // Remove meshes for boxes no longer in the list
+    for (const idx of Object.keys(targetBoxMeshes)) {
+      if (!seen.has(Number(idx))) {
+        scene.remove(targetBoxMeshes[idx]);
+        delete targetBoxMeshes[idx];
+      }
+    }
   }
 
   function updateDrones(observers) {
@@ -3979,7 +4169,7 @@ let ARENA_W_dyn = 20, ARENA_D_dyn = 10;
   }
 
   // Expose for fleetPoll()
-  window._arena3d = {updateDrones};
+  window._arena3d = {updateDrones, syncTargetBoxes};
 
   // Toggle wiring
   const cb = document.getElementById('arena_show_3d');
