@@ -619,6 +619,19 @@ _pos_cfg: dict = {
     "top_k_markers": 0,     # 0 = auto (code picks best 4); set to limit further
     "outlier_reject_m": 2.5,  # max distance from centroid before an estimate is dropped
     "imu_weight": 0.3,      # 0.0 = pure ArUco, 1.0 = pure IMU dead-reckoning
+    # ── Precision tuning (mirrors ctrl_position.py module constants) ──
+    # Exposed over the UI so operators can tighten / loosen the fusion
+    # without a server restart. Values here get pushed into the running
+    # positioner via live-patch in /api/position/config POST.
+    "pose_hold_sec":        0.8,    # keep publishing pose for N s after last valid fix
+    "min_ref_count":        1,      # min visible markers for a fused pose
+    "min_ref_weight":       0.0,    # min weight of best reference marker
+    "meas_blend_min":       0.35,   # EMA α lower bound (high-quality fixes)
+    "meas_blend_max":       0.85,   # EMA α upper bound (low-quality fixes)
+    "vel_blend":            0.25,   # IMU vel (0) ↔ Kalman-state vel (1) blend
+    "max_state_dt":         1.0,    # reset state if more than N s between updates
+    "kalman_process_var":   1e-3,   # Q — process-noise variance per axis
+    "kalman_meas_var":      1e-1,   # R — measurement-noise variance per axis
 }
 
 # Arena config — SDC challenge default layout.
@@ -4509,6 +4522,25 @@ def api_pos_config_set():
             _pos_cfg["outlier_reject_m"] = max(0.1, min(20.0, float(data["outlier_reject_m"])))
         if "imu_weight" in data:
             _pos_cfg["imu_weight"] = max(0.0, min(1.0, float(data["imu_weight"])))
+        # Extended tuning — all affect ctrl_position.py's multi-marker fusion
+        if "pose_hold_sec" in data:
+            _pos_cfg["pose_hold_sec"] = max(0.0, min(10.0, float(data["pose_hold_sec"])))
+        if "min_ref_count" in data:
+            _pos_cfg["min_ref_count"] = max(1, min(12, int(data["min_ref_count"])))
+        if "min_ref_weight" in data:
+            _pos_cfg["min_ref_weight"] = max(0.0, min(1.0, float(data["min_ref_weight"])))
+        if "meas_blend_min" in data:
+            _pos_cfg["meas_blend_min"] = max(0.0, min(1.0, float(data["meas_blend_min"])))
+        if "meas_blend_max" in data:
+            _pos_cfg["meas_blend_max"] = max(0.0, min(1.0, float(data["meas_blend_max"])))
+        if "vel_blend" in data:
+            _pos_cfg["vel_blend"] = max(0.0, min(1.0, float(data["vel_blend"])))
+        if "max_state_dt" in data:
+            _pos_cfg["max_state_dt"] = max(0.05, min(10.0, float(data["max_state_dt"])))
+        if "kalman_process_var" in data:
+            _pos_cfg["kalman_process_var"] = max(1e-6, min(10.0, float(data["kalman_process_var"])))
+        if "kalman_meas_var" in data:
+            _pos_cfg["kalman_meas_var"] = max(1e-6, min(10.0, float(data["kalman_meas_var"])))
         cfg_snap = dict(_pos_cfg)
 
     # Apply live filter changes to running processor
@@ -4536,6 +4568,40 @@ def api_pos_config_set():
             if "outlier_reject_m" in data:
                 _pos_processor.outlier_reject_m = float(cfg_snap["outlier_reject_m"])
                 print(f"[POS] outlier_reject_m set to {cfg_snap['outlier_reject_m']}m (live)")
+            # ── Extended tuning → patched as module globals on ctrl_position
+            # because the fusion code reads them as module-level constants. ──
+            import ctrl_position as _cp
+            if "pose_hold_sec" in data:
+                _cp.POSE_HOLD_SEC = float(cfg_snap["pose_hold_sec"])
+                print(f"[POS] pose_hold_sec = {_cp.POSE_HOLD_SEC}s (live)")
+            if "min_ref_count" in data:
+                _cp.MIN_REF_COUNT = int(cfg_snap["min_ref_count"])
+                print(f"[POS] min_ref_count = {_cp.MIN_REF_COUNT} (live)")
+            if "min_ref_weight" in data:
+                _cp.MIN_REF_WEIGHT = float(cfg_snap["min_ref_weight"])
+                print(f"[POS] min_ref_weight = {_cp.MIN_REF_WEIGHT} (live)")
+            if "meas_blend_min" in data:
+                _cp.MEAS_BLEND_MIN = float(cfg_snap["meas_blend_min"])
+                print(f"[POS] meas_blend_min = {_cp.MEAS_BLEND_MIN} (live)")
+            if "meas_blend_max" in data:
+                _cp.MEAS_BLEND_MAX = float(cfg_snap["meas_blend_max"])
+                print(f"[POS] meas_blend_max = {_cp.MEAS_BLEND_MAX} (live)")
+            if "vel_blend" in data:
+                _cp.VEL_BLEND = float(cfg_snap["vel_blend"])
+                print(f"[POS] vel_blend = {_cp.VEL_BLEND} (live)")
+            if "max_state_dt" in data:
+                _cp.MAX_STATE_DT = float(cfg_snap["max_state_dt"])
+                print(f"[POS] max_state_dt = {_cp.MAX_STATE_DT}s (live)")
+            if "kalman_process_var" in data:
+                v = float(cfg_snap["kalman_process_var"])
+                for kf in _pos_processor.kf_pos:
+                    kf.process_variance = v
+                print(f"[POS] kalman_process_var = {v} (live, per-axis)")
+            if "kalman_meas_var" in data:
+                v = float(cfg_snap["kalman_meas_var"])
+                for kf in _pos_processor.kf_pos:
+                    kf.measurement_variance = v
+                print(f"[POS] kalman_meas_var = {v} (live, per-axis)")
     except Exception as e:
         print(f"[POS] live config apply error: {e}")
 

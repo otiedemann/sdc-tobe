@@ -1,22 +1,27 @@
 {
   "1": {
+    "base": "http://flightctrl1:8080",
     "name": "Anafi 1",
-    "type": "anafi",
-    "base": "http://flightctrl1:8080"
+    "type": "anafi"
   },
   "2": {
+    "base": "http://flightctrl2:8080",
     "name": "Anafi 2",
-    "type": "anafi",
-    "base": "http://flightctrl2:8080"
+    "type": "anafi"
   },
   "3": {
+    "base": "http://flightctrl3:8080",
     "name": "Anafi 3",
-    "type": "anafi",
-    "base": "http://flightctrl3:8080"
+    "type": "anafi"
   },
   "4": {
+    "base": "http://flightctrl4:8080",
     "name": "Anafi 4",
+    "type": "anafi"
+  },
+  "5": {
+    "name": "Anafi 5",
     "type": "anafi",
-    "base": "http://flightctrl4:8080"
+    "base": "http://flightctrl5:8080"
   }
 }

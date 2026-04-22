@@ -163,6 +163,37 @@ HTML = """
     .pos-cfg label { font-size:12px; color:#94a3b8; }
     .pos-cfg input, .pos-cfg select { height:32px; border-radius:6px; border:1px solid #475569; background:#0f172a; color:#e2e8f0; padding:0 6px; }
     .pos-cfg button { height:32px; font-size:12px; padding:0 10px; }
+    /* ── Info-icon (ⓘ) system for tuning parameters ──────────────── */
+    .info-icon {
+      display:inline-flex; align-items:center; justify-content:center;
+      width:13px; height:13px; margin-left:4px;
+      border:1px solid #64748b; border-radius:50%;
+      color:#94a3b8; background:transparent;
+      font: italic 700 9px/1 Georgia, 'Times New Roman', serif;
+      cursor:pointer; user-select:none; vertical-align:middle;
+      transition: border-color .12s, color .12s, background .12s;
+    }
+    .info-icon:hover { border-color:#38bdf8; color:#38bdf8; background:#0b1424; }
+    #param_info_modal {
+      display:none; position:fixed; inset:0;
+      background:rgba(0,0,0,0.6); z-index:2000;
+      justify-content:center; align-items:center;
+    }
+    #param_info_modal .box {
+      background:#111827; border:1px solid #38bdf8; border-radius:8px;
+      padding:16px 20px; max-width:520px; width:90%;
+      color:#e2e8f0; box-shadow:0 12px 44px rgba(0,0,0,0.7);
+    }
+    #param_info_modal .title   { color:#38bdf8; font-weight:700; font-size:14px; margin-bottom:4px; }
+    #param_info_modal .subtitle{ color:#64748b; font-size:11px; font-family:monospace; margin-bottom:10px; }
+    #param_info_modal .body    { font-size:13px; line-height:1.55; white-space:pre-wrap; }
+    #param_info_modal .range   { font-size:11px; color:#94a3b8; margin-top:10px; font-family:monospace; }
+    #param_info_modal .close {
+      margin-top:12px; padding:6px 14px; background:#334155;
+      border:1px solid #64748b; color:#e2e8f0; border-radius:5px;
+      cursor:pointer; font-size:12px;
+    }
+    #param_info_modal .close:hover { background:#475569; }
     /* ── ArUco Seek panel ─────────────────────────────────────────── */
     #aruco_panel { margin-top:16px; padding:12px; background:#0b1220; border:1px solid #334155; border-radius:8px; }
     #aruco_panel h3 { margin:0 0 10px 0; color:#38bdf8; font-size:15px; }
@@ -293,15 +324,107 @@ HTML = """
     #mag_start_btn { background:#065f46; border-color:#10b981; }
     #mag_retry_btn { background:#1e3a5f; border-color:#3b82f6; display:none; }
     #mag_close_btn { background:#374151; border-color:#6b7280; }
+
+    /* ── Light theme ───────────────────────────────────────────────
+       Activated by setting <html data-theme=\"light\">. Uses !important
+       selectively to defeat the many hard-coded inline style=\"\"
+       colors scattered through this single-file UI. Inline attribute
+       selectors (e.g. [style*=\"background:#0f172a\"]) catch the most
+       common dark hex values without rewriting every element. */
+    html[data-theme=\"light\"]            { color-scheme: light; }
+    html[data-theme=\"light\"] body       { background:#f1f5f9 !important; color:#0f172a !important; }
+    html[data-theme=\"light\"] .panel     { background:#ffffff !important; border-color:#cbd5e1 !important; color:#0f172a !important; }
+    html[data-theme=\"light\"] button     { background:#e2e8f0 !important; color:#0f172a !important; border-color:#94a3b8 !important; }
+    html[data-theme=\"light\"] button:active,
+    html[data-theme=\"light\"] .active    { background:#0ea5e9 !important; color:#001018 !important; }
+    html[data-theme=\"light\"] input,
+    html[data-theme=\"light\"] select,
+    html[data-theme=\"light\"] textarea   { background:#ffffff !important; color:#0f172a !important; border-color:#cbd5e1 !important; }
+    html[data-theme=\"light\"] h2,
+    html[data-theme=\"light\"] h3         { color:#0369a1 !important; }
+    html[data-theme=\"light\"] .small     { color:#475569 !important; }
+    html[data-theme=\"light\"] #aruco_panel,
+    html[data-theme=\"light\"] #tuning_panel,
+    html[data-theme=\"light\"] #mission_panel,
+    html[data-theme=\"light\"] #anafi_panel,
+    html[data-theme=\"light\"] #missions_panel,
+    html[data-theme=\"light\"] #video_panel { background:#f8fafc !important; border-color:#cbd5e1 !important; color:#0f172a !important; }
+    html[data-theme=\"light\"] .arena-canvas { background:#f8fafc !important; border-color:#cbd5e1 !important; }
+    html[data-theme=\"light\"] .info-icon   { border-color:#94a3b8 !important; color:#475569 !important; }
+    html[data-theme=\"light\"] .info-icon:hover { border-color:#0369a1 !important; color:#0369a1 !important; background:#e0f2fe !important; }
+    html[data-theme=\"light\"] #param_info_modal { background:rgba(15,23,42,0.45) !important; }
+    html[data-theme=\"light\"] #param_info_modal .box { background:#ffffff !important; color:#0f172a !important; border-color:#0ea5e9 !important; }
+    html[data-theme=\"light\"] #param_info_modal .title { color:#0369a1 !important; }
+    html[data-theme=\"light\"] #param_info_modal .subtitle { color:#64748b !important; }
+    html[data-theme=\"light\"] #param_info_modal .body { color:#1e293b !important; }
+    html[data-theme=\"light\"] #param_info_modal .close { background:#e2e8f0 !important; color:#0f172a !important; border-color:#94a3b8 !important; }
+    html[data-theme=\"light\"] .collapsible-toggle { color:#0369a1 !important; }
+    html[data-theme=\"light\"] #aruco_panel .arc-readout   { color:#334155 !important; }
+    html[data-theme=\"light\"] #aruco_panel .arc-readout .k { color:#64748b !important; }
+    html[data-theme=\"light\"] #aruco_panel .arc-readout b  { color:#0284c7 !important; }
+    html[data-theme=\"light\"] #aruco_panel .arc-row label  { color:#334155 !important; }
+    html[data-theme=\"light\"] #aruco_panel .arc-pgroup-label { color:#64748b !important; }
+    html[data-theme=\"light\"] .drone-btn { background:#f1f5f9 !important; color:#1e293b !important; border-color:#94a3b8 !important; }
+    html[data-theme=\"light\"] .drone-btn.selected { background:#0ea5e9 !important; color:#001018 !important; border-color:#0ea5e9 !important; }
+    html[data-theme=\"light\"] .pos-cfg input,
+    html[data-theme=\"light\"] .pos-cfg select { background:#ffffff !important; color:#0f172a !important; border-color:#cbd5e1 !important; }
+    html[data-theme=\"light\"] .pos-cfg label { color:#475569 !important; }
+    html[data-theme=\"light\"] .meter-track { background:#e2e8f0 !important; border-color:#94a3b8 !important; }
+    html[data-theme=\"light\"] .meter-label { color:#475569 !important; }
+    html[data-theme=\"light\"] #arc_live_banner { background:#fecaca !important; color:#7f1d1d !important; }
+    html[data-theme=\"light\"] #takeoff_err { background:#fef2f2 !important; color:#7f1d1d !important; border-color:#f87171 !important; }
+    /* Catch common inline-styled dark backgrounds/colors */
+    html[data-theme=\"light\"] [style*=\"background:#0f172a\"],
+    html[data-theme=\"light\"] [style*=\"background: #0f172a\"],
+    html[data-theme=\"light\"] [style*=\"background:#111827\"],
+    html[data-theme=\"light\"] [style*=\"background:#0b1220\"],
+    html[data-theme=\"light\"] [style*=\"background:#0b1424\"] { background:#ffffff !important; }
+    html[data-theme=\"light\"] [style*=\"background:#1e293b\"],
+    html[data-theme=\"light\"] [style*=\"background:#1e2a3a\"] { background:#e2e8f0 !important; }
+    html[data-theme=\"light\"] [style*=\"background:#1f2937\"] { background:#e2e8f0 !important; }
+    html[data-theme=\"light\"] [style*=\"color:#e2e8f0\"] { color:#0f172a !important; }
+    html[data-theme=\"light\"] [style*=\"color:#94a3b8\"],
+    html[data-theme=\"light\"] [style*=\"color:#cbd5e1\"],
+    html[data-theme=\"light\"] [style*=\"color:#64748b\"] { color:#475569 !important; }
+    html[data-theme=\"light\"] [style*=\"border-color:#334155\"],
+    html[data-theme=\"light\"] [style*=\"border:1px solid #334155\"],
+    html[data-theme=\"light\"] [style*=\"border:1px solid #475569\"],
+    html[data-theme=\"light\"] [style*=\"border:1px solid #1e293b\"],
+    html[data-theme=\"light\"] [style*=\"border-top:1px solid #1e293b\"] { border-color:#cbd5e1 !important; }
+    /* Keep accent-coloured status badges vibrant (keep dark text on the accent) */
+    html[data-theme=\"light\"] [style*=\"color:#22c55e\"] { color:#15803d !important; }
+    html[data-theme=\"light\"] [style*=\"color:#f59e0b\"] { color:#b45309 !important; }
+    html[data-theme=\"light\"] [style*=\"color:#38bdf8\"] { color:#0369a1 !important; }
+    html[data-theme=\"light\"] [style*=\"color:#a78bfa\"] { color:#7c3aed !important; }
+    html[data-theme=\"light\"] [style*=\"color:#06b6d4\"] { color:#0e7490 !important; }
+    html[data-theme=\"light\"] #theme_toggle { color:#0369a1 !important; border-color:#94a3b8 !important; }
   </style>
 </head>
 <body>
-  <img id=\"team_logo\" src=\"/logo.png\" alt=\"Team logo\"
-       title=\"Team To Be Defined — SDC26\"
-       style=\"position:fixed;top:10px;right:12px;width:64px;height:64px;z-index:100;
-              filter:drop-shadow(0 2px 6px rgba(0,0,0,0.6));\"
-       onerror=\"this.style.display='none'\" />
-  <h2>Drone Remote Controller</h2>
+  <!-- Shared parameter-info popup. Any .info-icon click populates and
+       shows this modal via window.showParamInfo(key, event). -->
+  <div id=\"param_info_modal\" onclick=\"if(event.target===this) this.style.display='none';\">
+    <div class=\"box\">
+      <div class=\"title\"    id=\"pim_title\">parameter</div>
+      <div class=\"subtitle\" id=\"pim_key\">key</div>
+      <div class=\"body\"     id=\"pim_body\">explanation</div>
+      <div class=\"range\"    id=\"pim_range\"></div>
+      <div style=\"text-align:right;\">
+        <button class=\"close\" onclick=\"document.getElementById('param_info_modal').style.display='none';\">Close</button>
+      </div>
+    </div>
+  </div>
+  <div style=\"display:flex;align-items:center;gap:14px;margin:0 0 6px 0;\">
+    <h2 style=\"margin:0;flex:1;\">Drone Remote Controller</h2>
+    <button id=\"theme_toggle\" title=\"Toggle light / dark theme\"
+            style=\"height:34px;padding:0 12px;font-size:12px;font-weight:600;
+                   background:transparent;\">&#127769; Dark</button>
+    <img id=\"team_logo\" src=\"/logo.png?v=2\" alt=\"Team logo\"
+         title=\"Team To Be Defined — SDC26\"
+         style=\"width:110px;height:auto;background:transparent;
+                filter:drop-shadow(0 2px 6px rgba(0,0,0,0.45));\"
+         onerror=\"this.style.display='none'\" />
+  </div>
   <div style=\"display:flex;align-items:center;gap:8px;\">
     <div class=\"drone-bar\" id=\"drone_bar\" style=\"flex:1;\"></div>
     <button id=\"land_all_btn\" style=\"padding:6px 14px;font-size:13px;font-weight:700;background:#7f1d1d;border-color:#ef4444;color:#fee2e2;letter-spacing:0.4px;\" title=\"Land every drone in the fleet safely. Keyboard shortcut: 0 (zero)\">&#11088; LAND ALL (0)</button>
@@ -914,7 +1037,7 @@ HTML = """
         const r = document.createElement('div');
         r.className = 'arc-row';
         r.innerHTML =
-          '<label title=\"'+k+'\">'+label+'</label>' +
+          '<label title=\"'+k+'\">'+label+' <span class=\"info-icon\" data-info=\"'+k+'\">i</span></label>' +
           '<input type=\"range\" min=\"'+mn+'\" max=\"'+mx+'\" step=\"'+st+'\" value=\"'+v+'\" data-k=\"'+k+'\" />' +
           '<input type=\"number\" min=\"'+mn+'\" max=\"'+mx+'\" step=\"'+st+'\" value=\"'+v+'\" data-k=\"'+k+'\" />';
         cont.appendChild(r);
@@ -1207,7 +1330,7 @@ HTML = """
     arcPoll();
     // Version marker — if this string doesn't appear in the DOM,
     // you're running stale JS (restart the Python server or hard-refresh).
-    const BUILD = 'ax-tuning-panel-logo';
+    const BUILD = 'ay-precision-infoicons-theme';
     console.log('[arc] init complete, build=' + BUILD);
     const ver = document.createElement('span');
     ver.id = 'arc_build_tag';
@@ -1555,7 +1678,7 @@ HTML = """
       </div>
       <div style=\"display:flex;gap:8px;align-items:center;margin-bottom:6px;\">
         <label class=\"small\" style=\"color:#94a3b8;display:flex;align-items:center;gap:4px;cursor:pointer;\">
-          <input type=\"checkbox\" id=\"arena_show_3d\" style=\"accent-color:#0ea5e9;\" />
+          <input type=\"checkbox\" id=\"arena_show_3d\" checked style=\"accent-color:#0ea5e9;\" />
           3D view (Three.js)
         </label>
         <label class=\"small\" style=\"color:#94a3b8;display:flex;align-items:center;gap:4px;cursor:pointer;\">
@@ -1565,7 +1688,7 @@ HTML = """
         <span class=\"small\" style=\"color:#64748b;margin-left:12px;\">Grid: 1 m</span>
       </div>
       <canvas id=\"arena_canvas\" class=\"arena-canvas\" width=\"960\" height=\"560\" style=\"max-width:100%;\"></canvas>
-      <div id=\"arena3d_wrap\" style=\"display:none;margin-top:8px;position:relative;\">
+      <div id=\"arena3d_wrap\" style=\"display:block;margin-top:8px;position:relative;\">
         <div id=\"arena3d_container\" style=\"width:960px;max-width:100%;height:520px;background:#0f172a;border:1px solid #334155;border-radius:6px;\"></div>
         <div class=\"small\" style=\"color:#64748b;margin-top:4px;\">Drag to orbit · scroll to zoom · right-drag to pan</div>
       </div>
@@ -1591,17 +1714,17 @@ HTML = """
       </div>
       <div class=\"pos-cfg\">
         <div style=\"display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:6px;\">
-          <label>Profile:
+          <label>Profile <span class=\"info-icon\" data-info=\"detect_profile\">i</span>:
             <select id=\"pos_profile\" class=\"pos-cfg\">
               <option value=\"balanced\">Balanced</option>
               <option value=\"sensitive\">Sensitive</option>
               <option value=\"strict\">Strict</option>
             </select>
           </label>
-          <label>FOV°:
+          <label>FOV° <span class=\"info-icon\" data-info=\"fov_deg\">i</span>:
             <input id=\"pos_fov\" type=\"number\" min=\"40\" max=\"120\" value=\"69\" style=\"width:60px;\" />
           </label>
-          <label>Latency ms:
+          <label>Latency ms <span class=\"info-icon\" data-info=\"latency_ms\">i</span>:
             <input id=\"pos_latency\" type=\"range\" min=\"0\" max=\"800\" value=\"200\" style=\"width:90px;vertical-align:middle;\" />
             <span id=\"pos_latency_val\" style=\"font-size:11px;color:#94a3b8;\">200</span>
           </label>
@@ -1610,26 +1733,66 @@ HTML = """
             <input id=\"pos_imu_weight\" type=\"range\" min=\"0\" max=\"100\" value=\"30\" style=\"width:110px;vertical-align:middle;accent-color:#06b6d4;\" />
             <span style=\"font-size:11px;color:#94a3b8;\">IMU</span>
             <span id=\"pos_imu_weight_val\" style=\"font-size:11px;color:#06b6d4;font-weight:bold;min-width:32px;\">30%</span>
+            <span class=\"info-icon\" data-info=\"imu_weight\">i</span>
           </label>
         </div>
         <div style=\"display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:6px;padding:6px;background:#0f172a;border:1px solid #1e293b;border-radius:4px;\">
           <span class=\"small\" style=\"color:#64748b;min-width:70px;\">Filters:</span>
           <label style=\"display:flex;align-items:center;gap:4px;cursor:pointer;\">
             <input type=\"checkbox\" id=\"pos_kalman\" style=\"accent-color:#3b82f6;\" />
-            <span class=\"small\" style=\"color:#e2e8f0;\">Kalman filter</span>
+            <span class=\"small\" style=\"color:#e2e8f0;\">Kalman filter <span class=\"info-icon\" data-info=\"enable_kalman_filter\">i</span></span>
           </label>
-          <label class=\"small\" style=\"color:#94a3b8;\">Marker size (m):
+          <label class=\"small\" style=\"color:#94a3b8;\">Marker size (m) <span class=\"info-icon\" data-info=\"marker_size_m\">i</span>:
             <input id=\"pos_marker_size\" type=\"number\" min=\"0.05\" max=\"2.0\" step=\"0.01\" value=\"0.5\" style=\"width:64px;\" />
           </label>
-          <label class=\"small\" style=\"color:#94a3b8;\">Top-K:
+          <label class=\"small\" style=\"color:#94a3b8;\">Top-K <span class=\"info-icon\" data-info=\"top_k_markers\">i</span>:
             <input id=\"pos_top_k\" type=\"number\" min=\"0\" max=\"10\" step=\"1\" value=\"0\" style=\"width:50px;\" title=\"0 = auto (4)\" />
           </label>
-          <label class=\"small\" style=\"color:#94a3b8;\">Outlier (m):
+          <label class=\"small\" style=\"color:#94a3b8;\">Outlier (m) <span class=\"info-icon\" data-info=\"outlier_reject_m\">i</span>:
             <input id=\"pos_outlier\" type=\"number\" min=\"0.1\" max=\"20\" step=\"0.1\" value=\"2.5\" style=\"width:60px;\" />
           </label>
           <button id=\"pos_filters_apply\" class=\"pos-cfg\" style=\"height:26px;font-size:11px;padding:0 10px;\">Apply filters</button>
           <button id=\"pos_filters_reset\" class=\"pos-cfg\" style=\"height:26px;font-size:11px;padding:0 10px;background:#1e2a3a;\" title=\"Restore defaults: Kalman on, marker 0.5m, top-K auto, outlier 2.5m\">Defaults</button>
           <span id=\"pos_filters_status\" class=\"small\" style=\"color:#64748b;\"></span>
+        </div>
+        <!-- ── Precision tuning (advanced) ───────────────────────────
+             These parameters control multi-marker fusion, IMU blend,
+             the pose-coast window, and per-axis Kalman variances. They
+             apply immediately to the running positioner and also to
+             Aruco Seek / mission boundary guard since they read the
+             same global arena-frame pose.                             -->
+        <div style=\"display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:6px;padding:6px;background:#0f172a;border:1px solid #1e293b;border-radius:4px;\">
+          <span class=\"small\" style=\"color:#a78bfa;min-width:70px;font-weight:600;\">Precision:</span>
+          <label class=\"small\" style=\"color:#94a3b8;\">pose hold (s) <span class=\"info-icon\" data-info=\"pose_hold_sec\">i</span>:
+            <input id=\"pos_pose_hold\" type=\"number\" min=\"0\" max=\"10\" step=\"0.1\" value=\"0.8\" style=\"width:60px;\" />
+          </label>
+          <label class=\"small\" style=\"color:#94a3b8;\">min refs <span class=\"info-icon\" data-info=\"min_ref_count\">i</span>:
+            <input id=\"pos_min_refs\" type=\"number\" min=\"1\" max=\"12\" step=\"1\" value=\"1\" style=\"width:50px;\" />
+          </label>
+          <label class=\"small\" style=\"color:#94a3b8;\">min ref w <span class=\"info-icon\" data-info=\"min_ref_weight\">i</span>:
+            <input id=\"pos_min_ref_w\" type=\"number\" min=\"0\" max=\"1\" step=\"0.01\" value=\"0\" style=\"width:56px;\" />
+          </label>
+          <label class=\"small\" style=\"color:#94a3b8;\">blend min <span class=\"info-icon\" data-info=\"meas_blend_min\">i</span>:
+            <input id=\"pos_blend_min\" type=\"number\" min=\"0\" max=\"1\" step=\"0.05\" value=\"0.35\" style=\"width:56px;\" />
+          </label>
+          <label class=\"small\" style=\"color:#94a3b8;\">blend max <span class=\"info-icon\" data-info=\"meas_blend_max\">i</span>:
+            <input id=\"pos_blend_max\" type=\"number\" min=\"0\" max=\"1\" step=\"0.05\" value=\"0.85\" style=\"width:56px;\" />
+          </label>
+          <label class=\"small\" style=\"color:#94a3b8;\">vel blend <span class=\"info-icon\" data-info=\"vel_blend\">i</span>:
+            <input id=\"pos_vel_blend\" type=\"number\" min=\"0\" max=\"1\" step=\"0.05\" value=\"0.25\" style=\"width:56px;\" />
+          </label>
+          <label class=\"small\" style=\"color:#94a3b8;\">max Δt (s) <span class=\"info-icon\" data-info=\"max_state_dt\">i</span>:
+            <input id=\"pos_max_dt\" type=\"number\" min=\"0.05\" max=\"10\" step=\"0.05\" value=\"1.0\" style=\"width:60px;\" />
+          </label>
+          <label class=\"small\" style=\"color:#94a3b8;\">Q proc <span class=\"info-icon\" data-info=\"kalman_process_var\">i</span>:
+            <input id=\"pos_kf_q\" type=\"number\" min=\"1e-6\" max=\"10\" step=\"1e-5\" value=\"1e-3\" style=\"width:74px;\" />
+          </label>
+          <label class=\"small\" style=\"color:#94a3b8;\">R meas <span class=\"info-icon\" data-info=\"kalman_meas_var\">i</span>:
+            <input id=\"pos_kf_r\" type=\"number\" min=\"1e-6\" max=\"10\" step=\"1e-3\" value=\"0.1\" style=\"width:74px;\" />
+          </label>
+          <button id=\"pos_precision_apply\" class=\"pos-cfg\" style=\"height:26px;font-size:11px;padding:0 10px;\">Apply precision</button>
+          <button id=\"pos_precision_reset\" class=\"pos-cfg\" style=\"height:26px;font-size:11px;padding:0 10px;background:#1e2a3a;\" title=\"Restore precision defaults\">Defaults</button>
+          <span id=\"pos_precision_status\" class=\"small\" style=\"color:#64748b;\"></span>
         </div>
         <div style=\"display:flex;gap:8px;flex-wrap:wrap;align-items:center;\">
           <button id=\"pos_cfg_save\" class=\"pos-cfg\">Apply Config</button>
@@ -3752,6 +3915,20 @@ async function loadPosConfig() {
     if (tK && c.top_k_markers != null) tK.value = c.top_k_markers;
     const out = document.getElementById('pos_outlier');
     if (out && c.outlier_reject_m != null) out.value = c.outlier_reject_m;
+    // ── Populate precision (advanced) controls ──
+    const setIf = (id, val, formatter) => {
+      const el = document.getElementById(id);
+      if (el && val != null) el.value = formatter ? formatter(val) : val;
+    };
+    setIf('pos_pose_hold',  c.pose_hold_sec);
+    setIf('pos_min_refs',   c.min_ref_count);
+    setIf('pos_min_ref_w',  c.min_ref_weight);
+    setIf('pos_blend_min',  c.meas_blend_min);
+    setIf('pos_blend_max',  c.meas_blend_max);
+    setIf('pos_vel_blend',  c.vel_blend);
+    setIf('pos_max_dt',     c.max_state_dt);
+    setIf('pos_kf_q',       c.kalman_process_var, (v)=>Number(v).toPrecision(3));
+    setIf('pos_kf_r',       c.kalman_meas_var,    (v)=>Number(v).toPrecision(3));
     const cs = document.getElementById('pos_calib_status');
     cs.textContent = d.has_calibration ? '\\u2713 calibration loaded' : 'no calibration';
     cs.style.color = d.has_calibration ? '#22c55e' : '#94a3b8';
@@ -3794,6 +3971,280 @@ async function loadPosConfig() {
     document.getElementById('pos_outlier').value = '2.5';
     flash('defaults loaded — click Apply', '#94a3b8');
   };
+})();
+
+// ── Precision (advanced) controls — pose hold, Kalman variances,
+// measurement/velocity blend, min-refs. Live-apply through the same
+// endpoint; no restart required. Defaults mirror ctrl_position.py.
+(function wirePrecisionControls(){
+  const flash = (msg, col) => {
+    const e = document.getElementById('pos_precision_status');
+    if (!e) return;
+    e.textContent = msg; e.style.color = col || '#64748b';
+    setTimeout(() => { if (e.textContent === msg) e.textContent = ''; }, 2500);
+  };
+  const applyBtn = document.getElementById('pos_precision_apply');
+  if (applyBtn) applyBtn.onclick = async () => {
+    const num = (id) => parseFloat(document.getElementById(id).value);
+    const int = (id) => parseInt(document.getElementById(id).value, 10);
+    const payload = {
+      pose_hold_sec:       num('pos_pose_hold'),
+      min_ref_count:       int('pos_min_refs'),
+      min_ref_weight:      num('pos_min_ref_w'),
+      meas_blend_min:      num('pos_blend_min'),
+      meas_blend_max:      num('pos_blend_max'),
+      vel_blend:           num('pos_vel_blend'),
+      max_state_dt:        num('pos_max_dt'),
+      kalman_process_var:  num('pos_kf_q'),
+      kalman_meas_var:     num('pos_kf_r'),
+    };
+    try {
+      const r = await fetch('/proxy/position/config', {
+        method: 'POST',
+        headers: {'Content-Type':'application/json'},
+        body: JSON.stringify(payload),
+      });
+      const d = await r.json();
+      if (d.ok) flash('\\u2713 applied', '#22c55e');
+      else flash('error: ' + (d.error || 'unknown'), '#ef4444');
+    } catch (e) { flash('request failed', '#ef4444'); }
+  };
+  const resetBtn = document.getElementById('pos_precision_reset');
+  if (resetBtn) resetBtn.onclick = () => {
+    document.getElementById('pos_pose_hold').value = '0.8';
+    document.getElementById('pos_min_refs').value  = '1';
+    document.getElementById('pos_min_ref_w').value = '0';
+    document.getElementById('pos_blend_min').value = '0.35';
+    document.getElementById('pos_blend_max').value = '0.85';
+    document.getElementById('pos_vel_blend').value = '0.25';
+    document.getElementById('pos_max_dt').value    = '1.0';
+    document.getElementById('pos_kf_q').value      = '1e-3';
+    document.getElementById('pos_kf_r').value      = '0.1';
+    flash('defaults loaded — click Apply', '#94a3b8');
+  };
+})();
+
+// ── Parameter-info popup — click any ⓘ icon for an explanation ──
+// One shared map drives every tuning knob. The modal picks up title,
+// key, body (explanation), and an optional range/units hint.
+window.PARAM_INFO = {
+  // ===== Observer PD (visual servo — used by all missions) =====
+  hover_distance_m: {title:'Hover distance', units:'metres', body:
+    "Target stand-off distance from the marker during hover. The mission "+
+    "flies forward until the marker is this far away, then holds.\\n\\n"+
+    "Smaller = closer / more camera detail, but less safety margin against "+
+    "the net. 2 m is the rules-safe default for SDC26.\\n"+
+    "Feeds into: approach phase (distance error) and hover phase (dead-band)."},
+  fb_max:           {title:'Approach speed (forward)', units:'% RC', body:
+    "Upper clamp for forward throttle when approaching a marker. Scales "+
+    "the P gain output — higher = faster approach but larger overshoot.\\n\\n"+
+    "Pair with dist_p: the effective command is min(fb_max, dist_p · err_dist)."},
+  fb_back_max:      {title:'Retreat speed (backward)', units:'% RC', body:
+    "Upper clamp for backward throttle when the drone is too close to the "+
+    "target. Set lower than fb_max — retreats tend to happen near the net "+
+    "and should be cautious."},
+  dist_p:           {title:'Approach aggressiveness', units:'P · dist error (m)', body:
+    "Proportional gain turning distance-error (m) into forward RC%. Higher "+
+    "values react more sharply to distance error.\\n\\n"+
+    "Start low (10-20) and raise until the drone reaches the hover distance "+
+    "without overshoot. Tied to fb_max and the IMU D term (d_fb)."},
+  ema_alpha:        {title:'EMA smoothing (α)', units:'0..1', body:
+    "First-order low-pass on camera-derived errors. 1.0 = no smoothing "+
+    "(fastest response, jitteriest), 0.05 = heavy smoothing (laggy).\\n\\n"+
+    "Typical 0.25-0.5. Lower when the video is noisy or markers are small."},
+  deadband_x:       {title:'Yaw/lateral dead-band (err_x)', units:'normalised', body:
+    "Below this threshold, yaw + sideways commands are zero. Stops the "+
+    "drone hunting around an already-centred marker.\\n\\n"+
+    "Typical 0.03-0.08. Increase if the drone wiggles while hovered."},
+  deadband_y:       {title:'Altitude dead-band (err_y)', units:'normalised', body:
+    "Below this threshold vertical command is zero. Similar purpose to "+
+    "deadband_x but on the vertical axis. 0.05-0.1 typical."},
+  deadband_skew:    {title:'Skew dead-band', units:'normalised', body:
+    "Below this threshold the perpendicular-alignment (strafe) command is "+
+    "zero. Skew measures how tilted the marker appears — a small tilt "+
+    "doesn't need correction."},
+  deadband_dist_m:  {title:'Distance dead-band', units:'metres', body:
+    "Below this distance-error threshold the forward/back command is zero. "+
+    "Keeps the drone parked once it's ~within range of hover_distance_m.\\n\\n"+
+    "Too small and you get buzzing; too large and the drone drifts."},
+  yaw_p:            {title:'Yaw P-gain', units:'per err_x', body:
+    "Proportional gain from horizontal image-error to yaw RC%. Higher = "+
+    "snappier rotation toward the marker but more overshoot."},
+  skew_p:           {title:'Lateral P-gain', units:'per skew', body:
+    "Proportional gain from marker-tilt to sideways RC%. Used to strafe "+
+    "around the marker for head-on approach."},
+  alt_p:            {title:'Altitude P-gain', units:'per err_y', body:
+    "Proportional gain from vertical image-error to vertical RC%. Higher = "+
+    "snappier climb/descend to marker height."},
+  d_yaw:            {title:'Yaw D-damping', units:'per °/s (gyro)', body:
+    "Derivative damping on yaw using the gyro. Subtracts a fraction of the "+
+    "current yaw-rate from the yaw command — cancels oscillation.\\n\\n"+
+    "If the drone visibly orbits around the marker, increase."},
+  d_lr:             {title:'Lateral D-damping', units:'per cm/s (vgy)', body:
+    "Derivative damping on sideways RC using the body-frame Y velocity "+
+    "from the IMU. Prevents over-strafing."},
+  d_ud:             {title:'Vertical D-damping', units:'per cm/s (vgz)', body:
+    "Derivative damping on vertical RC using the body-frame Z velocity. "+
+    "Prevents vertical oscillation as the drone approaches target altitude."},
+  d_fb:             {title:'Fwd/back D-damping', units:'per cm/s (vgx)', body:
+    "Derivative damping on forward/back RC using the body-frame X velocity. "+
+    "The most important D term for not slamming into the net.\\n\\n"+
+    "Combined with the boundary guard (arena edge prediction) this is the "+
+    "primary brake during fast approaches."},
+  yaw_max:          {title:'Clamp · max yaw', units:'% RC', body:
+    "Hard upper limit for yaw RC%. Applied after the PD math. Keeps the "+
+    "drone from spinning wildly on large errors. 20-30 typical."},
+  lr_max:           {title:'Clamp · max lateral', units:'% RC', body:
+    "Hard upper limit for sideways RC%. 20-40 typical — too high and the "+
+    "drone over-strafes during approach."},
+  ud_max:           {title:'Clamp · max vertical', units:'% RC', body:
+    "Hard upper limit for vertical RC%. Typical 20-40. Raise for faster "+
+    "altitude acquisition if the ceiling guard allows."},
+  rc_min:           {title:'RC dead-floor', units:'% RC', body:
+    "Below this magnitude the RC output is forced to zero. Anafi ignores "+
+    "very small RC values anyway — this prevents buzzing/whine while "+
+    "hovered. Usually 2-3."},
+  cam_hfov_deg:     {title:'Camera H-FOV (drawing only)', units:'degrees', body:
+    "Used ONLY to draw the camera cone in the top-down view — does NOT "+
+    "affect PnP or any control. 69° is the Anafi nominal."},
+  marker_size_m:    {title:'Observer marker size', units:'metres', body:
+    "Physical marker side length for the observer's own PnP. Must match "+
+    "the printed markers. SDC26 markers are 0.5 m.\\n\\n"+
+    "Tip: keep this in sync with the Position Tracker's marker size."},
+
+  // ===== Position Tracker (arena-frame pose fusion) =====
+  detect_profile:     {title:'Detection profile', body:
+    "Preset for the ArUco detector parameters (corner refinement, adaptive "+
+    "threshold window, min marker size). Profiles:\\n"+
+    "  · Balanced  — default, good speed + robustness.\\n"+
+    "  · Sensitive — lighter thresholds, catches distant / partially-lit "+
+    "markers at higher CPU cost.\\n"+
+    "  · Strict    — tighter accept, rejects noisy detections."},
+  fov_deg:            {title:'Camera H-FOV', units:'degrees', body:
+    "Horizontal field-of-view used to synthesise the intrinsics matrix "+
+    "when no calibration file is loaded. Anafi 4K ≈ 69°.\\n\\n"+
+    "Uploading a .npz calibration overrides this."},
+  latency_ms:         {title:'Video-to-IMU latency', units:'ms', body:
+    "How long the camera frame is old relative to the current IMU sample. "+
+    "The positioner rewinds the IMU buffer by this amount so the IMU "+
+    "velocity used for dead-reckoning corresponds to the same moment as "+
+    "the vision measurement.\\n\\n"+
+    "Measure: the header Latency row shows c2→fc + fc→drone RTT plus a "+
+    "video decode offset; enabling auto-set pushes that total here."},
+  imu_weight:         {title:'IMU ↔ ArUco blend', units:'0..1', body:
+    "Mix between pure ArUco pose (0) and pure IMU dead-reckoning (1). "+
+    "Higher = smoother but drifts more during marker outages.\\n\\n"+
+    "30 % is a good default. Raise to 50-60 % if markers flicker in/out, "+
+    "lower if the IMU shows bias."},
+  enable_kalman_filter:{title:'Kalman filter', body:
+    "Per-axis 1-D Kalman filter on x/y/z. Models state as position+velocity "+
+    "and fuses ArUco fixes as measurements.\\n\\n"+
+    "ON (recommended): smoother, handles brief marker dropouts.\\n"+
+    "OFF: pose jumps straight to the last ArUco solution — noisier but "+
+    "with zero added latency."},
+  top_k_markers:      {title:'Top-K markers', body:
+    "Use only the N closest markers in the weighted-mean fusion. 0 = auto "+
+    "(picks 4). Smaller K = faster, less robust to outliers. Larger K = "+
+    "more samples but includes distant, less-accurate detections."},
+  outlier_reject_m:   {title:'Outlier reject distance', units:'metres', body:
+    "Per-marker poses further than this from the weighted-mean position "+
+    "are rejected as outliers before re-averaging.\\n\\n"+
+    "Default 2.5 m. Tighten to 1.0 m for a smaller, tidy arena; loosen to "+
+    "3.5 m if markers are far apart."},
+  pose_hold_sec:      {title:'Pose hold (dead-reckon)', units:'seconds', body:
+    "After the last valid ArUco fix, keep publishing pose based on IMU "+
+    "dead-reckoning for this many seconds.\\n\\n"+
+    "Too short → pose vanishes every time the camera blinks.\\n"+
+    "Too long  → stale pose during marker outages drifts meters.\\n"+
+    "0.5-1.0 s typical. Raise only if the IMU is well-calibrated."},
+  min_ref_count:      {title:'Minimum reference markers', body:
+    "Require at least this many markers to be visible before a fused pose "+
+    "is accepted. 1 = accept a single marker (can be noisy). 2-3 gives a "+
+    "much more robust fix by cross-checking."},
+  min_ref_weight:     {title:'Minimum reference weight', units:'0..1', body:
+    "Require the best-matching marker to have at least this fused weight. "+
+    "Rejects very low-confidence fits (tiny / extreme-angle markers).\\n\\n"+
+    "0 = accept any detection. 0.2-0.4 is restrictive but clean."},
+  meas_blend_min:     {title:'Measurement blend — low', units:'α ∈ [0..1]', body:
+    "Minimum EMA α applied to fresh ArUco measurements when fusing with "+
+    "the Kalman state. Used when fix quality is high (trust the filter).\\n\\n"+
+    "Lower values = more Kalman smoothing, less jitter."},
+  meas_blend_max:     {title:'Measurement blend — high', units:'α ∈ [0..1]', body:
+    "Maximum EMA α used when fix quality is low (trust the latest fresh "+
+    "measurement more). The positioner interpolates between min and max "+
+    "based on residual error and ref count."},
+  vel_blend:          {title:'Velocity blend', units:'0..1', body:
+    "Blend between IMU-measured velocity (0) and Kalman-state velocity "+
+    "derivative (1). Raises 0.25 means 25 % Kalman-derived, 75 % raw IMU.\\n\\n"+
+    "Higher = smoother vz/vy plots. Lower = faster reaction to real motion."},
+  max_state_dt:       {title:'Max state Δt', units:'seconds', body:
+    "If more than this amount of time passes between updates, the Kalman "+
+    "state is reset instead of extrapolated. Prevents exploding covariance "+
+    "during long outages (landing, lost camera link)."},
+  kalman_process_var: {title:'Kalman process variance (Q)', body:
+    "How much the state is expected to change between steps. Low Q → the "+
+    "filter believes its model (smooth but sluggish). High Q → the filter "+
+    "expects rapid changes (reacts faster but noisier).\\n\\n"+
+    "Default 1e-3. Try 5e-4 for smooth hover, 5e-3 for dynamic missions."},
+  kalman_meas_var:    {title:'Kalman measurement variance (R)', body:
+    "How noisy the ArUco measurements are. Low R → trust the camera "+
+    "more (snaps to detections). High R → trust the model more (smoother "+
+    "but may lag).\\n\\n"+
+    "Default 1e-1. Large markers at short range can use 1e-2; noisy, "+
+    "distant markers may benefit from 3e-1."},
+};
+
+window.showParamInfo = function(key, ev) {
+  if (ev) { ev.stopPropagation(); ev.preventDefault(); }
+  const info = window.PARAM_INFO[key];
+  const m = document.getElementById('param_info_modal');
+  if (!m) return;
+  if (!info) {
+    // Still show the modal with a graceful note — useful while adding new params.
+    document.getElementById('pim_title').textContent = key;
+    document.getElementById('pim_key').textContent   = key;
+    document.getElementById('pim_body').textContent  = 'No description registered for this parameter yet.';
+    document.getElementById('pim_range').textContent = '';
+  } else {
+    document.getElementById('pim_title').textContent = info.title || key;
+    document.getElementById('pim_key').textContent   = key;
+    document.getElementById('pim_body').textContent  = info.body || '';
+    document.getElementById('pim_range').textContent = info.units ? ('Units: ' + info.units) : '';
+  }
+  m.style.display = 'flex';
+};
+
+// Event delegation — any element with class .info-icon and data-info="<key>"
+// opens the modal. Works for icons injected later (observer PD rows) too.
+document.addEventListener('click', function(ev){
+  const el = ev.target.closest && ev.target.closest('.info-icon');
+  if (!el) return;
+  const key = el.dataset.info || el.getAttribute('data-info');
+  if (!key) return;
+  window.showParamInfo(key, ev);
+});
+
+// ── Light / dark theme toggle ──────────────────────────────────────
+// Persists via localStorage. Default = dark (matches the original UI).
+// The data-theme attribute drives the CSS overrides at the top of the
+// <style> block. Using !important there lets the light theme defeat
+// the many hard-coded inline style="" colours without rewriting every
+// DOM element.
+(function wireThemeToggle(){
+  const KEY = 'sdc_theme';
+  const btn = document.getElementById('theme_toggle');
+  function applyTheme(t) {
+    document.documentElement.setAttribute('data-theme', t);
+    if (btn) btn.innerHTML = (t === 'light') ? '\\u2600\\ufe0f Light' : '\\ud83c\\udf19 Dark';
+  }
+  const saved = (function(){ try { return localStorage.getItem(KEY) || 'dark'; } catch { return 'dark'; } })();
+  applyTheme(saved === 'light' ? 'light' : 'dark');
+  if (btn) btn.addEventListener('click', () => {
+    const cur = document.documentElement.getAttribute('data-theme') || 'dark';
+    const next = cur === 'dark' ? 'light' : 'dark';
+    try { localStorage.setItem(KEY, next); } catch {}
+    applyTheme(next);
+  });
 })();
 
 document.getElementById('pos_enabled').onchange = async function() {
@@ -4450,23 +4901,29 @@ let ARENA_W_dyn = 20, ARENA_D_dyn = 10;
   // Expose for fleetPoll()
   window._arena3d = {updateDrones, syncTargetBoxes};
 
-  // Toggle wiring
+  // Toggle wiring — 3D view is shown BY DEFAULT below the 2D canvas.
+  // The 2D canvas stays visible the whole time so operators have the
+  // top-down reference; unchecking simply tears down the 3D scene.
   const cb = document.getElementById('arena_show_3d');
   const wrap = document.getElementById('arena3d_wrap');
   const container = document.getElementById('arena3d_container');
-  if (cb && wrap && container) {
-    cb.addEventListener('change', () => {
-      if (cb.checked) {
-        wrap.style.display = '';
-        if (!scene) {
-          try { init3D(container); }
-          catch (e) { console.error('[3D] init failed:', e); cb.checked = false; wrap.style.display = 'none'; }
-        }
-      } else {
-        wrap.style.display = 'none';
-        teardown3D();
+  function apply3DState() {
+    if (cb.checked) {
+      wrap.style.display = '';
+      if (!scene) {
+        try { init3D(container); }
+        catch (e) { console.error('[3D] init failed:', e); cb.checked = false; wrap.style.display = 'none'; }
       }
-    });
+    } else {
+      wrap.style.display = 'none';
+      teardown3D();
+    }
+  }
+  if (cb && wrap && container) {
+    cb.addEventListener('change', apply3DState);
+    // Start in the default state — 3D active alongside the 2D canvas.
+    // Defer a tick so the container has layout dimensions before THREE initialises.
+    setTimeout(apply3DState, 0);
   }
 </script>
 </body>
@@ -4521,13 +4978,21 @@ def index():
 
 @app.get("/logo.png")
 def serve_logo():
-    """Serve the team logo for the top-right corner of the UI."""
+    """Serve the team logo for the header of the UI.
+
+    Prefers the alpha-masked variant (team_logo_transparent.png) so the
+    logo blends with the page's dark background rather than showing a
+    white rectangle. Falls back to the original PNG if the masked file
+    isn't present.
+    """
     from pathlib import Path as _P
-    p = _P(__file__).resolve().parent.parent / "1_Doc" / "team_logo.png"
-    if not p.exists():
-        return jsonify(ok=False, error="logo not found"), 404
-    return send_file(str(p), mimetype="image/png",
-                     max_age=86400)   # cache-1-day
+    base = _P(__file__).resolve().parent.parent / "1_Doc"
+    for name in ("team_logo_transparent.png", "team_logo.png"):
+        p = base / name
+        if p.exists():
+            return send_file(str(p), mimetype="image/png",
+                             max_age=86400)   # cache-1-day
+    return jsonify(ok=False, error="logo not found"), 404
 
 
 @app.get("/proxy/drones")
