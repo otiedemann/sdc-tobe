@@ -113,6 +113,19 @@ HTML = """
   <meta charset=\"utf-8\" />
   <meta name=\"viewport\" content=\"width=device-width,initial-scale=1\" />
   <title>Drone Remote Controller</title>
+  <!-- Three.js for optional 3D arena view. Loaded up-front so the 3D
+       checkbox handler can init the scene the first time it's ticked.
+       Uses ES module imports via importmap, which works in Chrome/Safari
+       desktop. Falls back gracefully — if the module fails to load, the
+       3D checkbox will log an error and the 2D view still works. -->
+  <script type=\"importmap\">
+  {
+    \"imports\": {
+      \"three\": \"https://unpkg.com/three@0.161.0/build/three.module.js\",
+      \"three/addons/\": \"https://unpkg.com/three@0.161.0/examples/jsm/\"
+    }
+  }
+  </script>
   <style>
     body { background:#0f172a; color:#e2e8f0; font-family:Arial,sans-serif; margin:0; padding:16px; }
     .row { display:flex; gap:16px; flex-wrap:wrap; align-items:flex-start; }
@@ -376,7 +389,6 @@ HTML = """
       <div class=\"adv\">
         <div class=\"small\" style=\"margin-bottom:6px;\">Advanced SDK controls</div>
         <div class=\"adv-grid\">
-          <button id=\"emergency\" style=\"background:#7f1d1d;border-color:#dc2626;\">EMERGENCY<br><span style=\"font-size:9px;font-weight:400;opacity:.8;\">Killswitch - will shutdown drone immediately - no safe landing</span></button>
           <button id=\"rotate_cw\">Rotate CW 45°</button>
           <button id=\"rotate_ccw\">Rotate CCW 45°</button>
           <button id=\"move_up\">Up 30cm</button>
@@ -412,7 +424,7 @@ HTML = """
         </div>
         <div class=\"row\" style=\"margin-top:8px; align-items:center;\">
           <span class=\"small\" style=\"min-width:80px;\">Max altitude (m)</span>
-          <input id=\"set_alt\" type=\"number\" min=\"0.5\" max=\"150\" step=\"0.5\" value=\"2\" style=\"width:70px;\" />
+          <input id=\"set_alt\" type=\"number\" min=\"0.5\" max=\"150\" step=\"0.5\" value=\"5\" style=\"width:70px;\" />
           <span class=\"small\" style=\"min-width:80px;\">Max vert spd</span>
           <input id=\"set_vspd\" type=\"number\" min=\"0.1\" max=\"4\" step=\"0.1\" value=\"0.5\" style=\"width:70px;\" />
           <span class=\"small\" style=\"min-width:80px;\">Max tilt (°)</span>
@@ -1084,7 +1096,7 @@ HTML = """
     arcPoll();
     // Version marker — if this string doesn't appear in the DOM,
     // you're running stale JS (restart the Python server or hard-refresh).
-    const BUILD = 'as-arena-safety-guard';
+    const BUILD = 'at-c2-upgrade';
     console.log('[arc] init complete, build=' + BUILD);
     const ver = document.createElement('span');
     ver.id = 'arc_build_tag';
@@ -1351,7 +1363,22 @@ HTML = """
         </label>
         <span id=\"pos_status_badge\" class=\"small\" style=\"color:#64748b;\">disabled</span>
       </div>
-      <canvas id=\"arena_canvas\" class=\"arena-canvas\" width=\"600\" height=\"400\"></canvas>
+      <div style=\"display:flex;gap:8px;align-items:center;margin-bottom:6px;\">
+        <label class=\"small\" style=\"color:#94a3b8;display:flex;align-items:center;gap:4px;cursor:pointer;\">
+          <input type=\"checkbox\" id=\"arena_show_3d\" style=\"accent-color:#0ea5e9;\" />
+          3D view (Three.js)
+        </label>
+        <label class=\"small\" style=\"color:#94a3b8;display:flex;align-items:center;gap:4px;cursor:pointer;\">
+          <input type=\"checkbox\" id=\"arena_show_all_drones\" checked style=\"accent-color:#10b981;\" />
+          Show all drones
+        </label>
+        <span class=\"small\" style=\"color:#64748b;margin-left:12px;\">Grid: 1 m</span>
+      </div>
+      <canvas id=\"arena_canvas\" class=\"arena-canvas\" width=\"960\" height=\"560\" style=\"max-width:100%;\"></canvas>
+      <div id=\"arena3d_wrap\" style=\"display:none;margin-top:8px;position:relative;\">
+        <div id=\"arena3d_container\" style=\"width:960px;max-width:100%;height:520px;background:#0f172a;border:1px solid #334155;border-radius:6px;\"></div>
+        <div class=\"small\" style=\"color:#64748b;margin-top:4px;\">Drag to orbit · scroll to zoom · right-drag to pan</div>
+      </div>
       <div class=\"pos-coords\" style=\"margin-top:6px;\">
         <span class=\"pos-x\">X: <span id=\"pos_x\">—</span></span>&nbsp;&nbsp;
         <span class=\"pos-y\">Y: <span id=\"pos_y\">—</span></span>&nbsp;&nbsp;
@@ -1720,7 +1747,7 @@ document.getElementById('clear_log').onclick = async ()=>{
   } catch {}
 };
 
-document.getElementById('emergency').onclick = ()=>post('/proxy/emergency',{});
+// (emergency killswitch button removed — was too easy to hit by accident)
 document.getElementById('rotate_cw').onclick = ()=>post('/proxy/rotate',{dir:'cw',deg:45});
 document.getElementById('rotate_ccw').onclick = ()=>post('/proxy/rotate',{dir:'ccw',deg:45});
 document.getElementById('move_up').onclick = ()=>post('/proxy/move',{dir:'up',cm:30});
@@ -2934,14 +2961,19 @@ function drawArena(pos, compPos, dir) {
   ctx.fillStyle = 'rgba(0,0,0,0.4)'; ctx.fillRect(PAD, PAD, W - 2*PAD, H - 2*PAD);
   ctx.fillStyle = '#0f172a'; ctx.fillRect(ax0, ay0, ax1 - ax0, ay1 - ay0);
 
-  // Grid lines over full view (5 m spacing)
-  ctx.strokeStyle = '#1e3a5f'; ctx.lineWidth = 1;
-  for (let gx = Math.ceil(viewOX / 5) * 5; gx <= viewOX + viewW + 0.01; gx += 5) {
+  // Grid lines — fine 1 m grid (subtle) + major 5 m grid (brighter)
+  // so the user can read position to the metre at a glance.
+  const minorStroke = '#17243b';
+  const majorStroke = '#1e3a5f';
+  ctx.lineWidth = 1;
+  for (let gx = Math.ceil(viewOX); gx <= viewOX + viewW + 0.01; gx += 1) {
     const [cx] = arenaToCanvas(gx, viewOY);
+    ctx.strokeStyle = (gx % 5 === 0) ? majorStroke : minorStroke;
     ctx.beginPath(); ctx.moveTo(cx, PAD); ctx.lineTo(cx, H - PAD); ctx.stroke();
   }
-  for (let gy = Math.ceil(viewOY / 5) * 5; gy <= viewOY + viewD + 0.01; gy += 5) {
+  for (let gy = Math.ceil(viewOY); gy <= viewOY + viewD + 0.01; gy += 1) {
     const [, cy] = arenaToCanvas(viewOX, gy);
+    ctx.strokeStyle = (gy % 5 === 0) ? majorStroke : minorStroke;
     ctx.beginPath(); ctx.moveTo(PAD, cy); ctx.lineTo(W - PAD, cy); ctx.stroke();
   }
 
@@ -3120,7 +3152,77 @@ function drawArena(pos, compPos, dir) {
   ctx.fillStyle = 'rgba(0,0,0,0.6)'; ctx.fillRect(lx - 2, ly - 11, lw + 4, 14);
   ctx.fillStyle = dotColor; ctx.textAlign = 'left';
   ctx.fillText(label, lx, ly);
+
+  // ── Multi-drone overlay (when checkbox enabled) ──────────────────
+  // Draw every OTHER drone in the fleet in a distinct colour so the
+  // C2 operator can see the whole swarm at once.
+  const showAll = document.getElementById('arena_show_all_drones');
+  if (showAll && showAll.checked && window._fleetObservers) {
+    const FLEET_COLORS = ['#38bdf8', '#a78bfa', '#f472b6', '#fbbf24', '#34d399'];
+    let idx = 0;
+    for (const [did, st] of Object.entries(window._fleetObservers)) {
+      if (did === (window.activeDroneId || activeDroneId)) { idx++; continue; }
+      const p = st && (st.pos || st.cam);
+      if (!p || p.length < 2) { idx++; continue; }
+      const col = FLEET_COLORS[idx % FLEET_COLORS.length];
+      const [rx, ry] = arenaToCanvas(p[0], p[1]);
+      const cxN = Math.max(M, Math.min(W - M, rx));
+      const cyN = Math.max(M, Math.min(H - M, ry));
+      const oob = rx !== cxN || ry !== cyN;
+      // Smaller dot for non-active drones
+      ctx.beginPath(); ctx.arc(cxN, cyN, 7, 0, Math.PI*2);
+      ctx.fillStyle = col; ctx.fill();
+      ctx.strokeStyle = 'rgba(255,255,255,0.6)'; ctx.lineWidth = 1.5; ctx.stroke();
+      // heading tick
+      const yawDeg = st.yaw;
+      if (typeof yawDeg === 'number') {
+        const a = yawDeg * Math.PI / 180;
+        ctx.strokeStyle = col; ctx.lineWidth = 2;
+        ctx.beginPath(); ctx.moveTo(cxN, cyN);
+        ctx.lineTo(cxN + Math.sin(a) * 16, cyN - Math.cos(a) * 16);
+        ctx.stroke();
+      }
+      // label with drone name + position
+      ctx.font = 'bold 10px monospace';
+      const name = (window._fleetNames && window._fleetNames[did]) || did;
+      const tag = `${name} (${p[0].toFixed(1)},${p[1].toFixed(1)})${oob ? ' OOB':''}`;
+      const tw = ctx.measureText(tag).width;
+      const tx = Math.min(cxN + 10, W - tw - PAD - 4);
+      const ty = cyN - 9;
+      ctx.fillStyle = 'rgba(0,0,0,0.65)'; ctx.fillRect(tx - 2, ty - 10, tw + 4, 13);
+      ctx.fillStyle = col; ctx.textAlign = 'left';
+      ctx.fillText(tag, tx, ty);
+      idx++;
+    }
+  }
 }
+
+// ── Fleet-wide position poll (drives multi-drone arena view) ──
+window._fleetObservers = {};
+window._fleetNames = {};
+async function fleetPoll() {
+  try {
+    const r = await fetch('/proxy/aruco/fleet', {cache:'no-store'});
+    const d = await r.json();
+    if (d && d.observers) {
+      window._fleetObservers = d.observers;
+      // Grab drone display names from the main drones dict if available
+      if (typeof drones === 'object') {
+        const names = {};
+        for (const [did, info] of Object.entries(drones || {})) {
+          names[did] = info?.name || did;
+        }
+        window._fleetNames = names;
+      }
+      // Feed positions into the Three.js scene if active
+      if (window._arena3d && window._arena3d.updateDrones) {
+        window._arena3d.updateDrones(d.observers);
+      }
+    }
+  } catch {}
+}
+setInterval(fleetPoll, 500);
+fleetPoll();
 
 function updatePosUI(d) {
   const pos = d.pos;
@@ -3654,6 +3756,182 @@ let ARENA_W_dyn = 20, ARENA_D_dyn = 10;
     wireToggle();
   }
 })(); */
+</script>
+
+<!-- ── Optional 3D arena view via Three.js ─────────────────────────── -->
+<script type=\"module\">
+  import * as THREE from 'three';
+  import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+
+  let scene, camera, renderer, controls, droneMeshes = {}, markerMeshes = {}, rafId = 0;
+  const ARENA_W = 20.0, ARENA_D = 10.8, ARENA_H = 6.0;
+  const ARENA_OX = -10.0, ARENA_OY = 0.0;
+
+  function init3D(container) {
+    scene = new THREE.Scene();
+    scene.background = new THREE.Color(0x0b1220);
+
+    camera = new THREE.PerspectiveCamera(50, container.clientWidth / container.clientHeight, 0.1, 200);
+    camera.position.set(15, 12, 15);
+
+    renderer = new THREE.WebGLRenderer({antialias: true});
+    renderer.setSize(container.clientWidth, container.clientHeight);
+    container.appendChild(renderer.domElement);
+
+    controls = new OrbitControls(camera, renderer.domElement);
+    controls.target.set(0, 1.5, 5.4);
+    controls.update();
+
+    // Lighting
+    const ambient = new THREE.AmbientLight(0xffffff, 0.45);
+    scene.add(ambient);
+    const dir = new THREE.DirectionalLight(0xffffff, 0.9);
+    dir.position.set(5, 12, 8);
+    scene.add(dir);
+
+    // Arena floor — 1 m grid (matches the 2D overlay)
+    const grid = new THREE.GridHelper(20, 20, 0x475569, 0x1e3a5f);
+    grid.position.set(0, 0, ARENA_D / 2);
+    scene.add(grid);
+    // Depth-direction grid (10.8 m, we round to 11 cells)
+    const grid2 = new THREE.GridHelper(12, 12, 0x475569, 0x1e3a5f);
+    grid2.rotation.x = Math.PI / 2;
+    grid2.position.set(0, 3, 0);
+    grid2.material.opacity = 0.0;
+    // keep subtle — 1 grid is enough; the floor grid is what matters
+
+    // Arena box (wireframe)
+    const boxGeom = new THREE.BoxGeometry(ARENA_W, ARENA_H, ARENA_D);
+    const boxMat = new THREE.LineBasicMaterial({color: 0x3b82f6, transparent: true, opacity: 0.4});
+    const box = new THREE.LineSegments(new THREE.EdgesGeometry(boxGeom), boxMat);
+    box.position.set(0, ARENA_H / 2, ARENA_D / 2);
+    scene.add(box);
+
+    // Arena origin marker (green corner cube)
+    const originGeom = new THREE.BoxGeometry(0.3, 0.3, 0.3);
+    const origin = new THREE.Mesh(originGeom, new THREE.MeshStandardMaterial({color: 0x10b981}));
+    origin.position.set(0, 0.15, 0);
+    scene.add(origin);
+
+    // Fetch + plot arena markers (from the arena_config we already fetched)
+    if (window.arenaMarkers && Object.keys(window.arenaMarkers).length) {
+      for (const [id, m] of Object.entries(window.arenaMarkers)) {
+        if (!m.pos) continue;
+        const g = new THREE.BoxGeometry(0.5, 0.5, 0.05);
+        const col = (m.wall === 'front') ? 0x6366f1
+                 : (m.wall === 'back')  ? 0xa855f7
+                 : (m.wall === 'left')  ? 0x06b6d4
+                 : (m.wall === 'right') ? 0x10b981 : 0x94a3b8;
+        const mesh = new THREE.Mesh(g, new THREE.MeshStandardMaterial({color: col}));
+        mesh.position.set(m.pos[0], m.pos[2] || 2, m.pos[1]);
+        scene.add(mesh);
+        markerMeshes[id] = mesh;
+      }
+    }
+
+    window.addEventListener('resize', () => {
+      if (!renderer) return;
+      const w = container.clientWidth, h = container.clientHeight;
+      camera.aspect = w / h;
+      camera.updateProjectionMatrix();
+      renderer.setSize(w, h);
+    });
+
+    function loop() {
+      controls.update();
+      renderer.render(scene, camera);
+      rafId = requestAnimationFrame(loop);
+    }
+    loop();
+  }
+
+  function updateDrones(observers) {
+    if (!scene) return;
+    const DRONE_COLORS = [0xf97316, 0x38bdf8, 0xa78bfa, 0xf472b6, 0xfbbf24];
+    let idx = 0;
+    const seen = new Set();
+    for (const [did, st] of Object.entries(observers || {})) {
+      seen.add(did);
+      const p = st && (st.pos || st.cam);
+      if (!p || p.length < 2) { idx++; continue; }
+      let mesh = droneMeshes[did];
+      if (!mesh) {
+        const col = DRONE_COLORS[idx % DRONE_COLORS.length];
+        // Drone = small sphere with a forward nose-cone
+        const group = new THREE.Group();
+        const body = new THREE.Mesh(
+          new THREE.SphereGeometry(0.18, 16, 12),
+          new THREE.MeshStandardMaterial({color: col}));
+        group.add(body);
+        const nose = new THREE.Mesh(
+          new THREE.ConeGeometry(0.08, 0.3, 8),
+          new THREE.MeshStandardMaterial({color: 0xffffff}));
+        nose.rotation.x = Math.PI / 2;
+        nose.position.set(0, 0, 0.2);
+        group.add(nose);
+        // Label (using a sprite)
+        const canvas = document.createElement('canvas');
+        canvas.width = 128; canvas.height = 32;
+        const c = canvas.getContext('2d');
+        c.fillStyle = 'rgba(0,0,0,0.7)'; c.fillRect(0,0,128,32);
+        c.fillStyle = '#fff'; c.font = 'bold 18px monospace';
+        c.fillText(did, 8, 22);
+        const tex = new THREE.CanvasTexture(canvas);
+        const sprite = new THREE.Sprite(new THREE.SpriteMaterial({map: tex, transparent: true}));
+        sprite.scale.set(0.9, 0.22, 1);
+        sprite.position.set(0, 0.4, 0);
+        group.add(sprite);
+        scene.add(group);
+        mesh = group;
+        droneMeshes[did] = mesh;
+      }
+      mesh.position.set(p[0], p[2] || 1.5, p[1]);
+      if (typeof st.yaw === 'number') mesh.rotation.y = -st.yaw * Math.PI / 180;
+      idx++;
+    }
+    // Remove meshes for drones that disappeared
+    for (const did of Object.keys(droneMeshes)) {
+      if (!seen.has(did)) {
+        scene.remove(droneMeshes[did]);
+        delete droneMeshes[did];
+      }
+    }
+  }
+
+  function teardown3D() {
+    if (rafId) { cancelAnimationFrame(rafId); rafId = 0; }
+    if (renderer) {
+      renderer.dispose();
+      if (renderer.domElement && renderer.domElement.parentNode) {
+        renderer.domElement.parentNode.removeChild(renderer.domElement);
+      }
+      renderer = null;
+    }
+    scene = null; camera = null; controls = null;
+    droneMeshes = {}; markerMeshes = {};
+  }
+
+  // Expose for fleetPoll()
+  window._arena3d = {updateDrones};
+
+  // Toggle wiring
+  const cb = document.getElementById('arena_show_3d');
+  const wrap = document.getElementById('arena3d_wrap');
+  const container = document.getElementById('arena3d_container');
+  if (cb && wrap && container) {
+    cb.addEventListener('change', () => {
+      if (cb.checked) {
+        wrap.style.display = '';
+        if (!scene) {
+          try { init3D(container); }
+          catch (e) { console.error('[3D] init failed:', e); cb.checked = false; wrap.style.display = 'none'; }
+        }
+      } else {
+        wrap.style.display = 'none';
+        teardown3D();
+      }
+    });
+  }
 </script>
 </body>
 </html>

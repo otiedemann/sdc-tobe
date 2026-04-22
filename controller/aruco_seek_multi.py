@@ -251,12 +251,19 @@ class DroneObserver:
             if safety_margin_m is not None:
                 self._safety_margin_m = float(safety_margin_m)
 
+    # Latency compensation: when checking "will this RC push the drone
+    # past the margin?", we look LOOKAHEAD_S seconds into the future
+    # using the current IMU velocity. Accounts for the drone's response
+    # lag + our network RTT — roughly 200-400 ms from RC command to
+    # physical response.
+    GUARD_LOOKAHEAD_S = 0.35
+
     def _apply_boundary_guard(self, lr: int, fb: int, ud: int, yaw_rc: int):
         """Return (lr, fb, ud, yaw_rc) clamped so the drone won't be
-        pushed past the arena margin. When already inside the margin,
-        REVERSES the offending component to actively retreat (hard brake
-        + push back). Yaw and altitude are treated independently from
-        xy translation.
+        pushed past the arena margin. Latency-aware: the check uses a
+        PREDICTED position based on current IMU velocity, not just the
+        instantaneous position, so the guard reacts before the drone
+        has already overshot.
 
         Body-frame → world-frame conversion uses the drone's current yaw:
             world_dx = cos(yaw)·lr + sin(yaw)·fb
@@ -279,19 +286,38 @@ class DroneObserver:
         yaw_rad = math.radians(float(yaw_deg))
         cy, sy = math.cos(yaw_rad), math.sin(yaw_rad)
 
+        # ── Latency-aware prediction ────────────────────────────────
+        # IMU velocity from Anafi telemetry is in BODY FRAME, cm/s.
+        # Convert to world frame (m/s) for prediction.
+        vbx = float(snap.get("vx_cms", 0) or 0) * 0.01   # body fwd
+        vby = float(snap.get("vy_cms", 0) or 0) * 0.01   # body right
+        vbz = float(snap.get("vz_cms", 0) or 0) * 0.01   # body down (Anafi)
+        # Same body→world rotation as RC (fwd=body+y, right=body+x).
+        vwx =  cy * vby + sy * vbx
+        vwy = -sy * vby + cy * vbx
+        vwz = -vbz   # world z-up, body z-down
+        dt = self.GUARD_LOOKAHEAD_S
+        px_pred = px + vwx * dt
+        py_pred = py + vwy * dt
+        pz_pred = pz + vwz * dt
+        # Use the PREDICTED position for clearance calculations so the
+        # guard reacts to where we'll be, not where we are.
+        px_eff, py_eff, pz_eff = px_pred, py_pred, pz_pred
+
         # Body-frame RC → world-frame intended velocity direction
         wdx =  cy * lr + sy * fb
         wdy = -sy * lr + cy * fb
 
-        # How deep inside each wall's margin are we? Positive = still
-        # outside the danger zone, negative = already past the margin.
+        # How deep inside each wall's margin are we, T seconds from now?
+        # Positive = still outside the danger zone, negative = already
+        # past the margin (accounting for current velocity + RTT).
         clearance = {
-            "x_max": bounds["x_max"] - px - margin,   # space left before +x wall
-            "x_min": (px - bounds["x_min"]) - margin, # space left before -x wall
-            "y_max": bounds["y_max"] - py - margin,
-            "y_min": (py - bounds["y_min"]) - margin,
-            "z_max": bounds["z_max"] - pz - margin,
-            "z_min": (pz - bounds["z_min"]) - margin,
+            "x_max": bounds["x_max"] - px_eff - margin,
+            "x_min": (px_eff - bounds["x_min"]) - margin,
+            "y_max": bounds["y_max"] - py_eff - margin,
+            "y_min": (py_eff - bounds["y_min"]) - margin,
+            "z_max": bounds["z_max"] - pz_eff - margin,
+            "z_min": (pz_eff - bounds["z_min"]) - margin,
         }
 
         # Retreat-RC magnitude. Modest so we don't overshoot in the opposite
@@ -300,7 +326,10 @@ class DroneObserver:
         RETREAT_RC = 15
         guard_info = {"active": False, "actions": [], "clearance": {
             k: round(v, 2) for k, v in clearance.items()
-        }, "pos": [round(px, 2), round(py, 2), round(pz, 2)]}
+        }, "pos": [round(px, 2), round(py, 2), round(pz, 2)],
+           "pos_pred": [round(px_eff, 2), round(py_eff, 2), round(pz_eff, 2)],
+           "vel_world": [round(vwx, 2), round(vwy, 2), round(vwz, 2)],
+           "lookahead_s": self.GUARD_LOOKAHEAD_S}
 
         # X axis (world)
         if clearance["x_max"] <= 0 and wdx >= 0:
@@ -1275,13 +1304,26 @@ class ScanAllMarkersMission:
                                  search_sub_start=None, hover_start=None)
                     return
                 if marker_id != target:
-                    # Lost sight — release claim, go back to searching
+                    # Lost sight of the target marker — HARD BRAKE + STOP-AND-SPIN
+                    # 1. Release the claim
+                    # 2. Zero the observer's target → no PD on any visible marker
+                    # 3. Push a single rc_stop so momentum is cancelled
+                    # 4. Immediately start the rotate sub-phase so the drone
+                    #    begins searching from its current position
                     self.claimed.pop(did, None)
                     obs.set_target(None)
-                    obs.set_search_rc(0, 0, 0, 0)
+                    try: obs.cmd_rc_stop()
+                    except Exception: pass
+                    obs.set_search_rc(0, 0, 0, self.SEARCH_ROTATE_YAW_RC)
                     state.update(phase="SEARCH", target=None, hover_start=None,
-                                 search_sub="idle", search_sub_start=None,
-                                 note=f"lost sight of {target}, re-searching")
+                                 search_sub="rotate", search_sub_start=now,
+                                 note=f"lost sight of {target} — brake + rotate to re-acquire")
+                    if self._trace:
+                        self._trace.write("marker_lost", {
+                            "drone": did, "lost": target,
+                            "visible_now": list(visible),
+                            "phase_was": "APPROACH",
+                        })
                     return
                 if distance_m is None:
                     return
@@ -1339,12 +1381,22 @@ class ScanAllMarkersMission:
                                  search_sub_start=None, hover_start=None)
                     return
                 if marker_id != target:
+                    # Lost sight mid-hover — brake immediately and start
+                    # rotating to reacquire a target marker.
                     self.claimed.pop(did, None)
                     obs.set_target(None)
-                    obs.set_search_rc(0, 0, 0, 0)
+                    try: obs.cmd_rc_stop()
+                    except Exception: pass
+                    obs.set_search_rc(0, 0, 0, self.SEARCH_ROTATE_YAW_RC)
                     state.update(phase="SEARCH", target=None, hover_start=None,
-                                 search_sub="idle", search_sub_start=None,
-                                 note=f"lost sight of {target} during hover, re-searching")
+                                 search_sub="rotate", search_sub_start=now,
+                                 note=f"lost sight of {target} during hover — brake + rotate")
+                    if self._trace:
+                        self._trace.write("marker_lost", {
+                            "drone": did, "lost": target,
+                            "visible_now": list(visible),
+                            "phase_was": "HOVER",
+                        })
                     return
                 elapsed = time.time() - (state["hover_start"] or time.time())
                 if elapsed >= self.hover_seconds:
