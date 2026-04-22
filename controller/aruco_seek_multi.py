@@ -180,6 +180,14 @@ class DroneObserver:
 
         self.mode: str = "observe"       # "observe" | "live"
         self.allow_live = bool(allow_live)
+        # ── Waypoint navigation (world-frame goto) ──────────────────
+        # When set, the observer flies toward a world-frame XYZ setpoint
+        # via P-control on arena-frame position, with independent yaw so
+        # the camera keeps facing a user-specified point (typically the
+        # arena centre to maximise marker visibility). Overrides the
+        # marker-tracking PD loop when active.
+        self._waypoint_xyz: Optional[tuple] = None     # (x, y, z) in arena frame
+        self._waypoint_face_xy: Optional[tuple] = None  # (x, y) to aim camera at
         # ── Arena safety bounds (world frame, metres) ────────────────
         # Drone must never leave this box. Default per SDC26 ruleset
         # (20 × 10.8 × 6 m field). Configurable via set_arena_bounds().
@@ -241,6 +249,89 @@ class DroneObserver:
             return {"ok": r.ok, "status": r.status_code}
         except Exception as e:
             return {"ok": False, "error": str(e)}
+
+    def set_waypoint(self, xyz, face_xy=None):
+        """Fly to a world-frame (x, y, z) setpoint. If face_xy is given,
+        the drone yaws to aim its camera at that world-XY point (typically
+        the arena centre so more markers stay in view for triangulation).
+        Pass None to cancel waypoint nav (drone returns to normal
+        marker-tracking PD)."""
+        with self._lock:
+            self._waypoint_xyz = (
+                (float(xyz[0]), float(xyz[1]), float(xyz[2])) if xyz is not None else None
+            )
+            self._waypoint_face_xy = (
+                (float(face_xy[0]), float(face_xy[1])) if face_xy is not None else None
+            )
+
+    def clear_waypoint(self):
+        self.set_waypoint(None, None)
+
+    def _compute_waypoint_rc(self):
+        """Return (lr, fb, ud, yaw, dist_xy, dz) for the current waypoint,
+        or None if waypoint nav isn't configured or position is unknown.
+        All values are RC% (-100..+100)."""
+        with self._lock:
+            wp = self._waypoint_xyz
+            face = self._waypoint_face_xy
+            snap = dict(self.latest)
+        if wp is None:
+            return None
+        pos = snap.get("pos") or snap.get("cam")
+        if not isinstance(pos, (list, tuple)) or len(pos) < 2:
+            return None
+        cx = float(pos[0])
+        cy = float(pos[1])
+        cz = float(pos[2]) if len(pos) >= 3 else (snap.get("altitude_m") or 1.5)
+
+        tx, ty, tz = wp
+        dx = tx - cx     # world
+        dy = ty - cy
+        dz = tz - cz
+        dist_xy = (dx * dx + dy * dy) ** 0.5
+
+        yaw_deg = float(snap.get("yaw", 0.0) or 0.0)
+        yaw_rad = math.radians(yaw_deg)
+        s = math.sin(yaw_rad)
+        c = math.cos(yaw_rad)
+
+        # Body-frame RC from world-frame desired motion. Anafi yaw
+        # convention: yaw=0 → nose points world +y. Body-fwd in world is
+        # (sin(y), cos(y)); body-right is (cos(y), -sin(y)). Solving
+        # world_move = lr · body_right + fb · body_fwd gives:
+        fb_err_m = dx * s + dy * c           # metres along body-fwd
+        lr_err_m = dx * c - dy * s           # metres along body-right
+
+        # P gains (RC% per metre). Conservative so the drone doesn't
+        # overshoot in the often-noisy arena-frame pose.
+        P_XY = 25
+        P_Z  = 35
+        P_YAW = 2.0   # RC% per degree
+
+        fb_rc = int(round(fb_err_m * P_XY))
+        lr_rc = int(round(lr_err_m * P_XY))
+        ud_rc = int(round(dz * P_Z))
+
+        # Face-point yaw control. Work out the world bearing from the
+        # drone to the face_point (typically arena centre), express it
+        # as a yaw angle (0° = world +y, CW positive to match Anafi),
+        # then P-control the yaw error.
+        yaw_rc = 0
+        if face is not None:
+            fx, fy = face
+            dfx = fx - cx
+            dfy = fy - cy
+            if (dfx * dfx + dfy * dfy) > 1e-4:
+                desired_yaw = math.degrees(math.atan2(dfx, dfy))
+                yaw_err = ((desired_yaw - yaw_deg + 180.0) % 360.0) - 180.0
+                yaw_rc = int(round(yaw_err * P_YAW))
+
+        # Clamps — safer than full-stick on waypoints
+        fb_rc  = max(-40, min(40, fb_rc))
+        lr_rc  = max(-40, min(40, lr_rc))
+        ud_rc  = max(-30, min(30, ud_rc))
+        yaw_rc = max(-50, min(50, yaw_rc))
+        return lr_rc, fb_rc, ud_rc, yaw_rc, dist_xy, dz
 
     def set_arena_bounds(self, bounds: dict, safety_margin_m: float = None):
         """Override the arena safety box. `bounds` keys: x_min, x_max,
@@ -598,6 +689,39 @@ class DroneObserver:
         # can visualise when the safety net is actively braking/retreating.
         if self._last_guard_info:
             snapshot["guard"] = dict(self._last_guard_info)
+
+        # ── Waypoint navigation (overrides marker PD when active) ──
+        # If a mission has set a world-frame waypoint, fly to it now.
+        # Position feedback comes from the ArUco pipeline (snap["pos"]).
+        # We also keep the camera aimed at face_point (typically arena
+        # centre) via independent yaw control so more markers stay in
+        # view for triangulation — decoupled from the body-forward axis.
+        wp_rc = self._compute_waypoint_rc()
+        if wp_rc is not None:
+            lr, fb, ud, yaw_rc, dist_xy, dz = wp_rc
+            if self.mode == "live":
+                try:
+                    self._send_rc(lr, fb, ud, yaw_rc)
+                    snapshot["rc_sent_at"] = round(t_now, 2)
+                except Exception as e:
+                    snapshot["rc_send_error"] = str(e)[:80]
+            with self._lock:
+                wp  = self._waypoint_xyz
+                face = self._waypoint_face_xy
+            snapshot.update({
+                "waypoint": list(wp) if wp else None,
+                "waypoint_face": list(face) if face else None,
+                "waypoint_dist_xy": round(dist_xy, 2),
+                "waypoint_dz": round(dz, 2),
+                "rc_lr": lr, "rc_fb": fb, "rc_ud": ud, "rc_yaw": yaw_rc,
+                "marker_id": None,
+                "status_msg": f"→ waypoint ({wp[0]:.1f},{wp[1]:.1f},{wp[2]:.1f}) "
+                              f"d={dist_xy:.2f}m dz={dz:+.2f}m",
+            })
+            self._chosen_id = None
+            with self._lock:
+                self.latest = snapshot
+            return
 
         if not vid_all:
             snapshot["marker_id"] = None
@@ -1469,6 +1593,420 @@ class ScanAllMarkersMission:
                 return
 
 
+# ═══════════════════════════════════════════════════════════════════════════
+#  CaptureAllTargetsMission — SDC26 capture-the-box mission
+# ═══════════════════════════════════════════════════════════════════════════
+#
+# Per SDC26 rules (v9): 6 boxes on the field, 3 per team zone. To capture
+# an enemy box, a drone hovers over it for ≥ 2 s without a defending drone
+# present. The capturing drone then must return to the team's home area for
+# the point to count.
+#
+# This mission flies the swarm one-by-one over the configured targets, holds
+# 1.5 m above each for 4 s (conservative vs the 2-s rule), then returns to
+# the home zone. Camera is kept pointed at the arena centre throughout so
+# the position tracker has as many markers as possible in view for
+# triangulation.
+#
+# FSM per drone:
+#   IDLE → NAV_TO_TARGET → HOVER → NAV_TO_HOME → DONE
+#
+# Shared claim map prevents two drones from attacking the same box.
+
+class CaptureAllTargetsMission:
+    """Fly each selected drone to a sequence of target boxes, hover 1.5 m
+    above each for `hover_seconds` seconds, then return home.
+
+    target_boxes is a list of dicts like:
+        [{"id": 1, "x": -5.0, "y": 2.0}, ...]
+    """
+
+    TICK_S = 0.5
+
+    def __init__(
+        self,
+        fleet: "ObserverFleet",
+        drone_ids: list[str],
+        target_boxes: list[dict],
+        home_xy: tuple[float, float] = (0.0, 1.5),
+        arena_face_xy: tuple[float, float] = (0.0, 5.4),
+        hover_above_m: float = 1.5,
+        hover_seconds: float = 4.0,
+        nav_tol_xy_m: float = 0.3,
+        nav_tol_z_m: float = 0.3,
+        auto_takeoff: bool = False,
+    ):
+        self.fleet = fleet
+        self.drone_ids = [str(d) for d in drone_ids]
+        # Normalise and index boxes
+        self.target_boxes = []
+        for i, b in enumerate(target_boxes or []):
+            try:
+                self.target_boxes.append({
+                    "idx": i,
+                    "id": b.get("id", i + 1),
+                    "x":  float(b["x"]),
+                    "y":  float(b["y"]),
+                    "home_team": b.get("home_team"),
+                })
+            except (KeyError, TypeError, ValueError):
+                continue
+        self.home_xy = (float(home_xy[0]), float(home_xy[1]))
+        self.arena_face_xy = (float(arena_face_xy[0]), float(arena_face_xy[1]))
+        self.hover_above_m = float(hover_above_m)
+        self.hover_seconds = float(hover_seconds)
+        self.nav_tol_xy_m = float(nav_tol_xy_m)
+        self.nav_tol_z_m  = float(nav_tol_z_m)
+        self.auto_takeoff = bool(auto_takeoff)
+
+        self._lock = threading.RLock()
+        self._active = False
+        self._thread: Optional[threading.Thread] = None
+        self.captured: set[int] = set()       # idx of boxes hovered over
+        self.claimed: dict[str, int] = {}     # drone_id → box idx
+        self.drones: dict[str, dict] = {}
+        self.started_at: Optional[float] = None
+        self.ended_at: Optional[float] = None
+        self.error: Optional[str] = None
+        self._trace: Optional[MissionTraceLogger] = None
+        self.trace_path: Optional[str] = None
+
+    # ── Lifecycle ─────────────────────────────────────────────────
+    def start(self):
+        with self._lock:
+            if self._active:
+                return False
+            if not self.target_boxes:
+                self.error = "no target_boxes configured"
+                return False
+            for did in self.drone_ids:
+                if self.fleet.get(did) is None:
+                    self.error = f"unknown drone id {did}"
+                    return False
+            if not self.fleet.allow_live:
+                self.error = "mission requires LIVE mode (REMOTE_NO_LIVE is set)"
+                return False
+            self._active = True
+            self.started_at = time.time()
+            self.ended_at = None
+            self.error = None
+            self.captured.clear()
+            self.claimed.clear()
+            self.drones = {
+                did: {
+                    "phase": "IDLE",
+                    "target_idx": None,
+                    "hover_start": None,
+                    "note": "",
+                    "boxes_done": 0,
+                }
+                for did in self.drone_ids
+            }
+            ts_tag = time.strftime("%Y%m%d_%H%M%S")
+            log_path = MISSION_LOG_DIR / f"mission_capture_{ts_tag}.jsonl"
+            try:
+                self._trace = MissionTraceLogger(log_path, "capture_all_targets")
+                self.trace_path = str(log_path)
+                self._trace.write("mission_start", {
+                    "drone_ids": list(self.drone_ids),
+                    "target_boxes": list(self.target_boxes),
+                    "home_xy": self.home_xy,
+                    "arena_face_xy": self.arena_face_xy,
+                    "hover_above_m": self.hover_above_m,
+                    "hover_seconds": self.hover_seconds,
+                    "auto_takeoff": self.auto_takeoff,
+                })
+                print(f"[MISSION] Capture-targets trace → {log_path}")
+            except Exception as e:
+                print(f"[MISSION] Trace init failed: {e}")
+                self._trace = None
+
+            # Start every observer in LIVE, always face arena centre
+            failed = []
+            for did in self.drone_ids:
+                obs = self.fleet.get(did)
+                obs.set_target(None)
+                obs.start()
+                if obs.set_mode("live") != "live":
+                    failed.append(did)
+                # Aim camera at arena centre from the start
+                obs.set_waypoint(None, self.arena_face_xy)
+                if self.auto_takeoff:
+                    try: obs.cmd_takeoff()
+                    except Exception: pass
+            if failed:
+                for did in self.drone_ids:
+                    o = self.fleet.get(did)
+                    if o: o.set_mode("observe")
+                self._active = False
+                self.error = f"could not switch {','.join(failed)} to LIVE"
+                return False
+            self._thread = threading.Thread(target=self._run, daemon=True,
+                                             name="mission-capture")
+            self._thread.start()
+            return True
+
+    def stop(self, land: bool = False):
+        with self._lock:
+            was_active = self._active
+            self._active = False
+            self.ended_at = time.time()
+            if self._trace:
+                self._trace.write("mission_stop", {
+                    "land": bool(land),
+                    "captured_count": len(self.captured),
+                    "target_count": len(self.target_boxes),
+                })
+        if was_active:
+            for did in self.drone_ids:
+                obs = self.fleet.get(did)
+                if obs is None:
+                    continue
+                try:
+                    obs.clear_waypoint()
+                    obs.set_search_rc(0, 0, 0, 0)
+                    obs.set_mode("observe")
+                except Exception:
+                    pass
+                if land:
+                    try:
+                        obs.set_mode("live")
+                        obs.cmd_land()
+                        obs.set_mode("observe")
+                    except Exception:
+                        pass
+        if self._trace:
+            try: self._trace.close()
+            except Exception: pass
+            self._trace = None
+
+    # ── Status snapshot ──
+    def get_status(self) -> dict:
+        with self._lock:
+            remaining = [b for b in self.target_boxes
+                         if b["idx"] not in self.captured]
+            return {
+                "active": self._active,
+                "kind": "capture_all_targets",
+                "drone_ids": list(self.drone_ids),
+                "target_boxes": list(self.target_boxes),
+                "home_xy": list(self.home_xy),
+                "arena_face_xy": list(self.arena_face_xy),
+                "hover_above_m": self.hover_above_m,
+                "hover_seconds": self.hover_seconds,
+                "captured": sorted(self.captured),
+                "remaining": [b["id"] for b in remaining],
+                "progress": f"{len(self.captured)}/{len(self.target_boxes)}",
+                "claimed": dict(self.claimed),
+                "drones": {did: dict(state) for did, state in self.drones.items()},
+                "started_at": self.started_at,
+                "ended_at": self.ended_at,
+                "error": self.error,
+                "trace_path": self.trace_path,
+            }
+
+    # ── FSM loop ──
+    def _run(self):
+        while True:
+            with self._lock:
+                if not self._active:
+                    break
+                all_done = all(
+                    d["phase"] == "DONE" for d in self.drones.values()
+                )
+            if all_done:
+                with self._lock:
+                    self._active = False
+                    self.ended_at = time.time()
+                if self._trace:
+                    self._trace.write("mission_end_auto", {"reason": "all_done"})
+                    try: self._trace.close()
+                    except Exception: pass
+                    self._trace = None
+                # Clear waypoints on all drones
+                for did in self.drone_ids:
+                    obs = self.fleet.get(did)
+                    if obs: obs.clear_waypoint()
+                break
+            for did in self.drone_ids:
+                obs = self.fleet.get(did)
+                if obs is None:
+                    continue
+                self._tick_drone(did, obs)
+            time.sleep(self.TICK_S)
+
+    def _pick_next_box(self, did: str, current_pos) -> Optional[int]:
+        """Pick the closest unclaimed, unvisited box for this drone."""
+        cands = [b for b in self.target_boxes
+                 if b["idx"] not in self.captured
+                 and b["idx"] not in self.claimed.values()]
+        if not cands:
+            return None
+        if current_pos is None:
+            return cands[0]["idx"]
+        cx, cy = float(current_pos[0]), float(current_pos[1])
+        cands.sort(key=lambda b: (b["x"] - cx) ** 2 + (b["y"] - cy) ** 2)
+        return cands[0]["idx"]
+
+    def _tick_drone(self, did: str, obs: "DroneObserver"):
+        now = time.time()
+        snap = obs.get_state()
+        running = snap.get("running")
+        pos = snap.get("pos") or snap.get("cam")
+        if not running:
+            try:
+                obs.start()
+                obs.set_mode("live")
+            except Exception:
+                pass
+            return
+
+        with self._lock:
+            state = self.drones[did]
+            phase = state["phase"]
+
+            # Select next target if IDLE
+            if phase == "IDLE":
+                idx = self._pick_next_box(did, pos)
+                if idx is None:
+                    # Nothing left to capture → go home
+                    state.update(phase="NAV_TO_HOME",
+                                 target_idx=None,
+                                 note="all boxes captured, returning home")
+                    if self._trace:
+                        self._trace.write("phase_change", {
+                            "drone": did, "from": "IDLE", "to": "NAV_TO_HOME",
+                            "reason": "no_unclaimed_boxes",
+                        })
+                    return
+                self.claimed[did] = idx
+                box = self.target_boxes[idx]
+                state.update(phase="NAV_TO_TARGET", target_idx=idx,
+                             hover_start=None,
+                             note=f"flying to box {box['id']} @ "
+                                  f"({box['x']:.1f},{box['y']:.1f})")
+                # Set waypoint: box xy, hover_above_m altitude, camera at arena centre
+                obs.set_waypoint((box["x"], box["y"], self.hover_above_m),
+                                 self.arena_face_xy)
+                if self._trace:
+                    self._trace.write("box_claimed", {
+                        "drone": did, "box_idx": idx, "box_id": box["id"],
+                        "box_xy": [box["x"], box["y"]],
+                    })
+                    self._trace.write("phase_change", {
+                        "drone": did, "from": "IDLE", "to": "NAV_TO_TARGET",
+                        "target": box["id"],
+                    })
+                return
+
+            if phase == "NAV_TO_TARGET":
+                idx = state["target_idx"]
+                if idx is None or idx not in range(len(self.target_boxes)):
+                    state["phase"] = "IDLE"
+                    return
+                box = self.target_boxes[idx]
+                if not isinstance(pos, (list, tuple)) or len(pos) < 2:
+                    state["note"] = f"→ box {box['id']}: no position fix"
+                    return
+                dx = box["x"] - float(pos[0])
+                dy = box["y"] - float(pos[1])
+                dist_xy = (dx * dx + dy * dy) ** 0.5
+                cur_z = float(pos[2]) if len(pos) >= 3 else (snap.get("altitude_m") or 0)
+                dz = self.hover_above_m - cur_z
+                if dist_xy <= self.nav_tol_xy_m and abs(dz) <= self.nav_tol_z_m:
+                    # Arrived — start the capture hover
+                    state.update(phase="HOVER", hover_start=now,
+                                 note=f"over box {box['id']} — capturing")
+                    if self._trace:
+                        self._trace.write("phase_change", {
+                            "drone": did, "from": "NAV_TO_TARGET", "to": "HOVER",
+                            "target": box["id"],
+                            "dist_xy": round(dist_xy, 2),
+                            "dz": round(dz, 2),
+                        })
+                else:
+                    state["note"] = (
+                        f"→ box {box['id']} d={dist_xy:.2f}m "
+                        f"dz={dz:+.2f}m"
+                    )
+                return
+
+            if phase == "HOVER":
+                idx = state["target_idx"]
+                if idx is None:
+                    state["phase"] = "NAV_TO_HOME"
+                    return
+                box = self.target_boxes[idx]
+                elapsed = now - (state["hover_start"] or now)
+                if elapsed >= self.hover_seconds:
+                    # Captured!
+                    self.captured.add(idx)
+                    self.claimed.pop(did, None)
+                    state["boxes_done"] += 1
+                    # Decide next action: another box or home?
+                    nxt = self._pick_next_box(did, pos)
+                    if nxt is not None:
+                        self.claimed[did] = nxt
+                        nbox = self.target_boxes[nxt]
+                        state.update(phase="NAV_TO_TARGET", target_idx=nxt,
+                                     hover_start=None,
+                                     note=f"captured {box['id']}, → box {nbox['id']}")
+                        obs.set_waypoint(
+                            (nbox["x"], nbox["y"], self.hover_above_m),
+                            self.arena_face_xy)
+                        if self._trace:
+                            self._trace.write("box_captured", {
+                                "drone": did, "box_idx": idx, "box_id": box["id"],
+                                "hover_elapsed": round(elapsed, 2),
+                            })
+                            self._trace.write("box_claimed", {
+                                "drone": did, "box_idx": nxt, "box_id": nbox["id"],
+                            })
+                    else:
+                        # No more boxes → return home
+                        obs.set_waypoint((self.home_xy[0], self.home_xy[1],
+                                          self.hover_above_m),
+                                         self.arena_face_xy)
+                        state.update(phase="NAV_TO_HOME",
+                                     target_idx=None, hover_start=None,
+                                     note=f"captured {box['id']} — returning home")
+                        if self._trace:
+                            self._trace.write("box_captured", {
+                                "drone": did, "box_idx": idx, "box_id": box["id"],
+                                "hover_elapsed": round(elapsed, 2),
+                            })
+                            self._trace.write("phase_change", {
+                                "drone": did, "from": "HOVER", "to": "NAV_TO_HOME",
+                                "reason": "all_done",
+                            })
+                else:
+                    remaining = self.hover_seconds - elapsed
+                    state["note"] = f"capturing box {box['id']}: {remaining:.1f}s left"
+                return
+
+            if phase == "NAV_TO_HOME":
+                if not isinstance(pos, (list, tuple)) or len(pos) < 2:
+                    state["note"] = "returning home (no pos fix)"
+                    return
+                dx = self.home_xy[0] - float(pos[0])
+                dy = self.home_xy[1] - float(pos[1])
+                dist_xy = (dx * dx + dy * dy) ** 0.5
+                if dist_xy <= self.nav_tol_xy_m:
+                    obs.clear_waypoint()
+                    state.update(phase="DONE",
+                                 note=f"arrived home ({state['boxes_done']} boxes)")
+                    if self._trace:
+                        self._trace.write("phase_change", {
+                            "drone": did, "from": "NAV_TO_HOME", "to": "DONE",
+                            "boxes_done": state["boxes_done"],
+                        })
+                else:
+                    state["note"] = f"→ home d={dist_xy:.2f}m"
+                return
+
+            # DONE — do nothing
+
+
 class MissionManager:
     """Single-slot holder for the currently-running special mission.
 
@@ -1498,6 +2036,34 @@ class MissionManager:
                 approach_tolerance_m=approach_tolerance_m,
                 approach_skew_tol=approach_skew_tol,
                 approach_err_x_tol=approach_err_x_tol,
+                auto_takeoff=auto_takeoff,
+            )
+            ok = m.start()
+            if not ok:
+                return False, m.error or "failed to start"
+            self._current = m
+            return True, "mission started"
+
+    def start_capture_all_targets(
+        self, drone_ids: list[str], target_boxes: list[dict],
+        home_xy: tuple = (0.0, 1.5),
+        arena_face_xy: tuple = (0.0, 5.4),
+        hover_above_m: float = 1.5,
+        hover_seconds: float = 4.0,
+        nav_tol_xy_m: float = 0.3,
+        auto_takeoff: bool = False,
+    ) -> tuple[bool, str]:
+        """Launch the capture-all-targets mission (SDC26 box-capture scoring)."""
+        with self._lock:
+            if self._current is not None and self._current._active:
+                return False, "a mission is already running — stop it first"
+            m = CaptureAllTargetsMission(
+                self.fleet, drone_ids, target_boxes,
+                home_xy=home_xy,
+                arena_face_xy=arena_face_xy,
+                hover_above_m=hover_above_m,
+                hover_seconds=hover_seconds,
+                nav_tol_xy_m=nav_tol_xy_m,
                 auto_takeoff=auto_takeoff,
             )
             ok = m.start()

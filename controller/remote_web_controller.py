@@ -585,7 +585,32 @@ HTML = """
       <label style=\"color:#94a3b8;\">Mission:</label>
       <select id=\"mis_type\">
         <option value=\"scan_all\">Scan all ArUco markers (sequential, collision-aware)</option>
+        <option value=\"capture_targets\">Capture enemy targets (SDC26 — box-capture, camera on arena centre)</option>
       </select>
+    </div>
+
+    <!-- Capture-Targets specific inputs — hidden unless that mission is selected. -->
+    <div id=\"mis_capture_rows\" style=\"display:none;\">
+      <div class=\"mis-row\">
+        <label style=\"color:#94a3b8;\" title=\"One JSON object per target box. Use the Blue team's 3 enemy boxes (the red-home boxes) for standard play.\">Target boxes (JSON):</label>
+        <textarea id=\"mis_boxes_json\" rows=\"3\" style=\"width:100%;max-width:520px;background:#0f172a;color:#e2e8f0;border:1px solid #334155;border-radius:4px;padding:6px;font-family:monospace;font-size:11px;\">[
+  {\"id\": 1, \"x\": -5.0, \"y\": 2.0},
+  {\"id\": 2, \"x\":  0.0, \"y\": 2.0},
+  {\"id\": 3, \"x\":  5.0, \"y\": 2.0}
+]</textarea>
+      </div>
+      <div class=\"mis-row\">
+        <label style=\"color:#94a3b8;\" title=\"World-frame XY the drone returns to after all captures. Typically your team's home-zone centre.\">Home XY:</label>
+        <input id=\"mis_home_x\" type=\"number\" step=\"0.1\" value=\"0.0\" style=\"width:70px;\" />
+        <input id=\"mis_home_y\" type=\"number\" step=\"0.1\" value=\"9.0\" style=\"width:70px;\" />
+        <label style=\"color:#94a3b8;margin-left:12px;\" title=\"World-frame XY the drone's camera aims at while moving (typically arena centre so many markers stay in view for triangulation).\">Face XY:</label>
+        <input id=\"mis_face_x\" type=\"number\" step=\"0.1\" value=\"0.0\" style=\"width:70px;\" />
+        <input id=\"mis_face_y\" type=\"number\" step=\"0.1\" value=\"5.4\" style=\"width:70px;\" />
+        <label style=\"color:#94a3b8;margin-left:12px;\" title=\"Altitude above the floor for the capture hover.\">Altitude (m):</label>
+        <input id=\"mis_alt\" type=\"number\" step=\"0.1\" min=\"0.5\" value=\"1.5\" style=\"width:70px;\" />
+        <label style=\"color:#94a3b8;margin-left:12px;\" title=\"Hover duration above each box. Must be ≥ the 2s capture-hold from SDC26 rules.\">Hover s:</label>
+        <input id=\"mis_cap_hover_s\" type=\"number\" step=\"0.5\" min=\"2.0\" value=\"4.0\" style=\"width:70px;\" />
+      </div>
     </div>
 
     <div class=\"mis-row\">
@@ -1096,7 +1121,7 @@ HTML = """
     arcPoll();
     // Version marker — if this string doesn't appear in the DOM,
     // you're running stale JS (restart the Python server or hard-refresh).
-    const BUILD = 'at-c2-upgrade';
+    const BUILD = 'au-capture-targets-mission';
     console.log('[arc] init complete, build=' + BUILD);
     const ver = document.createElement('span');
     ver.id = 'arc_build_tag';
@@ -1234,18 +1259,49 @@ HTML = """
         misShowWarn('✗ Select at least one drone first');
         return;
       }
-      const markers = document.getElementById('mis_markers').value;
-      const hover_seconds = parseFloat(document.getElementById('mis_hover_s').value) || 3.0;
-      const tol = parseFloat(document.getElementById('mis_tol_m').value) || 0.35;
-      const skew_tol_el = document.getElementById('mis_skew_tol');
-      const skew_tol = skew_tol_el ? (parseFloat(skew_tol_el.value) || 0.08) : 0.08;
+      const missionType = document.getElementById('mis_type').value;
       const auto_takeoff = document.getElementById('mis_auto_takeoff').checked;
-      const payload = {
-        drone_ids, target_markers: markers,
-        hover_seconds, approach_tolerance_m: tol,
-        approach_skew_tol: skew_tol,
-        auto_takeoff,
-      };
+      let endpoint, payload;
+      if (missionType === 'capture_targets') {
+        // Parse target-boxes JSON
+        let boxes = [];
+        try { boxes = JSON.parse(document.getElementById('mis_boxes_json').value); }
+        catch (e) { misShowWarn('✗ target_boxes JSON invalid: ' + e.message); return; }
+        if (!Array.isArray(boxes) || boxes.length === 0) {
+          misShowWarn('✗ target_boxes must be a non-empty JSON array'); return;
+        }
+        const home_xy = [
+          parseFloat(document.getElementById('mis_home_x').value) || 0,
+          parseFloat(document.getElementById('mis_home_y').value) || 0,
+        ];
+        const face_xy = [
+          parseFloat(document.getElementById('mis_face_x').value) || 0,
+          parseFloat(document.getElementById('mis_face_y').value) || 0,
+        ];
+        const alt = parseFloat(document.getElementById('mis_alt').value) || 1.5;
+        const hv  = parseFloat(document.getElementById('mis_cap_hover_s').value) || 4.0;
+        endpoint = '/proxy/missions/capture_targets/start';
+        payload = {
+          drone_ids, target_boxes: boxes,
+          home_xy, arena_face_xy: face_xy,
+          hover_above_m: alt, hover_seconds: hv,
+          auto_takeoff,
+        };
+      } else {
+        // scan_all (default)
+        const markers = document.getElementById('mis_markers').value;
+        const hover_seconds = parseFloat(document.getElementById('mis_hover_s').value) || 3.0;
+        const tol = parseFloat(document.getElementById('mis_tol_m').value) || 0.35;
+        const skew_tol_el = document.getElementById('mis_skew_tol');
+        const skew_tol = skew_tol_el ? (parseFloat(skew_tol_el.value) || 0.08) : 0.08;
+        endpoint = '/proxy/missions/scan_all/start';
+        payload = {
+          drone_ids, target_markers: markers,
+          hover_seconds, approach_tolerance_m: tol,
+          approach_skew_tol: skew_tol,
+          auto_takeoff,
+        };
+      }
       const btn = document.getElementById('mis_start');
       const now = Date.now();
       if (now >= _misArmedUntil) {
@@ -1279,7 +1335,7 @@ HTML = """
       btn.disabled = true; btn.textContent = '… starting';
       let j = {}; let httpStatus = 0;
       try {
-        const r = await fetch('/proxy/missions/scan_all/start', {method:'POST',
+        const r = await fetch(endpoint, {method:'POST',
           headers:{'Content-Type':'application/json'},
           body: JSON.stringify(payload)});
         httpStatus = r.status;
@@ -1329,6 +1385,17 @@ HTML = """
     setInterval(misLoadDrones, 5000);
     setInterval(misPoll, 500);
     misPoll();
+
+    // Show/hide the capture-targets-specific rows based on mission type
+    const misTypeSel = document.getElementById('mis_type');
+    const misCaptureRows = document.getElementById('mis_capture_rows');
+    const misScanRows = document.querySelector('#missions_panel .mis-row:nth-of-type(3)');
+    function syncMissionUI() {
+      const t = misTypeSel.value;
+      if (misCaptureRows) misCaptureRows.style.display = (t === 'capture_targets') ? '' : 'none';
+      if (misScanRows)    misScanRows.style.display    = (t === 'capture_targets') ? 'none' : '';
+    }
+    if (misTypeSel) { misTypeSel.addEventListener('change', syncMissionUI); syncMissionUI(); }
 
     // Mission panel click counter — same idea as the ArUco one. Proves the
     // Start / Stop buttons receive the click event, independent of what
@@ -5122,6 +5189,51 @@ def proxy_missions_scan_all_start():
     log_command("mission_scan_all_start", {
         "drone_ids": drone_ids, "target_markers": target_markers,
         "hover_seconds": hover_seconds, "ok": ok, "msg": msg,
+    })
+    status = 200 if ok else 409
+    return jsonify(ok=ok, message=msg, status=mission_manager.status()), status
+
+
+@app.post("/proxy/missions/capture_targets/start")
+def proxy_missions_capture_targets_start():
+    """Launch the SDC26 capture-all-targets mission. Body:
+    {
+      "drone_ids":    ["1", "2", ...],
+      "target_boxes": [{"id":1,"x":-5.0,"y":2.0}, ...],
+      "home_xy":      [x, y],                    # team home coord
+      "arena_face_xy":[x, y],                    # where the camera aims
+      "hover_above_m": 1.5,
+      "hover_seconds": 4.0,
+      "auto_takeoff":  false
+    }
+    """
+    data = request.get_json(silent=True) or {}
+    drone_ids = data.get("drone_ids") or []
+    if not isinstance(drone_ids, list) or not drone_ids:
+        return jsonify(ok=False, error="drone_ids (non-empty list) required"), 400
+    target_boxes = data.get("target_boxes") or []
+    if not isinstance(target_boxes, list) or not target_boxes:
+        return jsonify(ok=False, error="target_boxes (non-empty list) required"), 400
+    home_xy = data.get("home_xy", [0.0, 1.5])
+    arena_face_xy = data.get("arena_face_xy", [0.0, 5.4])
+    hover_above_m = float(data.get("hover_above_m", 1.5))
+    hover_seconds = float(data.get("hover_seconds", 4.0))
+    nav_tol_xy_m  = float(data.get("nav_tol_xy_m", 0.3))
+    auto_takeoff  = bool(data.get("auto_takeoff", False))
+    ok, msg = mission_manager.start_capture_all_targets(
+        drone_ids=[str(d) for d in drone_ids],
+        target_boxes=target_boxes,
+        home_xy=tuple(home_xy),
+        arena_face_xy=tuple(arena_face_xy),
+        hover_above_m=hover_above_m,
+        hover_seconds=hover_seconds,
+        nav_tol_xy_m=nav_tol_xy_m,
+        auto_takeoff=auto_takeoff,
+    )
+    log_command("mission_capture_targets_start", {
+        "drone_ids": drone_ids,
+        "target_boxes": target_boxes,
+        "ok": ok, "msg": msg,
     })
     status = 200 if ok else 409
     return jsonify(ok=ok, message=msg, status=mission_manager.status()), status
