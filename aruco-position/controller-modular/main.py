@@ -34,8 +34,10 @@ HEARTBEAT_INTERVAL = 1.0  # Sekunden: Status senden auch ohne Marker
 TARGET_Z_POS = -1.5  # fixed target height position (internal Z axis)
 MARKER_SIZE = 0.5
 DRY_RUN = False  # True: log RC/commands but send nothing to drone, no takeoff
-WIFI_AUTO_CHANNEL = True   # Set WiFi channel automatically after connect
+WIFI_AUTO_CHANNEL = False   # Set WiFi channel automatically after connect
 WIFI_BAND = "5_GHz"        # "5_GHz" | "2_4_GHz" | "all"
+WIFI_CHANNEL = 124
+STREAM_RECONNECT_TIMEOUT = 10.0  # seconds without a frame before reconnecting
 
 # Pose robustness settings
 MIN_REF_WEIGHT = 0.00  # Ignore very weak refs, but keep detection usable
@@ -748,6 +750,14 @@ def _install_olympe_thread_excepthook() -> None:
             thread_name = args.thread.name if args.thread else ""
             if "olympe" in thread_name.lower() or "pomp" in thread_name.lower():
                 return  # silently suppress known Olympe shutdown noise
+            # Also suppress when the exception originates inside Olympe internals
+            # (e.g. pdraw._media_removed running in a generic Thread-N).
+            tb = args.exc_traceback
+            while tb is not None:
+                fname = tb.tb_frame.f_code.co_filename
+                if "olympe" in fname.lower() or "pdraw" in fname.lower():
+                    return
+                tb = tb.tb_next
         _orig(args)
 
     threading.excepthook = _hook
@@ -994,7 +1004,7 @@ def main():
 
     anafi_drone = None
     anafi_stream_api = None
-    anafi_frame_state = {"frame": None}
+    anafi_frame_state = {"frame": None, "last_time": 0.0}
     anafi_frame_lock = threading.Lock()
 
     cap = None
@@ -1016,7 +1026,7 @@ def main():
 
         anafi_drone.connect()
         if WIFI_AUTO_CHANNEL and not DRY_RUN:
-            _set_wifi_channel(anafi_drone, band_str=WIFI_BAND, channel=123)
+            _set_wifi_channel(anafi_drone, band_str=WIFI_BAND, channel=WIFI_CHANNEL)
         from olympe.messages.ardrone3.SpeedSettings import MaxRotationSpeed
         anafi_drone(MaxRotationSpeed(150))
 
@@ -1055,6 +1065,7 @@ def main():
                 frame = cv2.cvtColor(yuv_frame.as_ndarray(), cv_cvt)
                 with anafi_frame_lock:
                     anafi_frame_state["frame"] = frame
+                    anafi_frame_state["last_time"] = time.monotonic()
             finally:
                 try:
                     yuv_frame.unref()
@@ -1073,7 +1084,55 @@ def main():
             raise RuntimeError("No compatible Olympe streaming API found")
 
         time.sleep(0.2)
+        anafi_frame_state["last_time"] = time.monotonic()  # start reconnect watchdog clock
         print("✅ Anafi videostream active")
+
+        def _reconnect_anafi() -> None:
+            """Stop stream, disconnect, wait, reconnect, restart stream."""
+            nonlocal anafi_drone, anafi_stream_api, motion_listener
+            print("[reconnect] No frames received – reconnecting to drone…")
+            # 1. Stop stream
+            try:
+                if anafi_stream_api == "modern":
+                    anafi_drone.streaming.stop()
+                else:
+                    anafi_drone.stop_video_streaming()
+            except Exception as _e:
+                print(f"[reconnect] Stream stop (ignored): {_e}")
+            # 2. Disconnect
+            try:
+                if motion_listener is not None:
+                    motion_listener.unsubscribe()
+            except Exception:
+                pass
+            try:
+                anafi_drone.disconnect()
+            except Exception as _e:
+                print(f"[reconnect] Disconnect (ignored): {_e}")
+            time.sleep(3.0)
+            # 3. New drone handle + reconnect
+            try:
+                anafi_drone = olympe.Drone(anafi_ip)
+                if enable_motion_input and input_module is not None:
+                    motion_listener = input_module.MotionListener(anafi_drone)
+                    motion_listener.subscribe()
+                anafi_drone.connect()
+                # 4. Restart stream
+                if hasattr(anafi_drone, "streaming") and hasattr(anafi_drone.streaming, "set_callbacks"):
+                    anafi_drone.streaming.set_callbacks(raw_cb=_anafi_frame_cb, flush_raw_cb=_anafi_flush_cb)
+                    anafi_drone.streaming.start()
+                    anafi_stream_api = "modern"
+                elif hasattr(anafi_drone, "set_streaming_callbacks"):
+                    anafi_drone.set_streaming_callbacks(raw_cb=_anafi_frame_cb)
+                    anafi_drone.start_video_streaming()
+                    anafi_stream_api = "legacy"
+                else:
+                    print("[reconnect] No compatible streaming API – giving up")
+                    return
+                anafi_frame_state["last_time"] = time.monotonic()
+                print("[reconnect] ✅ Reconnected successfully")
+            except Exception as _e:
+                print(f"[reconnect] ❌ Reconnect failed: {_e}")
 
         if ctrl_target is not None:
             ctrl_module.set_target(*ctrl_target)
@@ -1307,8 +1366,9 @@ def main():
                     MissionPhase.ABORTED, MissionPhase.IDLE
                 ):
                     mission.abort(anafi_drone)
-                elif anafi_drone is not None and not mission_dry_run:
-                    # No active mission – still stop and land immediately
+                # Always send zero PCMD + Landing regardless of mission state,
+                # so the drone stops immediately in every phase of the mission.
+                if anafi_drone is not None and not mission_dry_run:
                     try:
                         ctrl_module.send_pcmd_olympe(
                             anafi_drone,
@@ -1319,10 +1379,18 @@ def main():
                     try:
                         from olympe.messages.ardrone3.Piloting import Landing
                         anafi_drone(Landing())
-                        print("[abort] Emergency landing (no active mission)")
+                        print("[abort] Emergency landing command sent")
                     except Exception as _land_err:
                         print(f"[abort] Landing command failed: {_land_err}")
                 break  # exit main loop immediately; finally block handles cleanup
+
+            # --------------------------------------
+            # Stream reconnect watchdog (Anafi only)
+            # --------------------------------------
+            if use_anafi_stream and anafi_drone is not None and not _abort_flag.is_set():
+                _last_frame_time = anafi_frame_state.get("last_time", 0.0)
+                if _last_frame_time > 0.0 and (now - _last_frame_time) > STREAM_RECONNECT_TIMEOUT:
+                    _reconnect_anafi()
 
             # --------------------------------------
             # Manual SPACE confirm
@@ -1802,6 +1870,7 @@ def main():
                     if key == 27:   # ESC – emergency land
                         print("[abort] ESC pressed in preview window")
                         _abort_flag.set()
+                        continue  # restart loop immediately so abort check fires at top
                     elif key == 32:   # SPACE
                         _confirm_flag.set()
                     elif key in (ord('w'), ord('W')):
@@ -1917,6 +1986,22 @@ def main():
             cap.release()
 
         if anafi_drone is not None:
+            # Safety net: zero PCMD + Landing before tearing down the connection,
+            # in case the abort block's commands were lost or finally ran without abort.
+            if not mission_dry_run:
+                try:
+                    ctrl_module.send_pcmd_olympe(
+                        anafi_drone,
+                        {"forward_back": 0, "left_right": 0, "up_down": 0, "yaw": 0},
+                    )
+                except Exception:
+                    pass
+                try:
+                    from olympe.messages.ardrone3.Piloting import Landing
+                    anafi_drone(Landing())
+                    print("[finally] Safety landing command sent")
+                except Exception:
+                    pass
             try:
                 if anafi_stream_api == "modern":
                     anafi_drone.streaming.stop()

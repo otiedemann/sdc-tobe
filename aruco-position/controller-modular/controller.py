@@ -41,12 +41,12 @@ from typing import Optional
 # ============================================================
 
 # P gains: position error (m) → velocity setpoint (m/s)
-KP_XY: float = 0.75       # horizontal
-KP_Z: float  = 0.75       # vertical
+KP_XY: float = 0.50       # horizontal
+KP_Z: float  = 0.50       # vertical
 
 # Maximum velocity setpoints
-MAX_HORIZ_SPEED: float = 0.15    # %  (horizontal)
-MAX_VERT_SPEED: float  = 0.15    # %  (vertical)
+MAX_HORIZ_SPEED: float = 0.1    # %  (horizontal)
+MAX_VERT_SPEED: float  = 0.1    # %  (vertical)
 
 # Position acceptance radii (switch to HOVER phase)
 ARRIVE_RADIUS_XY: float = 0.25  # m
@@ -210,6 +210,18 @@ class PositionController:
             if dist_xy > HOVER_EXIT_RADIUS_XY:
                 self._phase = Phase.TRANSIT
                 print(f"[controller] → TRANSIT  (err_xy={dist_xy:.2f} m)")
+
+        # ---- arrived: stop all movement ----
+        if self._phase == Phase.HOVER:
+            return {
+                "forward_back": 0,
+                "left_right":   0,
+                "up_down":      0,
+                "yaw":          0,
+                "_phase":       self._phase,
+                "_err_xy":      round(dist_xy, 3),
+                "_err_z":       round(ez, 3),
+            }
 
         # ---- horizontal velocity setpoint (world frame) ----
         vx_sp = KP_XY * ex
