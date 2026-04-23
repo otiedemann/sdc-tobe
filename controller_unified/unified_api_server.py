@@ -4317,6 +4317,16 @@ def api_video_start():
     try:
         data = request.get_json(silent=True) or {}
         mode = data.get("mode", "mjpeg")
+        # Idempotency guard: if we're already in the requested mode AND
+        # frames are actively flowing, just return OK. The old code
+        # blindly called video_stop_all() + video_start_mjpeg() here,
+        # which tore down and rebuilt the Anafi decoder on every invoke
+        # — several seconds of dropped frames, which showed up as a
+        # frozen position tracker after every takeoff.
+        if mode == "mjpeg" and _video_streaming and _video_mode == "mjpeg":
+            return jsonify(ok=True, mode="mjpeg", message="already streaming",
+                           stream_url=f"http://{request.host}/api/video")
+        # Mode transition (or pipeline was off) — full stop, then start.
         b.video_stop_all()
         if mode == "mjpeg":
             ok, msg = b.video_start_mjpeg()
@@ -5782,7 +5792,7 @@ def main():
     print(f"[{tag}] Unified API server: http://{HTTP_HOST}:{HTTP_PORT}")
     print(f"[{tag}] Drone: {drone_type} @ {drone_ip} (auto-reconnect; watchdog={REMOTE_TIMEOUT_S}s)")
     print(f"[{tag}] SDKs available: tello={HAS_TELLO_SDK}, olympe={HAS_OLYMPE_SDK}")
-    print(f"[{tag}] Code version: 2026-04-23-cb (distance_scale correction factor)")
+    print(f"[{tag}] Code version: 2026-04-23-cc (idempotent video/start + no takeoff MJPEG restart)")
     app.run(host=HTTP_HOST, port=HTTP_PORT, threaded=True, use_reloader=False)
 
 
