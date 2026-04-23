@@ -5340,6 +5340,39 @@ def api_rec_stop():
     return jsonify(ok=True, path=path, frames=frames)
 
 
+@app.get("/api/video/recordings")
+def api_rec_list():
+    """List every video in the recordings folder. Used by the C2 to
+    pair per-flight mp4 files with their matching flight-log JSONL."""
+    rec_dir = Path(__file__).parent / "recordings"
+    if not rec_dir.exists():
+        return jsonify(ok=True, files=[])
+    out = []
+    for p in sorted(rec_dir.glob("*.mp4"), reverse=True):
+        try:
+            st = p.stat()
+            out.append({"name": p.name, "size": st.st_size,
+                        "mtime": st.st_mtime})
+        except Exception:
+            continue
+    return jsonify(ok=True, files=out)
+
+
+@app.get("/api/video/recordings/<path:name>")
+def api_rec_download(name):
+    """Download a specific recording. Rejects path-traversal attempts."""
+    rec_dir = (Path(__file__).parent / "recordings").resolve()
+    target = (rec_dir / name).resolve()
+    try:
+        target.relative_to(rec_dir)
+    except ValueError:
+        return jsonify(ok=False, error="invalid path"), 403
+    if not target.exists():
+        return jsonify(ok=False, error="not found"), 404
+    return send_file(str(target), mimetype="video/mp4",
+                     as_attachment=True, download_name=target.name)
+
+
 @app.get("/api/position/config")
 def api_pos_config_get():
     with _pos_cfg_lock:

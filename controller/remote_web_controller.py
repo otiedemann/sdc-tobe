@@ -402,40 +402,78 @@ class FlightLogger:
     def _open_unlocked(self, did: str, tel: dict):
         ts = time.strftime("%Y-%m-%d_%H-%M-%S", time.localtime())
         name = (self.drones.get(did, {}).get("name") or did).replace(" ", "_")
-        path = self.log_dir / f"flight_{ts}_drone-{did}_{name}.jsonl"
+        stem = f"flight_{ts}_drone-{did}_{name}"
+        path = self.log_dir / f"{stem}.jsonl"
         fh = path.open("w", encoding="utf-8", buffering=1)  # line-buffered
-        # Every flight's first record carries enough provenance that a
-        # log opened three months later still identifies what code
-        # produced it: git sha + branch + dirty flag + commit subject.
+        # Kick off video recording on the Pi with a matching basename so
+        # the .mp4 and the .jsonl travel together. Annotated mode so the
+        # recording has the detected-marker overlay for post-flight
+        # review. No-op if the Pi isn't reachable — video is nice-to-have,
+        # the log is the essential record.
+        video_name = f"{stem}.mp4"
+        video_started = False
+        base = (self.drones.get(did, {}) or {}).get("base")
+        if base:
+            try:
+                r = self.session.post(
+                    f"{base.rstrip('/')}/api/video/record/start",
+                    json={"filename": video_name, "raw": False},
+                    timeout=1.0,
+                )
+                video_started = r.ok and (r.json().get("ok") is True)
+            except Exception as e:
+                print(f"[FLIGHT_LOG] video record start failed: {e}")
+
         header = {
             "type": "takeoff", "ts": time.time(), "drone_id": did,
             "drone_name": self.drones.get(did, {}).get("name"),
             "git_revision": _GIT_REVISION,
-            "drone_base": self.drones.get(did, {}).get("base"),
+            "drone_base": base,
+            "video_filename": video_name if video_started else None,
             "telemetry": tel,
         }
         fh.write(json.dumps(header, default=str) + "\n")
         self._flights[did] = {
             "fh": fh, "path": path, "opened_at": time.time(), "records": 1,
+            "stem": stem, "video_name": video_name if video_started else None,
         }
-        print(f"[FLIGHT_LOG] takeoff → {path}")
+        print(f"[FLIGHT_LOG] takeoff → {path}"
+              + (f"  + video → {video_name}" if video_started else "  (no video)"))
 
     def _close_unlocked(self, did: str, reason: str = "landed"):
         flt = self._flights.pop(did, None)
         if flt is None:
             return
+        # Stop the matching video recording on the Pi (no-op if not started).
+        base = (self.drones.get(did, {}) or {}).get("base")
+        video_frames = None
+        if base and flt.get("video_name"):
+            try:
+                r = self.session.post(
+                    f"{base.rstrip('/')}/api/video/record/stop",
+                    json={}, timeout=1.5,
+                )
+                if r.ok:
+                    j = r.json()
+                    video_frames = j.get("frames")
+            except Exception as e:
+                print(f"[FLIGHT_LOG] video record stop failed: {e}")
         try:
             dur = time.time() - flt["opened_at"]
             flt["fh"].write(json.dumps({
                 "type": "close", "ts": time.time(), "reason": reason,
                 "duration_s": round(dur, 2), "records": flt["records"],
+                "video_filename": flt.get("video_name"),
+                "video_frames": video_frames,
             }) + "\n")
             flt["fh"].close()
         except Exception:
             pass
         print(f"[FLIGHT_LOG] closed {flt['path']} "
               f"(reason={reason}, records={flt['records']}, "
-              f"duration={time.time() - flt['opened_at']:.1f}s)")
+              f"duration={time.time() - flt['opened_at']:.1f}s"
+              + (f", video={video_frames} frames" if video_frames is not None else "")
+              + ")")
 
     def _write_unlocked(self, flt: dict, rec: dict):
         try:
@@ -2262,7 +2300,7 @@ HTML = """
     arcPoll();
     // Version marker — if this string doesn't appear in the DOM,
     // you're running stale JS (restart the Python server or hard-refresh).
-    const BUILD = 'cc-flight-log-viewer';
+    const BUILD = 'cd-per-flight-video';
     console.log('[arc] init complete, build=' + BUILD);
     const ver = document.createElement('span');
     ver.id = 'arc_build_tag';
@@ -3792,8 +3830,15 @@ async function resumeAllDrones(source) {
         list.innerHTML = '<i style="color:#64748b;">no flights recorded yet</i>';
         return;
       }
-      list.innerHTML = j.files.map(f =>
-        '<div style="display:flex;gap:10px;padding:2px 0;align-items:center;">' +
+      list.innerHTML = j.files.map(f => {
+        const vid = f.video;
+        const vidHtml = vid
+          ? ('<a href="/proxy/flight_video/' + encodeURIComponent(vid.name) + '" ' +
+             'style="color:#a78bfa;text-decoration:none;font-weight:600;" ' +
+             'title="Download ' + vid.name + ' (' + fmtSize(vid.size || 0) + ')">' +
+             '&#127916; Video</a>')
+          : '<span style="color:#475569;font-style:italic;" title="No video recorded for this flight">no video</span>';
+        return '<div style="display:flex;gap:10px;padding:2px 0;align-items:center;">' +
           '<span style="flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">' +
             '<a href="/proxy/flight_logs/' + encodeURIComponent(f.name) + '" ' +
                'style="color:#38bdf8;text-decoration:none;" title="Download ' + f.name + '">' +
@@ -3803,10 +3848,11 @@ async function resumeAllDrones(source) {
              'target="_blank" ' +
              'style="color:#fbbf24;text-decoration:none;font-weight:600;" ' +
              'title="Open replay viewer in a new tab">&#128065; View</a>' +
+          vidHtml +
           '<span style="color:#94a3b8;width:70px;text-align:right;">' + fmtSize(f.size) + '</span>' +
           '<span style="color:#64748b;width:70px;text-align:right;">' + fmtAge(f.mtime) + '</span>' +
-        '</div>'
-      ).join('');
+        '</div>';
+      }).join('');
     } catch (e) {
       list.innerHTML = '<i style="color:#ef4444;">error: ' + e + '</i>';
     }
@@ -7681,10 +7727,94 @@ def proxy_land_all():
     )
 
 
+def _collect_fleet_videos() -> dict:
+    """Gather the set of available recording filenames across all Pis.
+    Key = filename (basename), value = {drone_id, size, mtime}. We only
+    care about the flight-named ones (prefixed "flight_"). Other
+    recordings from the manual Record button are ignored.
+    """
+    out: dict = {}
+    for did, info in DRONES.items():
+        base = (info or {}).get("base")
+        if not base:
+            continue
+        # Skip offline drones so we don't burn 1-2 s per poll on them.
+        cli = drone_ws.get(str(did)) if 'drone_ws' in globals() else None
+        if cli is not None:
+            all_down = (not cli._ws_connected.get("telemetry") and
+                        not cli._ws_connected.get("position") and
+                        not cli._ws_connected.get("rc"))
+            if all_down:
+                continue
+        try:
+            r = _http_session.get(f"{base.rstrip('/')}/api/video/recordings",
+                                   timeout=0.5)
+            if not r.ok:
+                continue
+            for f in (r.json().get("files") or []):
+                name = f.get("name", "")
+                if name.startswith("flight_") and name.endswith(".mp4"):
+                    out[name] = {"drone_id": str(did), "size": f.get("size"),
+                                  "mtime": f.get("mtime")}
+        except Exception:
+            continue
+    return out
+
+
 @app.get("/proxy/flight_logs")
 def proxy_flight_logs_list():
-    """List archived per-flight log files (newest first)."""
-    return jsonify(ok=True, files=flight_logger.list_files())
+    """List archived per-flight log files (newest first), with video
+    metadata attached when a matching .mp4 lives on any Pi."""
+    files = flight_logger.list_files()
+    vids = _collect_fleet_videos()
+    for f in files:
+        stem = f["name"][:-len(".jsonl")] if f["name"].endswith(".jsonl") else f["name"]
+        video_name = stem + ".mp4"
+        v = vids.get(video_name)
+        if v:
+            f["video"] = {
+                "name":     video_name,
+                "drone_id": v["drone_id"],
+                "size":     v["size"],
+                "mtime":    v["mtime"],
+            }
+    return jsonify(ok=True, files=files)
+
+
+@app.get("/proxy/flight_video/<path:name>")
+def proxy_flight_video_download(name):
+    """Stream a flight video from whichever Pi has it. Filename is the
+    mp4 basename produced by FlightLogger (flight_YYYY-..._drone-N_X.mp4);
+    we look up the drone id from the filename and proxy straight through."""
+    # Locate the video across the fleet
+    vids = _collect_fleet_videos()
+    entry = vids.get(name)
+    if not entry:
+        return jsonify(ok=False, error="video not found on any drone"), 404
+    did = entry["drone_id"]
+    base = (DRONES.get(did, {}) or {}).get("base")
+    if not base:
+        return jsonify(ok=False, error="drone has no base url"), 500
+    try:
+        upstream = _http_session.get(
+            f"{base.rstrip('/')}/api/video/recordings/{name}",
+            stream=True, timeout=(3, 60))
+        if not upstream.ok:
+            return jsonify(ok=False, error=f"drone returned {upstream.status_code}"), 502
+    except Exception as e:
+        return jsonify(ok=False, error=str(e)), 502
+    def gen():
+        for chunk in upstream.iter_content(chunk_size=64 * 1024):
+            if chunk:
+                yield chunk
+    headers = {
+        "Content-Type": "video/mp4",
+        "Content-Disposition": f'attachment; filename="{name}"',
+    }
+    size = upstream.headers.get("Content-Length")
+    if size:
+        headers["Content-Length"] = size
+    return Response(gen(), headers=headers)
 
 
 @app.get("/proxy/flight_logs/<path:name>")
