@@ -304,7 +304,7 @@ class HeadlessAruCoPositioning:
 
         if profile == "sensitive":
             # Better far/small marker detection, more false positives
-            p.minMarkerPerimeterRate = 0.015
+            p.minMarkerPerimeterRate = 0.01
             p.adaptiveThreshWinSizeMin = 3
             p.adaptiveThreshWinSizeMax = 31
             p.adaptiveThreshWinSizeStep = 4
@@ -325,11 +325,16 @@ class HeadlessAruCoPositioning:
             p.minCornerDistanceRate = 0.06
             p.minDistanceToBorder = 8
         else:
-            # balanced (default)
-            p.minMarkerPerimeterRate = 0.025
+            # balanced (default) — matched to the C2-side VideoMarkerTracker
+            # params (tools/aruco_seek.py) so that if the operator-facing
+            # observer detects a marker, the FC-side position tracker
+            # sees it too. The old 0.025 perimeter threshold was
+            # silently losing markers at 3–5 m during flights, leaving
+            # the tracker stuck on last_valid_pose with seen_markers=[].
+            p.minMarkerPerimeterRate = 0.01
             p.adaptiveThreshWinSizeMin = 3
-            p.adaptiveThreshWinSizeMax = 31
-            p.adaptiveThreshWinSizeStep = 4
+            p.adaptiveThreshWinSizeMax = 23
+            p.adaptiveThreshWinSizeStep = 5
             p.adaptiveThreshConstant = 9
             p.polygonalApproxAccuracyRate = 0.04
             p.errorCorrectionRate = 0.6
