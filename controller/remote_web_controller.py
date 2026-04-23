@@ -2217,7 +2217,7 @@ HTML = """
     arcPoll();
     // Version marker — if this string doesn't appear in the DOM,
     // you're running stale JS (restart the Python server or hard-refresh).
-    const BUILD = 'bv-axis-lock-arena-margin';
+    const BUILD = 'bw-imu-lpf';
     console.log('[arc] init complete, build=' + BUILD);
     const ver = document.createElement('span');
     ver.id = 'arc_build_tag';
@@ -2676,6 +2676,10 @@ HTML = """
           </label>
           <label class=\"small\" style=\"color:#94a3b8;\">R meas <span class=\"info-icon\" data-info=\"kalman_meas_var\">i</span>:
             <input id=\"pos_kf_r\" type=\"number\" min=\"1e-6\" max=\"10\" step=\"1e-3\" value=\"0.1\" style=\"width:74px;\" />
+          </label>
+          <label class=\"small\" style=\"color:#94a3b8;\" title=\"First-order low-pass cut-off frequency applied to IMU velocity (vgx/vgy/vgz) at telemetry ingestion. 0 disables. Lower = more smoothing.\">IMU LPF (Hz) <span class=\"info-icon\" data-info=\"imu_lowpass_hz\">i</span>:
+            <input id=\"pos_imu_lpf\" type=\"range\" min=\"0\" max=\"30\" step=\"0.5\" value=\"5\" style=\"width:90px;vertical-align:middle;accent-color:#a78bfa;\" />
+            <span id=\"pos_imu_lpf_val\" style=\"font-size:11px;color:#a78bfa;font-weight:bold;min-width:42px;display:inline-block;\">5.0 Hz</span>
           </label>
           <button id=\"pos_precision_apply\" class=\"pos-cfg\" style=\"height:26px;font-size:11px;padding:0 10px;\">Apply precision</button>
           <button id=\"pos_precision_reset\" class=\"pos-cfg\" style=\"height:26px;font-size:11px;padding:0 10px;background:#1e2a3a;\" title=\"Restore precision defaults\">Defaults</button>
@@ -5301,6 +5305,15 @@ async function loadPosConfig() {
     setIf('pos_max_dt',     c.max_state_dt);
     setIf('pos_kf_q',       c.kalman_process_var, (v)=>Number(v).toPrecision(3));
     setIf('pos_kf_r',       c.kalman_meas_var,    (v)=>Number(v).toPrecision(3));
+    // IMU LPF slider + its live-label
+    if (c.imu_lowpass_hz != null) {
+      const slider = document.getElementById('pos_imu_lpf');
+      const label  = document.getElementById('pos_imu_lpf_val');
+      if (slider) slider.value = Number(c.imu_lowpass_hz).toFixed(1);
+      if (label)  label.textContent = (Number(c.imu_lowpass_hz) > 0
+                                        ? Number(c.imu_lowpass_hz).toFixed(1) + ' Hz'
+                                        : 'OFF');
+    }
     const cs = document.getElementById('pos_calib_status');
     cs.textContent = d.has_calibration ? '\\u2713 calibration loaded' : 'no calibration';
     cs.style.color = d.has_calibration ? '#22c55e' : '#94a3b8';
@@ -5369,6 +5382,7 @@ async function loadPosConfig() {
       max_state_dt:        num('pos_max_dt'),
       kalman_process_var:  num('pos_kf_q'),
       kalman_meas_var:     num('pos_kf_r'),
+      imu_lowpass_hz:      num('pos_imu_lpf'),
     };
     try {
       const r = await fetch('/proxy/position/config', {
@@ -5392,8 +5406,43 @@ async function loadPosConfig() {
     document.getElementById('pos_max_dt').value    = '1.0';
     document.getElementById('pos_kf_q').value      = '1e-3';
     document.getElementById('pos_kf_r').value      = '0.1';
+    const lpf = document.getElementById('pos_imu_lpf');
+    if (lpf) {
+      lpf.value = '5';
+      const lbl = document.getElementById('pos_imu_lpf_val');
+      if (lbl) lbl.textContent = '5.0 Hz';
+    }
     flash('defaults loaded — click Apply', '#94a3b8');
   };
+})();
+
+// ── IMU LPF slider live-label + debounced apply ─────────────────────
+// Updates the 'X.X Hz' / 'OFF' label on every frame of the drag, and
+// POSTs the value once the user stops moving it (~200 ms debounce).
+(function wireImuLpfSlider(){
+  const slider = document.getElementById('pos_imu_lpf');
+  const label  = document.getElementById('pos_imu_lpf_val');
+  if (!slider) return;
+  let _t = null;
+  function refreshLabel() {
+    if (!label) return;
+    const v = parseFloat(slider.value);
+    label.textContent = (v > 0 ? v.toFixed(1) + ' Hz' : 'OFF');
+  }
+  slider.addEventListener('input', () => {
+    refreshLabel();
+    if (_t) clearTimeout(_t);
+    _t = setTimeout(async () => {
+      try {
+        await fetch('/proxy/position/config', {
+          method: 'POST',
+          headers: {'Content-Type':'application/json'},
+          body: JSON.stringify({imu_lowpass_hz: parseFloat(slider.value)}),
+        });
+      } catch {}
+    }, 200);
+  });
+  refreshLabel();
 })();
 
 // ── Parameter-info popup — click any ⓘ icon for an explanation ──
@@ -5558,6 +5607,21 @@ window.PARAM_INFO = {
     "filter believes its model (smooth but sluggish). High Q → the filter "+
     "expects rapid changes (reacts faster but noisier).\\n\\n"+
     "Default 1e-3. Try 5e-4 for smooth hover, 5e-3 for dynamic missions."},
+  imu_lowpass_hz:     {title:'IMU low-pass cut-off', units:'Hz', body:
+    "First-order IIR low-pass filter applied to body-frame IMU "+
+    "velocity (vgx, vgy, vgz) at telemetry ingestion on the Pi. Smooths "+
+    "Anafi's noisy per-sample velocity before it reaches the position "+
+    "fusion, the synchronisation buffer, and the arena view.\\n\\n"+
+    "Parameter: cut-off frequency (Hz). Lower = more smoothing.\\n"+
+    "  • 0       → filter disabled (raw values passed through).\\n"+
+    "  • 1–3 Hz  → heavy smoothing, visibly laggy reaction.\\n"+
+    "  • 5 Hz    → default; cuts Anafi's ~15 Hz broadband jitter without\\n"+
+    "               dulling reaction to real motion.\\n"+
+    "  • 10-30 Hz→ minimal smoothing, reacts to faster manoeuvres.\\n\\n"+
+    "Implemented as a time-based alpha = dt / (tau + dt), where "+
+    "tau = 1 / (2π·fc), so uneven telemetry intervals still yield "+
+    "the correct filter response. State is reset when the filter is "+
+    "disabled so re-enabling starts clean."},
   kalman_meas_var:    {title:'Kalman measurement variance (R)', body:
     "How noisy the ArUco measurements are. Low R → trust the camera "+
     "more (snaps to detections). High R → trust the model more (smoother "+

@@ -691,7 +691,74 @@ _pos_cfg: dict = {
     "max_state_dt":         1.0,    # reset state if more than N s between updates
     "kalman_process_var":   1e-3,   # Q — process-noise variance per axis
     "kalman_meas_var":      1e-1,   # R — measurement-noise variance per axis
+    # ── IMU low-pass filter (first-order IIR) ───────────────────────
+    # Applied to vgx/vgy/vgz (body-frame velocity, cm/s) at telemetry
+    # ingestion time. Downstream: the position fusion + the sync buffer
+    # both see the filtered values. Set 0 (or negative) to disable.
+    # Default 5 Hz cut-off smooths Anafi's noisy per-sample velocity
+    # without dulling reaction to actual rapid moves.
+    "imu_lowpass_hz":       5.0,
 }
+
+
+# ── IMU low-pass filter state ────────────────────────────────────────
+# First-order IIR with configurable cut-off frequency. Applied per-axis
+# to the body-frame velocity components (vgx, vgy, vgz). The filter
+# uses a time-based alpha (alpha = dt / (tau + dt)) so it handles
+# the uneven telemetry cadence correctly.
+_imu_lpf_lock = threading.Lock()
+_imu_lpf_state: dict = {
+    "vgx": None, "vgy": None, "vgz": None,
+    "last_ts": 0.0,
+}
+
+
+def _apply_imu_lpf(vgx, vgy, vgz, ts_mono: float) -> tuple:
+    """Filter one telemetry sample of body-frame velocity.
+
+    Returns (vgx_f, vgy_f, vgz_f) — smoothed values, or the originals
+    unchanged if the filter is disabled (cut-off <= 0) or any input is
+    None (stale sample). Thread-safe; used from the Anafi telemetry
+    callback.
+    """
+    with _pos_cfg_lock:
+        fc = float(_pos_cfg.get("imu_lowpass_hz", 0.0) or 0.0)
+    if fc <= 0.0:
+        # Filter disabled — reset state so re-enable starts cleanly.
+        with _imu_lpf_lock:
+            _imu_lpf_state["vgx"] = None
+            _imu_lpf_state["vgy"] = None
+            _imu_lpf_state["vgz"] = None
+        return vgx, vgy, vgz
+    # Any None axis → bypass this sample (nothing to filter), but
+    # don't drop the other axes. Keeps the pipeline robust to partial
+    # telemetry gaps.
+    if vgx is None and vgy is None and vgz is None:
+        return vgx, vgy, vgz
+
+    with _imu_lpf_lock:
+        last = _imu_lpf_state["last_ts"]
+        dt = ts_mono - last if last > 0 else 1.0 / max(1e-3, fc)
+        # Clamp dt to a sane range — first sample or long-gap recovery
+        # should not slam the filter into a corner.
+        dt = max(1e-3, min(1.0, dt))
+        tau = 1.0 / (2.0 * math.pi * fc)
+        alpha = dt / (tau + dt)
+
+        def _step(prev, x):
+            if x is None:
+                return prev   # keep last value if sample missing
+            if prev is None:
+                return float(x)
+            return prev + alpha * (float(x) - prev)
+
+        _imu_lpf_state["vgx"] = _step(_imu_lpf_state["vgx"], vgx)
+        _imu_lpf_state["vgy"] = _step(_imu_lpf_state["vgy"], vgy)
+        _imu_lpf_state["vgz"] = _step(_imu_lpf_state["vgz"], vgz)
+        _imu_lpf_state["last_ts"] = ts_mono
+        return (_imu_lpf_state["vgx"],
+                _imu_lpf_state["vgy"],
+                _imu_lpf_state["vgz"])
 
 # Arena config — SDC challenge default layout.
 # Coordinates: X = left(-10) / right(+10), Y = near(0) / far(10), Z = low(-1) / high(+1).
@@ -2745,7 +2812,19 @@ def telemetry_loop():
         vgx = data.get("vgx") or 0
         vgy = data.get("vgy") or 0
         vgz = data.get("vgz") or 0
+
+        # ── IMU low-pass filter ──────────────────────────────────
+        # Runs before any downstream consumer sees these values, so
+        # both the telemetry dict and the sync buffer used for
+        # position fusion see the filtered velocity. The raw values
+        # are preserved on a suffixed key for diagnostics.
         if vgx or vgy or vgz:
+            vgx_f, vgy_f, vgz_f = _apply_imu_lpf(vgx, vgy, vgz, loop_mono)
+            data["vgx_raw"], data["vgy_raw"], data["vgz_raw"] = vgx, vgy, vgz
+            data["vgx"] = round(float(vgx_f), 3) if vgx_f is not None else vgx
+            data["vgy"] = round(float(vgy_f), 3) if vgy_f is not None else vgy
+            data["vgz"] = round(float(vgz_f), 3) if vgz_f is not None else vgz
+            vgx, vgy, vgz = data["vgx"], data["vgy"], data["vgz"]
             data["speed"] = round((vgx**2 + vgy**2 + vgz**2) ** 0.5, 1)
 
         with conn_lock:
@@ -5081,6 +5160,12 @@ def api_pos_config_set():
             _pos_cfg["kalman_process_var"] = max(1e-6, min(10.0, float(data["kalman_process_var"])))
         if "kalman_meas_var" in data:
             _pos_cfg["kalman_meas_var"] = max(1e-6, min(10.0, float(data["kalman_meas_var"])))
+        if "imu_lowpass_hz" in data:
+            # 0 (or negative) disables the filter. Positive values clamp
+            # to [0.1, 100] Hz — below 0.1 Hz it's basically DC-only,
+            # above 100 Hz the filter adds nothing useful at TELEMETRY_HZ.
+            v = float(data["imu_lowpass_hz"])
+            _pos_cfg["imu_lowpass_hz"] = 0.0 if v <= 0 else max(0.1, min(100.0, v))
         cfg_snap = dict(_pos_cfg)
 
     # Apply live filter changes to running processor
