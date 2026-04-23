@@ -478,6 +478,7 @@ class DroneWS:
         self._rc_ws_lock = threading.Lock()
         self._rc_seq = 0
         self._last_rc_send_ts: float = 0.0
+        self._last_rc_send_ms: float = 0.0      # wall-clock of the most recent ws.send()
         self._rc_rtt_ms: float = 0.0
         self._ws_connected = {"telemetry": False, "position": False, "rc": False}
         # Log-suppression state: only print on state transitions, not every
@@ -559,7 +560,8 @@ class DroneWS:
         _, tel_age = self.latest_telemetry()
         _, pos_age = self.latest_position()
         with self._lock:
-            rc_rtt = self._rc_rtt_ms
+            rc_rtt     = self._rc_rtt_ms
+            rc_send_ms = self._last_rc_send_ms
         return {
             "drone_id": self.drone_id,
             "rc":        self._ws_connected["rc"],
@@ -567,34 +569,49 @@ class DroneWS:
             "position":  self._ws_connected["position"],
             "telemetry_age_ms": int(tel_age * 1000) if tel_age < 1e6 else None,
             "position_age_ms":  int(pos_age * 1000) if pos_age < 1e6 else None,
-            "rc_rtt_ms":        rc_rtt if rc_rtt > 0 else None,
+            "rc_rtt_ms":        rc_rtt     if rc_rtt > 0 else None,
+            "rc_send_ms":       rc_send_ms if rc_send_ms > 0 else None,
         }
 
     # --- Internals ---
     def _send_rc_message(self, msg: dict) -> bool:
-        """Send fire-and-forget. Does NOT hold our lock around the
-        socket write — that was a latency bug: a single stalled send
-        serialised every other Flask thread waiting on the same lock.
-        The websocket-client library has its own internal write lock,
-        which is enough to keep frames intact.
+        """Send fire-and-forget with a tight timeout budget. If the send
+        takes noticeably longer than a round-trip (~50 ms), we treat the
+        socket as stalled, abandon it, and let the reconnect loop spin
+        up a fresh one — otherwise TCP back-pressure from a wedged
+        server can queue RC frames for seconds of perceived lag.
 
         No sequence numbers / no ACKs — RC is idempotent and bandwidth
-        is tiny, round-tripping every frame just doubled the traffic
-        and gated sends on the receiver draining its write buffer."""
+        is tiny; any "lost" frame is corrected on the next 100 ms tick.
+        """
         if not HAS_WSCLIENT:
             return False
         ws = self._rc_ws        # snapshot ref — no lock needed
         if ws is None:
             return False
+        t0 = time.time()
         try:
             ws.send(json.dumps(msg))
+            dt_ms = (time.time() - t0) * 1000.0
             with self._lock:
                 self._last_rc_send_ts = time.time()
+                self._last_rc_send_ms = dt_ms
+            # Any RC send over 250 ms is anomalous — the socket is
+            # almost certainly wedged by TCP back-pressure. Kill it so
+            # the reconnect loop replaces it, otherwise every
+            # subsequent send waits behind the same clogged buffer.
+            if dt_ms > 250.0:
+                print(f"[WS] {self.drone_id} rc send SLOW {dt_ms:.0f}ms — "
+                      f"dropping socket")
+                with self._rc_ws_lock:
+                    if self._rc_ws is ws:
+                        try: ws.close()
+                        except Exception: pass
+                        self._rc_ws = None
+                        self._ws_connected["rc"] = False
+                return False
             return True
         except Exception as e:
-            # Connection died — flag and let the reconnect loop handle it.
-            # Guard the state mutation with the lock so we don't race the
-            # reconnect thread which is (re)assigning self._rc_ws.
             print(f"[WS] {self.drone_id} rc send failed: {e}")
             with self._rc_ws_lock:
                 if self._rc_ws is ws:
@@ -2119,7 +2136,7 @@ HTML = """
     arcPoll();
     // Version marker — if this string doesn't appear in the DOM,
     // you're running stale JS (restart the Python server or hard-refresh).
-    const BUILD = 'bm-takeoff-land-slow-timeout';
+    const BUILD = 'bn-http-mode-fix-ws-backpressure';
     console.log('[arc] init complete, build=' + BUILD);
     const ver = document.createElement('span');
     ver.id = 'arc_build_tag';
@@ -3363,13 +3380,17 @@ async function resumeAllDrones(source) {
       }
       const up = (st.telemetry ? 1 : 0) + (st.position ? 1 : 0) + (st.rc ? 1 : 0);
       if (up === 3) {
-        el.style.background = '#064e3b';
-        el.style.color = '#86efac';
+        // Amber if the most recent RC send was slow (TCP back-pressure);
+        // green only when everything is snappy.
+        const slowSend = (st.rc_send_ms != null && st.rc_send_ms > 50);
+        el.style.background = slowSend ? '#78350f' : '#064e3b';
+        el.style.color      = slowSend ? '#fde68a' : '#86efac';
         const parts = [];
-        if (st.rc_rtt_ms       != null) parts.push('rc ' + st.rc_rtt_ms + 'ms');
+        if (st.rc_send_ms     != null) parts.push('send ' + Math.round(st.rc_send_ms) + 'ms');
+        if (st.rc_rtt_ms      != null) parts.push('rtt ' + st.rc_rtt_ms + 'ms');
         if (st.telemetry_age_ms != null) parts.push('tel ' + st.telemetry_age_ms + 'ms');
         if (st.position_age_ms  != null) parts.push('pos ' + st.position_age_ms  + 'ms');
-        el.textContent = 'WS \u2713 ' + parts.join(' · ');
+        el.textContent = (slowSend ? 'WS \u26a0 ' : 'WS \u2713 ') + parts.join(' · ');
       } else if (up > 0) {
         el.style.background = '#78350f';
         el.style.color = '#fde68a';
@@ -6496,14 +6517,19 @@ def proxy_key_down():
         if ws and ws.send_key(k, "down"):
             return jsonify(ok=True, via="ws")
         if mode == "ws":
-            # Forced WS and it failed — don't mask the problem by quietly
-            # switching to HTTP. Return 503 so the operator sees reality.
             return jsonify(ok=False, error="ws forced but not connected",
                            via="ws"), 503
-    if not _active_drone_reachable():
-        return jsonify(ok=False, error="drone unreachable", via="none"), 503
-    r = pi_post("/api/key_down", data)
-    return (r.text, r.status_code, {"Content-Type": r.headers.get("Content-Type", "application/json")})
+    # HTTP path — tight TIMEOUT_FAST so an unreachable drone fails fast
+    # (was TIMEOUT_CMD=8s, which made every key burn 8s when the Pi
+    # didn't answer — the real cause of "HTTP controls don't work").
+    # No more _active_drone_reachable() gate: HTTP shouldn't be vetoed
+    # by WS status. If HTTP itself is broken the timeout tells us.
+    try:
+        r = pi_post("/api/key_down", data, timeout=TIMEOUT_FAST)
+        return (r.text, r.status_code,
+                {"Content-Type": r.headers.get("Content-Type", "application/json")})
+    except Exception as e:
+        return jsonify(ok=False, error=f"http: {e}", via="http"), 502
 
 
 @app.post("/proxy/key_up")
@@ -6519,10 +6545,12 @@ def proxy_key_up():
         if mode == "ws":
             return jsonify(ok=False, error="ws forced but not connected",
                            via="ws"), 503
-    if not _active_drone_reachable():
-        return jsonify(ok=False, error="drone unreachable", via="none"), 503
-    r = pi_post("/api/key_up", data)
-    return (r.text, r.status_code, {"Content-Type": r.headers.get("Content-Type", "application/json")})
+    try:
+        r = pi_post("/api/key_up", data, timeout=TIMEOUT_FAST)
+        return (r.text, r.status_code,
+                {"Content-Type": r.headers.get("Content-Type", "application/json")})
+    except Exception as e:
+        return jsonify(ok=False, error=f"http: {e}", via="http"), 502
 
 
 @app.post("/proxy/key_batch")
@@ -6561,13 +6589,13 @@ def proxy_key_batch():
             return jsonify(ok=False, error="ws forced but not connected",
                            via="ws"), 503
 
-    if not _active_drone_reachable():
-        return jsonify(ok=False, error="drone unreachable", via="none"), 503
-
     log_command("key_batch", {"keys": uniq, "via": "http"})
     last_r = None
-    for k in uniq:
-        last_r = pi_post("/api/key_down", {"key": k})
+    try:
+        for k in uniq:
+            last_r = pi_post("/api/key_down", {"key": k}, timeout=TIMEOUT_FAST)
+    except Exception as e:
+        return jsonify(ok=False, error=f"http: {e}", via="http"), 502
     if last_r is not None:
         return (last_r.text, last_r.status_code,
                 {"Content-Type": last_r.headers.get("Content-Type", "application/json")})
