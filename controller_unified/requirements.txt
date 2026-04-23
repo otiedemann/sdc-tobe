@@ -1,16 +1,22 @@
-# Unified Pi API Server - Python dependencies
+# Unified flight-controller API server — Python dependencies.
+# CURRENT TARGET: x86 Linux (the flight-controller boxes in the SDC26
+#                 fleet are full x86 PCs, NOT Raspberry Pis).
+#
 # Install with: pip install -r requirements.txt
 #
-# On Raspberry Pi (ARM): pip install -r requirements-pi.txt
-# On x86 (with Anafi):   pip install -r requirements.txt
+# Legacy (Tello on ARM hosts, rarely used today):
+#   pip install -r requirements-pi.txt
 
 # --- Required ---
 flask
+# WebSocket push channel for telemetry / position / RC. Drops C2↔FC
+# round-trip overhead below HTTP framing levels (see BUILD bd notes).
+flask-sock
 
 # --- Tello drone support ---
 djitellopy
 
-# --- Anafi drone support (x86 only, not available on ARM/Raspberry Pi) ---
+# --- Anafi drone support (x86 only — the primary target) ---
 parrot-olympe
 
 # --- Video streaming (MJPEG mode) ---

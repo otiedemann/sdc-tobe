@@ -131,6 +131,16 @@ class HoverParams:
     # Physical marker size in meters — drives distance estimation.
     # Distance scale auto-adjusts via (marker_size_m / MARKER_SIZE_CALIB_M) ** CALIB_B.
     marker_size_m: float   = ASEEK.MARKER_SIZE_M
+    # ── Axis-locked (Manhattan) flight mode ──────────────────────────
+    # When True, all autonomous motion (waypoint nav + PD approach) is
+    # constrained to wall-parallel axes only:
+    #   • Yaw snaps to nearest 90° (0/90/180/270° in arena frame)
+    #   • At any tick, only ONE of {forward/back, left/right strafe} is
+    #     non-zero — no diagonals
+    #   • Vertical (up/down) always remains free
+    # Manual WASD and emergency/stop paths are UNAFFECTED. The switch
+    # applies exclusively to the autonomous motion decisions.
+    axis_locked: bool      = False
 
 
 def _clamp_int(v: float, lo: int, hi: int) -> int:
@@ -139,6 +149,34 @@ def _clamp_int(v: float, lo: int, hi: int) -> int:
 
 def _clamp_rc(v: int) -> int:
     return max(-100, min(100, int(v)))
+
+
+def _axis_lock_rc(lr: int, fb: int) -> tuple[int, int]:
+    """Keep only the dominant lateral axis. Used by HoverParams.axis_locked:
+    the drone never moves diagonally — at any tick it's either strafing
+    left/right OR moving forward/back, whichever direction has the
+    larger RC magnitude."""
+    if abs(lr) >= abs(fb):
+        return lr, 0
+    return 0, fb
+
+
+def _snap_yaw_to_cardinal(yaw_deg: float) -> float:
+    """Round a heading to the nearest 90° multiple, normalised to [0, 360)."""
+    y = yaw_deg % 360.0
+    return (round(y / 90.0) * 90.0) % 360.0
+
+
+def _yaw_error_to_cardinal(yaw_deg: float) -> float:
+    """Signed shortest-path error (deg) from current yaw to the nearest
+    cardinal (0°/90°/180°/270°). Positive = rotate CCW (increase yaw)."""
+    target = _snap_yaw_to_cardinal(yaw_deg)
+    err = target - (yaw_deg % 360.0)
+    if err > 180.0:
+        err -= 360.0
+    elif err < -180.0:
+        err += 360.0
+    return err
 
 
 # ─── Per-drone observer ─────────────────────────────────────────────────────
@@ -180,6 +218,18 @@ class DroneObserver:
 
         self.mode: str = "observe"       # "observe" | "live"
         self.allow_live = bool(allow_live)
+        # ── Waypoint navigation (world-frame goto) ──────────────────
+        # When set, the observer flies toward a world-frame XYZ setpoint
+        # via P-control on arena-frame position, with independent yaw so
+        # the camera keeps facing a user-specified point (typically the
+        # arena centre to maximise marker visibility). Overrides the
+        # marker-tracking PD loop when active.
+        self._waypoint_xyz: Optional[tuple] = None     # (x, y, z) in arena frame
+        self._waypoint_face_xy: Optional[tuple] = None  # (x, y) to aim camera at
+        # Fleet-wide override: when set, any set_waypoint(xyz, face_xy=None)
+        # falls back to this point. Typically (0, arena_depth/2) — the
+        # arena centre. Gives the camera maximum marker visibility.
+        self._camera_face_override_xy: Optional[tuple] = None
         # ── Arena safety bounds (world frame, metres) ────────────────
         # Drone must never leave this box. Default per SDC26 ruleset
         # (20 × 10.8 × 6 m field). Configurable via set_arena_bounds().
@@ -189,7 +239,13 @@ class DroneObserver:
             "y_min":   0.0, "y_max": 10.8,
             "z_min":   0.3, "z_max":  5.0,   # some ceiling headroom
         }
-        self._safety_margin_m = 1.0
+        # Autonomous-mode safety margin from arena borders. Increased
+        # from 1.0 → 1.5 m per ops policy: during autonomous flight the
+        # drone must NEVER approach the walls closer than 1.5 m. Manual
+        # flight is unaffected — this margin only kicks in when the
+        # observer is running with live RC output. Adjustable via
+        # set_arena_bounds(safety_margin_m=…).
+        self._safety_margin_m = 1.5
         self._last_guard_info = {}   # diagnostics for state snapshot
         # Search RC — commands the drone sends when in LIVE mode but not
         # actively tracking a marker (e.g. mission SEARCH maneuver).
@@ -222,6 +278,10 @@ class DroneObserver:
         self._prev_yaw: Optional[float] = None
         self._prev_yaw_t: float = 0.0
         self._yaw_rate: float = 0.0
+        # Marker-lost safety net — when set, timestamp of the first tick
+        # with zero markers visible. Drives the brake-then-rotate pattern
+        # in _tick. Cleared whenever markers come back.
+        self._panic_since: Optional[float] = None
 
     # ── Per-drone HTTP helpers (replaces aruco_seek module globals) ──
     def _api_post(self, path: str, body: Optional[dict] = None, timeout: float = 12.0) -> dict:
@@ -242,6 +302,152 @@ class DroneObserver:
         except Exception as e:
             return {"ok": False, "error": str(e)}
 
+    def set_camera_face_override(self, xy):
+        """Fleet-wide "camera always faces arena centre" override.
+
+        When set (not None), set_waypoint() uses this as the face target
+        whenever the caller doesn't supply one explicitly. That way any
+        mission — including future ones — automatically gets the
+        arena-centre-facing behaviour, which maximises the number of
+        markers visible at any moment and thus the quality of the
+        fused arena-frame pose.
+
+        Pass None to clear the override.
+        """
+        with self._lock:
+            if xy is None:
+                self._camera_face_override_xy = None
+            else:
+                self._camera_face_override_xy = (float(xy[0]), float(xy[1]))
+            # Retroactively apply to any active waypoint that has no
+            # explicit face — otherwise the camera stays wherever it was
+            # last pointed until the next waypoint fires.
+            if (self._waypoint_xyz is not None
+                    and self._waypoint_face_xy is None
+                    and self._camera_face_override_xy is not None):
+                self._waypoint_face_xy = self._camera_face_override_xy
+
+    def set_waypoint(self, xyz, face_xy=None):
+        """Fly to a world-frame (x, y, z) setpoint. If face_xy is given,
+        the drone yaws to aim its camera at that world-XY point (typically
+        the arena centre so more markers stay in view for triangulation).
+        Pass None to cancel waypoint nav (drone returns to normal
+        marker-tracking PD).
+
+        If face_xy is None AND a fleet-wide "camera faces arena centre"
+        override is active (set via set_camera_face_override), the
+        override is used automatically. Missions can still provide an
+        explicit face_xy to opt out on a per-call basis.
+        """
+        with self._lock:
+            self._waypoint_xyz = (
+                (float(xyz[0]), float(xyz[1]), float(xyz[2])) if xyz is not None else None
+            )
+            if face_xy is not None:
+                self._waypoint_face_xy = (float(face_xy[0]), float(face_xy[1]))
+            elif self._camera_face_override_xy is not None and xyz is not None:
+                # Fall back to the fleet-wide override. Only when there's
+                # an active waypoint — pure-None calls still clear face.
+                self._waypoint_face_xy = self._camera_face_override_xy
+            else:
+                self._waypoint_face_xy = None
+
+    def clear_waypoint(self):
+        self.set_waypoint(None, None)
+
+    def _compute_waypoint_rc(self):
+        """Return (lr, fb, ud, yaw, dist_xy, dz) for the current waypoint,
+        or None if waypoint nav isn't configured or position is unknown.
+        All values are RC% (-100..+100)."""
+        with self._lock:
+            wp = self._waypoint_xyz
+            face = self._waypoint_face_xy
+            snap = dict(self.latest)
+        if wp is None:
+            return None
+        pos = snap.get("pos") or snap.get("cam")
+        if not isinstance(pos, (list, tuple)) or len(pos) < 2:
+            return None
+        cx = float(pos[0])
+        cy = float(pos[1])
+        cz = float(pos[2]) if len(pos) >= 3 else (snap.get("altitude_m") or 1.5)
+
+        tx, ty, tz = wp
+        dx = tx - cx     # world
+        dy = ty - cy
+        dz = tz - cz
+        dist_xy = (dx * dx + dy * dy) ** 0.5
+
+        yaw_deg = float(snap.get("yaw", 0.0) or 0.0)
+        yaw_rad = math.radians(yaw_deg)
+        s = math.sin(yaw_rad)
+        c = math.cos(yaw_rad)
+
+        # Body-frame RC from world-frame desired motion. Anafi yaw
+        # convention: yaw=0 → nose points world +y. Body-fwd in world is
+        # (sin(y), cos(y)); body-right is (cos(y), -sin(y)). Solving
+        # world_move = lr · body_right + fb · body_fwd gives:
+        fb_err_m = dx * s + dy * c           # metres along body-fwd
+        lr_err_m = dx * c - dy * s           # metres along body-right
+
+        # P gains (RC% per metre). Conservative so the drone doesn't
+        # overshoot in the often-noisy arena-frame pose.
+        P_XY = 25
+        P_Z  = 35
+        P_YAW = 2.0   # RC% per degree
+
+        fb_rc = int(round(fb_err_m * P_XY))
+        lr_rc = int(round(lr_err_m * P_XY))
+        ud_rc = int(round(dz * P_Z))
+
+        # Face-point yaw control. Work out the world bearing from the
+        # drone to the face_point (typically arena centre), express it
+        # as a yaw angle (0° = world +y, CW positive to match Anafi),
+        # then P-control the yaw error.
+        yaw_rc = 0
+        if face is not None:
+            fx, fy = face
+            dfx = fx - cx
+            dfy = fy - cy
+            if (dfx * dfx + dfy * dfy) > 1e-4:
+                desired_yaw = math.degrees(math.atan2(dfx, dfy))
+                yaw_err = ((desired_yaw - yaw_deg + 180.0) % 360.0) - 180.0
+                yaw_rc = int(round(yaw_err * P_YAW))
+
+        # ── Axis-locked (Manhattan) mode ─────────────────────────────
+        # When enabled, the drone stays aligned to cardinal directions
+        # and never moves diagonally:
+        #   1. Yaw is driven to the nearest 90° (0/90/180/270°) in the
+        #      arena frame — overrides the face-point target until
+        #      aligned. Once aligned, yaw is held.
+        #   2. Of {forward/back, strafe}, only the dominant-magnitude
+        #      axis moves. The smaller one is zeroed.
+        if self.params.axis_locked:
+            # Step 1: lock yaw to nearest cardinal. Only rotate if the
+            # error exceeds a small deadband (~4°) so we don't buzz at
+            # the target heading.
+            yaw_err_card = _yaw_error_to_cardinal(yaw_deg)
+            if abs(yaw_err_card) > 4.0:
+                # Rotate toward the cardinal — P-control with a low gain
+                # for a smooth, predictable 90° increment movement.
+                yaw_rc = int(round(yaw_err_card * 1.2))
+                # While aligning yaw, keep horizontal motion stopped so
+                # the drone doesn't drift diagonally during the rotation.
+                fb_rc = 0
+                lr_rc = 0
+            else:
+                # Snap yaw command to zero — we're at a cardinal heading.
+                yaw_rc = 0
+                # Step 2: axis-lock horizontal motion.
+                lr_rc, fb_rc = _axis_lock_rc(lr_rc, fb_rc)
+
+        # Clamps — safer than full-stick on waypoints
+        fb_rc  = max(-40, min(40, fb_rc))
+        lr_rc  = max(-40, min(40, lr_rc))
+        ud_rc  = max(-30, min(30, ud_rc))
+        yaw_rc = max(-50, min(50, yaw_rc))
+        return lr_rc, fb_rc, ud_rc, yaw_rc, dist_xy, dz
+
     def set_arena_bounds(self, bounds: dict, safety_margin_m: float = None):
         """Override the arena safety box. `bounds` keys: x_min, x_max,
         y_min, y_max, z_min, z_max (all metres, world frame)."""
@@ -251,12 +457,19 @@ class DroneObserver:
             if safety_margin_m is not None:
                 self._safety_margin_m = float(safety_margin_m)
 
+    # Latency compensation: when checking "will this RC push the drone
+    # past the margin?", we look LOOKAHEAD_S seconds into the future
+    # using the current IMU velocity. Accounts for the drone's response
+    # lag + our network RTT — roughly 200-400 ms from RC command to
+    # physical response.
+    GUARD_LOOKAHEAD_S = 0.35
+
     def _apply_boundary_guard(self, lr: int, fb: int, ud: int, yaw_rc: int):
         """Return (lr, fb, ud, yaw_rc) clamped so the drone won't be
-        pushed past the arena margin. When already inside the margin,
-        REVERSES the offending component to actively retreat (hard brake
-        + push back). Yaw and altitude are treated independently from
-        xy translation.
+        pushed past the arena margin. Latency-aware: the check uses a
+        PREDICTED position based on current IMU velocity, not just the
+        instantaneous position, so the guard reacts before the drone
+        has already overshot.
 
         Body-frame → world-frame conversion uses the drone's current yaw:
             world_dx = cos(yaw)·lr + sin(yaw)·fb
@@ -279,19 +492,38 @@ class DroneObserver:
         yaw_rad = math.radians(float(yaw_deg))
         cy, sy = math.cos(yaw_rad), math.sin(yaw_rad)
 
+        # ── Latency-aware prediction ────────────────────────────────
+        # IMU velocity from Anafi telemetry is in BODY FRAME, cm/s.
+        # Convert to world frame (m/s) for prediction.
+        vbx = float(snap.get("vx_cms", 0) or 0) * 0.01   # body fwd
+        vby = float(snap.get("vy_cms", 0) or 0) * 0.01   # body right
+        vbz = float(snap.get("vz_cms", 0) or 0) * 0.01   # body down (Anafi)
+        # Same body→world rotation as RC (fwd=body+y, right=body+x).
+        vwx =  cy * vby + sy * vbx
+        vwy = -sy * vby + cy * vbx
+        vwz = -vbz   # world z-up, body z-down
+        dt = self.GUARD_LOOKAHEAD_S
+        px_pred = px + vwx * dt
+        py_pred = py + vwy * dt
+        pz_pred = pz + vwz * dt
+        # Use the PREDICTED position for clearance calculations so the
+        # guard reacts to where we'll be, not where we are.
+        px_eff, py_eff, pz_eff = px_pred, py_pred, pz_pred
+
         # Body-frame RC → world-frame intended velocity direction
         wdx =  cy * lr + sy * fb
         wdy = -sy * lr + cy * fb
 
-        # How deep inside each wall's margin are we? Positive = still
-        # outside the danger zone, negative = already past the margin.
+        # How deep inside each wall's margin are we, T seconds from now?
+        # Positive = still outside the danger zone, negative = already
+        # past the margin (accounting for current velocity + RTT).
         clearance = {
-            "x_max": bounds["x_max"] - px - margin,   # space left before +x wall
-            "x_min": (px - bounds["x_min"]) - margin, # space left before -x wall
-            "y_max": bounds["y_max"] - py - margin,
-            "y_min": (py - bounds["y_min"]) - margin,
-            "z_max": bounds["z_max"] - pz - margin,
-            "z_min": (pz - bounds["z_min"]) - margin,
+            "x_max": bounds["x_max"] - px_eff - margin,
+            "x_min": (px_eff - bounds["x_min"]) - margin,
+            "y_max": bounds["y_max"] - py_eff - margin,
+            "y_min": (py_eff - bounds["y_min"]) - margin,
+            "z_max": bounds["z_max"] - pz_eff - margin,
+            "z_min": (pz_eff - bounds["z_min"]) - margin,
         }
 
         # Retreat-RC magnitude. Modest so we don't overshoot in the opposite
@@ -300,7 +532,10 @@ class DroneObserver:
         RETREAT_RC = 15
         guard_info = {"active": False, "actions": [], "clearance": {
             k: round(v, 2) for k, v in clearance.items()
-        }, "pos": [round(px, 2), round(py, 2), round(pz, 2)]}
+        }, "pos": [round(px, 2), round(py, 2), round(pz, 2)],
+           "pos_pred": [round(px_eff, 2), round(py_eff, 2), round(pz_eff, 2)],
+           "vel_world": [round(vwx, 2), round(vwy, 2), round(vwz, 2)],
+           "lookahead_s": self.GUARD_LOOKAHEAD_S}
 
         # X axis (world)
         if clearance["x_max"] <= 0 and wdx >= 0:
@@ -390,7 +625,16 @@ class DroneObserver:
                     continue
                 cur = getattr(self.params, k)
                 try:
-                    new_val = int(round(float(v))) if (isinstance(cur, int) and not isinstance(cur, bool)) else float(v)
+                    if isinstance(cur, bool):
+                        # Accept "true"/"false"/"1"/"0"/0/1/true/false.
+                        if isinstance(v, str):
+                            new_val = v.strip().lower() in ("1", "true", "yes", "on")
+                        else:
+                            new_val = bool(v)
+                    elif isinstance(cur, int):
+                        new_val = int(round(float(v)))
+                    else:
+                        new_val = float(v)
                     setattr(self.params, k, new_val)
                     applied[k] = new_val
                 except Exception:
@@ -533,6 +777,38 @@ class DroneObserver:
             "vid_age": round(self._vid.age, 2),
         }
 
+        # ── Merge fused ArUco + IMU pose into the snapshot ──
+        # The per-drone positioner (running on the flight-controller Pi) emits
+        # `/api/position/events` with pos/dir/vel. The PositionListener caches
+        # the latest payload; we surface it here so the fleet view (2D top-
+        # down canvas + Three.js 3D arena + Position Tracker panel) can draw
+        # the drone at its actual arena-frame coordinates. Without this merge
+        # every state dict lacks "pos" and the 3D updateDrones() call
+        # silently skips rendering meshes for this drone.
+        if self._pos is not None:
+            try:
+                pos_snap = self._pos.get()
+            except Exception:
+                pos_snap = None
+            if isinstance(pos_snap, dict):
+                if pos_snap.get("pos") is not None:
+                    snapshot["pos"]        = pos_snap["pos"]
+                if pos_snap.get("cam") is not None:
+                    snapshot["cam"]        = pos_snap["cam"]
+                if pos_snap.get("dir") is not None:
+                    snapshot["dir"]        = pos_snap["dir"]
+                if pos_snap.get("vel") is not None:
+                    snapshot["pos_vel"]    = pos_snap["vel"]
+                if pos_snap.get("ref_markers") is not None:
+                    snapshot["ref_markers"] = pos_snap["ref_markers"]
+                if pos_snap.get("seen_markers") is not None:
+                    snapshot["seen_markers"] = pos_snap["seen_markers"]
+                if pos_snap.get("stale") is not None:
+                    snapshot["pos_stale"]  = pos_snap["stale"]
+                if pos_snap.get("fps") is not None:
+                    snapshot["pos_fps"]    = pos_snap["fps"]
+            snapshot["pos_age"] = round(float(getattr(self._pos, "age", float("inf"))), 2)
+
         vid_all = self._vid.get_all()
         snapshot["visible_ids"] = sorted(vid_all.keys())
 
@@ -570,32 +846,107 @@ class DroneObserver:
         if self._last_guard_info:
             snapshot["guard"] = dict(self._last_guard_info)
 
-        if not vid_all:
-            snapshot["marker_id"] = None
-            snapshot["status_msg"] = "no markers visible"
-            # Safety: if we were actively tracking in live mode and just lost
-            # the marker, push a single RC-stop so the drone doesn't drift.
-            if self.mode == "live" and self._chosen_id is not None:
-                try:
-                    self._send_rc_stop()
-                    snapshot["rc_sent_at"] = round(t_now, 2)
-                except Exception:
-                    pass
-                self._chosen_id = None
-            # Apply search RC (mission-driven rotation/translation) if set
+        # ── Marker-lost safety net (pre-empts waypoint nav + PD) ──
+        # Hard rule: during ANY non-manual flight (LIVE mode), if no
+        # ArUco markers are currently visible we brake to a full stop
+        # and then rotate in place until a marker re-enters the frame.
+        # Waypoint nav and marker-PD tracking both run *after* this
+        # check so they never override the safety search.
+        #
+        # Priority order when LIVE + vid_all empty:
+        #   1. Mission-driven search_rc (swarm manager's choreography)
+        #   2. Auto brake (0.5s) → rotate CCW (until marker returns)
+        if self.mode == "live" and not vid_all:
             with self._lock:
                 src = self._search_rc
-            if self.mode == "live" and any(v != 0 for v in src):
+            snapshot["marker_id"] = None
+            if any(v != 0 for v in src):
+                # Mission plan present — trust the manager.
+                self._panic_since = None
                 try:
                     self._send_rc(*src)
                     snapshot["rc_sent_at"] = round(t_now, 2)
                     snapshot["search_rc"] = list(src)
                     snapshot["status_msg"] = (
-                        f"searching — rc(lr={src[0]}, fb={src[1]}, "
+                        f"mission search — rc(lr={src[0]}, fb={src[1]}, "
                         f"ud={src[2]}, yaw={src[3]})"
                     )
                 except Exception:
                     pass
+            else:
+                # No plan — automatic brake+rotate until a marker shows up.
+                if self._panic_since is None:
+                    self._panic_since = t_now
+                dt_panic = t_now - self._panic_since
+                PANIC_BRAKE_S = 0.5
+                PANIC_YAW_RC = 18     # ~20°/s — full 360° sweep in ~18s
+                try:
+                    if dt_panic < PANIC_BRAKE_S:
+                        self._send_rc(0, 0, 0, 0)
+                        snapshot["panic_phase"] = "brake"
+                        snapshot["status_msg"] = (
+                            f"\u26a0 marker lost — FULL STOP ({dt_panic:.1f}s)"
+                        )
+                    else:
+                        self._send_rc(0, 0, 0, PANIC_YAW_RC)
+                        snapshot["panic_phase"] = "rotate"
+                        snapshot["panic_yaw_rc"] = PANIC_YAW_RC
+                        snapshot["status_msg"] = (
+                            f"\u26a0 marker lost — rotating CCW "
+                            f"({dt_panic:.1f}s, ~{int(dt_panic * 20)}\u00b0 swept)"
+                        )
+                    snapshot["rc_sent_at"] = round(t_now, 2)
+                    snapshot["panic"] = True
+                    snapshot["panic_dt_s"] = round(dt_panic, 2)
+                except Exception:
+                    pass
+            with self._lock:
+                self.latest = snapshot
+            return
+        elif vid_all:
+            # Markers visible again — reset so the next loss starts a
+            # fresh brake+rotate cycle rather than resuming mid-spin.
+            self._panic_since = None
+
+        # ── Waypoint navigation (overrides marker PD when active) ──
+        # If a mission has set a world-frame waypoint, fly to it now.
+        # Position feedback comes from the ArUco pipeline (snap["pos"]).
+        # We also keep the camera aimed at face_point (typically arena
+        # centre) via independent yaw control so more markers stay in
+        # view for triangulation — decoupled from the body-forward axis.
+        wp_rc = self._compute_waypoint_rc()
+        if wp_rc is not None:
+            lr, fb, ud, yaw_rc, dist_xy, dz = wp_rc
+            if self.mode == "live":
+                try:
+                    self._send_rc(lr, fb, ud, yaw_rc)
+                    snapshot["rc_sent_at"] = round(t_now, 2)
+                except Exception as e:
+                    snapshot["rc_send_error"] = str(e)[:80]
+            with self._lock:
+                wp  = self._waypoint_xyz
+                face = self._waypoint_face_xy
+            snapshot.update({
+                "waypoint": list(wp) if wp else None,
+                "waypoint_face": list(face) if face else None,
+                "waypoint_dist_xy": round(dist_xy, 2),
+                "waypoint_dz": round(dz, 2),
+                "rc_lr": lr, "rc_fb": fb, "rc_ud": ud, "rc_yaw": yaw_rc,
+                "marker_id": None,
+                "status_msg": f"→ waypoint ({wp[0]:.1f},{wp[1]:.1f},{wp[2]:.1f}) "
+                              f"d={dist_xy:.2f}m dz={dz:+.2f}m",
+            })
+            self._chosen_id = None
+            with self._lock:
+                self.latest = snapshot
+            return
+
+        # OBSERVE mode only — the LIVE + no-markers case already returned
+        # above via the marker-lost safety net.
+        if not vid_all:
+            snapshot["marker_id"] = None
+            snapshot["status_msg"] = "no markers visible (OBSERVE)"
+            self._chosen_id = None
             with self._lock:
                 self.latest = snapshot
             return
@@ -706,6 +1057,24 @@ class DroneObserver:
         if abs(lr)     < p.rc_min: lr     = 0
         if abs(ud)     < p.rc_min: ud     = 0
         if abs(fb)     < p.rc_min: fb     = 0
+
+        # ── Axis-locked (Manhattan) mode ─────────────────────────────
+        # Mirrors the constraint applied in _compute_waypoint_rc. The
+        # marker-PD path skews the drone toward the marker; under
+        # axis-lock we:
+        #   1. Override the visual-servo yaw with a command that drives
+        #      the drone's compass yaw to the nearest 90° multiple.
+        #   2. Keep only the dominant horizontal axis (strafe OR fwd/back).
+        if p.axis_locked:
+            yaw_deg_now = float(snapshot.get("yaw", 0.0) or 0.0)
+            yaw_err_card = _yaw_error_to_cardinal(yaw_deg_now)
+            if abs(yaw_err_card) > 4.0:
+                yaw_rc = _clamp_int(yaw_err_card * 1.2, -p.yaw_max, p.yaw_max)
+                lr = 0
+                fb = 0
+            else:
+                yaw_rc = 0
+                lr, fb = _axis_lock_rc(lr, fb)
 
         snapshot.update({
             "marker_id": chosen,
@@ -1275,13 +1644,26 @@ class ScanAllMarkersMission:
                                  search_sub_start=None, hover_start=None)
                     return
                 if marker_id != target:
-                    # Lost sight — release claim, go back to searching
+                    # Lost sight of the target marker — HARD BRAKE + STOP-AND-SPIN
+                    # 1. Release the claim
+                    # 2. Zero the observer's target → no PD on any visible marker
+                    # 3. Push a single rc_stop so momentum is cancelled
+                    # 4. Immediately start the rotate sub-phase so the drone
+                    #    begins searching from its current position
                     self.claimed.pop(did, None)
                     obs.set_target(None)
-                    obs.set_search_rc(0, 0, 0, 0)
+                    try: obs.cmd_rc_stop()
+                    except Exception: pass
+                    obs.set_search_rc(0, 0, 0, self.SEARCH_ROTATE_YAW_RC)
                     state.update(phase="SEARCH", target=None, hover_start=None,
-                                 search_sub="idle", search_sub_start=None,
-                                 note=f"lost sight of {target}, re-searching")
+                                 search_sub="rotate", search_sub_start=now,
+                                 note=f"lost sight of {target} — brake + rotate to re-acquire")
+                    if self._trace:
+                        self._trace.write("marker_lost", {
+                            "drone": did, "lost": target,
+                            "visible_now": list(visible),
+                            "phase_was": "APPROACH",
+                        })
                     return
                 if distance_m is None:
                     return
@@ -1339,12 +1721,22 @@ class ScanAllMarkersMission:
                                  search_sub_start=None, hover_start=None)
                     return
                 if marker_id != target:
+                    # Lost sight mid-hover — brake immediately and start
+                    # rotating to reacquire a target marker.
                     self.claimed.pop(did, None)
                     obs.set_target(None)
-                    obs.set_search_rc(0, 0, 0, 0)
+                    try: obs.cmd_rc_stop()
+                    except Exception: pass
+                    obs.set_search_rc(0, 0, 0, self.SEARCH_ROTATE_YAW_RC)
                     state.update(phase="SEARCH", target=None, hover_start=None,
-                                 search_sub="idle", search_sub_start=None,
-                                 note=f"lost sight of {target} during hover, re-searching")
+                                 search_sub="rotate", search_sub_start=now,
+                                 note=f"lost sight of {target} during hover — brake + rotate")
+                    if self._trace:
+                        self._trace.write("marker_lost", {
+                            "drone": did, "lost": target,
+                            "visible_now": list(visible),
+                            "phase_was": "HOVER",
+                        })
                     return
                 elapsed = time.time() - (state["hover_start"] or time.time())
                 if elapsed >= self.hover_seconds:
@@ -1417,6 +1809,420 @@ class ScanAllMarkersMission:
                 return
 
 
+# ═══════════════════════════════════════════════════════════════════════════
+#  CaptureAllTargetsMission — SDC26 capture-the-box mission
+# ═══════════════════════════════════════════════════════════════════════════
+#
+# Per SDC26 rules (v9): 6 boxes on the field, 3 per team zone. To capture
+# an enemy box, a drone hovers over it for ≥ 2 s without a defending drone
+# present. The capturing drone then must return to the team's home area for
+# the point to count.
+#
+# This mission flies the swarm one-by-one over the configured targets, holds
+# 1.5 m above each for 4 s (conservative vs the 2-s rule), then returns to
+# the home zone. Camera is kept pointed at the arena centre throughout so
+# the position tracker has as many markers as possible in view for
+# triangulation.
+#
+# FSM per drone:
+#   IDLE → NAV_TO_TARGET → HOVER → NAV_TO_HOME → DONE
+#
+# Shared claim map prevents two drones from attacking the same box.
+
+class CaptureAllTargetsMission:
+    """Fly each selected drone to a sequence of target boxes, hover 1.5 m
+    above each for `hover_seconds` seconds, then return home.
+
+    target_boxes is a list of dicts like:
+        [{"id": 1, "x": -5.0, "y": 2.0}, ...]
+    """
+
+    TICK_S = 0.5
+
+    def __init__(
+        self,
+        fleet: "ObserverFleet",
+        drone_ids: list[str],
+        target_boxes: list[dict],
+        home_xy: tuple[float, float] = (0.0, 1.5),
+        arena_face_xy: tuple[float, float] = (0.0, 5.4),
+        hover_above_m: float = 1.5,
+        hover_seconds: float = 4.0,
+        nav_tol_xy_m: float = 0.3,
+        nav_tol_z_m: float = 0.3,
+        auto_takeoff: bool = False,
+    ):
+        self.fleet = fleet
+        self.drone_ids = [str(d) for d in drone_ids]
+        # Normalise and index boxes
+        self.target_boxes = []
+        for i, b in enumerate(target_boxes or []):
+            try:
+                self.target_boxes.append({
+                    "idx": i,
+                    "id": b.get("id", i + 1),
+                    "x":  float(b["x"]),
+                    "y":  float(b["y"]),
+                    "home_team": b.get("home_team"),
+                })
+            except (KeyError, TypeError, ValueError):
+                continue
+        self.home_xy = (float(home_xy[0]), float(home_xy[1]))
+        self.arena_face_xy = (float(arena_face_xy[0]), float(arena_face_xy[1]))
+        self.hover_above_m = float(hover_above_m)
+        self.hover_seconds = float(hover_seconds)
+        self.nav_tol_xy_m = float(nav_tol_xy_m)
+        self.nav_tol_z_m  = float(nav_tol_z_m)
+        self.auto_takeoff = bool(auto_takeoff)
+
+        self._lock = threading.RLock()
+        self._active = False
+        self._thread: Optional[threading.Thread] = None
+        self.captured: set[int] = set()       # idx of boxes hovered over
+        self.claimed: dict[str, int] = {}     # drone_id → box idx
+        self.drones: dict[str, dict] = {}
+        self.started_at: Optional[float] = None
+        self.ended_at: Optional[float] = None
+        self.error: Optional[str] = None
+        self._trace: Optional[MissionTraceLogger] = None
+        self.trace_path: Optional[str] = None
+
+    # ── Lifecycle ─────────────────────────────────────────────────
+    def start(self):
+        with self._lock:
+            if self._active:
+                return False
+            if not self.target_boxes:
+                self.error = "no target_boxes configured"
+                return False
+            for did in self.drone_ids:
+                if self.fleet.get(did) is None:
+                    self.error = f"unknown drone id {did}"
+                    return False
+            if not self.fleet.allow_live:
+                self.error = "mission requires LIVE mode (REMOTE_NO_LIVE is set)"
+                return False
+            self._active = True
+            self.started_at = time.time()
+            self.ended_at = None
+            self.error = None
+            self.captured.clear()
+            self.claimed.clear()
+            self.drones = {
+                did: {
+                    "phase": "IDLE",
+                    "target_idx": None,
+                    "hover_start": None,
+                    "note": "",
+                    "boxes_done": 0,
+                }
+                for did in self.drone_ids
+            }
+            ts_tag = time.strftime("%Y%m%d_%H%M%S")
+            log_path = MISSION_LOG_DIR / f"mission_capture_{ts_tag}.jsonl"
+            try:
+                self._trace = MissionTraceLogger(log_path, "capture_all_targets")
+                self.trace_path = str(log_path)
+                self._trace.write("mission_start", {
+                    "drone_ids": list(self.drone_ids),
+                    "target_boxes": list(self.target_boxes),
+                    "home_xy": self.home_xy,
+                    "arena_face_xy": self.arena_face_xy,
+                    "hover_above_m": self.hover_above_m,
+                    "hover_seconds": self.hover_seconds,
+                    "auto_takeoff": self.auto_takeoff,
+                })
+                print(f"[MISSION] Capture-targets trace → {log_path}")
+            except Exception as e:
+                print(f"[MISSION] Trace init failed: {e}")
+                self._trace = None
+
+            # Start every observer in LIVE, always face arena centre
+            failed = []
+            for did in self.drone_ids:
+                obs = self.fleet.get(did)
+                obs.set_target(None)
+                obs.start()
+                if obs.set_mode("live") != "live":
+                    failed.append(did)
+                # Aim camera at arena centre from the start
+                obs.set_waypoint(None, self.arena_face_xy)
+                if self.auto_takeoff:
+                    try: obs.cmd_takeoff()
+                    except Exception: pass
+            if failed:
+                for did in self.drone_ids:
+                    o = self.fleet.get(did)
+                    if o: o.set_mode("observe")
+                self._active = False
+                self.error = f"could not switch {','.join(failed)} to LIVE"
+                return False
+            self._thread = threading.Thread(target=self._run, daemon=True,
+                                             name="mission-capture")
+            self._thread.start()
+            return True
+
+    def stop(self, land: bool = False):
+        with self._lock:
+            was_active = self._active
+            self._active = False
+            self.ended_at = time.time()
+            if self._trace:
+                self._trace.write("mission_stop", {
+                    "land": bool(land),
+                    "captured_count": len(self.captured),
+                    "target_count": len(self.target_boxes),
+                })
+        if was_active:
+            for did in self.drone_ids:
+                obs = self.fleet.get(did)
+                if obs is None:
+                    continue
+                try:
+                    obs.clear_waypoint()
+                    obs.set_search_rc(0, 0, 0, 0)
+                    obs.set_mode("observe")
+                except Exception:
+                    pass
+                if land:
+                    try:
+                        obs.set_mode("live")
+                        obs.cmd_land()
+                        obs.set_mode("observe")
+                    except Exception:
+                        pass
+        if self._trace:
+            try: self._trace.close()
+            except Exception: pass
+            self._trace = None
+
+    # ── Status snapshot ──
+    def get_status(self) -> dict:
+        with self._lock:
+            remaining = [b for b in self.target_boxes
+                         if b["idx"] not in self.captured]
+            return {
+                "active": self._active,
+                "kind": "capture_all_targets",
+                "drone_ids": list(self.drone_ids),
+                "target_boxes": list(self.target_boxes),
+                "home_xy": list(self.home_xy),
+                "arena_face_xy": list(self.arena_face_xy),
+                "hover_above_m": self.hover_above_m,
+                "hover_seconds": self.hover_seconds,
+                "captured": sorted(self.captured),
+                "remaining": [b["id"] for b in remaining],
+                "progress": f"{len(self.captured)}/{len(self.target_boxes)}",
+                "claimed": dict(self.claimed),
+                "drones": {did: dict(state) for did, state in self.drones.items()},
+                "started_at": self.started_at,
+                "ended_at": self.ended_at,
+                "error": self.error,
+                "trace_path": self.trace_path,
+            }
+
+    # ── FSM loop ──
+    def _run(self):
+        while True:
+            with self._lock:
+                if not self._active:
+                    break
+                all_done = all(
+                    d["phase"] == "DONE" for d in self.drones.values()
+                )
+            if all_done:
+                with self._lock:
+                    self._active = False
+                    self.ended_at = time.time()
+                if self._trace:
+                    self._trace.write("mission_end_auto", {"reason": "all_done"})
+                    try: self._trace.close()
+                    except Exception: pass
+                    self._trace = None
+                # Clear waypoints on all drones
+                for did in self.drone_ids:
+                    obs = self.fleet.get(did)
+                    if obs: obs.clear_waypoint()
+                break
+            for did in self.drone_ids:
+                obs = self.fleet.get(did)
+                if obs is None:
+                    continue
+                self._tick_drone(did, obs)
+            time.sleep(self.TICK_S)
+
+    def _pick_next_box(self, did: str, current_pos) -> Optional[int]:
+        """Pick the closest unclaimed, unvisited box for this drone."""
+        cands = [b for b in self.target_boxes
+                 if b["idx"] not in self.captured
+                 and b["idx"] not in self.claimed.values()]
+        if not cands:
+            return None
+        if current_pos is None:
+            return cands[0]["idx"]
+        cx, cy = float(current_pos[0]), float(current_pos[1])
+        cands.sort(key=lambda b: (b["x"] - cx) ** 2 + (b["y"] - cy) ** 2)
+        return cands[0]["idx"]
+
+    def _tick_drone(self, did: str, obs: "DroneObserver"):
+        now = time.time()
+        snap = obs.get_state()
+        running = snap.get("running")
+        pos = snap.get("pos") or snap.get("cam")
+        if not running:
+            try:
+                obs.start()
+                obs.set_mode("live")
+            except Exception:
+                pass
+            return
+
+        with self._lock:
+            state = self.drones[did]
+            phase = state["phase"]
+
+            # Select next target if IDLE
+            if phase == "IDLE":
+                idx = self._pick_next_box(did, pos)
+                if idx is None:
+                    # Nothing left to capture → go home
+                    state.update(phase="NAV_TO_HOME",
+                                 target_idx=None,
+                                 note="all boxes captured, returning home")
+                    if self._trace:
+                        self._trace.write("phase_change", {
+                            "drone": did, "from": "IDLE", "to": "NAV_TO_HOME",
+                            "reason": "no_unclaimed_boxes",
+                        })
+                    return
+                self.claimed[did] = idx
+                box = self.target_boxes[idx]
+                state.update(phase="NAV_TO_TARGET", target_idx=idx,
+                             hover_start=None,
+                             note=f"flying to box {box['id']} @ "
+                                  f"({box['x']:.1f},{box['y']:.1f})")
+                # Set waypoint: box xy, hover_above_m altitude, camera at arena centre
+                obs.set_waypoint((box["x"], box["y"], self.hover_above_m),
+                                 self.arena_face_xy)
+                if self._trace:
+                    self._trace.write("box_claimed", {
+                        "drone": did, "box_idx": idx, "box_id": box["id"],
+                        "box_xy": [box["x"], box["y"]],
+                    })
+                    self._trace.write("phase_change", {
+                        "drone": did, "from": "IDLE", "to": "NAV_TO_TARGET",
+                        "target": box["id"],
+                    })
+                return
+
+            if phase == "NAV_TO_TARGET":
+                idx = state["target_idx"]
+                if idx is None or idx not in range(len(self.target_boxes)):
+                    state["phase"] = "IDLE"
+                    return
+                box = self.target_boxes[idx]
+                if not isinstance(pos, (list, tuple)) or len(pos) < 2:
+                    state["note"] = f"→ box {box['id']}: no position fix"
+                    return
+                dx = box["x"] - float(pos[0])
+                dy = box["y"] - float(pos[1])
+                dist_xy = (dx * dx + dy * dy) ** 0.5
+                cur_z = float(pos[2]) if len(pos) >= 3 else (snap.get("altitude_m") or 0)
+                dz = self.hover_above_m - cur_z
+                if dist_xy <= self.nav_tol_xy_m and abs(dz) <= self.nav_tol_z_m:
+                    # Arrived — start the capture hover
+                    state.update(phase="HOVER", hover_start=now,
+                                 note=f"over box {box['id']} — capturing")
+                    if self._trace:
+                        self._trace.write("phase_change", {
+                            "drone": did, "from": "NAV_TO_TARGET", "to": "HOVER",
+                            "target": box["id"],
+                            "dist_xy": round(dist_xy, 2),
+                            "dz": round(dz, 2),
+                        })
+                else:
+                    state["note"] = (
+                        f"→ box {box['id']} d={dist_xy:.2f}m "
+                        f"dz={dz:+.2f}m"
+                    )
+                return
+
+            if phase == "HOVER":
+                idx = state["target_idx"]
+                if idx is None:
+                    state["phase"] = "NAV_TO_HOME"
+                    return
+                box = self.target_boxes[idx]
+                elapsed = now - (state["hover_start"] or now)
+                if elapsed >= self.hover_seconds:
+                    # Captured!
+                    self.captured.add(idx)
+                    self.claimed.pop(did, None)
+                    state["boxes_done"] += 1
+                    # Decide next action: another box or home?
+                    nxt = self._pick_next_box(did, pos)
+                    if nxt is not None:
+                        self.claimed[did] = nxt
+                        nbox = self.target_boxes[nxt]
+                        state.update(phase="NAV_TO_TARGET", target_idx=nxt,
+                                     hover_start=None,
+                                     note=f"captured {box['id']}, → box {nbox['id']}")
+                        obs.set_waypoint(
+                            (nbox["x"], nbox["y"], self.hover_above_m),
+                            self.arena_face_xy)
+                        if self._trace:
+                            self._trace.write("box_captured", {
+                                "drone": did, "box_idx": idx, "box_id": box["id"],
+                                "hover_elapsed": round(elapsed, 2),
+                            })
+                            self._trace.write("box_claimed", {
+                                "drone": did, "box_idx": nxt, "box_id": nbox["id"],
+                            })
+                    else:
+                        # No more boxes → return home
+                        obs.set_waypoint((self.home_xy[0], self.home_xy[1],
+                                          self.hover_above_m),
+                                         self.arena_face_xy)
+                        state.update(phase="NAV_TO_HOME",
+                                     target_idx=None, hover_start=None,
+                                     note=f"captured {box['id']} — returning home")
+                        if self._trace:
+                            self._trace.write("box_captured", {
+                                "drone": did, "box_idx": idx, "box_id": box["id"],
+                                "hover_elapsed": round(elapsed, 2),
+                            })
+                            self._trace.write("phase_change", {
+                                "drone": did, "from": "HOVER", "to": "NAV_TO_HOME",
+                                "reason": "all_done",
+                            })
+                else:
+                    remaining = self.hover_seconds - elapsed
+                    state["note"] = f"capturing box {box['id']}: {remaining:.1f}s left"
+                return
+
+            if phase == "NAV_TO_HOME":
+                if not isinstance(pos, (list, tuple)) or len(pos) < 2:
+                    state["note"] = "returning home (no pos fix)"
+                    return
+                dx = self.home_xy[0] - float(pos[0])
+                dy = self.home_xy[1] - float(pos[1])
+                dist_xy = (dx * dx + dy * dy) ** 0.5
+                if dist_xy <= self.nav_tol_xy_m:
+                    obs.clear_waypoint()
+                    state.update(phase="DONE",
+                                 note=f"arrived home ({state['boxes_done']} boxes)")
+                    if self._trace:
+                        self._trace.write("phase_change", {
+                            "drone": did, "from": "NAV_TO_HOME", "to": "DONE",
+                            "boxes_done": state["boxes_done"],
+                        })
+                else:
+                    state["note"] = f"→ home d={dist_xy:.2f}m"
+                return
+
+            # DONE — do nothing
+
+
 class MissionManager:
     """Single-slot holder for the currently-running special mission.
 
@@ -1446,6 +2252,34 @@ class MissionManager:
                 approach_tolerance_m=approach_tolerance_m,
                 approach_skew_tol=approach_skew_tol,
                 approach_err_x_tol=approach_err_x_tol,
+                auto_takeoff=auto_takeoff,
+            )
+            ok = m.start()
+            if not ok:
+                return False, m.error or "failed to start"
+            self._current = m
+            return True, "mission started"
+
+    def start_capture_all_targets(
+        self, drone_ids: list[str], target_boxes: list[dict],
+        home_xy: tuple = (0.0, 1.5),
+        arena_face_xy: tuple = (0.0, 5.4),
+        hover_above_m: float = 1.5,
+        hover_seconds: float = 4.0,
+        nav_tol_xy_m: float = 0.3,
+        auto_takeoff: bool = False,
+    ) -> tuple[bool, str]:
+        """Launch the capture-all-targets mission (SDC26 box-capture scoring)."""
+        with self._lock:
+            if self._current is not None and self._current._active:
+                return False, "a mission is already running — stop it first"
+            m = CaptureAllTargetsMission(
+                self.fleet, drone_ids, target_boxes,
+                home_xy=home_xy,
+                arena_face_xy=arena_face_xy,
+                hover_above_m=hover_above_m,
+                hover_seconds=hover_seconds,
+                nav_tol_xy_m=nav_tol_xy_m,
                 auto_takeoff=auto_takeoff,
             )
             ok = m.start()

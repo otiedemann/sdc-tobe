@@ -5,8 +5,12 @@ Use this file as the default guide for agentic coding tools.
 ## Scope and layout
 - Active modules:
   - `c2_interface/` (FastAPI C2 backend + web UI)
-  - `controller/` (Flask Tello Pi API + remote controller)
-  - `controller_unified/` (Flask unified Tello/Anafi API)
+  - `controller/` (Flask C2 / remote web controller — "the C2"; also
+    contains the original Tello flight-controller API, now historical)
+  - `controller_unified/` (Flask unified flight-controller API for
+    Anafi + Tello. Runs on an **x86 Linux PC** — the flight controller
+    is NOT a Raspberry Pi in the current SDC26 fleet, despite legacy
+    "Pi" naming in some files.)
   - `aruco-position/` (ArUco detection, calibration, streaming)
   - `sim_swarm/` and `sim_swarm_c2/` (simulation + viewers)
   - `drone-sim/` (HTTP/UDP simulator)
@@ -26,7 +30,9 @@ pip install -r c2_interface/requirements.txt
 pip install -r aruco-position/requirements.txt
 pip install -r controller_unified/requirements.txt
 ```
-- On ARM/Raspberry Pi, prefer `controller_unified/requirements-pi.txt`.
+- Only use `controller_unified/requirements-pi.txt` on legacy ARM hosts
+  (Raspberry Pi, Tello-only). The current flight controllers are x86
+  Linux — use the main `requirements.txt`.
 
 ## Build/run commands
 No compile step exists; run scripts/services directly.

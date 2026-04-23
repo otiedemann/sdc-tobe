@@ -1,8 +1,11 @@
-# Unified Pi API Server - Raspberry Pi (ARM) dependencies
-# Tello-only: Olympe SDK is not available on ARM
+# LEGACY dependency set for ARM hosts (Raspberry Pi). Current SDC26
+# deployments use x86 Linux flight-controllers + Anafi via Olympe —
+# see requirements.txt for that. This file only exists for backwards
+# compatibility with Tello-only ARM setups.
 # Install with: pip install -r requirements-pi.txt
 
 flask
+flask-sock        # WebSocket endpoints for low-latency C2↔FC channel
 djitellopy
 opencv-python-headless
 numpy

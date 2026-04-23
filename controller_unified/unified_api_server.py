@@ -39,7 +39,11 @@ except ImportError:
 import json as _json
 
 # ---------------------------------------------------------------------------
-# Architecture detection — skip Olympe on Raspberry Pi (ARM)
+# Architecture detection. The SDC26 flight controller is an x86 Linux
+# box running Olympe + Anafi (NOT a Raspberry Pi — comments and module
+# names may still say "Pi" for historical reasons, but the host is x86).
+# The ARM / Tello-only fallback below is legacy for older deployments;
+# safe to leave in place, simply not exercised in the current fleet.
 # ---------------------------------------------------------------------------
 import platform
 
@@ -81,6 +85,19 @@ if not IS_ARM:
         from olympe.messages.ardrone3.Animations import Flip
         from olympe.messages.ardrone3.SpeedSettings import MaxRotationSpeed, MaxVerticalSpeed
         from olympe.messages.ardrone3.PilotingSettings import MaxAltitude, MaxTilt
+        try:
+            # Confirmation state — drone ACKs the MaxAltitude command by
+            # emitting this message. Reading it back lets us VERIFY the
+            # firmware accepted the value (vs silently clamping to its
+            # own range). Some Olympe versions don't expose this — we
+            # just skip the verify if so.
+            from olympe.messages.ardrone3.PilotingSettingsState import (
+                MaxAltitudeChanged,
+            )
+            _HAS_MAXALT_STATE = True
+        except Exception:
+            MaxAltitudeChanged = None
+            _HAS_MAXALT_STATE = False
         HAS_OLYMPE_SDK = True
     except (ImportError, KeyError):
         pass
@@ -243,6 +260,11 @@ def _magneto_needs_calibration(status: Optional[str]) -> bool:
     except (ImportError, KeyError):
         pass
     try:
+        from olympe.messages.camera import set_zoom_target as _CameraSetZoom
+        HAS_CAMERA_ZOOM = True
+    except (ImportError, KeyError):
+        HAS_CAMERA_ZOOM = False
+    try:
         from olympe.messages.gimbal import set_target, attitude as gimbal_attitude
         HAS_GIMBAL = True
     except (ImportError, KeyError):
@@ -307,7 +329,34 @@ RC_HZ = 20
 STICK = 60
 YAW_STICK_ANAFI = 90
 MAX_YAW_SPEED = 150
-MAX_ALTITUDE_M = float(os.getenv("MAX_ALTITUDE_M", "2.0"))
+MAX_ALTITUDE_M = float(os.getenv("MAX_ALTITUDE_M", "5.0"))
+# Hard ceiling guard — runtime state surfaced via /api/config/ceiling and
+# read in the RC tick loop. `_ceiling_engaged` flashes True whenever the
+# guard clamps or overrides an RC command; `_ceiling_last_reason` is a
+# human-readable explanation surfaced in /api/telemetry for UI banners.
+_ceiling_engaged: bool = False
+_ceiling_last_reason: str = ""
+
+# ── Arena XY boundary guard (Pi-side, applies to ALL RC) ─────────────
+# Previously only the autonomous observer enforced a safety margin from
+# arena walls. If the operator flew manually (WASD) or took off near a
+# wall, nothing clamped the RC — which is how a recent flight ended up
+# inside the net at y=10.95 (arena back wall y=10.8). This guard runs
+# in the Pi's own rc_loop so it applies to BOTH transport paths (WS +
+# HTTP) and BOTH control modes (manual + autonomous). Values persisted
+# to flight_config.json.
+_ARENA_BOUNDS_DEFAULT = {
+    "x_min": -10.0, "x_max": 10.0,
+    "y_min":   0.0, "y_max": 10.8,
+}
+_arena_bounds: dict = dict(_ARENA_BOUNDS_DEFAULT)
+_arena_margin_m: float = float(os.getenv("ARENA_SAFETY_MARGIN_M", "1.5"))
+# Toggle: applies to BOTH manual and autonomous flight. Default ON.
+# When OFF the Pi's RC tick makes no XY boundary decisions — operator
+# takes full responsibility. The altitude ceiling remains on regardless.
+_arena_guard_enabled: bool = os.getenv("ARENA_GUARD_ENABLED", "1") not in {"0", "false", "False"}
+_arena_engaged: bool = False
+_arena_last_reason: str = ""
 MAX_VERTICAL_SPEED = float(os.getenv("MAX_VERTICAL_SPEED", "0.5"))
 MAX_TILT = float(os.getenv("MAX_TILT", "15"))
 CONNECT_RETRY_S = 3.0
@@ -356,6 +405,48 @@ def _host_reachable(host: str) -> bool:
     return r.returncode == 0
 
 
+def _ping_rtt_ms(host: str, timeout_s: float = 0.8) -> Optional[float]:
+    """Return the round-trip time in milliseconds to `host`, or None on
+    failure. Uses a single ICMP echo. Parses `time=XX.X ms` from the
+    `ping` output — works on both macOS and Linux.
+    """
+    try:
+        # -c 1: one packet; -W ms or s depending on OS. BSD ping uses
+        # -W ms (integer), Linux ping uses -W seconds (integer). Use
+        # large enough timeout for both: -W 1 second is portable.
+        r = subprocess.run(
+            ["ping", "-c", "1", "-W", "1", host],
+            capture_output=True, text=True, timeout=timeout_s)
+        if r.returncode != 0:
+            return None
+        import re as _re
+        m = _re.search(r"time[=<]([\d.]+)\s*ms", r.stdout)
+        return float(m.group(1)) if m else None
+    except Exception:
+        return None
+
+
+# Background ping sampler — keeps a rolling RTT to drone_ip so /api/drone_ping
+# can return the current value instantly (ping takes ~1s so we don't want the
+# web request to block on it).
+_drone_ping_state = {"rtt_ms": None, "last_update": 0.0, "host": ""}
+_drone_ping_lock = threading.Lock()
+
+
+def _drone_ping_loop():
+    """Runs in the background. Pings the drone once per second and
+    caches the latest RTT so /api/drone_ping returns immediately."""
+    while running:
+        host = drone_ip
+        if host:
+            rtt = _ping_rtt_ms(host, timeout_s=1.2)
+            with _drone_ping_lock:
+                _drone_ping_state["rtt_ms"] = rtt
+                _drone_ping_state["last_update"] = time.time()
+                _drone_ping_state["host"] = host
+        time.sleep(1.0)
+
+
 def detect_drone_type() -> Tuple[str, str]:
     """Returns (drone_type, drone_ip). drone_type is 'tello' or 'anafi'."""
     forced_type = os.getenv("DRONE_TYPE", "").lower().strip()
@@ -381,7 +472,9 @@ def detect_drone_type() -> Tuple[str, str]:
 
     print("[UNIFIED] Auto-detecting drone type...")
 
-    # On ARM (Raspberry Pi), only Tello is supported (no Olympe SDK)
+    # On ARM hosts only Tello is supported (no Olympe SDK). The
+    # current SDC26 flight controller is x86 Linux, so this branch
+    # is only hit on legacy setups.
     if IS_ARM:
         if _host_reachable(tello_ip):
             print(f"[UNIFIED] Tello detected at {tello_ip}")
@@ -405,6 +498,38 @@ def detect_drone_type() -> Tuple[str, str]:
 # Global state (shared across backends)
 # ---------------------------------------------------------------------------
 app = Flask(__name__)
+
+# ── WebSocket channel (C2 ↔ this FC) ──────────────────────────────────
+# Three endpoints that exist alongside the HTTP API and carry the same
+# payloads without the TCP+HTTP framing overhead per call. Falls back to
+# "import flask_sock" so an older Pi without the package still runs;
+# only the HTTP endpoints will be available there.
+try:
+    from flask_sock import Sock as _Sock
+    sock = _Sock(app)
+    HAS_WS = True
+except Exception as _e:
+    sock = None
+    HAS_WS = False
+    print(f"[WS] flask-sock not available ({_e}) — WS endpoints disabled")
+
+# Grab simple-websocket's ConnectionClosed so we can silence the (very
+# chatty) "Connection closed: 1000" message on clean client disconnects.
+# 1000 is the RFC 6455 "normal closure" code — not an error condition.
+try:
+    from simple_websocket import ConnectionClosed as _WSConnectionClosed
+except Exception:
+    _WSConnectionClosed = None
+
+
+def _ws_is_clean_close(exc: Exception) -> bool:
+    """True if the exception represents a clean peer disconnect. We
+    treat these as info, not errors — otherwise every reconnect logs
+    a scary-looking stack trace."""
+    if _WSConnectionClosed is not None and isinstance(exc, _WSConnectionClosed):
+        return True
+    msg = str(exc)
+    return "Connection closed" in msg or "1000" in msg
 
 
 # Enum-aware JSON encoder. Olympe returns enum instances (class `band`,
@@ -506,6 +631,14 @@ _telemetry_sync_lock = threading.Lock()
 
 command_lock = threading.Lock()
 discrete_until = 0.0
+# Dedicated lock for discrete_until reads/writes. MUST NOT be the same
+# as command_lock — Olympe blocking calls (takeoff/land/flip) hold
+# command_lock for up to 10 s per attempt × 3 retries. If the RC tick
+# loop also waited on command_lock for the brief discrete_until read,
+# every keystroke during that window would stall, then all queued
+# keys would slam the drone simultaneously once Olympe released. That
+# was the 10-18 s WASD delay after the second takeoff.
+discrete_lock = threading.Lock()
 takeoff_cooldown_until = 0.0
 safe_takeoff_enabled = SAFE_TAKEOFF_DEFAULT
 
@@ -572,7 +705,99 @@ _pos_cfg: dict = {
     "top_k_markers": 0,     # 0 = auto (code picks best 4); set to limit further
     "outlier_reject_m": 2.5,  # max distance from centroid before an estimate is dropped
     "imu_weight": 0.3,      # 0.0 = pure ArUco, 1.0 = pure IMU dead-reckoning
+    # Multiplicative correction on the camera↔marker distance estimated by
+    # solvePnP. 1.0 = no correction. Use to compensate for systematic
+    # scale error caused by marker_size_m mismatch or uncalibrated focal
+    # length. Field example: UI reads 7 m, real distance is 9 m →
+    # distance_scale = 9/7 ≈ 1.286.
+    "distance_scale":       1.0,
+    # ── Precision tuning (mirrors ctrl_position.py module constants) ──
+    # Exposed over the UI so operators can tighten / loosen the fusion
+    # without a server restart. Values here get pushed into the running
+    # positioner via live-patch in /api/position/config POST.
+    "pose_hold_sec":        0.8,    # keep publishing pose for N s after last valid fix
+    "min_ref_count":        1,      # min visible markers for a fused pose
+    "min_ref_weight":       0.0,    # min weight of best reference marker
+    "meas_blend_min":       0.35,   # EMA α lower bound (high-quality fixes)
+    "meas_blend_max":       0.85,   # EMA α upper bound (low-quality fixes)
+    "vel_blend":            0.25,   # IMU vel (0) ↔ Kalman-state vel (1) blend
+    "max_state_dt":         1.0,    # reset state if more than N s between updates
+    "kalman_process_var":   1e-3,   # Q — process-noise variance per axis
+    "kalman_meas_var":      1e-1,   # R — measurement-noise variance per axis
+    # ── IMU low-pass filter (first-order IIR) ───────────────────────
+    # Applied to vgx/vgy/vgz (body-frame velocity, cm/s) at telemetry
+    # ingestion time. Downstream: the position fusion + the sync buffer
+    # both see the filtered values. Set 0 (or negative) to disable.
+    # Default 5 Hz cut-off smooths Anafi's noisy per-sample velocity
+    # without dulling reaction to actual rapid moves.
+    "imu_lowpass_hz":       5.0,
+    # Seen-marker hold time (seconds). A marker that's been detected
+    # within this window still appears as "seen" even if the current
+    # frame missed it. Stops the arena-view halos flickering on
+    # single-frame detection dropouts — the per-frame detection rate
+    # is still visible on seen_markers_raw for diagnostics.
+    "seen_hold_s":          0.6,
 }
+
+
+# ── IMU low-pass filter state ────────────────────────────────────────
+# First-order IIR with configurable cut-off frequency. Applied per-axis
+# to the body-frame velocity components (vgx, vgy, vgz). The filter
+# uses a time-based alpha (alpha = dt / (tau + dt)) so it handles
+# the uneven telemetry cadence correctly.
+_imu_lpf_lock = threading.Lock()
+_imu_lpf_state: dict = {
+    "vgx": None, "vgy": None, "vgz": None,
+    "last_ts": 0.0,
+}
+
+
+def _apply_imu_lpf(vgx, vgy, vgz, ts_mono: float) -> tuple:
+    """Filter one telemetry sample of body-frame velocity.
+
+    Returns (vgx_f, vgy_f, vgz_f) — smoothed values, or the originals
+    unchanged if the filter is disabled (cut-off <= 0) or any input is
+    None (stale sample). Thread-safe; used from the Anafi telemetry
+    callback.
+    """
+    with _pos_cfg_lock:
+        fc = float(_pos_cfg.get("imu_lowpass_hz", 0.0) or 0.0)
+    if fc <= 0.0:
+        # Filter disabled — reset state so re-enable starts cleanly.
+        with _imu_lpf_lock:
+            _imu_lpf_state["vgx"] = None
+            _imu_lpf_state["vgy"] = None
+            _imu_lpf_state["vgz"] = None
+        return vgx, vgy, vgz
+    # Any None axis → bypass this sample (nothing to filter), but
+    # don't drop the other axes. Keeps the pipeline robust to partial
+    # telemetry gaps.
+    if vgx is None and vgy is None and vgz is None:
+        return vgx, vgy, vgz
+
+    with _imu_lpf_lock:
+        last = _imu_lpf_state["last_ts"]
+        dt = ts_mono - last if last > 0 else 1.0 / max(1e-3, fc)
+        # Clamp dt to a sane range — first sample or long-gap recovery
+        # should not slam the filter into a corner.
+        dt = max(1e-3, min(1.0, dt))
+        tau = 1.0 / (2.0 * math.pi * fc)
+        alpha = dt / (tau + dt)
+
+        def _step(prev, x):
+            if x is None:
+                return prev   # keep last value if sample missing
+            if prev is None:
+                return float(x)
+            return prev + alpha * (float(x) - prev)
+
+        _imu_lpf_state["vgx"] = _step(_imu_lpf_state["vgx"], vgx)
+        _imu_lpf_state["vgy"] = _step(_imu_lpf_state["vgy"], vgy)
+        _imu_lpf_state["vgz"] = _step(_imu_lpf_state["vgz"], vgz)
+        _imu_lpf_state["last_ts"] = ts_mono
+        return (_imu_lpf_state["vgx"],
+                _imu_lpf_state["vgy"],
+                _imu_lpf_state["vgz"])
 
 # Arena config — SDC challenge default layout.
 # Coordinates: X = left(-10) / right(+10), Y = near(0) / far(10), Z = low(-1) / high(+1).
@@ -637,8 +862,19 @@ def _save_arena_config(cfg: dict):
 
 
 def _load_flight_config():
-    """Apply persisted flight limits to globals on startup."""
+    """Apply persisted flight limits to globals on startup.
+
+    The ceiling (MAX_ALTITUDE_M) is the most important one here: it's
+    enforced by THIS process's RC tick loop (20 Hz, see rc_loop()) and
+    is independent of any remote/C2 connection. If the C2 is down, the
+    Pi still reads MAX_ALTITUDE_M every tick and clamps any upward RC
+    that would take the drone past it. That's why persisting the value
+    to disk matters — after a Pi restart the guard must come back up
+    with the operator's last-set value, not just the compile-time
+    default.
+    """
     global MAX_ALTITUDE_M, MAX_VERTICAL_SPEED, MAX_TILT, MAX_YAW_SPEED
+    global _arena_margin_m, _arena_bounds
     try:
         if FLIGHT_CONFIG_PATH.exists():
             data = json.loads(FLIGHT_CONFIG_PATH.read_text())
@@ -650,14 +886,26 @@ def _load_flight_config():
                 MAX_TILT = float(data["max_tilt"])
             if "max_yaw_speed" in data:
                 MAX_YAW_SPEED = float(data["max_yaw_speed"])
+            if "arena_safety_margin_m" in data:
+                _arena_margin_m = float(data["arena_safety_margin_m"])
+            if "arena_bounds" in data and isinstance(data["arena_bounds"], dict):
+                for k, v in data["arena_bounds"].items():
+                    if k in _arena_bounds:
+                        _arena_bounds[k] = float(v)
             print(f"[UNIFIED] Loaded flight config: alt={MAX_ALTITUDE_M} vs={MAX_VERTICAL_SPEED} tilt={MAX_TILT} yaw={MAX_YAW_SPEED}")
+            print(f"[CEILING] Pi-side safety ceiling: {MAX_ALTITUDE_M:.2f} m (loaded from {FLIGHT_CONFIG_PATH.name})")
+            print(f"[CEILING] Enforced every RC tick, independent of C2 connection.")
+            print(f"[ARENA]   Pi-side safety margin: {_arena_margin_m:.2f} m "
+                  f"bounds=x[{_arena_bounds['x_min']},{_arena_bounds['x_max']}] "
+                  f"y[{_arena_bounds['y_min']},{_arena_bounds['y_max']}]")
     except Exception as e:
         print(f"[UNIFIED] flight_config load error: {e}")
 
 
 def _save_flight_config(results: dict):
     """Persist any successfully-updated flight limit to flight_config.json."""
-    keys = {"max_altitude_m", "max_vertical_speed", "max_tilt", "max_yaw_speed"}
+    keys = {"max_altitude_m", "max_vertical_speed", "max_tilt", "max_yaw_speed",
+            "arena_safety_margin_m", "arena_bounds"}
     if not any(k in results for k in keys):
         return
     try:
@@ -754,7 +1002,7 @@ def append_command_log(event: str, payload: dict | None = None):
 
 def start_discrete_window(seconds: float):
     global discrete_until
-    with command_lock:
+    with discrete_lock:
         discrete_until = max(discrete_until, time.time() + max(0.0, seconds))
 
 
@@ -2229,9 +2477,33 @@ class OlympeBackend(DroneBackend):
         if "max_altitude_m" in data:
             v = max(0.5, min(150, float(data["max_altitude_m"])))
             try:
+                # Send the SDK command (ardrone3.PilotingSettings.MaxAltitude).
+                # This is exactly the "MaxAltitude" setting the Anafi
+                # autopilot uses internally — we send it via the Olympe
+                # SDK, not a custom layer.
                 d(MaxAltitude(v)).wait(_timeout=2)
                 MAX_ALTITUDE_M = v
                 results["max_altitude_m"] = v
+
+                # Verification — read the drone's CONFIRMED MaxAltitude
+                # state. The drone may clamp to its own [min..max] range
+                # silently; the state tells us what it actually accepted.
+                if _HAS_MAXALT_STATE:
+                    try:
+                        st = d.get_state(MaxAltitudeChanged)
+                        if st and "current" in st:
+                            accepted = float(st["current"])
+                            results["max_altitude_m_firmware_current"] = accepted
+                            if abs(accepted - v) > 0.05:
+                                print(f"[ANAFI] MaxAltitude: requested {v}m, "
+                                      f"drone accepted {accepted}m (clamped by firmware)")
+                            else:
+                                print(f"[ANAFI] MaxAltitude: {accepted}m confirmed by drone")
+                        if st and "min" in st and "max" in st:
+                            results["max_altitude_m_firmware_range"] = [
+                                float(st["min"]), float(st["max"])]
+                    except Exception as e:
+                        results["max_altitude_m_verify_error"] = str(e)[:120]
             except Exception as e:
                 results["max_altitude_m_error"] = str(e)
         if "max_vertical_speed" in data:
@@ -2275,7 +2547,26 @@ class OlympeBackend(DroneBackend):
         return results
 
     # --- Video (Anafi MJPEG / UDP forward) ---
+    # Class-level mutex so two concurrent callers can't both see
+    # "_video_streaming == False" and each fire their own d.streaming.start().
+    # That race was leaking VideoDecoder#N on every near-simultaneous call.
+    _video_start_mutex = threading.Lock()
+
     def video_start_mjpeg(self) -> Tuple[bool, str]:
+        """Start (or re-use) the Anafi MJPEG pipeline.
+
+        IDEMPOTENT *AND* MUTUALLY EXCLUSIVE — the class-level
+        _video_start_mutex prevents two concurrent callers from both
+        entering d.streaming.start(). Prior versions, even with the
+        "already streaming?" check, could race: thread A reads flag
+        False, thread B reads flag False, both call start(). Olympe
+        spawns two decoders. Mutex fixes that.
+
+        Also resets the flag if the drone connection was lost — a
+        reconnect must rebuild the stream from scratch, otherwise
+        the flag stays stuck True and subsequent calls are silent
+        no-ops against a disconnected drone.
+        """
         global _video_mode, _video_last_jpeg, _video_frame_count, _video_streaming
         d = self._d()
         if d is None:
@@ -2283,42 +2574,60 @@ class OlympeBackend(DroneBackend):
         if not HAS_CV2:
             return False, "cv2 not installed — pip install opencv-python-headless"
 
-        # Detect API
-        api = "none"
-        if hasattr(d, "streaming") and hasattr(d.streaming, "set_callbacks"):
-            api = "modern"
-        elif hasattr(d, "set_streaming_callbacks"):
-            api = "legacy"
-        print(f"[ANAFI] Olympe streaming API: {api}")
+        with self.__class__._video_start_mutex:
+            # Re-check inside the mutex — another thread may have started
+            # the stream while we were waiting.
+            if _video_streaming and _video_mode == "mjpeg":
+                print("[ANAFI] video_start_mjpeg: already streaming, skipping")
+                return True, "mjpeg already streaming"
 
-        _video_mode = "mjpeg"
-        _video_last_jpeg = b""
-        _video_frame_count = 0
+            # If we were in forward mode or half-started, tear down FIRST so
+            # Olympe can release its decoder before we request a new one.
+            if _video_streaming:
+                print("[ANAFI] video_start_mjpeg: stopping previous stream before restart")
+                try:
+                    self.video_stop_mjpeg()
+                except Exception:
+                    pass
+                time.sleep(0.3)   # let Olympe tear down before we re-start
 
-        if api == "modern":
-            try:
-                d.streaming.set_callbacks(
-                    raw_cb=self._video_frame_cb,
-                    flush_raw_cb=self._video_flush_cb,
-                )
-                d.streaming.start()
-                _video_streaming = True
-                return True, "mjpeg started (modern)"
-            except Exception as e:
-                print(f"[ANAFI] Modern streaming failed: {e}")
-                if hasattr(d, "set_streaming_callbacks"):
-                    api = "legacy"
+            # Detect API — still inside the mutex so no concurrent caller
+            # can race between detection and start.
+            api = "none"
+            if hasattr(d, "streaming") and hasattr(d.streaming, "set_callbacks"):
+                api = "modern"
+            elif hasattr(d, "set_streaming_callbacks"):
+                api = "legacy"
+            print(f"[ANAFI] Olympe streaming API: {api}")
 
-        if api == "legacy":
-            try:
-                d.set_streaming_callbacks(raw_cb=self._video_frame_cb)
-                d.start_video_streaming()
-                _video_streaming = True
-                return True, "mjpeg started (legacy)"
-            except Exception as e:
-                return False, f"legacy streaming failed: {e}"
+            _video_mode = "mjpeg"
+            _video_last_jpeg = b""
+            _video_frame_count = 0
 
-        return False, "no streaming API in this Olympe version"
+            if api == "modern":
+                try:
+                    d.streaming.set_callbacks(
+                        raw_cb=self._video_frame_cb,
+                        flush_raw_cb=self._video_flush_cb,
+                    )
+                    d.streaming.start()
+                    _video_streaming = True
+                    return True, "mjpeg started (modern)"
+                except Exception as e:
+                    print(f"[ANAFI] Modern streaming failed: {e}")
+                    if hasattr(d, "set_streaming_callbacks"):
+                        api = "legacy"
+
+            if api == "legacy":
+                try:
+                    d.set_streaming_callbacks(raw_cb=self._video_frame_cb)
+                    d.start_video_streaming()
+                    _video_streaming = True
+                    return True, "mjpeg started (legacy)"
+                except Exception as e:
+                    return False, f"legacy streaming failed: {e}"
+
+            return False, "no streaming API in this Olympe version"
 
     def video_stop_mjpeg(self):
         global _video_streaming, _video_last_jpeg
@@ -2544,7 +2853,7 @@ def telemetry_loop():
                     conn_state["connected"] = True
                     print(f"[{drone_type.upper()}] Connection detected via telemetry")
         if sdk_flying is not None:
-            with command_lock:
+            with discrete_lock:
                 in_discrete = time.time() < discrete_until
             if not in_discrete:
                 flying = sdk_flying
@@ -2553,7 +2862,19 @@ def telemetry_loop():
         vgx = data.get("vgx") or 0
         vgy = data.get("vgy") or 0
         vgz = data.get("vgz") or 0
+
+        # ── IMU low-pass filter ──────────────────────────────────
+        # Runs before any downstream consumer sees these values, so
+        # both the telemetry dict and the sync buffer used for
+        # position fusion see the filtered velocity. The raw values
+        # are preserved on a suffixed key for diagnostics.
         if vgx or vgy or vgz:
+            vgx_f, vgy_f, vgz_f = _apply_imu_lpf(vgx, vgy, vgz, loop_mono)
+            data["vgx_raw"], data["vgy_raw"], data["vgz_raw"] = vgx, vgy, vgz
+            data["vgx"] = round(float(vgx_f), 3) if vgx_f is not None else vgx
+            data["vgy"] = round(float(vgy_f), 3) if vgy_f is not None else vgy
+            data["vgz"] = round(float(vgz_f), 3) if vgz_f is not None else vgz
+            vgx, vgy, vgz = data["vgx"], data["vgy"], data["vgz"]
             data["speed"] = round((vgx**2 + vgy**2 + vgz**2) ** 0.5, 1)
 
         with conn_lock:
@@ -2615,10 +2936,16 @@ def reconnect_loop():
             print(f"[{tag}] Drone connected" if connected_now else f"[{tag}] Drone disconnected (retrying...)")
             last_conn_print = connected_now
             if connected_now:
-                # Success — reset failure counter
                 with conn_lock:
                     conn_state["consecutive_failures"] = 0
                     conn_state["last_error"] = ""
+            else:
+                # Drone dropped — reset the video-streaming flag so the
+                # next video_start_mjpeg call actually restarts the
+                # pipeline against the NEW connection instead of being
+                # silently skipped ("already streaming").
+                global _video_streaming
+                _video_streaming = False
 
         # Health check while connected
         if connected_now:
@@ -2771,14 +3098,172 @@ def rc_loop():
             elif rc_override is not None:
                 rc_override = None
 
-        # Altitude fence (Anafi)
-        if b.has_altitude_fence():
-            with telemetry_lock:
-                cur_h = telemetry.get("height_cm")
-            if cur_h is not None and cur_h >= MAX_ALTITUDE_M * 100 and ud > 0:
-                ud = 0
+        # ══════════════════════════════════════════════════════════════
+        # Hard altitude ceiling — active in BOTH manual and autonomous flight.
+        #
+        # Our drone crashed into the roof once because:
+        #   - The firmware MaxAltitude setting can be relaxed / ignored
+        #     in indoor mode (where there's no GPS, only TOF/baro).
+        #   - The old fence only zeroed positive ud when already at/above
+        #     ceiling — no anticipation, no forced descent.
+        #
+        # New behaviour:
+        #   - approaching zone  (h ≥ ceiling − APPROACH_MARGIN)  → clamp ud
+        #                                                         proportionally
+        #                                                         to remaining
+        #                                                         clearance.
+        #   - at ceiling        (h ≥ ceiling)                   → block all
+        #                                                         upward RC.
+        #   - above ceiling     (h ≥ ceiling + HARD_OVERSHOOT)   → force
+        #                                                         active descent
+        #                                                         regardless of
+        #                                                         any input. The
+        #                                                         drone yields
+        #                                                         before the
+        #                                                         pilot does.
+        #
+        # Applies unconditionally (no has_altitude_fence() gate) because we
+        # don't care whether the firmware thinks it has a fence — height_cm
+        # comes from TOF/baro and is what matters.
+        global _ceiling_engaged, _ceiling_last_reason
+        with telemetry_lock:
+            cur_h_cm = telemetry.get("height_cm")
+        _ceiling_engaged = False
+        _ceiling_last_reason = ""
+        if cur_h_cm is not None:
+            ceil_cm = max(30, int(MAX_ALTITUDE_M * 100))
+            APPROACH_MARGIN_CM = 50   # start easing off 50 cm below ceiling
+            HARD_OVERSHOOT_CM = 20    # force descent if >20 cm above ceiling
+            DESCENT_RC = 18           # gentle but authoritative push-down
+            over_cm = cur_h_cm - ceil_cm
+            if over_cm >= HARD_OVERSHOOT_CM:
+                # Already above the ceiling by a meaningful margin — stop
+                # arguing with the operator, push the drone down ourselves.
+                ud = -max(DESCENT_RC, abs(int(ud))) if ud < 0 else -DESCENT_RC
+                _ceiling_engaged = True
+                _ceiling_last_reason = (
+                    f"above ceiling: {cur_h_cm/100:.2f}m > {MAX_ALTITUDE_M:.2f}m, forcing descent"
+                )
+            elif over_cm >= 0:
+                # Right at or just above — block any climb, allow descent.
+                if ud > 0:
+                    ud = 0
+                _ceiling_engaged = True
+                _ceiling_last_reason = (
+                    f"at ceiling: {cur_h_cm/100:.2f}m ≥ {MAX_ALTITUDE_M:.2f}m, climb blocked"
+                )
+            elif over_cm >= -APPROACH_MARGIN_CM and ud > 0:
+                # Approaching — clamp proportionally. 50cm→full input,
+                # 0cm→zero. Prevents the drone from smashing the ceiling
+                # under its own momentum when the pilot releases the stick.
+                remaining = (-over_cm) / APPROACH_MARGIN_CM   # 0..1
+                cap = max(1, int(STICK * remaining))
+                if ud > cap:
+                    ud = cap
+                _ceiling_engaged = True
+                _ceiling_last_reason = (
+                    f"approaching ceiling: {cur_h_cm/100:.2f}m, climb capped to {cap}% "
+                    f"(clearance {-over_cm}cm)"
+                )
+        # Soft floor — never let a descent command push us into the ground.
+        FLOOR_CM = 15    # Anafi TOF minimum, roughly
+        if cur_h_cm is not None and cur_h_cm <= FLOOR_CM and ud < 0:
+            ud = 0
 
-        with command_lock:
+        # ══════════════════════════════════════════════════════════════
+        # Arena XY boundary guard — enforced on EVERY RC command,
+        # manual or autonomous. Reads the arena-frame pose published by
+        # the position processor (_pos_st) and, if the drone is within
+        # _arena_margin_m of any wall AND the current RC vector would
+        # push it closer, clamps the offending axis to zero (or reverses
+        # it if we've already overshot the margin).
+        #
+        # Applies to manual WASD → the old path where this was missing
+        # — that's how the recent flight ended up at y=10.95 past the
+        # y=10.8 back wall.
+        #
+        # Falls back silently when the positioner has no fresh fix
+        # (stale=True or never published). In that case the boundary
+        # guard contributes nothing; the operator is responsible.
+        global _arena_engaged, _arena_last_reason
+        _arena_engaged = False
+        _arena_last_reason = ""
+        try:
+            with _pos_st_lock:
+                px = _pos_st.get("x")
+                py = _pos_st.get("y")
+                pos_stale = _pos_st.get("stale", True)
+                dx_dir    = _pos_st.get("dx")
+                dy_dir    = _pos_st.get("dy")
+        except Exception:
+            px = py = None
+            pos_stale = True
+            dx_dir = dy_dir = None
+
+        if (_arena_guard_enabled and
+                px is not None and py is not None and not pos_stale):
+            margin = float(_arena_margin_m)
+            xmin, xmax = _arena_bounds["x_min"], _arena_bounds["x_max"]
+            ymin, ymax = _arena_bounds["y_min"], _arena_bounds["y_max"]
+
+            # Distance to each wall — negative means already past the margin.
+            clearance = {
+                "x_max": xmax - px - margin,
+                "x_min": (px - xmin) - margin,
+                "y_max": ymax - py - margin,
+                "y_min": (py - ymin) - margin,
+            }
+
+            # RC interpretation: convert body-frame RC (lr, fb) to world-
+            # frame intent using the drone's current heading (from the
+            # position processor's dx/dy direction vector — already
+            # normalised). Using position-processor direction avoids
+            # chasing compass-yaw drift.
+            #
+            # Convention (matches _apply_boundary_guard in aruco_seek):
+            #   body +fb  → world  dir  (dx, dy)
+            #   body +lr  → world  right (cos, -sin) where yaw atan2(dx,dy)
+            dx = float(dx_dir) if dx_dir is not None else 0.0
+            dy = float(dy_dir) if dy_dir is not None else 1.0
+            # Right-vector perpendicular to heading (90° CW in world XY):
+            rx = dy
+            ry = -dx
+            wdx = lr * rx + fb * dx
+            wdy = lr * ry + fb * dy
+
+            actions = []
+            # x max (right wall)
+            if clearance["x_max"] <= 0 and wdx > 0:
+                wdx = 0
+                actions.append("clamp-x_max")
+            # x min (left wall)
+            if clearance["x_min"] <= 0 and wdx < 0:
+                wdx = 0
+                actions.append("clamp-x_min")
+            # y max (back wall / net)
+            if clearance["y_max"] <= 0 and wdy > 0:
+                wdy = 0
+                actions.append("clamp-y_max")
+            # y min (front wall)
+            if clearance["y_min"] <= 0 and wdy < 0:
+                wdy = 0
+                actions.append("clamp-y_min")
+
+            if actions:
+                # Convert world-frame intent back to body-frame RC.
+                # inv rotation: lr = wdx·rx + wdy·ry; fb = wdx·dx + wdy·dy
+                # (rx,ry) and (dx,dy) are orthonormal so transpose = inverse.
+                lr = int(round(wdx * rx + wdy * ry))
+                fb = int(round(wdx * dx + wdy * dy))
+                _arena_engaged = True
+                _arena_last_reason = (
+                    f"near wall: pos=({px:.2f},{py:.2f}) "
+                    f"clear=x[{clearance['x_max']:.2f},{clearance['x_min']:.2f}] "
+                    f"y[{clearance['y_max']:.2f},{clearance['y_min']:.2f}] "
+                    f"actions={','.join(actions)}"
+                )
+
+        with discrete_lock:
             in_discrete = now < discrete_until
 
         if in_discrete:
@@ -2891,6 +3376,21 @@ def api_heartbeat():
     with conn_lock:
         connected = conn_state["connected"]
     return jsonify(ok=True, flying=flying, connected=connected, drone_type=drone_type, t=time.time())
+
+
+@app.get("/api/drone_ping")
+def api_drone_ping():
+    """Return the flight-controller → drone ICMP ping RTT in milliseconds.
+    The value is sampled once per second by a background thread
+    (_drone_ping_loop) so this endpoint returns immediately with the
+    most recent measurement. None means the last ping timed out."""
+    with _drone_ping_lock:
+        st = dict(_drone_ping_state)
+    age_s = time.time() - st["last_update"] if st.get("last_update") else None
+    return jsonify(ok=True,
+                   rtt_ms=st.get("rtt_ms"),
+                   host=st.get("host") or drone_ip,
+                   sample_age_s=round(age_s, 2) if age_s is not None else None)
 
 
 @app.get("/api/magneto")
@@ -3337,6 +3837,51 @@ def api_key_up():
     return jsonify(ok=True)
 
 
+@app.post("/api/key_batch")
+def api_key_batch():
+    """Refresh a batch of held keys in a single request.
+
+    Replaces the pattern where the C2 used to fire N separate POSTs —
+    one per held key — every 100 ms. At 3 held keys × 10 Hz that was
+    30 HTTP requests/sec just for key-holding, and it saturated the
+    browser's 6-connection pool whenever a WS fallback was in play.
+    Body: {"keys": ["w", "a"]}
+    """
+    data = request.get_json(silent=True) or {}
+    keys = data.get("keys", [])
+    if not isinstance(keys, list):
+        return jsonify(ok=False, error="keys must be a list"), 400
+    for k in keys:
+        if k:
+            add_key(str(k))
+    return jsonify(ok=True, n=len(keys))
+
+
+def _auto_record_after_takeoff(grace_s: float = 2.5):
+    """Background one-shot: wait `grace_s` for the C2-side FlightLogger to
+    start its own (matched-name) recording; if nothing is recording by then,
+    start a fallback recording with a default timestamp filename. Ensures
+    every flight leaves a video on disk even without a C2 in the loop.
+    """
+    try:
+        time.sleep(grace_s)
+        if not flying:
+            return  # already landed in the grace window
+        with _rec_lock:
+            already = _rec_enabled
+        if already:
+            return  # C2 FlightLogger (or someone else) won the race — good
+        ts = time.strftime("%Y-%m-%d_%H-%M-%S", time.localtime())
+        fname = f"flight_{ts}_auto.mp4"
+        ok, payload = _start_recording_internal(fname=fname, raw=False)
+        if ok:
+            print(f"[REC] Auto-record fallback triggered after takeoff: {fname}")
+        else:
+            print(f"[REC] Auto-record fallback skipped: {payload}")
+    except Exception as e:
+        print(f"[REC] Auto-record fallback error: {e}")
+
+
 @app.post("/api/takeoff")
 def api_takeoff():
     global flying, takeoff_cooldown_until
@@ -3355,6 +3900,18 @@ def api_takeoff():
             if ok:
                 flying = True
                 takeoff_cooldown_until = time.time() + hold_s
+                # Belt-and-braces: ensure every flight is recorded. The C2
+                # FlightLogger normally fires /api/video/record/start with a
+                # matched-name mp4 within ~1 s of seeing flying=True; this
+                # thread is the fallback for C2-less operation.
+                try:
+                    threading.Thread(
+                        target=_auto_record_after_takeoff,
+                        kwargs={"grace_s": 2.5},
+                        daemon=True, name="auto-record",
+                    ).start()
+                except Exception as te:
+                    print(f"[REC] Could not spawn auto-record thread: {te}")
             else:
                 print(f"[{drone_type.upper()}] Takeoff returned ok=False msg={msg}")
                 return jsonify(ok=False, error=msg), 500
@@ -3392,6 +3949,15 @@ def api_land():
         b.after_discrete_command()
         if ok:
             flying = False
+            # Close any auto-started recording so its mp4 is properly
+            # finalised on disk. If C2's FlightLogger is the one driving
+            # recording it will call /api/video/record/stop itself; doing
+            # it here as well is idempotent (the second call returns
+            # ok=False "not recording", which we ignore).
+            try:
+                _stop_recording_internal(reason="land")
+            except Exception as se:
+                print(f"[REC] Auto-stop on land failed: {se}")
             return jsonify(ok=True, flying=False)
         print(f"[{drone_type.upper()}] Land returned ok=False msg={msg}")
         return jsonify(ok=False, error=msg), 500
@@ -3659,6 +4225,35 @@ def api_camera_record_stop():
     return jsonify(ok=ok, recording=False) if ok else (jsonify(ok=False, error=msg), 501 if msg == "not_supported" else 500)
 
 
+@app.post("/api/camera/zoom")
+def api_camera_zoom():
+    """Set the Anafi's digital camera zoom.
+    Body: {"zoom": 1.0..3.0}  (1.0 = no zoom, 3.0 = max 3× digital).
+    Implemented via Olympe's camera.set_zoom_target with control_mode=level.
+    """
+    if not HAS_CAMERA_ZOOM:
+        return jsonify(ok=False, error="camera zoom not supported "
+                                        "by this Olympe build"), 501
+    b = backend
+    if b is None or not isinstance(b, OlympeBackend) or b.drone is None:
+        return jsonify(ok=False, error="drone not connected"), 503
+    data = request.get_json(silent=True) or {}
+    try:
+        z = float(data.get("zoom", 1.0))
+    except Exception:
+        return jsonify(ok=False, error="zoom must be numeric"), 400
+    # Clamp — Anafi digital zoom range is 1.0..3.0.
+    z = max(1.0, min(3.0, z))
+    try:
+        with command_lock:
+            # control_mode="level" = absolute zoom level; "velocity" = rate.
+            b.drone(_CameraSetZoom(cam_id=0, control_mode="level",
+                                    target=z)).wait(_timeout=2)
+        return jsonify(ok=True, zoom=z)
+    except Exception as e:
+        return jsonify(ok=False, error=str(e)), 500
+
+
 @app.post("/api/gimbal")
 def api_gimbal():
     b = backend
@@ -3786,9 +4381,386 @@ def api_settings_set():
     return jsonify(ok=True, **results)
 
 
+@app.get("/api/config/ceiling")
+def api_ceiling_get():
+    """Return the active soft-ceiling and live guard state, plus the
+    drone's firmware-confirmed MaxAltitude so the operator can verify
+    the SDK-level limit matches our software guard.
+    """
+    firmware_current = None
+    firmware_range   = None
+    try:
+        b = backend
+        if b is not None and _HAS_MAXALT_STATE and MaxAltitudeChanged is not None:
+            d = getattr(b, "drone", None)
+            if d is not None:
+                st = d.get_state(MaxAltitudeChanged)
+                if st:
+                    if "current" in st:
+                        firmware_current = round(float(st["current"]), 2)
+                    if "min" in st and "max" in st:
+                        firmware_range = [round(float(st["min"]), 2),
+                                          round(float(st["max"]), 2)]
+    except Exception:
+        pass
+    return jsonify(
+        ok=True,
+        ceiling_m=round(float(MAX_ALTITUDE_M), 2),
+        engaged=bool(_ceiling_engaged),
+        reason=_ceiling_last_reason,
+        firmware_max_altitude=firmware_current,
+        firmware_range=firmware_range,
+        persisted_to=str(FLIGHT_CONFIG_PATH),
+    )
+
+
+@app.post("/api/config/ceiling")
+def api_ceiling_set():
+    """Set the soft ceiling (metres above ground). Also pushes the same
+    value to the Anafi firmware MaxAltitude where supported — belt and
+    braces, because the firmware limit gets enforced by the drone's own
+    autopilot and is a useful second line of defence."""
+    global MAX_ALTITUDE_M
+    data = request.get_json(silent=True) or {}
+    try:
+        v = float(data.get("ceiling_m") or data.get("max_altitude_m"))
+    except (TypeError, ValueError):
+        return jsonify(ok=False, error="ceiling_m required (float, metres)"), 400
+    v = max(0.5, min(150.0, v))
+    MAX_ALTITUDE_M = v
+    firmware_result = None
+    # Also try to apply the firmware cap — don't let its failure veto
+    # the software ceiling, since the software one is the real safety.
+    b = backend
+    try:
+        if b is not None and hasattr(b, "set_settings"):
+            r = b.set_settings({"max_altitude_m": v})
+            firmware_result = r.get("max_altitude_m", r.get("max_altitude_m_error"))
+    except Exception as e:
+        firmware_result = f"firmware_error: {e}"
+    # Persist so a server restart keeps the value
+    try:
+        _save_flight_config({"max_altitude_m": v})
+    except Exception:
+        pass
+    print(f"[CEILING] set to {v}m (firmware={firmware_result})")
+    return jsonify(ok=True, ceiling_m=v, firmware_result=firmware_result)
+
+
+@app.get("/api/config/arena_safety")
+def api_arena_safety_get():
+    """Return Pi-side arena boundary guard state + config.
+
+    The guard runs in rc_loop() for EVERY RC tick (manual + autonomous),
+    so it enforces the margin whether the operator is piloting by hand
+    or a mission is active. Independent of C2 connection.
+    """
+    return jsonify(
+        ok=True,
+        enabled=bool(_arena_guard_enabled),
+        margin_m=round(float(_arena_margin_m), 2),
+        bounds=dict(_arena_bounds),
+        engaged=bool(_arena_engaged),
+        reason=_arena_last_reason,
+        persisted_to=str(FLIGHT_CONFIG_PATH),
+    )
+
+
+@app.post("/api/config/arena_safety")
+def api_arena_safety_set():
+    """Update arena safety: any subset of
+      {"enabled": bool, "margin_m": float, "bounds": {x_min, x_max, y_min, y_max}}"""
+    global _arena_guard_enabled, _arena_margin_m, _arena_bounds
+    data = request.get_json(silent=True) or {}
+    changed: dict = {}
+    if "enabled" in data:
+        _arena_guard_enabled = bool(data["enabled"])
+        changed["enabled"] = _arena_guard_enabled
+    if "margin_m" in data:
+        try:
+            v = max(0.0, min(5.0, float(data["margin_m"])))
+            _arena_margin_m = v
+            changed["margin_m"] = v
+        except (TypeError, ValueError):
+            pass
+    if "bounds" in data and isinstance(data["bounds"], dict):
+        for k, v in data["bounds"].items():
+            if k in _arena_bounds:
+                try:
+                    _arena_bounds[k] = float(v)
+                except (TypeError, ValueError):
+                    pass
+        changed["bounds"] = dict(_arena_bounds)
+    # Persist so a Pi restart keeps operator intent
+    try:
+        _save_flight_config({
+            "arena_safety_margin_m": _arena_margin_m,
+            "arena_bounds":           dict(_arena_bounds),
+        })
+    except Exception:
+        pass
+    print(f"[ARENA] guard {_arena_guard_enabled and 'ON' or 'OFF'} margin={_arena_margin_m}m "
+          f"bounds={_arena_bounds} (changed={changed})")
+    return jsonify(ok=True, changed=changed,
+                   enabled=_arena_guard_enabled, margin_m=_arena_margin_m,
+                   bounds=dict(_arena_bounds))
+
+
+@app.get("/api/diagnostics")
+def api_diagnostics():
+    """Pi-side health snapshot — thread count, internal buffer sizes.
+    Use from the C2 when chasing "degrades-over-time" symptoms. The
+    counters that matter are the ones that should NOT grow
+    monotonically across flights: thread count, pressed_web size,
+    telemetry buffer length. Video frame-count is expected to grow.
+    """
+    import threading as _th
+    threads = _th.enumerate()
+    by_name: dict[str, int] = {}
+    for t in threads:
+        # Collapse numbered worker threads so the counts stay readable
+        name = t.name
+        for prefix in ("ThreadPoolExecutor-", "Thread-"):
+            if name.startswith(prefix):
+                name = prefix + "*"
+                break
+        by_name[name] = by_name.get(name, 0) + 1
+
+    with telemetry_lock:
+        tel_snap = len(telemetry)
+    with pressed_lock:
+        pressed = sorted(pressed_web)
+    with _telemetry_sync_lock:
+        tel_buf_len = len(_telemetry_sync_buf)
+    with _pos_sse_lock:
+        sse_clients = len(_pos_sse_queues)
+        ws_pos_clients = len(_pos_ws_queues)
+
+    return jsonify(
+        ok=True,
+        thread_count=len(threads),
+        threads_by_name=by_name,
+        telemetry_keys=tel_snap,
+        pressed_web=pressed,
+        telemetry_sync_buffer_len=tel_buf_len,
+        pos_sse_clients=sse_clients,
+        pos_ws_clients=ws_pos_clients,
+        video_mode=_video_mode,
+        video_streaming=_video_streaming,
+        video_frame_count=_video_frame_count,
+        flying=flying,
+        connected=bool(conn_state.get("connected", False)),
+        # Safety state — proves the ceiling is Pi-enforced even with
+        # no remote/C2 connection. `ceiling_source` tells you where
+        # the current value came from (config file or env default).
+        ceiling={
+            "ceiling_m":        round(float(MAX_ALTITUDE_M), 2),
+            "engaged":          bool(_ceiling_engaged),
+            "reason":           _ceiling_last_reason or "",
+            "config_file":      str(FLIGHT_CONFIG_PATH),
+            "config_persists":  FLIGHT_CONFIG_PATH.exists(),
+            "enforced_by":      "pi.rc_loop @ 20Hz (independent of C2)",
+        },
+    )
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# WebSocket endpoints — low-latency C2 ↔ FC channel
+# ═══════════════════════════════════════════════════════════════════════
+#
+# Three long-lived WS connections replace the highest-rate HTTP polls:
+#
+#   /ws/telemetry  — server-push at TELEMETRY_HZ (no framing per call)
+#   /ws/position   — server-push on every pose update (same cadence as
+#                    the existing SSE stream, but lower overhead)
+#   /ws/rc         — bidirectional. C2 sends {type:"rc",lr,fb,ud,yaw}
+#                    or {type:"key",event,key}; server applies them and
+#                    acks.
+#
+# The endpoints only exist if flask-sock was importable (HAS_WS). When
+# missing, the HTTP endpoints keep working unchanged.
+
+if HAS_WS:
+    # Server-side heartbeat cadence. Short enough that the C2 client's
+    # recv timeout (8 s on telemetry/position pull loops) sees a ping
+    # before it gives up and reconnects — otherwise every 5–8 seconds
+    # of idle positions / telemetry caused a churn cycle.
+    _WS_PING_INTERVAL_S = 3.0
+
+    @sock.route("/ws/telemetry")
+    def ws_telemetry(ws):
+        """Pushes one telemetry JSON per (1/TELEMETRY_HZ) seconds. Stops
+        the moment the client disconnects. Wrapped in try/except because
+        the receiver can close mid-send and raises ConnectionClosed —
+        that's a clean close, not an error condition."""
+        _ws_set_nodelay(ws)
+        try:
+            ws.send(json.dumps({
+                "type": "hello", "service": "telemetry",
+                "drone_type": drone_type, "hz": TELEMETRY_HZ,
+                "server_ts": time.time(),
+            }))
+            period = 1.0 / max(0.5, float(TELEMETRY_HZ))
+            last_ping = time.time()
+            while running:
+                t0 = time.time()
+                payload = _build_telemetry_payload()
+                payload["type"] = "telemetry"
+                payload["server_ts"] = t0
+                try:
+                    ws.send(json.dumps(payload, default=str))
+                except Exception as e:
+                    if _ws_is_clean_close(e):
+                        return
+                    raise
+                if t0 - last_ping > _WS_PING_INTERVAL_S:
+                    try:
+                        ws.send(json.dumps({"type": "ping", "server_ts": t0}))
+                        last_ping = t0
+                    except Exception as e:
+                        if _ws_is_clean_close(e):
+                            return
+                        raise
+                dt = time.time() - t0
+                time.sleep(max(0.01, period - dt))
+        except Exception as e:
+            if not _ws_is_clean_close(e):
+                print(f"[WS] /ws/telemetry error: {e}")
+
+    @sock.route("/ws/position")
+    def ws_position(ws):
+        """Pushes a payload on every position update. Piggybacks the
+        existing broadcast queue (_pos_ws_queues) so there's zero extra
+        work in the positioner loop.
+
+        Idle behaviour: the positioner only emits when detections arrive.
+        Between frames we send a heartbeat every _WS_PING_INTERVAL_S so
+        the client's recv never times out; otherwise a parked drone with
+        no detections produces a reconnect loop (see _ws_is_clean_close)."""
+        _ws_set_nodelay(ws)
+        q: queue.Queue = queue.Queue(maxsize=30)
+        with _pos_sse_lock:
+            _pos_ws_queues.append(q)
+        try:
+            ws.send(json.dumps({
+                "type": "hello", "service": "position",
+                "server_ts": time.time(),
+            }))
+            last_ping = time.time()
+            while running:
+                try:
+                    # Short queue timeout so we can issue heartbeats even
+                    # when the positioner is silent.
+                    msg = q.get(timeout=2.0)
+                    ws.send(msg)
+                except queue.Empty:
+                    now = time.time()
+                    if now - last_ping > _WS_PING_INTERVAL_S:
+                        try:
+                            ws.send(json.dumps({"type": "ping", "server_ts": now}))
+                            last_ping = now
+                        except Exception as e:
+                            if _ws_is_clean_close(e):
+                                return
+                            raise
+                except Exception as e:
+                    # Clean peer close is expected — don't log as error.
+                    if _ws_is_clean_close(e):
+                        return
+                    raise
+        except Exception as e:
+            if not _ws_is_clean_close(e):
+                print(f"[WS] /ws/position error: {e}")
+        finally:
+            with _pos_sse_lock:
+                try:
+                    _pos_ws_queues.remove(q)
+                except ValueError:
+                    pass
+
+    def _ws_set_nodelay(ws):
+        """Set TCP_NODELAY on the underlying socket so small RC frames
+        aren't batched by Nagle's algorithm. flask-sock exposes the raw
+        socket via `ws.sock` (simple-websocket) — grab it defensively
+        in case the API varies."""
+        try:
+            import socket as _sock
+            raw = getattr(ws, "sock", None) or getattr(ws, "_sock", None)
+            if raw is not None and hasattr(raw, "setsockopt"):
+                raw.setsockopt(_sock.IPPROTO_TCP, _sock.TCP_NODELAY, 1)
+                raw.setsockopt(_sock.SOL_SOCKET,  _sock.SO_KEEPALIVE, 1)
+        except Exception:
+            pass
+
+    @sock.route("/ws/rc")
+    def ws_rc(ws):
+        """Bidirectional RC channel.
+
+            {"type":"rc",  "lr":0, "fb":0, "ud":0, "yaw":0, "duration_ms":250}
+            {"type":"key", "event":"down"|"up", "key":"w"}
+            {"type":"ping","client_ts":<unix>}  → replies with pong
+
+        Fire-and-forget by default — no ACKs. The client prefers short
+        latency over confirmation; a missed frame is corrected on the
+        next one. Applies to the same rc_override / pressed_web globals
+        that /api/rc and /api/key_down write, so the tick loop picks it
+        up without caring about the transport."""
+        global rc_override, rc_override_until
+        _ws_set_nodelay(ws)
+        try:
+            ws.send(json.dumps({
+                "type": "hello", "service": "rc", "server_ts": time.time(),
+            }))
+            while running:
+                try:
+                    msg = ws.receive(timeout=20.0)
+                except Exception:
+                    return
+                if msg is None:
+                    return
+                try:
+                    data = json.loads(msg)
+                except Exception:
+                    continue
+                mtype = data.get("type")
+                if mtype == "rc":
+                    def clamp(v):
+                        try:    return max(-100, min(100, int(v)))
+                        except: return 0
+                    lr  = clamp(data.get("lr", 0))
+                    fb  = clamp(data.get("fb", 0))
+                    ud  = clamp(data.get("ud", 0))
+                    yaw = clamp(data.get("yaw", 0))
+                    dur = max(50, min(2000, int(data.get("duration_ms", 250))))
+                    with rc_lock:
+                        rc_override = (lr, fb, ud, yaw)
+                        rc_override_until = time.time() + (dur / 1000.0)
+                elif mtype == "key":
+                    ev = (data.get("event") or "").lower()
+                    k  = str(data.get("key") or "").lower()
+                    if k:
+                        if ev == "down": add_key(k)
+                        elif ev == "up": remove_key(k)
+                elif mtype == "ping":
+                    # Respond so the client can measure RTT.
+                    try:
+                        ws.send(json.dumps({
+                            "type": "pong",
+                            "server_ts": time.time(),
+                            "echo": data.get("client_ts"),
+                        }))
+                    except Exception:
+                        return
+        except Exception as e:
+            if not _ws_is_clean_close(e):
+                print(f"[WS] /ws/rc error: {e}")
+
+
 # --- Telemetry endpoints ---
-@app.get("/api/telemetry")
-def api_telemetry():
+def _build_telemetry_payload() -> dict:
+    """Shared telemetry builder used by both HTTP (/api/telemetry) and
+    WebSocket (/ws/telemetry) paths so every consumer sees identical
+    fields with a single implementation to maintain."""
     now = time.time()
     age = (now - last_state_seen) if last_state_seen else 9999.0
     with telemetry_lock:
@@ -3796,14 +4768,16 @@ def api_telemetry():
     payload["state_age_s"] = round(age, 3)
     payload["state_fresh"] = age <= 2.0
     payload["drone_type"] = drone_type
-    # Connection watchdog telemetry — lets the C2 show reconnect activity
     with conn_lock:
         payload["connected"] = bool(conn_state.get("connected", False))
         payload["reconnect_failures"] = int(conn_state.get("consecutive_failures", 0))
         payload["reconnect_last_error"] = conn_state.get("last_error", "") or ""
-    # Magnetometer calibration status (Anafi only) so the C2 can show a
-    # "CAL NEEDED" indicator. Read defensively because older Olympe versions
-    # may not have the calibration messages at all.
+    payload["ceiling_m"] = round(float(MAX_ALTITUDE_M), 2)
+    payload["ceiling_engaged"] = bool(_ceiling_engaged)
+    payload["ceiling_reason"] = _ceiling_last_reason or ""
+    payload["arena_margin_m"] = round(float(_arena_margin_m), 2)
+    payload["arena_engaged"] = bool(_arena_engaged)
+    payload["arena_reason"] = _arena_last_reason or ""
     try:
         b = backend
         reader = getattr(b, "_read_magnetometer_state", None) if b else None
@@ -3813,6 +4787,12 @@ def api_telemetry():
             payload["magneto_required"] = _magneto_needs_calibration(mag)
     except Exception:
         pass
+    return payload
+
+
+@app.get("/api/telemetry")
+def api_telemetry():
+    payload = _build_telemetry_payload()
     resp = jsonify(payload)
     resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
     resp.headers["Pragma"] = "no-cache"
@@ -3962,17 +4942,31 @@ def _pos_snapshot_to_js(snapshot: dict) -> dict:
     }
 
 
+_pos_ws_queues: list = []        # list[queue.Queue] — one per /ws/position client
+
+
 def _broadcast_pos_sse(snapshot: dict):
-    msg = f"data: {json.dumps(_pos_snapshot_to_js(snapshot))}\n\n"
+    payload = _pos_snapshot_to_js(snapshot)
+    msg_sse = f"data: {json.dumps(payload)}\n\n"
+    msg_ws  = json.dumps({"type": "position", **payload, "ts": time.time()})
     with _pos_sse_lock:
         dead = []
         for q in _pos_sse_queues:
             try:
-                q.put_nowait(msg)
+                q.put_nowait(msg_sse)
             except queue.Full:
                 dead.append(q)
         for q in dead:
             _pos_sse_queues.remove(q)
+        # Same snapshot to every WS client subscribed to /ws/position.
+        dead = []
+        for q in _pos_ws_queues:
+            try:
+                q.put_nowait(msg_ws)
+            except queue.Full:
+                dead.append(q)
+        for q in dead:
+            _pos_ws_queues.remove(q)
 
 
 def _default_camera_matrix_pos(frame_w: int, frame_h: int):
@@ -4081,11 +5075,13 @@ def positioning_loop():
                     if cfg_marker:
                         init_marker_size = float(cfg_marker)
                     init_kalman = bool(_pos_cfg.get("enable_kalman_filter", True))
+                    init_dist_scale = float(_pos_cfg.get("distance_scale", 1.0))
                 processor = _HeadlessAruCo(cam_mat, dist, detect_profile=profile,
                                            marker_size=init_marker_size, enable_kalman_filter=init_kalman)
                 _apply_arena_cfg_to_processor(processor)
+                processor.distance_scale = init_dist_scale
                 _pos_processor = processor
-                print(f"[POS] Processor initialised (profile={profile})")
+                print(f"[POS] Processor initialised (profile={profile}, distance_scale={init_dist_scale:.4f})")
             except Exception as ie:
                 print(f"[POS] Processor init error: {ie}")
                 time.sleep(1)
@@ -4176,6 +5172,32 @@ def positioning_loop():
             _pos_fps_counter = 0
             _pos_fps_last_reset = _fps_now
 
+        # ── Seen-marker hold-time (hysteresis) ───────────────────────
+        # ArUco detection isn't perfectly reliable per frame — blur,
+        # glare, or extreme angle can cause a single-frame miss. The
+        # UI halos would then flicker even though the camera is still
+        # pointed at the marker. We keep a per-marker last-seen
+        # timestamp and treat any marker seen within HOLD_S as still
+        # visible, smoothing single-frame drops.
+        _SEEN_HOLD_S = float(_pos_cfg.get("seen_hold_s", 0.6))
+        fresh_ids = [str(m) for m in (result.get("seen_markers") or [])]
+        now_mono = time.monotonic()
+        if not hasattr(positioning_loop, "_seen_last"):
+            positioning_loop._seen_last = {}   # marker_id → last monotonic ts
+        seen_last: dict = positioning_loop._seen_last
+        for mid in fresh_ids:
+            seen_last[mid] = now_mono
+        # Prune really stale entries so the dict doesn't grow forever.
+        cutoff = now_mono - max(_SEEN_HOLD_S, 2.0)
+        for mid in [k for k, ts in seen_last.items() if ts < cutoff]:
+            del seen_last[mid]
+        # Build the hysteresis-smoothed list: every marker seen within
+        # HOLD_S counts. Preserve detection order: most recently-seen first.
+        held_ids = sorted(
+            (mid for mid, ts in seen_last.items() if (now_mono - ts) <= _SEEN_HOLD_S),
+            key=lambda m: seen_last[m], reverse=True,
+        )
+
         with _pos_st_lock:
             if cam is not None:
                 _pos_st["x"] = round(float(cam[0]), 4)
@@ -4187,7 +5209,11 @@ def positioning_loop():
             _pos_st["markers"] = {str(k): round(float(v), 4)
                                    for k, v in (result.get("marker_weights") or {}).items()}
             _pos_st["ref_markers"] = list(result.get("ref_markers") or [])
-            _pos_st["seen_markers"] = list(result.get("seen_markers") or [])
+            # Publish the SMOOTHED list so the UI halos don't flicker.
+            # The raw per-frame detections are still available for
+            # diagnostics / flight-log accuracy on "seen_markers_raw".
+            _pos_st["seen_markers"]     = held_ids
+            _pos_st["seen_markers_raw"] = fresh_ids
             _pos_st["seen_count"] = int(result.get("seen_count") or 0)
             _pos_st["stale"] = stale
             _pos_st["ts"] = ts
@@ -4324,18 +5350,49 @@ def api_rec_status():
         return jsonify(ok=True, recording=_rec_enabled, raw=_rec_raw, path=_rec_path, frames=_rec_frame_count)
 
 
-@app.post("/api/video/record/start")
-def api_rec_start():
+def _ensure_mjpeg_streaming(reason: str = "recording") -> tuple[bool, str]:
+    """Make sure the MJPEG video pipeline is actively streaming so that the
+    video callback fires and feeds _pos_frame_q. Without this, `_rec_enabled`
+    flips to True but no frames ever arrive → VideoWriter never gets created
+    → the mp4 file is never written (the old "no video" bug).
+
+    Idempotent — safe to call whether or not the stream is already running.
+    """
+    global _video_mode
+    b = backend
+    if b is None:
+        return False, "backend not ready"
+    if _video_streaming and _video_mode == "mjpeg":
+        return True, "already streaming"
+    try:
+        ok, msg = b.video_start_mjpeg()
+        if ok:
+            _video_mode = "mjpeg"
+            print(f"[REC] Auto-started MJPEG pipeline for {reason}")
+            return True, msg
+        print(f"[REC] Auto-start MJPEG failed ({reason}): {msg}")
+        return False, msg
+    except Exception as e:
+        print(f"[REC] Auto-start MJPEG exception ({reason}): {e}")
+        return False, str(e)
+
+
+def _start_recording_internal(fname: str | None, raw: bool) -> tuple[bool, dict]:
+    """Internal helper shared by /api/video/record/start and the post-takeoff
+    auto-record fallback. Arms recording (deferred writer) and ensures the
+    MJPEG pipeline is running so frames actually flow.
+
+    Returns (ok, payload). On conflict (already recording) ok=False with
+    error='already recording' and the current path.
+    """
     global _rec_enabled, _rec_raw, _rec_writer, _rec_path, _rec_frame_count
     global _rec_fname, _rec_fps_target, _rec_writer_size
-    data = request.get_json(silent=True) or {}
     with _rec_lock:
         if _rec_enabled:
-            return jsonify(ok=False, error="already recording", path=_rec_path)
-        raw_mode = bool(data.get("raw", False))
+            return False, {"error": "already recording", "path": _rec_path}
+        raw_mode = bool(raw)
         suffix = "_raw" if raw_mode else "_ann"
-        fname = data.get("filename") or f"rec{suffix}_{int(time.time())}.mp4"
-        # Ensure recordings dir exists
+        fname = fname or f"rec{suffix}_{int(time.time())}.mp4"
         rec_dir = Path(__file__).parent / "recordings"
         rec_dir.mkdir(exist_ok=True)
         full_path = str(rec_dir / fname)
@@ -4352,15 +5409,33 @@ def api_rec_start():
         _rec_fps_target = float(_pos_fps_current or 5.0)
         _rec_enabled = True
         print(f"[REC] Recording armed ({'raw' if raw_mode else 'annotated'}): {full_path} — waiting for first frame")
-        return jsonify(ok=True, path=full_path)
+    # Kick the MJPEG pipeline AFTER releasing the rec lock to avoid any
+    # lock-ordering surprises with the video callback.
+    mjpeg_ok, mjpeg_msg = _ensure_mjpeg_streaming(reason="record/start")
+    return True, {"path": full_path, "mjpeg_ok": mjpeg_ok, "mjpeg_msg": mjpeg_msg}
 
 
-@app.post("/api/video/record/stop")
-def api_rec_stop():
+@app.post("/api/video/record/start")
+def api_rec_start():
+    data = request.get_json(silent=True) or {}
+    ok, payload = _start_recording_internal(
+        fname=data.get("filename"),
+        raw=bool(data.get("raw", False)),
+    )
+    if not ok:
+        return jsonify(ok=False, **payload)
+    return jsonify(ok=True, **payload)
+
+
+def _stop_recording_internal(reason: str = "manual") -> tuple[bool, dict]:
+    """Internal helper shared by /api/video/record/stop and the auto-stop
+    on land. Returns (ok, payload). Idempotent — returns ok=False with
+    'not recording' if nothing is active.
+    """
     global _rec_enabled, _rec_writer, _rec_path, _rec_frame_count
     with _rec_lock:
         if not _rec_enabled:
-            return jsonify(ok=False, error="not recording")
+            return False, {"error": "not recording"}
         _rec_enabled = False
         frames = _rec_frame_count
         path = _rec_path
@@ -4370,8 +5445,49 @@ def api_rec_stop():
                 _rec_writer = None
         except Exception:
             pass
-        print(f"[REC] Recording stopped: {path} ({frames} frames)")
-    return jsonify(ok=True, path=path, frames=frames)
+        print(f"[REC] Recording stopped ({reason}): {path} ({frames} frames)")
+    return True, {"path": path, "frames": frames}
+
+
+@app.post("/api/video/record/stop")
+def api_rec_stop():
+    ok, payload = _stop_recording_internal(reason="api")
+    if not ok:
+        return jsonify(ok=False, **payload)
+    return jsonify(ok=True, **payload)
+
+
+@app.get("/api/video/recordings")
+def api_rec_list():
+    """List every video in the recordings folder. Used by the C2 to
+    pair per-flight mp4 files with their matching flight-log JSONL."""
+    rec_dir = Path(__file__).parent / "recordings"
+    if not rec_dir.exists():
+        return jsonify(ok=True, files=[])
+    out = []
+    for p in sorted(rec_dir.glob("*.mp4"), reverse=True):
+        try:
+            st = p.stat()
+            out.append({"name": p.name, "size": st.st_size,
+                        "mtime": st.st_mtime})
+        except Exception:
+            continue
+    return jsonify(ok=True, files=out)
+
+
+@app.get("/api/video/recordings/<path:name>")
+def api_rec_download(name):
+    """Download a specific recording. Rejects path-traversal attempts."""
+    rec_dir = (Path(__file__).parent / "recordings").resolve()
+    target = (rec_dir / name).resolve()
+    try:
+        target.relative_to(rec_dir)
+    except ValueError:
+        return jsonify(ok=False, error="invalid path"), 403
+    if not target.exists():
+        return jsonify(ok=False, error="not found"), 404
+    return send_file(str(target), mimetype="video/mp4",
+                     as_attachment=True, download_name=target.name)
 
 
 @app.get("/api/position/config")
@@ -4418,6 +5534,40 @@ def api_pos_config_set():
             _pos_cfg["outlier_reject_m"] = max(0.1, min(20.0, float(data["outlier_reject_m"])))
         if "imu_weight" in data:
             _pos_cfg["imu_weight"] = max(0.0, min(1.0, float(data["imu_weight"])))
+        if "distance_scale" in data:
+            # Clamped to [0.1, 5.0] — anything outside that range is almost
+            # certainly a typo / bad input. 1.0 = no correction.
+            _pos_cfg["distance_scale"] = max(0.1, min(5.0, float(data["distance_scale"])))
+        # Extended tuning — all affect ctrl_position.py's multi-marker fusion
+        if "pose_hold_sec" in data:
+            _pos_cfg["pose_hold_sec"] = max(0.0, min(10.0, float(data["pose_hold_sec"])))
+        if "min_ref_count" in data:
+            _pos_cfg["min_ref_count"] = max(1, min(12, int(data["min_ref_count"])))
+        if "min_ref_weight" in data:
+            _pos_cfg["min_ref_weight"] = max(0.0, min(1.0, float(data["min_ref_weight"])))
+        if "meas_blend_min" in data:
+            _pos_cfg["meas_blend_min"] = max(0.0, min(1.0, float(data["meas_blend_min"])))
+        if "meas_blend_max" in data:
+            _pos_cfg["meas_blend_max"] = max(0.0, min(1.0, float(data["meas_blend_max"])))
+        if "vel_blend" in data:
+            _pos_cfg["vel_blend"] = max(0.0, min(1.0, float(data["vel_blend"])))
+        if "max_state_dt" in data:
+            _pos_cfg["max_state_dt"] = max(0.05, min(10.0, float(data["max_state_dt"])))
+        if "kalman_process_var" in data:
+            _pos_cfg["kalman_process_var"] = max(1e-6, min(10.0, float(data["kalman_process_var"])))
+        if "kalman_meas_var" in data:
+            _pos_cfg["kalman_meas_var"] = max(1e-6, min(10.0, float(data["kalman_meas_var"])))
+        if "imu_lowpass_hz" in data:
+            # 0 (or negative) disables the filter. Positive values clamp
+            # to [0.1, 100] Hz — below 0.1 Hz it's basically DC-only,
+            # above 100 Hz the filter adds nothing useful at TELEMETRY_HZ.
+            v = float(data["imu_lowpass_hz"])
+            _pos_cfg["imu_lowpass_hz"] = 0.0 if v <= 0 else max(0.1, min(100.0, v))
+        if "seen_hold_s" in data:
+            # 0 disables hysteresis (halo reflects per-frame detection
+            # exactly). Positive values clamped 0..3 s.
+            v = float(data["seen_hold_s"])
+            _pos_cfg["seen_hold_s"] = max(0.0, min(3.0, v))
         cfg_snap = dict(_pos_cfg)
 
     # Apply live filter changes to running processor
@@ -4445,6 +5595,43 @@ def api_pos_config_set():
             if "outlier_reject_m" in data:
                 _pos_processor.outlier_reject_m = float(cfg_snap["outlier_reject_m"])
                 print(f"[POS] outlier_reject_m set to {cfg_snap['outlier_reject_m']}m (live)")
+            if "distance_scale" in data:
+                _pos_processor.distance_scale = float(cfg_snap["distance_scale"])
+                print(f"[POS] distance_scale = {cfg_snap['distance_scale']:.4f}× (live)")
+            # ── Extended tuning → patched as module globals on ctrl_position
+            # because the fusion code reads them as module-level constants. ──
+            import ctrl_position as _cp
+            if "pose_hold_sec" in data:
+                _cp.POSE_HOLD_SEC = float(cfg_snap["pose_hold_sec"])
+                print(f"[POS] pose_hold_sec = {_cp.POSE_HOLD_SEC}s (live)")
+            if "min_ref_count" in data:
+                _cp.MIN_REF_COUNT = int(cfg_snap["min_ref_count"])
+                print(f"[POS] min_ref_count = {_cp.MIN_REF_COUNT} (live)")
+            if "min_ref_weight" in data:
+                _cp.MIN_REF_WEIGHT = float(cfg_snap["min_ref_weight"])
+                print(f"[POS] min_ref_weight = {_cp.MIN_REF_WEIGHT} (live)")
+            if "meas_blend_min" in data:
+                _cp.MEAS_BLEND_MIN = float(cfg_snap["meas_blend_min"])
+                print(f"[POS] meas_blend_min = {_cp.MEAS_BLEND_MIN} (live)")
+            if "meas_blend_max" in data:
+                _cp.MEAS_BLEND_MAX = float(cfg_snap["meas_blend_max"])
+                print(f"[POS] meas_blend_max = {_cp.MEAS_BLEND_MAX} (live)")
+            if "vel_blend" in data:
+                _cp.VEL_BLEND = float(cfg_snap["vel_blend"])
+                print(f"[POS] vel_blend = {_cp.VEL_BLEND} (live)")
+            if "max_state_dt" in data:
+                _cp.MAX_STATE_DT = float(cfg_snap["max_state_dt"])
+                print(f"[POS] max_state_dt = {_cp.MAX_STATE_DT}s (live)")
+            if "kalman_process_var" in data:
+                v = float(cfg_snap["kalman_process_var"])
+                for kf in _pos_processor.kf_pos:
+                    kf.process_variance = v
+                print(f"[POS] kalman_process_var = {v} (live, per-axis)")
+            if "kalman_meas_var" in data:
+                v = float(cfg_snap["kalman_meas_var"])
+                for kf in _pos_processor.kf_pos:
+                    kf.measurement_variance = v
+                print(f"[POS] kalman_meas_var = {v} (live, per-axis)")
     except Exception as e:
         print(f"[POS] live config apply error: {e}")
 
@@ -4572,6 +5759,8 @@ def main():
     threading.Thread(target=reconnect_loop, daemon=True).start()
     threading.Thread(target=rc_loop, daemon=True).start()
     threading.Thread(target=watchdog_loop, daemon=True).start()
+    threading.Thread(target=_drone_ping_loop, daemon=True,
+                     name="drone-ping").start()
 
     # Load persisted flight limits
     _load_flight_config()
@@ -4593,7 +5782,7 @@ def main():
     print(f"[{tag}] Unified API server: http://{HTTP_HOST}:{HTTP_PORT}")
     print(f"[{tag}] Drone: {drone_type} @ {drone_ip} (auto-reconnect; watchdog={REMOTE_TIMEOUT_S}s)")
     print(f"[{tag}] SDKs available: tello={HAS_TELLO_SDK}, olympe={HAS_OLYMPE_SDK}")
-    print(f"[{tag}] Code version: 2026-03-26-v2")
+    print(f"[{tag}] Code version: 2026-04-23-cb (distance_scale correction factor)")
     app.run(host=HTTP_HOST, port=HTTP_PORT, threaded=True, use_reloader=False)
 
 

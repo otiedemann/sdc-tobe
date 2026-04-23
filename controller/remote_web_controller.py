@@ -9,6 +9,18 @@ from pathlib import Path
 import requests
 from flask import Flask, Response, jsonify, request, send_file
 
+# ── WebSocket client — optional dependency ────────────────────────────
+# When present, the C2 opens a long-lived WS per drone for telemetry,
+# position, and RC. Drops per-call HTTP framing overhead; important
+# savings on the RC path that fires per key stroke.
+try:
+    import websocket as _wsclient  # websocket-client package
+    HAS_WSCLIENT = True
+except Exception as _e:
+    _wsclient = None
+    HAS_WSCLIENT = False
+    print(f"[WS] websocket-client not available ({_e}) — C2 falls back to HTTP")
+
 # ── ArUco Seek (multi-drone observer / LIVE controller) ────────────────────
 import sys as _sys
 _sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -24,8 +36,11 @@ from aruco_seek_multi import (  # noqa: E402
 _http_session = requests.Session()
 _http_session.headers.update({"Connection": "keep-alive"})
 adapter = requests.adapters.HTTPAdapter(
-    pool_connections=8,    # one per drone + spare
-    pool_maxsize=16,       # concurrent requests per host
+    pool_connections=16,   # one per drone × multiple concurrent types (tel/pos/cmd)
+    pool_maxsize=64,       # bumped from 16: the browser fires ~13 polls/sec, each
+                           # can fan out to 5 Pis → pool was saturating within a
+                           # second and queueing everything else. 64 gives
+                           # comfortable headroom for the observed workload.
     max_retries=0,         # fail fast — don't retry on control commands
 )
 _http_session.mount("http://", adapter)
@@ -44,8 +59,18 @@ except ImportError:
 # Runs on remote PC. Proxies to Pi API server.
 HTTP_HOST = "0.0.0.0"
 HTTP_PORT = 8090
-TIMEOUT_CMD = float(os.getenv("PI_TIMEOUT_CMD", "12"))
+TIMEOUT_CMD = float(os.getenv("PI_TIMEOUT_CMD", "8.0"))
 TIMEOUT_STATUS = float(os.getenv("PI_TIMEOUT_STATUS", "0.5"))
+# Fast per-keystroke commands — RC / key_down / key_up. These are
+# fire-and-forget on the Pi side; tightly-timeouted so an unreachable
+# drone doesn't back up the UI. Anything longer than this on a
+# keystroke is a network/server problem, not expected latency.
+TIMEOUT_FAST = float(os.getenv("PI_TIMEOUT_FAST", "1.5"))
+# Explicitly slow commands — takeoff + land block until the drone
+# reports the corresponding state, which on Anafi routinely takes
+# 3-5 s. Use this override (via pi_post(..., timeout=TIMEOUT_SLOW))
+# so the default TIMEOUT_CMD stays small for responsive UI.
+TIMEOUT_SLOW = float(os.getenv("PI_TIMEOUT_SLOW", "15.0"))
 VIDEO_UDP_FORWARD_PORT = int(os.getenv("VIDEO_UDP_FORWARD_PORT", "55004"))
 VIDEO_FPS = int(os.getenv("VIDEO_FPS", "30"))
 VIDEO_JPEG_QUALITY = int(os.getenv("VIDEO_JPEG_QUALITY", "70"))
@@ -102,9 +127,822 @@ aruco_fleet = ObserverFleet(session=_http_session, allow_live=_aruco_allow_live)
 aruco_fleet.configure(DRONES)
 mission_manager = MissionManager(aruco_fleet)
 
+# ── Global PAUSE state ─────────────────────────────────────────────────
+# When True, every autonomous subsystem (missions, ArUco Seek LIVE) is
+# vetoed. Manual WASD / RC / keepalive remain active so the operator
+# can nudge a drone manually. Set by /proxy/pause_all, cleared by
+# /proxy/resume_all. UI hotkey is '9' (next to '0' = LAND ALL).
+_global_paused: bool = False
+_global_paused_at: float = 0.0
+_global_paused_src: str = ""
+_pause_lock = threading.Lock()
+
+
+def _is_paused() -> bool:
+    with _pause_lock:
+        return _global_paused
+
+
+def _pause_guard_response():
+    """Return a Flask response to reject an autonomous-control request
+    while the fleet is paused, or None if we're allowed to proceed."""
+    if _is_paused():
+        return jsonify(
+            ok=False,
+            error="fleet paused — autonomous control is disabled",
+            hint="press CONTINUE MISSION (button) or 9 (hotkey) to resume",
+            paused=True,
+        ), 409
+    return None
+
+
 command_log_enabled = os.getenv("REMOTE_COMMAND_LOG", "0") in {"1", "true", "True"}
 command_log_path = Path(os.getenv("REMOTE_COMMAND_LOG_PATH", "remote_command_log.jsonl"))
 command_log_last: dict[str, float] = {}
+
+# ── Automatic per-flight logging ───────────────────────────────────────
+# Every take-off opens a fresh JSONL file under FLIGHT_LOG_DIR; every
+# land (or loss-of-flying-state) closes it. Records are either
+# "tick" (5 Hz telemetry + position + visible markers) or "cmd"
+# (every command logged through log_command). Files are readable via
+# /proxy/flight_logs (list + download).
+FLIGHT_LOG_DIR = Path(os.getenv("FLIGHT_LOG_DIR", "flight_logs")).resolve()
+FLIGHT_LOG_HZ  = float(os.getenv("FLIGHT_LOG_HZ", "5.0"))
+
+
+def _read_git_revision() -> dict:
+    """Return a small dict describing the repo state at C2 startup.
+    Safe under: no .git dir, detached HEAD, git not on PATH.
+    Used to stamp every flight-log header for post-flight traceability."""
+    import subprocess
+    info = {}
+    repo = Path(__file__).resolve().parent.parent
+    def _run(args):
+        try:
+            r = subprocess.run(args, cwd=repo, capture_output=True,
+                                text=True, timeout=2)
+            if r.returncode == 0:
+                return r.stdout.strip()
+        except Exception:
+            pass
+        return ""
+    sha     = _run(["git", "rev-parse", "HEAD"])
+    short   = _run(["git", "rev-parse", "--short", "HEAD"])
+    branch  = _run(["git", "rev-parse", "--abbrev-ref", "HEAD"])
+    dirty   = _run(["git", "status", "--porcelain"])
+    subject = _run(["git", "log", "-1", "--pretty=%s"])
+    info["sha"] = sha
+    info["short_sha"] = short
+    info["branch"] = branch
+    info["dirty"] = bool(dirty)
+    info["subject"] = subject
+    return info
+
+
+_GIT_REVISION = _read_git_revision()
+print(f"[GIT] {_GIT_REVISION.get('branch') or '?'} @ {_GIT_REVISION.get('short_sha') or '?'}"
+      f"{' (dirty)' if _GIT_REVISION.get('dirty') else ''} "
+      f"— {_GIT_REVISION.get('subject') or ''}")
+
+
+class FlightLogger:
+    """Per-drone flight logger.
+
+    Runs one background thread that polls /api/telemetry + /api/position +
+    /proxy/aruco/state for every configured drone at FLIGHT_LOG_HZ. On the
+    rising edge of ``flying`` (or airborne detected by height_cm > 30) a
+    new JSONL file is opened; on the falling edge it's closed. Commands
+    logged via ``log_command()`` are funnelled into the active files so
+    every per-flight file is a complete, timestamped audit trail of:
+      - telemetry (battery, attitude, velocity, ceiling state, ...)
+      - fused arena position (x, y, z, dir, vel, stale)
+      - visible ArUco markers (seen + reference lists)
+      - every command sent (takeoff, land, rc, mission-start, pause, ...)
+
+    Files land in ``<FLIGHT_LOG_DIR>/flight_<timestamp>_drone-<id>.jsonl``.
+    """
+
+    def __init__(self, drones: dict, session, log_dir: Path, hz: float = 5.0):
+        self.drones  = drones
+        self.session = session
+        self.log_dir = log_dir
+        self.period  = max(0.1, 1.0 / float(hz or 5.0))
+        self._flights: dict[str, dict] = {}
+        self._lock    = threading.Lock()
+        self._running = False
+        self.log_dir.mkdir(parents=True, exist_ok=True)
+
+    def start(self):
+        if self._running:
+            return
+        self._running = True
+        t = threading.Thread(target=self._loop, daemon=True, name="flight-logger")
+        t.start()
+        print(f"[FLIGHT_LOG] started, dir={self.log_dir}, period={self.period:.2f}s")
+
+    def stop(self):
+        self._running = False
+        with self._lock:
+            for did in list(self._flights.keys()):
+                self._close_unlocked(did, reason="shutdown")
+
+    # Public — called from log_command
+    def record_command(self, drone_id, event: str, payload: dict | None):
+        """Append a command record to the active flight log(s). If
+        drone_id is None we broadcast to every active flight (fleet-wide
+        commands like PAUSE_ALL / LAND_ALL apply to all airborne drones)."""
+        if not self._running:
+            return
+        did = str(drone_id) if drone_id else None
+        with self._lock:
+            targets = [did] if did and did in self._flights else list(self._flights.keys())
+            for d in targets:
+                flt = self._flights.get(d)
+                if not flt:
+                    continue
+                self._write_unlocked(flt, {
+                    "type":    "cmd",
+                    "ts":      time.time(),
+                    "drone_id": d,
+                    "event":   event,
+                    "payload": payload or {},
+                })
+
+    def list_files(self) -> list[dict]:
+        """For /proxy/flight_logs — list all flight files with basic meta."""
+        out = []
+        try:
+            for p in sorted(self.log_dir.glob("flight_*.jsonl"), reverse=True):
+                try:
+                    st = p.stat()
+                    out.append({
+                        "name": p.name,
+                        "size": st.st_size,
+                        "mtime": st.st_mtime,
+                    })
+                except Exception:
+                    continue
+        except Exception:
+            pass
+        return out
+
+    def file_path(self, name: str) -> Path | None:
+        """Resolve a filename to a path inside log_dir. Rejects path
+        traversal attempts."""
+        p = (self.log_dir / name).resolve()
+        try:
+            p.relative_to(self.log_dir)
+        except ValueError:
+            return None
+        return p if p.exists() else None
+
+    # ── internals ──
+    def _loop(self):
+        while self._running:
+            t0 = time.time()
+            try:
+                self._tick()
+            except Exception as e:
+                print(f"[FLIGHT_LOG] tick error: {e}")
+            dt = time.time() - t0
+            time.sleep(max(0.02, self.period - dt))
+
+    def _tick(self):
+        for did, info in list(self.drones.items()):
+            did  = str(did)
+            base = (info or {}).get("base")
+            if not base:
+                continue
+            # Skip HTTP polls entirely for drones whose WS is fully down —
+            # otherwise each unreachable Pi burns 1.5 s per tick and the
+            # whole fleet-logger thread falls behind at 5 Hz.
+            cli = drone_ws.get(did) if 'drone_ws' in globals() else None
+            if cli is not None:
+                all_down = (not cli._ws_connected.get("telemetry") and
+                            not cli._ws_connected.get("position") and
+                            not cli._ws_connected.get("rc"))
+                if all_down:
+                    # Close any open flight for this drone (we can't log
+                    # what we can't see) and move on.
+                    with self._lock:
+                        if did in self._flights:
+                            self._close_unlocked(did, reason="unreachable")
+                    continue
+            try:
+                tr  = self.session.get(f"{base.rstrip('/')}/api/telemetry", timeout=0.6)
+                tel = tr.json() if tr.ok else {}
+            except Exception:
+                tel = {}
+            try:
+                pr  = self.session.get(f"{base.rstrip('/')}/api/position", timeout=0.3)
+                pos = pr.json() if pr.ok else {}
+            except Exception:
+                pos = {}
+
+            # Airborne detection: trust "flying" but fall back to height_cm
+            flying   = bool(tel.get("flying"))
+            height_cm = (tel.get("height_cm") or 0)
+            airborne = flying or (height_cm and height_cm > 30)
+
+            with self._lock:
+                flt = self._flights.get(did)
+                if airborne and flt is None:
+                    self._open_unlocked(did, tel)
+                    flt = self._flights.get(did)
+                elif not airborne and flt is not None:
+                    self._write_unlocked(flt, {
+                        "type": "land", "ts": time.time(), "drone_id": did,
+                        "telemetry": tel,
+                    })
+                    self._close_unlocked(did, reason="landed")
+                    flt = None
+                if flt is None:
+                    continue
+                # Active flight — emit a tick record.
+                #
+                # Visible markers: the ArUco observer exposes a `visible_ids`
+                # list, but only when the observer thread is started (which
+                # happens when ArUco Seek is armed or a mission is running).
+                # During plain manual flight the observer is idle and that
+                # list is empty. The per-drone position service on the Pi
+                # runs its own detection pipeline and publishes `seen_markers`
+                # in /api/position — use it as a fallback so the flight log
+                # always reflects what the camera is actually seeing.
+                vis_markers = []
+                try:
+                    obs = aruco_fleet.get(did)
+                    if obs is not None:
+                        st = obs.get_state()
+                        vis_markers = st.get("visible_ids") or []
+                except Exception:
+                    pass
+                if not vis_markers:
+                    vis_markers = list(pos.get("seen_markers") or [])
+                rec = {
+                    "type":    "tick",
+                    "ts":      time.time(),
+                    "drone_id": did,
+                    "telemetry": {k: tel.get(k) for k in (
+                        "battery", "height_cm", "altitude_m", "flying",
+                        "connected", "yaw", "pitch", "roll",
+                        "vgx", "vgy", "vgz", "agx", "agy", "agz",
+                        "ceiling_m", "ceiling_engaged", "ceiling_reason",
+                        "state_age_s", "state_fresh",
+                    ) if k in tel},
+                    "position": pos.get("pos"),
+                    "direction": pos.get("dir"),
+                    "pos_vel": pos.get("vel"),
+                    "pos_stale": pos.get("stale"),
+                    "visible_markers": vis_markers,
+                    "ref_markers":  pos.get("ref_markers") or [],
+                    "seen_markers": pos.get("seen_markers") or [],
+                }
+                self._write_unlocked(flt, rec)
+
+    def _open_unlocked(self, did: str, tel: dict):
+        ts = time.strftime("%Y-%m-%d_%H-%M-%S", time.localtime())
+        name = (self.drones.get(did, {}).get("name") or did).replace(" ", "_")
+        stem = f"flight_{ts}_drone-{did}_{name}"
+        path = self.log_dir / f"{stem}.jsonl"
+        fh = path.open("w", encoding="utf-8", buffering=1)  # line-buffered
+        # Kick off video recording on the FC with a matching basename so the
+        # .mp4 and the .jsonl travel together. Annotated mode so the recording
+        # has the detected-marker overlay for post-flight review.
+        #
+        # IMPORTANT: the FC needs its MJPEG pipeline running BEFORE frames
+        # can flow into the recorder. /api/video/record/start now auto-starts
+        # MJPEG internally if it's off, but we also ping /api/video/start here
+        # so older FCs without the auto-start still record. No-op when the
+        # FC isn't reachable — video is nice-to-have, the log is the record.
+        video_name = f"{stem}.mp4"
+        video_started = False
+        video_err = None
+        base = (self.drones.get(did, {}) or {}).get("base")
+        if base:
+            # Step 1: ensure MJPEG is running (idempotent on the FC side).
+            try:
+                self.session.post(
+                    f"{base.rstrip('/')}/api/video/start",
+                    json={"mode": "mjpeg"},
+                    timeout=1.5,
+                )
+            except Exception as ve:
+                # Not fatal — record/start on a newer FC will self-start MJPEG.
+                print(f"[FLIGHT_LOG] video/start pre-roll failed (non-fatal): {ve}")
+            # Step 2: arm recording with the matched flight-log basename.
+            try:
+                r = self.session.post(
+                    f"{base.rstrip('/')}/api/video/record/start",
+                    json={"filename": video_name, "raw": False},
+                    timeout=2.0,
+                )
+                if r.ok:
+                    body = r.json() if r.content else {}
+                    if body.get("ok") is True:
+                        video_started = True
+                    else:
+                        video_err = body.get("error") or "record/start returned ok=false"
+                else:
+                    video_err = f"HTTP {r.status_code}"
+            except Exception as e:
+                video_err = str(e)
+                print(f"[FLIGHT_LOG] video record start failed: {e}")
+
+        header = {
+            "type": "takeoff", "ts": time.time(), "drone_id": did,
+            "drone_name": self.drones.get(did, {}).get("name"),
+            "git_revision": _GIT_REVISION,
+            "drone_base": base,
+            "video_filename": video_name if video_started else None,
+            "telemetry": tel,
+        }
+        fh.write(json.dumps(header, default=str) + "\n")
+        self._flights[did] = {
+            "fh": fh, "path": path, "opened_at": time.time(), "records": 1,
+            "stem": stem, "video_name": video_name if video_started else None,
+        }
+        if video_started:
+            print(f"[FLIGHT_LOG] takeoff → {path}  + video → {video_name}")
+        else:
+            print(f"[FLIGHT_LOG] takeoff → {path}  (no video: {video_err or 'FC unreachable'})")
+
+    def _close_unlocked(self, did: str, reason: str = "landed"):
+        flt = self._flights.pop(did, None)
+        if flt is None:
+            return
+        # Stop the matching video recording on the Pi (no-op if not started).
+        base = (self.drones.get(did, {}) or {}).get("base")
+        video_frames = None
+        if base and flt.get("video_name"):
+            try:
+                r = self.session.post(
+                    f"{base.rstrip('/')}/api/video/record/stop",
+                    json={}, timeout=1.5,
+                )
+                if r.ok:
+                    j = r.json()
+                    video_frames = j.get("frames")
+            except Exception as e:
+                print(f"[FLIGHT_LOG] video record stop failed: {e}")
+        try:
+            dur = time.time() - flt["opened_at"]
+            flt["fh"].write(json.dumps({
+                "type": "close", "ts": time.time(), "reason": reason,
+                "duration_s": round(dur, 2), "records": flt["records"],
+                "video_filename": flt.get("video_name"),
+                "video_frames": video_frames,
+            }) + "\n")
+            flt["fh"].close()
+        except Exception:
+            pass
+        print(f"[FLIGHT_LOG] closed {flt['path']} "
+              f"(reason={reason}, records={flt['records']}, "
+              f"duration={time.time() - flt['opened_at']:.1f}s"
+              + (f", video={video_frames} frames" if video_frames is not None else "")
+              + ")")
+
+    def _write_unlocked(self, flt: dict, rec: dict):
+        try:
+            flt["fh"].write(json.dumps(rec, default=str) + "\n")
+            flt["records"] += 1
+        except Exception as e:
+            print(f"[FLIGHT_LOG] write error: {e}")
+
+
+flight_logger = FlightLogger(DRONES, _http_session, FLIGHT_LOG_DIR, FLIGHT_LOG_HZ)
+flight_logger.start()
+
+
+# ── Server-side heartbeat loop ─────────────────────────────────────────
+# The Pi's watchdog auto-lands if it sees no remote activity for
+# REMOTE_TIMEOUT_S (default 2 s). Historically the browser polled
+# /proxy/heartbeat at 2 Hz to keep that alive — a complete waste of
+# the browser's HTTP connection pool since the heartbeat has no UI
+# purpose. Now fired from a background thread on the C2 itself, once
+# per second per drone, skipping drones whose WS is fully down. The
+# browser doesn't have to issue ANY heartbeat traffic.
+_HEARTBEAT_INTERVAL_S = 1.0
+
+
+def _heartbeat_loop():
+    """Ping every reachable Pi's /api/heartbeat at HEARTBEAT_INTERVAL_S.
+    Runs as a daemon thread so it exits with the process. Per-drone
+    failures are swallowed silently — the Pi's watchdog only needs
+    SOME successful heartbeat per REMOTE_TIMEOUT_S seconds."""
+    while True:
+        try:
+            for did, info in DRONES.items():
+                base = (info or {}).get("base")
+                if not base:
+                    continue
+                cli = drone_ws.get(str(did))
+                if cli is not None:
+                    all_down = (not cli._ws_connected.get("telemetry") and
+                                not cli._ws_connected.get("position") and
+                                not cli._ws_connected.get("rc"))
+                    if all_down:
+                        continue
+                try:
+                    _http_session.get(f"{base.rstrip('/')}/api/heartbeat",
+                                      timeout=0.4)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        time.sleep(_HEARTBEAT_INTERVAL_S)
+
+
+threading.Thread(target=_heartbeat_loop, daemon=True, name="heartbeat-loop").start()
+print(f"[HEARTBEAT] background loop started ({_HEARTBEAT_INTERVAL_S:.1f}s interval)")
+
+
+# ── WebSocket client per drone ─────────────────────────────────────────
+# Maintains three long-lived WS to each Pi (/ws/telemetry pulls, /ws/position
+# pulls, /ws/rc pushes). Caches the latest telemetry + position so HTTP
+# proxy calls can answer instantly from RAM instead of going back to the
+# Pi. RC/key events take the send path which reuses the already-open
+# TCP+WS socket — shaves the ~3-15 ms per-call HTTP framing cost.
+class DroneWS:
+    """One WS channel (really three sockets) to a single Pi. All
+    connections auto-reconnect with 1s backoff up to 5s. When the
+    websocket-client package isn't present (HAS_WSCLIENT=False) all
+    sends become no-ops and callers fall back to HTTP."""
+
+    def __init__(self, drone_id: str, base_http_url: str):
+        self.drone_id = str(drone_id)
+        self.base_http = base_http_url.rstrip("/")
+        # Convert http(s):// → ws(s):// for the WS URL
+        if self.base_http.startswith("https://"):
+            self.ws_base = "wss://" + self.base_http[len("https://"):]
+        elif self.base_http.startswith("http://"):
+            self.ws_base = "ws://"  + self.base_http[len("http://"):]
+        else:
+            self.ws_base = "ws://"  + self.base_http
+
+        self._lock = threading.Lock()
+        self._latest_tel: dict | None = None
+        self._latest_tel_ts: float = 0.0
+        self._latest_pos: dict | None = None
+        self._latest_pos_ts: float = 0.0
+        self._rc_ws = None                    # websocket.WebSocket
+        self._rc_ws_lock = threading.Lock()
+        self._rc_seq = 0
+        self._last_rc_send_ts: float = 0.0
+        self._last_rc_send_ms: float = 0.0      # wall-clock of the most recent ws.send()
+        self._rc_rtt_ms: float = 0.0
+        self._ws_connected = {"telemetry": False, "position": False, "rc": False}
+        # Log-suppression state: only print on state transitions, not every
+        # reconnect attempt. Offline hosts would otherwise produce 3 lines
+        # every 5 s per drone = a flood that obscures every real log.
+        self._was_connected = {"telemetry": False, "position": False, "rc": False}
+        self._consec_failures = {"telemetry": 0, "position": 0, "rc": 0}
+        self._running = False
+
+    @staticmethod
+    def _sockopt_low_latency():
+        """TCP_NODELAY kills Nagle's 40 ms batching delay on small
+        frames — RC/key events are tiny (50-80 bytes) so without this
+        the OS would buffer them. SO_KEEPALIVE on the socket helps us
+        notice dead links faster than a timeout."""
+        import socket as _sock
+        return [
+            (_sock.IPPROTO_TCP, _sock.TCP_NODELAY, 1),
+            (_sock.SOL_SOCKET,  _sock.SO_KEEPALIVE, 1),
+        ]
+
+    # --- Public API ---
+    def start(self):
+        if not HAS_WSCLIENT or self._running:
+            return
+        self._running = True
+        for name, target in (
+            ("telemetry", self._rx_telemetry_loop),
+            ("position",  self._rx_position_loop),
+            ("rc",        self._rc_connect_loop),
+        ):
+            t = threading.Thread(target=target, daemon=True,
+                                  name=f"ws-{name}-{self.drone_id}")
+            t.start()
+
+    def stop(self):
+        self._running = False
+        with self._rc_ws_lock:
+            if self._rc_ws is not None:
+                try: self._rc_ws.close()
+                except Exception: pass
+                self._rc_ws = None
+
+    def latest_telemetry(self) -> tuple[dict | None, float]:
+        """Return (cached_telemetry, age_seconds) or (None, +inf) when
+        no WS frame has arrived."""
+        with self._lock:
+            if self._latest_tel is None:
+                return None, float("inf")
+            return dict(self._latest_tel), time.time() - self._latest_tel_ts
+
+    def latest_position(self) -> tuple[dict | None, float]:
+        with self._lock:
+            if self._latest_pos is None:
+                return None, float("inf")
+            return dict(self._latest_pos), time.time() - self._latest_pos_ts
+
+    def send_rc(self, lr: int, fb: int, ud: int, yaw: int,
+                duration_ms: int = 250) -> bool:
+        """Send an RC frame over WS. Returns True on success, False if
+        the socket is not currently connected — caller should fall back
+        to HTTP."""
+        return self._send_rc_message({
+            "type": "rc", "lr": int(lr), "fb": int(fb),
+            "ud": int(ud), "yaw": int(yaw),
+            "duration_ms": int(duration_ms),
+        })
+
+    def send_key(self, key: str, event: str) -> bool:
+        """Send a key_down / key_up over WS. event must be 'down' or 'up'."""
+        if event not in ("down", "up"):
+            return False
+        return self._send_rc_message({
+            "type": "key", "key": str(key).lower(), "event": event,
+        })
+
+    def status(self) -> dict:
+        """Connection snapshot for /proxy/ws/status + UI badge."""
+        _, tel_age = self.latest_telemetry()
+        _, pos_age = self.latest_position()
+        with self._lock:
+            rc_rtt     = self._rc_rtt_ms
+            rc_send_ms = self._last_rc_send_ms
+        return {
+            "drone_id": self.drone_id,
+            "rc":        self._ws_connected["rc"],
+            "telemetry": self._ws_connected["telemetry"],
+            "position":  self._ws_connected["position"],
+            "telemetry_age_ms": int(tel_age * 1000) if tel_age < 1e6 else None,
+            "position_age_ms":  int(pos_age * 1000) if pos_age < 1e6 else None,
+            "rc_rtt_ms":        rc_rtt     if rc_rtt > 0 else None,
+            "rc_send_ms":       rc_send_ms if rc_send_ms > 0 else None,
+        }
+
+    # --- Internals ---
+    def _send_rc_message(self, msg: dict) -> bool:
+        """Send fire-and-forget with a tight timeout budget. If the send
+        takes noticeably longer than a round-trip (~50 ms), we treat the
+        socket as stalled, abandon it, and let the reconnect loop spin
+        up a fresh one — otherwise TCP back-pressure from a wedged
+        server can queue RC frames for seconds of perceived lag.
+
+        No sequence numbers / no ACKs — RC is idempotent and bandwidth
+        is tiny; any "lost" frame is corrected on the next 100 ms tick.
+        """
+        if not HAS_WSCLIENT:
+            return False
+        ws = self._rc_ws        # snapshot ref — no lock needed
+        if ws is None:
+            return False
+        t0 = time.time()
+        try:
+            ws.send(json.dumps(msg))
+            dt_ms = (time.time() - t0) * 1000.0
+            with self._lock:
+                self._last_rc_send_ts = time.time()
+                self._last_rc_send_ms = dt_ms
+            # Any RC send over 250 ms is anomalous — the socket is
+            # almost certainly wedged by TCP back-pressure. Kill it so
+            # the reconnect loop replaces it, otherwise every
+            # subsequent send waits behind the same clogged buffer.
+            if dt_ms > 250.0:
+                print(f"[WS] {self.drone_id} rc send SLOW {dt_ms:.0f}ms — "
+                      f"dropping socket")
+                with self._rc_ws_lock:
+                    if self._rc_ws is ws:
+                        try: ws.close()
+                        except Exception: pass
+                        self._rc_ws = None
+                        self._ws_connected["rc"] = False
+                return False
+            return True
+        except Exception as e:
+            print(f"[WS] {self.drone_id} rc send failed: {e}")
+            with self._rc_ws_lock:
+                if self._rc_ws is ws:
+                    try: ws.close()
+                    except Exception: pass
+                    self._rc_ws = None
+                    self._ws_connected["rc"] = False
+            return False
+
+    def _rx_telemetry_loop(self):
+        self._rx_pull_loop("telemetry", f"{self.ws_base}/ws/telemetry",
+                            self._on_telemetry_msg)
+
+    def _rx_position_loop(self):
+        self._rx_pull_loop("position", f"{self.ws_base}/ws/position",
+                            self._on_position_msg)
+
+    def _rx_pull_loop(self, name: str, url: str, handler):
+        """Generic pull loop — opens a WS, reads until it closes, marks
+        disconnected, retries with backoff.
+
+        recv timeout must be comfortably longer than the server's
+        _WS_PING_INTERVAL_S (currently 3 s) so idle channels don't
+        false-positive as dead links. 30 s gives ~10× headroom and
+        still catches real link losses in under a minute.
+
+        Logging discipline: an offline host would otherwise log every
+        reconnect attempt forever. We log only on state transitions
+        (first failure after connected, or first success after
+        failing). Backoff also ramps to 60 s so the log stays quiet
+        and bandwidth is minimal when a drone is simply offline."""
+        backoff = 1.0
+        while self._running:
+            try:
+                ws = _wsclient.create_connection(
+                    url, timeout=4, sockopt=self._sockopt_low_latency())
+                ws.settimeout(30.0)
+                self._ws_connected[name] = True
+                # Transition FAIL → OK — log only once, reset counters.
+                if not self._was_connected[name]:
+                    if self._consec_failures[name] > 0:
+                        print(f"[WS] {self.drone_id} {name} connected "
+                              f"(after {self._consec_failures[name]} failure(s))")
+                    self._was_connected[name] = True
+                    self._consec_failures[name] = 0
+                backoff = 1.0          # reset on successful connect
+                while self._running:
+                    try:
+                        msg = ws.recv()
+                    except Exception:
+                        break
+                    if not msg:
+                        break
+                    try:
+                        data = json.loads(msg)
+                    except Exception:
+                        continue
+                    try:
+                        handler(data)
+                    except Exception as he:
+                        print(f"[WS] {self.drone_id} {name} handler error: {he}")
+                try: ws.close()
+                except Exception: pass
+            except Exception as e:
+                if self._running:
+                    self._consec_failures[name] += 1
+                    # Log once on: (a) transition from connected → failed,
+                    # or (b) the very first failure at boot so the operator
+                    # knows a drone is unreachable. Subsequent reconnect
+                    # attempts stay silent so the log doesn't flood while
+                    # the drone sits offline.
+                    first_failure = (self._consec_failures[name] == 1
+                                      and not self._was_connected[name])
+                    if self._was_connected[name] or first_failure:
+                        self._was_connected[name] = False
+                        msg = str(e)
+                        if ("Connection refused" not in msg
+                                and "Connection closed" not in msg
+                                and "1000" not in msg):
+                            print(f"[WS] {self.drone_id} {name} disconnect: {e}")
+                        else:
+                            print(f"[WS] {self.drone_id} {name} offline "
+                                  f"(retries will stay silent until recovery)")
+            finally:
+                self._ws_connected[name] = False
+            if self._running:
+                time.sleep(backoff)
+                # Fast retries while we're likely just between frames (1-5 s),
+                # slow retries while the host is clearly offline (>10 failures
+                # → 60 s cap). Keeps the reconnect alive without spamming.
+                if self._consec_failures[name] <= 3:
+                    backoff = min(5.0, backoff * 1.6)
+                else:
+                    backoff = min(60.0, backoff * 2.0)
+
+    def _rc_connect_loop(self):
+        """Keeps the RC send socket alive.
+
+        Crucial latency details:
+          - TCP_NODELAY via sockopt — without it, Nagle's 40 ms delay
+            batches small RC frames and key events feel sluggish.
+          - settimeout(0.3) — short. The timeout applies to BOTH recv
+            and send on the socket, so a big value (old: 2 s) meant a
+            single stalled send blocked the caller for 2 s. 0.3 s is
+            long enough for LAN round-trips but short enough that a
+            dropped link fails fast and falls back to HTTP.
+          - Ping every ~2 s and measure the round-trip — exposed as
+            rc_rtt_ms so operators can see the actual latency."""
+        url = f"{self.ws_base}/ws/rc"
+        backoff = 1.0
+        while self._running:
+            try:
+                ws = _wsclient.create_connection(
+                    url, timeout=4, sockopt=self._sockopt_low_latency())
+                ws.settimeout(0.3)
+                with self._rc_ws_lock:
+                    self._rc_ws = ws
+                self._ws_connected["rc"] = True
+                # Transition FAIL → OK — log only once.
+                if not self._was_connected["rc"]:
+                    if self._consec_failures["rc"] > 0:
+                        print(f"[WS] {self.drone_id} rc connected "
+                              f"(after {self._consec_failures['rc']} failure(s))")
+                    self._was_connected["rc"] = True
+                    self._consec_failures["rc"] = 0
+                backoff = 1.0
+                last_ping = 0.0
+                ping_pending: dict[int, float] = {}  # client_ts → send_monotonic
+                while self._running:
+                    # Opportunistic ping for RTT measurement
+                    now = time.time()
+                    if now - last_ping > 2.0:
+                        last_ping = now
+                        mono = time.monotonic()
+                        try:
+                            ws.send(json.dumps({
+                                "type": "ping",
+                                "client_ts": now,
+                            }))
+                            ping_pending[int(now * 1000)] = mono
+                        except Exception:
+                            break
+                    try:
+                        msg = ws.recv()
+                    except _wsclient._exceptions.WebSocketTimeoutException:
+                        continue
+                    except Exception:
+                        break
+                    if not msg:
+                        break
+                    try:
+                        data = json.loads(msg)
+                    except Exception:
+                        continue
+                    if data.get("type") == "pong":
+                        echo = data.get("echo")
+                        if echo is not None:
+                            sent_mono = ping_pending.pop(int(float(echo) * 1000), None)
+                            if sent_mono is not None:
+                                with self._lock:
+                                    self._rc_rtt_ms = round((time.monotonic() - sent_mono) * 1000.0, 1)
+            except Exception as e:
+                if self._running:
+                    self._consec_failures["rc"] += 1
+                    first_failure = (self._consec_failures["rc"] == 1
+                                      and not self._was_connected["rc"])
+                    if self._was_connected["rc"] or first_failure:
+                        self._was_connected["rc"] = False
+                        m = str(e)
+                        if ("Connection refused" not in m
+                                and "Connection closed" not in m
+                                and "1000" not in m):
+                            print(f"[WS] {self.drone_id} rc disconnect: {e}")
+                        else:
+                            print(f"[WS] {self.drone_id} rc offline "
+                                  f"(retries silent until recovery)")
+            finally:
+                with self._rc_ws_lock:
+                    self._rc_ws = None
+                self._ws_connected["rc"] = False
+            if self._running:
+                time.sleep(backoff)
+                if self._consec_failures["rc"] <= 3:
+                    backoff = min(5.0, backoff * 1.6)
+                else:
+                    backoff = min(60.0, backoff * 2.0)
+
+    def _on_telemetry_msg(self, data: dict):
+        if data.get("type") not in (None, "telemetry"):
+            return
+        # Strip framing field; store the rest
+        snap = {k: v for k, v in data.items() if k not in ("type",)}
+        with self._lock:
+            self._latest_tel = snap
+            self._latest_tel_ts = time.time()
+
+    def _on_position_msg(self, data: dict):
+        if data.get("type") not in (None, "position"):
+            return
+        snap = {k: v for k, v in data.items() if k not in ("type",)}
+        with self._lock:
+            self._latest_pos = snap
+            self._latest_pos_ts = time.time()
+
+
+# Create one client per configured drone. They connect on their own
+# schedule — failing to reach a drone never blocks the C2 boot.
+drone_ws: dict[str, DroneWS] = {}
+def _init_drone_ws():
+    for did, info in DRONES.items():
+        base = (info or {}).get("base")
+        if not base:
+            continue
+        try:
+            client = DroneWS(str(did), base)
+            client.start()
+            drone_ws[str(did)] = client
+            print(f"[WS] started client for drone {did} → {client.ws_base}")
+        except Exception as e:
+            print(f"[WS] failed to start client for drone {did}: {e}")
+_init_drone_ws()
 
 HTML = """
 <!doctype html>
@@ -113,6 +951,19 @@ HTML = """
   <meta charset=\"utf-8\" />
   <meta name=\"viewport\" content=\"width=device-width,initial-scale=1\" />
   <title>Drone Remote Controller</title>
+  <!-- Three.js for optional 3D arena view. Loaded up-front so the 3D
+       checkbox handler can init the scene the first time it's ticked.
+       Uses ES module imports via importmap, which works in Chrome/Safari
+       desktop. Falls back gracefully — if the module fails to load, the
+       3D checkbox will log an error and the 2D view still works. -->
+  <script type=\"importmap\">
+  {
+    \"imports\": {
+      \"three\": \"https://unpkg.com/three@0.161.0/build/three.module.js\",
+      \"three/addons/\": \"https://unpkg.com/three@0.161.0/examples/jsm/\"
+    }
+  }
+  </script>
   <style>
     body { background:#0f172a; color:#e2e8f0; font-family:Arial,sans-serif; margin:0; padding:16px; }
     .row { display:flex; gap:16px; flex-wrap:wrap; align-items:flex-start; }
@@ -150,6 +1001,37 @@ HTML = """
     .pos-cfg label { font-size:12px; color:#94a3b8; }
     .pos-cfg input, .pos-cfg select { height:32px; border-radius:6px; border:1px solid #475569; background:#0f172a; color:#e2e8f0; padding:0 6px; }
     .pos-cfg button { height:32px; font-size:12px; padding:0 10px; }
+    /* ── Info-icon (ⓘ) system for tuning parameters ──────────────── */
+    .info-icon {
+      display:inline-flex; align-items:center; justify-content:center;
+      width:13px; height:13px; margin-left:4px;
+      border:1px solid #64748b; border-radius:50%;
+      color:#94a3b8; background:transparent;
+      font: italic 700 9px/1 Georgia, 'Times New Roman', serif;
+      cursor:pointer; user-select:none; vertical-align:middle;
+      transition: border-color .12s, color .12s, background .12s;
+    }
+    .info-icon:hover { border-color:#38bdf8; color:#38bdf8; background:#0b1424; }
+    #param_info_modal {
+      display:none; position:fixed; inset:0;
+      background:rgba(0,0,0,0.6); z-index:2000;
+      justify-content:center; align-items:center;
+    }
+    #param_info_modal .box {
+      background:#111827; border:1px solid #38bdf8; border-radius:8px;
+      padding:16px 20px; max-width:520px; width:90%;
+      color:#e2e8f0; box-shadow:0 12px 44px rgba(0,0,0,0.7);
+    }
+    #param_info_modal .title   { color:#38bdf8; font-weight:700; font-size:14px; margin-bottom:4px; }
+    #param_info_modal .subtitle{ color:#64748b; font-size:11px; font-family:monospace; margin-bottom:10px; }
+    #param_info_modal .body    { font-size:13px; line-height:1.55; white-space:pre-wrap; }
+    #param_info_modal .range   { font-size:11px; color:#94a3b8; margin-top:10px; font-family:monospace; }
+    #param_info_modal .close {
+      margin-top:12px; padding:6px 14px; background:#334155;
+      border:1px solid #64748b; color:#e2e8f0; border-radius:5px;
+      cursor:pointer; font-size:12px;
+    }
+    #param_info_modal .close:hover { background:#475569; }
     /* ── ArUco Seek panel ─────────────────────────────────────────── */
     #aruco_panel { margin-top:16px; padding:12px; background:#0b1220; border:1px solid #334155; border-radius:8px; }
     #aruco_panel h3 { margin:0 0 10px 0; color:#38bdf8; font-size:15px; }
@@ -178,6 +1060,39 @@ HTML = """
     #arc_live_banner { display:none; background:#b91c1c; color:#fee2e2; padding:6px 10px; border-radius:4px; font-weight:700; letter-spacing:0.04em; margin-bottom:8px; box-shadow:0 0 0 2px #fbbf24 inset; text-align:center; font-size:12px; }
     #arc_live_banner.show { display:block; animation:arcpulse 1.6s ease-in-out infinite; }
     @keyframes arcpulse { 0%,100% { box-shadow:0 0 0 2px #fbbf24 inset; } 50% { box-shadow:0 0 0 4px #fbbf24 inset; } }
+    /* PAUSED banner pulse (stronger, so it can't be missed) */
+    @keyframes pausepulse { 0%,100% { box-shadow:0 0 0 2px #facc15 inset; } 50% { box-shadow:0 0 0 5px #fde68a inset; } }
+    /* Dim autonomous-mode controls while paused to make the blocked
+       state obvious — operator can still see them, but they're clearly
+       disabled. Manual (WASD) controls remain at full opacity. */
+    body.paused-mode #mission_panel,
+    body.paused-mode #missions_panel,
+    body.paused-mode #aruco_panel { opacity:0.45; filter:grayscale(0.6); pointer-events:none; }
+
+    /* Collapsible panels — click the header to toggle. State persists in
+       localStorage so each operator keeps their preferred layout. */
+    .collapsible-toggle {
+      cursor: pointer; user-select: none;
+      display: flex; align-items: center; gap: 8px;
+      padding: 2px 0;
+    }
+    .collapsible-toggle:hover { color: #60a5fa; }
+    .collapsible-toggle:before {
+      content: '▾'; transition: transform 0.15s;
+      display: inline-block; font-size: 11px; color: #94a3b8; width: 10px;
+    }
+    .collapsible.collapsed > .collapsible-toggle:before {
+      transform: rotate(-90deg);
+    }
+    .collapsible.collapsed > .collapsible-body {
+      display: none !important;
+    }
+    /* Video panel special case: keep the <img> alive (= still decoding
+       MJPEG) but not visually rendered when the panel is collapsed. */
+    #video_panel.collapsible.collapsed > .collapsible-body {
+      display: block !important;
+      height: 0; overflow: hidden; margin: 0; padding: 0;
+    }
     body.arc-live-mode { box-shadow:0 0 0 4px #b91c1c inset; }
     .arc-rc-sent { color:#f87171; font-weight:600; }
     /* ── Special Missions panel ──────────────────────────────────── */
@@ -255,14 +1170,188 @@ HTML = """
     #mag_start_btn { background:#065f46; border-color:#10b981; }
     #mag_retry_btn { background:#1e3a5f; border-color:#3b82f6; display:none; }
     #mag_close_btn { background:#374151; border-color:#6b7280; }
+
+    /* ── Light theme ───────────────────────────────────────────────
+       Activated by setting <html data-theme=\"light\">. Uses !important
+       selectively to defeat the many hard-coded inline style=\"\"
+       colors scattered through this single-file UI. Inline attribute
+       selectors (e.g. [style*=\"background:#0f172a\"]) catch the most
+       common dark hex values without rewriting every element. */
+    html[data-theme=\"light\"]            { color-scheme: light; }
+    html[data-theme=\"light\"] body       { background:#f1f5f9 !important; color:#0f172a !important; }
+    html[data-theme=\"light\"] .panel     { background:#ffffff !important; border-color:#cbd5e1 !important; color:#0f172a !important; }
+    html[data-theme=\"light\"] button     { background:#e2e8f0 !important; color:#0f172a !important; border-color:#94a3b8 !important; }
+    html[data-theme=\"light\"] button:active,
+    html[data-theme=\"light\"] .active    { background:#0ea5e9 !important; color:#001018 !important; }
+    html[data-theme=\"light\"] input,
+    html[data-theme=\"light\"] select,
+    html[data-theme=\"light\"] textarea   { background:#ffffff !important; color:#0f172a !important; border-color:#cbd5e1 !important; }
+    html[data-theme=\"light\"] h2,
+    html[data-theme=\"light\"] h3         { color:#0369a1 !important; }
+    html[data-theme=\"light\"] .small     { color:#475569 !important; }
+    html[data-theme=\"light\"] #aruco_panel,
+    html[data-theme=\"light\"] #tuning_panel,
+    html[data-theme=\"light\"] #mission_panel,
+    html[data-theme=\"light\"] #anafi_panel,
+    html[data-theme=\"light\"] #missions_panel,
+    html[data-theme=\"light\"] #video_panel { background:#f8fafc !important; border-color:#cbd5e1 !important; color:#0f172a !important; }
+    html[data-theme=\"light\"] .arena-canvas { background:#f8fafc !important; border-color:#cbd5e1 !important; }
+    html[data-theme=\"light\"] .info-icon   { border-color:#94a3b8 !important; color:#475569 !important; }
+    html[data-theme=\"light\"] .info-icon:hover { border-color:#0369a1 !important; color:#0369a1 !important; background:#e0f2fe !important; }
+    html[data-theme=\"light\"] #param_info_modal { background:rgba(15,23,42,0.45) !important; }
+    html[data-theme=\"light\"] #param_info_modal .box { background:#ffffff !important; color:#0f172a !important; border-color:#0ea5e9 !important; }
+    html[data-theme=\"light\"] #param_info_modal .title { color:#0369a1 !important; }
+    html[data-theme=\"light\"] #param_info_modal .subtitle { color:#64748b !important; }
+    html[data-theme=\"light\"] #param_info_modal .body { color:#1e293b !important; }
+    html[data-theme=\"light\"] #param_info_modal .close { background:#e2e8f0 !important; color:#0f172a !important; border-color:#94a3b8 !important; }
+    html[data-theme=\"light\"] .collapsible-toggle { color:#0369a1 !important; }
+    html[data-theme=\"light\"] #aruco_panel .arc-readout   { color:#334155 !important; }
+    html[data-theme=\"light\"] #aruco_panel .arc-readout .k { color:#64748b !important; }
+    html[data-theme=\"light\"] #aruco_panel .arc-readout b  { color:#0284c7 !important; }
+    html[data-theme=\"light\"] #aruco_panel .arc-row label  { color:#334155 !important; }
+    html[data-theme=\"light\"] #aruco_panel .arc-pgroup-label { color:#64748b !important; }
+    html[data-theme=\"light\"] .drone-btn { background:#f1f5f9 !important; color:#1e293b !important; border-color:#94a3b8 !important; }
+    html[data-theme=\"light\"] .drone-btn.selected { background:#0ea5e9 !important; color:#001018 !important; border-color:#0ea5e9 !important; }
+    html[data-theme=\"light\"] .pos-cfg input,
+    html[data-theme=\"light\"] .pos-cfg select { background:#ffffff !important; color:#0f172a !important; border-color:#cbd5e1 !important; }
+    html[data-theme=\"light\"] .pos-cfg label { color:#475569 !important; }
+    html[data-theme=\"light\"] .meter-track { background:#e2e8f0 !important; border-color:#94a3b8 !important; }
+    html[data-theme=\"light\"] .meter-label { color:#475569 !important; }
+    html[data-theme=\"light\"] #arc_live_banner { background:#fecaca !important; color:#7f1d1d !important; }
+    html[data-theme=\"light\"] #takeoff_err { background:#fef2f2 !important; color:#7f1d1d !important; border-color:#f87171 !important; }
+    /* Catch common inline-styled dark backgrounds/colors */
+    html[data-theme=\"light\"] [style*=\"background:#0f172a\"],
+    html[data-theme=\"light\"] [style*=\"background: #0f172a\"],
+    html[data-theme=\"light\"] [style*=\"background:#111827\"],
+    html[data-theme=\"light\"] [style*=\"background:#0b1220\"],
+    html[data-theme=\"light\"] [style*=\"background:#0b1424\"] { background:#ffffff !important; }
+    html[data-theme=\"light\"] [style*=\"background:#1e293b\"],
+    html[data-theme=\"light\"] [style*=\"background:#1e2a3a\"] { background:#e2e8f0 !important; }
+    html[data-theme=\"light\"] [style*=\"background:#1f2937\"] { background:#e2e8f0 !important; }
+    html[data-theme=\"light\"] [style*=\"color:#e2e8f0\"] { color:#0f172a !important; }
+    html[data-theme=\"light\"] [style*=\"color:#94a3b8\"],
+    html[data-theme=\"light\"] [style*=\"color:#cbd5e1\"],
+    html[data-theme=\"light\"] [style*=\"color:#64748b\"] { color:#475569 !important; }
+    html[data-theme=\"light\"] [style*=\"border-color:#334155\"],
+    html[data-theme=\"light\"] [style*=\"border:1px solid #334155\"],
+    html[data-theme=\"light\"] [style*=\"border:1px solid #475569\"],
+    html[data-theme=\"light\"] [style*=\"border:1px solid #1e293b\"],
+    html[data-theme=\"light\"] [style*=\"border-top:1px solid #1e293b\"] { border-color:#cbd5e1 !important; }
+    /* Keep accent-coloured status badges vibrant (keep dark text on the accent) */
+    html[data-theme=\"light\"] [style*=\"color:#22c55e\"] { color:#15803d !important; }
+    html[data-theme=\"light\"] [style*=\"color:#f59e0b\"] { color:#b45309 !important; }
+    html[data-theme=\"light\"] [style*=\"color:#38bdf8\"] { color:#0369a1 !important; }
+    html[data-theme=\"light\"] [style*=\"color:#a78bfa\"] { color:#7c3aed !important; }
+    html[data-theme=\"light\"] [style*=\"color:#06b6d4\"] { color:#0e7490 !important; }
+    html[data-theme=\"light\"] #theme_toggle { color:#0369a1 !important; border-color:#94a3b8 !important; }
   </style>
 </head>
 <body>
-  <h2>Drone Remote Controller</h2>
+  <!-- Shared parameter-info popup. Any .info-icon click populates and
+       shows this modal via window.showParamInfo(key, event). -->
+  <div id=\"param_info_modal\" onclick=\"if(event.target===this) this.style.display='none';\">
+    <div class=\"box\">
+      <div class=\"title\"    id=\"pim_title\">parameter</div>
+      <div class=\"subtitle\" id=\"pim_key\">key</div>
+      <div class=\"body\"     id=\"pim_body\">explanation</div>
+      <div class=\"range\"    id=\"pim_range\"></div>
+      <div style=\"text-align:right;\">
+        <button class=\"close\" onclick=\"document.getElementById('param_info_modal').style.display='none';\">Close</button>
+      </div>
+    </div>
+  </div>
+  <div style=\"display:flex;align-items:center;gap:14px;margin:0 0 6px 0;\">
+    <h2 style=\"margin:0;flex:1;\">Drone Remote Controller</h2>
+    <button id=\"theme_toggle\" title=\"Toggle light / dark theme\"
+            style=\"height:34px;padding:0 12px;font-size:12px;font-weight:600;
+                   background:transparent;\">&#127769; Dark</button>
+    <img id=\"team_logo\" src=\"/logo.png?v=2\" alt=\"Team logo\"
+         title=\"Team To Be Defined — SDC26\"
+         style=\"width:110px;height:auto;background:transparent;
+                filter:drop-shadow(0 2px 6px rgba(0,0,0,0.45));\"
+         onerror=\"this.style.display='none'\" />
+  </div>
   <div style=\"display:flex;align-items:center;gap:8px;\">
     <div class=\"drone-bar\" id=\"drone_bar\" style=\"flex:1;\"></div>
+    <button id=\"pause_all_btn\" style=\"padding:6px 14px;font-size:13px;font-weight:700;background:#78350f;border-color:#f59e0b;color:#fde68a;letter-spacing:0.4px;\" title=\"Override any command and freeze every drone in place. Autonomous missions abort; drones hover with zero RC. Keyboard shortcut: 9\">&#9208;&#65039; PAUSE ALL (9)</button>
+    <button id=\"resume_all_btn\" style=\"padding:6px 14px;font-size:13px;font-weight:700;background:#065f46;border-color:#10b981;color:#d1fae5;letter-spacing:0.4px;display:none;\" title=\"Clear the pause — operators may re-arm missions manually. Keyboard shortcut: 9\">&#9654;&#65039; CONTINUE MISSION</button>
     <button id=\"land_all_btn\" style=\"padding:6px 14px;font-size:13px;font-weight:700;background:#7f1d1d;border-color:#ef4444;color:#fee2e2;letter-spacing:0.4px;\" title=\"Land every drone in the fleet safely. Keyboard shortcut: 0 (zero)\">&#11088; LAND ALL (0)</button>
     <button id=\"edit_drones_btn\" style=\"padding:4px 12px;font-size:12px;background:#1e3a5f;border-color:#3b82f6;\" title=\"Edit drone fleet config\">Config</button>
+  </div>
+  <!-- Global PAUSE banner — sits just below the drone bar, hidden until
+       the fleet is paused. Amber bg + animated pulse to make it impossible
+       to miss. Reminds the operator that WASD is the only active control. -->
+  <div id=\"global_pause_banner\" style=\"display:none;background:#ca8a04;color:#1c1917;padding:8px 14px;margin-top:6px;border-radius:6px;font-weight:700;letter-spacing:0.04em;text-align:center;box-shadow:0 0 0 2px #facc15 inset;animation:pausepulse 1.4s ease-in-out infinite;\">
+    &#9208;&#65039; PAUSED &mdash; autonomous control is disabled. Drones hover at current position. Only WASD / manual RC is live. Press <b>CONTINUE MISSION</b> or <b>9</b> to resume.
+  </div>
+  <!-- Ceiling guard — the C2 UI sets the value, but the enforcement
+       runs ENTIRELY on each drone's flight-controller Pi (its 20 Hz
+       rc_loop using its own height_cm telemetry). If the C2 crashes,
+       disconnects, or even shuts down, the Pi keeps clamping upward
+       RC. The value persists to flight_config.json on the Pi so a
+       Pi restart also retains the ceiling. This is the last-line
+       safety — independent of C2 connection. -->
+  <div style=\"display:flex;align-items:center;gap:10px;margin-top:6px;padding:4px 10px;background:#0b1424;border:1px solid #1e293b;border-radius:5px;font-size:12px;\">
+    <span style=\"color:#fca5a5;font-weight:600;letter-spacing:0.04em;\"
+          title=\"Safety ceiling — set here, enforced on every Pi independently\">
+      &#128737;&#65039; Ceiling
+    </span>
+    <label style=\"color:#94a3b8;display:flex;align-items:center;gap:4px;cursor:pointer;\"
+           title=\"Hard maximum altitude above ground. Stored and enforced LOCALLY on each drone's Pi (no C2 dependency). Proportional clamp within 50cm, hard stop at ceiling, forced descent above. Persists across Pi restarts via flight_config.json.\">
+      max
+      <input id=\"ceiling_input\" type=\"number\" min=\"0.5\" max=\"20\" step=\"0.1\" value=\"5.0\" style=\"width:64px;height:26px;font-size:12px;\" />
+      m
+      <span class=\"info-icon\" data-info=\"ceiling_m\">i</span>
+    </label>
+    <button id=\"ceiling_apply_btn\"
+            style=\"height:26px;font-size:11px;padding:0 10px;background:#7f1d1d;border-color:#ef4444;color:#fee2e2;\"
+            title=\"POST the new value to every drone's /api/config/ceiling. Each Pi then: (1) stores it in MAX_ALTITUDE_M for its local RC tick, (2) writes it to flight_config.json for persistence, (3) pushes it to the Anafi firmware MaxAltitude as a second-line guard.\">Apply to fleet</button>
+    <span id=\"ceiling_status\" class=\"small\" style=\"color:#64748b;\"></span>
+    <span id=\"ceiling_engaged_badge\" class=\"small\" style=\"display:none;color:#fde68a;background:#7f1d1d;padding:2px 8px;border-radius:4px;font-weight:700;letter-spacing:0.04em;animation:pausepulse 1.0s ease-in-out infinite;\">
+      &#128680; CEILING ENGAGED
+    </span>
+    <span class=\"small\" style=\"color:#64748b;margin-left:auto;\"
+          title=\"The Pi enforces this ceiling on every RC tick regardless of C2 state — no remote connection required.\">
+      &#128274; Pi-enforced
+    </span>
+  </div>
+  <!-- Flight safety guards — axis-lock (autonomous only), arena
+       boundary (BOTH manual + autonomous when 'Manual guard' is on),
+       and safety margin. The arena guard is enforced on each Pi in
+       the RC tick loop so it works independently of the C2. -->
+  <div style=\"display:flex;align-items:center;gap:14px;margin-top:4px;padding:4px 10px;background:#0b1424;border:1px solid #1e293b;border-radius:5px;font-size:12px;flex-wrap:wrap;\">
+    <span style=\"color:#fbbf24;font-weight:600;letter-spacing:0.04em;\">&#129517; Flight guards</span>
+    <label style=\"color:#94a3b8;display:flex;align-items:center;gap:4px;cursor:pointer;\"
+           title=\"When ON: during missions and autonomous flight the drone only flies parallel to arena walls — yaw snaps to nearest 90°, lateral motion is strafe OR forward/back but never diagonal. Manual WASD is unchanged.\">
+      <input type=\"checkbox\" id=\"axis_locked_toggle\" style=\"accent-color:#fbbf24;\" />
+      Axis-lock (autonomous)
+      <span class=\"info-icon\" data-info=\"axis_locked\">i</span>
+    </label>
+    <label style=\"color:#94a3b8;display:flex;align-items:center;gap:4px;cursor:pointer;\"
+           title=\"When ON: every RC command on the Pi — manual WASD, keystroke, autonomous mission, everything — is clamped so the drone never approaches an arena wall closer than the margin. Enforced by the Pi's own RC tick at 20 Hz, independent of C2 connection. Falls back silently when position is unknown (operator is responsible).\">
+      <input type=\"checkbox\" id=\"arena_guard_toggle\" checked style=\"accent-color:#f87171;\" />
+      Arena guard (manual+auto)
+      <span class=\"info-icon\" data-info=\"arena_guard_enabled\">i</span>
+    </label>
+    <label style=\"color:#94a3b8;display:flex;align-items:center;gap:4px;cursor:pointer;\"
+           title=\"Minimum distance from any arena wall. The Pi-side RC tick clamps any command that would push the drone closer than this.\">
+      margin
+      <input id=\"safety_margin_input\" type=\"number\" min=\"0.1\" max=\"5.0\" step=\"0.1\" value=\"1.5\" style=\"width:54px;height:24px;font-size:12px;\" />
+      m
+      <span class=\"info-icon\" data-info=\"safety_margin_m\">i</span>
+    </label>
+    <button id=\"safety_margin_apply\" style=\"height:24px;font-size:11px;padding:0 8px;background:#78350f;border-color:#f59e0b;color:#fde68a;\"
+            title=\"Push margin to every drone's Pi (arena guard) + every observer (autonomous guard)\">Apply</button>
+    <span id=\"arena_guard_engaged_badge\" class=\"small\" style=\"display:none;color:#fde68a;background:#7f1d1d;padding:2px 8px;border-radius:4px;font-weight:700;letter-spacing:0.04em;\">
+      &#128680; ARENA GUARD ENGAGED
+    </span>
+    <label style=\"color:#94a3b8;display:flex;align-items:center;gap:4px;cursor:pointer;\"
+           title=\"When ON: during ANY autonomous mission, the drone's camera aims at the arena centre (default x=0, y=5.4) regardless of which direction it's flying. This keeps the maximum number of ArUco markers in view at once, which in turn gives the position processor more references and a more accurate fused pose.\">
+      <input type=\"checkbox\" id=\"cam_face_center_toggle\" style=\"accent-color:#22d3ee;\" />
+      &#128247; Cam → arena centre
+      <span class=\"info-icon\" data-info=\"camera_face_center\">i</span>
+    </label>
+    <span id=\"autonomous_guards_status\" class=\"small\" style=\"color:#64748b;\"></span>
   </div>
   <div id=\"drone_config_modal\" style=\"display:none;position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,0.7);z-index:1000;justify-content:center;align-items:center;\">
     <div style=\"background:#1e293b;border:1px solid #334155;border-radius:8px;padding:20px;max-width:700px;width:90%;max-height:80vh;overflow-y:auto;\">
@@ -341,6 +1430,81 @@ HTML = """
   <div class=\"small\">Active: <span id=\"pi\"></span></div>
   <div class=\"small\">API status: <span id=\"api_status\">checking...</span></div>
   <div class=\"small\">Drone telemetry status: <span id=\"drone_status\">checking...</span></div>
+  <!-- Latency indicator (live ms). Click the toggle to auto-push the total
+       into the position-tracker's latency_ms slider. Video-decode offset
+       slider lets the operator add the C2-side processing time that isn't
+       captured by either ping. -->
+  <div class=\"small\" id=\"latency_widget\" style=\"display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-top:4px;padding:4px 8px;background:#0f172a;border:1px solid #1e293b;border-radius:4px;\">
+    <b style=\"color:#e2e8f0;\">Latency:</b>
+    <span id=\"lat_total\" style=\"font-weight:700;color:#22c55e;min-width:60px;\">—</span>
+    <span class=\"small\" style=\"color:#64748b;\">=
+      c2→fc <span id=\"lat_c2fc\" style=\"color:#93c5fd;\">—</span> +
+      fc→drone <span id=\"lat_fcdr\" style=\"color:#fbbf24;\">—</span> +
+      video <span id=\"lat_vid\" style=\"color:#c4b5fd;\">—</span>
+    </span>
+    <label style=\"display:flex;align-items:center;gap:4px;color:#94a3b8;cursor:pointer;\" title=\"Add this many ms for local video-frame processing/decoding on the C2. Not measured by either ping.\">
+      video +<input id=\"lat_video_offset\" type=\"number\" min=\"0\" max=\"500\" step=\"5\" value=\"30\" style=\"width:55px;\" /> ms
+    </label>
+    <label style=\"display:flex;align-items:center;gap:4px;color:#94a3b8;cursor:pointer;\" title=\"Auto-push the total into the Position Tracker latency slider every poll.\">
+      <input type=\"checkbox\" id=\"lat_auto_apply\" checked /> auto-set latency
+    </label>
+    <span id=\"ws_status_badge\" class=\"small\" title=\"WebSocket channel between C2 and flight controller. Tel/Pos/RC are pushed on a persistent connection — no per-call HTTP framing overhead.\" style=\"padding:2px 8px;border-radius:3px;font-family:monospace;font-size:10.5px;letter-spacing:0.03em;font-weight:700;background:#334155;color:#94a3b8;\">WS —</span>
+  </div>
+  <!-- ── Transport selector — per-subsystem WS ↔ HTTP switches ──
+       auto = prefer WS, fall back to HTTP when WS is down (default)
+       ws   = force WS only (503 if WS disconnected)
+       http = force HTTP only (never use WS)
+       Persisted on the server + mirrored in localStorage so every tab
+       reflects the same choice. -->
+  <div id=\"transport_widget\" class=\"small\" style=\"display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-top:4px;padding:4px 8px;background:#0f172a;border:1px solid #1e293b;border-radius:4px;\">
+    <b style=\"color:#e2e8f0;\">Transport:</b>
+    <span style=\"color:#64748b;\">Controls (RC/WASD)</span>
+    <select id=\"transport_rc\" class=\"transport-sel\" data-subsys=\"rc\" style=\"height:22px;font-size:11px;padding:0 4px;\">
+      <option value=\"auto\">auto</option>
+      <option value=\"ws\">ws</option>
+      <option value=\"http\">http</option>
+    </select>
+    <span style=\"color:#64748b;\">Telemetry</span>
+    <select id=\"transport_telemetry\" class=\"transport-sel\" data-subsys=\"telemetry\" style=\"height:22px;font-size:11px;padding:0 4px;\">
+      <option value=\"auto\">auto</option>
+      <option value=\"ws\">ws</option>
+      <option value=\"http\">http</option>
+    </select>
+    <span style=\"color:#64748b;\">Position</span>
+    <select id=\"transport_position\" class=\"transport-sel\" data-subsys=\"position\" style=\"height:22px;font-size:11px;padding:0 4px;\">
+      <option value=\"auto\">auto</option>
+      <option value=\"ws\">ws</option>
+      <option value=\"http\">http</option>
+    </select>
+    <button id=\"transport_all_http\" style=\"height:22px;font-size:11px;padding:0 8px;background:#1e293b;border-color:#475569;\" title=\"Force every subsystem to HTTP (legacy transport). Useful for diagnosing WS as the source of latency.\">All HTTP</button>
+    <button id=\"transport_all_auto\" style=\"height:22px;font-size:11px;padding:0 8px;background:#1e293b;border-color:#475569;\" title=\"Reset: prefer WS with HTTP fallback\">All auto</button>
+    <span id=\"transport_status\" class=\"small\" style=\"color:#64748b;\"></span>
+  </div>
+  <!-- ── Tuning Parameters — one place for all live-tunable knobs ──
+       The Observer PD gains (approach speed, skew correction, IMU damping,
+       clamps, etc.) AND the Position Tracker config (profile, FOV, latency,
+       IMU/ArUco blend, Kalman, marker size, top-K, outlier) all live here
+       so operators don't have to hunt for the right slider. Content is
+       relocated at runtime from the ArUco Seek and Position Tracker panels
+       via JS to keep existing IDs and handlers intact. -->
+  <div id=\"tuning_panel\" class=\"panel\" style=\"margin-top:10px;\">
+    <h3 style=\"margin:0 0 8px 0;color:#38bdf8;\">Tuning Parameters <span class=\"small\" style=\"color:#64748b;font-weight:400;\">— all live-adjustable knobs in one place</span></h3>
+    <div style=\"display:flex;flex-wrap:wrap;gap:16px;align-items:flex-start;\">
+      <div style=\"flex:1;min-width:360px;\">
+        <div class=\"small\" style=\"color:#a78bfa;margin-bottom:4px;font-weight:600;\">
+          Observer PD — visual-servo gains (hover in front of markers, used by missions)
+        </div>
+        <div id=\"tuning_observer_slot\" style=\"min-height:10px;\"></div>
+      </div>
+      <div style=\"flex:1;min-width:360px;\">
+        <div class=\"small\" style=\"color:#22d3ee;margin-bottom:4px;font-weight:600;\">
+          Position Tracker — absolute arena-frame pose fusion (all missions + boundary guard)
+        </div>
+        <div id=\"tuning_position_slot\" style=\"min-height:10px;\"></div>
+      </div>
+    </div>
+  </div>
+
   <div class=\"row\" style=\"margin-top:10px;\">
     <div class=\"panel\">
       <div class=\"grid\" id=\"grid\">
@@ -373,10 +1537,22 @@ HTML = """
         <button id=\"download_cmd_log\">Download Command Log</button>
         <button id=\"clear_cmd_log\">Clear Command Log</button>
       </div>
+      <!-- Automatic per-flight logs — a fresh JSONL file per takeoff → land
+           pair, containing telemetry + commands + arena position + visible
+           ArUco markers. Archived list below; click a row to download. -->
+      <div class=\"adv\" style=\"margin-top:10px;\">
+        <div class=\"small\" style=\"margin-bottom:6px;\">
+          <b>Flight Logs</b> <span style=\"color:#64748b;\">— auto-recorded per takeoff</span>
+          <button id=\"flight_logs_refresh\" style=\"height:24px;font-size:11px;padding:0 8px;margin-left:10px;background:#1e293b;\">Refresh</button>
+        </div>
+        <div id=\"flight_logs_list\" class=\"small\"
+             style=\"font-family:monospace;font-size:11px;max-height:180px;overflow-y:auto;border:1px solid #334155;border-radius:4px;padding:6px;background:#0b1220;color:#cbd5e1;\">
+          <i style=\"color:#64748b;\">loading…</i>
+        </div>
+      </div>
       <div class=\"adv\">
         <div class=\"small\" style=\"margin-bottom:6px;\">Advanced SDK controls</div>
         <div class=\"adv-grid\">
-          <button id=\"emergency\" style=\"background:#7f1d1d;border-color:#dc2626;\">EMERGENCY<br><span style=\"font-size:9px;font-weight:400;opacity:.8;\">Killswitch - will shutdown drone immediately - no safe landing</span></button>
           <button id=\"rotate_cw\">Rotate CW 45°</button>
           <button id=\"rotate_ccw\">Rotate CCW 45°</button>
           <button id=\"move_up\">Up 30cm</button>
@@ -412,7 +1588,7 @@ HTML = """
         </div>
         <div class=\"row\" style=\"margin-top:8px; align-items:center;\">
           <span class=\"small\" style=\"min-width:80px;\">Max altitude (m)</span>
-          <input id=\"set_alt\" type=\"number\" min=\"0.5\" max=\"150\" step=\"0.5\" value=\"2\" style=\"width:70px;\" />
+          <input id=\"set_alt\" type=\"number\" min=\"0.5\" max=\"150\" step=\"0.5\" value=\"5\" style=\"width:70px;\" />
           <span class=\"small\" style=\"min-width:80px;\">Max vert spd</span>
           <input id=\"set_vspd\" type=\"number\" min=\"0.1\" max=\"4\" step=\"0.1\" value=\"0.5\" style=\"width:70px;\" />
           <span class=\"small\" style=\"min-width:80px;\">Max tilt (°)</span>
@@ -485,6 +1661,15 @@ HTML = """
         </div>
         <div class=\"video-status\" id=\"video_status\">Mode: off</div>
         <div class=\"video-url\" id=\"video_url\" style=\"display:none;\"></div>
+        <!-- Anafi camera zoom. Digital zoom 1.0–3.0×. Slider writes to
+             /proxy/camera/zoom, which forwards to Olympe's set_zoom_target
+             on the Pi. Value updates live as you drag. -->
+        <div class=\"video-controls\" style=\"margin-top:8px;\">
+          <span class=\"small\" style=\"min-width:52px;\">Zoom</span>
+          <input id=\"video_zoom\" type=\"range\" min=\"1.0\" max=\"3.0\" step=\"0.05\" value=\"1.0\" style=\"flex:1;max-width:200px;\" />
+          <span id=\"video_zoom_val\" class=\"small\" style=\"min-width:40px;\">1.00×</span>
+          <button id=\"video_zoom_reset\" style=\"padding:2px 8px;font-size:11px;\">Reset</button>
+        </div>
         <div id=\"video_container\" style=\"margin-top:8px;display:none;\">
           <img id=\"video_img\" src=\"\" alt=\"video stream\" style=\"width:480px;height:auto;\" />
         </div>
@@ -573,7 +1758,35 @@ HTML = """
       <label style=\"color:#94a3b8;\">Mission:</label>
       <select id=\"mis_type\">
         <option value=\"scan_all\">Scan all ArUco markers (sequential, collision-aware)</option>
+        <option value=\"capture_targets\">Capture enemy targets (SDC26 — box-capture, camera on arena centre)</option>
       </select>
+    </div>
+
+    <!-- Capture-Targets specific inputs — hidden unless that mission is selected. -->
+    <div id=\"mis_capture_rows\" style=\"display:none;\">
+      <div class=\"mis-row\">
+        <label style=\"color:#94a3b8;\" title=\"One JSON object per target box. Use the Blue team's 3 enemy boxes (the red-home boxes) for standard play.\">Target boxes (JSON):</label>
+        <textarea id=\"mis_boxes_json\" rows=\"8\" style=\"width:100%;max-width:520px;background:#0f172a;color:#e2e8f0;border:1px solid #334155;border-radius:4px;padding:6px;font-family:monospace;font-size:11px;\">[
+  {\"id\": 1, \"x\": -7.0, \"y\": 2.5, \"home_team\": \"red\"},
+  {\"id\": 2, \"x\": -5.0, \"y\": 5.4, \"home_team\": \"red\"},
+  {\"id\": 3, \"x\": -7.0, \"y\": 8.3, \"home_team\": \"red\"},
+  {\"id\": 4, \"x\":  7.0, \"y\": 2.5, \"home_team\": \"blue\"},
+  {\"id\": 5, \"x\":  5.0, \"y\": 5.4, \"home_team\": \"blue\"},
+  {\"id\": 6, \"x\":  7.0, \"y\": 8.3, \"home_team\": \"blue\"}
+]</textarea>
+      </div>
+      <div class=\"mis-row\">
+        <label style=\"color:#94a3b8;\" title=\"World-frame XY the drone returns to after all captures. Typically your team's home-zone centre.\">Home XY:</label>
+        <input id=\"mis_home_x\" type=\"number\" step=\"0.1\" value=\"0.0\" style=\"width:70px;\" />
+        <input id=\"mis_home_y\" type=\"number\" step=\"0.1\" value=\"9.0\" style=\"width:70px;\" />
+        <label style=\"color:#94a3b8;margin-left:12px;\" title=\"World-frame XY the drone's camera aims at while moving (typically arena centre so many markers stay in view for triangulation).\">Face XY:</label>
+        <input id=\"mis_face_x\" type=\"number\" step=\"0.1\" value=\"0.0\" style=\"width:70px;\" />
+        <input id=\"mis_face_y\" type=\"number\" step=\"0.1\" value=\"5.4\" style=\"width:70px;\" />
+        <label style=\"color:#94a3b8;margin-left:12px;\" title=\"Altitude above the floor for the capture hover.\">Altitude (m):</label>
+        <input id=\"mis_alt\" type=\"number\" step=\"0.1\" min=\"0.5\" value=\"1.5\" style=\"width:70px;\" />
+        <label style=\"color:#94a3b8;margin-left:12px;\" title=\"Hover duration above each box. Must be ≥ the 2s capture-hold from SDC26 rules.\">Hover s:</label>
+        <input id=\"mis_cap_hover_s\" type=\"number\" step=\"0.5\" min=\"2.0\" value=\"4.0\" style=\"width:70px;\" />
+      </div>
     </div>
 
     <div class=\"mis-row\">
@@ -594,6 +1807,35 @@ HTML = """
         <input id=\"mis_auto_takeoff\" type=\"checkbox\" />
         auto-takeoff
       </label>
+    </div>
+
+    <!-- ── Mission-as-code + presets ──────────────────────────────────
+         Every mission type has its own JSON parameter block. The
+         editor below is the canonical source of truth; the form
+         fields above auto-sync into it when you click "From form".
+         Presets are saved server-side in controller/mission_presets.json
+         so they survive server restarts and are shared across browser
+         tabs. -->
+    <div class=\"mis-row\" style=\"margin-top:8px;\">
+      <label style=\"color:#94a3b8;\">Preset:</label>
+      <select id=\"mis_preset_sel\" style=\"min-width:180px;\"></select>
+      <button id=\"mis_preset_load\" style=\"background:#1e293b;border-color:#475569;\" title=\"Load the selected preset's JSON into the editor\">Load</button>
+      <input id=\"mis_preset_name\" type=\"text\" placeholder=\"preset name\" style=\"width:140px;\" />
+      <button id=\"mis_preset_save\" style=\"background:#1e293b;border-color:#475569;\" title=\"Save the current JSON as a named preset (overwrites if name exists)\">Save</button>
+      <button id=\"mis_preset_delete\" style=\"background:#450a0a;border-color:#b91c1c;color:#fecaca;\" title=\"Delete the selected preset\">Delete</button>
+      <span id=\"mis_preset_status\" class=\"small\" style=\"color:#64748b;\"></span>
+    </div>
+    <div class=\"mis-row\">
+      <label style=\"color:#94a3b8;align-self:flex-start;\">Code (JSON):</label>
+      <textarea id=\"mis_code\" rows=\"10\" spellcheck=\"false\"
+                style=\"width:100%;max-width:680px;background:#0f172a;color:#e2e8f0;border:1px solid #334155;border-radius:4px;padding:6px;font-family:monospace;font-size:11px;line-height:1.4;\"
+                placeholder=\"JSON parameters for the selected mission…\"></textarea>
+    </div>
+    <div class=\"mis-row\">
+      <button id=\"mis_code_from_form\" style=\"background:#1e293b;border-color:#475569;\" title=\"Rebuild the JSON from the form fields above\">&#8689; From form</button>
+      <button id=\"mis_code_to_form\" style=\"background:#1e293b;border-color:#475569;\" title=\"Apply the JSON values to the form fields (where possible)\">&#8690; To form</button>
+      <button id=\"mis_code_run\" style=\"background:#065f46;border-color:#10b981;\" title=\"Parse the JSON and start the mission using those parameters — bypasses the form\">&#9654; Run from code</button>
+      <span id=\"mis_code_status\" class=\"small\" style=\"color:#64748b;\"></span>
     </div>
 
     <div class=\"mis-row\" style=\"margin-top:8px;\">
@@ -791,7 +2033,7 @@ HTML = """
         const r = document.createElement('div');
         r.className = 'arc-row';
         r.innerHTML =
-          '<label title=\"'+k+'\">'+label+'</label>' +
+          '<label title=\"'+k+'\">'+label+' <span class=\"info-icon\" data-info=\"'+k+'\">i</span></label>' +
           '<input type=\"range\" min=\"'+mn+'\" max=\"'+mx+'\" step=\"'+st+'\" value=\"'+v+'\" data-k=\"'+k+'\" />' +
           '<input type=\"number\" min=\"'+mn+'\" max=\"'+mx+'\" step=\"'+st+'\" value=\"'+v+'\" data-k=\"'+k+'\" />';
         cont.appendChild(r);
@@ -1080,11 +2322,11 @@ HTML = """
     document.getElementById('arc_emergency').onclick = () => arcPostCmd('/proxy/aruco/emergency', '⛔ EMERGENCY STOP — cut motors immediately. Confirm?');
 
     arcLoadParams();
-    setInterval(arcPoll, 250);
+    setInterval(arcPoll, 500);    // was 250ms/4Hz → 2Hz; 500ms is plenty for the readout
     arcPoll();
     // Version marker — if this string doesn't appear in the DOM,
     // you're running stale JS (restart the Python server or hard-refresh).
-    const BUILD = 'as-arena-safety-guard';
+    const BUILD = 'cg-distance-scale-correction';
     console.log('[arc] init complete, build=' + BUILD);
     const ver = document.createElement('span');
     ver.id = 'arc_build_tag';
@@ -1194,9 +2436,46 @@ HTML = """
     async function misPoll() {
       try {
         const r = await fetch('/proxy/missions/status');
-        misRenderStatus(await r.json());
+        const st = await r.json();
+        misRenderStatus(st);
+        // If a capture-targets mission is running, pull its boxes into the
+        // global so the arena views (2D + 3D) can render them.
+        if (st && st.has_mission && st.target_boxes &&
+            Array.isArray(st.target_boxes) && st.target_boxes.length) {
+          window._targetBoxes = st.target_boxes;
+        }
+        // Capture state → colour the boxes in the arena view
+        window._missionClaimedBoxes = (st && st.claimed) || {};
+        window._missionCapturedBoxes = (st && st.captured) || [];
       } catch {}
     }
+
+    // Parse the mission's target-boxes JSON textarea live and expose it
+    // globally. Both the 2D canvas drawArena() and the Three.js scene
+    // read window._targetBoxes to render the boxes on the floor even
+    // before the mission starts.
+    function _parseTargetBoxesInput() {
+      const el = document.getElementById('mis_boxes_json');
+      if (!el) return;
+      try {
+        const v = JSON.parse(el.value);
+        if (Array.isArray(v)) {
+          window._targetBoxes = v;
+          el.style.borderColor = '#334155';
+        } else {
+          el.style.borderColor = '#ef4444';
+        }
+      } catch {
+        el.style.borderColor = '#ef4444';
+      }
+    }
+    (function(){
+      const el = document.getElementById('mis_boxes_json');
+      if (el) {
+        el.addEventListener('input', _parseTargetBoxesInput);
+        _parseTargetBoxesInput();  // initial parse so defaults render
+      }
+    })();
 
     // Click-to-arm pattern for Start Mission — no native confirm() dialog
     // (some browsers auto-dismiss rapid-fire dialogs, making the mission
@@ -1222,18 +2501,49 @@ HTML = """
         misShowWarn('✗ Select at least one drone first');
         return;
       }
-      const markers = document.getElementById('mis_markers').value;
-      const hover_seconds = parseFloat(document.getElementById('mis_hover_s').value) || 3.0;
-      const tol = parseFloat(document.getElementById('mis_tol_m').value) || 0.35;
-      const skew_tol_el = document.getElementById('mis_skew_tol');
-      const skew_tol = skew_tol_el ? (parseFloat(skew_tol_el.value) || 0.08) : 0.08;
+      const missionType = document.getElementById('mis_type').value;
       const auto_takeoff = document.getElementById('mis_auto_takeoff').checked;
-      const payload = {
-        drone_ids, target_markers: markers,
-        hover_seconds, approach_tolerance_m: tol,
-        approach_skew_tol: skew_tol,
-        auto_takeoff,
-      };
+      let endpoint, payload;
+      if (missionType === 'capture_targets') {
+        // Parse target-boxes JSON
+        let boxes = [];
+        try { boxes = JSON.parse(document.getElementById('mis_boxes_json').value); }
+        catch (e) { misShowWarn('✗ target_boxes JSON invalid: ' + e.message); return; }
+        if (!Array.isArray(boxes) || boxes.length === 0) {
+          misShowWarn('✗ target_boxes must be a non-empty JSON array'); return;
+        }
+        const home_xy = [
+          parseFloat(document.getElementById('mis_home_x').value) || 0,
+          parseFloat(document.getElementById('mis_home_y').value) || 0,
+        ];
+        const face_xy = [
+          parseFloat(document.getElementById('mis_face_x').value) || 0,
+          parseFloat(document.getElementById('mis_face_y').value) || 0,
+        ];
+        const alt = parseFloat(document.getElementById('mis_alt').value) || 1.5;
+        const hv  = parseFloat(document.getElementById('mis_cap_hover_s').value) || 4.0;
+        endpoint = '/proxy/missions/capture_targets/start';
+        payload = {
+          drone_ids, target_boxes: boxes,
+          home_xy, arena_face_xy: face_xy,
+          hover_above_m: alt, hover_seconds: hv,
+          auto_takeoff,
+        };
+      } else {
+        // scan_all (default)
+        const markers = document.getElementById('mis_markers').value;
+        const hover_seconds = parseFloat(document.getElementById('mis_hover_s').value) || 3.0;
+        const tol = parseFloat(document.getElementById('mis_tol_m').value) || 0.35;
+        const skew_tol_el = document.getElementById('mis_skew_tol');
+        const skew_tol = skew_tol_el ? (parseFloat(skew_tol_el.value) || 0.08) : 0.08;
+        endpoint = '/proxy/missions/scan_all/start';
+        payload = {
+          drone_ids, target_markers: markers,
+          hover_seconds, approach_tolerance_m: tol,
+          approach_skew_tol: skew_tol,
+          auto_takeoff,
+        };
+      }
       const btn = document.getElementById('mis_start');
       const now = Date.now();
       if (now >= _misArmedUntil) {
@@ -1267,7 +2577,7 @@ HTML = """
       btn.disabled = true; btn.textContent = '… starting';
       let j = {}; let httpStatus = 0;
       try {
-        const r = await fetch('/proxy/missions/scan_all/start', {method:'POST',
+        const r = await fetch(endpoint, {method:'POST',
           headers:{'Content-Type':'application/json'},
           body: JSON.stringify(payload)});
         httpStatus = r.status;
@@ -1315,8 +2625,222 @@ HTML = """
     // If the drone config changes, the drones list in the ArUco section
     // repopulates via /proxy/drones poll — mirror that for missions.
     setInterval(misLoadDrones, 5000);
-    setInterval(misPoll, 500);
+    setInterval(misPoll, 1500);  // was 500ms → 1.5s; mission status barely changes between ticks
     misPoll();
+
+    // Show/hide the capture-targets-specific rows based on mission type
+    const misTypeSel = document.getElementById('mis_type');
+    const misCaptureRows = document.getElementById('mis_capture_rows');
+    const misScanRows = document.querySelector('#missions_panel .mis-row:nth-of-type(3)');
+    function syncMissionUI() {
+      const t = misTypeSel.value;
+      if (misCaptureRows) misCaptureRows.style.display = (t === 'capture_targets') ? '' : 'none';
+      if (misScanRows)    misScanRows.style.display    = (t === 'capture_targets') ? 'none' : '';
+    }
+    if (misTypeSel) { misTypeSel.addEventListener('change', syncMissionUI); syncMissionUI(); }
+
+    // ── Mission-as-code + preset management ─────────────────────────
+    // Each mission type has its own JSON block. The editor is the
+    // canonical source of truth: "Run from code" parses it and starts
+    // directly. "From form" rebuilds the JSON from the form fields so
+    // the editor stays in sync with traditional click-around editing.
+    // Presets are persisted server-side in mission_presets.json.
+    (function wireMissionCode(){
+      const code  = document.getElementById('mis_code');
+      const sel   = document.getElementById('mis_preset_sel');
+      const nameI = document.getElementById('mis_preset_name');
+      const psBtn = document.getElementById('mis_preset_save');
+      const pdBtn = document.getElementById('mis_preset_delete');
+      const plBtn = document.getElementById('mis_preset_load');
+      const ffBtn = document.getElementById('mis_code_from_form');
+      const tfBtn = document.getElementById('mis_code_to_form');
+      const runBtn = document.getElementById('mis_code_run');
+      const psStatus = document.getElementById('mis_preset_status');
+      const cStatus  = document.getElementById('mis_code_status');
+      if (!code) return;
+      let _presets = {};
+
+      function flash(el, msg, col) {
+        if (!el) return;
+        el.textContent = msg;
+        el.style.color = col || '#64748b';
+        setTimeout(() => { if (el.textContent === msg) el.textContent = ''; }, 3000);
+      }
+      function currentType() {
+        return (misTypeSel && misTypeSel.value) || 'scan_all';
+      }
+      function renderPresetList() {
+        if (!sel) return;
+        const t = currentType();
+        const names = Object.keys((_presets[t]) || {}).sort();
+        sel.innerHTML = '';
+        if (!names.length) {
+          const opt = document.createElement('option');
+          opt.value = ''; opt.textContent = '(no presets)';
+          sel.appendChild(opt);
+          return;
+        }
+        names.forEach(n => {
+          const opt = document.createElement('option');
+          opt.value = n; opt.textContent = n;
+          sel.appendChild(opt);
+        });
+        if (names.includes('default')) sel.value = 'default';
+      }
+      async function loadPresets() {
+        try {
+          const j = await (await fetch('/proxy/missions/presets')).json();
+          _presets = j.presets || {};
+          renderPresetList();
+          // Auto-populate the code editor with the default preset on first load
+          if (!code.value.trim()) loadIntoEditor('default');
+        } catch (e) { console.warn('[mis] preset load failed', e); }
+      }
+      function loadIntoEditor(name) {
+        const t = currentType();
+        const params = (_presets[t] || {})[name];
+        if (!params) return;
+        code.value = JSON.stringify(params, null, 2);
+        if (nameI) nameI.value = name;
+        flash(psStatus, '\u2713 loaded "' + name + '"', '#22c55e');
+      }
+      function buildFromForm() {
+        // Reuse the same logic as mis_start but return the payload
+        // instead of POSTing. Everything below mirrors the existing
+        // build in mis_start.
+        const drone_ids = misSelectedDroneIds();
+        const auto_takeoff = document.getElementById('mis_auto_takeoff').checked;
+        if (currentType() === 'capture_targets') {
+          let boxes = [];
+          try { boxes = JSON.parse(document.getElementById('mis_boxes_json').value); }
+          catch {}
+          return {
+            drone_ids, target_boxes: boxes,
+            home_xy: [
+              parseFloat(document.getElementById('mis_home_x').value) || 0,
+              parseFloat(document.getElementById('mis_home_y').value) || 0,
+            ],
+            arena_face_xy: [
+              parseFloat(document.getElementById('mis_face_x').value) || 0,
+              parseFloat(document.getElementById('mis_face_y').value) || 0,
+            ],
+            hover_above_m: parseFloat(document.getElementById('mis_alt').value) || 1.5,
+            hover_seconds: parseFloat(document.getElementById('mis_cap_hover_s').value) || 4.0,
+            auto_takeoff,
+          };
+        }
+        return {
+          drone_ids,
+          target_markers: document.getElementById('mis_markers').value,
+          hover_seconds: parseFloat(document.getElementById('mis_hover_s').value) || 3.0,
+          approach_tolerance_m: parseFloat(document.getElementById('mis_tol_m').value) || 0.30,
+          approach_skew_tol: parseFloat(document.getElementById('mis_skew_tol').value) || 0.12,
+          auto_takeoff,
+        };
+      }
+      function applyCodeToForm() {
+        try {
+          const p = JSON.parse(code.value);
+          if (currentType() === 'capture_targets') {
+            if (Array.isArray(p.target_boxes))
+              document.getElementById('mis_boxes_json').value = JSON.stringify(p.target_boxes, null, 2);
+            if (Array.isArray(p.home_xy)) {
+              document.getElementById('mis_home_x').value = p.home_xy[0];
+              document.getElementById('mis_home_y').value = p.home_xy[1];
+            }
+            if (Array.isArray(p.arena_face_xy)) {
+              document.getElementById('mis_face_x').value = p.arena_face_xy[0];
+              document.getElementById('mis_face_y').value = p.arena_face_xy[1];
+            }
+            if (p.hover_above_m != null) document.getElementById('mis_alt').value = p.hover_above_m;
+            if (p.hover_seconds != null) document.getElementById('mis_cap_hover_s').value = p.hover_seconds;
+          } else {
+            if (p.target_markers != null) document.getElementById('mis_markers').value = p.target_markers;
+            if (p.hover_seconds != null) document.getElementById('mis_hover_s').value = p.hover_seconds;
+            if (p.approach_tolerance_m != null) document.getElementById('mis_tol_m').value = p.approach_tolerance_m;
+            if (p.approach_skew_tol != null) document.getElementById('mis_skew_tol').value = p.approach_skew_tol;
+          }
+          if (typeof p.auto_takeoff === 'boolean')
+            document.getElementById('mis_auto_takeoff').checked = p.auto_takeoff;
+          flash(cStatus, '\u2713 form populated from JSON', '#22c55e');
+        } catch (e) { flash(cStatus, '\u2717 JSON parse error: ' + e.message, '#ef4444'); }
+      }
+      // Wire buttons
+      if (ffBtn) ffBtn.onclick = () => {
+        code.value = JSON.stringify(buildFromForm(), null, 2);
+        flash(cStatus, '\u2713 JSON rebuilt from form', '#22c55e');
+      };
+      if (tfBtn) tfBtn.onclick = applyCodeToForm;
+      if (plBtn) plBtn.onclick = () => { if (sel && sel.value) loadIntoEditor(sel.value); };
+      if (psBtn) psBtn.onclick = async () => {
+        const name = (nameI && nameI.value.trim()) || (sel && sel.value) || '';
+        if (!name) { flash(psStatus, '\u2717 enter a preset name', '#ef4444'); return; }
+        let params;
+        try { params = JSON.parse(code.value); }
+        catch (e) { flash(psStatus, '\u2717 invalid JSON: ' + e.message, '#ef4444'); return; }
+        try {
+          const r = await fetch('/proxy/missions/presets', {
+            method: 'POST',
+            headers: {'Content-Type':'application/json'},
+            body: JSON.stringify({
+              mission_type: currentType(), name, params,
+            }),
+          });
+          const j = await r.json();
+          if (j.ok) { flash(psStatus, '\u2713 saved "' + name + '"', '#22c55e'); await loadPresets(); }
+          else flash(psStatus, '\u2717 ' + (j.error || 'save failed'), '#ef4444');
+        } catch (e) { flash(psStatus, '\u2717 ' + e, '#ef4444'); }
+      };
+      if (pdBtn) pdBtn.onclick = async () => {
+        const name = (sel && sel.value) || '';
+        if (!name) return;
+        if (!confirm('Delete preset "' + name + '" for ' + currentType() + '?')) return;
+        try {
+          const u = '/proxy/missions/presets?mission_type=' + encodeURIComponent(currentType())
+                    + '&name=' + encodeURIComponent(name);
+          const r = await fetch(u, {method:'DELETE'});
+          const j = await r.json();
+          if (j.ok) { flash(psStatus, '\u2713 deleted "' + name + '"', '#22c55e'); await loadPresets(); }
+          else flash(psStatus, '\u2717 ' + (j.error || 'delete failed'), '#ef4444');
+        } catch (e) { flash(psStatus, '\u2717 ' + e, '#ef4444'); }
+      };
+      if (runBtn) runBtn.onclick = async () => {
+        let payload;
+        try { payload = JSON.parse(code.value); }
+        catch (e) { flash(cStatus, '\u2717 JSON parse error: ' + e.message, '#ef4444'); return; }
+        // Fill drone_ids from selector if JSON didn't provide any
+        if (!Array.isArray(payload.drone_ids) || !payload.drone_ids.length) {
+          payload.drone_ids = misSelectedDroneIds();
+        }
+        if (!payload.drone_ids || !payload.drone_ids.length) {
+          flash(cStatus, '\u2717 drone_ids missing — select drone(s) or include in JSON', '#ef4444');
+          return;
+        }
+        const endpoint = (currentType() === 'capture_targets')
+          ? '/proxy/missions/capture_targets/start'
+          : '/proxy/missions/scan_all/start';
+        try {
+          const r = await fetch(endpoint, {
+            method: 'POST',
+            headers: {'Content-Type':'application/json'},
+            body: JSON.stringify(payload),
+          });
+          const j = await r.json();
+          if (r.ok && j.ok) flash(cStatus, '\u2713 mission started', '#22c55e');
+          else flash(cStatus, '\u2717 ' + (j.error || j.message || ('HTTP ' + r.status)), '#ef4444');
+          misPoll();
+        } catch (e) { flash(cStatus, '\u2717 ' + e, '#ef4444'); }
+      };
+      // Re-render preset list when the user flips mission type
+      if (misTypeSel) misTypeSel.addEventListener('change', () => {
+        renderPresetList();
+        // Also auto-load the default preset of the new type so the
+        // editor shows something relevant instead of stale JSON.
+        const def = (_presets[currentType()] || {}).default;
+        if (def) code.value = JSON.stringify(def, null, 2);
+      });
+      loadPresets();
+    })();
 
     // Mission panel click counter — same idea as the ArUco one. Proves the
     // Start / Stop buttons receive the click event, independent of what
@@ -1351,7 +2875,22 @@ HTML = """
         </label>
         <span id=\"pos_status_badge\" class=\"small\" style=\"color:#64748b;\">disabled</span>
       </div>
-      <canvas id=\"arena_canvas\" class=\"arena-canvas\" width=\"600\" height=\"400\"></canvas>
+      <div style=\"display:flex;gap:8px;align-items:center;margin-bottom:6px;\">
+        <label class=\"small\" style=\"color:#94a3b8;display:flex;align-items:center;gap:4px;cursor:pointer;\">
+          <input type=\"checkbox\" id=\"arena_show_3d\" checked style=\"accent-color:#0ea5e9;\" />
+          3D view (Three.js)
+        </label>
+        <label class=\"small\" style=\"color:#94a3b8;display:flex;align-items:center;gap:4px;cursor:pointer;\">
+          <input type=\"checkbox\" id=\"arena_show_all_drones\" checked style=\"accent-color:#10b981;\" />
+          Show all drones
+        </label>
+        <span class=\"small\" style=\"color:#64748b;margin-left:12px;\">Grid: 1 m</span>
+      </div>
+      <canvas id=\"arena_canvas\" class=\"arena-canvas\" width=\"960\" height=\"560\" style=\"max-width:100%;\"></canvas>
+      <div id=\"arena3d_wrap\" style=\"display:block;margin-top:8px;position:relative;\">
+        <div id=\"arena3d_container\" style=\"width:960px;max-width:100%;height:520px;background:#0f172a;border:1px solid #334155;border-radius:6px;\"></div>
+        <div class=\"small\" style=\"color:#64748b;margin-top:4px;\">Drag to orbit · scroll to zoom · right-drag to pan</div>
+      </div>
       <div class=\"pos-coords\" style=\"margin-top:6px;\">
         <span class=\"pos-x\">X: <span id=\"pos_x\">—</span></span>&nbsp;&nbsp;
         <span class=\"pos-y\">Y: <span id=\"pos_y\">—</span></span>&nbsp;&nbsp;
@@ -1372,19 +2911,27 @@ HTML = """
         Ay:&nbsp;<span id=\"tel_ay\">—</span>&nbsp;
         Az:&nbsp;<span id=\"tel_az\">—</span>&nbsp;cm/s²
       </div>
+      <!-- Safety distance readout — shows how far the active drone is from
+           the nearest safety boundary. Green when inside the safe zone,
+           amber when approaching, red when outside the margin. Updated on
+           every SSE position event. -->
+      <div class=\"small\" style=\"margin-top:2px;font-family:monospace;\">
+        <span style=\"color:#94a3b8;\">Safety:</span>
+        <span id=\"pos_safety_readout\" style=\"color:#64748b;\">—</span>
+      </div>
       <div class=\"pos-cfg\">
         <div style=\"display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:6px;\">
-          <label>Profile:
+          <label>Profile <span class=\"info-icon\" data-info=\"detect_profile\">i</span>:
             <select id=\"pos_profile\" class=\"pos-cfg\">
               <option value=\"balanced\">Balanced</option>
               <option value=\"sensitive\">Sensitive</option>
               <option value=\"strict\">Strict</option>
             </select>
           </label>
-          <label>FOV°:
+          <label>FOV° <span class=\"info-icon\" data-info=\"fov_deg\">i</span>:
             <input id=\"pos_fov\" type=\"number\" min=\"40\" max=\"120\" value=\"69\" style=\"width:60px;\" />
           </label>
-          <label>Latency ms:
+          <label>Latency ms <span class=\"info-icon\" data-info=\"latency_ms\">i</span>:
             <input id=\"pos_latency\" type=\"range\" min=\"0\" max=\"800\" value=\"200\" style=\"width:90px;vertical-align:middle;\" />
             <span id=\"pos_latency_val\" style=\"font-size:11px;color:#94a3b8;\">200</span>
           </label>
@@ -1393,26 +2940,87 @@ HTML = """
             <input id=\"pos_imu_weight\" type=\"range\" min=\"0\" max=\"100\" value=\"30\" style=\"width:110px;vertical-align:middle;accent-color:#06b6d4;\" />
             <span style=\"font-size:11px;color:#94a3b8;\">IMU</span>
             <span id=\"pos_imu_weight_val\" style=\"font-size:11px;color:#06b6d4;font-weight:bold;min-width:32px;\">30%</span>
+            <span class=\"info-icon\" data-info=\"imu_weight\">i</span>
           </label>
         </div>
         <div style=\"display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:6px;padding:6px;background:#0f172a;border:1px solid #1e293b;border-radius:4px;\">
           <span class=\"small\" style=\"color:#64748b;min-width:70px;\">Filters:</span>
           <label style=\"display:flex;align-items:center;gap:4px;cursor:pointer;\">
             <input type=\"checkbox\" id=\"pos_kalman\" style=\"accent-color:#3b82f6;\" />
-            <span class=\"small\" style=\"color:#e2e8f0;\">Kalman filter</span>
+            <span class=\"small\" style=\"color:#e2e8f0;\">Kalman filter <span class=\"info-icon\" data-info=\"enable_kalman_filter\">i</span></span>
           </label>
-          <label class=\"small\" style=\"color:#94a3b8;\">Marker size (m):
+          <label class=\"small\" style=\"color:#94a3b8;\">Marker size (m) <span class=\"info-icon\" data-info=\"marker_size_m\">i</span>:
             <input id=\"pos_marker_size\" type=\"number\" min=\"0.05\" max=\"2.0\" step=\"0.01\" value=\"0.5\" style=\"width:64px;\" />
           </label>
-          <label class=\"small\" style=\"color:#94a3b8;\">Top-K:
+          <label class=\"small\" style=\"color:#94a3b8;\">Top-K <span class=\"info-icon\" data-info=\"top_k_markers\">i</span>:
             <input id=\"pos_top_k\" type=\"number\" min=\"0\" max=\"10\" step=\"1\" value=\"0\" style=\"width:50px;\" title=\"0 = auto (4)\" />
           </label>
-          <label class=\"small\" style=\"color:#94a3b8;\">Outlier (m):
+          <label class=\"small\" style=\"color:#94a3b8;\">Outlier (m) <span class=\"info-icon\" data-info=\"outlier_reject_m\">i</span>:
             <input id=\"pos_outlier\" type=\"number\" min=\"0.1\" max=\"20\" step=\"0.1\" value=\"2.5\" style=\"width:60px;\" />
           </label>
+          <label class=\"small\" style=\"color:#fbbf24;\" title=\"Multiplicative correction on camera↔marker distance from solvePnP. 1.0 = no correction. If the UI shows 7 m but actual is 9 m → set 9/7 ≈ 1.286.\">dist × <span class=\"info-icon\" data-info=\"distance_scale\">i</span>:
+            <input id=\"pos_distance_scale\" type=\"number\" min=\"0.1\" max=\"5.0\" step=\"0.001\" value=\"1.000\" style=\"width:70px;\" />
+          </label>
           <button id=\"pos_filters_apply\" class=\"pos-cfg\" style=\"height:26px;font-size:11px;padding:0 10px;\">Apply filters</button>
-          <button id=\"pos_filters_reset\" class=\"pos-cfg\" style=\"height:26px;font-size:11px;padding:0 10px;background:#1e2a3a;\" title=\"Restore defaults: Kalman on, marker 0.5m, top-K auto, outlier 2.5m\">Defaults</button>
+          <button id=\"pos_filters_reset\" class=\"pos-cfg\" style=\"height:26px;font-size:11px;padding:0 10px;background:#1e2a3a;\" title=\"Restore defaults: Kalman on, marker 0.5m, top-K auto, outlier 2.5m, dist scale 1.0\">Defaults</button>
           <span id=\"pos_filters_status\" class=\"small\" style=\"color:#64748b;\"></span>
+        </div>
+        <!-- ── Precision tuning (advanced) ───────────────────────────
+             These parameters control multi-marker fusion, IMU blend,
+             the pose-coast window, and per-axis Kalman variances. They
+             apply immediately to the running positioner and also to
+             Aruco Seek / mission boundary guard since they read the
+             same global arena-frame pose.                             -->
+        <div style=\"display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:6px;padding:6px;background:#0f172a;border:1px solid #1e293b;border-radius:4px;\">
+          <span class=\"small\" style=\"color:#a78bfa;min-width:70px;font-weight:600;\">Precision:</span>
+          <label class=\"small\" style=\"color:#94a3b8;\">pose hold (s) <span class=\"info-icon\" data-info=\"pose_hold_sec\">i</span>:
+            <input id=\"pos_pose_hold\" type=\"number\" min=\"0\" max=\"10\" step=\"0.1\" value=\"0.8\" style=\"width:60px;\" />
+          </label>
+          <label class=\"small\" style=\"color:#94a3b8;\">min refs <span class=\"info-icon\" data-info=\"min_ref_count\">i</span>:
+            <input id=\"pos_min_refs\" type=\"number\" min=\"1\" max=\"12\" step=\"1\" value=\"1\" style=\"width:50px;\" />
+          </label>
+          <label class=\"small\" style=\"color:#94a3b8;\">min ref w <span class=\"info-icon\" data-info=\"min_ref_weight\">i</span>:
+            <input id=\"pos_min_ref_w\" type=\"number\" min=\"0\" max=\"1\" step=\"0.01\" value=\"0\" style=\"width:56px;\" />
+          </label>
+          <label class=\"small\" style=\"color:#94a3b8;\">blend min <span class=\"info-icon\" data-info=\"meas_blend_min\">i</span>:
+            <input id=\"pos_blend_min\" type=\"number\" min=\"0\" max=\"1\" step=\"0.05\" value=\"0.35\" style=\"width:56px;\" />
+          </label>
+          <label class=\"small\" style=\"color:#94a3b8;\">blend max <span class=\"info-icon\" data-info=\"meas_blend_max\">i</span>:
+            <input id=\"pos_blend_max\" type=\"number\" min=\"0\" max=\"1\" step=\"0.05\" value=\"0.85\" style=\"width:56px;\" />
+          </label>
+          <label class=\"small\" style=\"color:#94a3b8;\">vel blend <span class=\"info-icon\" data-info=\"vel_blend\">i</span>:
+            <input id=\"pos_vel_blend\" type=\"number\" min=\"0\" max=\"1\" step=\"0.05\" value=\"0.25\" style=\"width:56px;\" />
+          </label>
+          <label class=\"small\" style=\"color:#94a3b8;\">max Δt (s) <span class=\"info-icon\" data-info=\"max_state_dt\">i</span>:
+            <input id=\"pos_max_dt\" type=\"number\" min=\"0.05\" max=\"10\" step=\"0.05\" value=\"1.0\" style=\"width:60px;\" />
+          </label>
+          <label class=\"small\" style=\"color:#94a3b8;\">Q proc <span class=\"info-icon\" data-info=\"kalman_process_var\">i</span>:
+            <input id=\"pos_kf_q\" type=\"number\" min=\"1e-6\" max=\"10\" step=\"1e-5\" value=\"1e-3\" style=\"width:74px;\" />
+          </label>
+          <label class=\"small\" style=\"color:#94a3b8;\">R meas <span class=\"info-icon\" data-info=\"kalman_meas_var\">i</span>:
+            <input id=\"pos_kf_r\" type=\"number\" min=\"1e-6\" max=\"10\" step=\"1e-3\" value=\"0.1\" style=\"width:74px;\" />
+          </label>
+          <label class=\"small\" style=\"color:#94a3b8;\" title=\"First-order low-pass cut-off frequency applied to IMU velocity (vgx/vgy/vgz) at telemetry ingestion. 0 disables. Lower = more smoothing.\">IMU LPF (Hz) <span class=\"info-icon\" data-info=\"imu_lowpass_hz\">i</span>:
+            <input id=\"pos_imu_lpf\" type=\"range\" min=\"0\" max=\"30\" step=\"0.5\" value=\"5\" style=\"width:90px;vertical-align:middle;accent-color:#a78bfa;\" />
+            <span id=\"pos_imu_lpf_val\" style=\"font-size:11px;color:#a78bfa;font-weight:bold;min-width:42px;display:inline-block;\">5.0 Hz</span>
+          </label>
+          <button id=\"pos_precision_apply\" class=\"pos-cfg\" style=\"height:26px;font-size:11px;padding:0 10px;\">Apply precision</button>
+          <button id=\"pos_precision_reset\" class=\"pos-cfg\" style=\"height:26px;font-size:11px;padding:0 10px;background:#1e2a3a;\" title=\"Restore precision defaults\">Defaults</button>
+          <span id=\"pos_precision_status\" class=\"small\" style=\"color:#64748b;\"></span>
+        </div>
+        <!-- ── Position-tracker presets ─────────────────────────────
+             Stored server-side in controller/position_presets.json.
+             Loading a preset fans out to every drone via
+             /proxy/position/config so the whole fleet gets the new
+             tuning in one click. -->
+        <div style=\"display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:6px;padding:6px;background:#0f172a;border:1px solid #1e293b;border-radius:4px;\">
+          <span class=\"small\" style=\"color:#4ade80;min-width:70px;font-weight:600;\">Presets:</span>
+          <select id=\"pos_preset_sel\" style=\"min-width:140px;height:22px;font-size:11px;\"></select>
+          <button id=\"pos_preset_apply\" style=\"height:22px;font-size:11px;padding:0 8px;background:#065f46;border-color:#10b981;color:#d1fae5;\" title=\"Apply the selected preset to every drone in the fleet\">Apply to fleet</button>
+          <input id=\"pos_preset_name\" type=\"text\" placeholder=\"preset name\" style=\"width:120px;height:22px;font-size:11px;\" />
+          <button id=\"pos_preset_save\" style=\"height:22px;font-size:11px;padding:0 8px;background:#1e293b;border-color:#475569;\" title=\"Save the current values as a named preset (overwrites if name exists)\">Save</button>
+          <button id=\"pos_preset_delete\" style=\"height:22px;font-size:11px;padding:0 8px;background:#450a0a;border-color:#b91c1c;color:#fecaca;\" title=\"Delete the selected preset\">Delete</button>
+          <span id=\"pos_preset_status\" class=\"small\" style=\"color:#64748b;\"></span>
         </div>
         <div style=\"display:flex;gap:8px;flex-wrap:wrap;align-items:center;\">
           <button id=\"pos_cfg_save\" class=\"pos-cfg\">Apply Config</button>
@@ -1720,7 +3328,7 @@ document.getElementById('clear_log').onclick = async ()=>{
   } catch {}
 };
 
-document.getElementById('emergency').onclick = ()=>post('/proxy/emergency',{});
+// (emergency killswitch button removed — was too easy to hit by accident)
 document.getElementById('rotate_cw').onclick = ()=>post('/proxy/rotate',{dir:'cw',deg:45});
 document.getElementById('rotate_ccw').onclick = ()=>post('/proxy/rotate',{dir:'ccw',deg:45});
 document.getElementById('move_up').onclick = ()=>post('/proxy/move',{dir:'up',cm:30});
@@ -1936,20 +3544,46 @@ function _isTyping() {
   return t === 'INPUT' || t === 'TEXTAREA' || document.activeElement?.isContentEditable;
 }
 window.addEventListener('keydown', (e)=>{
-  if (_isTyping()) return;
   const k = e.key.toLowerCase();
-  // ── Global panic-button: '0' lands EVERY drone in the fleet ────────
-  // Using the zero key because it's not in the movement keymap (Q is
-  // yaw-CCW, W/A/S/D are translation, R/F are altitude, so letters are
-  // risky). '0' is far from the flight grid and easy to hit one-handed.
+  // ── SAFETY HOTKEYS — always top priority ────────────────────────────
+  // 0 (LAND ALL) and 9 (PAUSE / CONTINUE) are the fleet-level emergency
+  // controls. They MUST fire even when a preset-name textbox, slider,
+  // code editor, or any other input has focus — otherwise "press 0 to
+  // land" becomes "sometimes presses 0 to land" which is unacceptable
+  // for safety. We bypass the _isTyping() guard for these two keys.
+  // Movement keys still respect _isTyping() so typing "w" in a textbox
+  // doesn't fly the drone.
   if (k === '0') {
     e.preventDefault();
-    if (window._landAllInFlight) return;    // debounce
+    // Blur any text field so the keystroke doesn't also land in it.
+    if (document.activeElement && document.activeElement !== document.body) {
+      try { document.activeElement.blur(); } catch {}
+    }
+    if (window._landAllInFlight) return;
     window._landAllInFlight = true;
-    console.log('[LAND_ALL] 0 pressed — landing every drone');
+    console.log('[LAND_ALL] 0 pressed — landing every drone (top-priority hotkey)');
     landAllDrones('0 hotkey').finally(() => { window._landAllInFlight = false; });
     return;
   }
+  if (k === '9') {
+    e.preventDefault();
+    if (document.activeElement && document.activeElement !== document.body) {
+      try { document.activeElement.blur(); } catch {}
+    }
+    if (window._pauseInFlight) return;
+    window._pauseInFlight = true;
+    console.log('[PAUSE] 9 pressed — toggling fleet pause (top-priority hotkey)');
+    if (window._globalPaused) {
+      console.log('[PAUSE] 9 pressed — resuming fleet');
+      resumeAllDrones('9 hotkey').finally(() => { window._pauseInFlight = false; });
+    } else {
+      console.log('[PAUSE] 9 pressed — pausing fleet');
+      pauseAllDrones('9 hotkey').finally(() => { window._pauseInFlight = false; });
+    }
+    return;
+  }
+  // Below this point, non-safety keys respect the typing guard.
+  if (_isTyping()) return;
   // ── Drone switch hotkey: digits 1-5 select the Nth drone in the bar ──
   // Order follows Object.entries(drones) insertion order, same as the
   // drone-bar buttons top→bottom. '1' = first drone, '2' = second, etc.
@@ -1997,6 +3631,468 @@ window.addEventListener('keydown', (e)=>{
     console.log('[LAND_ALL] button clicked');
     landAllDrones('button').finally(() => { window._landAllInFlight = false; });
   });
+})();
+
+// ── PAUSE ALL / CONTINUE MISSION wiring ───────────────────────────────
+// The PAUSE button overrides any command — every drone freezes at its
+// current position (autonomous missions abort, ArUco Seek drops out of
+// LIVE, and a zero-RC brake goes out to every drone). Only manual WASD
+// / RC remains active. CONTINUE MISSION clears the flag; nothing
+// auto-restarts so the operator is never surprised by a darting drone.
+window._globalPaused = false;
+function applyPauseUI(paused, info) {
+  window._globalPaused = !!paused;
+  const pbtn = document.getElementById('pause_all_btn');
+  const rbtn = document.getElementById('resume_all_btn');
+  const ban  = document.getElementById('global_pause_banner');
+  if (pbtn) pbtn.style.display = paused ? 'none' : '';
+  if (rbtn) rbtn.style.display = paused ? '' : 'none';
+  if (ban)  ban.style.display  = paused ? '' : 'none';
+  document.body.classList.toggle('paused-mode', !!paused);
+  if (paused && info && info.source) {
+    if (ban) ban.title = 'paused via ' + info.source;
+  }
+}
+async function pauseAllDrones(source) {
+  try {
+    const r = await fetch('/proxy/pause_all', {
+      method: 'POST',
+      headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({source: source || 'ui'}),
+    });
+    const j = await r.json();
+    console.log('[PAUSE] result:', j);
+    applyPauseUI(true, j);
+    showLandAllBanner(
+      '\\u23f8 PAUSED — ' + (j.braked || 0) + '/' + (j.total || 0) +
+      ' drones braked' + (j.mission_stopped ? ' (mission stopped)' : ''),
+      '#78350f', '#fde68a', 4000);
+  } catch (err) {
+    console.error('[PAUSE] failed:', err);
+    showLandAllBanner('\\u2717 PAUSE failed: ' + err, '#7f1d1d', '#fecaca', 5000);
+  }
+}
+async function resumeAllDrones(source) {
+  try {
+    const r = await fetch('/proxy/resume_all', {
+      method: 'POST',
+      headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({source: source || 'ui'}),
+    });
+    const j = await r.json();
+    console.log('[RESUME] result:', j);
+    applyPauseUI(false, j);
+    showLandAllBanner('\\u25b6 RESUMED — autonomous control re-enabled',
+                      '#064e3b', '#a7f3d0', 3500);
+  } catch (err) {
+    console.error('[RESUME] failed:', err);
+    showLandAllBanner('\\u2717 RESUME failed: ' + err, '#7f1d1d', '#fecaca', 5000);
+  }
+}
+(function wirePauseButtons(){
+  const p = document.getElementById('pause_all_btn');
+  if (p) p.addEventListener('click', () => {
+    if (window._pauseInFlight) return;
+    window._pauseInFlight = true;
+    pauseAllDrones('button').finally(() => { window._pauseInFlight = false; });
+  });
+  const r = document.getElementById('resume_all_btn');
+  if (r) r.addEventListener('click', () => {
+    if (window._pauseInFlight) return;
+    window._pauseInFlight = true;
+    resumeAllDrones('button').finally(() => { window._pauseInFlight = false; });
+  });
+})();
+// Pause state sync is now handled by the unified uiStatePoll() above.
+// Retained applyPauseUI() — it's called from there and from hotkey handlers.
+
+// ── Transport selector (per-subsystem WS ↔ HTTP) ──────────────────────
+// Populated from /proxy/config/transport on load + every time the
+// server is polled via the WS status check. POSTs on every dropdown
+// change so the server state always matches the UI.
+(function wireTransport(){
+  const selectors = document.querySelectorAll('.transport-sel');
+  const status = document.getElementById('transport_status');
+  function flash(msg, col) {
+    if (!status) return;
+    status.textContent = msg;
+    status.style.color = col || '#64748b';
+    setTimeout(() => { if (status.textContent === msg) status.textContent = ''; }, 2500);
+  }
+  async function apply(patch, label) {
+    try {
+      const r = await fetch('/proxy/config/transport', {
+        method: 'POST',
+        headers: {'Content-Type':'application/json'},
+        body: JSON.stringify(patch),
+      });
+      const j = await r.json();
+      if (j.ok) {
+        // Reflect server's authoritative state in case some keys were rejected.
+        Object.keys(j.transport || {}).forEach(k => {
+          const el = document.getElementById('transport_' + k);
+          if (el) el.value = j.transport[k];
+        });
+        flash('\\u2713 ' + (label || 'applied'), '#22c55e');
+      } else {
+        flash('error: ' + (j.error || 'unknown'), '#ef4444');
+      }
+    } catch (e) { flash('request failed', '#ef4444'); }
+  }
+  selectors.forEach(el => {
+    el.addEventListener('change', () => {
+      apply({[el.dataset.subsys]: el.value}, el.dataset.subsys + '=' + el.value);
+    });
+  });
+  const allHttp = document.getElementById('transport_all_http');
+  if (allHttp) allHttp.onclick = () =>
+    apply({rc: 'http', telemetry: 'http', position: 'http'}, 'all → http');
+  const allAuto = document.getElementById('transport_all_auto');
+  if (allAuto) allAuto.onclick = () =>
+    apply({rc: 'auto', telemetry: 'auto', position: 'auto'}, 'all → auto');
+
+  // Initial load — fetch current state from the server.
+  (async () => {
+    try {
+      const j = await (await fetch('/proxy/config/transport')).json();
+      Object.keys(j.transport || {}).forEach(k => {
+        const el = document.getElementById('transport_' + k);
+        if (el) el.value = j.transport[k];
+      });
+      if (!j.ws_available) {
+        document.querySelectorAll('.transport-sel').forEach(el => {
+          // Disable the WS option when the client library is missing
+          el.querySelectorAll('option[value="ws"]').forEach(o => o.disabled = true);
+          if (el.value === 'ws') el.value = 'http';
+        });
+        flash('WS library missing — selectors locked to http/auto', '#fbbf24');
+      }
+    } catch {}
+  })();
+})();
+
+// ── WebSocket status badge ────────────────────────────────────────────
+// Polls /proxy/ws/status every 2 s. Green when the active drone has
+// telemetry + position + rc sockets all up; amber if partial; red if
+// the WS client lib is missing or all three are down.
+(function wireWsStatus(){
+  const el = document.getElementById('ws_status_badge');
+  if (!el) return;
+  async function tick() {
+    try {
+      applyWs(await (await fetch('/proxy/ws/status', {cache:'no-store'})).json());
+    } catch {
+      el.style.background = '#334155';
+      el.style.color = '#94a3b8';
+      el.textContent = 'WS ?';
+    }
+  }
+  // Exposed on window so the unified uiStatePoll() can drive it without
+  // the local timer firing separate /proxy/ws/status requests.
+  function applyWs(j) {
+    if (!j || !j.available) {
+      el.style.background = '#7f1d1d';
+      el.style.color = '#fecaca';
+      el.textContent = 'WS off';
+      el.title = 'websocket-client not installed on C2 — falling back to HTTP';
+      return;
+    }
+    const did = String(window.activeDroneId || activeDroneId);
+    const st = (j.drones || {})[did];
+    if (!st) {
+      el.style.background = '#334155';
+      el.style.color = '#94a3b8';
+      el.textContent = 'WS —';
+      return;
+    }
+    const up = (st.telemetry ? 1 : 0) + (st.position ? 1 : 0) + (st.rc ? 1 : 0);
+    if (up === 3) {
+      const slowSend = (st.rc_send_ms != null && st.rc_send_ms > 50);
+      el.style.background = slowSend ? '#78350f' : '#064e3b';
+      el.style.color      = slowSend ? '#fde68a' : '#86efac';
+      const parts = [];
+      if (st.rc_send_ms     != null) parts.push('send ' + Math.round(st.rc_send_ms) + 'ms');
+      if (st.rc_rtt_ms      != null) parts.push('rtt ' + st.rc_rtt_ms + 'ms');
+      if (st.telemetry_age_ms != null) parts.push('tel ' + st.telemetry_age_ms + 'ms');
+      if (st.position_age_ms  != null) parts.push('pos ' + st.position_age_ms  + 'ms');
+      el.textContent = (slowSend ? 'WS \u26a0 ' : 'WS \u2713 ') + parts.join(' · ');
+    } else if (up > 0) {
+      el.style.background = '#78350f';
+      el.style.color = '#fde68a';
+      const flags = (st.telemetry?'T':'·') + (st.position?'P':'·') + (st.rc?'R':'·');
+      el.textContent = 'WS ' + flags;
+    } else {
+      el.style.background = '#7f1d1d';
+      el.style.color = '#fecaca';
+      el.textContent = 'WS down';
+    }
+    el.title = 'tel=' + st.telemetry + ' pos=' + st.position + ' rc=' + st.rc;
+  }
+  window._applyWsStatus = applyWs;
+  tick();  // one-time initial fetch; steady state is pushed by uiStatePoll()
+})();
+
+// ── Flight Logs list ──────────────────────────────────────────────────
+// Lists archived per-flight JSONL files. Polls occasionally so a live
+// recording's size updates visibly (the file grows as ticks accumulate).
+(function wireFlightLogs(){
+  const list = document.getElementById('flight_logs_list');
+  const btn  = document.getElementById('flight_logs_refresh');
+  if (!list) return;
+  function fmtSize(n) {
+    if (n < 1024) return n + ' B';
+    if (n < 1024*1024) return (n/1024).toFixed(1) + ' KB';
+    return (n/1024/1024).toFixed(2) + ' MB';
+  }
+  function fmtAge(ts) {
+    const dt = Math.max(0, Date.now()/1000 - ts);
+    if (dt < 60) return Math.round(dt) + 's ago';
+    if (dt < 3600) return Math.round(dt/60) + 'm ago';
+    if (dt < 86400) return Math.round(dt/3600) + 'h ago';
+    return Math.round(dt/86400) + 'd ago';
+  }
+  async function refresh() {
+    try {
+      const r = await fetch('/proxy/flight_logs');
+      const j = await r.json();
+      if (!j.files || !j.files.length) {
+        list.innerHTML = '<i style="color:#64748b;">no flights recorded yet</i>';
+        return;
+      }
+      list.innerHTML = j.files.map(f => {
+        const vid = f.video;
+        const vidHtml = vid
+          ? ('<a href="/proxy/flight_video/' + encodeURIComponent(vid.name) + '" ' +
+             'style="color:#a78bfa;text-decoration:none;font-weight:600;" ' +
+             'title="Download ' + vid.name + ' (' + fmtSize(vid.size || 0) + ')">' +
+             '&#127916; Video</a>')
+          : '<span style="color:#475569;font-style:italic;" title="No video recorded for this flight">no video</span>';
+        return '<div style="display:flex;gap:10px;padding:2px 0;align-items:center;">' +
+          '<span style="flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">' +
+            '<a href="/proxy/flight_logs/' + encodeURIComponent(f.name) + '" ' +
+               'style="color:#38bdf8;text-decoration:none;" title="Download ' + f.name + '">' +
+               f.name + '</a>' +
+          '</span>' +
+          '<a href="/flight_log_viewer?file=' + encodeURIComponent(f.name) + '" ' +
+             'target="_blank" ' +
+             'style="color:#fbbf24;text-decoration:none;font-weight:600;" ' +
+             'title="Open replay viewer in a new tab">&#128065; View</a>' +
+          vidHtml +
+          '<span style="color:#94a3b8;width:70px;text-align:right;">' + fmtSize(f.size) + '</span>' +
+          '<span style="color:#64748b;width:70px;text-align:right;">' + fmtAge(f.mtime) + '</span>' +
+        '</div>';
+      }).join('');
+    } catch (e) {
+      list.innerHTML = '<i style="color:#ef4444;">error: ' + e + '</i>';
+    }
+  }
+  if (btn) btn.onclick = refresh;
+  refresh();
+  setInterval(refresh, 15000);  // 15s — enough to see new flights appear
+})();
+
+// ── Flight guards: axis-lock + arena safety (manual + autonomous) ─
+(function wireFlightGuards(){
+  const axisTog   = document.getElementById('axis_locked_toggle');
+  const arenaTog  = document.getElementById('arena_guard_toggle');
+  const camFaceTog = document.getElementById('cam_face_center_toggle');
+  const inp       = document.getElementById('safety_margin_input');
+  const btn       = document.getElementById('safety_margin_apply');
+  const status    = document.getElementById('autonomous_guards_status');
+  const badge     = document.getElementById('arena_guard_engaged_badge');
+  function flash(msg, col) {
+    if (!status) return;
+    status.textContent = msg;
+    status.style.color = col || '#64748b';
+    setTimeout(() => { if (status.textContent === msg) status.textContent = ''; }, 2500);
+  }
+
+  async function load() {
+    try {
+      // axis-lock (autonomous-observer param)
+      const p = await (await fetch('/proxy/aruco/params')).json();
+      if (axisTog && typeof p.axis_locked !== 'undefined') axisTog.checked = !!p.axis_locked;
+      // Camera-faces-arena-centre toggle (C2-local fleet-wide setting)
+      try {
+        const cf = await (await fetch('/proxy/config/camera_face_center')).json();
+        if (camFaceTog && typeof cf.enabled !== 'undefined') camFaceTog.checked = !!cf.enabled;
+      } catch {}
+      // arena guard + margin (Pi-side, enforces on BOTH manual + auto)
+      const a = await (await fetch('/proxy/config/arena_safety')).json();
+      if (arenaTog && typeof a.enabled !== 'undefined') arenaTog.checked = !!a.enabled;
+      if (inp && a.margin_m != null && document.activeElement !== inp)
+        inp.value = Number(a.margin_m).toFixed(1);
+      if (badge) badge.style.display = a.engaged ? '' : 'none';
+      // Cache on window so drawArena + 3D + position readout can render
+      // the dashed safety boundary + distance-to-wall readout.
+      window._arenaSafety = {
+        enabled:  !!a.enabled,
+        margin_m: a.margin_m,
+        engaged:  !!a.engaged,
+        reasons:  a.reasons || [],
+      };
+      // Redraw the 2D arena so the updated margin rectangle appears
+      // even if no fresh position event has arrived (e.g. operator
+      // changed the margin value while the drone is stationary).
+      if (typeof drawArena === 'function') drawArena();
+      // Update the 3D highlight too — safety overlay mesh refresh
+      if (window._arena3d && window._arena3d.updateSafetyMargin) {
+        window._arena3d.updateSafetyMargin(a.margin_m, !!a.engaged);
+      }
+    } catch {}
+  }
+  // Initial load only — subsequent updates ride on the unified 1Hz
+  // /proxy/ui_state poll (see uiStatePoll). Avoids adding another
+  // per-2s fetch cycle that would compete with the browser's 6-
+  // connection HTTP/1.1 pool alongside keydown/batch traffic.
+  load();
+  // Expose for the unified poller
+  window._applyArenaSafety = (a) => {
+    if (!a) return;
+    if (arenaTog && typeof a.enabled !== 'undefined') arenaTog.checked = !!a.enabled;
+    if (inp && a.margin_m != null && document.activeElement !== inp)
+      inp.value = Number(a.margin_m).toFixed(1);
+    if (badge) badge.style.display = a.engaged ? '' : 'none';
+    window._arenaSafety = {
+      enabled:  !!a.enabled,
+      margin_m: a.margin_m,
+      engaged:  !!a.engaged,
+      reasons:  a.reasons || [],
+    };
+    if (typeof drawArena === 'function') drawArena();
+    if (window._arena3d && window._arena3d.updateSafetyMargin) {
+      window._arena3d.updateSafetyMargin(a.margin_m, !!a.engaged);
+    }
+  };
+
+  if (axisTog) axisTog.addEventListener('change', async () => {
+    try {
+      await fetch('/proxy/aruco/params', {
+        method: 'POST',
+        headers: {'Content-Type':'application/json'},
+        body: JSON.stringify({axis_locked: axisTog.checked}),
+      });
+      flash(axisTog.checked ? '\u2713 axis-lock ON' : '\u2713 axis-lock OFF', '#22c55e');
+    } catch (e) { flash('request failed', '#ef4444'); }
+  });
+
+  if (camFaceTog) camFaceTog.addEventListener('change', async () => {
+    try {
+      const r = await fetch('/proxy/config/camera_face_center', {
+        method: 'POST',
+        headers: {'Content-Type':'application/json'},
+        body: JSON.stringify({enabled: camFaceTog.checked}),
+      });
+      const j = await r.json();
+      if (j.ok) flash(camFaceTog.checked
+                        ? '\u2713 camera \u2192 arena centre (fleet)'
+                        : '\u2713 camera free (mission-driven)',
+                       '#22c55e');
+      else flash('error: ' + (j.error || 'unknown'), '#ef4444');
+    } catch (e) { flash('request failed', '#ef4444'); }
+  });
+
+  if (arenaTog) arenaTog.addEventListener('change', async () => {
+    try {
+      const r = await fetch('/proxy/config/arena_safety', {
+        method: 'POST',
+        headers: {'Content-Type':'application/json'},
+        body: JSON.stringify({enabled: arenaTog.checked}),
+      });
+      const j = await r.json();
+      if (j.ok) flash(arenaTog.checked
+                        ? '\u2713 arena guard ON (manual + auto)'
+                        : '\u26a0 arena guard OFF — operator owns boundaries',
+                       arenaTog.checked ? '#22c55e' : '#fbbf24');
+      else flash('error: ' + (j.error || 'unknown'), '#ef4444');
+    } catch (e) { flash('request failed', '#ef4444'); }
+  });
+
+  if (btn) btn.onclick = async () => {
+    const v = parseFloat(inp.value);
+    if (!isFinite(v) || v < 0.1 || v > 5.0) {
+      flash('enter 0.1 - 5.0 m', '#ef4444');
+      return;
+    }
+    // Push to BOTH the Pi-side guard (manual + auto) AND the observer
+    // autonomous guard so they share a single source of truth.
+    try {
+      const [a, b] = await Promise.all([
+        fetch('/proxy/config/arena_safety', {
+          method: 'POST',
+          headers: {'Content-Type':'application/json'},
+          body: JSON.stringify({margin_m: v}),
+        }).then(r => r.json()).catch(e => ({ok:false, error:String(e)})),
+        fetch('/proxy/aruco/safety_margin', {
+          method: 'POST',
+          headers: {'Content-Type':'application/json'},
+          body: JSON.stringify({safety_margin_m: v}),
+        }).then(r => r.json()).catch(e => ({ok:false, error:String(e)})),
+      ]);
+      if (a.ok && b.ok) flash('\u2713 margin \u2192 ' + v + ' m (Pi + observers)', '#22c55e');
+      else flash('partial: pi=' + (a.ok?'ok':'err') + ' obs=' + (b.ok?'ok':'err'), '#fbbf24');
+    } catch (e) { flash('request failed', '#ef4444'); }
+  };
+})();
+
+// ── Ceiling safety wiring ─────────────────────────────────────────────
+// The ceiling is enforced on the Pi (can't be bypassed by client code),
+// but the UI mirrors its value and flashes an alert banner when the
+// guard is actively clamping any drone. Poll every ~1 s so operators
+// see engagement immediately on overshoot.
+(function wireCeiling(){
+  const inp = document.getElementById('ceiling_input');
+  const btn = document.getElementById('ceiling_apply_btn');
+  const badge = document.getElementById('ceiling_engaged_badge');
+  const status = document.getElementById('ceiling_status');
+  function apply(j) {
+    if (!j) return;
+    if (typeof j.ceiling_m === 'number') {
+      if (document.activeElement !== inp) inp.value = Number(j.ceiling_m).toFixed(1);
+    }
+    if (badge) badge.style.display = j.engaged ? '' : 'none';
+    if (status) {
+      if (j.engaged && j.reasons && j.reasons.length) {
+        status.textContent = '\u26a0 ' + j.reasons[0];
+        status.style.color = '#fbbf24';
+      } else {
+        status.textContent = '';
+      }
+    }
+  }
+  // Exposed for the unified uiStatePoll — no local setInterval anymore.
+  window._applyCeilingStatus = apply;
+  async function load() {
+    try {
+      const j = await (await fetch('/proxy/config/ceiling', {cache:'no-store'})).json();
+      apply(j);
+    } catch {}
+  }
+  if (btn) btn.onclick = async () => {
+    const v = parseFloat(inp.value);
+    if (!isFinite(v) || v < 0.5 || v > 20) {
+      status.textContent = 'enter 0.5 - 20 m';
+      status.style.color = '#ef4444';
+      return;
+    }
+    status.textContent = 'applying...';
+    status.style.color = '#94a3b8';
+    try {
+      const r = await fetch('/proxy/config/ceiling', {
+        method:'POST',
+        headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({ceiling_m: v}),
+      });
+      const j = await r.json();
+      status.textContent = '\u2713 ' + (j.applied || 0) + '/' + (j.total || 0) + ' drones → ' + v + ' m';
+      status.style.color = '#22c55e';
+      console.log('[CEILING] apply result:', j);
+    } catch (err) {
+      status.textContent = 'failed: ' + err;
+      status.style.color = '#ef4444';
+    }
+  };
+  load();   // one-time initial fetch; steady state pushed by uiStatePoll()
 })();
 
 // Fleet-wide panic land — used by the 'q' hotkey and the big red
@@ -2258,8 +4354,205 @@ async function autoStartVideo() {
   const ok = await startVideoStream('mjpeg');
   if (!ok) console.warn('[video] auto-start failed, click Start Video manually');
 }
-// Fire a bit after page load so /proxy/heartbeat has time to succeed first
+// Fire a bit after page load so the C2 has booted + WS clients settled.
+// Heartbeat is handled server-side now — the browser doesn't wait for it.
 setTimeout(autoStartVideo, 300);
+
+// ── Anafi camera zoom slider ─────────────────────────────────────────
+(function(){
+  const sl  = document.getElementById('video_zoom');
+  const lbl = document.getElementById('video_zoom_val');
+  const rst = document.getElementById('video_zoom_reset');
+  if (!sl || !lbl) return;
+  let _zoomTimer = null;
+  function sendZoom(v) {
+    fetch('/proxy/camera/zoom', {method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({zoom: v})}).catch(()=>{});
+  }
+  sl.addEventListener('input', () => {
+    const v = Number(sl.value);
+    lbl.textContent = v.toFixed(2) + '×';
+    // Debounce — don't spam the drone with 100+ posts per drag
+    if (_zoomTimer) clearTimeout(_zoomTimer);
+    _zoomTimer = setTimeout(() => sendZoom(v), 80);
+  });
+  if (rst) rst.addEventListener('click', () => {
+    sl.value = 1.0;
+    lbl.textContent = '1.00×';
+    sendZoom(1.0);
+  });
+})();
+
+// ── Latency measurement ──────────────────────────────────────────────
+// Polls /proxy/latency every 2s. Total displayed = c2_to_fc + fc_to_drone
+// + video_offset (operator-configurable). When the "auto-set latency"
+// checkbox is ticked, the total is pushed into the Position Tracker's
+// latency_ms slider each poll so position fusion stays in sync with the
+// actual comm-stack delay.
+async function latPoll() {
+  try {
+    const r = await fetch('/proxy/latency', {cache:'no-store'});
+    const d = await r.json();
+    const fm = (x) => (x == null) ? '—' : Math.round(x) + ' ms';
+    const c2fc = d.c2_to_fc_ms;
+    const fcdr = d.fc_to_drone_ms;
+    const videoEl = document.getElementById('lat_video_offset');
+    const videoMs = videoEl ? (parseInt(videoEl.value, 10) || 0) : 0;
+    const totalMs = (c2fc || 0) + (fcdr || 0) + videoMs;
+    document.getElementById('lat_c2fc').textContent = fm(c2fc);
+    document.getElementById('lat_fcdr').textContent = fm(fcdr);
+    document.getElementById('lat_vid').textContent = fm(videoMs);
+    const tEl = document.getElementById('lat_total');
+    tEl.textContent = Math.round(totalMs) + ' ms';
+    // Colour total: <80ms green, <200ms amber, else red
+    tEl.style.color = (totalMs < 80) ? '#22c55e'
+                    : (totalMs < 200) ? '#fbbf24' : '#ef4444';
+    // Auto-push into Position Tracker slider if toggle on
+    const auto = document.getElementById('lat_auto_apply');
+    if (auto && auto.checked && c2fc != null && fcdr != null) {
+      const slider = document.getElementById('pos_latency');
+      const lbl = document.getElementById('pos_latency_val');
+      if (slider) {
+        slider.value = Math.round(totalMs);
+        if (lbl) lbl.textContent = Math.round(totalMs);
+        // Mirror to server so the positioning pipeline uses this too
+        fetch('/proxy/position/config', {method:'POST',
+          headers:{'Content-Type':'application/json'},
+          body: JSON.stringify({latency_ms: Math.round(totalMs)})}).catch(()=>{});
+      }
+    }
+  } catch {}
+}
+setInterval(latPoll, 2000);
+setTimeout(latPoll, 800);
+
+// ── Collapsible panels ───────────────────────────────────────────────
+// Wrap a panel's existing content under a click-to-toggle header.
+// If the panel already contains an h2/h3 as its first significant
+// child, reuse it as the toggle; otherwise inject a new header with
+// `defaultTitle`. State persists in localStorage per `storageKey` so
+// each operator keeps their preferred layout across page reloads.
+function makeCollapsible(el, defaultTitle, storageKey, startCollapsed) {
+  if (!el || el.classList.contains('collapsible')) return;
+  // Prefer an existing h2/h3 as the toggle header
+  let header = el.querySelector(':scope > h2, :scope > h3');
+  let body;
+  if (header) {
+    body = document.createElement('div');
+    body.className = 'collapsible-body';
+    const siblings = Array.from(el.children).filter(c => c !== header);
+    siblings.forEach(c => body.appendChild(c));
+    el.appendChild(body);
+  } else {
+    body = document.createElement('div');
+    body.className = 'collapsible-body';
+    while (el.firstChild) body.appendChild(el.firstChild);
+    header = document.createElement('div');
+    header.innerHTML = '<b>' + defaultTitle + '</b>';
+    el.appendChild(header);
+    el.appendChild(body);
+  }
+  header.classList.add('collapsible-toggle');
+  el.classList.add('collapsible');
+  header.addEventListener('click', (e) => {
+    // Don't toggle if the click was on an interactive child
+    const t = e.target;
+    if (t !== header && (t.tagName === 'INPUT' || t.tagName === 'BUTTON' ||
+                         t.tagName === 'SELECT' || t.tagName === 'A' ||
+                         t.tagName === 'TEXTAREA')) return;
+    el.classList.toggle('collapsed');
+    try { localStorage.setItem(storageKey,
+          el.classList.contains('collapsed') ? '1' : '0'); } catch {}
+  });
+  // Load persisted state (fall back to startCollapsed default)
+  let saved = null;
+  try { saved = localStorage.getItem(storageKey); } catch {}
+  const shouldCollapse = (saved === null) ? Boolean(startCollapsed)
+                                           : (saved === '1');
+  if (shouldCollapse) el.classList.add('collapsed');
+}
+
+// Find a .panel that contains a <b> with the given exact text.
+function _panelByBoldTitle(title) {
+  const panels = Array.from(document.querySelectorAll('.panel'));
+  for (const p of panels) {
+    const b = p.querySelector('b');
+    if (b && b.textContent.trim() === title) return p;
+  }
+  return null;
+}
+
+// Run after the DOM is settled — some panels are only fully populated
+// after the first polls (e.g. drone bar) but their structure is fixed.
+// ── Relocate tuning controls into the new unified Tuning Parameters
+// panel. Runs BEFORE makeCollapsible so the panel's starting state is
+// set correctly. Keeps existing DOM nodes intact (IDs, handlers, all
+// event bindings) — we just re-parent them. The original ArUco Seek
+// panel keeps only the live readout; the Position Tracker panel keeps
+// only the canvas + coordinate readouts. Everything else moves here.
+function relocateTuningControls() {
+  const obsSlot = document.getElementById('tuning_observer_slot');
+  const posSlot = document.getElementById('tuning_position_slot');
+  if (!obsSlot || !posSlot) return;
+
+  // Observer PD — the slider grid + Reload button container
+  const arcParamsWrap = document.getElementById('arc_params');
+  if (arcParamsWrap && arcParamsWrap.parentElement) {
+    // The adjacent 'Live tuning parameters' label + Reload button are
+    // siblings of #arc_params inside the same wrapper <div>. Move the
+    // whole wrapper for convenience.
+    const wrap = arcParamsWrap.parentElement;
+    obsSlot.appendChild(wrap);
+  }
+
+  // Position Tracker — the .pos-cfg div holding all the fusion sliders.
+  // The tracker panel keeps its canvas + numeric readouts; the config
+  // rows (Profile / FOV / Latency / IMU blend / Kalman / Marker size /
+  // Top-K / Outlier / Apply Config) move over.
+  const posCfgWrap = document.querySelector('#pos_panel .pos-cfg') ||
+                     Array.from(document.querySelectorAll('.pos-cfg'))
+                       .find(el => el.querySelector('#pos_profile'));
+  if (posCfgWrap) posSlot.appendChild(posCfgWrap);
+}
+relocateTuningControls();
+
+setTimeout(() => {
+  // id-addressable panels
+  makeCollapsible(document.getElementById('tuning_panel'),     'Tuning Parameters',     'collapsed_tuning',           true);
+  makeCollapsible(document.getElementById('mission_panel'),    'Mission Planner',       'collapsed_mission_planner',  true);
+  makeCollapsible(document.getElementById('anafi_panel'),      'Anafi / Olympe controls','collapsed_anafi',           true);
+  makeCollapsible(document.getElementById('video_panel'),      'Video stream',          'collapsed_video',            false);
+  makeCollapsible(document.getElementById('aruco_panel'),      'ArUco Seek',            'collapsed_aruco',            true);
+  makeCollapsible(document.getElementById('missions_panel'),   'Special Missions',      'collapsed_missions',         true);
+
+  // Panels addressed by their <b>-wrapped title
+  makeCollapsible(_panelByBoldTitle('Telemetry'),          'Telemetry',          'collapsed_telemetry',  false);
+  makeCollapsible(_panelByBoldTitle('Position Tracker'),   'Position Tracker',   'collapsed_pos_tracker', false);
+  makeCollapsible(_panelByBoldTitle('Arena Configuration'),'Arena Configuration','collapsed_arena_cfg',  true);
+
+  // WASD grid panel — first .panel that contains a .grid
+  (function wrapKeyPanel() {
+    const p = document.querySelector('.panel:has(> .grid)') ||
+              Array.from(document.querySelectorAll('.panel')).find(
+                x => x.querySelector(':scope > .grid'));
+    if (p) makeCollapsible(p, 'WASD Key controls', 'collapsed_keys', false);
+  })();
+
+  // Advanced SDK controls — .adv block with the "Advanced SDK controls" label
+  (function wrapAdvPanel() {
+    const advs = document.querySelectorAll('.adv');
+    for (const a of advs) {
+      const lbl = a.querySelector(':scope > .small');
+      if (lbl && lbl.textContent.trim().startsWith('Advanced SDK controls')) {
+        // Replace the tiny 'small' label with a proper header
+        lbl.remove();
+        makeCollapsible(a, 'Advanced SDK controls', 'collapsed_adv_sdk', true);
+        return;
+      }
+    }
+  })();
+}, 150);
 
 // Poll video status
 async function refreshVideoStatus() {
@@ -2279,11 +4572,46 @@ async function refreshVideoStatus() {
 setInterval(refreshVideoStatus, 5000);
 
 // Heartbeat — keeps the drone watchdog alive so it doesn't auto-land
-async function sendHeartbeat(){
-  try { await fetch('/proxy/heartbeat', {cache:'no-store'}); } catch {}
+// ── UNIFIED STATUS POLL ─────────────────────────────────────────────
+// Replaces /proxy/heartbeat + /proxy/pause_status + /proxy/ws/status +
+// /proxy/config/ceiling + /proxy/config/transport + /proxy/missions/status
+// with ONE request at 1 Hz. The C2 aggregates them all locally (all are
+// in-memory dict reads) — this frees the browser's 6-connection pool so
+// CONTROL traffic (WASD, takeoff, rc) goes through without queueing.
+//
+// Control latency (keypress → drone) is completely unaffected: those go
+// via /proxy/key_down | key_up | key_batch which are NOT part of this
+// unified poll. Only the low-frequency UI bookkeeping lives here.
+let _uiPollSeq = 0;
+async function uiStatePoll(){
+  const mySeq = ++_uiPollSeq;
+  try {
+    const r = await fetch('/proxy/ui_state', {cache:'no-store'});
+    if (_uiPollSeq !== mySeq) return;   // a newer poll already fired
+    const j = await r.json();
+    // Distribute to the individual consumers
+    if (j.pause && typeof applyPauseUI === 'function') {
+      if (!!j.pause.paused !== !!window._globalPaused) applyPauseUI(j.pause.paused, j.pause);
+    }
+    if (j.ceiling && typeof window._applyCeilingStatus === 'function') {
+      window._applyCeilingStatus(j.ceiling);
+    }
+    if (j.arena_safety && typeof window._applyArenaSafety === 'function') {
+      window._applyArenaSafety(j.arena_safety);
+    }
+    if (j.ws && typeof window._applyWsStatus === 'function') {
+      window._applyWsStatus(j.ws);
+    }
+    if (j.transport && typeof window._applyTransportState === 'function') {
+      window._applyTransportState(j.transport);
+    }
+    if (j.missions && typeof window._applyMissionsStatus === 'function') {
+      window._applyMissionsStatus(j.missions);
+    }
+  } catch {}
 }
-setInterval(sendHeartbeat, 500);
-sendHeartbeat();
+setInterval(uiStatePoll, 1000);
+uiStatePoll();
 
 // ── Telemetry SSE (replaces polling for near-real-time updates) ──
 let telEvtSource = null;
@@ -2884,10 +5212,11 @@ const arenaCanvas = document.getElementById('arena_canvas');
 const arenaCtx = arenaCanvas.getContext('2d');
 
 // World dimensions — updated when arena config loads
-let arenaW = 20, arenaD = 10, arenaOX = -10, arenaOY = 0;
-// View adds a margin around arena so out-of-bounds positions are still visible
-const VIEW_MARGIN = 5;  // metres
-let viewOX = -15, viewOY = -5, viewW = 30, viewD = 20;
+let arenaW = 20, arenaD = 10.8, arenaOX = -10, arenaOY = 0;
+// Tight 1 m border around the arena — the arena fills most of the view,
+// and out-of-bounds positions beyond 1 m get clamped with an OOB arrow.
+const VIEW_MARGIN = 1;  // metres
+let viewOX = -11, viewOY = -1, viewW = 22, viewD = 12.8;
 
 function _updateView() {
   viewOX = arenaOX - VIEW_MARGIN;
@@ -2934,20 +5263,77 @@ function drawArena(pos, compPos, dir) {
   ctx.fillStyle = 'rgba(0,0,0,0.4)'; ctx.fillRect(PAD, PAD, W - 2*PAD, H - 2*PAD);
   ctx.fillStyle = '#0f172a'; ctx.fillRect(ax0, ay0, ax1 - ax0, ay1 - ay0);
 
-  // Grid lines over full view (5 m spacing)
-  ctx.strokeStyle = '#1e3a5f'; ctx.lineWidth = 1;
-  for (let gx = Math.ceil(viewOX / 5) * 5; gx <= viewOX + viewW + 0.01; gx += 5) {
+  // ── Team-zone shading (SDC26: red home zone LEFT, blue home zone RIGHT,
+  //    neutral middle). Splits the 20 m length into three equal thirds.
+  (function shadeZones() {
+    const thirdW = (arenaW) / 3;
+    // Red zone: x ∈ [arenaOX, arenaOX + thirdW]
+    const [rx0] = arenaToCanvas(arenaOX, arenaOY);
+    const [rx1] = arenaToCanvas(arenaOX + thirdW, arenaOY);
+    ctx.fillStyle = 'rgba(239,68,68,0.06)';
+    ctx.fillRect(rx0, ay0, rx1 - rx0, ay1 - ay0);
+    // Blue zone: x ∈ [arenaOX + 2·thirdW, arenaOX + arenaW]
+    const [bx0] = arenaToCanvas(arenaOX + 2 * thirdW, arenaOY);
+    const [bx1] = arenaToCanvas(arenaOX + arenaW, arenaOY);
+    ctx.fillStyle = 'rgba(59,130,246,0.06)';
+    ctx.fillRect(bx0, ay0, bx1 - bx0, ay1 - ay0);
+  })();
+
+  // Grid lines — fine 1 m grid (subtle) + major 5 m grid (brighter)
+  // so the user can read position to the metre at a glance.
+  const minorStroke = '#17243b';
+  const majorStroke = '#1e3a5f';
+  ctx.lineWidth = 1;
+  for (let gx = Math.ceil(viewOX); gx <= viewOX + viewW + 0.01; gx += 1) {
     const [cx] = arenaToCanvas(gx, viewOY);
+    ctx.strokeStyle = (gx % 5 === 0) ? majorStroke : minorStroke;
     ctx.beginPath(); ctx.moveTo(cx, PAD); ctx.lineTo(cx, H - PAD); ctx.stroke();
   }
-  for (let gy = Math.ceil(viewOY / 5) * 5; gy <= viewOY + viewD + 0.01; gy += 5) {
+  for (let gy = Math.ceil(viewOY); gy <= viewOY + viewD + 0.01; gy += 1) {
     const [, cy] = arenaToCanvas(viewOX, gy);
+    ctx.strokeStyle = (gy % 5 === 0) ? majorStroke : minorStroke;
     ctx.beginPath(); ctx.moveTo(PAD, cy); ctx.lineTo(W - PAD, cy); ctx.stroke();
   }
 
   // Arena border (highlighted)
   ctx.strokeStyle = '#475569'; ctx.lineWidth = 2;
   ctx.strokeRect(ax0, ay0, ax1 - ax0, ay1 - ay0);
+
+  // ── Safety margin rectangle ────────────────────────────────────
+  // Draws the Pi-side arena guard's inner boundary as a dashed red
+  // outline and shades the restricted zone (between the outline and
+  // the arena wall) with a faint red tint. The drone is not allowed
+  // to cross the inner boundary during autonomous flight OR manual
+  // flight (when the guard is ON). Value comes from the last
+  // /proxy/config/arena_safety poll, cached in window._arenaSafety.
+  (function drawSafetyMargin() {
+    const sa = window._arenaSafety || {};
+    const margin = (typeof sa.margin_m === 'number' && sa.margin_m > 0)
+                     ? sa.margin_m : null;
+    if (margin == null) return;
+    // Inner boundary rectangle — arena bounds minus margin.
+    const [sx0, sy0] = arenaToCanvas(arenaOX + margin, arenaOY + arenaD - margin);
+    const [sx1, sy1] = arenaToCanvas(arenaOX + arenaW - margin, arenaOY + margin);
+    // Faint red shading in the restricted band (between margin and wall).
+    // We paint four rectangles: top/bottom/left/right edges.
+    ctx.fillStyle = 'rgba(239,68,68,0.08)';
+    ctx.fillRect(ax0, ay0, ax1 - ax0, sy0 - ay0);                  // top (y=max zone)
+    ctx.fillRect(ax0, sy1, ax1 - ax0, ay1 - sy1);                  // bottom
+    ctx.fillRect(ax0, sy0, sx0 - ax0, sy1 - sy0);                  // left
+    ctx.fillRect(sx1, sy0, ax1 - sx1, sy1 - sy0);                  // right
+    // Dashed inner boundary — brighter if the guard is currently engaged.
+    ctx.save();
+    ctx.setLineDash([6, 4]);
+    ctx.lineWidth = sa.engaged ? 2 : 1.5;
+    ctx.strokeStyle = sa.engaged ? '#ef4444' : '#f87171';
+    ctx.strokeRect(sx0, sy0, sx1 - sx0, sy1 - sy0);
+    ctx.restore();
+    // Tiny label so operators know what the dashed rect means
+    ctx.font = '9px monospace';
+    ctx.fillStyle = '#fca5a5';
+    ctx.textAlign = 'left';
+    ctx.fillText('safe @ -' + margin.toFixed(1) + 'm', sx0 + 4, sy0 + 11);
+  })();
 
   // Outer view border
   ctx.strokeStyle = '#1e293b'; ctx.lineWidth = 1;
@@ -2982,59 +5368,107 @@ function drawArena(pos, compPos, dir) {
   // brighter border; unseen markers are dimmed to ~40% for visual separation.
   ctx.font = 'bold 11px monospace';
   ctx.textBaseline = 'middle';
+
+  // ── Bucket markers that share the same (x,y) top-down projection ──
+  // The SDC arena uses stacked pairs (low at z≈2 m, high at z≈4 m) on
+  // every wall. On the 2D top-down they collapse to identical pixels.
+  // Drawing them individually means the label of the later-iterated ID
+  // hides the first. We group by rounded canvas coordinate and render
+  // a single combined glyph with a multi-ID label ("1/2") where each
+  // individual ID is coloured by its own seen/ref state.
+  const _bucketKey = (x, y) => Math.round(x) + ',' + Math.round(y);
+  const buckets = new Map();
   for (const [id, m] of Object.entries(arenaMarkers)) {
     if (!m.pos) continue;
     const [mx, my] = arenaToCanvas(m.pos[0], m.pos[1]);
     if (mx < PAD - 4 || mx > W - PAD + 4 || my < PAD - 4 || my > H - PAD + 4) continue;
+    const key = _bucketKey(mx, my);
+    let b = buckets.get(key);
+    if (!b) {
+      b = {cx: mx, cy: my, wall: m.wall, entries: []};
+      buckets.set(key, b);
+    }
+    b.entries.push({
+      id:   String(id),
+      seen: _seenMarkers.has(String(id)),
+      ref:  _refMarkers.has(String(id)),
+      z:    (m.pos[2] != null) ? Number(m.pos[2]) : 0,
+    });
+  }
 
-    const isSeen = _seenMarkers.has(String(id));
-    const isRef  = _refMarkers.has(String(id));
-    const baseColor = WALL_COLOR[m.wall] || '#94a3b8';
+  for (const b of buckets.values()) {
+    // Sort HIGH altitude first so the top row of the label is the
+    // upper marker (matches the physical stacking on the wall: low ID
+    // paints low, high ID paints high in the same pixel column).
+    b.entries.sort((a, b) => b.z - a.z);
+    const mx = b.cx, my = b.cy;
+    const anySeen = b.entries.some(e => e.seen);
+    const anyRef  = b.entries.some(e => e.ref);
+    const baseColor = WALL_COLOR[b.wall] || '#94a3b8';
 
-    // Halo behind seen markers so they visibly pulse against the arena
-    if (isSeen) {
+    // Halo whenever ANY marker in the stack is seen.
+    if (anySeen) {
       ctx.beginPath();
       ctx.arc(mx, my, 14, 0, Math.PI * 2);
-      ctx.fillStyle = (isRef ? 'rgba(34,197,94,0.35)' : 'rgba(251,191,36,0.35)');
+      ctx.fillStyle = (anyRef ? 'rgba(34,197,94,0.35)' : 'rgba(251,191,36,0.35)');
       ctx.fill();
       ctx.beginPath();
       ctx.arc(mx, my, 14, 0, Math.PI * 2);
-      ctx.strokeStyle = (isRef ? '#22c55e' : '#fbbf24');
+      ctx.strokeStyle = (anyRef ? '#22c55e' : '#fbbf24');
       ctx.lineWidth = 1.5; ctx.stroke();
     }
 
-    // Square marker — always full-opacity so markers never disappear.
-    // Seen markers get a brighter white border to make them pop.
+    // Square marker glyph — same shape as before; brighter border if
+    // any of the stacked IDs is currently seen.
     ctx.fillStyle = baseColor;
     ctx.fillRect(mx - 5, my - 5, 10, 10);
-    ctx.strokeStyle = isSeen ? '#ffffff' : 'rgba(15,23,42,0.9)';
-    ctx.lineWidth = isSeen ? 1.5 : 1;
+    ctx.strokeStyle = anySeen ? '#ffffff' : 'rgba(15,23,42,0.9)';
+    ctx.lineWidth = anySeen ? 1.5 : 1;
     ctx.strokeRect(mx - 5.5, my - 5.5, 11, 11);
 
-    // Position label pill on the side away from the wall (so ID doesn't collide with BACK/FRONT/LEFT/RIGHT)
-    // front=y≈0 → label up, back=y≈max → down, left=x≈0 → right, right=x≈max → left
-    const idText = String(id);
-    const tw = ctx.measureText(idText).width;
-    const pillW = tw + 8, pillH = 15;
-    let labelX, labelY, anchor = 'center';
-    const wall = (m.wall || '').toLowerCase();
-    if (wall === 'front')      { labelX = mx; labelY = my - 13; }
-    else if (wall === 'back')  { labelX = mx; labelY = my + 13; }
-    else if (wall === 'left')  { labelX = mx + 9 + pillW / 2; labelY = my; }
-    else if (wall === 'right') { labelX = mx - 9 - pillW / 2; labelY = my; }
-    else                       { labelX = mx; labelY = my - 13; }
+    // Vertical label stack — one row per ID. Upper-altitude marker sits
+    // on the top row; lower marker on the bottom. This mirrors the
+    // physical layout of the stacked wall pairs (high above low).
+    const LINE_H = 13;
+    const pillW  = Math.max(...b.entries.map(e => ctx.measureText(e.id).width)) + 10;
+    const pillH  = b.entries.length * LINE_H + 4;
 
-    // Dark background pill for legibility — always visible
+    // Side opposite the BACK/FRONT/LEFT/RIGHT text so the pill doesn't
+    // collide with it. Offset includes pillH now since the pill is taller.
+    const wall = (b.wall || '').toLowerCase();
+    let labelX, labelY;
+    if      (wall === 'front') { labelX = mx;                      labelY = my - pillH / 2 - 8; }
+    else if (wall === 'back')  { labelX = mx;                      labelY = my + pillH / 2 + 8; }
+    else if (wall === 'left')  { labelX = mx + 9 + pillW / 2;      labelY = my; }
+    else if (wall === 'right') { labelX = mx - 9 - pillW / 2;      labelY = my; }
+    else                        { labelX = mx;                      labelY = my - pillH / 2 - 8; }
+
+    // Pill background + border (brighter border when anything seen)
     ctx.fillStyle = 'rgba(15,23,42,0.9)';
     ctx.fillRect(labelX - pillW / 2, labelY - pillH / 2, pillW, pillH);
     ctx.strokeStyle = baseColor;
-    ctx.lineWidth = isSeen ? 1.5 : 1;
+    ctx.lineWidth = anySeen ? 1.5 : 1;
     ctx.strokeRect(labelX - pillW / 2 + 0.5, labelY - pillH / 2 + 0.5, pillW - 1, pillH - 1);
 
-    // ID text — white for seen markers, wall color for unseen
-    ctx.fillStyle = isSeen ? '#ffffff' : baseColor;
+    // Render each ID on its own row; seen → bold white, unseen → wall
+    // colour. Thin separator line between rows makes the pair visually
+    // obvious when both IDs are unseen (same colour otherwise).
     ctx.textAlign = 'center';
-    ctx.fillText(idText, labelX, labelY + 0.5);
+    b.entries.forEach((e, i) => {
+      const rowY = labelY - pillH / 2 + (i + 0.5) * LINE_H + 2;
+      ctx.fillStyle = e.seen ? '#ffffff' : baseColor;
+      ctx.font      = e.seen ? 'bold 11px monospace' : '11px monospace';
+      ctx.fillText(e.id, labelX, rowY);
+      if (i < b.entries.length - 1) {
+        ctx.strokeStyle = 'rgba(100,116,139,0.5)';
+        ctx.lineWidth = 0.5;
+        ctx.beginPath();
+        ctx.moveTo(labelX - pillW / 2 + 2, labelY - pillH / 2 + (i + 1) * LINE_H + 2);
+        ctx.lineTo(labelX + pillW / 2 - 2, labelY - pillH / 2 + (i + 1) * LINE_H + 2);
+        ctx.stroke();
+      }
+    });
+    ctx.font = 'bold 11px monospace';   // restore default for any later caller
   }
   ctx.textBaseline = 'alphabetic';  // restore default so downstream drawing is unaffected
 
@@ -3049,6 +5483,58 @@ function drawArena(pos, compPos, dir) {
   ctx.fillStyle = 'rgba(0,0,0,0.75)'; ctx.fillRect(PAD, PAD, dbgW, dbgLines.length * 16 + 6);
   ctx.fillStyle = '#22d3ee'; ctx.textAlign = 'left';
   dbgLines.forEach((l, i) => ctx.fillText(l, PAD + 5, PAD + 15 + i * 16));
+
+  // ── Target boxes (from the capture-targets mission config) ──
+  // Drawn on the floor as a labelled square with a diamond marker.
+  // Colour indicates capture state when a mission is running:
+  //   grey   = not yet visited
+  //   yellow = currently claimed by a drone
+  //   green  = captured
+  const boxes = window._targetBoxes;
+  if (Array.isArray(boxes) && boxes.length) {
+    const claimed = (window._missionClaimedBoxes || {});
+    const captured = new Set(window._missionCapturedBoxes || []);
+    boxes.forEach((b, i) => {
+      if (b == null || b.x == null || b.y == null) return;
+      const [bx, by] = arenaToCanvas(Number(b.x), Number(b.y));
+      const idx = (typeof b.idx === 'number') ? b.idx : i;
+      const isCap = captured.has(idx);
+      const isClaimed = Object.values(claimed).includes(idx);
+      const team = (b.home_team || '').toLowerCase();
+      // Default colour is the team the box BELONGS to (red/blue start colour
+      // from the SDC26 rules). While being approached by us → yellow.
+      // After capture → green (ours).
+      const fill = isCap     ? 'rgba(34,197,94,0.55)'
+                 : isClaimed ? 'rgba(250,204,21,0.55)'
+                 : team === 'red'  ? 'rgba(239,68,68,0.55)'
+                 : team === 'blue' ? 'rgba(59,130,246,0.55)'
+                                   : 'rgba(148,163,184,0.45)';
+      const stroke = isCap     ? '#16a34a'
+                   : isClaimed ? '#eab308'
+                   : team === 'red'  ? '#dc2626'
+                   : team === 'blue' ? '#2563eb'
+                                     : '#64748b';
+      // Box body: 20 px diamond-ish square
+      const s = 18;
+      ctx.save();
+      ctx.translate(bx, by);
+      ctx.rotate(Math.PI / 4);
+      ctx.fillStyle = fill;
+      ctx.fillRect(-s/2, -s/2, s, s);
+      ctx.strokeStyle = stroke; ctx.lineWidth = 2;
+      ctx.strokeRect(-s/2, -s/2, s, s);
+      ctx.restore();
+      // Label: box id + status
+      const label = `#${b.id ?? idx+1}` +
+                    (isCap ? ' ✓' : (isClaimed ? ' ⏱' : ''));
+      ctx.font = 'bold 11px monospace'; ctx.textAlign = 'center';
+      ctx.fillStyle = 'rgba(0,0,0,0.75)';
+      const tw = ctx.measureText(label).width;
+      ctx.fillRect(bx - tw/2 - 3, by + 14, tw + 6, 13);
+      ctx.fillStyle = stroke;
+      ctx.fillText(label, bx, by + 24);
+    });
+  }
 
   // Drone positions
   if (!_pos) return;
@@ -3120,7 +5606,98 @@ function drawArena(pos, compPos, dir) {
   ctx.fillStyle = 'rgba(0,0,0,0.6)'; ctx.fillRect(lx - 2, ly - 11, lw + 4, 14);
   ctx.fillStyle = dotColor; ctx.textAlign = 'left';
   ctx.fillText(label, lx, ly);
+
+  // ── Multi-drone overlay (when checkbox enabled) ──────────────────
+  // Draw every OTHER drone in the fleet in a distinct colour so the
+  // C2 operator can see the whole swarm at once.
+  const showAll = document.getElementById('arena_show_all_drones');
+  if (showAll && showAll.checked && window._fleetObservers) {
+    const FLEET_COLORS = ['#38bdf8', '#a78bfa', '#f472b6', '#fbbf24', '#34d399'];
+    let idx = 0;
+    for (const [did, st] of Object.entries(window._fleetObservers)) {
+      if (did === (window.activeDroneId || activeDroneId)) { idx++; continue; }
+      const p = st && (st.pos || st.cam);
+      if (!p || p.length < 2) { idx++; continue; }
+      const col = FLEET_COLORS[idx % FLEET_COLORS.length];
+      const [rx, ry] = arenaToCanvas(p[0], p[1]);
+      const cxN = Math.max(M, Math.min(W - M, rx));
+      const cyN = Math.max(M, Math.min(H - M, ry));
+      const oob = rx !== cxN || ry !== cyN;
+      // Smaller dot for non-active drones
+      ctx.beginPath(); ctx.arc(cxN, cyN, 7, 0, Math.PI*2);
+      ctx.fillStyle = col; ctx.fill();
+      ctx.strokeStyle = 'rgba(255,255,255,0.6)'; ctx.lineWidth = 1.5; ctx.stroke();
+      // heading tick
+      const yawDeg = st.yaw;
+      if (typeof yawDeg === 'number') {
+        const a = yawDeg * Math.PI / 180;
+        ctx.strokeStyle = col; ctx.lineWidth = 2;
+        ctx.beginPath(); ctx.moveTo(cxN, cyN);
+        ctx.lineTo(cxN + Math.sin(a) * 16, cyN - Math.cos(a) * 16);
+        ctx.stroke();
+      }
+      // label with drone name + position
+      ctx.font = 'bold 10px monospace';
+      const name = (window._fleetNames && window._fleetNames[did]) || did;
+      const tag = `${name} (${p[0].toFixed(1)},${p[1].toFixed(1)})${oob ? ' OOB':''}`;
+      const tw = ctx.measureText(tag).width;
+      const tx = Math.min(cxN + 10, W - tw - PAD - 4);
+      const ty = cyN - 9;
+      ctx.fillStyle = 'rgba(0,0,0,0.65)'; ctx.fillRect(tx - 2, ty - 10, tw + 4, 13);
+      ctx.fillStyle = col; ctx.textAlign = 'left';
+      ctx.fillText(tag, tx, ty);
+      idx++;
+    }
+  }
 }
+
+// ── Fleet-wide position poll (drives multi-drone arena view) ──
+window._fleetObservers = {};
+window._fleetNames = {};
+async function fleetPoll() {
+  try {
+    const r = await fetch('/proxy/aruco/fleet', {cache:'no-store'});
+    const d = await r.json();
+    if (d && d.observers) {
+      window._fleetObservers = d.observers;
+      // Grab drone display names from the main drones dict if available
+      if (typeof drones === 'object') {
+        const names = {};
+        for (const [did, info] of Object.entries(drones || {})) {
+          names[did] = info?.name || did;
+        }
+        window._fleetNames = names;
+      }
+      // Feed positions into the Three.js scene if active
+      if (window._arena3d && window._arena3d.updateDrones) {
+        window._arena3d.updateDrones(d.observers);
+        if (window._arena3d.syncTargetBoxes) window._arena3d.syncTargetBoxes();
+        if (window._arena3d.updateDronePositionHUD) {
+          window._arena3d.updateDronePositionHUD(d.observers);
+        }
+        // Aggregate which markers are currently visible / used as refs
+        // across the whole fleet so the 3D highlight matches the 2D
+        // halo. Prefer the position service's seen_markers field; fall
+        // back to ref_markers-only when the observer isn't running.
+        if (window._arena3d.updateVisibleMarkers) {
+          const seenAll = new Set();
+          const refAll  = new Set();
+          for (const st of Object.values(d.observers || {})) {
+            (st.seen_markers || []).forEach(m => seenAll.add(String(m)));
+            (st.ref_markers  || []).forEach(m => {
+              refAll.add(String(m));
+              seenAll.add(String(m));   // ref implies seen
+            });
+          }
+          window._arena3d.updateVisibleMarkers(
+            Array.from(seenAll), Array.from(refAll));
+        }
+      }
+    }
+  } catch {}
+}
+setInterval(fleetPoll, 1000);   // was 500ms/2Hz → 1Hz; fleet poll fans out to all drones, heaviest endpoint
+fleetPoll();
 
 function updatePosUI(d) {
   const pos = d.pos;
@@ -3138,6 +5715,67 @@ function updatePosUI(d) {
   const spd = vel ? Math.sqrt((vel[0]||0)**2 + (vel[1]||0)**2).toFixed(2) : '\\u2014';
   document.getElementById('pos_vel').textContent = spd + ' m/s';
   document.getElementById('pos_refs').textContent = d.ref_markers ? d.ref_markers.length : '\\u2014';
+
+  // ── Safety distance readout ───────────────────────────────────────
+  // How close is the drone to the nearest safety boundary? Green =
+  // safe zone with margin; amber = within 30 cm of the boundary; red
+  // = past the margin (i.e. inside the restricted band between the
+  // dashed safety line and the arena wall).
+  (function updateSafetyReadout() {
+    const el = document.getElementById('pos_safety_readout');
+    if (!el) return;
+    const sa = window._arenaSafety || {};
+    if (!sa.enabled) {
+      el.textContent = 'guard OFF — operator owns boundaries';
+      el.style.color = '#fbbf24';
+      return;
+    }
+    if (sa.margin_m == null || !Array.isArray(pos) || pos.length < 2) {
+      el.textContent = '—';
+      el.style.color = '#64748b';
+      return;
+    }
+    const m = sa.margin_m;
+    const x = Number(pos[0]), y = Number(pos[1]);
+    // Distance to nearest wall, then distance to the SAFE inner boundary.
+    // Negative value = drone is inside the restricted band (past the margin).
+    const dWall = Math.min(
+      (arenaOX + arenaW) - x,      // right wall
+      x - arenaOX,                  // left wall
+      (arenaOY + arenaD) - y,      // back wall (y_max)
+      y - arenaOY,                  // front wall (y_min)
+    );
+    const dSafe = dWall - m;        // metres from safe boundary
+    const wallNames = {
+      xr: (arenaOX + arenaW) - x,
+      xl: x - arenaOX,
+      yb: (arenaOY + arenaD) - y,
+      yf: y - arenaOY,
+    };
+    let closest = 'right';
+    let closestD = wallNames.xr;
+    if (wallNames.xl < closestD) { closest = 'left';  closestD = wallNames.xl; }
+    if (wallNames.yb < closestD) { closest = 'back';  closestD = wallNames.yb; }
+    if (wallNames.yf < closestD) { closest = 'front'; closestD = wallNames.yf; }
+
+    if (dSafe < 0) {
+      // Inside restricted band — or worse, outside arena.
+      el.textContent = '\u26a0 RESTRICTED — ' + Math.abs(dSafe).toFixed(2) +
+                        ' m past ' + closest + ' margin  (wall ' +
+                        closestD.toFixed(2) + ' m away)';
+      el.style.color = '#ef4444';
+    } else if (dSafe < 0.3) {
+      el.textContent = '\u26a1 approaching ' + closest + ' — ' +
+                        dSafe.toFixed(2) + ' m to margin  (' +
+                        closestD.toFixed(2) + ' m to wall)';
+      el.style.color = '#fbbf24';
+    } else {
+      el.textContent = '\u2713 safe — ' + dSafe.toFixed(2) +
+                        ' m to ' + closest + ' margin  (' +
+                        closestD.toFixed(2) + ' m to wall)';
+      el.style.color = '#22c55e';
+    }
+  })();
   document.getElementById('pos_fps').textContent = d.fps != null ? d.fps : '\\u2014';
   document.getElementById('pos_stale').style.display = d.stale ? '' : 'none';
 
@@ -3194,6 +5832,31 @@ async function loadPosConfig() {
     if (tK && c.top_k_markers != null) tK.value = c.top_k_markers;
     const out = document.getElementById('pos_outlier');
     if (out && c.outlier_reject_m != null) out.value = c.outlier_reject_m;
+    const ds = document.getElementById('pos_distance_scale');
+    if (ds && c.distance_scale != null) ds.value = Number(c.distance_scale).toFixed(3);
+    // ── Populate precision (advanced) controls ──
+    const setIf = (id, val, formatter) => {
+      const el = document.getElementById(id);
+      if (el && val != null) el.value = formatter ? formatter(val) : val;
+    };
+    setIf('pos_pose_hold',  c.pose_hold_sec);
+    setIf('pos_min_refs',   c.min_ref_count);
+    setIf('pos_min_ref_w',  c.min_ref_weight);
+    setIf('pos_blend_min',  c.meas_blend_min);
+    setIf('pos_blend_max',  c.meas_blend_max);
+    setIf('pos_vel_blend',  c.vel_blend);
+    setIf('pos_max_dt',     c.max_state_dt);
+    setIf('pos_kf_q',       c.kalman_process_var, (v)=>Number(v).toPrecision(3));
+    setIf('pos_kf_r',       c.kalman_meas_var,    (v)=>Number(v).toPrecision(3));
+    // IMU LPF slider + its live-label
+    if (c.imu_lowpass_hz != null) {
+      const slider = document.getElementById('pos_imu_lpf');
+      const label  = document.getElementById('pos_imu_lpf_val');
+      if (slider) slider.value = Number(c.imu_lowpass_hz).toFixed(1);
+      if (label)  label.textContent = (Number(c.imu_lowpass_hz) > 0
+                                        ? Number(c.imu_lowpass_hz).toFixed(1) + ' Hz'
+                                        : 'OFF');
+    }
     const cs = document.getElementById('pos_calib_status');
     cs.textContent = d.has_calibration ? '\\u2713 calibration loaded' : 'no calibration';
     cs.style.color = d.has_calibration ? '#22c55e' : '#94a3b8';
@@ -3211,11 +5874,13 @@ async function loadPosConfig() {
   };
   const applyBtn = document.getElementById('pos_filters_apply');
   if (applyBtn) applyBtn.onclick = async () => {
+    const dsEl = document.getElementById('pos_distance_scale');
     const payload = {
       enable_kalman_filter: document.getElementById('pos_kalman').checked,
       marker_size_m: parseFloat(document.getElementById('pos_marker_size').value),
       top_k_markers: parseInt(document.getElementById('pos_top_k').value, 10),
       outlier_reject_m: parseFloat(document.getElementById('pos_outlier').value),
+      distance_scale: dsEl ? parseFloat(dsEl.value) : 1.0,
     };
     try {
       const r = await fetch('/proxy/position/config', {
@@ -3234,8 +5899,537 @@ async function loadPosConfig() {
     document.getElementById('pos_marker_size').value = '0.50';
     document.getElementById('pos_top_k').value = '0';
     document.getElementById('pos_outlier').value = '2.5';
+    const ds = document.getElementById('pos_distance_scale');
+    if (ds) ds.value = '1.000';
     flash('defaults loaded — click Apply', '#94a3b8');
   };
+})();
+
+// ── Precision (advanced) controls — pose hold, Kalman variances,
+// measurement/velocity blend, min-refs. Live-apply through the same
+// endpoint; no restart required. Defaults mirror ctrl_position.py.
+(function wirePrecisionControls(){
+  const flash = (msg, col) => {
+    const e = document.getElementById('pos_precision_status');
+    if (!e) return;
+    e.textContent = msg; e.style.color = col || '#64748b';
+    setTimeout(() => { if (e.textContent === msg) e.textContent = ''; }, 2500);
+  };
+  const applyBtn = document.getElementById('pos_precision_apply');
+  if (applyBtn) applyBtn.onclick = async () => {
+    const num = (id) => parseFloat(document.getElementById(id).value);
+    const int = (id) => parseInt(document.getElementById(id).value, 10);
+    const payload = {
+      pose_hold_sec:       num('pos_pose_hold'),
+      min_ref_count:       int('pos_min_refs'),
+      min_ref_weight:      num('pos_min_ref_w'),
+      meas_blend_min:      num('pos_blend_min'),
+      meas_blend_max:      num('pos_blend_max'),
+      vel_blend:           num('pos_vel_blend'),
+      max_state_dt:        num('pos_max_dt'),
+      kalman_process_var:  num('pos_kf_q'),
+      kalman_meas_var:     num('pos_kf_r'),
+      imu_lowpass_hz:      num('pos_imu_lpf'),
+    };
+    try {
+      const r = await fetch('/proxy/position/config', {
+        method: 'POST',
+        headers: {'Content-Type':'application/json'},
+        body: JSON.stringify(payload),
+      });
+      const d = await r.json();
+      if (d.ok) flash('\\u2713 applied', '#22c55e');
+      else flash('error: ' + (d.error || 'unknown'), '#ef4444');
+    } catch (e) { flash('request failed', '#ef4444'); }
+  };
+  const resetBtn = document.getElementById('pos_precision_reset');
+  if (resetBtn) resetBtn.onclick = () => {
+    document.getElementById('pos_pose_hold').value = '0.8';
+    document.getElementById('pos_min_refs').value  = '1';
+    document.getElementById('pos_min_ref_w').value = '0';
+    document.getElementById('pos_blend_min').value = '0.35';
+    document.getElementById('pos_blend_max').value = '0.85';
+    document.getElementById('pos_vel_blend').value = '0.25';
+    document.getElementById('pos_max_dt').value    = '1.0';
+    document.getElementById('pos_kf_q').value      = '1e-3';
+    document.getElementById('pos_kf_r').value      = '0.1';
+    const lpf = document.getElementById('pos_imu_lpf');
+    if (lpf) {
+      lpf.value = '5';
+      const lbl = document.getElementById('pos_imu_lpf_val');
+      if (lbl) lbl.textContent = '5.0 Hz';
+    }
+    flash('defaults loaded — click Apply', '#94a3b8');
+  };
+})();
+
+// ── Position-tracker preset management ─────────────────────────────
+// Mirrors the mission preset system. Apply fans out to every drone
+// via /proxy/position/config; Save gathers current UI values and
+// POSTs to /proxy/position/presets.
+(function wirePositionPresets(){
+  const sel   = document.getElementById('pos_preset_sel');
+  const aBtn  = document.getElementById('pos_preset_apply');
+  const sBtn  = document.getElementById('pos_preset_save');
+  const dBtn  = document.getElementById('pos_preset_delete');
+  const nameI = document.getElementById('pos_preset_name');
+  const status = document.getElementById('pos_preset_status');
+  if (!sel) return;
+  function flash(msg, col) {
+    if (!status) return;
+    status.textContent = msg;
+    status.style.color = col || '#64748b';
+    setTimeout(() => { if (status.textContent === msg) status.textContent = ''; }, 3000);
+  }
+  function readCurrentParams() {
+    // Gather everything live-tunable on the Position Tracker panel.
+    // The server accepts unknown keys gracefully; we send a superset.
+    const v = (id, parser) => {
+      const el = document.getElementById(id);
+      if (!el) return undefined;
+      const raw = el.value;
+      if (parser === 'float') { const f = parseFloat(raw); return isFinite(f) ? f : undefined; }
+      if (parser === 'int')   { const i = parseInt(raw, 10); return isFinite(i) ? i : undefined; }
+      if (parser === 'bool')  return !!el.checked;
+      return raw;
+    };
+    return {
+      detect_profile:        v('pos_profile'),
+      fov_deg:               v('pos_fov', 'float'),
+      imu_weight:            (v('pos_imu_weight', 'float') || 0) / 100.0,
+      latency_ms:            v('pos_latency', 'float'),
+      enable_kalman_filter:  v('pos_kalman', 'bool'),
+      marker_size_m:         v('pos_marker_size', 'float'),
+      top_k_markers:         v('pos_top_k', 'int'),
+      outlier_reject_m:      v('pos_outlier', 'float'),
+      distance_scale:        v('pos_distance_scale', 'float'),
+      pose_hold_sec:         v('pos_pose_hold', 'float'),
+      min_ref_count:         v('pos_min_refs', 'int'),
+      min_ref_weight:        v('pos_min_ref_w', 'float'),
+      meas_blend_min:        v('pos_blend_min', 'float'),
+      meas_blend_max:        v('pos_blend_max', 'float'),
+      vel_blend:             v('pos_vel_blend', 'float'),
+      max_state_dt:          v('pos_max_dt', 'float'),
+      kalman_process_var:    v('pos_kf_q', 'float'),
+      kalman_meas_var:       v('pos_kf_r', 'float'),
+      imu_lowpass_hz:        v('pos_imu_lpf', 'float'),
+    };
+  }
+  async function refresh() {
+    try {
+      const j = await (await fetch('/proxy/position/presets')).json();
+      const presets = j.presets || {};
+      const names = Object.keys(presets).sort();
+      sel.innerHTML = '';
+      if (!names.length) {
+        const opt = document.createElement('option');
+        opt.value = ''; opt.textContent = '(no presets)';
+        sel.appendChild(opt);
+      } else {
+        names.forEach(n => {
+          const opt = document.createElement('option');
+          opt.value = n; opt.textContent = n;
+          sel.appendChild(opt);
+        });
+        if (names.includes('balanced')) sel.value = 'balanced';
+      }
+    } catch {}
+  }
+  if (aBtn) aBtn.onclick = async () => {
+    const name = sel.value;
+    if (!name) { flash('no preset selected', '#ef4444'); return; }
+    try {
+      const r = await fetch('/proxy/position/presets/apply', {
+        method:'POST',
+        headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({name}),
+      });
+      const j = await r.json();
+      if (j.ok) {
+        flash('\u2713 "' + name + '" \u2192 ' + (j.applied_to || 0) + '/' + (j.total || 0) + ' drones', '#22c55e');
+        if (typeof loadPosConfig === 'function') loadPosConfig();   // pull fresh UI values
+      } else flash('\u2717 ' + (j.error || 'apply failed'), '#ef4444');
+    } catch (e) { flash('\u2717 ' + e, '#ef4444'); }
+  };
+  if (sBtn) sBtn.onclick = async () => {
+    const name = (nameI.value.trim()) || sel.value;
+    if (!name) { flash('enter a preset name', '#ef4444'); return; }
+    const params = readCurrentParams();
+    try {
+      const r = await fetch('/proxy/position/presets', {
+        method:'POST',
+        headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({name, params}),
+      });
+      const j = await r.json();
+      if (j.ok) { flash('\u2713 saved "' + name + '"', '#22c55e'); await refresh(); }
+      else flash('\u2717 ' + (j.error || 'save failed'), '#ef4444');
+    } catch (e) { flash('\u2717 ' + e, '#ef4444'); }
+  };
+  if (dBtn) dBtn.onclick = async () => {
+    const name = sel.value;
+    if (!name) return;
+    if (!confirm('Delete position preset "' + name + '"?')) return;
+    try {
+      const r = await fetch('/proxy/position/presets?name=' + encodeURIComponent(name),
+                             {method:'DELETE'});
+      const j = await r.json();
+      if (j.ok) { flash('\u2713 deleted', '#22c55e'); await refresh(); }
+      else flash('\u2717 ' + (j.error || 'delete failed'), '#ef4444');
+    } catch (e) { flash('\u2717 ' + e, '#ef4444'); }
+  };
+  refresh();
+})();
+
+// ── IMU LPF slider live-label + debounced apply ─────────────────────
+// Updates the 'X.X Hz' / 'OFF' label on every frame of the drag, and
+// POSTs the value once the user stops moving it (~200 ms debounce).
+(function wireImuLpfSlider(){
+  const slider = document.getElementById('pos_imu_lpf');
+  const label  = document.getElementById('pos_imu_lpf_val');
+  if (!slider) return;
+  let _t = null;
+  function refreshLabel() {
+    if (!label) return;
+    const v = parseFloat(slider.value);
+    label.textContent = (v > 0 ? v.toFixed(1) + ' Hz' : 'OFF');
+  }
+  slider.addEventListener('input', () => {
+    refreshLabel();
+    if (_t) clearTimeout(_t);
+    _t = setTimeout(async () => {
+      try {
+        await fetch('/proxy/position/config', {
+          method: 'POST',
+          headers: {'Content-Type':'application/json'},
+          body: JSON.stringify({imu_lowpass_hz: parseFloat(slider.value)}),
+        });
+      } catch {}
+    }, 200);
+  });
+  refreshLabel();
+})();
+
+// ── Parameter-info popup — click any ⓘ icon for an explanation ──
+// One shared map drives every tuning knob. The modal picks up title,
+// key, body (explanation), and an optional range/units hint.
+window.PARAM_INFO = {
+  // ===== Observer PD (visual servo — used by all missions) =====
+  hover_distance_m: {title:'Hover distance', units:'metres', body:
+    "Target stand-off distance from the marker during hover. The mission "+
+    "flies forward until the marker is this far away, then holds.\\n\\n"+
+    "Smaller = closer / more camera detail, but less safety margin against "+
+    "the net. 2 m is the rules-safe default for SDC26.\\n"+
+    "Feeds into: approach phase (distance error) and hover phase (dead-band)."},
+  fb_max:           {title:'Approach speed (forward)', units:'% RC', body:
+    "Upper clamp for forward throttle when approaching a marker. Scales "+
+    "the P gain output — higher = faster approach but larger overshoot.\\n\\n"+
+    "Pair with dist_p: the effective command is min(fb_max, dist_p · err_dist)."},
+  fb_back_max:      {title:'Retreat speed (backward)', units:'% RC', body:
+    "Upper clamp for backward throttle when the drone is too close to the "+
+    "target. Set lower than fb_max — retreats tend to happen near the net "+
+    "and should be cautious."},
+  dist_p:           {title:'Approach aggressiveness', units:'P · dist error (m)', body:
+    "Proportional gain turning distance-error (m) into forward RC%. Higher "+
+    "values react more sharply to distance error.\\n\\n"+
+    "Start low (10-20) and raise until the drone reaches the hover distance "+
+    "without overshoot. Tied to fb_max and the IMU D term (d_fb)."},
+  ema_alpha:        {title:'EMA smoothing (α)', units:'0..1', body:
+    "First-order low-pass on camera-derived errors. 1.0 = no smoothing "+
+    "(fastest response, jitteriest), 0.05 = heavy smoothing (laggy).\\n\\n"+
+    "Typical 0.25-0.5. Lower when the video is noisy or markers are small."},
+  deadband_x:       {title:'Yaw/lateral dead-band (err_x)', units:'normalised', body:
+    "Below this threshold, yaw + sideways commands are zero. Stops the "+
+    "drone hunting around an already-centred marker.\\n\\n"+
+    "Typical 0.03-0.08. Increase if the drone wiggles while hovered."},
+  deadband_y:       {title:'Altitude dead-band (err_y)', units:'normalised', body:
+    "Below this threshold vertical command is zero. Similar purpose to "+
+    "deadband_x but on the vertical axis. 0.05-0.1 typical."},
+  deadband_skew:    {title:'Skew dead-band', units:'normalised', body:
+    "Below this threshold the perpendicular-alignment (strafe) command is "+
+    "zero. Skew measures how tilted the marker appears — a small tilt "+
+    "doesn't need correction."},
+  deadband_dist_m:  {title:'Distance dead-band', units:'metres', body:
+    "Below this distance-error threshold the forward/back command is zero. "+
+    "Keeps the drone parked once it's ~within range of hover_distance_m.\\n\\n"+
+    "Too small and you get buzzing; too large and the drone drifts."},
+  yaw_p:            {title:'Yaw P-gain', units:'per err_x', body:
+    "Proportional gain from horizontal image-error to yaw RC%. Higher = "+
+    "snappier rotation toward the marker but more overshoot."},
+  skew_p:           {title:'Lateral P-gain', units:'per skew', body:
+    "Proportional gain from marker-tilt to sideways RC%. Used to strafe "+
+    "around the marker for head-on approach."},
+  alt_p:            {title:'Altitude P-gain', units:'per err_y', body:
+    "Proportional gain from vertical image-error to vertical RC%. Higher = "+
+    "snappier climb/descend to marker height."},
+  d_yaw:            {title:'Yaw D-damping', units:'per °/s (gyro)', body:
+    "Derivative damping on yaw using the gyro. Subtracts a fraction of the "+
+    "current yaw-rate from the yaw command — cancels oscillation.\\n\\n"+
+    "If the drone visibly orbits around the marker, increase."},
+  d_lr:             {title:'Lateral D-damping', units:'per cm/s (vgy)', body:
+    "Derivative damping on sideways RC using the body-frame Y velocity "+
+    "from the IMU. Prevents over-strafing."},
+  d_ud:             {title:'Vertical D-damping', units:'per cm/s (vgz)', body:
+    "Derivative damping on vertical RC using the body-frame Z velocity. "+
+    "Prevents vertical oscillation as the drone approaches target altitude."},
+  d_fb:             {title:'Fwd/back D-damping', units:'per cm/s (vgx)', body:
+    "Derivative damping on forward/back RC using the body-frame X velocity. "+
+    "The most important D term for not slamming into the net.\\n\\n"+
+    "Combined with the boundary guard (arena edge prediction) this is the "+
+    "primary brake during fast approaches."},
+  yaw_max:          {title:'Clamp · max yaw', units:'% RC', body:
+    "Hard upper limit for yaw RC%. Applied after the PD math. Keeps the "+
+    "drone from spinning wildly on large errors. 20-30 typical."},
+  lr_max:           {title:'Clamp · max lateral', units:'% RC', body:
+    "Hard upper limit for sideways RC%. 20-40 typical — too high and the "+
+    "drone over-strafes during approach."},
+  ud_max:           {title:'Clamp · max vertical', units:'% RC', body:
+    "Hard upper limit for vertical RC%. Typical 20-40. Raise for faster "+
+    "altitude acquisition if the ceiling guard allows."},
+  rc_min:           {title:'RC dead-floor', units:'% RC', body:
+    "Below this magnitude the RC output is forced to zero. Anafi ignores "+
+    "very small RC values anyway — this prevents buzzing/whine while "+
+    "hovered. Usually 2-3."},
+  cam_hfov_deg:     {title:'Camera H-FOV (drawing only)', units:'degrees', body:
+    "Used ONLY to draw the camera cone in the top-down view — does NOT "+
+    "affect PnP or any control. 69° is the Anafi nominal."},
+  marker_size_m:    {title:'Observer marker size', units:'metres', body:
+    "Physical marker side length for the observer's own PnP. Must match "+
+    "the printed markers. SDC26 markers are 0.5 m.\\n\\n"+
+    "Tip: keep this in sync with the Position Tracker's marker size."},
+
+  // ===== Position Tracker (arena-frame pose fusion) =====
+  detect_profile:     {title:'Detection profile', body:
+    "Preset for the ArUco detector parameters (corner refinement, adaptive "+
+    "threshold window, min marker size). Profiles:\\n"+
+    "  · Balanced  — default, good speed + robustness.\\n"+
+    "  · Sensitive — lighter thresholds, catches distant / partially-lit "+
+    "markers at higher CPU cost.\\n"+
+    "  · Strict    — tighter accept, rejects noisy detections."},
+  fov_deg:            {title:'Camera H-FOV', units:'degrees', body:
+    "Horizontal field-of-view used to synthesise the intrinsics matrix "+
+    "when no calibration file is loaded. Anafi 4K ≈ 69°.\\n\\n"+
+    "Uploading a .npz calibration overrides this."},
+  latency_ms:         {title:'Video-to-IMU latency', units:'ms', body:
+    "How long the camera frame is old relative to the current IMU sample. "+
+    "The positioner rewinds the IMU buffer by this amount so the IMU "+
+    "velocity used for dead-reckoning corresponds to the same moment as "+
+    "the vision measurement.\\n\\n"+
+    "Measure: the header Latency row shows c2→fc + fc→drone RTT plus a "+
+    "video decode offset; enabling auto-set pushes that total here."},
+  imu_weight:         {title:'IMU ↔ ArUco blend', units:'0..1', body:
+    "Mix between pure ArUco pose (0) and pure IMU dead-reckoning (1). "+
+    "Higher = smoother but drifts more during marker outages.\\n\\n"+
+    "30 % is a good default. Raise to 50-60 % if markers flicker in/out, "+
+    "lower if the IMU shows bias."},
+  enable_kalman_filter:{title:'Kalman filter', body:
+    "Per-axis 1-D Kalman filter on x/y/z. Models state as position+velocity "+
+    "and fuses ArUco fixes as measurements.\\n\\n"+
+    "ON (recommended): smoother, handles brief marker dropouts.\\n"+
+    "OFF: pose jumps straight to the last ArUco solution — noisier but "+
+    "with zero added latency."},
+  top_k_markers:      {title:'Top-K markers', body:
+    "Use only the N closest markers in the weighted-mean fusion. 0 = auto "+
+    "(picks 4). Smaller K = faster, less robust to outliers. Larger K = "+
+    "more samples but includes distant, less-accurate detections."},
+  outlier_reject_m:   {title:'Outlier reject distance', units:'metres', body:
+    "Per-marker poses further than this from the weighted-mean position "+
+    "are rejected as outliers before re-averaging.\\n\\n"+
+    "Default 2.5 m. Tighten to 1.0 m for a smaller, tidy arena; loosen to "+
+    "3.5 m if markers are far apart."},
+  distance_scale:     {title:'Distance correction factor', units:'multiplier (1.0 = no correction)', body:
+    "Multiplicative correction applied to the camera\\u2194marker translation "+
+    "from solvePnP. Compensates for systematic scale error, usually caused "+
+    "by a mismatch between the real marker size and the configured "+
+    "marker_size_m, or by an uncalibrated focal length.\\n\\n"+
+    "Calibration recipe: put the drone a known distance D_real from a marker, "+
+    "read the UI distance D_ui, then set distance_scale = D_real / D_ui.\\n\\n"+
+    "Example: UI shows 7 m, tape measure says 9 m \\u2192 9 / 7 \\u2248 1.286.\\n\\n"+
+    "The scale applies equally to every pose axis, so it works whether the "+
+    "error shows up in x, y, z, or the combined 3-D distance. If the error "+
+    "is direction-dependent, fix the camera calibration instead."},
+  pose_hold_sec:      {title:'Pose hold (dead-reckon)', units:'seconds', body:
+    "After the last valid ArUco fix, keep publishing pose based on IMU "+
+    "dead-reckoning for this many seconds.\\n\\n"+
+    "Too short → pose vanishes every time the camera blinks.\\n"+
+    "Too long  → stale pose during marker outages drifts meters.\\n"+
+    "0.5-1.0 s typical. Raise only if the IMU is well-calibrated."},
+  min_ref_count:      {title:'Minimum reference markers', body:
+    "Require at least this many markers to be visible before a fused pose "+
+    "is accepted. 1 = accept a single marker (can be noisy). 2-3 gives a "+
+    "much more robust fix by cross-checking."},
+  min_ref_weight:     {title:'Minimum reference weight', units:'0..1', body:
+    "Require the best-matching marker to have at least this fused weight. "+
+    "Rejects very low-confidence fits (tiny / extreme-angle markers).\\n\\n"+
+    "0 = accept any detection. 0.2-0.4 is restrictive but clean."},
+  meas_blend_min:     {title:'Measurement blend — low', units:'α ∈ [0..1]', body:
+    "Minimum EMA α applied to fresh ArUco measurements when fusing with "+
+    "the Kalman state. Used when fix quality is high (trust the filter).\\n\\n"+
+    "Lower values = more Kalman smoothing, less jitter."},
+  meas_blend_max:     {title:'Measurement blend — high', units:'α ∈ [0..1]', body:
+    "Maximum EMA α used when fix quality is low (trust the latest fresh "+
+    "measurement more). The positioner interpolates between min and max "+
+    "based on residual error and ref count."},
+  vel_blend:          {title:'Velocity blend', units:'0..1', body:
+    "Blend between IMU-measured velocity (0) and Kalman-state velocity "+
+    "derivative (1). Raises 0.25 means 25 % Kalman-derived, 75 % raw IMU.\\n\\n"+
+    "Higher = smoother vz/vy plots. Lower = faster reaction to real motion."},
+  max_state_dt:       {title:'Max state Δt', units:'seconds', body:
+    "If more than this amount of time passes between updates, the Kalman "+
+    "state is reset instead of extrapolated. Prevents exploding covariance "+
+    "during long outages (landing, lost camera link)."},
+  kalman_process_var: {title:'Kalman process variance (Q)', body:
+    "How much the state is expected to change between steps. Low Q → the "+
+    "filter believes its model (smooth but sluggish). High Q → the filter "+
+    "expects rapid changes (reacts faster but noisier).\\n\\n"+
+    "Default 1e-3. Try 5e-4 for smooth hover, 5e-3 for dynamic missions."},
+  imu_lowpass_hz:     {title:'IMU low-pass cut-off', units:'Hz', body:
+    "First-order IIR low-pass filter applied to body-frame IMU "+
+    "velocity (vgx, vgy, vgz) at telemetry ingestion on the Pi. Smooths "+
+    "Anafi's noisy per-sample velocity before it reaches the position "+
+    "fusion, the synchronisation buffer, and the arena view.\\n\\n"+
+    "Parameter: cut-off frequency (Hz). Lower = more smoothing.\\n"+
+    "  • 0       → filter disabled (raw values passed through).\\n"+
+    "  • 1–3 Hz  → heavy smoothing, visibly laggy reaction.\\n"+
+    "  • 5 Hz    → default; cuts Anafi's ~15 Hz broadband jitter without\\n"+
+    "               dulling reaction to real motion.\\n"+
+    "  • 10-30 Hz→ minimal smoothing, reacts to faster manoeuvres.\\n\\n"+
+    "Implemented as a time-based alpha = dt / (tau + dt), where "+
+    "tau = 1 / (2π·fc), so uneven telemetry intervals still yield "+
+    "the correct filter response. State is reset when the filter is "+
+    "disabled so re-enabling starts clean."},
+  kalman_meas_var:    {title:'Kalman measurement variance (R)', body:
+    "How noisy the ArUco measurements are. Low R → trust the camera "+
+    "more (snaps to detections). High R → trust the model more (smoother "+
+    "but may lag).\\n\\n"+
+    "Default 1e-1. Large markers at short range can use 1e-2; noisy, "+
+    "distant markers may benefit from 3e-1."},
+
+  // ===== Safety =====
+  axis_locked: {title:'Axis-locked (Manhattan) autonomous flight', body:
+    "When ON, autonomous motion (missions + ArUco LIVE + waypoint nav) "+
+    "is constrained to wall-parallel axes only:\\n\\n"+
+    "  1. Yaw snaps to the nearest 90° multiple (0° / 90° / 180° / 270° "+
+    "in arena frame). The drone aligns to a cardinal heading before "+
+    "moving. Rotations happen in 90° increments only.\\n"+
+    "  2. Only ONE horizontal axis moves at a time: either strafe (LR) "+
+    "or forward/back (FB), whichever has the larger magnitude. The "+
+    "drone never flies diagonally.\\n"+
+    "  3. Vertical (up/down) is unaffected.\\n\\n"+
+    "Manual WASD / Q-E / R-F is unaffected — this constraint applies "+
+    "exclusively to autonomous decisions (observer LIVE + waypoints).\\n\\n"+
+    "Typical use: structured arena navigation where diagonals invite "+
+    "unnecessary marker-tracking jitter. Default OFF."},
+  camera_face_center: {title:'Camera → arena centre', body:
+    "Fleet-wide toggle: when ON, every observer's waypoint face-target "+
+    "defaults to the arena centre (x=0, y=half-depth). During autonomous "+
+    "missions, the drone's camera then aims at the centre of the arena "+
+    "regardless of which direction it's flying — keeping the maximum "+
+    "number of ArUco markers in view at once.\\n\\n"+
+    "Why: the position processor fuses poses from every visible marker. "+
+    "More visible markers = tighter fused arena-frame pose. Pointing the "+
+    "camera at one specific marker (the mission's target) means only a "+
+    "handful of markers are in the FOV at a time; pointing at the centre "+
+    "typically keeps 4-6 markers visible throughout a flight.\\n\\n"+
+    "Missions can still override this on a per-call basis by passing an "+
+    "explicit face target. If OFF, missions that don't set a face leave "+
+    "the camera aligned with the drone's direction of travel.\\n\\n"+
+    "Arena centre defaults to (0, 5.4) for a 20×10.8m arena. The value "+
+    "is adjustable via POST /proxy/config/camera_face_center body "+
+    "{\\\"xy\\\": [x, y]}."},
+  arena_guard_enabled: {title:'Arena guard (manual + auto)', body:
+    "When ON (default), the Pi's own RC tick loop runs a boundary "+
+    "guard on EVERY command — manual WASD, autonomous missions, "+
+    "ArUco LIVE, everything. If the drone is within the safety "+
+    "margin of any arena wall AND the command would push it closer, "+
+    "that axis of the command is clamped to zero.\\n\\n"+
+    "Independent of C2 connection — the guard runs on the flight "+
+    "controller itself using the position processor's arena-frame "+
+    "pose. If the position fix is stale or missing, the guard "+
+    "gracefully falls back (no clamping) and the operator owns the "+
+    "boundary decision.\\n\\n"+
+    "Turn OFF for test/debug flights where you want raw control."},
+  safety_margin_m: {title:'Arena safety margin', units:'metres', body:
+    "Minimum distance the drone will maintain from ANY arena wall "+
+    "during autonomous flight. The boundary guard runs per-tick at "+
+    "20 Hz and overrides any waypoint or PD command that would drive "+
+    "the drone closer to a wall than this margin.\\n\\n"+
+    "Defaults to 1.5 m per ops policy. Adjustable 0.1–5.0 m.\\n\\n"+
+    "The guard uses the latency-aware lookahead (GUARD_LOOKAHEAD_S = "+
+    "0.35 s) so it accounts for momentum — the drone brakes / retreats "+
+    "BEFORE it would cross the margin, not after. Only active during "+
+    "autonomous flight (observer LIVE / waypoint). Manual flight is "+
+    "bounded only by the hard altitude ceiling."},
+  ceiling_m: {title:'Hard altitude ceiling', units:'metres', body:
+    "Maximum altitude above ground. The value is set from this UI, but "+
+    "the enforcement is ENTIRELY on each drone's flight-controller Pi — "+
+    "in its own 20 Hz RC tick loop, using its own height_cm telemetry. "+
+    "Independent of any C2 connection: if this browser or the C2 server "+
+    "crashes mid-flight, the Pi keeps clamping upward RC.\\n\\n"+
+    "Behaviour:\\n"+
+    "  • approaching (within 50 cm): climb RC clamped proportionally to "+
+    "remaining clearance.\\n"+
+    "  • at ceiling: all climb blocked.\\n"+
+    "  • above ceiling (+20 cm): forced active descent regardless of any "+
+    "input — manual WASD or autonomous mission, no difference.\\n\\n"+
+    "Persistence: the Pi writes the chosen value to flight_config.json "+
+    "and reloads it on restart, so power-cycling the Pi still leaves "+
+    "your last-set ceiling active. The firmware MaxAltitude is also "+
+    "pushed to the Anafi as a second-line guard on every connect.\\n\\n"+
+    "Default 5 m."},
+};
+
+window.showParamInfo = function(key, ev) {
+  if (ev) { ev.stopPropagation(); ev.preventDefault(); }
+  const info = window.PARAM_INFO[key];
+  const m = document.getElementById('param_info_modal');
+  if (!m) return;
+  if (!info) {
+    // Still show the modal with a graceful note — useful while adding new params.
+    document.getElementById('pim_title').textContent = key;
+    document.getElementById('pim_key').textContent   = key;
+    document.getElementById('pim_body').textContent  = 'No description registered for this parameter yet.';
+    document.getElementById('pim_range').textContent = '';
+  } else {
+    document.getElementById('pim_title').textContent = info.title || key;
+    document.getElementById('pim_key').textContent   = key;
+    document.getElementById('pim_body').textContent  = info.body || '';
+    document.getElementById('pim_range').textContent = info.units ? ('Units: ' + info.units) : '';
+  }
+  m.style.display = 'flex';
+};
+
+// Event delegation — any element with class .info-icon and data-info="<key>"
+// opens the modal. Works for icons injected later (observer PD rows) too.
+document.addEventListener('click', function(ev){
+  const el = ev.target.closest && ev.target.closest('.info-icon');
+  if (!el) return;
+  const key = el.dataset.info || el.getAttribute('data-info');
+  if (!key) return;
+  window.showParamInfo(key, ev);
+});
+
+// ── Light / dark theme toggle ──────────────────────────────────────
+// Persists via localStorage. Default = dark (matches the original UI).
+// The data-theme attribute drives the CSS overrides at the top of the
+// <style> block. Using !important there lets the light theme defeat
+// the many hard-coded inline style="" colours without rewriting every
+// DOM element.
+(function wireThemeToggle(){
+  const KEY = 'sdc_theme';
+  const btn = document.getElementById('theme_toggle');
+  function applyTheme(t) {
+    document.documentElement.setAttribute('data-theme', t);
+    if (btn) btn.innerHTML = (t === 'light') ? '\\u2600\\ufe0f Light' : '\\ud83c\\udf19 Dark';
+  }
+  const saved = (function(){ try { return localStorage.getItem(KEY) || 'dark'; } catch { return 'dark'; } })();
+  applyTheme(saved === 'light' ? 'light' : 'dark');
+  if (btn) btn.addEventListener('click', () => {
+    const cur = document.documentElement.getAttribute('data-theme') || 'dark';
+    const next = cur === 'dark' ? 'light' : 'dark';
+    try { localStorage.setItem(KEY, next); } catch {}
+    applyTheme(next);
+  });
 })();
 
 document.getElementById('pos_enabled').onchange = async function() {
@@ -3655,12 +6849,504 @@ let ARENA_W_dyn = 20, ARENA_D_dyn = 10;
   }
 })(); */
 </script>
+
+<!-- ── Optional 3D arena view via Three.js ─────────────────────────── -->
+<script type=\"module\">
+  import * as THREE from 'three';
+  import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+
+  let scene, camera, renderer, controls, droneMeshes = {}, markerMeshes = {}, rafId = 0;
+  const ARENA_W = 20.0, ARENA_D = 10.8, ARENA_H = 6.0;
+  const ARENA_OX = -10.0, ARENA_OY = 0.0;
+
+  function init3D(container) {
+    scene = new THREE.Scene();
+    scene.background = new THREE.Color(0x0b1220);
+
+    camera = new THREE.PerspectiveCamera(50, container.clientWidth / container.clientHeight, 0.1, 200);
+    camera.position.set(15, 12, 15);
+
+    renderer = new THREE.WebGLRenderer({antialias: true});
+    renderer.setSize(container.clientWidth, container.clientHeight);
+    container.appendChild(renderer.domElement);
+
+    controls = new OrbitControls(camera, renderer.domElement);
+    controls.target.set(0, 1.5, 5.4);
+    controls.update();
+
+    // Lighting
+    const ambient = new THREE.AmbientLight(0xffffff, 0.45);
+    scene.add(ambient);
+    const dir = new THREE.DirectionalLight(0xffffff, 0.9);
+    dir.position.set(5, 12, 8);
+    scene.add(dir);
+
+    // Arena floor — 1 m grid (matches the 2D overlay)
+    const grid = new THREE.GridHelper(20, 20, 0x475569, 0x1e3a5f);
+    grid.position.set(0, 0, ARENA_D / 2);
+    scene.add(grid);
+    // Depth-direction grid (10.8 m, we round to 11 cells)
+    const grid2 = new THREE.GridHelper(12, 12, 0x475569, 0x1e3a5f);
+    grid2.rotation.x = Math.PI / 2;
+    grid2.position.set(0, 3, 0);
+    grid2.material.opacity = 0.0;
+    // keep subtle — 1 grid is enough; the floor grid is what matters
+
+    // Arena box (wireframe)
+    const boxGeom = new THREE.BoxGeometry(ARENA_W, ARENA_H, ARENA_D);
+    const boxMat = new THREE.LineBasicMaterial({color: 0x3b82f6, transparent: true, opacity: 0.4});
+    const box = new THREE.LineSegments(new THREE.EdgesGeometry(boxGeom), boxMat);
+    box.position.set(0, ARENA_H / 2, ARENA_D / 2);
+    scene.add(box);
+
+    // Arena origin marker (green corner cube)
+    const originGeom = new THREE.BoxGeometry(0.3, 0.3, 0.3);
+    const origin = new THREE.Mesh(originGeom, new THREE.MeshStandardMaterial({color: 0x10b981}));
+    origin.position.set(0, 0.15, 0);
+    scene.add(origin);
+
+    // Helper — build a floating canvas-sprite label with a given text.
+    // Canvas resolution is fixed; sprite.scale controls world size.
+    function _makeLabelSprite(text, bgRGBA, fgRGB, fontPx) {
+      const canvas = document.createElement('canvas');
+      canvas.width = 128; canvas.height = 56;
+      const c = canvas.getContext('2d');
+      c.fillStyle = bgRGBA;
+      // Rounded rect for a nicer badge look
+      const r = 8;
+      c.beginPath();
+      c.moveTo(r, 0);
+      c.lineTo(canvas.width - r, 0);
+      c.quadraticCurveTo(canvas.width, 0, canvas.width, r);
+      c.lineTo(canvas.width, canvas.height - r);
+      c.quadraticCurveTo(canvas.width, canvas.height, canvas.width - r, canvas.height);
+      c.lineTo(r, canvas.height);
+      c.quadraticCurveTo(0, canvas.height, 0, canvas.height - r);
+      c.lineTo(0, r);
+      c.quadraticCurveTo(0, 0, r, 0);
+      c.closePath();
+      c.fill();
+      c.fillStyle = fgRGB;
+      c.font = 'bold ' + (fontPx || 32) + 'px monospace';
+      c.textAlign = 'center';
+      c.textBaseline = 'middle';
+      c.fillText(String(text), canvas.width / 2, canvas.height / 2 + 2);
+      const tex = new THREE.CanvasTexture(canvas);
+      tex.minFilter = THREE.LinearFilter;
+      const sprite = new THREE.Sprite(new THREE.SpriteMaterial({map: tex, transparent: true, depthTest: false}));
+      sprite.renderOrder = 100;   // float on top of everything
+      return sprite;
+    }
+
+    // Fetch + plot arena markers (from the arena_config we already fetched).
+    // Each marker gets a coloured face cube AND a floating ID label so the
+    // 3D scene is immediately readable without hovering / guessing.
+    if (window.arenaMarkers && Object.keys(window.arenaMarkers).length) {
+      for (const [id, m] of Object.entries(window.arenaMarkers)) {
+        if (!m.pos) continue;
+        const g = new THREE.BoxGeometry(0.5, 0.5, 0.05);
+        const col = (m.wall === 'front') ? 0x6366f1
+                 : (m.wall === 'back')  ? 0xa855f7
+                 : (m.wall === 'left')  ? 0x06b6d4
+                 : (m.wall === 'right') ? 0x10b981 : 0x94a3b8;
+        // Wrap in a group so we can carry a label sprite alongside the cube.
+        const grp = new THREE.Group();
+        const mesh = new THREE.Mesh(g, new THREE.MeshStandardMaterial({color: col}));
+        grp.add(mesh);
+        const label = _makeLabelSprite(id, 'rgba(15,23,42,0.85)', '#e2e8f0', 34);
+        label.scale.set(0.55, 0.24, 1);     // world units — ~55 cm wide
+        label.position.set(0, 0.4, 0);      // above the cube
+        grp.add(label);
+        grp.position.set(m.pos[0], m.pos[2] || 2, m.pos[1]);
+        scene.add(grp);
+        // Keep the Mesh in markerMeshes (updateVisibleMarkers mutates the
+        // material on the cube, not the group).
+        mesh.userData._label = label;       // so updateVisibleMarkers can tint
+        mesh.userData._group = grp;
+        markerMeshes[id] = mesh;
+      }
+    }
+
+    window.addEventListener('resize', () => {
+      if (!renderer) return;
+      const w = container.clientWidth, h = container.clientHeight;
+      camera.aspect = w / h;
+      camera.updateProjectionMatrix();
+      renderer.setSize(w, h);
+    });
+
+    // Render the initial set of target boxes as soon as the scene opens
+    syncTargetBoxes();
+
+    function loop() {
+      controls.update();
+      renderer.render(scene, camera);
+      rafId = requestAnimationFrame(loop);
+    }
+    loop();
+  }
+
+  // ── Target-box 3D rendering ────────────────────────────────────
+  // Kept separately so we can call it both at scene-init AND every
+  // time the textarea / mission status updates the list.
+  const targetBoxMeshes = {};   // index → THREE.Mesh
+  function syncTargetBoxes() {
+    if (!scene) return;
+    const boxes = window._targetBoxes || [];
+    const claimed = window._missionClaimedBoxes || {};
+    const captured = new Set(window._missionCapturedBoxes || []);
+    const seen = new Set();
+    boxes.forEach((b, i) => {
+      if (!b || b.x == null || b.y == null) return;
+      const idx = (typeof b.idx === 'number') ? b.idx : i;
+      seen.add(idx);
+      const isCap = captured.has(idx);
+      const isClaimed = Object.values(claimed).includes(idx);
+      const team = (b.home_team || '').toLowerCase();
+      const col = isCap     ? 0x22c55e
+                : isClaimed ? 0xfacc15
+                : team === 'red'  ? 0xef4444
+                : team === 'blue' ? 0x3b82f6
+                                  : 0x94a3b8;
+      let mesh = targetBoxMeshes[idx];
+      if (!mesh) {
+        const group = new THREE.Group();
+        // SDC box dimensions (rules §1.2): 57.5×37.5×55 cm closed,
+        // up to 73 cm when open. We render 0.575×0.55×0.375 as an
+        // approximation sitting on the floor.
+        const body = new THREE.Mesh(
+          new THREE.BoxGeometry(0.575, 0.55, 0.375),
+          new THREE.MeshStandardMaterial({color: col, transparent:true, opacity:0.85}));
+        body.position.y = 0.275;
+        group.add(body);
+        const ring = new THREE.Mesh(
+          new THREE.TorusGeometry(0.42, 0.04, 8, 24),
+          new THREE.MeshStandardMaterial({color: col, transparent:true, opacity:0.55}));
+        ring.rotation.x = Math.PI / 2;
+        ring.position.y = 0.02;
+        group.add(ring);
+        // Label
+        const canvas = document.createElement('canvas');
+        canvas.width = 128; canvas.height = 36;
+        const c = canvas.getContext('2d');
+        c.fillStyle = 'rgba(0,0,0,0.7)'; c.fillRect(0,0,128,36);
+        c.fillStyle = '#fff'; c.font = 'bold 20px monospace';
+        c.fillText('BOX ' + (b.id ?? idx+1), 6, 25);
+        const tex = new THREE.CanvasTexture(canvas);
+        const sprite = new THREE.Sprite(
+          new THREE.SpriteMaterial({map: tex, transparent: true}));
+        sprite.scale.set(1.1, 0.32, 1);
+        sprite.position.set(0, 0.95, 0);
+        group.add(sprite);
+        group.userData.body = body;
+        group.userData.ring = ring;
+        scene.add(group);
+        targetBoxMeshes[idx] = group;
+        mesh = group;
+      }
+      // Update position + colour every frame in case they moved or state changed
+      mesh.position.set(Number(b.x), 0, Number(b.y));
+      if (mesh.userData.body) {
+        mesh.userData.body.material.color.setHex(col);
+        mesh.userData.body.material.opacity = isCap ? 0.55 : 0.85;
+      }
+      if (mesh.userData.ring) {
+        mesh.userData.ring.material.color.setHex(col);
+      }
+    });
+    // Remove meshes for boxes no longer in the list
+    for (const idx of Object.keys(targetBoxMeshes)) {
+      if (!seen.has(Number(idx))) {
+        scene.remove(targetBoxMeshes[idx]);
+        delete targetBoxMeshes[idx];
+      }
+    }
+  }
+
+  function updateDrones(observers) {
+    if (!scene) return;
+    const DRONE_COLORS = [0xf97316, 0x38bdf8, 0xa78bfa, 0xf472b6, 0xfbbf24];
+    let idx = 0;
+    const seen = new Set();
+    for (const [did, st] of Object.entries(observers || {})) {
+      seen.add(did);
+      const p = st && (st.pos || st.cam);
+      if (!p || p.length < 2) { idx++; continue; }
+      let mesh = droneMeshes[did];
+      if (!mesh) {
+        const col = DRONE_COLORS[idx % DRONE_COLORS.length];
+        // Drone = small sphere with a forward nose-cone
+        const group = new THREE.Group();
+        const body = new THREE.Mesh(
+          new THREE.SphereGeometry(0.18, 16, 12),
+          new THREE.MeshStandardMaterial({color: col}));
+        group.add(body);
+        const nose = new THREE.Mesh(
+          new THREE.ConeGeometry(0.08, 0.3, 8),
+          new THREE.MeshStandardMaterial({color: 0xffffff}));
+        nose.rotation.x = Math.PI / 2;
+        nose.position.set(0, 0, 0.2);
+        group.add(nose);
+        // Label (using a sprite)
+        const canvas = document.createElement('canvas');
+        canvas.width = 128; canvas.height = 32;
+        const c = canvas.getContext('2d');
+        c.fillStyle = 'rgba(0,0,0,0.7)'; c.fillRect(0,0,128,32);
+        c.fillStyle = '#fff'; c.font = 'bold 18px monospace';
+        c.fillText(did, 8, 22);
+        const tex = new THREE.CanvasTexture(canvas);
+        const sprite = new THREE.Sprite(new THREE.SpriteMaterial({map: tex, transparent: true}));
+        sprite.scale.set(0.9, 0.22, 1);
+        sprite.position.set(0, 0.4, 0);
+        group.add(sprite);
+        scene.add(group);
+        mesh = group;
+        droneMeshes[did] = mesh;
+      }
+      // Map ArUco-arena coords → Three.js world coords:
+      //   ArUco  x = arena horizontal  →  Three.js X
+      //   ArUco  y = arena depth       →  Three.js Z (forward)
+      //   ArUco  z = altitude          →  Three.js Y (up)
+      // Use a typeof check instead of `||` so a legit z=0 reading isn't
+      // silently replaced by the 1.5 m fallback (which was hiding grounded
+      // or pre-takeoff drones on the cover of the arena).
+      const ax = Number(p[0]) || 0;
+      const ay = Number(p[1]) || 0;
+      const az = (typeof p[2] === 'number' && isFinite(p[2]))
+                   ? p[2]
+                   : (Number(st.altitude_m) || 1.5);
+      mesh.position.set(ax, Math.max(0, az), ay);
+      // Heading: prefer the ArUco-derived direction vector (dx,dy) in the
+      // arena frame because it matches the pose we just plotted. Fall back
+      // to the compass yaw from drone telemetry if the positioner is stale.
+      if (Array.isArray(st.dir) && st.dir.length >= 2 &&
+          (st.dir[0]*st.dir[0] + st.dir[1]*st.dir[1]) > 1e-6) {
+        const hdg = Math.atan2(st.dir[0], st.dir[1]);   // rad from +Y axis
+        mesh.rotation.y = -hdg;
+      } else if (typeof st.yaw === 'number') {
+        mesh.rotation.y = -st.yaw * Math.PI / 180;
+      }
+      // Flash opacity if the pose is stale so operators see the drone is
+      // running on IMU dead-reckoning rather than live vision.
+      const staleAlpha = (st.pos_stale === true) ? 0.55 : 1.0;
+      mesh.traverse(o => {
+        if (o.material && 'opacity' in o.material) {
+          o.material.transparent = staleAlpha < 1.0;
+          o.material.opacity = staleAlpha;
+        }
+      });
+      idx++;
+    }
+    // Remove meshes for drones that disappeared
+    for (const did of Object.keys(droneMeshes)) {
+      if (!seen.has(did)) {
+        scene.remove(droneMeshes[did]);
+        delete droneMeshes[did];
+      }
+    }
+  }
+
+  function teardown3D() {
+    if (rafId) { cancelAnimationFrame(rafId); rafId = 0; }
+    if (renderer) {
+      renderer.dispose();
+      if (renderer.domElement && renderer.domElement.parentNode) {
+        renderer.domElement.parentNode.removeChild(renderer.domElement);
+      }
+      renderer = null;
+    }
+    scene = null; camera = null; controls = null;
+    droneMeshes = {}; markerMeshes = {};
+    // Remove the HUD overlay DIV so it doesn't show stale coordinates
+    // when the 3D view gets re-enabled later.
+    if (_hudEl && _hudEl.parentNode) {
+      _hudEl.parentNode.removeChild(_hudEl);
+    }
+    _hudEl = null;
+  }
+
+  // ── Visible-marker highlight for the 3D arena ─────────────────────
+  // Mirrors the 2D halo/white-border on seen markers. We cache each
+  // marker's base colour + emissive on first create and mutate only
+  // on state changes — cheaper than rebuilding materials per frame.
+  function updateVisibleMarkers(seenIds, refIds) {
+    if (!scene) return;
+    const seen = new Set((seenIds || []).map(String));
+    const refs = new Set((refIds  || []).map(String));
+    for (const [id, mesh] of Object.entries(markerMeshes)) {
+      if (!mesh || !mesh.material) continue;
+      if (mesh.userData._baseColor == null) {
+        // Cache originals the first time we touch this mesh.
+        mesh.userData._baseColor    = mesh.material.color.getHex();
+        mesh.userData._baseEmissive = mesh.material.emissive
+                                        ? mesh.material.emissive.getHex() : 0;
+        mesh.userData._baseScale    = mesh.scale.x;
+      }
+      const isSeen = seen.has(String(id));
+      const isRef  = refs.has(String(id));
+      const lbl = mesh.userData._label;
+      if (isSeen) {
+        // Bright yellow (or green if actually used for pose fusion).
+        const highlightColor = isRef ? 0x22c55e : 0xfbbf24;
+        mesh.material.color.setHex(highlightColor);
+        if (mesh.material.emissive) {
+          mesh.material.emissive.setHex(highlightColor);
+          mesh.material.emissiveIntensity = 0.6;
+        }
+        mesh.scale.setScalar(mesh.userData._baseScale * 1.35);
+        if (lbl) lbl.scale.set(0.75, 0.32, 1);  // grow label too
+      } else {
+        mesh.material.color.setHex(mesh.userData._baseColor);
+        if (mesh.material.emissive) {
+          mesh.material.emissive.setHex(mesh.userData._baseEmissive);
+          mesh.material.emissiveIntensity = 0;
+        }
+        mesh.scale.setScalar(mesh.userData._baseScale);
+        if (lbl) lbl.scale.set(0.55, 0.24, 1);
+      }
+    }
+  }
+
+  // ── Drone position HUD — floating DIV above the 3D container ──────
+  // Three.js scenes lack an obvious "show me the active drone's xyz"
+  // readout. Add a small top-left overlay that shows per-drone
+  // coordinates; falls out of the container's bottom if there are many
+  // drones, which is fine for up to ~5.
+  let _hudEl = null;
+  function _ensureHUD() {
+    if (_hudEl) return _hudEl;
+    const wrap = document.getElementById('arena3d_wrap');
+    if (!wrap) return null;
+    _hudEl = document.createElement('div');
+    _hudEl.id = 'arena3d_hud';
+    _hudEl.style.cssText = [
+      'position:absolute', 'top:6px', 'left:6px', 'z-index:10',
+      'padding:4px 8px',
+      'background:rgba(15,23,42,0.8)',
+      'color:#e2e8f0', 'font-family:monospace', 'font-size:11px',
+      'line-height:1.4', 'border:1px solid #334155', 'border-radius:4px',
+      'pointer-events:none', 'max-width:240px',
+    ].join(';') + ';';
+    wrap.appendChild(_hudEl);
+    return _hudEl;
+  }
+  function updateDronePositionHUD(observers) {
+    const el = _ensureHUD();
+    if (!el) return;
+    const lines = [];
+    const DRONE_COLORS = ['#f97316', '#38bdf8', '#a78bfa', '#f472b6', '#fbbf24'];
+    let idx = 0;
+    for (const [did, st] of Object.entries(observers || {})) {
+      const p = st && (st.pos || st.cam);
+      const col = DRONE_COLORS[idx % DRONE_COLORS.length];
+      idx++;
+      if (!Array.isArray(p) || p.length < 2) {
+        lines.push('<span style="color:#64748b;">drone ' + did + ': no fix</span>');
+        continue;
+      }
+      const x = Number(p[0]).toFixed(2);
+      const y = Number(p[1]).toFixed(2);
+      const z = (typeof p[2] === 'number' && isFinite(p[2])) ? Number(p[2]).toFixed(2) : '–';
+      const stale = st.pos_stale ? ' <span style="color:#fbbf24;">stale</span>' : '';
+      lines.push(
+        '<span style="color:' + col + ';font-weight:700;">drone ' + did + '</span> ' +
+        '<span style="color:#38bdf8;">x=' + x + '</span> ' +
+        '<span style="color:#4ade80;">y=' + y + '</span> ' +
+        '<span style="color:#fb923c;">z=' + z + '</span>' + stale
+      );
+    }
+    if (!lines.length) lines.push('<span style="color:#64748b;">no drones</span>');
+    el.innerHTML = lines.join('<br/>');
+  }
+
+  // ── Safety-margin box in the 3D arena ─────────────────────────────
+  // A translucent red wireframe cuboid indicating the Pi-side arena
+  // guard boundary. Created lazily the first time updateSafetyMargin
+  // is called; subsequent calls just rescale it.
+  let safetyBoxMesh = null;
+  function updateSafetyMargin(marginM, engaged) {
+    if (!scene) return;
+    if (marginM == null || marginM <= 0) {
+      if (safetyBoxMesh) { scene.remove(safetyBoxMesh); safetyBoxMesh = null; }
+      return;
+    }
+    // Dimensions: arena minus 2×margin on each horizontal axis; height
+    // matches the ceiling (MAX_ALTITUDE_M comes from the safety bar).
+    const w = Math.max(0.2, ARENA_W - 2 * marginM);
+    const d = Math.max(0.2, ARENA_D - 2 * marginM);
+    const ceilM = (window._arenaSafety && window._arenaSafety.ceiling_m)
+                    || parseFloat((document.getElementById('ceiling_input') || {}).value)
+                    || 5.0;
+    const h = Math.max(0.5, ceilM);
+    if (!safetyBoxMesh) {
+      const geom = new THREE.BoxGeometry(w, h, d);
+      const edges = new THREE.EdgesGeometry(geom);
+      const mat = new THREE.LineBasicMaterial({
+        color: 0xef4444, transparent: true, opacity: 0.35,
+      });
+      safetyBoxMesh = new THREE.LineSegments(edges, mat);
+      scene.add(safetyBoxMesh);
+    } else {
+      // Rebuild geometry on dimension change — simpler than scaling.
+      safetyBoxMesh.geometry.dispose();
+      const geom = new THREE.BoxGeometry(w, h, d);
+      safetyBoxMesh.geometry = new THREE.EdgesGeometry(geom);
+    }
+    // Centre of arena: x=0, depth=arena_depth/2, y=height/2.
+    safetyBoxMesh.position.set(0, h / 2, ARENA_D / 2);
+    // Brighter + thicker line when guard is actively clamping.
+    if (safetyBoxMesh.material) {
+      safetyBoxMesh.material.opacity = engaged ? 0.85 : 0.35;
+      safetyBoxMesh.material.color.setHex(engaged ? 0xfca5a5 : 0xef4444);
+    }
+  }
+
+  // Expose for fleetPoll()
+  window._arena3d = {updateDrones, syncTargetBoxes, updateVisibleMarkers,
+                     updateDronePositionHUD, updateSafetyMargin};
+
+  // Toggle wiring — 3D view is shown BY DEFAULT below the 2D canvas.
+  // The 2D canvas stays visible the whole time so operators have the
+  // top-down reference; unchecking simply tears down the 3D scene.
+  const cb = document.getElementById('arena_show_3d');
+  const wrap = document.getElementById('arena3d_wrap');
+  const container = document.getElementById('arena3d_container');
+  function apply3DState() {
+    if (cb.checked) {
+      wrap.style.display = '';
+      if (!scene) {
+        try { init3D(container); }
+        catch (e) { console.error('[3D] init failed:', e); cb.checked = false; wrap.style.display = 'none'; }
+      }
+    } else {
+      wrap.style.display = 'none';
+      teardown3D();
+    }
+  }
+  if (cb && wrap && container) {
+    cb.addEventListener('change', apply3DState);
+    // Start in the default state — 3D active alongside the 2D canvas.
+    // Defer a tick so the container has layout dimensions before THREE initialises.
+    setTimeout(apply3DState, 0);
+  }
+</script>
 </body>
 </html>
 """
 
 
 def log_command(event: str, payload: dict | None = None):
+    # Always feed the per-flight logger — that path runs regardless of the
+    # optional debug command log file. When no drones are airborne the
+    # call is a cheap no-op.
+    try:
+        did = None
+        if payload is not None:
+            did = payload.get("id") or payload.get("drone_id")
+        flight_logger.record_command(did, event, payload)
+    except Exception:
+        pass
+
     if not command_log_enabled:
         return
     try:
@@ -3692,17 +7378,91 @@ def log_command(event: str, payload: dict | None = None):
         pass
 
 
+# ── Diagnostic ring — track recent slow Pi calls so we can see the
+# "second takeoff takes 10 s" pattern as real data instead of guessing.
+# Any call over 500 ms gets appended. /proxy/diagnostics returns it.
+_slow_calls_lock = threading.Lock()
+_slow_calls: list = []
+_SLOW_CALL_THRESHOLD_S = 0.5
+
+
+def _record_pi_call(method: str, path: str, dt_s: float, status: int | None,
+                     err: str | None = None):
+    if dt_s < _SLOW_CALL_THRESHOLD_S and err is None:
+        return
+    rec = {
+        "ts":       time.time(),
+        "method":   method,
+        "path":     path,
+        "dt_ms":    int(dt_s * 1000),
+        "status":   status,
+        "error":    err,
+        "drone_id": active_drone_id,
+    }
+    with _slow_calls_lock:
+        _slow_calls.append(rec)
+        # Keep only last 200 entries — more than enough for debugging.
+        if len(_slow_calls) > 200:
+            del _slow_calls[:len(_slow_calls) - 200]
+    # Always print slow calls so the operator sees them live without
+    # having to pull /proxy/diagnostics.
+    print(f"[PI SLOW] {method} {path} {dt_s:.2f}s "
+          f"status={status} err={err or '-'}")
+
+
 def pi_post(path: str, body: dict | None = None, timeout: float | None = None):
-    return _http_session.post(f"{PI_BASE}{path}", json=body or {}, timeout=TIMEOUT_CMD if timeout is None else timeout)
+    t0 = time.time()
+    status = None
+    err = None
+    try:
+        r = _http_session.post(f"{PI_BASE}{path}", json=body or {},
+                               timeout=TIMEOUT_CMD if timeout is None else timeout)
+        status = r.status_code
+        return r
+    except Exception as e:
+        err = f"{type(e).__name__}: {e}"
+        raise
+    finally:
+        _record_pi_call("POST", path, time.time() - t0, status, err)
 
 
 def pi_get(path: str, timeout: float | None = None):
-    return _http_session.get(f"{PI_BASE}{path}", timeout=TIMEOUT_CMD if timeout is None else timeout)
+    t0 = time.time()
+    status = None
+    err = None
+    try:
+        r = _http_session.get(f"{PI_BASE}{path}", timeout=TIMEOUT_CMD if timeout is None else timeout)
+        status = r.status_code
+        return r
+    except Exception as e:
+        err = f"{type(e).__name__}: {e}"
+        raise
+    finally:
+        _record_pi_call("GET", path, time.time() - t0, status, err)
 
 
 @app.get("/")
 def index():
     return Response(HTML, mimetype="text/html")
+
+
+@app.get("/logo.png")
+def serve_logo():
+    """Serve the team logo for the header of the UI.
+
+    Prefers the alpha-masked variant (team_logo_transparent.png) so the
+    logo blends with the page's dark background rather than showing a
+    white rectangle. Falls back to the original PNG if the masked file
+    isn't present.
+    """
+    from pathlib import Path as _P
+    base = _P(__file__).resolve().parent.parent / "1_Doc"
+    for name in ("team_logo_transparent.png", "team_logo.png"):
+        p = base / name
+        if p.exists():
+            return send_file(str(p), mimetype="image/png",
+                             max_age=86400)   # cache-1-day
+    return jsonify(ok=False, error="logo not found"), 404
 
 
 @app.get("/proxy/drones")
@@ -3757,49 +7517,195 @@ def proxy_drones_config_save():
     return jsonify(ok=True, drones=DRONES)
 
 
+# ── Per-subsystem transport preference ────────────────────────────────
+# Three values accepted:
+#   "auto" — prefer WS, fall back to HTTP when WS is down
+#   "ws"   — force WS; if WS is down, endpoint returns 503 immediately
+#            (no HTTP fallback at all — useful to diagnose whether WS
+#            itself is slow)
+#   "http" — force HTTP; never use the WS path (useful to confirm WS
+#            isn't the source of latency without restarting the server)
+#
+# Initial values come from env for backward-compat (C2_WS_RC=0 still
+# disables WS RC at boot), then overridden at runtime via
+# /proxy/config/transport.
+_transport_lock = threading.Lock()
+_transport = {
+    "rc":        "http" if os.getenv("C2_WS_RC", "1") in {"0", "false", "False"} else "auto",
+    "telemetry": "auto",
+    "position":  "auto",
+}
+
+
+def _transport_mode(subsystem: str) -> str:
+    with _transport_lock:
+        return _transport.get(subsystem, "auto")
+
+
+def _ws_enabled_for(subsystem: str) -> bool:
+    """Should we attempt the WS path for this subsystem?"""
+    return _transport_mode(subsystem) in ("auto", "ws")
+
+
+def _http_fallback_allowed_for(subsystem: str) -> bool:
+    """Should we fall back to HTTP if WS fails?"""
+    return _transport_mode(subsystem) in ("auto", "http")
+
+
+# Legacy alias — still read by a couple of old log messages. Keeps
+# existing behaviour if anyone ships a patch that checks this directly.
+WS_RC_ENABLED = _ws_enabled_for("rc")
+
+
+def _active_drone_reachable() -> bool:
+    """Cheap check — is the active drone's WS up on any channel? When
+    everything is down we can skip slow HTTP fallbacks to avoid blocking
+    the Flask request for the full TIMEOUT_CMD (2 s) per keypress."""
+    ws = drone_ws.get(str(active_drone_id))
+    if ws is None:
+        return True   # assume reachable if no WS client (tello, HTTP-only)
+    return (ws._ws_connected.get("rc")
+            or ws._ws_connected.get("telemetry")
+            or ws._ws_connected.get("position"))
+
+
 @app.post("/proxy/key_down")
 def proxy_key_down():
     data = request.get_json(silent=True) or {}
     log_command("key_down", data)
-    r = pi_post("/api/key_down", data)
-    return (r.text, r.status_code, {"Content-Type": r.headers.get("Content-Type", "application/json")})
+    mode = _transport_mode("rc")
+    if mode in ("auto", "ws"):
+        k = str(data.get("key", ""))
+        ws = drone_ws.get(str(active_drone_id))
+        if ws and ws.send_key(k, "down"):
+            return jsonify(ok=True, via="ws")
+        if mode == "ws":
+            return jsonify(ok=False, error="ws forced but not connected",
+                           via="ws"), 503
+    # HTTP path — tight TIMEOUT_FAST so an unreachable drone fails fast
+    # (was TIMEOUT_CMD=8s, which made every key burn 8s when the Pi
+    # didn't answer — the real cause of "HTTP controls don't work").
+    # No more _active_drone_reachable() gate: HTTP shouldn't be vetoed
+    # by WS status. If HTTP itself is broken the timeout tells us.
+    try:
+        r = pi_post("/api/key_down", data, timeout=TIMEOUT_FAST)
+        return (r.text, r.status_code,
+                {"Content-Type": r.headers.get("Content-Type", "application/json")})
+    except Exception as e:
+        return jsonify(ok=False, error=f"http: {e}", via="http"), 502
 
 
 @app.post("/proxy/key_up")
 def proxy_key_up():
     data = request.get_json(silent=True) or {}
     log_command("key_up", data)
-    r = pi_post("/api/key_up", data)
-    return (r.text, r.status_code, {"Content-Type": r.headers.get("Content-Type", "application/json")})
+    mode = _transport_mode("rc")
+    if mode in ("auto", "ws"):
+        k = str(data.get("key", ""))
+        ws = drone_ws.get(str(active_drone_id))
+        if ws and ws.send_key(k, "up"):
+            return jsonify(ok=True, via="ws")
+        if mode == "ws":
+            return jsonify(ok=False, error="ws forced but not connected",
+                           via="ws"), 503
+    try:
+        r = pi_post("/api/key_up", data, timeout=TIMEOUT_FAST)
+        return (r.text, r.status_code,
+                {"Content-Type": r.headers.get("Content-Type", "application/json")})
+    except Exception as e:
+        return jsonify(ok=False, error=f"http: {e}", via="http"), 502
 
 
 @app.post("/proxy/key_batch")
 def proxy_key_batch():
-    """Batch key_down for all currently held keys in a single HTTP request."""
+    """Batch key_down for all currently held keys in a single request.
+
+    Fires at ~10 Hz from the browser — it's the keep-alive that stops
+    the Pi's KEY_STALE_S=1 timer from dropping keys mid-flight. Historic
+    path did N serial HTTP POSTs per batch which is the real WASD
+    latency culprit (3 held keys × 10 Hz × slow HTTP = backed-up fetch
+    queue).
+
+    New path: one WS send per held key on the persistent socket. With
+    fire-and-forget semantics, the whole batch clears in microseconds.
+    Fallback to HTTP on WS disconnect."""
     data = request.get_json(silent=True) or {}
     keys = data.get("keys", [])
-    last_r = None
-    for k in keys:
-        payload = {"key": k}
-        log_command("key_down", payload)
-        last_r = pi_post("/api/key_down", payload)
-    if last_r is not None:
-        return (last_r.text, last_r.status_code, {"Content-Type": last_r.headers.get("Content-Type", "application/json")})
-    return jsonify(ok=True)
+    if not keys:
+        return jsonify(ok=True)
+    # Dedup so the log and the wire don't carry redundant presses
+    uniq = list(dict.fromkeys(keys))
+
+    mode = _transport_mode("rc")
+    if mode in ("auto", "ws"):
+        ws = drone_ws.get(str(active_drone_id))
+        if ws:
+            all_sent = True
+            for k in uniq:
+                if not ws.send_key(str(k), "down"):
+                    all_sent = False
+                    break
+            if all_sent:
+                log_command("key_batch", {"keys": uniq, "via": "ws"})
+                return jsonify(ok=True, via="ws", n=len(uniq))
+        if mode == "ws":
+            return jsonify(ok=False, error="ws forced but not connected",
+                           via="ws"), 503
+
+    log_command("key_batch", {"keys": uniq, "via": "http"})
+    # SINGLE HTTP POST to the Pi's batch endpoint — was N serial
+    # per-key calls previously, which saturated the browser's
+    # 6-connection pool whenever WS fell back to HTTP.
+    try:
+        r = pi_post("/api/key_batch", {"keys": uniq}, timeout=TIMEOUT_FAST)
+        return (r.text, r.status_code,
+                {"Content-Type": r.headers.get("Content-Type", "application/json")})
+    except Exception as e:
+        return jsonify(ok=False, error=f"http: {e}", via="http"), 502
 
 
 @app.post("/proxy/takeoff")
 def proxy_takeoff():
+    """Relay takeoff to the active drone's Pi.
+
+    Uses TIMEOUT_SLOW (default 15s) not the default TIMEOUT_CMD (8s)
+    because Anafi takeoff routinely takes 3-5 seconds for the armament
+    sensors + motor spin-up before /api/takeoff returns success. The
+    earlier 2s default truncated this and led to "network error
+    contacting drone: TypeError: Failed to fetch" on every attempt.
+    Also wraps the call in try/except so a slow drone returns clean
+    JSON to the UI instead of a Flask stack-trace HTML page.
+    """
     log_command("takeoff")
-    r = pi_post("/api/takeoff")
-    return (r.text, r.status_code, {"Content-Type": r.headers.get("Content-Type", "application/json")})
+    try:
+        r = pi_post("/api/takeoff", timeout=TIMEOUT_SLOW)
+    except Exception as e:
+        import requests as _rq
+        if isinstance(e, _rq.exceptions.ReadTimeout):
+            return jsonify(ok=False,
+                           error=f"takeoff timed out after {TIMEOUT_SLOW}s — "
+                                 f"drone may still be arming; check telemetry"), 504
+        return jsonify(ok=False, error=f"network error: {e}"), 502
+    return (r.text, r.status_code,
+            {"Content-Type": r.headers.get("Content-Type", "application/json")})
 
 
 @app.post("/proxy/land")
 def proxy_land():
+    """Relay land to the active drone's Pi. Same slow-command timeout
+    as takeoff — Anafi land waits for ground-contact before returning."""
     log_command("land")
-    r = pi_post("/api/land")
-    return (r.text, r.status_code, {"Content-Type": r.headers.get("Content-Type", "application/json")})
+    try:
+        r = pi_post("/api/land", timeout=TIMEOUT_SLOW)
+    except Exception as e:
+        import requests as _rq
+        if isinstance(e, _rq.exceptions.ReadTimeout):
+            return jsonify(ok=False,
+                           error=f"land timed out after {TIMEOUT_SLOW}s — "
+                                 f"check drone state before retrying"), 504
+        return jsonify(ok=False, error=f"network error: {e}"), 502
+    return (r.text, r.status_code,
+            {"Content-Type": r.headers.get("Content-Type", "application/json")})
 
 
 @app.post("/proxy/land_all")
@@ -3828,8 +7734,10 @@ def proxy_land_all():
             results[str(did)] = {"ok": False, "error": "no base url"}
             continue
         try:
+            # Use the slow-command timeout — Anafi land blocks until
+            # ground contact. 3s wasn't enough for gentle descent.
             resp = _http_session.post(f"{base.rstrip('/')}/api/land",
-                                      json={}, timeout=3.0)
+                                      json={}, timeout=TIMEOUT_SLOW)
             try:
                 j = resp.json()
             except Exception:
@@ -3864,6 +7772,364 @@ def proxy_land_all():
         mission_stopped=mission_stopped,
         results=results,
     )
+
+
+def _collect_fleet_videos() -> dict:
+    """Gather the set of available recording filenames across all FCs.
+    Key = filename (basename), value = {drone_id, size, mtime}. We only
+    care about the flight-named ones (prefixed "flight_"). Other
+    recordings from the manual Record button are ignored.
+
+    Note: we deliberately do NOT pre-filter by WS status — the WS channel
+    can be down while HTTP still works (fallback mode), and we want the
+    operator to be able to download videos in that case. A 0.6 s HTTP
+    timeout keeps the cost of a fully-offline drone low enough.
+    """
+    out: dict = {}
+    for did, info in DRONES.items():
+        base = (info or {}).get("base")
+        if not base:
+            continue
+        try:
+            r = _http_session.get(f"{base.rstrip('/')}/api/video/recordings",
+                                   timeout=0.6)
+            if not r.ok:
+                continue
+            for f in (r.json().get("files") or []):
+                name = f.get("name", "")
+                if name.startswith("flight_") and name.endswith(".mp4"):
+                    out[name] = {"drone_id": str(did), "size": f.get("size"),
+                                  "mtime": f.get("mtime")}
+        except Exception:
+            continue
+    return out
+
+
+@app.get("/proxy/flight_logs")
+def proxy_flight_logs_list():
+    """List archived per-flight log files (newest first), with video
+    metadata attached when a matching .mp4 lives on any Pi."""
+    files = flight_logger.list_files()
+    vids = _collect_fleet_videos()
+    for f in files:
+        stem = f["name"][:-len(".jsonl")] if f["name"].endswith(".jsonl") else f["name"]
+        video_name = stem + ".mp4"
+        v = vids.get(video_name)
+        if v:
+            f["video"] = {
+                "name":     video_name,
+                "drone_id": v["drone_id"],
+                "size":     v["size"],
+                "mtime":    v["mtime"],
+            }
+    return jsonify(ok=True, files=files)
+
+
+@app.get("/proxy/flight_video/<path:name>")
+def proxy_flight_video_download(name):
+    """Stream a flight video from whichever Pi has it. Filename is the
+    mp4 basename produced by FlightLogger (flight_YYYY-..._drone-N_X.mp4);
+    we look up the drone id from the filename and proxy straight through."""
+    # Locate the video across the fleet
+    vids = _collect_fleet_videos()
+    entry = vids.get(name)
+    if not entry:
+        return jsonify(ok=False, error="video not found on any drone"), 404
+    did = entry["drone_id"]
+    base = (DRONES.get(did, {}) or {}).get("base")
+    if not base:
+        return jsonify(ok=False, error="drone has no base url"), 500
+    try:
+        upstream = _http_session.get(
+            f"{base.rstrip('/')}/api/video/recordings/{name}",
+            stream=True, timeout=(3, 60))
+        if not upstream.ok:
+            return jsonify(ok=False, error=f"drone returned {upstream.status_code}"), 502
+    except Exception as e:
+        return jsonify(ok=False, error=str(e)), 502
+    def gen():
+        for chunk in upstream.iter_content(chunk_size=64 * 1024):
+            if chunk:
+                yield chunk
+    headers = {
+        "Content-Type": "video/mp4",
+        "Content-Disposition": f'attachment; filename="{name}"',
+    }
+    size = upstream.headers.get("Content-Length")
+    if size:
+        headers["Content-Length"] = size
+    return Response(gen(), headers=headers)
+
+
+@app.get("/proxy/flight_logs/<path:name>")
+def proxy_flight_logs_download(name):
+    p = flight_logger.file_path(name)
+    if p is None:
+        return jsonify(ok=False, error="file not found"), 404
+    # Inline when "as_attachment=false" so the viewer can fetch-and-parse
+    # rather than trigger a download.
+    as_att = request.args.get("dl", "1") != "0"
+    return send_file(str(p), mimetype="application/jsonlines",
+                     as_attachment=as_att, download_name=p.name)
+
+
+@app.get("/flight_log_viewer")
+def serve_flight_log_viewer():
+    """Interactive replay UI for flight logs.
+
+    Opens ?file=<name> auto-loaded via /proxy/flight_logs/<name>?dl=0.
+    Visualises trajectory + events + timeline so an operator can scrub
+    through a flight and see exactly where something went wrong.
+    """
+    from pathlib import Path as _P
+    p = _P(__file__).with_name("flight_log_viewer.html")
+    if not p.exists():
+        return jsonify(ok=False, error="viewer html missing"), 404
+    return send_file(str(p), mimetype="text/html", max_age=0)
+
+
+@app.get("/proxy/config/ceiling")
+def proxy_ceiling_get():
+    """Aggregate the soft ceiling and engaged state from every drone in
+    the fleet. Returns the minimum ceiling across drones (most
+    conservative) and engaged=True if ANY drone is currently clamped."""
+    results = {}
+    any_engaged = False
+    min_ceiling = None
+    reasons = []
+    for did, info in DRONES.items():
+        base = (info or {}).get("base")
+        if not base:
+            results[str(did)] = {"ok": False, "error": "no base url"}
+            continue
+        try:
+            r = _http_session.get(f"{base.rstrip('/')}/api/config/ceiling", timeout=1.0)
+            j = r.json()
+            results[str(did)] = j
+            if j.get("engaged"):
+                any_engaged = True
+                if j.get("reason"):
+                    reasons.append(f"{did}: {j['reason']}")
+            if j.get("ceiling_m") is not None:
+                c = float(j["ceiling_m"])
+                if min_ceiling is None or c < min_ceiling:
+                    min_ceiling = c
+        except Exception as e:
+            results[str(did)] = {"ok": False, "error": str(e)[:120]}
+    return jsonify(
+        ok=True,
+        ceiling_m=min_ceiling,
+        engaged=any_engaged,
+        reasons=reasons,
+        per_drone=results,
+    )
+
+
+@app.get("/proxy/config/arena_safety")
+def proxy_arena_safety_get():
+    """Aggregate arena-safety state across the fleet — min margin wins,
+    any engaged → engaged, any disabled → disabled (most conservative)."""
+    results = {}
+    any_engaged = False
+    all_enabled = True
+    min_margin = None
+    reasons = []
+    for did, info in DRONES.items():
+        base = (info or {}).get("base")
+        if not base:
+            results[str(did)] = {"ok": False, "error": "no base url"}
+            continue
+        try:
+            r = _http_session.get(f"{base.rstrip('/')}/api/config/arena_safety",
+                                   timeout=1.0)
+            j = r.json() if r.ok else {"ok": False}
+            results[str(did)] = j
+            if j.get("engaged"):
+                any_engaged = True
+                if j.get("reason"):
+                    reasons.append(f"{did}: {j['reason']}")
+            if not j.get("enabled", True):
+                all_enabled = False
+            m = j.get("margin_m")
+            if isinstance(m, (int, float)):
+                if min_margin is None or m < min_margin:
+                    min_margin = float(m)
+        except Exception as e:
+            results[str(did)] = {"ok": False, "error": str(e)[:120]}
+    return jsonify(
+        ok=True,
+        enabled=all_enabled,
+        margin_m=min_margin,
+        engaged=any_engaged,
+        reasons=reasons,
+        per_drone=results,
+    )
+
+
+@app.post("/proxy/config/arena_safety")
+def proxy_arena_safety_set():
+    """Fan-out arena safety settings to every drone's Pi."""
+    data = request.get_json(silent=True) or {}
+    log_command("arena_safety_set", data)
+    results = {}
+    for did, info in DRONES.items():
+        base = (info or {}).get("base")
+        if not base:
+            continue
+        try:
+            r = _http_session.post(f"{base.rstrip('/')}/api/config/arena_safety",
+                                    json=data, timeout=2.0)
+            results[str(did)] = r.json() if r.ok else {"ok": False, "status": r.status_code}
+        except Exception as e:
+            results[str(did)] = {"ok": False, "error": str(e)[:120]}
+    ok_count = sum(1 for v in results.values() if v.get("ok"))
+    print(f"[ARENA] fleet-wide: {data} → {ok_count}/{len(results)} drones acknowledged")
+    return jsonify(ok=True, applied=ok_count, total=len(results), results=results)
+
+
+@app.post("/proxy/config/ceiling")
+def proxy_ceiling_set():
+    """Push a new soft ceiling to every drone in the fleet. Body:
+        {"ceiling_m": <float, metres>}
+    """
+    data = request.get_json(silent=True) or {}
+    try:
+        v = float(data.get("ceiling_m") or data.get("max_altitude_m"))
+    except (TypeError, ValueError):
+        return jsonify(ok=False, error="ceiling_m required"), 400
+    log_command("ceiling_set", {"ceiling_m": v})
+    results = {}
+    for did, info in DRONES.items():
+        base = (info or {}).get("base")
+        if not base:
+            results[str(did)] = {"ok": False, "error": "no base url"}
+            continue
+        try:
+            r = _http_session.post(f"{base.rstrip('/')}/api/config/ceiling",
+                                   json={"ceiling_m": v}, timeout=2.0)
+            results[str(did)] = r.json()
+        except Exception as e:
+            results[str(did)] = {"ok": False, "error": str(e)[:120]}
+    ok_count = sum(1 for v in results.values() if v.get("ok"))
+    print(f"[CEILING] fleet-wide set to {v}m: {ok_count}/{len(results)} drones acknowledged")
+    return jsonify(ok=True, ceiling_m=v, applied=ok_count, total=len(results), results=results)
+
+
+@app.post("/proxy/pause_all")
+def proxy_pause_all():
+    """Fleet-wide PAUSE. Overrides any command — every drone stays
+    airborne at its current position (Anafi auto-hovers with zero RC).
+
+    Side-effects, in order:
+      1. Raise the global pause flag (blocks mission start + ArUco LIVE).
+      2. Abort any running mission (do NOT land — the drones hover).
+      3. Yank every ArUco observer out of LIVE back to OBSERVE and clear
+         its search RC override, so it stops pushing commands.
+      4. Send a hard zero-RC (full brake) to each drone so any residual
+         translation command stops immediately.
+
+    The call is idempotent — pressing it again while already paused is
+    a no-op beyond re-issuing the zero-RC.
+    """
+    global _global_paused, _global_paused_at, _global_paused_src
+    data = request.get_json(silent=True) or {}
+    source = str(data.get("source") or "unknown")
+    log_command("pause_all", {"source": source})
+
+    # 1) Raise the flag first so guards start rejecting autonomous starts
+    #    even before we're done tearing down the existing activity.
+    with _pause_lock:
+        _global_paused = True
+        _global_paused_at = time.time()
+        _global_paused_src = source
+
+    # 2) Stop any running mission (don't land).
+    mission_stopped = False
+    try:
+        if mission_manager is not None and mission_manager.current is not None:
+            mission_stopped = mission_manager.stop(land=False)
+    except Exception as e:
+        print(f"[PAUSE_ALL] mission stop failed: {e}")
+
+    # 3) Observers → OBSERVE, clear search overrides.
+    try:
+        for did, obs in aruco_fleet._obs.items():
+            try:
+                obs.set_search_rc(0, 0, 0, 0)
+                obs.set_mode("observe")
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    # 4) Full brake — POST rc(0,0,0,0) to every drone in parallel-ish.
+    results: dict[str, dict] = {}
+    for did, info in DRONES.items():
+        base = (info or {}).get("base")
+        if not base:
+            results[str(did)] = {"ok": False, "error": "no base url"}
+            continue
+        try:
+            # Some APIs want the full RC tuple, others accept a rc_stop
+            # shortcut. The unified API exposes /api/rc; send zeros.
+            resp = _http_session.post(
+                f"{base.rstrip('/')}/api/rc",
+                json={"lr": 0, "fb": 0, "ud": 0, "yaw": 0},
+                timeout=2.0,
+            )
+            try:
+                j = resp.json()
+            except Exception:
+                j = {"raw": resp.text[:120]}
+            results[str(did)] = {
+                "ok": bool(j.get("ok", resp.status_code == 200)),
+                "status": resp.status_code,
+            }
+        except Exception as e:
+            results[str(did)] = {"ok": False, "error": str(e)[:120]}
+
+    ok_count = sum(1 for v in results.values() if v.get("ok"))
+    print(f"[PAUSE_ALL] fleet paused (source={source}) — "
+          f"{ok_count}/{len(results)} drones braked, "
+          f"mission_stopped={mission_stopped}")
+    return jsonify(
+        ok=True, paused=True,
+        source=source,
+        mission_stopped=mission_stopped,
+        braked=ok_count, total=len(results),
+        results=results,
+    )
+
+
+@app.post("/proxy/resume_all")
+def proxy_resume_all():
+    """Clear the global pause. Autonomous endpoints (missions, ArUco
+    LIVE) become reachable again, but nothing auto-restarts — the
+    operator must re-arm any mission themselves. That's intentional:
+    coming out of pause should never surprise the pilot with a drone
+    suddenly darting off."""
+    global _global_paused, _global_paused_at, _global_paused_src
+    data = request.get_json(silent=True) or {}
+    source = str(data.get("source") or "unknown")
+    log_command("resume_all", {"source": source})
+    with _pause_lock:
+        was_paused = _global_paused
+        _global_paused = False
+        _global_paused_at = time.time()
+        _global_paused_src = ""
+    print(f"[RESUME_ALL] fleet resumed (source={source}, was_paused={was_paused})")
+    return jsonify(ok=True, paused=False, source=source, was_paused=was_paused)
+
+
+@app.get("/proxy/pause_status")
+def proxy_pause_status():
+    """UI poll target — lets multiple open tabs sync their button state."""
+    with _pause_lock:
+        return jsonify(
+            paused=_global_paused,
+            since=_global_paused_at,
+            source=_global_paused_src,
+        )
 
 
 @app.post("/proxy/flip")
@@ -4309,24 +8575,110 @@ def proxy_video_forward_stream():
     return Response(gen(), mimetype="multipart/x-mixed-replace; boundary=frame")
 
 
+@app.post("/proxy/camera/zoom")
+def proxy_camera_zoom():
+    data = request.get_json(silent=True) or {}
+    try:
+        r = _http_session.post(f"{PI_BASE}/api/camera/zoom", json=data, timeout=1.5)
+        return (r.text, r.status_code,
+                {"Content-Type": r.headers.get("Content-Type", "application/json")})
+    except Exception as e:
+        return jsonify(ok=False, error=str(e)), 502
+
+
 @app.get("/proxy/heartbeat")
 def proxy_heartbeat():
-    """Send heartbeat to ALL drones in parallel to keep their watchdogs alive."""
+    """Send heartbeat to all REACHABLE drones in parallel.
+
+    Skips drones whose WS client reports every channel down — no point
+    spending 300 ms × N offline drones every 750 ms. That was the main
+    reason the heartbeat poll stalled the HTTP pool when most of the
+    fleet was offline.
+    """
     def _ping(did_info):
         did, info = did_info
         try:
-            r = _http_session.get(f"{info['base']}/api/heartbeat", timeout=0.3)
+            r = _http_session.get(f"{info['base']}/api/heartbeat", timeout=0.25)
             return did, r.status_code
         except Exception:
             return did, "timeout"
 
-    futures = list(_heartbeat_pool.map(_ping, DRONES.items()))
-    results = dict(futures)
+    # Filter out offline drones using the WS client's health flag.
+    live_items = []
+    skipped = {}
+    for did, info in DRONES.items():
+        did_s = str(did)
+        cli = drone_ws.get(did_s) if 'drone_ws' in globals() else None
+        if cli is not None:
+            all_down = (not cli._ws_connected.get("telemetry") and
+                        not cli._ws_connected.get("position") and
+                        not cli._ws_connected.get("rc"))
+            if all_down:
+                skipped[did_s] = "offline"
+                continue
+        live_items.append((did, info))
+
+    results = dict(_heartbeat_pool.map(_ping, live_items)) if live_items else {}
+    results.update(skipped)
     return jsonify(ok=True, drones=results)
+
+
+# ─── Latency ping (C2 → flight controller + flight controller → drone) ──────
+@app.get("/proxy/latency")
+def proxy_latency():
+    """Returns the three-leg latency picture for the ACTIVE drone:
+      c2_to_fc_ms     — fresh HTTP round-trip to /api/heartbeat on the Pi
+      fc_to_drone_ms  — cached flight-controller-to-drone ICMP ping from /api/drone_ping
+      sample_age_s    — age of the fc_to_drone sample
+    The client adds these together (plus a user-tuned video-processing
+    offset) to get the total command-loop latency."""
+    t0 = time.time()
+    c2_rtt = None
+    fc = None
+    try:
+        r = _http_session.get(f"{PI_BASE}/api/heartbeat", timeout=1.0)
+        c2_rtt = (time.time() - t0) * 1000.0
+        fc_ok = (r.status_code == 200)
+    except Exception:
+        fc_ok = False
+    try:
+        r2 = _http_session.get(f"{PI_BASE}/api/drone_ping", timeout=1.0)
+        if r2.ok:
+            fc = r2.json()
+    except Exception:
+        pass
+    resp = {
+        "ok": True,
+        "c2_to_fc_ms": round(c2_rtt, 2) if c2_rtt is not None else None,
+        "fc_reachable": fc_ok,
+        "fc_to_drone_ms": (fc.get("rtt_ms") if fc else None),
+        "fc_to_drone_host": (fc.get("host") if fc else None),
+        "fc_to_drone_sample_age_s": (fc.get("sample_age_s") if fc else None),
+        "pi_base": PI_BASE,
+    }
+    return jsonify(resp)
 
 
 @app.get("/proxy/telemetry")
 def proxy_telemetry():
+    mode = _transport_mode("telemetry")
+    if mode in ("auto", "ws"):
+        ws = drone_ws.get(str(active_drone_id))
+        if ws:
+            tel, age = ws.latest_telemetry()
+            if tel is not None and age < 1.5:
+                tel = dict(tel)
+                tel["_source"] = "ws"
+                tel["_age_ms"] = int(age * 1000)
+                headers = {
+                    "Content-Type": "application/json",
+                    "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
+                    "Pragma": "no-cache",
+                    "Expires": "0",
+                }
+                return (json.dumps(tel, default=str), 200, headers)
+        if mode == "ws":
+            return jsonify(ok=False, error="ws forced but not connected", via="ws"), 503
     try:
         r = pi_get("/api/telemetry", timeout=TIMEOUT_STATUS)
         headers = {
@@ -4338,6 +8690,282 @@ def proxy_telemetry():
         return (r.text, r.status_code, headers)
     except Exception as e:
         return jsonify(ok=False, error=str(e)), 502
+
+
+@app.get("/proxy/ui_state")
+def proxy_ui_state():
+    """Single consolidated poll — replaces the many 0.5-5Hz polls the UI
+    used to fire for tiny pieces of state (heartbeat, pause, ws_status,
+    ceiling, transport, mission status). All of them are cheap reads
+    of local C2 state; making them one request means the browser keeps
+    its 6 HTTP/1.1 connections free for real traffic (takeoff, key
+    events) instead of queueing behind 8 small polls.
+
+    Heartbeat to the Pi is STILL sent here so the Pi watchdog stays
+    happy — we reuse the existing parallel-ping logic.
+    """
+    out: dict = {}
+
+    # --- Pause state ---
+    with _pause_lock:
+        out["pause"] = {
+            "paused":  _global_paused,
+            "since":   _global_paused_at,
+            "source":  _global_paused_src,
+        }
+
+    # --- Ceiling + arena-safety (aggregated from per-drone endpoints) ---
+    # Combined fan-out: for every live drone we fetch BOTH endpoints in
+    # sequence. That's 2 HTTP calls per drone per uiStatePoll tick (1Hz)
+    # instead of two separate per-2s polls issued by the browser — less
+    # load on the C2's HTTP pool and on the browser's 6-connection limit.
+    try:
+        ceilings = []
+        any_c_engaged = False
+        c_reasons = []
+        margins = []
+        all_arena_enabled = True
+        any_a_engaged = False
+        a_reasons = []
+        for did, info in DRONES.items():
+            base = (info or {}).get("base")
+            if not base: continue
+            cli = drone_ws.get(str(did)) if 'drone_ws' in globals() else None
+            if cli is not None:
+                all_down = (not cli._ws_connected.get("telemetry") and
+                            not cli._ws_connected.get("position") and
+                            not cli._ws_connected.get("rc"))
+                if all_down:
+                    continue
+            # Ceiling
+            try:
+                r = _http_session.get(f"{base.rstrip('/')}/api/config/ceiling",
+                                       timeout=0.25)
+                if r.status_code == 200:
+                    j = r.json()
+                    if j.get("ceiling_m") is not None:
+                        ceilings.append(float(j["ceiling_m"]))
+                    if j.get("engaged"):
+                        any_c_engaged = True
+                        if j.get("reason"):
+                            c_reasons.append(f"{did}: {j['reason']}")
+            except Exception:
+                pass
+            # Arena safety
+            try:
+                r = _http_session.get(f"{base.rstrip('/')}/api/config/arena_safety",
+                                       timeout=0.25)
+                if r.status_code == 200:
+                    j = r.json()
+                    if j.get("margin_m") is not None:
+                        margins.append(float(j["margin_m"]))
+                    if not j.get("enabled", True):
+                        all_arena_enabled = False
+                    if j.get("engaged"):
+                        any_a_engaged = True
+                        if j.get("reason"):
+                            a_reasons.append(f"{did}: {j['reason']}")
+            except Exception:
+                pass
+        out["ceiling"] = {
+            "ceiling_m": min(ceilings) if ceilings else None,
+            "engaged":   any_c_engaged,
+            "reasons":   c_reasons,
+        }
+        out["arena_safety"] = {
+            "enabled":  all_arena_enabled,
+            "margin_m": min(margins) if margins else None,
+            "engaged":  any_a_engaged,
+            "reasons":  a_reasons,
+        }
+    except Exception:
+        out["ceiling"] = {"ceiling_m": None, "engaged": False, "reasons": []}
+        out["arena_safety"] = {"enabled": True, "margin_m": None,
+                                "engaged": False, "reasons": []}
+
+    # --- WS status (per drone) ---
+    try:
+        out["ws"] = {
+            "available": HAS_WSCLIENT,
+            "drones": {did: cli.status() for did, cli in drone_ws.items()},
+        }
+    except Exception:
+        out["ws"] = {"available": HAS_WSCLIENT, "drones": {}}
+
+    # --- Transport selector state ---
+    try:
+        with _transport_lock:
+            out["transport"] = dict(_transport)
+    except Exception:
+        out["transport"] = {}
+
+    # --- Missions ---
+    try:
+        out["missions"] = mission_manager.status()
+    except Exception:
+        out["missions"] = {}
+
+    # Heartbeat removed — now handled by the C2's _heartbeat_loop()
+    # background thread directly. No reason for the browser to be
+    # involved in keeping the Pi watchdog alive.
+
+    return jsonify(ok=True, **out)
+
+
+@app.get("/proxy/diagnostics")
+def proxy_diagnostics():
+    """C2-side + Pi-side diagnostic snapshot.
+
+    Everything that SHOULD NOT grow monotonically across flights is
+    here. If a counter keeps climbing flight-after-flight, that's the
+    leak. To use:
+      1. Open this URL in a browser tab before flight 1.
+      2. Note the thread_count + flight_logger.active_files + http_pool counts.
+      3. Fly, land, fly, land.
+      4. Refresh. Any number growing is a direct clue.
+    """
+    import threading as _th, gc as _gc
+    with _slow_calls_lock:
+        slow = list(_slow_calls)
+
+    # --- C2 threads ---
+    threads = _th.enumerate()
+    by_name: dict[str, int] = {}
+    for t in threads:
+        n = t.name
+        for prefix in ("ThreadPoolExecutor-", "Thread-", "obs-", "ws-"):
+            if n.startswith(prefix):
+                n = prefix + "*"
+                break
+        by_name[n] = by_name.get(n, 0) + 1
+
+    # --- HTTP session connection pool ---
+    http_pool_stats = {}
+    try:
+        adapter = _http_session.get_adapter("http://x")
+        if hasattr(adapter, "poolmanager"):
+            pm = adapter.poolmanager
+            http_pool_stats = {
+                "pool_connections_limit": getattr(adapter, "_pool_connections", None),
+                "pool_maxsize_limit":     getattr(adapter, "_pool_maxsize",     None),
+                "pools_cached":           len(pm.pools) if hasattr(pm, "pools") else None,
+            }
+    except Exception as e:
+        http_pool_stats = {"error": str(e)[:120]}
+
+    # --- FlightLogger ---
+    try:
+        with flight_logger._lock:
+            fl_state = {
+                "active_files": len(flight_logger._flights),
+                "drone_ids":    list(flight_logger._flights.keys()),
+                "running":      flight_logger._running,
+                "log_dir":      str(flight_logger.log_dir),
+            }
+    except Exception as e:
+        fl_state = {"error": str(e)[:120]}
+
+    # --- DroneWS clients ---
+    ws_clients = {}
+    for did, cli in drone_ws.items():
+        try:
+            s = cli.status()
+            ws_clients[did] = {
+                "rc": s.get("rc"),
+                "telemetry": s.get("telemetry"),
+                "position":  s.get("position"),
+                "rc_rtt_ms": s.get("rc_rtt_ms"),
+                "rc_send_ms": s.get("rc_send_ms"),
+                "consec_failures": dict(cli._consec_failures),
+            }
+        except Exception as e:
+            ws_clients[did] = {"error": str(e)[:80]}
+
+    # --- Per-drone Pi diagnostics ---
+    per_drone = {}
+    for did, info in DRONES.items():
+        base = (info or {}).get("base")
+        if not base:
+            continue
+        # Skip fan-out for drones whose WS is all-down — same pattern
+        # as fleet poll. Keeps this endpoint responsive under partial
+        # outage.
+        cli = drone_ws.get(str(did))
+        if cli is not None:
+            all_down = (not cli._ws_connected.get("telemetry") and
+                        not cli._ws_connected.get("position") and
+                        not cli._ws_connected.get("rc"))
+            if all_down:
+                per_drone[str(did)] = {"error": "offline (ws all down)"}
+                continue
+        try:
+            r = _http_session.get(f"{base.rstrip('/')}/api/diagnostics", timeout=0.5)
+            per_drone[str(did)] = r.json() if r.ok else {"error": f"http {r.status_code}"}
+        except Exception as e:
+            per_drone[str(did)] = {"error": str(e)[:120]}
+
+    return jsonify(
+        ok=True,
+        # C2-side counters — these are what usually leak
+        c2={
+            "thread_count":    len(threads),
+            "threads_by_name": by_name,
+            "gc_counts":       list(_gc.get_count()),
+            "http_pool":       http_pool_stats,
+            "flight_logger":   fl_state,
+            "ws_clients":      ws_clients,
+            "slow_calls":      slow,
+        },
+        per_drone=per_drone,
+        active_drone=active_drone_id,
+    )
+
+
+@app.get("/proxy/ws/status")
+def proxy_ws_status():
+    """Per-drone WS connection snapshot for the UI badge."""
+    out = {did: cli.status() for did, cli in drone_ws.items()}
+    return jsonify(
+        ok=True,
+        available=HAS_WSCLIENT,
+        drones=out,
+    )
+
+
+@app.get("/proxy/config/transport")
+def proxy_transport_get():
+    """Return the current per-subsystem transport preference."""
+    with _transport_lock:
+        snap = dict(_transport)
+    return jsonify(ok=True, transport=snap, ws_available=HAS_WSCLIENT)
+
+
+@app.post("/proxy/config/transport")
+def proxy_transport_set():
+    """Update the transport preference for one or more subsystems.
+    Body: {"rc":"http", "telemetry":"auto", "position":"ws"}
+
+    Valid values: "auto" (WS if up, HTTP fallback), "ws" (force WS),
+    "http" (force HTTP). Unknown subsystems / values are ignored.
+    """
+    global WS_RC_ENABLED
+    data = request.get_json(silent=True) or {}
+    allowed = {"auto", "ws", "http"}
+    changed = {}
+    with _transport_lock:
+        for subsys in ("rc", "telemetry", "position"):
+            v = data.get(subsys)
+            if v is None:
+                continue
+            v = str(v).lower()
+            if v in allowed:
+                _transport[subsys] = v
+                changed[subsys] = v
+        snap = dict(_transport)
+    WS_RC_ENABLED = snap["rc"] in ("auto", "ws")
+    log_command("transport_set", {"changed": changed, "active": snap})
+    print(f"[TRANSPORT] updated: {changed} → now {snap}")
+    return jsonify(ok=True, transport=snap, changed=changed)
 
 
 # ── Positioning subsystem proxy ───────────────────────────────────────────────
@@ -4604,10 +9232,150 @@ def proxy_aruco_state():
 
 @app.get("/proxy/aruco/fleet")
 def proxy_aruco_fleet():
-    """Snapshot of every observer in the fleet."""
+    """Snapshot of every observer in the fleet.
+
+    Merged data flow:
+      1. Start from the observer's own state dict (pos + telemetry) if
+         the observer thread is actually running on this drone.
+      2. For every drone in DRONES, fan out a lightweight GET to
+         <base>/api/position in parallel (300 ms timeout). That endpoint
+         returns the live fused pose even when no observer is started,
+         which is exactly what manual-flight mode needs — otherwise the
+         3D arena view stays empty until someone arms ArUco Seek.
+
+    Merge policy: the observer's pos wins if present (it's been cached
+    with IMU dead-reckoning); the /api/position fallback fills any gap.
+    """
+    observers = dict(aruco_fleet.all_states())
+    # Ensure every configured drone has at least an entry to populate
+    for did in DRONES.keys():
+        did = str(did)
+        if did not in observers:
+            observers[did] = {"drone_id": did, "running": False}
+
+    # Two data paths, in order of preference:
+    #   1. WS cache (zero HTTP on the fleet-poll tick — <1 ms)
+    #   2. Parallel fan-out to each Pi's /api/position
+    #
+    # We SKIP the HTTP fan-out for any drone whose WS is known-disconnected.
+    # If the WS can't reach the Pi, HTTP won't either — trying anyway wastes
+    # ~200 ms per drone per poll on connection-refused / timeout, which was
+    # the real cause of the "500 timeout" and button-press delays (the fleet
+    # poll was holding up Flask threads that other endpoints needed).
+    need_http: list[tuple[str, str]] = []
+    pos_mode = _transport_mode("position")
+    for did, info in DRONES.items():
+        did = str(did)
+        base = (info or {}).get("base")
+        if not base:
+            continue
+        # WS cache first (unless position transport is forced to http)
+        cli = drone_ws.get(did) if pos_mode in ("auto", "ws") else None
+        if cli is not None:
+            pj, age = cli.latest_position()
+            if pj is not None and age < 1.5:
+                entry = observers.setdefault(did, {"drone_id": did})
+                if entry.get("pos") is None and pj.get("pos") is not None:
+                    entry["pos"] = pj["pos"]
+                if entry.get("dir") is None and pj.get("dir") is not None:
+                    entry["dir"] = pj["dir"]
+                if entry.get("pos_vel") is None and pj.get("vel") is not None:
+                    entry["pos_vel"] = pj["vel"]
+                if entry.get("pos_stale") is None and pj.get("stale") is not None:
+                    entry["pos_stale"] = pj["stale"]
+                if entry.get("ref_markers") is None and pj.get("ref_markers") is not None:
+                    entry["ref_markers"] = pj["ref_markers"]
+                # Currently-visible markers — MUST be propagated so the 2D
+                # halo + 3D highlight light up on manual flight too. When
+                # the DroneObserver isn't started, the per-drone position
+                # service is the only source for this, and we were dropping
+                # it in both the WS-cache and HTTP-fallback paths.
+                if entry.get("seen_markers") is None and pj.get("seen_markers") is not None:
+                    entry["seen_markers"] = pj["seen_markers"]
+                if entry.get("altitude_m") is None and pj.get("pos"):
+                    try:
+                        entry["altitude_m"] = float(pj["pos"][2])
+                    except (IndexError, TypeError, ValueError):
+                        pass
+                entry["_pos_source"] = "ws"
+                continue
+            # WS exists but stale — skip HTTP if ALL three sockets are down
+            # (i.e. the Pi is unreachable). Keep trying HTTP if only position
+            # is down but telemetry/rc still connected (different failure mode).
+            all_down = (not cli._ws_connected.get("telemetry") and
+                        not cli._ws_connected.get("position") and
+                        not cli._ws_connected.get("rc"))
+            if all_down:
+                observers.setdefault(did, {"drone_id": did, "ws_all_down": True})
+                continue
+        # Position forced to ws-only: don't attempt HTTP.
+        if pos_mode == "ws":
+            observers.setdefault(did, {"drone_id": did, "ws_only": True})
+            continue
+        need_http.append((did, base))
+
+    def _fetch(did: str, base: str):
+        try:
+            resp = _http_session.get(f"{base.rstrip('/')}/api/position", timeout=0.3)
+            if resp.status_code == 200:
+                return did, resp.json()
+        except Exception:
+            pass
+        return did, None
+
+    if need_http:
+        import concurrent.futures as _cf
+        jobs = {}
+        pool = _cf.ThreadPoolExecutor(max_workers=max(1, len(need_http)))
+        try:
+            for did, base in need_http:
+                jobs[pool.submit(_fetch, did, base)] = did
+            # Loop with a per-future timeout rather than as_completed's
+            # global timeout — that one raises TimeoutError instead of
+            # returning partial results, which used to bubble up as a
+            # 500 whenever any Pi was slow/unreachable.
+            deadline = time.time() + 0.6
+            for fut in list(jobs):
+                remaining = max(0.0, deadline - time.time())
+                try:
+                    did, pj = fut.result(timeout=remaining)
+                except Exception:
+                    continue
+                if not pj:
+                    continue
+                entry = observers.setdefault(did, {"drone_id": did})
+                if entry.get("pos") is None and pj.get("pos") is not None:
+                    entry["pos"] = pj["pos"]
+                if entry.get("dir") is None and pj.get("dir") is not None:
+                    entry["dir"] = pj["dir"]
+                if entry.get("pos_vel") is None and pj.get("vel") is not None:
+                    entry["pos_vel"] = pj["vel"]
+                if entry.get("pos_stale") is None and pj.get("stale") is not None:
+                    entry["pos_stale"] = pj["stale"]
+                if entry.get("ref_markers") is None and pj.get("ref_markers") is not None:
+                    entry["ref_markers"] = pj["ref_markers"]
+                # Currently-visible markers — MUST be propagated so the 2D
+                # halo + 3D highlight light up on manual flight too. When
+                # the DroneObserver isn't started, the per-drone position
+                # service is the only source for this, and we were dropping
+                # it in both the WS-cache and HTTP-fallback paths.
+                if entry.get("seen_markers") is None and pj.get("seen_markers") is not None:
+                    entry["seen_markers"] = pj["seen_markers"]
+                if entry.get("altitude_m") is None and pj.get("pos"):
+                    try:
+                        entry["altitude_m"] = float(pj["pos"][2])
+                    except (IndexError, TypeError, ValueError):
+                        pass
+                entry["_pos_source"] = "http"
+        finally:
+            # Don't wait for slow workers — let them finish in the
+            # background. If we joined here the endpoint could block 4+
+            # seconds when a drone is unreachable.
+            pool.shutdown(wait=False)
+
     return jsonify(active=active_drone_id,
                    allow_live=aruco_fleet.allow_live,
-                   observers=aruco_fleet.all_states())
+                   observers=observers)
 
 
 @app.get("/proxy/aruco/params")
@@ -4627,12 +9395,128 @@ def asdict_hover_defaults():
 @app.post("/proxy/aruco/params")
 def proxy_aruco_params_set():
     data = request.get_json(silent=True) or {}
-    did = str(data.pop("id", "") or request.args.get("id") or active_drone_id)
-    obs, did = _aruco_resolve(did)
+    # If no id, broadcast to EVERY observer (fleet-wide knobs like
+    # axis_locked should apply to the whole swarm, not just one drone).
+    did = data.pop("id", None) or request.args.get("id")
+    if did:
+        obs, did = _aruco_resolve(str(did))
+        if obs is None:
+            return jsonify(ok=False, error="unknown drone"), 404
+        applied = obs.update_params(data)
+        return jsonify(ok=True, applied=applied, drone_id=did)
+    # Fleet-wide fan-out
+    applied_all = {}
+    for d_id, o in aruco_fleet._obs.items():
+        try:
+            applied_all[d_id] = o.update_params(data)
+        except Exception as e:
+            applied_all[d_id] = {"error": str(e)[:80]}
+    return jsonify(ok=True, applied=applied_all, fleet=True)
+
+
+# ── Camera-faces-arena-centre toggle ──────────────────────────────────
+# Fleet-wide switch. When enabled, every observer's "face override" is
+# set to (0, arena_depth/2) so any mission waypoint with no explicit
+# face target automatically aims the drone's camera at the arena
+# centre — maximising marker visibility, which means better fused
+# arena-frame position.
+#
+# The toggle lives on the C2 so the UI can flip it, the value gets
+# broadcast to all observers, and capture_targets mission etc. pick
+# it up on the next set_waypoint(...) call.
+_camera_face_center_lock = threading.Lock()
+_camera_face_center_enabled: bool = os.getenv("C2_CAMERA_FACE_CENTER", "1") not in {"0", "false", "False"}
+_camera_face_center_xy: tuple = (0.0, 5.4)   # default arena centre (20×10.8 m)
+
+
+def _apply_camera_face_to_fleet():
+    """Push the current camera-face setting to every observer."""
+    with _camera_face_center_lock:
+        xy = _camera_face_center_xy if _camera_face_center_enabled else None
+    for d_id, o in aruco_fleet._obs.items():
+        try:
+            o.set_camera_face_override(xy)
+        except Exception as e:
+            print(f"[CAMERA_FACE] drone {d_id} set failed: {e}")
+
+
+# Apply at import time so observers created by configure() already
+# have the right override before any mission runs.
+_apply_camera_face_to_fleet()
+
+
+@app.get("/proxy/config/camera_face_center")
+def proxy_camera_face_center_get():
+    with _camera_face_center_lock:
+        return jsonify(
+            ok=True,
+            enabled=_camera_face_center_enabled,
+            xy=list(_camera_face_center_xy),
+        )
+
+
+@app.post("/proxy/config/camera_face_center")
+def proxy_camera_face_center_set():
+    """Enable/disable the toggle, optionally override the centre XY.
+    Body: {"enabled": true, "xy": [0, 5.4]}"""
+    global _camera_face_center_enabled, _camera_face_center_xy
+    data = request.get_json(silent=True) or {}
+    changed = {}
+    with _camera_face_center_lock:
+        if "enabled" in data:
+            _camera_face_center_enabled = bool(data["enabled"])
+            changed["enabled"] = _camera_face_center_enabled
+        if "xy" in data and isinstance(data["xy"], (list, tuple)) and len(data["xy"]) >= 2:
+            try:
+                _camera_face_center_xy = (float(data["xy"][0]), float(data["xy"][1]))
+                changed["xy"] = list(_camera_face_center_xy)
+            except (TypeError, ValueError):
+                pass
+    _apply_camera_face_to_fleet()
+    log_command("camera_face_center_set", changed)
+    print(f"[CAMERA_FACE] enabled={_camera_face_center_enabled} xy={_camera_face_center_xy}")
+    return jsonify(ok=True, changed=changed,
+                   enabled=_camera_face_center_enabled,
+                   xy=list(_camera_face_center_xy))
+
+
+@app.get("/proxy/aruco/safety_margin")
+def proxy_aruco_safety_margin_get():
+    """Return the current autonomous-mode arena safety margin (metres).
+    Reads from the active drone's observer since the margin is
+    per-observer state; fleet-wide consistency is maintained by the
+    POST endpoint broadcasting to every observer."""
+    obs = aruco_fleet.get(str(active_drone_id))
     if obs is None:
-        return jsonify(ok=False, error="unknown drone"), 404
-    applied = obs.update_params(data)
-    return jsonify(ok=True, applied=applied)
+        return jsonify(ok=False, safety_margin_m=None), 200
+    with obs._lock:
+        return jsonify(
+            ok=True,
+            safety_margin_m=float(obs._safety_margin_m),
+            arena_bounds=dict(obs._arena_bounds),
+        )
+
+
+@app.post("/proxy/aruco/safety_margin")
+def proxy_aruco_safety_margin_set():
+    """Set the autonomous-mode arena safety margin. Body:
+        {"safety_margin_m": 1.5}
+    Broadcasts to every drone's observer so the fleet shares one value.
+    """
+    data = request.get_json(silent=True) or {}
+    try:
+        v = float(data.get("safety_margin_m"))
+    except (TypeError, ValueError):
+        return jsonify(ok=False, error="safety_margin_m required"), 400
+    v = max(0.1, min(5.0, v))   # clamp to a sane range
+    for d_id, o in aruco_fleet._obs.items():
+        try:
+            o.set_arena_bounds({}, safety_margin_m=v)
+        except Exception as e:
+            print(f"[SAFETY] drone {d_id} set failed: {e}")
+    log_command("safety_margin_set", {"safety_margin_m": v})
+    print(f"[SAFETY] arena margin set to {v}m (fleet-wide)")
+    return jsonify(ok=True, safety_margin_m=v)
 
 
 @app.post("/proxy/aruco/start")
@@ -4685,6 +9569,13 @@ def proxy_aruco_mode():
     if obs is None:
         return jsonify(ok=False, error="unknown drone"), 404
     requested = (data.get("mode") or "").lower()
+    # Respect global PAUSE — switching to LIVE while paused is exactly
+    # the kind of autonomous-command surprise PAUSE exists to prevent.
+    # Going back to OBSERVE is always allowed (it's a safety downgrade).
+    if requested == "live":
+        guarded = _pause_guard_response()
+        if guarded is not None:
+            return guarded
     if requested == "live" and not obs.allow_live:
         return jsonify(ok=False, mode=obs.mode,
                        error="LIVE mode disabled on this server (REMOTE_NO_LIVE=1)"), 403
@@ -4818,8 +9709,303 @@ def proxy_missions_status():
     return jsonify(mission_manager.status())
 
 
+# ── Position-tracker presets ──────────────────────────────────────────
+# Mirror of the mission-preset system but for Position Tracker tuning.
+# Stored on the C2 (controller/position_presets.json) because:
+#   - presets should be shared across the whole fleet (one drone's
+#     position setup usually applies to all)
+#   - loading a preset fans out to every Pi via /proxy/position/config
+#   - C2 is the single authority for operator-facing config
+POSITION_PRESETS_PATH = Path(os.getenv(
+    "POSITION_PRESETS_PATH",
+    str(Path(__file__).with_name("position_presets.json"))))
+_position_presets_lock = threading.Lock()
+
+_POSITION_PRESETS_DEFAULTS: dict = {
+    "balanced": {
+        "detect_profile":     "balanced",
+        "fov_deg":             69,
+        "imu_weight":          0.30,
+        "latency_comp_s":      0.20,
+        "enable_kalman_filter": True,
+        "marker_size_m":       0.50,
+        "top_k_markers":       0,
+        "outlier_reject_m":    2.5,
+        "distance_scale":      1.0,
+        "pose_hold_sec":       0.8,
+        "min_ref_count":       1,
+        "min_ref_weight":      0.0,
+        "meas_blend_min":      0.35,
+        "meas_blend_max":      0.85,
+        "vel_blend":           0.25,
+        "max_state_dt":        1.0,
+        "kalman_process_var":  1e-3,
+        "kalman_meas_var":     1e-1,
+        "imu_lowpass_hz":      5.0,
+        "seen_hold_s":         0.6,
+    },
+    "smooth": {
+        "detect_profile":     "balanced",
+        "fov_deg":             69,
+        "imu_weight":          0.50,
+        "enable_kalman_filter": True,
+        "kalman_process_var":  5e-4,
+        "kalman_meas_var":     2e-1,
+        "imu_lowpass_hz":      3.0,
+        "pose_hold_sec":       1.2,
+        "meas_blend_min":      0.20,
+        "meas_blend_max":      0.60,
+    },
+    "responsive": {
+        "detect_profile":     "sensitive",
+        "fov_deg":             69,
+        "imu_weight":          0.15,
+        "enable_kalman_filter": True,
+        "kalman_process_var":  5e-3,
+        "kalman_meas_var":     5e-2,
+        "imu_lowpass_hz":      15.0,
+        "pose_hold_sec":       0.4,
+        "meas_blend_min":      0.60,
+        "meas_blend_max":      0.95,
+    },
+}
+
+
+def _load_position_presets() -> dict:
+    with _position_presets_lock:
+        if not POSITION_PRESETS_PATH.exists():
+            try:
+                POSITION_PRESETS_PATH.parent.mkdir(parents=True, exist_ok=True)
+                POSITION_PRESETS_PATH.write_text(
+                    json.dumps(_POSITION_PRESETS_DEFAULTS, indent=2))
+            except Exception as e:
+                print(f"[PRESETS] position seed write failed: {e}")
+            return json.loads(json.dumps(_POSITION_PRESETS_DEFAULTS))
+        try:
+            return json.loads(POSITION_PRESETS_PATH.read_text())
+        except Exception as e:
+            print(f"[PRESETS] position load failed ({e}) — using defaults")
+            return json.loads(json.dumps(_POSITION_PRESETS_DEFAULTS))
+
+
+def _save_position_presets(data: dict):
+    with _position_presets_lock:
+        tmp = POSITION_PRESETS_PATH.with_suffix(".json.tmp")
+        POSITION_PRESETS_PATH.parent.mkdir(parents=True, exist_ok=True)
+        tmp.write_text(json.dumps(data, indent=2))
+        tmp.replace(POSITION_PRESETS_PATH)
+
+
+@app.get("/proxy/position/presets")
+def proxy_position_presets_list():
+    return jsonify(ok=True, presets=_load_position_presets(),
+                   path=str(POSITION_PRESETS_PATH))
+
+
+@app.post("/proxy/position/presets")
+def proxy_position_presets_save():
+    """Save a named preset. Body: {"name": "X", "params": {...}}"""
+    data = request.get_json(silent=True) or {}
+    name = str(data.get("name", "")).strip()
+    params = data.get("params")
+    if not name or not isinstance(params, dict):
+        return jsonify(ok=False, error="name + params required"), 400
+    presets = _load_position_presets()
+    presets[name] = params
+    try:
+        _save_position_presets(presets)
+    except Exception as e:
+        return jsonify(ok=False, error=f"save failed: {e}"), 500
+    log_command("position_preset_save", {"name": name})
+    return jsonify(ok=True, name=name)
+
+
+@app.delete("/proxy/position/presets")
+def proxy_position_presets_delete():
+    name = str(request.args.get("name", "")).strip()
+    if not name:
+        return jsonify(ok=False, error="name required"), 400
+    presets = _load_position_presets()
+    if name not in presets:
+        return jsonify(ok=False, error="preset not found"), 404
+    del presets[name]
+    try:
+        _save_position_presets(presets)
+    except Exception as e:
+        return jsonify(ok=False, error=f"save failed: {e}"), 500
+    log_command("position_preset_delete", {"name": name})
+    return jsonify(ok=True)
+
+
+@app.post("/proxy/position/presets/apply")
+def proxy_position_presets_apply():
+    """Load a preset and fan it out to every drone via /proxy/position/config.
+    Body: {"name": "..."} — any unknown keys in the preset are accepted
+    by the position config endpoint (it silently ignores unknown fields)."""
+    data = request.get_json(silent=True) or {}
+    name = str(data.get("name", "")).strip()
+    if not name:
+        return jsonify(ok=False, error="name required"), 400
+    presets = _load_position_presets()
+    params = presets.get(name)
+    if not isinstance(params, dict):
+        return jsonify(ok=False, error="preset not found"), 404
+    # Fan out to every drone's /api/position/config
+    results = {}
+    for did, info in DRONES.items():
+        base = (info or {}).get("base")
+        if not base:
+            results[str(did)] = {"ok": False, "error": "no base url"}
+            continue
+        try:
+            r = _http_session.post(f"{base.rstrip('/')}/api/position/config",
+                                   json=params, timeout=2.0)
+            results[str(did)] = r.json() if r.ok else {"ok": False, "status": r.status_code}
+        except Exception as e:
+            results[str(did)] = {"ok": False, "error": str(e)[:120]}
+    log_command("position_preset_apply", {"name": name})
+    ok_count = sum(1 for v in results.values() if v.get("ok"))
+    return jsonify(ok=True, name=name, applied_to=ok_count,
+                   total=len(results), results=results)
+
+
+# ── Mission presets ───────────────────────────────────────────────────
+# Each special-mission type has its own JSON parameter block. Operators
+# can edit it as code in the UI and save named presets here. Storage is
+# a single JSON file on the C2 (the mission runner lives here, not on
+# the FC), loaded lazily and written atomically on save/delete.
+MISSION_PRESETS_PATH = Path(os.getenv(
+    "MISSION_PRESETS_PATH",
+    str(Path(__file__).with_name("mission_presets.json"))))
+_mission_presets_lock = threading.Lock()
+
+
+# Built-in starter presets — so the editor never starts empty. Users
+# can override or delete them; they re-appear on missing-file.
+_MISSION_PRESETS_DEFAULTS: dict = {
+    "scan_all": {
+        "default": {
+            "drone_ids": ["1"],
+            "target_markers": "1-12",
+            "hover_seconds": 1.5,
+            "approach_tolerance_m": 0.30,
+            "approach_skew_tol": 0.12,
+            "approach_err_x_tol": 0.15,
+            "auto_takeoff": False,
+        },
+    },
+    "capture_targets": {
+        "default": {
+            "drone_ids": ["1"],
+            "target_boxes": [
+                {"id": 1, "x": -7.0, "y": 2.5, "home_team": "red"},
+                {"id": 2, "x": -5.0, "y": 5.4, "home_team": "red"},
+                {"id": 3, "x": -7.0, "y": 8.3, "home_team": "red"},
+                {"id": 4, "x":  7.0, "y": 2.5, "home_team": "blue"},
+                {"id": 5, "x":  5.0, "y": 5.4, "home_team": "blue"},
+                {"id": 6, "x":  7.0, "y": 8.3, "home_team": "blue"},
+            ],
+            "home_xy":        [0.0, 9.0],
+            "arena_face_xy":  [0.0, 5.4],
+            "hover_above_m":  1.5,
+            "hover_seconds":  4.0,
+            "nav_tol_xy_m":   0.3,
+            "auto_takeoff":   False,
+        },
+    },
+}
+
+
+def _load_mission_presets() -> dict:
+    """Load presets, seeding from defaults on first access."""
+    with _mission_presets_lock:
+        if not MISSION_PRESETS_PATH.exists():
+            try:
+                MISSION_PRESETS_PATH.parent.mkdir(parents=True, exist_ok=True)
+                MISSION_PRESETS_PATH.write_text(
+                    json.dumps(_MISSION_PRESETS_DEFAULTS, indent=2))
+            except Exception as e:
+                print(f"[PRESETS] seed write failed: {e}")
+            return json.loads(json.dumps(_MISSION_PRESETS_DEFAULTS))   # deep copy
+        try:
+            return json.loads(MISSION_PRESETS_PATH.read_text())
+        except Exception as e:
+            print(f"[PRESETS] load failed ({e}) — using in-memory defaults")
+            return json.loads(json.dumps(_MISSION_PRESETS_DEFAULTS))
+
+
+def _save_mission_presets(data: dict):
+    """Atomic write — avoids truncated file on crash mid-write."""
+    with _mission_presets_lock:
+        tmp = MISSION_PRESETS_PATH.with_suffix(".json.tmp")
+        MISSION_PRESETS_PATH.parent.mkdir(parents=True, exist_ok=True)
+        tmp.write_text(json.dumps(data, indent=2))
+        tmp.replace(MISSION_PRESETS_PATH)
+
+
+@app.get("/proxy/missions/presets")
+def proxy_mission_presets_list():
+    """Return all presets grouped by mission type."""
+    return jsonify(ok=True, presets=_load_mission_presets(),
+                   path=str(MISSION_PRESETS_PATH))
+
+
+@app.post("/proxy/missions/presets")
+def proxy_mission_presets_save():
+    """Create or overwrite a named preset.
+    Body: {"mission_type": "scan_all", "name": "tight-margin",
+           "params": {...}}"""
+    data = request.get_json(silent=True) or {}
+    mtype = str(data.get("mission_type", "")).strip()
+    name  = str(data.get("name", "")).strip()
+    params = data.get("params")
+    if not mtype or not name or not isinstance(params, dict):
+        return jsonify(ok=False, error="mission_type, name, params required"), 400
+    if mtype not in ("scan_all", "capture_targets"):
+        return jsonify(ok=False, error=f"unknown mission_type: {mtype}"), 400
+    # Minimal sanity checks per mission type — we don't want a broken
+    # preset to silently save.
+    if mtype == "scan_all":
+        if "target_markers" not in params:
+            return jsonify(ok=False, error="target_markers required for scan_all"), 400
+    if mtype == "capture_targets":
+        if not isinstance(params.get("target_boxes"), list):
+            return jsonify(ok=False, error="target_boxes (list) required for capture_targets"), 400
+    presets = _load_mission_presets()
+    presets.setdefault(mtype, {})[name] = params
+    try:
+        _save_mission_presets(presets)
+    except Exception as e:
+        return jsonify(ok=False, error=f"save failed: {e}"), 500
+    log_command("mission_preset_save", {"mission_type": mtype, "name": name})
+    return jsonify(ok=True, mission_type=mtype, name=name)
+
+
+@app.delete("/proxy/missions/presets")
+def proxy_mission_presets_delete():
+    """Delete a named preset. Query: ?mission_type=X&name=Y"""
+    mtype = str(request.args.get("mission_type", "")).strip()
+    name  = str(request.args.get("name", "")).strip()
+    if not mtype or not name:
+        return jsonify(ok=False, error="mission_type, name required"), 400
+    presets = _load_mission_presets()
+    bucket  = presets.get(mtype, {})
+    if name not in bucket:
+        return jsonify(ok=False, error="preset not found"), 404
+    del bucket[name]
+    try:
+        _save_mission_presets(presets)
+    except Exception as e:
+        return jsonify(ok=False, error=f"save failed: {e}"), 500
+    log_command("mission_preset_delete", {"mission_type": mtype, "name": name})
+    return jsonify(ok=True)
+
+
 @app.post("/proxy/missions/scan_all/start")
 def proxy_missions_scan_all_start():
+    guarded = _pause_guard_response()
+    if guarded is not None:
+        return guarded
     data = request.get_json(silent=True) or {}
     drone_ids = data.get("drone_ids") or []
     if not isinstance(drone_ids, list) or not drone_ids:
@@ -4844,6 +10030,54 @@ def proxy_missions_scan_all_start():
     log_command("mission_scan_all_start", {
         "drone_ids": drone_ids, "target_markers": target_markers,
         "hover_seconds": hover_seconds, "ok": ok, "msg": msg,
+    })
+    status = 200 if ok else 409
+    return jsonify(ok=ok, message=msg, status=mission_manager.status()), status
+
+
+@app.post("/proxy/missions/capture_targets/start")
+def proxy_missions_capture_targets_start():
+    """Launch the SDC26 capture-all-targets mission. Body:
+    {
+      "drone_ids":    ["1", "2", ...],
+      "target_boxes": [{"id":1,"x":-5.0,"y":2.0}, ...],
+      "home_xy":      [x, y],                    # team home coord
+      "arena_face_xy":[x, y],                    # where the camera aims
+      "hover_above_m": 1.5,
+      "hover_seconds": 4.0,
+      "auto_takeoff":  false
+    }
+    """
+    guarded = _pause_guard_response()
+    if guarded is not None:
+        return guarded
+    data = request.get_json(silent=True) or {}
+    drone_ids = data.get("drone_ids") or []
+    if not isinstance(drone_ids, list) or not drone_ids:
+        return jsonify(ok=False, error="drone_ids (non-empty list) required"), 400
+    target_boxes = data.get("target_boxes") or []
+    if not isinstance(target_boxes, list) or not target_boxes:
+        return jsonify(ok=False, error="target_boxes (non-empty list) required"), 400
+    home_xy = data.get("home_xy", [0.0, 1.5])
+    arena_face_xy = data.get("arena_face_xy", [0.0, 5.4])
+    hover_above_m = float(data.get("hover_above_m", 1.5))
+    hover_seconds = float(data.get("hover_seconds", 4.0))
+    nav_tol_xy_m  = float(data.get("nav_tol_xy_m", 0.3))
+    auto_takeoff  = bool(data.get("auto_takeoff", False))
+    ok, msg = mission_manager.start_capture_all_targets(
+        drone_ids=[str(d) for d in drone_ids],
+        target_boxes=target_boxes,
+        home_xy=tuple(home_xy),
+        arena_face_xy=tuple(arena_face_xy),
+        hover_above_m=hover_above_m,
+        hover_seconds=hover_seconds,
+        nav_tol_xy_m=nav_tol_xy_m,
+        auto_takeoff=auto_takeoff,
+    )
+    log_command("mission_capture_targets_start", {
+        "drone_ids": drone_ids,
+        "target_boxes": target_boxes,
+        "ok": ok, "msg": msg,
     })
     status = 200 if ok else 409
     return jsonify(ok=ok, message=msg, status=mission_manager.status()), status

@@ -1,0 +1,513 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>Flight Log Viewer — SDC26</title>
+<style>
+  :root { color-scheme: dark; }
+  body { margin: 0; padding: 12px; background: #0f172a; color: #e2e8f0;
+         font-family: -apple-system, Arial, sans-serif; font-size: 13px; }
+  h2 { margin: 0 0 8px 0; color: #38bdf8; font-size: 18px; }
+  .small { font-size: 11px; color: #94a3b8; }
+  .row { display: flex; gap: 12px; flex-wrap: wrap; align-items: flex-start; }
+  .panel { background: #111827; border: 1px solid #334155; border-radius: 8px;
+           padding: 10px; }
+  button { height: 28px; padding: 0 12px; font-size: 12px; background: #1e293b;
+           color: #e2e8f0; border: 1px solid #475569; border-radius: 5px;
+           cursor: pointer; font-weight: 600; }
+  button:hover { background: #334155; }
+  button.active { background: #0ea5e9; color: #001018; border-color: #0ea5e9; }
+  input[type="file"] { color: #94a3b8; }
+  input[type="range"] { width: 100%; }
+
+  #drop { border: 2px dashed #475569; padding: 24px; text-align: center;
+          color: #94a3b8; border-radius: 8px; margin-bottom: 10px; }
+  #drop.drag { border-color: #0ea5e9; background: #0b2332; color: #7dd3fc; }
+
+  canvas { display: block; background: #0f172a; border: 1px solid #334155;
+           border-radius: 6px; }
+  #arena_canvas { width: 720px; height: 480px; max-width: 100%; }
+  #plot_canvas { width: 720px; height: 220px; max-width: 100%; }
+
+  .kv { font-family: monospace; font-size: 12px; line-height: 1.5; }
+  .kv .k { color: #64748b; display: inline-block; min-width: 90px; }
+  .kv .vx { color: #38bdf8; }
+  .kv .vy { color: #4ade80; }
+  .kv .vz { color: #fb923c; }
+
+  #events_list { max-height: 220px; overflow-y: auto; font-family: monospace;
+                 font-size: 11px; line-height: 1.4; padding-right: 4px; }
+  .ev { padding: 2px 4px; border-radius: 3px; cursor: pointer; }
+  .ev:hover { background: #1e293b; }
+  .ev.curr { background: #334155; }
+  .ev .t { color: #38bdf8; }
+  .ev .c { color: #fbbf24; }
+  .ev .p { color: #e2e8f0; }
+
+  .chip { display: inline-block; padding: 1px 6px; margin: 0 3px 3px 0;
+          border-radius: 3px; background: #1e293b; font-family: monospace;
+          font-size: 10px; font-weight: 600; color: #94a3b8; }
+  .chip.seen { background: #78350f; color: #fde68a; }
+  .chip.ref  { background: #065f46; color: #86efac; }
+
+  .timeline { margin-top: 8px; }
+  #tl_cursor_label { color: #38bdf8; font-family: monospace; font-weight: 700;
+                     font-size: 14px; }
+</style>
+</head>
+<body>
+  <h2>🎥 Flight Log Viewer</h2>
+  <div class="small" style="margin-bottom:8px;">
+    Open a <code>flight_YYYY-MM-DD_HH-MM-SS_drone-N_Name.jsonl</code> file to
+    replay the trajectory, inspect events, and trace anomalies frame-by-frame.
+  </div>
+
+  <div id="drop" class="panel">
+    <strong>Drop a flight log here</strong> or
+    <input type="file" id="file_input" accept=".jsonl,.json,.log" />
+    <div class="small" id="file_status" style="margin-top:6px;"></div>
+  </div>
+
+  <div class="row">
+    <!-- Arena + plot -->
+    <div class="panel" style="flex:2; min-width:700px;">
+      <canvas id="arena_canvas" width="720" height="480"></canvas>
+      <div class="timeline">
+        <div style="display:flex;gap:8px;align-items:center;margin-bottom:6px;">
+          <button id="play_btn">▶ Play</button>
+          <button id="slow_btn" title="0.25×">¼×</button>
+          <button id="norm_btn" class="active" title="1×">1×</button>
+          <button id="fast_btn" title="4×">4×</button>
+          <button id="max_btn" title="16×">16×</button>
+          <span style="flex:1;"></span>
+          <span id="tl_cursor_label">t+0.00s</span>
+          <span id="tl_duration" class="small">/ 0.00s</span>
+        </div>
+        <input type="range" id="tl_slider" min="0" max="100" value="0" step="0.01" />
+      </div>
+      <canvas id="plot_canvas" width="720" height="220"
+              style="margin-top:10px;"></canvas>
+      <div class="small" style="margin-top:4px;color:#94a3b8;">
+        <span style="color:#38bdf8;">— X</span> &nbsp;
+        <span style="color:#4ade80;">— Y</span> &nbsp;
+        <span style="color:#fb923c;">— Z</span> &nbsp;
+        <span style="color:#f472b6;">— Yaw/20</span> &nbsp;
+        <span style="color:#a78bfa;">— |v|</span>
+      </div>
+    </div>
+
+    <!-- State panel -->
+    <div class="panel" style="flex:1; min-width:280px;">
+      <div class="small" style="color:#64748b;font-weight:700;margin-bottom:4px;">
+        State at cursor
+      </div>
+      <div class="kv" id="state_panel">open a file to start</div>
+      <div class="small" style="color:#64748b;font-weight:700;margin:10px 0 4px 0;">
+        Visible markers
+      </div>
+      <div id="markers_panel"></div>
+      <div class="small" style="color:#64748b;font-weight:700;margin:10px 0 4px 0;">
+        Events (click to jump)
+      </div>
+      <div id="events_list"></div>
+    </div>
+  </div>
+
+<script>
+// ── Constants matching the main UI ──────────────────────────────────
+const ARENA_OX = -10.0, ARENA_OY = 0.0;
+const ARENA_W  = 20.0,  ARENA_D  = 10.8;
+const VIEW_PAD = 1.0;
+const CANVAS_PAD = 20;
+
+// ── State ───────────────────────────────────────────────────────────
+let records = [], t0 = 0, durS = 0, ticks = [], cmds = [];
+let cursorIdx = 0;
+let playing = false, playSpeed = 1.0;
+let lastTickWall = 0;
+
+const arenaCanvas = document.getElementById('arena_canvas');
+const plotCanvas  = document.getElementById('plot_canvas');
+const actx = arenaCanvas.getContext('2d');
+const pctx = plotCanvas.getContext('2d');
+const tlSlider = document.getElementById('tl_slider');
+
+// ── File loading ────────────────────────────────────────────────────
+const dropEl = document.getElementById('drop');
+const fileInp = document.getElementById('file_input');
+const fileStatus = document.getElementById('file_status');
+['dragover','dragenter'].forEach(ev => dropEl.addEventListener(ev, e => {
+  e.preventDefault(); dropEl.classList.add('drag');
+}));
+['dragleave','drop'].forEach(ev => dropEl.addEventListener(ev, e => {
+  e.preventDefault(); dropEl.classList.remove('drag');
+}));
+dropEl.addEventListener('drop', e => {
+  const f = e.dataTransfer.files[0]; if (f) loadFile(f);
+});
+fileInp.addEventListener('change', e => {
+  const f = e.target.files[0]; if (f) loadFile(f);
+});
+async function loadFile(f) {
+  fileStatus.textContent = 'loading ' + f.name + '…';
+  const text = await f.text();
+  parseLog(text, f.name);
+}
+
+// Auto-load from ?file= query param (so the main UI can deep-link).
+// The C2 serves /proxy/flight_logs/<name>, which we can fetch directly.
+(async function autoLoadFromQuery() {
+  const qs = new URLSearchParams(location.search);
+  const f = qs.get('file');
+  if (!f) return;
+  try {
+    fileStatus.textContent = 'fetching ' + f + '…';
+    const r = await fetch('/proxy/flight_logs/' + encodeURIComponent(f) + '?dl=0');
+    if (!r.ok) { fileStatus.textContent = 'fetch failed: ' + r.status; return; }
+    const text = await r.text();
+    parseLog(text, f);
+  } catch (e) {
+    fileStatus.textContent = 'error: ' + e;
+  }
+})();
+
+function parseLog(text, label) {
+  records = [];
+  for (const ln of text.split(/\r?\n/)) {
+    if (!ln.trim()) continue;
+    try { records.push(JSON.parse(ln)); } catch {}
+  }
+  if (!records.length) {
+    fileStatus.textContent = 'no records parsed';
+    return;
+  }
+  ticks = records.filter(r => r.type === 'tick' && r.position);
+  cmds  = records.filter(r => r.type === 'cmd');
+  t0 = records[0].ts;
+  durS = (records[records.length - 1].ts - t0);
+  cursorIdx = 0;
+  const drone = records[0].drone_name || records[0].drone_id || '?';
+  fileStatus.innerHTML = '<b>' + label + '</b> — drone <b>' + drone +
+    '</b>, ' + ticks.length + ' ticks, ' + cmds.length + ' cmds, duration ' +
+    durS.toFixed(1) + 's, git=' +
+    (records[0].git_revision?.short_sha || '?');
+  tlSlider.max = durS.toFixed(2);
+  tlSlider.value = 0;
+  document.getElementById('tl_duration').textContent = '/ ' + durS.toFixed(1) + 's';
+  renderEventList();
+  drawAll();
+}
+
+// ── Arena drawing ───────────────────────────────────────────────────
+function arenaToCanvas(x, y) {
+  const W = arenaCanvas.width, H = arenaCanvas.height;
+  const vw = ARENA_W + 2 * VIEW_PAD, vd = ARENA_D + 2 * VIEW_PAD;
+  const sx = (W - 2 * CANVAS_PAD) / vw, sy = (H - 2 * CANVAS_PAD) / vd;
+  return [
+    CANVAS_PAD + (x - (ARENA_OX - VIEW_PAD)) * sx,
+    H - CANVAS_PAD - (y - (ARENA_OY - VIEW_PAD)) * sy,
+  ];
+}
+
+function drawArena() {
+  const ctx = actx, W = arenaCanvas.width, H = arenaCanvas.height;
+  ctx.fillStyle = '#0f172a'; ctx.fillRect(0, 0, W, H);
+  const [ax0, ay0] = arenaToCanvas(ARENA_OX, ARENA_OY + ARENA_D);
+  const [ax1, ay1] = arenaToCanvas(ARENA_OX + ARENA_W, ARENA_OY);
+  ctx.fillStyle = '#0b1220'; ctx.fillRect(ax0, ay0, ax1 - ax0, ay1 - ay0);
+  // grid
+  ctx.strokeStyle = '#1e293b'; ctx.lineWidth = 1;
+  for (let gx = ARENA_OX; gx <= ARENA_OX + ARENA_W + 0.01; gx += 1) {
+    const [cx] = arenaToCanvas(gx, ARENA_OY);
+    ctx.beginPath(); ctx.moveTo(cx, ay0); ctx.lineTo(cx, ay1); ctx.stroke();
+  }
+  for (let gy = ARENA_OY; gy <= ARENA_OY + ARENA_D + 0.01; gy += 1) {
+    const [, cy] = arenaToCanvas(ARENA_OX, gy);
+    ctx.beginPath(); ctx.moveTo(ax0, cy); ctx.lineTo(ax1, cy); ctx.stroke();
+  }
+  ctx.strokeStyle = '#475569'; ctx.lineWidth = 2;
+  ctx.strokeRect(ax0, ay0, ax1 - ax0, ay1 - ay0);
+  // wall labels
+  ctx.fillStyle = '#64748b'; ctx.font = 'bold 10px monospace';
+  ctx.textAlign = 'center'; ctx.textBaseline = 'top';
+  ctx.fillText('BACK',  (ax0+ax1)/2, ay0 + 3);
+  ctx.fillText('FRONT', (ax0+ax1)/2, ay1 - 12);
+  ctx.save(); ctx.translate(ax0 + 10, (ay0+ay1)/2); ctx.rotate(-Math.PI/2);
+  ctx.fillText('LEFT', 0, 0); ctx.restore();
+  ctx.save(); ctx.translate(ax1 - 10, (ay0+ay1)/2); ctx.rotate(Math.PI/2);
+  ctx.fillText('RIGHT', 0, 0); ctx.restore();
+
+  // ── Trajectory — coloured polyline, older = dimmer ──
+  if (ticks.length) {
+    const cursorT = currentT();
+    const recent = ticks.filter(r => (r.ts - t0) <= cursorT);
+    // Gradient-ish: walk the polyline, varying alpha by age
+    ctx.lineWidth = 1.5;
+    for (let i = 1; i < recent.length; i++) {
+      const age = cursorT - (recent[i-1].ts - t0);
+      const alpha = Math.max(0.1, 1.0 - age / Math.max(1, durS));
+      ctx.strokeStyle = 'rgba(56,189,248,' + alpha + ')';
+      const [x0, y0] = arenaToCanvas(recent[i-1].position[0], recent[i-1].position[1]);
+      const [x1, y1] = arenaToCanvas(recent[i].position[0], recent[i].position[1]);
+      ctx.beginPath(); ctx.moveTo(x0, y0); ctx.lineTo(x1, y1); ctx.stroke();
+    }
+    // Current position — big dot + yaw arrow
+    const c = currentTick();
+    if (c) {
+      const [cx, cy] = arenaToCanvas(c.position[0], c.position[1]);
+      ctx.beginPath(); ctx.arc(cx, cy, 7, 0, 2*Math.PI);
+      ctx.fillStyle = '#fbbf24'; ctx.fill();
+      ctx.strokeStyle = '#fff'; ctx.lineWidth = 1.5; ctx.stroke();
+      const yaw = c.telemetry?.yaw;
+      if (typeof yaw === 'number') {
+        const a = yaw * Math.PI / 180;   // Anafi: 0° = +y
+        const L = 18;
+        ctx.strokeStyle = '#fbbf24'; ctx.lineWidth = 2;
+        ctx.beginPath();
+        ctx.moveTo(cx, cy);
+        ctx.lineTo(cx + Math.sin(a) * L, cy - Math.cos(a) * L);
+        ctx.stroke();
+      }
+      // velocity vector
+      if (Array.isArray(c.pos_vel) && (c.pos_vel[0] || c.pos_vel[1])) {
+        const vs = 6;   // scale
+        const [vx, vy] = arenaToCanvas(
+          c.position[0] + c.pos_vel[0] * vs,
+          c.position[1] + c.pos_vel[1] * vs);
+        ctx.strokeStyle = '#a78bfa'; ctx.lineWidth = 1.5;
+        ctx.beginPath(); ctx.moveTo(cx, cy); ctx.lineTo(vx, vy); ctx.stroke();
+      }
+    }
+  }
+
+  // Pose-jump indicators — draw at positions where |Δxy| > 1 m in a tick
+  for (let i = 1; i < ticks.length; i++) {
+    const dt = ticks[i].ts - ticks[i-1].ts;
+    if (dt <= 0) continue;
+    const dx = ticks[i].position[0] - ticks[i-1].position[0];
+    const dy = ticks[i].position[1] - ticks[i-1].position[1];
+    const d = Math.hypot(dx, dy);
+    if (d > 1.0) {
+      const [x, y] = arenaToCanvas(ticks[i].position[0], ticks[i].position[1]);
+      ctx.strokeStyle = '#ef4444'; ctx.lineWidth = 2;
+      ctx.beginPath(); ctx.arc(x, y, 9, 0, 2*Math.PI); ctx.stroke();
+      ctx.fillStyle = '#ef4444'; ctx.font = 'bold 10px monospace';
+      ctx.textAlign = 'left'; ctx.textBaseline = 'middle';
+      ctx.fillText('Δ' + d.toFixed(1) + 'm', x + 12, y);
+    }
+  }
+}
+
+function currentT() {
+  return parseFloat(tlSlider.value);
+}
+function currentTick() {
+  if (!ticks.length) return null;
+  const t = currentT();
+  // binary-search the nearest tick at t
+  let lo = 0, hi = ticks.length - 1;
+  while (lo < hi) {
+    const mid = (lo + hi) >> 1;
+    if ((ticks[mid].ts - t0) < t) lo = mid + 1; else hi = mid;
+  }
+  return ticks[lo];
+}
+
+// ── Plot charts (X / Y / Z / yaw / speed) ───────────────────────────
+function drawPlot() {
+  const ctx = pctx, W = plotCanvas.width, H = plotCanvas.height;
+  ctx.fillStyle = '#0f172a'; ctx.fillRect(0, 0, W, H);
+  if (!ticks.length) return;
+  const PX = 40, PW = W - PX - 8;
+  const PY = 10, PH = H - PY - 16;
+  // X = time; Y axes scaled independently per series
+  const tMax = durS;
+  // Draw zero line
+  ctx.strokeStyle = '#1e293b'; ctx.lineWidth = 1;
+  ctx.beginPath(); ctx.moveTo(PX, PY + PH/2); ctx.lineTo(PX + PW, PY + PH/2); ctx.stroke();
+  // Series
+  const series = [
+    {get: r => r.position[0],             min: -10,  max: 10,  col: '#38bdf8'},
+    {get: r => r.position[1],             min: 0,    max: 11,  col: '#4ade80'},
+    {get: r => r.position[2],             min: 0,    max: 6,   col: '#fb923c'},
+    {get: r => (r.telemetry?.yaw ?? 0)/20,min: -18,  max: 18,  col: '#f472b6'},
+    {get: r => {
+      const v = r.pos_vel;
+      return Array.isArray(v) ? Math.hypot(v[0]||0, v[1]||0, v[2]||0) : 0;
+    }, min: 0, max: 4, col: '#a78bfa'},
+  ];
+  for (const s of series) {
+    ctx.strokeStyle = s.col; ctx.lineWidth = 1.2;
+    ctx.beginPath();
+    let started = false;
+    for (const r of ticks) {
+      const t = r.ts - t0;
+      const v = s.get(r);
+      const x = PX + (t / tMax) * PW;
+      const y = PY + PH - ((v - s.min) / (s.max - s.min)) * PH;
+      if (!started) { ctx.moveTo(x, y); started = true; }
+      else          { ctx.lineTo(x, y); }
+    }
+    ctx.stroke();
+  }
+  // Event markers
+  ctx.fillStyle = '#fbbf24';
+  for (const c of cmds) {
+    const t = c.ts - t0;
+    const x = PX + (t / tMax) * PW;
+    ctx.fillRect(x, PY, 1, PH);
+  }
+  // Cursor
+  const cursorX = PX + (currentT() / tMax) * PW;
+  ctx.strokeStyle = '#fbbf24'; ctx.lineWidth = 1;
+  ctx.beginPath(); ctx.moveTo(cursorX, PY); ctx.lineTo(cursorX, PY + PH); ctx.stroke();
+  // Axis labels
+  ctx.fillStyle = '#64748b'; ctx.font = '9px monospace'; ctx.textAlign = 'right';
+  ctx.fillText('+10', PX - 2, PY + 4);
+  ctx.fillText(' 0',  PX - 2, PY + PH/2 + 3);
+  ctx.fillText('-10', PX - 2, PY + PH - 2);
+  ctx.textAlign = 'left';
+  for (let i = 0; i <= 10; i++) {
+    const t = (i / 10) * tMax;
+    const x = PX + (t / tMax) * PW;
+    ctx.fillText(t.toFixed(0) + 's', x, H - 2);
+  }
+}
+
+// ── State + events panels ───────────────────────────────────────────
+function renderStatePanel() {
+  const el = document.getElementById('state_panel');
+  if (!ticks.length) { el.textContent = '—'; return; }
+  const r = currentTick();
+  const t = (r.ts - t0).toFixed(2);
+  const p = r.position;
+  const tel = r.telemetry || {};
+  const vel = r.pos_vel || [0,0,0];
+  el.innerHTML =
+    '<span class="k">time</span>  <span class="vx">t+' + t + 's</span><br>' +
+    '<span class="k">pos</span>  ' +
+      '<span class="vx">x=' + p[0].toFixed(2) + '</span> ' +
+      '<span class="vy">y=' + p[1].toFixed(2) + '</span> ' +
+      '<span class="vz">z=' + p[2].toFixed(2) + '</span><br>' +
+    '<span class="k">vel</span>  ' +
+      '<span class="vx">' + vel[0].toFixed(2) + '</span>, ' +
+      '<span class="vy">' + vel[1].toFixed(2) + '</span>, ' +
+      '<span class="vz">' + vel[2].toFixed(2) + '</span> m/s<br>' +
+    '<span class="k">yaw</span>  ' + (tel.yaw?.toFixed?.(1) || '?') + '°<br>' +
+    '<span class="k">height</span>  ' + (tel.height_cm ?? '?') + ' cm<br>' +
+    '<span class="k">battery</span>  ' + (tel.battery ?? '?') + '%<br>' +
+    '<span class="k">flying</span>  ' + (tel.flying ? 'YES' : 'no') + '<br>' +
+    '<span class="k">pos_stale</span>  ' + (r.pos_stale ? 'STALE' : 'fresh') + '<br>' +
+    '<span class="k">ceiling</span>  ' + (tel.ceiling_m ?? '?') + 'm ' +
+      (tel.ceiling_engaged ? '⚠ ENGAGED' : '') + '<br>' +
+    '<span class="k">vgx/y/z</span>  ' +
+      (tel.vgx ?? '?') + ' / ' + (tel.vgy ?? '?') + ' / ' + (tel.vgz ?? '?');
+}
+function renderMarkersPanel() {
+  const el = document.getElementById('markers_panel');
+  if (!ticks.length) { el.innerHTML = '—'; return; }
+  const r = currentTick();
+  const vis = r.visible_markers || [];
+  const refs = new Set((r.ref_markers || []).map(String));
+  el.innerHTML = vis.length
+    ? vis.map(m => {
+        const cls = refs.has(String(m)) ? 'chip ref' : 'chip seen';
+        return '<span class="' + cls + '">' + m + (refs.has(String(m)) ? '*' : '') + '</span>';
+      }).join('')
+    : '<span class="small" style="color:#ef4444;">none visible</span>';
+}
+function renderEventList() {
+  const el = document.getElementById('events_list');
+  // Build event list: cmds + pose jumps + ref-marker changes
+  const events = [];
+  for (const c of cmds) {
+    events.push({ts: c.ts - t0, kind: 'cmd', label: c.event,
+                 payload: c.payload || {}});
+  }
+  // Pose jumps
+  for (let i = 1; i < ticks.length; i++) {
+    const dx = ticks[i].position[0] - ticks[i-1].position[0];
+    const dy = ticks[i].position[1] - ticks[i-1].position[1];
+    const dt = ticks[i].ts - ticks[i-1].ts;
+    const d = Math.hypot(dx, dy);
+    if (d > 1.0 && dt > 0) {
+      events.push({ts: ticks[i].ts - t0, kind: 'jump',
+                   label: 'pose jump Δ=' + d.toFixed(2) + 'm',
+                   payload: {pos: ticks[i].position}});
+    }
+  }
+  // Ref marker changes
+  let lastRefs = '';
+  for (const r of ticks) {
+    const refs = (r.ref_markers || []).slice().sort().join(',');
+    if (refs !== lastRefs) {
+      events.push({ts: r.ts - t0, kind: 'refs',
+                   label: 'refs → [' + refs + ']',
+                   payload: {}});
+      lastRefs = refs;
+    }
+  }
+  events.sort((a,b) => a.ts - b.ts);
+  el.innerHTML = events.map((e, i) => {
+    const pl = e.kind === 'cmd'
+      ? (e.payload.keys || e.payload.key || e.payload.drone_ids || '')
+      : '';
+    return '<div class="ev" data-t="' + e.ts.toFixed(3) + '">' +
+      '<span class="t">t+' + e.ts.toFixed(2) + 's</span> ' +
+      '<span class="c">' + e.kind + '</span> ' +
+      '<span class="p">' + e.label + ' ' + (pl ? JSON.stringify(pl) : '') + '</span>' +
+    '</div>';
+  }).join('');
+  el.querySelectorAll('.ev').forEach(d => {
+    d.addEventListener('click', () => {
+      tlSlider.value = d.dataset.t;
+      drawAll();
+    });
+  });
+}
+
+// ── Loop + redraw ───────────────────────────────────────────────────
+function drawAll() {
+  drawArena();
+  drawPlot();
+  renderStatePanel();
+  renderMarkersPanel();
+  document.getElementById('tl_cursor_label').textContent = 't+' + currentT().toFixed(2) + 's';
+}
+tlSlider.addEventListener('input', drawAll);
+
+// Playback
+function tick(now) {
+  if (playing) {
+    const dt = (now - lastTickWall) / 1000.0;
+    lastTickWall = now;
+    let t = currentT() + dt * playSpeed;
+    if (t >= durS) { t = durS; playing = false; updatePlayBtn(); }
+    tlSlider.value = t.toFixed(3);
+    drawAll();
+  } else {
+    lastTickWall = now;
+  }
+  requestAnimationFrame(tick);
+}
+requestAnimationFrame(tick);
+
+document.getElementById('play_btn').addEventListener('click', () => {
+  playing = !playing;
+  if (playing && currentT() >= durS - 0.05) tlSlider.value = 0;
+  updatePlayBtn();
+});
+function updatePlayBtn() {
+  document.getElementById('play_btn').textContent = playing ? '⏸ Pause' : '▶ Play';
+}
+[['slow_btn',0.25], ['norm_btn',1], ['fast_btn',4], ['max_btn',16]].forEach(
+  ([id, sp]) => document.getElementById(id).addEventListener('click', () => {
+    playSpeed = sp;
+    ['slow_btn','norm_btn','fast_btn','max_btn'].forEach(
+      oid => document.getElementById(oid).classList.toggle('active', oid === id));
+  }));
+
+drawAll();
+</script>
+</body>
+</html>

@@ -181,6 +181,15 @@ class HeadlessAruCoPositioning:
         # Live-tunable fusion knobs
         self.top_k_markers = 4           # keep best N of visible refs; 0 = unlimited
         self.outlier_reject_m = OUTLIER_POS_THRESH  # drop per-marker estimates > this from centroid
+        # ── Distance correction factor ──────────────────────────────────
+        # Multiplier applied to the solvePnP-produced marker→camera
+        # translation (tvec). Compensates for systematic scale error in
+        # the fused pose, typically caused by a mismatch between the real
+        # marker physical size and the configured marker_size_m, or by an
+        # uncalibrated-camera focal length. Use when the UI shows e.g.
+        # 7 m but the real distance to the marker is 9 m → set to 9/7
+        # ≈ 1.286. Default 1.0 = no correction.
+        self.distance_scale = 1.0
 
         # last valid pose cache for temporary marker loss
         self.last_valid_pose = None
@@ -526,12 +535,26 @@ class HeadlessAruCoPositioning:
         # Use self.MARKER_3D_POINTS so that the configured marker_size_m is
         # taken into account when estimating camera-to-marker distance via solvePnP.
         marker_points = self.MARKER_3D_POINTS.astype(np.float32)
+        # Global multiplicative correction on camera→marker distance.
+        # Applied to tvec so that downstream ref-pose fusion AND target
+        # projection both see the corrected geometry (scaling tvec rotates
+        # through R_m_c correctly, giving the camera the right distance
+        # from the marker in world coords).
+        try:
+            dist_scale = float(getattr(self, "distance_scale", 1.0))
+        except Exception:
+            dist_scale = 1.0
+        if dist_scale <= 0 or not np.isfinite(dist_scale):
+            dist_scale = 1.0
         for i, mid_raw in enumerate(seen_ids):
             mid = int(mid_raw)
             ok, rvec, tvec = cv2.solvePnP(marker_points, corners[i].reshape(-1, 2), self.camera_matrix,
                                           self.dist_coeffs, flags=cv2.SOLVEPNP_IPPE_SQUARE)
             if ok:
-                cached_poses[mid] = (rvec, tvec.reshape(3))
+                t = tvec.reshape(3)
+                if dist_scale != 1.0:
+                    t = t * dist_scale
+                cached_poses[mid] = (rvec, t)
         ref_indices = [i for i, mid in enumerate(seen_ids) if
                        int(mid) in self.marker_positions and int(mid) in cached_poses]
         tgt_indices = [i for i, mid in enumerate(seen_ids) if int(mid) >= 30 and int(mid) in cached_poses]
