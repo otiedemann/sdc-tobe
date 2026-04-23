@@ -3,6 +3,7 @@
 # Install with: pip install -r requirements-pi.txt
 
 flask
+flask-sock        # WebSocket endpoints for low-latency C2↔FC channel
 djitellopy
 opencv-python-headless
 numpy

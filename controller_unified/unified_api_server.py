@@ -459,6 +459,20 @@ def detect_drone_type() -> Tuple[str, str]:
 # ---------------------------------------------------------------------------
 app = Flask(__name__)
 
+# ── WebSocket channel (C2 ↔ this FC) ──────────────────────────────────
+# Three endpoints that exist alongside the HTTP API and carry the same
+# payloads without the TCP+HTTP framing overhead per call. Falls back to
+# "import flask_sock" so an older Pi without the package still runs;
+# only the HTTP endpoints will be available there.
+try:
+    from flask_sock import Sock as _Sock
+    sock = _Sock(app)
+    HAS_WS = True
+except Exception as _e:
+    sock = None
+    HAS_WS = False
+    print(f"[WS] flask-sock not available ({_e}) — WS endpoints disabled")
+
 
 # Enum-aware JSON encoder. Olympe returns enum instances (class `band`,
 # `selection_type`, etc.) in its state dicts; Flask's stock encoder raises
@@ -4007,9 +4021,170 @@ def api_ceiling_set():
     return jsonify(ok=True, ceiling_m=v, firmware_result=firmware_result)
 
 
+# ═══════════════════════════════════════════════════════════════════════
+# WebSocket endpoints — low-latency C2 ↔ FC channel
+# ═══════════════════════════════════════════════════════════════════════
+#
+# Three long-lived WS connections replace the highest-rate HTTP polls:
+#
+#   /ws/telemetry  — server-push at TELEMETRY_HZ (no framing per call)
+#   /ws/position   — server-push on every pose update (same cadence as
+#                    the existing SSE stream, but lower overhead)
+#   /ws/rc         — bidirectional. C2 sends {type:"rc",lr,fb,ud,yaw}
+#                    or {type:"key",event,key}; server applies them and
+#                    acks.
+#
+# The endpoints only exist if flask-sock was importable (HAS_WS). When
+# missing, the HTTP endpoints keep working unchanged.
+
+if HAS_WS:
+    _WS_PING_INTERVAL_S = 15.0    # keep NATs / firewalls happy
+
+    @sock.route("/ws/telemetry")
+    def ws_telemetry(ws):
+        """Pushes one telemetry JSON per (1/TELEMETRY_HZ) seconds. Stops
+        the moment the client disconnects. Wrapped in try/except because
+        the receiver can close mid-send and raises ConnectionError."""
+        try:
+            # Hello packet lets the C2 check connectivity + read drone_type
+            ws.send(json.dumps({
+                "type": "hello", "service": "telemetry",
+                "drone_type": drone_type, "hz": TELEMETRY_HZ,
+                "server_ts": time.time(),
+            }))
+            period = 1.0 / max(0.5, float(TELEMETRY_HZ))
+            last_ping = time.time()
+            while running:
+                t0 = time.time()
+                payload = _build_telemetry_payload()
+                payload["type"] = "telemetry"
+                payload["server_ts"] = t0
+                try:
+                    ws.send(json.dumps(payload, default=str))
+                except Exception:
+                    return
+                # Opportunistic ping to keep the NAT entry alive
+                if t0 - last_ping > _WS_PING_INTERVAL_S:
+                    try:
+                        ws.send(json.dumps({"type": "ping", "server_ts": t0}))
+                    except Exception:
+                        return
+                    last_ping = t0
+                dt = time.time() - t0
+                time.sleep(max(0.01, period - dt))
+        except Exception as e:
+            print(f"[WS] /ws/telemetry error: {e}")
+
+    @sock.route("/ws/position")
+    def ws_position(ws):
+        """Pushes a payload on every position update. Piggybacks the
+        existing broadcast queue (_pos_ws_queues) so there's zero extra
+        work in the positioner loop."""
+        q: queue.Queue = queue.Queue(maxsize=30)
+        with _pos_sse_lock:
+            _pos_ws_queues.append(q)
+        try:
+            ws.send(json.dumps({
+                "type": "hello", "service": "position",
+                "server_ts": time.time(),
+            }))
+            last_ping = time.time()
+            while running:
+                try:
+                    msg = q.get(timeout=5.0)
+                    ws.send(msg)
+                except queue.Empty:
+                    now = time.time()
+                    if now - last_ping > _WS_PING_INTERVAL_S:
+                        ws.send(json.dumps({"type": "ping", "server_ts": now}))
+                        last_ping = now
+                except Exception:
+                    return
+        except Exception as e:
+            print(f"[WS] /ws/position error: {e}")
+        finally:
+            with _pos_sse_lock:
+                try:
+                    _pos_ws_queues.remove(q)
+                except ValueError:
+                    pass
+
+    @sock.route("/ws/rc")
+    def ws_rc(ws):
+        """Bidirectional RC channel. Accepts two message shapes:
+
+            {"type":"rc",  "lr":0, "fb":0, "ud":0, "yaw":0, "duration_ms":250}
+            {"type":"key", "event":"down"|"up", "key":"w"}
+
+        Replies with {"type":"ack","seq":N} if the client included a seq,
+        otherwise stays silent (fire-and-forget). Applies to the same
+        rc_override / pressed_web globals that /api/rc and /api/key_down
+        write — so the tick loop picks it up without caring about the
+        transport."""
+        global rc_override, rc_override_until
+        try:
+            ws.send(json.dumps({
+                "type": "hello", "service": "rc", "server_ts": time.time(),
+            }))
+            while running:
+                try:
+                    msg = ws.receive(timeout=20.0)
+                except Exception:
+                    return
+                if msg is None:
+                    return
+                try:
+                    data = json.loads(msg)
+                except Exception:
+                    continue
+                mtype = data.get("type")
+                seq = data.get("seq")
+                if mtype == "rc":
+                    def clamp(v):
+                        try:    return max(-100, min(100, int(v)))
+                        except: return 0
+                    lr  = clamp(data.get("lr", 0))
+                    fb  = clamp(data.get("fb", 0))
+                    ud  = clamp(data.get("ud", 0))
+                    yaw = clamp(data.get("yaw", 0))
+                    dur = max(50, min(2000, int(data.get("duration_ms", 250))))
+                    with rc_lock:
+                        rc_override = (lr, fb, ud, yaw)
+                        rc_override_until = time.time() + (dur / 1000.0)
+                    if seq is not None:
+                        try:
+                            ws.send(json.dumps({"type": "ack", "seq": seq}))
+                        except Exception:
+                            return
+                elif mtype == "key":
+                    ev = (data.get("event") or "").lower()
+                    k  = str(data.get("key") or "").lower()
+                    if k:
+                        if ev == "down": add_key(k)
+                        elif ev == "up": remove_key(k)
+                    if seq is not None:
+                        try:
+                            ws.send(json.dumps({"type": "ack", "seq": seq}))
+                        except Exception:
+                            return
+                elif mtype == "ping":
+                    try:
+                        ws.send(json.dumps({
+                            "type": "pong",
+                            "server_ts": time.time(),
+                            "echo": data.get("client_ts"),
+                        }))
+                    except Exception:
+                        return
+        except Exception as e:
+            print(f"[WS] /ws/rc error: {e}")
+
+
 # --- Telemetry endpoints ---
-@app.get("/api/telemetry")
-def api_telemetry():
+def _build_telemetry_payload() -> dict:
+    """Shared telemetry builder used by both HTTP (/api/telemetry) and
+    WebSocket (/ws/telemetry) paths so every consumer sees identical
+    fields with a single implementation to maintain."""
     now = time.time()
     age = (now - last_state_seen) if last_state_seen else 9999.0
     with telemetry_lock:
@@ -4017,18 +4192,13 @@ def api_telemetry():
     payload["state_age_s"] = round(age, 3)
     payload["state_fresh"] = age <= 2.0
     payload["drone_type"] = drone_type
-    # Connection watchdog telemetry — lets the C2 show reconnect activity
     with conn_lock:
         payload["connected"] = bool(conn_state.get("connected", False))
         payload["reconnect_failures"] = int(conn_state.get("consecutive_failures", 0))
         payload["reconnect_last_error"] = conn_state.get("last_error", "") or ""
-    # Ceiling guard state — UI banners + flight logs consume this
     payload["ceiling_m"] = round(float(MAX_ALTITUDE_M), 2)
     payload["ceiling_engaged"] = bool(_ceiling_engaged)
     payload["ceiling_reason"] = _ceiling_last_reason or ""
-    # Magnetometer calibration status (Anafi only) so the C2 can show a
-    # "CAL NEEDED" indicator. Read defensively because older Olympe versions
-    # may not have the calibration messages at all.
     try:
         b = backend
         reader = getattr(b, "_read_magnetometer_state", None) if b else None
@@ -4038,6 +4208,12 @@ def api_telemetry():
             payload["magneto_required"] = _magneto_needs_calibration(mag)
     except Exception:
         pass
+    return payload
+
+
+@app.get("/api/telemetry")
+def api_telemetry():
+    payload = _build_telemetry_payload()
     resp = jsonify(payload)
     resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
     resp.headers["Pragma"] = "no-cache"
@@ -4187,17 +4363,31 @@ def _pos_snapshot_to_js(snapshot: dict) -> dict:
     }
 
 
+_pos_ws_queues: list = []        # list[queue.Queue] — one per /ws/position client
+
+
 def _broadcast_pos_sse(snapshot: dict):
-    msg = f"data: {json.dumps(_pos_snapshot_to_js(snapshot))}\n\n"
+    payload = _pos_snapshot_to_js(snapshot)
+    msg_sse = f"data: {json.dumps(payload)}\n\n"
+    msg_ws  = json.dumps({"type": "position", **payload, "ts": time.time()})
     with _pos_sse_lock:
         dead = []
         for q in _pos_sse_queues:
             try:
-                q.put_nowait(msg)
+                q.put_nowait(msg_sse)
             except queue.Full:
                 dead.append(q)
         for q in dead:
             _pos_sse_queues.remove(q)
+        # Same snapshot to every WS client subscribed to /ws/position.
+        dead = []
+        for q in _pos_ws_queues:
+            try:
+                q.put_nowait(msg_ws)
+            except queue.Full:
+                dead.append(q)
+        for q in dead:
+            _pos_ws_queues.remove(q)
 
 
 def _default_camera_matrix_pos(frame_w: int, frame_h: int):

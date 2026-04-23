@@ -6,6 +6,9 @@
 
 # --- Required ---
 flask
+# WebSocket push channel for telemetry / position / RC. Drops C2↔FC
+# round-trip overhead below HTTP framing levels (see BUILD bd notes).
+flask-sock
 
 # --- Tello drone support ---
 djitellopy

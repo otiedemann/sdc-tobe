@@ -9,6 +9,18 @@ from pathlib import Path
 import requests
 from flask import Flask, Response, jsonify, request, send_file
 
+# ── WebSocket client — optional dependency ────────────────────────────
+# When present, the C2 opens a long-lived WS per drone for telemetry,
+# position, and RC. Drops per-call HTTP framing overhead; important
+# savings on the RC path that fires per key stroke.
+try:
+    import websocket as _wsclient  # websocket-client package
+    HAS_WSCLIENT = True
+except Exception as _e:
+    _wsclient = None
+    HAS_WSCLIENT = False
+    print(f"[WS] websocket-client not available ({_e}) — C2 falls back to HTTP")
+
 # ── ArUco Seek (multi-drone observer / LIVE controller) ────────────────────
 import sys as _sys
 _sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -143,6 +155,41 @@ command_log_last: dict[str, float] = {}
 # /proxy/flight_logs (list + download).
 FLIGHT_LOG_DIR = Path(os.getenv("FLIGHT_LOG_DIR", "flight_logs")).resolve()
 FLIGHT_LOG_HZ  = float(os.getenv("FLIGHT_LOG_HZ", "5.0"))
+
+
+def _read_git_revision() -> dict:
+    """Return a small dict describing the repo state at C2 startup.
+    Safe under: no .git dir, detached HEAD, git not on PATH.
+    Used to stamp every flight-log header for post-flight traceability."""
+    import subprocess
+    info = {}
+    repo = Path(__file__).resolve().parent.parent
+    def _run(args):
+        try:
+            r = subprocess.run(args, cwd=repo, capture_output=True,
+                                text=True, timeout=2)
+            if r.returncode == 0:
+                return r.stdout.strip()
+        except Exception:
+            pass
+        return ""
+    sha     = _run(["git", "rev-parse", "HEAD"])
+    short   = _run(["git", "rev-parse", "--short", "HEAD"])
+    branch  = _run(["git", "rev-parse", "--abbrev-ref", "HEAD"])
+    dirty   = _run(["git", "status", "--porcelain"])
+    subject = _run(["git", "log", "-1", "--pretty=%s"])
+    info["sha"] = sha
+    info["short_sha"] = short
+    info["branch"] = branch
+    info["dirty"] = bool(dirty)
+    info["subject"] = subject
+    return info
+
+
+_GIT_REVISION = _read_git_revision()
+print(f"[GIT] {_GIT_REVISION.get('branch') or '?'} @ {_GIT_REVISION.get('short_sha') or '?'}"
+      f"{' (dirty)' if _GIT_REVISION.get('dirty') else ''} "
+      f"— {_GIT_REVISION.get('subject') or ''}")
 
 
 class FlightLogger:
@@ -319,11 +366,17 @@ class FlightLogger:
         name = (self.drones.get(did, {}).get("name") or did).replace(" ", "_")
         path = self.log_dir / f"flight_{ts}_drone-{did}_{name}.jsonl"
         fh = path.open("w", encoding="utf-8", buffering=1)  # line-buffered
-        fh.write(json.dumps({
+        # Every flight's first record carries enough provenance that a
+        # log opened three months later still identifies what code
+        # produced it: git sha + branch + dirty flag + commit subject.
+        header = {
             "type": "takeoff", "ts": time.time(), "drone_id": did,
             "drone_name": self.drones.get(did, {}).get("name"),
+            "git_revision": _GIT_REVISION,
+            "drone_base": self.drones.get(did, {}).get("base"),
             "telemetry": tel,
-        }, default=str) + "\n")
+        }
+        fh.write(json.dumps(header, default=str) + "\n")
         self._flights[did] = {
             "fh": fh, "path": path, "opened_at": time.time(), "records": 1,
         }
@@ -356,6 +409,251 @@ class FlightLogger:
 
 flight_logger = FlightLogger(DRONES, _http_session, FLIGHT_LOG_DIR, FLIGHT_LOG_HZ)
 flight_logger.start()
+
+
+# ── WebSocket client per drone ─────────────────────────────────────────
+# Maintains three long-lived WS to each Pi (/ws/telemetry pulls, /ws/position
+# pulls, /ws/rc pushes). Caches the latest telemetry + position so HTTP
+# proxy calls can answer instantly from RAM instead of going back to the
+# Pi. RC/key events take the send path which reuses the already-open
+# TCP+WS socket — shaves the ~3-15 ms per-call HTTP framing cost.
+class DroneWS:
+    """One WS channel (really three sockets) to a single Pi. All
+    connections auto-reconnect with 1s backoff up to 5s. When the
+    websocket-client package isn't present (HAS_WSCLIENT=False) all
+    sends become no-ops and callers fall back to HTTP."""
+
+    def __init__(self, drone_id: str, base_http_url: str):
+        self.drone_id = str(drone_id)
+        self.base_http = base_http_url.rstrip("/")
+        # Convert http(s):// → ws(s):// for the WS URL
+        if self.base_http.startswith("https://"):
+            self.ws_base = "wss://" + self.base_http[len("https://"):]
+        elif self.base_http.startswith("http://"):
+            self.ws_base = "ws://"  + self.base_http[len("http://"):]
+        else:
+            self.ws_base = "ws://"  + self.base_http
+
+        self._lock = threading.Lock()
+        self._latest_tel: dict | None = None
+        self._latest_tel_ts: float = 0.0
+        self._latest_pos: dict | None = None
+        self._latest_pos_ts: float = 0.0
+        self._rc_ws = None                    # websocket.WebSocket
+        self._rc_ws_lock = threading.Lock()
+        self._rc_seq = 0
+        self._ws_connected = {"telemetry": False, "position": False, "rc": False}
+        self._running = False
+
+    # --- Public API ---
+    def start(self):
+        if not HAS_WSCLIENT or self._running:
+            return
+        self._running = True
+        for name, target in (
+            ("telemetry", self._rx_telemetry_loop),
+            ("position",  self._rx_position_loop),
+            ("rc",        self._rc_connect_loop),
+        ):
+            t = threading.Thread(target=target, daemon=True,
+                                  name=f"ws-{name}-{self.drone_id}")
+            t.start()
+
+    def stop(self):
+        self._running = False
+        with self._rc_ws_lock:
+            if self._rc_ws is not None:
+                try: self._rc_ws.close()
+                except Exception: pass
+                self._rc_ws = None
+
+    def latest_telemetry(self) -> tuple[dict | None, float]:
+        """Return (cached_telemetry, age_seconds) or (None, +inf) when
+        no WS frame has arrived."""
+        with self._lock:
+            if self._latest_tel is None:
+                return None, float("inf")
+            return dict(self._latest_tel), time.time() - self._latest_tel_ts
+
+    def latest_position(self) -> tuple[dict | None, float]:
+        with self._lock:
+            if self._latest_pos is None:
+                return None, float("inf")
+            return dict(self._latest_pos), time.time() - self._latest_pos_ts
+
+    def send_rc(self, lr: int, fb: int, ud: int, yaw: int,
+                duration_ms: int = 250) -> bool:
+        """Send an RC frame over WS. Returns True on success, False if
+        the socket is not currently connected — caller should fall back
+        to HTTP."""
+        return self._send_rc_message({
+            "type": "rc", "lr": int(lr), "fb": int(fb),
+            "ud": int(ud), "yaw": int(yaw),
+            "duration_ms": int(duration_ms),
+        })
+
+    def send_key(self, key: str, event: str) -> bool:
+        """Send a key_down / key_up over WS. event must be 'down' or 'up'."""
+        if event not in ("down", "up"):
+            return False
+        return self._send_rc_message({
+            "type": "key", "key": str(key).lower(), "event": event,
+        })
+
+    def status(self) -> dict:
+        """Connection snapshot for /proxy/ws/status + UI badge."""
+        _, tel_age = self.latest_telemetry()
+        _, pos_age = self.latest_position()
+        return {
+            "drone_id": self.drone_id,
+            "rc":        self._ws_connected["rc"],
+            "telemetry": self._ws_connected["telemetry"],
+            "position":  self._ws_connected["position"],
+            "telemetry_age_ms": int(tel_age * 1000) if tel_age < 1e6 else None,
+            "position_age_ms":  int(pos_age * 1000) if pos_age < 1e6 else None,
+        }
+
+    # --- Internals ---
+    def _send_rc_message(self, msg: dict) -> bool:
+        if not HAS_WSCLIENT:
+            return False
+        with self._rc_ws_lock:
+            ws = self._rc_ws
+            if ws is None:
+                return False
+            self._rc_seq += 1
+            msg["seq"] = self._rc_seq
+            try:
+                ws.send(json.dumps(msg))
+                return True
+            except Exception as e:
+                # Connection died — flag and let the reconnect loop handle it
+                print(f"[WS] {self.drone_id} rc send failed: {e}")
+                try: ws.close()
+                except Exception: pass
+                self._rc_ws = None
+                self._ws_connected["rc"] = False
+                return False
+
+    def _rx_telemetry_loop(self):
+        self._rx_pull_loop("telemetry", f"{self.ws_base}/ws/telemetry",
+                            self._on_telemetry_msg)
+
+    def _rx_position_loop(self):
+        self._rx_pull_loop("position", f"{self.ws_base}/ws/position",
+                            self._on_position_msg)
+
+    def _rx_pull_loop(self, name: str, url: str, handler):
+        """Generic pull loop — opens a WS, reads until it closes, marks
+        disconnected, retries with backoff."""
+        backoff = 1.0
+        while self._running:
+            try:
+                ws = _wsclient.create_connection(url, timeout=4)
+                ws.settimeout(8.0)     # receive timeout → detects dead links
+                self._ws_connected[name] = True
+                backoff = 1.0          # reset on successful connect
+                while self._running:
+                    try:
+                        msg = ws.recv()
+                    except Exception:
+                        break
+                    if not msg:
+                        break
+                    try:
+                        data = json.loads(msg)
+                    except Exception:
+                        continue
+                    try:
+                        handler(data)
+                    except Exception as he:
+                        print(f"[WS] {self.drone_id} {name} handler error: {he}")
+                try: ws.close()
+                except Exception: pass
+            except Exception as e:
+                # Connect failed — sleep before retry
+                if self._running:
+                    print(f"[WS] {self.drone_id} {name} reconnect: {e}")
+            finally:
+                self._ws_connected[name] = False
+            if self._running:
+                time.sleep(backoff)
+                backoff = min(5.0, backoff * 1.5)
+
+    def _rc_connect_loop(self):
+        """Keeps the RC send socket alive. Unlike the pull loops this
+        socket mostly just sits idle — we reuse it on demand from
+        send_rc()/send_key()."""
+        url = f"{self.ws_base}/ws/rc"
+        backoff = 1.0
+        while self._running:
+            try:
+                ws = _wsclient.create_connection(url, timeout=4)
+                # Shortish send timeout — we'd rather fail fast and fall
+                # back to HTTP than block for 30s.
+                ws.settimeout(2.0)
+                with self._rc_ws_lock:
+                    self._rc_ws = ws
+                self._ws_connected["rc"] = True
+                backoff = 1.0
+                # Keep the connection alive by reading ACKs / pongs. When
+                # the server closes we break out and retry.
+                while self._running:
+                    try:
+                        msg = ws.recv()
+                    except _wsclient._exceptions.WebSocketTimeoutException:
+                        # normal — just keep looping; send() updates the socket
+                        continue
+                    except Exception:
+                        break
+                    if not msg:
+                        break
+                    # ACK messages are fine, nothing to do
+            except Exception as e:
+                if self._running:
+                    print(f"[WS] {self.drone_id} rc reconnect: {e}")
+            finally:
+                with self._rc_ws_lock:
+                    self._rc_ws = None
+                self._ws_connected["rc"] = False
+            if self._running:
+                time.sleep(backoff)
+                backoff = min(5.0, backoff * 1.5)
+
+    def _on_telemetry_msg(self, data: dict):
+        if data.get("type") not in (None, "telemetry"):
+            return
+        # Strip framing field; store the rest
+        snap = {k: v for k, v in data.items() if k not in ("type",)}
+        with self._lock:
+            self._latest_tel = snap
+            self._latest_tel_ts = time.time()
+
+    def _on_position_msg(self, data: dict):
+        if data.get("type") not in (None, "position"):
+            return
+        snap = {k: v for k, v in data.items() if k not in ("type",)}
+        with self._lock:
+            self._latest_pos = snap
+            self._latest_pos_ts = time.time()
+
+
+# Create one client per configured drone. They connect on their own
+# schedule — failing to reach a drone never blocks the C2 boot.
+drone_ws: dict[str, DroneWS] = {}
+def _init_drone_ws():
+    for did, info in DRONES.items():
+        base = (info or {}).get("base")
+        if not base:
+            continue
+        try:
+            client = DroneWS(str(did), base)
+            client.start()
+            drone_ws[str(did)] = client
+            print(f"[WS] started client for drone {did} → {client.ws_base}")
+        except Exception as e:
+            print(f"[WS] failed to start client for drone {did}: {e}")
+_init_drone_ws()
 
 HTML = """
 <!doctype html>
@@ -810,6 +1108,7 @@ HTML = """
     <label style=\"display:flex;align-items:center;gap:4px;color:#94a3b8;cursor:pointer;\" title=\"Auto-push the total into the Position Tracker latency slider every poll.\">
       <input type=\"checkbox\" id=\"lat_auto_apply\" /> auto-set latency
     </label>
+    <span id=\"ws_status_badge\" class=\"small\" title=\"WebSocket channel between C2 and flight controller. Tel/Pos/RC are pushed on a persistent connection — no per-call HTTP framing overhead.\" style=\"padding:2px 8px;border-radius:3px;font-family:monospace;font-size:10.5px;letter-spacing:0.03em;font-weight:700;background:#334155;color:#94a3b8;\">WS —</span>
   </div>
   <!-- ── Tuning Parameters — one place for all live-tunable knobs ──
        The Observer PD gains (approach speed, skew correction, IMU damping,
@@ -1628,7 +1927,7 @@ HTML = """
     arcPoll();
     // Version marker — if this string doesn't appear in the DOM,
     // you're running stale JS (restart the Python server or hard-refresh).
-    const BUILD = 'bc-ceiling-flight-logs';
+    const BUILD = 'bd-websocket-channel';
     console.log('[arc] init complete, build=' + BUILD);
     const ver = document.createElement('span');
     ver.id = 'arc_build_tag';
@@ -2774,6 +3073,61 @@ async function resumeAllDrones(source) {
       const j = await r.json();
       if (!!j.paused !== !!window._globalPaused) applyPauseUI(j.paused, j);
     } catch {}
+  }
+  tick();
+  setInterval(tick, 2000);
+})();
+
+// ── WebSocket status badge ────────────────────────────────────────────
+// Polls /proxy/ws/status every 2 s. Green when the active drone has
+// telemetry + position + rc sockets all up; amber if partial; red if
+// the WS client lib is missing or all three are down.
+(function wireWsStatus(){
+  const el = document.getElementById('ws_status_badge');
+  if (!el) return;
+  async function tick() {
+    try {
+      const r = await fetch('/proxy/ws/status', {cache:'no-store'});
+      const j = await r.json();
+      if (!j.available) {
+        el.style.background = '#7f1d1d';
+        el.style.color = '#fecaca';
+        el.textContent = 'WS off';
+        el.title = 'websocket-client not installed on C2 — falling back to HTTP';
+        return;
+      }
+      const did = String(window.activeDroneId || activeDroneId);
+      const st = (j.drones || {})[did];
+      if (!st) {
+        el.style.background = '#334155';
+        el.style.color = '#94a3b8';
+        el.textContent = 'WS —';
+        return;
+      }
+      const up = (st.telemetry ? 1 : 0) + (st.position ? 1 : 0) + (st.rc ? 1 : 0);
+      if (up === 3) {
+        el.style.background = '#064e3b';
+        el.style.color = '#86efac';
+        const parts = [];
+        if (st.telemetry_age_ms != null) parts.push('tel ' + st.telemetry_age_ms + 'ms');
+        if (st.position_age_ms  != null) parts.push('pos ' + st.position_age_ms  + 'ms');
+        el.textContent = 'WS \u2713 ' + parts.join(' · ');
+      } else if (up > 0) {
+        el.style.background = '#78350f';
+        el.style.color = '#fde68a';
+        const flags = (st.telemetry?'T':'·') + (st.position?'P':'·') + (st.rc?'R':'·');
+        el.textContent = 'WS ' + flags;
+      } else {
+        el.style.background = '#7f1d1d';
+        el.style.color = '#fecaca';
+        el.textContent = 'WS down';
+      }
+      el.title = 'tel=' + st.telemetry + ' pos=' + st.position + ' rc=' + st.rc;
+    } catch {
+      el.style.background = '#334155';
+      el.style.color = '#94a3b8';
+      el.textContent = 'WS ?';
+    }
   }
   tick();
   setInterval(tick, 2000);
@@ -5611,6 +5965,13 @@ def proxy_drones_config_save():
 def proxy_key_down():
     data = request.get_json(silent=True) or {}
     log_command("key_down", data)
+    # WS fast path — per-key RTT on a persistent socket is ~1ms vs
+    # ~5-15ms for a fresh HTTP POST over wireless. Fall back to HTTP
+    # transparently when the WS isn't connected.
+    k = str(data.get("key", ""))
+    ws = drone_ws.get(str(active_drone_id))
+    if ws and ws.send_key(k, "down"):
+        return jsonify(ok=True, via="ws")
     r = pi_post("/api/key_down", data)
     return (r.text, r.status_code, {"Content-Type": r.headers.get("Content-Type", "application/json")})
 
@@ -5619,6 +5980,10 @@ def proxy_key_down():
 def proxy_key_up():
     data = request.get_json(silent=True) or {}
     log_command("key_up", data)
+    k = str(data.get("key", ""))
+    ws = drone_ws.get(str(active_drone_id))
+    if ws and ws.send_key(k, "up"):
+        return jsonify(ok=True, via="ws")
     r = pi_post("/api/key_up", data)
     return (r.text, r.status_code, {"Content-Type": r.headers.get("Content-Type", "application/json")})
 
@@ -6421,6 +6786,23 @@ def proxy_latency():
 
 @app.get("/proxy/telemetry")
 def proxy_telemetry():
+    # WS cache first — if we have a frame < 1.5s old, return that (no
+    # network round-trip at all). The 1.5s window allows for one missed
+    # push at TELEMETRY_HZ=2 before we bother going over HTTP.
+    ws = drone_ws.get(str(active_drone_id))
+    if ws:
+        tel, age = ws.latest_telemetry()
+        if tel is not None and age < 1.5:
+            tel = dict(tel)
+            tel["_source"] = "ws"
+            tel["_age_ms"] = int(age * 1000)
+            headers = {
+                "Content-Type": "application/json",
+                "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
+                "Pragma": "no-cache",
+                "Expires": "0",
+            }
+            return (json.dumps(tel, default=str), 200, headers)
     try:
         r = pi_get("/api/telemetry", timeout=TIMEOUT_STATUS)
         headers = {
@@ -6432,6 +6814,17 @@ def proxy_telemetry():
         return (r.text, r.status_code, headers)
     except Exception as e:
         return jsonify(ok=False, error=str(e)), 502
+
+
+@app.get("/proxy/ws/status")
+def proxy_ws_status():
+    """Per-drone WS connection snapshot for the UI badge."""
+    out = {did: cli.status() for did, cli in drone_ws.items()}
+    return jsonify(
+        ok=True,
+        available=HAS_WSCLIENT,
+        drones=out,
+    )
 
 
 # ── Positioning subsystem proxy ───────────────────────────────────────────────
@@ -6719,8 +7112,42 @@ def proxy_aruco_fleet():
         if did not in observers:
             observers[did] = {"drone_id": did, "running": False}
 
-    # Parallel fan-out to each drone's /api/position. With N<=5 drones
-    # and a 300 ms per-request timeout, worst-case wall clock is ~300 ms.
+    # Two data paths, in order of preference:
+    #   1. WS cache (zero HTTP on the fleet-poll tick — <1 ms)
+    #   2. Parallel fan-out to each Pi's /api/position (300 ms timeout)
+    # Any drone whose WS has a fresh frame (<1.5 s old) short-circuits
+    # the HTTP call entirely. The remainder fall through to the fan-out.
+    need_http: list[tuple[str, str]] = []
+    for did, info in DRONES.items():
+        did = str(did)
+        base = (info or {}).get("base")
+        if not base:
+            continue
+        # Check WS cache
+        cli = drone_ws.get(did)
+        if cli is not None:
+            pj, age = cli.latest_position()
+            if pj is not None and age < 1.5:
+                entry = observers.setdefault(did, {"drone_id": did})
+                if entry.get("pos") is None and pj.get("pos") is not None:
+                    entry["pos"] = pj["pos"]
+                if entry.get("dir") is None and pj.get("dir") is not None:
+                    entry["dir"] = pj["dir"]
+                if entry.get("pos_vel") is None and pj.get("vel") is not None:
+                    entry["pos_vel"] = pj["vel"]
+                if entry.get("pos_stale") is None and pj.get("stale") is not None:
+                    entry["pos_stale"] = pj["stale"]
+                if entry.get("ref_markers") is None and pj.get("ref_markers") is not None:
+                    entry["ref_markers"] = pj["ref_markers"]
+                if entry.get("altitude_m") is None and pj.get("pos"):
+                    try:
+                        entry["altitude_m"] = float(pj["pos"][2])
+                    except (IndexError, TypeError, ValueError):
+                        pass
+                entry["_pos_source"] = "ws"
+                continue
+        need_http.append((did, base))
+
     def _fetch(did: str, base: str):
         try:
             resp = _http_session.get(f"{base.rstrip('/')}/api/position", timeout=0.3)
@@ -6730,38 +7157,36 @@ def proxy_aruco_fleet():
             pass
         return did, None
 
-    import concurrent.futures as _cf
-    jobs = []
-    with _cf.ThreadPoolExecutor(max_workers=max(1, len(DRONES))) as pool:
-        for did, info in DRONES.items():
-            base = (info or {}).get("base")
-            if base:
-                jobs.append(pool.submit(_fetch, str(did), base))
-        for fut in _cf.as_completed(jobs, timeout=0.6):
-            try:
-                did, pj = fut.result()
-            except Exception:
-                continue
-            if not pj:
-                continue
-            entry = observers.setdefault(did, {"drone_id": did})
-            # Only overwrite if the observer entry lacks this field
-            if entry.get("pos") is None and pj.get("pos") is not None:
-                entry["pos"] = pj["pos"]
-            if entry.get("dir") is None and pj.get("dir") is not None:
-                entry["dir"] = pj["dir"]
-            if entry.get("pos_vel") is None and pj.get("vel") is not None:
-                entry["pos_vel"] = pj["vel"]
-            if entry.get("pos_stale") is None and pj.get("stale") is not None:
-                entry["pos_stale"] = pj["stale"]
-            if entry.get("ref_markers") is None and pj.get("ref_markers") is not None:
-                entry["ref_markers"] = pj["ref_markers"]
-            # Also surface altitude/height for the 3D fallback path
-            if entry.get("altitude_m") is None and pj.get("pos"):
+    if need_http:
+        import concurrent.futures as _cf
+        jobs = []
+        with _cf.ThreadPoolExecutor(max_workers=max(1, len(need_http))) as pool:
+            for did, base in need_http:
+                jobs.append(pool.submit(_fetch, did, base))
+            for fut in _cf.as_completed(jobs, timeout=0.6):
                 try:
-                    entry["altitude_m"] = float(pj["pos"][2])
-                except (IndexError, TypeError, ValueError):
-                    pass
+                    did, pj = fut.result()
+                except Exception:
+                    continue
+                if not pj:
+                    continue
+                entry = observers.setdefault(did, {"drone_id": did})
+                if entry.get("pos") is None and pj.get("pos") is not None:
+                    entry["pos"] = pj["pos"]
+                if entry.get("dir") is None and pj.get("dir") is not None:
+                    entry["dir"] = pj["dir"]
+                if entry.get("pos_vel") is None and pj.get("vel") is not None:
+                    entry["pos_vel"] = pj["vel"]
+                if entry.get("pos_stale") is None and pj.get("stale") is not None:
+                    entry["pos_stale"] = pj["stale"]
+                if entry.get("ref_markers") is None and pj.get("ref_markers") is not None:
+                    entry["ref_markers"] = pj["ref_markers"]
+                if entry.get("altitude_m") is None and pj.get("pos"):
+                    try:
+                        entry["altitude_m"] = float(pj["pos"][2])
+                    except (IndexError, TypeError, ValueError):
+                        pass
+                entry["_pos_source"] = "http"
 
     return jsonify(active=active_drone_id,
                    allow_live=aruco_fleet.allow_live,
