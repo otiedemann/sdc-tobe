@@ -2326,7 +2326,7 @@ HTML = """
     arcPoll();
     // Version marker — if this string doesn't appear in the DOM,
     // you're running stale JS (restart the Python server or hard-refresh).
-    const BUILD = 'cf-auto-record-on-takeoff';
+    const BUILD = 'cg-distance-scale-correction';
     console.log('[arc] init complete, build=' + BUILD);
     const ver = document.createElement('span');
     ver.id = 'arc_build_tag';
@@ -2958,8 +2958,11 @@ HTML = """
           <label class=\"small\" style=\"color:#94a3b8;\">Outlier (m) <span class=\"info-icon\" data-info=\"outlier_reject_m\">i</span>:
             <input id=\"pos_outlier\" type=\"number\" min=\"0.1\" max=\"20\" step=\"0.1\" value=\"2.5\" style=\"width:60px;\" />
           </label>
+          <label class=\"small\" style=\"color:#fbbf24;\" title=\"Multiplicative correction on camera↔marker distance from solvePnP. 1.0 = no correction. If the UI shows 7 m but actual is 9 m → set 9/7 ≈ 1.286.\">dist × <span class=\"info-icon\" data-info=\"distance_scale\">i</span>:
+            <input id=\"pos_distance_scale\" type=\"number\" min=\"0.1\" max=\"5.0\" step=\"0.001\" value=\"1.000\" style=\"width:70px;\" />
+          </label>
           <button id=\"pos_filters_apply\" class=\"pos-cfg\" style=\"height:26px;font-size:11px;padding:0 10px;\">Apply filters</button>
-          <button id=\"pos_filters_reset\" class=\"pos-cfg\" style=\"height:26px;font-size:11px;padding:0 10px;background:#1e2a3a;\" title=\"Restore defaults: Kalman on, marker 0.5m, top-K auto, outlier 2.5m\">Defaults</button>
+          <button id=\"pos_filters_reset\" class=\"pos-cfg\" style=\"height:26px;font-size:11px;padding:0 10px;background:#1e2a3a;\" title=\"Restore defaults: Kalman on, marker 0.5m, top-K auto, outlier 2.5m, dist scale 1.0\">Defaults</button>
           <span id=\"pos_filters_status\" class=\"small\" style=\"color:#64748b;\"></span>
         </div>
         <!-- ── Precision tuning (advanced) ───────────────────────────
@@ -5829,6 +5832,8 @@ async function loadPosConfig() {
     if (tK && c.top_k_markers != null) tK.value = c.top_k_markers;
     const out = document.getElementById('pos_outlier');
     if (out && c.outlier_reject_m != null) out.value = c.outlier_reject_m;
+    const ds = document.getElementById('pos_distance_scale');
+    if (ds && c.distance_scale != null) ds.value = Number(c.distance_scale).toFixed(3);
     // ── Populate precision (advanced) controls ──
     const setIf = (id, val, formatter) => {
       const el = document.getElementById(id);
@@ -5869,11 +5874,13 @@ async function loadPosConfig() {
   };
   const applyBtn = document.getElementById('pos_filters_apply');
   if (applyBtn) applyBtn.onclick = async () => {
+    const dsEl = document.getElementById('pos_distance_scale');
     const payload = {
       enable_kalman_filter: document.getElementById('pos_kalman').checked,
       marker_size_m: parseFloat(document.getElementById('pos_marker_size').value),
       top_k_markers: parseInt(document.getElementById('pos_top_k').value, 10),
       outlier_reject_m: parseFloat(document.getElementById('pos_outlier').value),
+      distance_scale: dsEl ? parseFloat(dsEl.value) : 1.0,
     };
     try {
       const r = await fetch('/proxy/position/config', {
@@ -5892,6 +5899,8 @@ async function loadPosConfig() {
     document.getElementById('pos_marker_size').value = '0.50';
     document.getElementById('pos_top_k').value = '0';
     document.getElementById('pos_outlier').value = '2.5';
+    const ds = document.getElementById('pos_distance_scale');
+    if (ds) ds.value = '1.000';
     flash('defaults loaded — click Apply', '#94a3b8');
   };
 })();
@@ -5993,6 +6002,7 @@ async function loadPosConfig() {
       marker_size_m:         v('pos_marker_size', 'float'),
       top_k_markers:         v('pos_top_k', 'int'),
       outlier_reject_m:      v('pos_outlier', 'float'),
+      distance_scale:        v('pos_distance_scale', 'float'),
       pose_hold_sec:         v('pos_pose_hold', 'float'),
       min_ref_count:         v('pos_min_refs', 'int'),
       min_ref_weight:        v('pos_min_ref_w', 'float'),
@@ -6227,6 +6237,17 @@ window.PARAM_INFO = {
     "are rejected as outliers before re-averaging.\\n\\n"+
     "Default 2.5 m. Tighten to 1.0 m for a smaller, tidy arena; loosen to "+
     "3.5 m if markers are far apart."},
+  distance_scale:     {title:'Distance correction factor', units:'multiplier (1.0 = no correction)', body:
+    "Multiplicative correction applied to the camera\\u2194marker translation "+
+    "from solvePnP. Compensates for systematic scale error, usually caused "+
+    "by a mismatch between the real marker size and the configured "+
+    "marker_size_m, or by an uncalibrated focal length.\\n\\n"+
+    "Calibration recipe: put the drone a known distance D_real from a marker, "+
+    "read the UI distance D_ui, then set distance_scale = D_real / D_ui.\\n\\n"+
+    "Example: UI shows 7 m, tape measure says 9 m \\u2192 9 / 7 \\u2248 1.286.\\n\\n"+
+    "The scale applies equally to every pose axis, so it works whether the "+
+    "error shows up in x, y, z, or the combined 3-D distance. If the error "+
+    "is direction-dependent, fix the camera calibration instead."},
   pose_hold_sec:      {title:'Pose hold (dead-reckon)', units:'seconds', body:
     "After the last valid ArUco fix, keep publishing pose based on IMU "+
     "dead-reckoning for this many seconds.\\n\\n"+
@@ -9710,6 +9731,7 @@ _POSITION_PRESETS_DEFAULTS: dict = {
         "marker_size_m":       0.50,
         "top_k_markers":       0,
         "outlier_reject_m":    2.5,
+        "distance_scale":      1.0,
         "pose_hold_sec":       0.8,
         "min_ref_count":       1,
         "min_ref_weight":      0.0,

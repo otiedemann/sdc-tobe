@@ -705,6 +705,12 @@ _pos_cfg: dict = {
     "top_k_markers": 0,     # 0 = auto (code picks best 4); set to limit further
     "outlier_reject_m": 2.5,  # max distance from centroid before an estimate is dropped
     "imu_weight": 0.3,      # 0.0 = pure ArUco, 1.0 = pure IMU dead-reckoning
+    # Multiplicative correction on the camera↔marker distance estimated by
+    # solvePnP. 1.0 = no correction. Use to compensate for systematic
+    # scale error caused by marker_size_m mismatch or uncalibrated focal
+    # length. Field example: UI reads 7 m, real distance is 9 m →
+    # distance_scale = 9/7 ≈ 1.286.
+    "distance_scale":       1.0,
     # ── Precision tuning (mirrors ctrl_position.py module constants) ──
     # Exposed over the UI so operators can tighten / loosen the fusion
     # without a server restart. Values here get pushed into the running
@@ -5069,11 +5075,13 @@ def positioning_loop():
                     if cfg_marker:
                         init_marker_size = float(cfg_marker)
                     init_kalman = bool(_pos_cfg.get("enable_kalman_filter", True))
+                    init_dist_scale = float(_pos_cfg.get("distance_scale", 1.0))
                 processor = _HeadlessAruCo(cam_mat, dist, detect_profile=profile,
                                            marker_size=init_marker_size, enable_kalman_filter=init_kalman)
                 _apply_arena_cfg_to_processor(processor)
+                processor.distance_scale = init_dist_scale
                 _pos_processor = processor
-                print(f"[POS] Processor initialised (profile={profile})")
+                print(f"[POS] Processor initialised (profile={profile}, distance_scale={init_dist_scale:.4f})")
             except Exception as ie:
                 print(f"[POS] Processor init error: {ie}")
                 time.sleep(1)
@@ -5526,6 +5534,10 @@ def api_pos_config_set():
             _pos_cfg["outlier_reject_m"] = max(0.1, min(20.0, float(data["outlier_reject_m"])))
         if "imu_weight" in data:
             _pos_cfg["imu_weight"] = max(0.0, min(1.0, float(data["imu_weight"])))
+        if "distance_scale" in data:
+            # Clamped to [0.1, 5.0] — anything outside that range is almost
+            # certainly a typo / bad input. 1.0 = no correction.
+            _pos_cfg["distance_scale"] = max(0.1, min(5.0, float(data["distance_scale"])))
         # Extended tuning — all affect ctrl_position.py's multi-marker fusion
         if "pose_hold_sec" in data:
             _pos_cfg["pose_hold_sec"] = max(0.0, min(10.0, float(data["pose_hold_sec"])))
@@ -5583,6 +5595,9 @@ def api_pos_config_set():
             if "outlier_reject_m" in data:
                 _pos_processor.outlier_reject_m = float(cfg_snap["outlier_reject_m"])
                 print(f"[POS] outlier_reject_m set to {cfg_snap['outlier_reject_m']}m (live)")
+            if "distance_scale" in data:
+                _pos_processor.distance_scale = float(cfg_snap["distance_scale"])
+                print(f"[POS] distance_scale = {cfg_snap['distance_scale']:.4f}× (live)")
             # ── Extended tuning → patched as module globals on ctrl_position
             # because the fusion code reads them as module-level constants. ──
             import ctrl_position as _cp
@@ -5767,7 +5782,7 @@ def main():
     print(f"[{tag}] Unified API server: http://{HTTP_HOST}:{HTTP_PORT}")
     print(f"[{tag}] Drone: {drone_type} @ {drone_ip} (auto-reconnect; watchdog={REMOTE_TIMEOUT_S}s)")
     print(f"[{tag}] SDKs available: tello={HAS_TELLO_SDK}, olympe={HAS_OLYMPE_SDK}")
-    print(f"[{tag}] Code version: 2026-04-23-ca (auto-record-on-takeoff + mjpeg-self-start)")
+    print(f"[{tag}] Code version: 2026-04-23-cb (distance_scale correction factor)")
     app.run(host=HTTP_HOST, port=HTTP_PORT, threaded=True, use_reloader=False)
 
 
