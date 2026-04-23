@@ -1366,7 +1366,7 @@ HTML = """
       video +<input id=\"lat_video_offset\" type=\"number\" min=\"0\" max=\"500\" step=\"5\" value=\"30\" style=\"width:55px;\" /> ms
     </label>
     <label style=\"display:flex;align-items:center;gap:4px;color:#94a3b8;cursor:pointer;\" title=\"Auto-push the total into the Position Tracker latency slider every poll.\">
-      <input type=\"checkbox\" id=\"lat_auto_apply\" /> auto-set latency
+      <input type=\"checkbox\" id=\"lat_auto_apply\" checked /> auto-set latency
     </label>
     <span id=\"ws_status_badge\" class=\"small\" title=\"WebSocket channel between C2 and flight controller. Tel/Pos/RC are pushed on a persistent connection — no per-call HTTP framing overhead.\" style=\"padding:2px 8px;border-radius:3px;font-family:monospace;font-size:10.5px;letter-spacing:0.03em;font-weight:700;background:#334155;color:#94a3b8;\">WS —</span>
   </div>
@@ -2217,7 +2217,7 @@ HTML = """
     arcPoll();
     // Version marker — if this string doesn't appear in the DOM,
     // you're running stale JS (restart the Python server or hard-refresh).
-    const BUILD = 'bw-imu-lpf';
+    const BUILD = 'bx-auto-latency-default-on';
     console.log('[arc] init complete, build=' + BUILD);
     const ver = document.createElement('span');
     ver.id = 'arc_build_tag';
