@@ -653,6 +653,38 @@ class DroneObserver:
             "vid_age": round(self._vid.age, 2),
         }
 
+        # ── Merge fused ArUco + IMU pose into the snapshot ──
+        # The per-drone positioner (running on the flight-controller Pi) emits
+        # `/api/position/events` with pos/dir/vel. The PositionListener caches
+        # the latest payload; we surface it here so the fleet view (2D top-
+        # down canvas + Three.js 3D arena + Position Tracker panel) can draw
+        # the drone at its actual arena-frame coordinates. Without this merge
+        # every state dict lacks "pos" and the 3D updateDrones() call
+        # silently skips rendering meshes for this drone.
+        if self._pos is not None:
+            try:
+                pos_snap = self._pos.get()
+            except Exception:
+                pos_snap = None
+            if isinstance(pos_snap, dict):
+                if pos_snap.get("pos") is not None:
+                    snapshot["pos"]        = pos_snap["pos"]
+                if pos_snap.get("cam") is not None:
+                    snapshot["cam"]        = pos_snap["cam"]
+                if pos_snap.get("dir") is not None:
+                    snapshot["dir"]        = pos_snap["dir"]
+                if pos_snap.get("vel") is not None:
+                    snapshot["pos_vel"]    = pos_snap["vel"]
+                if pos_snap.get("ref_markers") is not None:
+                    snapshot["ref_markers"] = pos_snap["ref_markers"]
+                if pos_snap.get("seen_markers") is not None:
+                    snapshot["seen_markers"] = pos_snap["seen_markers"]
+                if pos_snap.get("stale") is not None:
+                    snapshot["pos_stale"]  = pos_snap["stale"]
+                if pos_snap.get("fps") is not None:
+                    snapshot["pos_fps"]    = pos_snap["fps"]
+            snapshot["pos_age"] = round(float(getattr(self._pos, "age", float("inf"))), 2)
+
         vid_all = self._vid.get_all()
         snapshot["visible_ids"] = sorted(vid_all.keys())
 

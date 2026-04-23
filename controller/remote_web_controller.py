@@ -1375,7 +1375,7 @@ HTML = """
     arcPoll();
     // Version marker — if this string doesn't appear in the DOM,
     // you're running stale JS (restart the Python server or hard-refresh).
-    const BUILD = 'az-pause-all-continue';
+    const BUILD = 'ba-3d-drones';
     console.log('[arc] init complete, build=' + BUILD);
     const ver = document.createElement('span');
     ver.id = 'arc_build_tag';
@@ -5019,8 +5019,38 @@ let ARENA_W_dyn = 20, ARENA_D_dyn = 10;
         mesh = group;
         droneMeshes[did] = mesh;
       }
-      mesh.position.set(p[0], p[2] || 1.5, p[1]);
-      if (typeof st.yaw === 'number') mesh.rotation.y = -st.yaw * Math.PI / 180;
+      // Map ArUco-arena coords → Three.js world coords:
+      //   ArUco  x = arena horizontal  →  Three.js X
+      //   ArUco  y = arena depth       →  Three.js Z (forward)
+      //   ArUco  z = altitude          →  Three.js Y (up)
+      // Use a typeof check instead of `||` so a legit z=0 reading isn't
+      // silently replaced by the 1.5 m fallback (which was hiding grounded
+      // or pre-takeoff drones on the cover of the arena).
+      const ax = Number(p[0]) || 0;
+      const ay = Number(p[1]) || 0;
+      const az = (typeof p[2] === 'number' && isFinite(p[2]))
+                   ? p[2]
+                   : (Number(st.altitude_m) || 1.5);
+      mesh.position.set(ax, Math.max(0, az), ay);
+      // Heading: prefer the ArUco-derived direction vector (dx,dy) in the
+      // arena frame because it matches the pose we just plotted. Fall back
+      // to the compass yaw from drone telemetry if the positioner is stale.
+      if (Array.isArray(st.dir) && st.dir.length >= 2 &&
+          (st.dir[0]*st.dir[0] + st.dir[1]*st.dir[1]) > 1e-6) {
+        const hdg = Math.atan2(st.dir[0], st.dir[1]);   // rad from +Y axis
+        mesh.rotation.y = -hdg;
+      } else if (typeof st.yaw === 'number') {
+        mesh.rotation.y = -st.yaw * Math.PI / 180;
+      }
+      // Flash opacity if the pose is stale so operators see the drone is
+      // running on IMU dead-reckoning rather than live vision.
+      const staleAlpha = (st.pos_stale === true) ? 0.55 : 1.0;
+      mesh.traverse(o => {
+        if (o.material && 'opacity' in o.material) {
+          o.material.transparent = staleAlpha < 1.0;
+          o.material.opacity = staleAlpha;
+        }
+      });
       idx++;
     }
     // Remove meshes for drones that disappeared
