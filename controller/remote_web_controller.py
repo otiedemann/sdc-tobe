@@ -449,6 +449,49 @@ flight_logger = FlightLogger(DRONES, _http_session, FLIGHT_LOG_DIR, FLIGHT_LOG_H
 flight_logger.start()
 
 
+# ── Server-side heartbeat loop ─────────────────────────────────────────
+# The Pi's watchdog auto-lands if it sees no remote activity for
+# REMOTE_TIMEOUT_S (default 2 s). Historically the browser polled
+# /proxy/heartbeat at 2 Hz to keep that alive — a complete waste of
+# the browser's HTTP connection pool since the heartbeat has no UI
+# purpose. Now fired from a background thread on the C2 itself, once
+# per second per drone, skipping drones whose WS is fully down. The
+# browser doesn't have to issue ANY heartbeat traffic.
+_HEARTBEAT_INTERVAL_S = 1.0
+
+
+def _heartbeat_loop():
+    """Ping every reachable Pi's /api/heartbeat at HEARTBEAT_INTERVAL_S.
+    Runs as a daemon thread so it exits with the process. Per-drone
+    failures are swallowed silently — the Pi's watchdog only needs
+    SOME successful heartbeat per REMOTE_TIMEOUT_S seconds."""
+    while True:
+        try:
+            for did, info in DRONES.items():
+                base = (info or {}).get("base")
+                if not base:
+                    continue
+                cli = drone_ws.get(str(did))
+                if cli is not None:
+                    all_down = (not cli._ws_connected.get("telemetry") and
+                                not cli._ws_connected.get("position") and
+                                not cli._ws_connected.get("rc"))
+                    if all_down:
+                        continue
+                try:
+                    _http_session.get(f"{base.rstrip('/')}/api/heartbeat",
+                                      timeout=0.4)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        time.sleep(_HEARTBEAT_INTERVAL_S)
+
+
+threading.Thread(target=_heartbeat_loop, daemon=True, name="heartbeat-loop").start()
+print(f"[HEARTBEAT] background loop started ({_HEARTBEAT_INTERVAL_S:.1f}s interval)")
+
+
 # ── WebSocket client per drone ─────────────────────────────────────────
 # Maintains three long-lived WS to each Pi (/ws/telemetry pulls, /ws/position
 # pulls, /ws/rc pushes). Caches the latest telemetry + position so HTTP
@@ -2139,7 +2182,7 @@ HTML = """
     arcPoll();
     // Version marker — if this string doesn't appear in the DOM,
     // you're running stale JS (restart the Python server or hard-refresh).
-    const BUILD = 'br-unified-poll';
+    const BUILD = 'bs-heartbeat-server-side';
     console.log('[arc] init complete, build=' + BUILD);
     const ver = document.createElement('span');
     ver.id = 'arc_build_tag';
@@ -3770,7 +3813,8 @@ async function autoStartVideo() {
   const ok = await startVideoStream('mjpeg');
   if (!ok) console.warn('[video] auto-start failed, click Start Video manually');
 }
-// Fire a bit after page load so /proxy/heartbeat has time to succeed first
+// Fire a bit after page load so the C2 has booted + WS clients settled.
+// Heartbeat is handled server-side now — the browser doesn't wait for it.
 setTimeout(autoStartVideo, 300);
 
 // ── Anafi camera zoom slider ─────────────────────────────────────────
@@ -7631,67 +7675,120 @@ def proxy_ui_state():
     except Exception:
         out["missions"] = {}
 
-    # --- Heartbeat (fire-and-forget) — reuse the existing parallel map
-    # so we don't block on any single drone. Collapses 4-5 short
-    # request/response cycles into 1 C2→Pi fan-out cycle per tick.
-    def _ping(did_info):
-        did, info = did_info
-        try:
-            r = _http_session.get(f"{info['base']}/api/heartbeat", timeout=0.25)
-            return did, r.status_code
-        except Exception:
-            return did, "timeout"
-    live_items = []
-    for did, info in DRONES.items():
-        did_s = str(did)
-        cli = drone_ws.get(did_s) if 'drone_ws' in globals() else None
-        if cli is not None:
-            all_down = (not cli._ws_connected.get("telemetry") and
-                        not cli._ws_connected.get("position") and
-                        not cli._ws_connected.get("rc"))
-            if all_down:
-                continue
-        live_items.append((did, info))
-    if live_items:
-        try:
-            out["heartbeat"] = dict(_heartbeat_pool.map(_ping, live_items))
-        except Exception:
-            out["heartbeat"] = {}
-    else:
-        out["heartbeat"] = {}
+    # Heartbeat removed — now handled by the C2's _heartbeat_loop()
+    # background thread directly. No reason for the browser to be
+    # involved in keeping the Pi watchdog alive.
 
     return jsonify(ok=True, **out)
 
 
 @app.get("/proxy/diagnostics")
 def proxy_diagnostics():
-    """C2-side diagnostic ring + per-drone Pi diagnostics.
+    """C2-side + Pi-side diagnostic snapshot.
 
-    Returns:
-      - slow_calls: last 200 pi_post/pi_get calls over 500ms
-      - per_drone: live thread count + internal buffer sizes from each
-                   reachable Pi (GET /api/diagnostics). Unreachable
-                   drones report error:"offline".
-
-    Watch thread counts across two consecutive flights. If they grow
-    from e.g. 48 → 64 → 82, something is leaking threads every flight."""
+    Everything that SHOULD NOT grow monotonically across flights is
+    here. If a counter keeps climbing flight-after-flight, that's the
+    leak. To use:
+      1. Open this URL in a browser tab before flight 1.
+      2. Note the thread_count + flight_logger.active_files + http_pool counts.
+      3. Fly, land, fly, land.
+      4. Refresh. Any number growing is a direct clue.
+    """
+    import threading as _th, gc as _gc
     with _slow_calls_lock:
         slow = list(_slow_calls)
+
+    # --- C2 threads ---
+    threads = _th.enumerate()
+    by_name: dict[str, int] = {}
+    for t in threads:
+        n = t.name
+        for prefix in ("ThreadPoolExecutor-", "Thread-", "obs-", "ws-"):
+            if n.startswith(prefix):
+                n = prefix + "*"
+                break
+        by_name[n] = by_name.get(n, 0) + 1
+
+    # --- HTTP session connection pool ---
+    http_pool_stats = {}
+    try:
+        adapter = _http_session.get_adapter("http://x")
+        if hasattr(adapter, "poolmanager"):
+            pm = adapter.poolmanager
+            http_pool_stats = {
+                "pool_connections_limit": getattr(adapter, "_pool_connections", None),
+                "pool_maxsize_limit":     getattr(adapter, "_pool_maxsize",     None),
+                "pools_cached":           len(pm.pools) if hasattr(pm, "pools") else None,
+            }
+    except Exception as e:
+        http_pool_stats = {"error": str(e)[:120]}
+
+    # --- FlightLogger ---
+    try:
+        with flight_logger._lock:
+            fl_state = {
+                "active_files": len(flight_logger._flights),
+                "drone_ids":    list(flight_logger._flights.keys()),
+                "running":      flight_logger._running,
+                "log_dir":      str(flight_logger.log_dir),
+            }
+    except Exception as e:
+        fl_state = {"error": str(e)[:120]}
+
+    # --- DroneWS clients ---
+    ws_clients = {}
+    for did, cli in drone_ws.items():
+        try:
+            s = cli.status()
+            ws_clients[did] = {
+                "rc": s.get("rc"),
+                "telemetry": s.get("telemetry"),
+                "position":  s.get("position"),
+                "rc_rtt_ms": s.get("rc_rtt_ms"),
+                "rc_send_ms": s.get("rc_send_ms"),
+                "consec_failures": dict(cli._consec_failures),
+            }
+        except Exception as e:
+            ws_clients[did] = {"error": str(e)[:80]}
+
+    # --- Per-drone Pi diagnostics ---
     per_drone = {}
     for did, info in DRONES.items():
         base = (info or {}).get("base")
         if not base:
             continue
+        # Skip fan-out for drones whose WS is all-down — same pattern
+        # as fleet poll. Keeps this endpoint responsive under partial
+        # outage.
+        cli = drone_ws.get(str(did))
+        if cli is not None:
+            all_down = (not cli._ws_connected.get("telemetry") and
+                        not cli._ws_connected.get("position") and
+                        not cli._ws_connected.get("rc"))
+            if all_down:
+                per_drone[str(did)] = {"error": "offline (ws all down)"}
+                continue
         try:
-            r = _http_session.get(f"{base.rstrip('/')}/api/diagnostics", timeout=1.0)
-            if r.ok:
-                per_drone[str(did)] = r.json()
-            else:
-                per_drone[str(did)] = {"error": f"http {r.status_code}"}
+            r = _http_session.get(f"{base.rstrip('/')}/api/diagnostics", timeout=0.5)
+            per_drone[str(did)] = r.json() if r.ok else {"error": f"http {r.status_code}"}
         except Exception as e:
             per_drone[str(did)] = {"error": str(e)[:120]}
-    return jsonify(ok=True, slow_calls=slow, per_drone=per_drone,
-                   active_drone=active_drone_id)
+
+    return jsonify(
+        ok=True,
+        # C2-side counters — these are what usually leak
+        c2={
+            "thread_count":    len(threads),
+            "threads_by_name": by_name,
+            "gc_counts":       list(_gc.get_count()),
+            "http_pool":       http_pool_stats,
+            "flight_logger":   fl_state,
+            "ws_clients":      ws_clients,
+            "slow_calls":      slow,
+        },
+        per_drone=per_drone,
+        active_drone=active_drone_id,
+    )
 
 
 @app.get("/proxy/ws/status")
