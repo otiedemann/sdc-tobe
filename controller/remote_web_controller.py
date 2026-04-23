@@ -2136,7 +2136,7 @@ HTML = """
     arcPoll();
     // Version marker — if this string doesn't appear in the DOM,
     // you're running stale JS (restart the Python server or hard-refresh).
-    const BUILD = 'bo-decouple-rc-from-olympe-lock';
+    const BUILD = 'bp-video-idempotent-diagnostics';
     console.log('[arc] init complete, build=' + BUILD);
     const ver = document.createElement('span');
     ver.id = 'arc_build_tag';
@@ -7501,6 +7501,37 @@ def proxy_telemetry():
         return (r.text, r.status_code, headers)
     except Exception as e:
         return jsonify(ok=False, error=str(e)), 502
+
+
+@app.get("/proxy/diagnostics")
+def proxy_diagnostics():
+    """C2-side diagnostic ring + per-drone Pi diagnostics.
+
+    Returns:
+      - slow_calls: last 200 pi_post/pi_get calls over 500ms
+      - per_drone: live thread count + internal buffer sizes from each
+                   reachable Pi (GET /api/diagnostics). Unreachable
+                   drones report error:"offline".
+
+    Watch thread counts across two consecutive flights. If they grow
+    from e.g. 48 → 64 → 82, something is leaking threads every flight."""
+    with _slow_calls_lock:
+        slow = list(_slow_calls)
+    per_drone = {}
+    for did, info in DRONES.items():
+        base = (info or {}).get("base")
+        if not base:
+            continue
+        try:
+            r = _http_session.get(f"{base.rstrip('/')}/api/diagnostics", timeout=1.0)
+            if r.ok:
+                per_drone[str(did)] = r.json()
+            else:
+                per_drone[str(did)] = {"error": f"http {r.status_code}"}
+        except Exception as e:
+            per_drone[str(did)] = {"error": str(e)[:120]}
+    return jsonify(ok=True, slow_calls=slow, per_drone=per_drone,
+                   active_drone=active_drone_id)
 
 
 @app.get("/proxy/ws/status")

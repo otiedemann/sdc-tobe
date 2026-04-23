@@ -2382,12 +2382,39 @@ class OlympeBackend(DroneBackend):
 
     # --- Video (Anafi MJPEG / UDP forward) ---
     def video_start_mjpeg(self) -> Tuple[bool, str]:
+        """Start (or re-use) the Anafi MJPEG pipeline.
+
+        IDEMPOTENT — a second call while already streaming returns
+        "already streaming" without touching Olympe. Prior versions
+        blindly called d.streaming.start() again, which left the old
+        decoder running and spawned a NEW one. Over repeated calls
+        (every /api/video/start from the UI, every observer re-arm)
+        we'd see Olympe log "VideoDecoder#2, #7, #12" — incrementing
+        IDs, each pulling CPU + RAM + callbacks, without anyone ever
+        being deregistered. That accumulation is a strong candidate
+        for the "after 2 flights everything delays 20+ seconds" bug.
+        """
         global _video_mode, _video_last_jpeg, _video_frame_count, _video_streaming
         d = self._d()
         if d is None:
             return False, "drone not connected"
         if not HAS_CV2:
             return False, "cv2 not installed — pip install opencv-python-headless"
+
+        # Already streaming MJPEG? Skip — no need to restart.
+        if _video_streaming and _video_mode == "mjpeg":
+            print("[ANAFI] video_start_mjpeg: already streaming, skipping")
+            return True, "mjpeg already streaming"
+
+        # If we were in forward mode or half-started, tear down FIRST so
+        # Olympe can release its decoder before we request a new one.
+        if _video_streaming:
+            print("[ANAFI] video_start_mjpeg: stopping previous stream before restart")
+            try:
+                self.video_stop_mjpeg()
+            except Exception:
+                pass
+            time.sleep(0.3)   # let Olympe tear down before we re-start
 
         # Detect API
         api = "none"
@@ -4045,6 +4072,53 @@ def api_ceiling_set():
         pass
     print(f"[CEILING] set to {v}m (firmware={firmware_result})")
     return jsonify(ok=True, ceiling_m=v, firmware_result=firmware_result)
+
+
+@app.get("/api/diagnostics")
+def api_diagnostics():
+    """Pi-side health snapshot — thread count, internal buffer sizes.
+    Use from the C2 when chasing "degrades-over-time" symptoms. The
+    counters that matter are the ones that should NOT grow
+    monotonically across flights: thread count, pressed_web size,
+    telemetry buffer length. Video frame-count is expected to grow.
+    """
+    import threading as _th
+    threads = _th.enumerate()
+    by_name: dict[str, int] = {}
+    for t in threads:
+        # Collapse numbered worker threads so the counts stay readable
+        name = t.name
+        for prefix in ("ThreadPoolExecutor-", "Thread-"):
+            if name.startswith(prefix):
+                name = prefix + "*"
+                break
+        by_name[name] = by_name.get(name, 0) + 1
+
+    with telemetry_lock:
+        tel_snap = len(telemetry)
+    with pressed_lock:
+        pressed = sorted(pressed_web)
+    with _telemetry_sync_lock:
+        tel_buf_len = len(_telemetry_sync_buf)
+    with _pos_sse_lock:
+        sse_clients = len(_pos_sse_queues)
+        ws_pos_clients = len(_pos_ws_queues)
+
+    return jsonify(
+        ok=True,
+        thread_count=len(threads),
+        threads_by_name=by_name,
+        telemetry_keys=tel_snap,
+        pressed_web=pressed,
+        telemetry_sync_buffer_len=tel_buf_len,
+        pos_sse_clients=sse_clients,
+        pos_ws_clients=ws_pos_clients,
+        video_mode=_video_mode,
+        video_streaming=_video_streaming,
+        video_frame_count=_video_frame_count,
+        flying=flying,
+        connected=bool(conn_state.get("connected", False)),
+    )
 
 
 # ═══════════════════════════════════════════════════════════════════════
