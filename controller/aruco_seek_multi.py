@@ -230,6 +230,10 @@ class DroneObserver:
         self._prev_yaw: Optional[float] = None
         self._prev_yaw_t: float = 0.0
         self._yaw_rate: float = 0.0
+        # Marker-lost safety net — when set, timestamp of the first tick
+        # with zero markers visible. Drives the brake-then-rotate pattern
+        # in _tick. Cleared whenever markers come back.
+        self._panic_since: Optional[float] = None
 
     # ── Per-drone HTTP helpers (replaces aruco_seek module globals) ──
     def _api_post(self, path: str, body: Optional[dict] = None, timeout: float = 12.0) -> dict:
@@ -722,6 +726,68 @@ class DroneObserver:
         if self._last_guard_info:
             snapshot["guard"] = dict(self._last_guard_info)
 
+        # ── Marker-lost safety net (pre-empts waypoint nav + PD) ──
+        # Hard rule: during ANY non-manual flight (LIVE mode), if no
+        # ArUco markers are currently visible we brake to a full stop
+        # and then rotate in place until a marker re-enters the frame.
+        # Waypoint nav and marker-PD tracking both run *after* this
+        # check so they never override the safety search.
+        #
+        # Priority order when LIVE + vid_all empty:
+        #   1. Mission-driven search_rc (swarm manager's choreography)
+        #   2. Auto brake (0.5s) → rotate CCW (until marker returns)
+        if self.mode == "live" and not vid_all:
+            with self._lock:
+                src = self._search_rc
+            snapshot["marker_id"] = None
+            if any(v != 0 for v in src):
+                # Mission plan present — trust the manager.
+                self._panic_since = None
+                try:
+                    self._send_rc(*src)
+                    snapshot["rc_sent_at"] = round(t_now, 2)
+                    snapshot["search_rc"] = list(src)
+                    snapshot["status_msg"] = (
+                        f"mission search — rc(lr={src[0]}, fb={src[1]}, "
+                        f"ud={src[2]}, yaw={src[3]})"
+                    )
+                except Exception:
+                    pass
+            else:
+                # No plan — automatic brake+rotate until a marker shows up.
+                if self._panic_since is None:
+                    self._panic_since = t_now
+                dt_panic = t_now - self._panic_since
+                PANIC_BRAKE_S = 0.5
+                PANIC_YAW_RC = 18     # ~20°/s — full 360° sweep in ~18s
+                try:
+                    if dt_panic < PANIC_BRAKE_S:
+                        self._send_rc(0, 0, 0, 0)
+                        snapshot["panic_phase"] = "brake"
+                        snapshot["status_msg"] = (
+                            f"\u26a0 marker lost — FULL STOP ({dt_panic:.1f}s)"
+                        )
+                    else:
+                        self._send_rc(0, 0, 0, PANIC_YAW_RC)
+                        snapshot["panic_phase"] = "rotate"
+                        snapshot["panic_yaw_rc"] = PANIC_YAW_RC
+                        snapshot["status_msg"] = (
+                            f"\u26a0 marker lost — rotating CCW "
+                            f"({dt_panic:.1f}s, ~{int(dt_panic * 20)}\u00b0 swept)"
+                        )
+                    snapshot["rc_sent_at"] = round(t_now, 2)
+                    snapshot["panic"] = True
+                    snapshot["panic_dt_s"] = round(dt_panic, 2)
+                except Exception:
+                    pass
+            with self._lock:
+                self.latest = snapshot
+            return
+        elif vid_all:
+            # Markers visible again — reset so the next loss starts a
+            # fresh brake+rotate cycle rather than resuming mid-spin.
+            self._panic_since = None
+
         # ── Waypoint navigation (overrides marker PD when active) ──
         # If a mission has set a world-frame waypoint, fly to it now.
         # Position feedback comes from the ArUco pipeline (snap["pos"]).
@@ -755,32 +821,12 @@ class DroneObserver:
                 self.latest = snapshot
             return
 
+        # OBSERVE mode only — the LIVE + no-markers case already returned
+        # above via the marker-lost safety net.
         if not vid_all:
             snapshot["marker_id"] = None
-            snapshot["status_msg"] = "no markers visible"
-            # Safety: if we were actively tracking in live mode and just lost
-            # the marker, push a single RC-stop so the drone doesn't drift.
-            if self.mode == "live" and self._chosen_id is not None:
-                try:
-                    self._send_rc_stop()
-                    snapshot["rc_sent_at"] = round(t_now, 2)
-                except Exception:
-                    pass
-                self._chosen_id = None
-            # Apply search RC (mission-driven rotation/translation) if set
-            with self._lock:
-                src = self._search_rc
-            if self.mode == "live" and any(v != 0 for v in src):
-                try:
-                    self._send_rc(*src)
-                    snapshot["rc_sent_at"] = round(t_now, 2)
-                    snapshot["search_rc"] = list(src)
-                    snapshot["status_msg"] = (
-                        f"searching — rc(lr={src[0]}, fb={src[1]}, "
-                        f"ud={src[2]}, yaw={src[3]})"
-                    )
-                except Exception:
-                    pass
+            snapshot["status_msg"] = "no markers visible (OBSERVE)"
+            self._chosen_id = None
             with self._lock:
                 self.latest = snapshot
             return

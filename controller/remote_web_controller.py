@@ -1375,7 +1375,7 @@ HTML = """
     arcPoll();
     // Version marker — if this string doesn't appear in the DOM,
     // you're running stale JS (restart the Python server or hard-refresh).
-    const BUILD = 'ba-3d-drones';
+    const BUILD = 'bb-fleet-3d-panic-rotate';
     console.log('[arc] init complete, build=' + BUILD);
     const ver = document.createElement('span');
     ver.id = 'arc_build_tag';
@@ -6235,10 +6235,74 @@ def proxy_aruco_state():
 
 @app.get("/proxy/aruco/fleet")
 def proxy_aruco_fleet():
-    """Snapshot of every observer in the fleet."""
+    """Snapshot of every observer in the fleet.
+
+    Merged data flow:
+      1. Start from the observer's own state dict (pos + telemetry) if
+         the observer thread is actually running on this drone.
+      2. For every drone in DRONES, fan out a lightweight GET to
+         <base>/api/position in parallel (300 ms timeout). That endpoint
+         returns the live fused pose even when no observer is started,
+         which is exactly what manual-flight mode needs — otherwise the
+         3D arena view stays empty until someone arms ArUco Seek.
+
+    Merge policy: the observer's pos wins if present (it's been cached
+    with IMU dead-reckoning); the /api/position fallback fills any gap.
+    """
+    observers = dict(aruco_fleet.all_states())
+    # Ensure every configured drone has at least an entry to populate
+    for did in DRONES.keys():
+        did = str(did)
+        if did not in observers:
+            observers[did] = {"drone_id": did, "running": False}
+
+    # Parallel fan-out to each drone's /api/position. With N<=5 drones
+    # and a 300 ms per-request timeout, worst-case wall clock is ~300 ms.
+    def _fetch(did: str, base: str):
+        try:
+            resp = _http_session.get(f"{base.rstrip('/')}/api/position", timeout=0.3)
+            if resp.status_code == 200:
+                return did, resp.json()
+        except Exception:
+            pass
+        return did, None
+
+    import concurrent.futures as _cf
+    jobs = []
+    with _cf.ThreadPoolExecutor(max_workers=max(1, len(DRONES))) as pool:
+        for did, info in DRONES.items():
+            base = (info or {}).get("base")
+            if base:
+                jobs.append(pool.submit(_fetch, str(did), base))
+        for fut in _cf.as_completed(jobs, timeout=0.6):
+            try:
+                did, pj = fut.result()
+            except Exception:
+                continue
+            if not pj:
+                continue
+            entry = observers.setdefault(did, {"drone_id": did})
+            # Only overwrite if the observer entry lacks this field
+            if entry.get("pos") is None and pj.get("pos") is not None:
+                entry["pos"] = pj["pos"]
+            if entry.get("dir") is None and pj.get("dir") is not None:
+                entry["dir"] = pj["dir"]
+            if entry.get("pos_vel") is None and pj.get("vel") is not None:
+                entry["pos_vel"] = pj["vel"]
+            if entry.get("pos_stale") is None and pj.get("stale") is not None:
+                entry["pos_stale"] = pj["stale"]
+            if entry.get("ref_markers") is None and pj.get("ref_markers") is not None:
+                entry["ref_markers"] = pj["ref_markers"]
+            # Also surface altitude/height for the 3D fallback path
+            if entry.get("altitude_m") is None and pj.get("pos"):
+                try:
+                    entry["altitude_m"] = float(pj["pos"][2])
+                except (IndexError, TypeError, ValueError):
+                    pass
+
     return jsonify(active=active_drone_id,
                    allow_live=aruco_fleet.allow_live,
-                   observers=aruco_fleet.all_states())
+                   observers=observers)
 
 
 @app.get("/proxy/aruco/params")

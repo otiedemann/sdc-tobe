@@ -950,6 +950,18 @@ def build():
     # ─── 22. Troubleshooting ──────────────────────────────────────────
     story.append(_h1("22 &nbsp; Troubleshooting quick-ref", S))
     story.append(_button_table([
+        ("No drones in 3D arena",
+         "The 3D view plots any drone for which "
+         "<font name='Courier-Bold'>/api/position</font> returns a pose. "
+         "Ensure the Position Tracker is <b>Enabled</b> on each drone "
+         "(tick the checkbox) — the C2 fans out to every Pi's position "
+         "endpoint every 500 ms."),
+        ("Drone keeps rotating in place",
+         "LIVE-mode safety net: when no ArUco markers are visible the "
+         "drone brakes (0.5 s) and rotates CCW at ~20°/s until a marker "
+         "re-appears. Switch the observer to OBSERVE or hit PAUSE ALL "
+         "(9) to interrupt. A mission can override with its own "
+         "<font name='Courier-Bold'>search_rc</font> pattern."),
         ("Drone bar empty",
          "<font name='Courier-Bold'>flightctrlN</font> hostname not "
          "resolving, or the Pi's API isn't running on port 8080."),
