@@ -56,8 +56,18 @@ except ImportError:
 # Runs on remote PC. Proxies to Pi API server.
 HTTP_HOST = "0.0.0.0"
 HTTP_PORT = 8090
-TIMEOUT_CMD = float(os.getenv("PI_TIMEOUT_CMD", "2.0"))
+TIMEOUT_CMD = float(os.getenv("PI_TIMEOUT_CMD", "8.0"))
 TIMEOUT_STATUS = float(os.getenv("PI_TIMEOUT_STATUS", "0.5"))
+# Fast per-keystroke commands — RC / key_down / key_up. These are
+# fire-and-forget on the Pi side; tightly-timeouted so an unreachable
+# drone doesn't back up the UI. Anything longer than this on a
+# keystroke is a network/server problem, not expected latency.
+TIMEOUT_FAST = float(os.getenv("PI_TIMEOUT_FAST", "1.5"))
+# Explicitly slow commands — takeoff + land block until the drone
+# reports the corresponding state, which on Anafi routinely takes
+# 3-5 s. Use this override (via pi_post(..., timeout=TIMEOUT_SLOW))
+# so the default TIMEOUT_CMD stays small for responsive UI.
+TIMEOUT_SLOW = float(os.getenv("PI_TIMEOUT_SLOW", "15.0"))
 VIDEO_UDP_FORWARD_PORT = int(os.getenv("VIDEO_UDP_FORWARD_PORT", "55004"))
 VIDEO_FPS = int(os.getenv("VIDEO_FPS", "30"))
 VIDEO_JPEG_QUALITY = int(os.getenv("VIDEO_JPEG_QUALITY", "70"))
@@ -2109,7 +2119,7 @@ HTML = """
     arcPoll();
     // Version marker — if this string doesn't appear in the DOM,
     // you're running stale JS (restart the Python server or hard-refresh).
-    const BUILD = 'bl-transport-selector';
+    const BUILD = 'bm-takeoff-land-slow-timeout';
     console.log('[arc] init complete, build=' + BUILD);
     const ver = document.createElement('span');
     ver.id = 'arc_build_tag';
@@ -6566,16 +6576,46 @@ def proxy_key_batch():
 
 @app.post("/proxy/takeoff")
 def proxy_takeoff():
+    """Relay takeoff to the active drone's Pi.
+
+    Uses TIMEOUT_SLOW (default 15s) not the default TIMEOUT_CMD (8s)
+    because Anafi takeoff routinely takes 3-5 seconds for the armament
+    sensors + motor spin-up before /api/takeoff returns success. The
+    earlier 2s default truncated this and led to "network error
+    contacting drone: TypeError: Failed to fetch" on every attempt.
+    Also wraps the call in try/except so a slow drone returns clean
+    JSON to the UI instead of a Flask stack-trace HTML page.
+    """
     log_command("takeoff")
-    r = pi_post("/api/takeoff")
-    return (r.text, r.status_code, {"Content-Type": r.headers.get("Content-Type", "application/json")})
+    try:
+        r = pi_post("/api/takeoff", timeout=TIMEOUT_SLOW)
+    except Exception as e:
+        import requests as _rq
+        if isinstance(e, _rq.exceptions.ReadTimeout):
+            return jsonify(ok=False,
+                           error=f"takeoff timed out after {TIMEOUT_SLOW}s — "
+                                 f"drone may still be arming; check telemetry"), 504
+        return jsonify(ok=False, error=f"network error: {e}"), 502
+    return (r.text, r.status_code,
+            {"Content-Type": r.headers.get("Content-Type", "application/json")})
 
 
 @app.post("/proxy/land")
 def proxy_land():
+    """Relay land to the active drone's Pi. Same slow-command timeout
+    as takeoff — Anafi land waits for ground-contact before returning."""
     log_command("land")
-    r = pi_post("/api/land")
-    return (r.text, r.status_code, {"Content-Type": r.headers.get("Content-Type", "application/json")})
+    try:
+        r = pi_post("/api/land", timeout=TIMEOUT_SLOW)
+    except Exception as e:
+        import requests as _rq
+        if isinstance(e, _rq.exceptions.ReadTimeout):
+            return jsonify(ok=False,
+                           error=f"land timed out after {TIMEOUT_SLOW}s — "
+                                 f"check drone state before retrying"), 504
+        return jsonify(ok=False, error=f"network error: {e}"), 502
+    return (r.text, r.status_code,
+            {"Content-Type": r.headers.get("Content-Type", "application/json")})
 
 
 @app.post("/proxy/land_all")
@@ -6604,8 +6644,10 @@ def proxy_land_all():
             results[str(did)] = {"ok": False, "error": "no base url"}
             continue
         try:
+            # Use the slow-command timeout — Anafi land blocks until
+            # ground contact. 3s wasn't enough for gentle descent.
             resp = _http_session.post(f"{base.rstrip('/')}/api/land",
-                                      json={}, timeout=3.0)
+                                      json={}, timeout=TIMEOUT_SLOW)
             try:
                 j = resp.json()
             except Exception:
