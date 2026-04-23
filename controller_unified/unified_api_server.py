@@ -591,6 +591,14 @@ _telemetry_sync_lock = threading.Lock()
 
 command_lock = threading.Lock()
 discrete_until = 0.0
+# Dedicated lock for discrete_until reads/writes. MUST NOT be the same
+# as command_lock — Olympe blocking calls (takeoff/land/flip) hold
+# command_lock for up to 10 s per attempt × 3 retries. If the RC tick
+# loop also waited on command_lock for the brief discrete_until read,
+# every keystroke during that window would stall, then all queued
+# keys would slam the drone simultaneously once Olympe released. That
+# was the 10-18 s WASD delay after the second takeoff.
+discrete_lock = threading.Lock()
 takeoff_cooldown_until = 0.0
 safe_takeoff_enabled = SAFE_TAKEOFF_DEFAULT
 
@@ -852,7 +860,7 @@ def append_command_log(event: str, payload: dict | None = None):
 
 def start_discrete_window(seconds: float):
     global discrete_until
-    with command_lock:
+    with discrete_lock:
         discrete_until = max(discrete_until, time.time() + max(0.0, seconds))
 
 
@@ -2642,7 +2650,7 @@ def telemetry_loop():
                     conn_state["connected"] = True
                     print(f"[{drone_type.upper()}] Connection detected via telemetry")
         if sdk_flying is not None:
-            with command_lock:
+            with discrete_lock:
                 in_discrete = time.time() < discrete_until
             if not in_discrete:
                 flying = sdk_flying
@@ -2941,7 +2949,7 @@ def rc_loop():
         if cur_h_cm is not None and cur_h_cm <= FLOOR_CM and ud < 0:
             ud = 0
 
-        with command_lock:
+        with discrete_lock:
             in_discrete = now < discrete_until
 
         if in_discrete:

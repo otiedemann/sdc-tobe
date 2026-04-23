@@ -2136,7 +2136,7 @@ HTML = """
     arcPoll();
     // Version marker — if this string doesn't appear in the DOM,
     // you're running stale JS (restart the Python server or hard-refresh).
-    const BUILD = 'bn-http-mode-fix-ws-backpressure';
+    const BUILD = 'bo-decouple-rc-from-olympe-lock';
     console.log('[arc] init complete, build=' + BUILD);
     const ver = document.createElement('span');
     ver.id = 'arc_build_tag';
@@ -6370,12 +6370,67 @@ def log_command(event: str, payload: dict | None = None):
         pass
 
 
+# ── Diagnostic ring — track recent slow Pi calls so we can see the
+# "second takeoff takes 10 s" pattern as real data instead of guessing.
+# Any call over 500 ms gets appended. /proxy/diagnostics returns it.
+_slow_calls_lock = threading.Lock()
+_slow_calls: list = []
+_SLOW_CALL_THRESHOLD_S = 0.5
+
+
+def _record_pi_call(method: str, path: str, dt_s: float, status: int | None,
+                     err: str | None = None):
+    if dt_s < _SLOW_CALL_THRESHOLD_S and err is None:
+        return
+    rec = {
+        "ts":       time.time(),
+        "method":   method,
+        "path":     path,
+        "dt_ms":    int(dt_s * 1000),
+        "status":   status,
+        "error":    err,
+        "drone_id": active_drone_id,
+    }
+    with _slow_calls_lock:
+        _slow_calls.append(rec)
+        # Keep only last 200 entries — more than enough for debugging.
+        if len(_slow_calls) > 200:
+            del _slow_calls[:len(_slow_calls) - 200]
+    # Always print slow calls so the operator sees them live without
+    # having to pull /proxy/diagnostics.
+    print(f"[PI SLOW] {method} {path} {dt_s:.2f}s "
+          f"status={status} err={err or '-'}")
+
+
 def pi_post(path: str, body: dict | None = None, timeout: float | None = None):
-    return _http_session.post(f"{PI_BASE}{path}", json=body or {}, timeout=TIMEOUT_CMD if timeout is None else timeout)
+    t0 = time.time()
+    status = None
+    err = None
+    try:
+        r = _http_session.post(f"{PI_BASE}{path}", json=body or {},
+                               timeout=TIMEOUT_CMD if timeout is None else timeout)
+        status = r.status_code
+        return r
+    except Exception as e:
+        err = f"{type(e).__name__}: {e}"
+        raise
+    finally:
+        _record_pi_call("POST", path, time.time() - t0, status, err)
 
 
 def pi_get(path: str, timeout: float | None = None):
-    return _http_session.get(f"{PI_BASE}{path}", timeout=TIMEOUT_CMD if timeout is None else timeout)
+    t0 = time.time()
+    status = None
+    err = None
+    try:
+        r = _http_session.get(f"{PI_BASE}{path}", timeout=TIMEOUT_CMD if timeout is None else timeout)
+        status = r.status_code
+        return r
+    except Exception as e:
+        err = f"{type(e).__name__}: {e}"
+        raise
+    finally:
+        _record_pi_call("GET", path, time.time() - t0, status, err)
 
 
 @app.get("/")
