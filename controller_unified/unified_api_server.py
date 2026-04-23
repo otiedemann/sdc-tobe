@@ -2381,18 +2381,25 @@ class OlympeBackend(DroneBackend):
         return results
 
     # --- Video (Anafi MJPEG / UDP forward) ---
+    # Class-level mutex so two concurrent callers can't both see
+    # "_video_streaming == False" and each fire their own d.streaming.start().
+    # That race was leaking VideoDecoder#N on every near-simultaneous call.
+    _video_start_mutex = threading.Lock()
+
     def video_start_mjpeg(self) -> Tuple[bool, str]:
         """Start (or re-use) the Anafi MJPEG pipeline.
 
-        IDEMPOTENT — a second call while already streaming returns
-        "already streaming" without touching Olympe. Prior versions
-        blindly called d.streaming.start() again, which left the old
-        decoder running and spawned a NEW one. Over repeated calls
-        (every /api/video/start from the UI, every observer re-arm)
-        we'd see Olympe log "VideoDecoder#2, #7, #12" — incrementing
-        IDs, each pulling CPU + RAM + callbacks, without anyone ever
-        being deregistered. That accumulation is a strong candidate
-        for the "after 2 flights everything delays 20+ seconds" bug.
+        IDEMPOTENT *AND* MUTUALLY EXCLUSIVE — the class-level
+        _video_start_mutex prevents two concurrent callers from both
+        entering d.streaming.start(). Prior versions, even with the
+        "already streaming?" check, could race: thread A reads flag
+        False, thread B reads flag False, both call start(). Olympe
+        spawns two decoders. Mutex fixes that.
+
+        Also resets the flag if the drone connection was lost — a
+        reconnect must rebuild the stream from scratch, otherwise
+        the flag stays stuck True and subsequent calls are silent
+        no-ops against a disconnected drone.
         """
         global _video_mode, _video_last_jpeg, _video_frame_count, _video_streaming
         d = self._d()
@@ -2401,57 +2408,60 @@ class OlympeBackend(DroneBackend):
         if not HAS_CV2:
             return False, "cv2 not installed — pip install opencv-python-headless"
 
-        # Already streaming MJPEG? Skip — no need to restart.
-        if _video_streaming and _video_mode == "mjpeg":
-            print("[ANAFI] video_start_mjpeg: already streaming, skipping")
-            return True, "mjpeg already streaming"
+        with self.__class__._video_start_mutex:
+            # Re-check inside the mutex — another thread may have started
+            # the stream while we were waiting.
+            if _video_streaming and _video_mode == "mjpeg":
+                print("[ANAFI] video_start_mjpeg: already streaming, skipping")
+                return True, "mjpeg already streaming"
 
-        # If we were in forward mode or half-started, tear down FIRST so
-        # Olympe can release its decoder before we request a new one.
-        if _video_streaming:
-            print("[ANAFI] video_start_mjpeg: stopping previous stream before restart")
-            try:
-                self.video_stop_mjpeg()
-            except Exception:
-                pass
-            time.sleep(0.3)   # let Olympe tear down before we re-start
+            # If we were in forward mode or half-started, tear down FIRST so
+            # Olympe can release its decoder before we request a new one.
+            if _video_streaming:
+                print("[ANAFI] video_start_mjpeg: stopping previous stream before restart")
+                try:
+                    self.video_stop_mjpeg()
+                except Exception:
+                    pass
+                time.sleep(0.3)   # let Olympe tear down before we re-start
 
-        # Detect API
-        api = "none"
-        if hasattr(d, "streaming") and hasattr(d.streaming, "set_callbacks"):
-            api = "modern"
-        elif hasattr(d, "set_streaming_callbacks"):
-            api = "legacy"
-        print(f"[ANAFI] Olympe streaming API: {api}")
+            # Detect API — still inside the mutex so no concurrent caller
+            # can race between detection and start.
+            api = "none"
+            if hasattr(d, "streaming") and hasattr(d.streaming, "set_callbacks"):
+                api = "modern"
+            elif hasattr(d, "set_streaming_callbacks"):
+                api = "legacy"
+            print(f"[ANAFI] Olympe streaming API: {api}")
 
-        _video_mode = "mjpeg"
-        _video_last_jpeg = b""
-        _video_frame_count = 0
+            _video_mode = "mjpeg"
+            _video_last_jpeg = b""
+            _video_frame_count = 0
 
-        if api == "modern":
-            try:
-                d.streaming.set_callbacks(
-                    raw_cb=self._video_frame_cb,
-                    flush_raw_cb=self._video_flush_cb,
-                )
-                d.streaming.start()
-                _video_streaming = True
-                return True, "mjpeg started (modern)"
-            except Exception as e:
-                print(f"[ANAFI] Modern streaming failed: {e}")
-                if hasattr(d, "set_streaming_callbacks"):
-                    api = "legacy"
+            if api == "modern":
+                try:
+                    d.streaming.set_callbacks(
+                        raw_cb=self._video_frame_cb,
+                        flush_raw_cb=self._video_flush_cb,
+                    )
+                    d.streaming.start()
+                    _video_streaming = True
+                    return True, "mjpeg started (modern)"
+                except Exception as e:
+                    print(f"[ANAFI] Modern streaming failed: {e}")
+                    if hasattr(d, "set_streaming_callbacks"):
+                        api = "legacy"
 
-        if api == "legacy":
-            try:
-                d.set_streaming_callbacks(raw_cb=self._video_frame_cb)
-                d.start_video_streaming()
-                _video_streaming = True
-                return True, "mjpeg started (legacy)"
-            except Exception as e:
-                return False, f"legacy streaming failed: {e}"
+            if api == "legacy":
+                try:
+                    d.set_streaming_callbacks(raw_cb=self._video_frame_cb)
+                    d.start_video_streaming()
+                    _video_streaming = True
+                    return True, "mjpeg started (legacy)"
+                except Exception as e:
+                    return False, f"legacy streaming failed: {e}"
 
-        return False, "no streaming API in this Olympe version"
+            return False, "no streaming API in this Olympe version"
 
     def video_stop_mjpeg(self):
         global _video_streaming, _video_last_jpeg
@@ -2748,10 +2758,16 @@ def reconnect_loop():
             print(f"[{tag}] Drone connected" if connected_now else f"[{tag}] Drone disconnected (retrying...)")
             last_conn_print = connected_now
             if connected_now:
-                # Success — reset failure counter
                 with conn_lock:
                     conn_state["consecutive_failures"] = 0
                     conn_state["last_error"] = ""
+            else:
+                # Drone dropped — reset the video-streaming flag so the
+                # next video_start_mjpeg call actually restarts the
+                # pipeline against the NEW connection instead of being
+                # silently skipped ("already streaming").
+                global _video_streaming
+                _video_streaming = False
 
         # Health check while connected
         if connected_now:
@@ -5196,7 +5212,7 @@ def main():
     print(f"[{tag}] Unified API server: http://{HTTP_HOST}:{HTTP_PORT}")
     print(f"[{tag}] Drone: {drone_type} @ {drone_ip} (auto-reconnect; watchdog={REMOTE_TIMEOUT_S}s)")
     print(f"[{tag}] SDKs available: tello={HAS_TELLO_SDK}, olympe={HAS_OLYMPE_SDK}")
-    print(f"[{tag}] Code version: 2026-03-26-v2")
+    print(f"[{tag}] Code version: 2026-04-23-bp (video-idempotent + diagnostics)")
     app.run(host=HTTP_HOST, port=HTTP_PORT, threaded=True, use_reloader=False)
 
 
