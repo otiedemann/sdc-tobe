@@ -1997,7 +1997,7 @@ HTML = """
     arcPoll();
     // Version marker — if this string doesn't appear in the DOM,
     // you're running stale JS (restart the Python server or hard-refresh).
-    const BUILD = 'bf-wasd-keepalive-ws';
+    const BUILD = 'bg-stacked-markers-3d-highlight';
     console.log('[arc] init complete, build=' + BUILD);
     const ver = document.createElement('span');
     ver.id = 'arc_build_tag';
@@ -4509,59 +4509,110 @@ function drawArena(pos, compPos, dir) {
   // brighter border; unseen markers are dimmed to ~40% for visual separation.
   ctx.font = 'bold 11px monospace';
   ctx.textBaseline = 'middle';
+
+  // ── Bucket markers that share the same (x,y) top-down projection ──
+  // The SDC arena uses stacked pairs (low at z≈2 m, high at z≈4 m) on
+  // every wall. On the 2D top-down they collapse to identical pixels.
+  // Drawing them individually means the label of the later-iterated ID
+  // hides the first. We group by rounded canvas coordinate and render
+  // a single combined glyph with a multi-ID label ("1/2") where each
+  // individual ID is coloured by its own seen/ref state.
+  const _bucketKey = (x, y) => Math.round(x) + ',' + Math.round(y);
+  const buckets = new Map();
   for (const [id, m] of Object.entries(arenaMarkers)) {
     if (!m.pos) continue;
     const [mx, my] = arenaToCanvas(m.pos[0], m.pos[1]);
     if (mx < PAD - 4 || mx > W - PAD + 4 || my < PAD - 4 || my > H - PAD + 4) continue;
+    const key = _bucketKey(mx, my);
+    let b = buckets.get(key);
+    if (!b) {
+      b = {cx: mx, cy: my, wall: m.wall, entries: []};
+      buckets.set(key, b);
+    }
+    b.entries.push({
+      id:   String(id),
+      seen: _seenMarkers.has(String(id)),
+      ref:  _refMarkers.has(String(id)),
+      z:    (m.pos[2] != null) ? Number(m.pos[2]) : 0,
+    });
+  }
 
-    const isSeen = _seenMarkers.has(String(id));
-    const isRef  = _refMarkers.has(String(id));
-    const baseColor = WALL_COLOR[m.wall] || '#94a3b8';
+  for (const b of buckets.values()) {
+    // Sort low-altitude → high so "low/high" labels read naturally.
+    b.entries.sort((a, b) => a.z - b.z);
+    const mx = b.cx, my = b.cy;
+    const anySeen = b.entries.some(e => e.seen);
+    const anyRef  = b.entries.some(e => e.ref);
+    const baseColor = WALL_COLOR[b.wall] || '#94a3b8';
 
-    // Halo behind seen markers so they visibly pulse against the arena
-    if (isSeen) {
+    // Halo whenever ANY marker in the stack is seen.
+    if (anySeen) {
       ctx.beginPath();
       ctx.arc(mx, my, 14, 0, Math.PI * 2);
-      ctx.fillStyle = (isRef ? 'rgba(34,197,94,0.35)' : 'rgba(251,191,36,0.35)');
+      ctx.fillStyle = (anyRef ? 'rgba(34,197,94,0.35)' : 'rgba(251,191,36,0.35)');
       ctx.fill();
       ctx.beginPath();
       ctx.arc(mx, my, 14, 0, Math.PI * 2);
-      ctx.strokeStyle = (isRef ? '#22c55e' : '#fbbf24');
+      ctx.strokeStyle = (anyRef ? '#22c55e' : '#fbbf24');
       ctx.lineWidth = 1.5; ctx.stroke();
     }
 
-    // Square marker — always full-opacity so markers never disappear.
-    // Seen markers get a brighter white border to make them pop.
+    // Square marker glyph — same shape as before; brighter border if
+    // any of the stacked IDs is currently seen.
     ctx.fillStyle = baseColor;
     ctx.fillRect(mx - 5, my - 5, 10, 10);
-    ctx.strokeStyle = isSeen ? '#ffffff' : 'rgba(15,23,42,0.9)';
-    ctx.lineWidth = isSeen ? 1.5 : 1;
+    ctx.strokeStyle = anySeen ? '#ffffff' : 'rgba(15,23,42,0.9)';
+    ctx.lineWidth = anySeen ? 1.5 : 1;
     ctx.strokeRect(mx - 5.5, my - 5.5, 11, 11);
 
-    // Position label pill on the side away from the wall (so ID doesn't collide with BACK/FRONT/LEFT/RIGHT)
-    // front=y≈0 → label up, back=y≈max → down, left=x≈0 → right, right=x≈max → left
-    const idText = String(id);
-    const tw = ctx.measureText(idText).width;
-    const pillW = tw + 8, pillH = 15;
-    let labelX, labelY, anchor = 'center';
-    const wall = (m.wall || '').toLowerCase();
-    if (wall === 'front')      { labelX = mx; labelY = my - 13; }
+    // Build a combined label text "id1/id2/…" and its total width so
+    // the pill is sized correctly. We draw each ID separately below
+    // with per-ID colouring.
+    const sep = '/';
+    const sepW = ctx.measureText(sep).width;
+    let totalW = 0;
+    const pieces = [];
+    b.entries.forEach((e, i) => {
+      const w = ctx.measureText(e.id).width;
+      pieces.push({id: e.id, seen: e.seen, w});
+      totalW += w;
+      if (i < b.entries.length - 1) totalW += sepW;
+    });
+    const pillW = totalW + 8, pillH = 15;
+
+    // Side of the wall opposite the BACK/FRONT/LEFT/RIGHT text.
+    const wall = (b.wall || '').toLowerCase();
+    let labelX, labelY;
+    if      (wall === 'front') { labelX = mx; labelY = my - 13; }
     else if (wall === 'back')  { labelX = mx; labelY = my + 13; }
     else if (wall === 'left')  { labelX = mx + 9 + pillW / 2; labelY = my; }
     else if (wall === 'right') { labelX = mx - 9 - pillW / 2; labelY = my; }
-    else                       { labelX = mx; labelY = my - 13; }
+    else                        { labelX = mx; labelY = my - 13; }
 
-    // Dark background pill for legibility — always visible
+    // Pill background + border
     ctx.fillStyle = 'rgba(15,23,42,0.9)';
     ctx.fillRect(labelX - pillW / 2, labelY - pillH / 2, pillW, pillH);
     ctx.strokeStyle = baseColor;
-    ctx.lineWidth = isSeen ? 1.5 : 1;
+    ctx.lineWidth = anySeen ? 1.5 : 1;
     ctx.strokeRect(labelX - pillW / 2 + 0.5, labelY - pillH / 2 + 0.5, pillW - 1, pillH - 1);
 
-    // ID text — white for seen markers, wall color for unseen
-    ctx.fillStyle = isSeen ? '#ffffff' : baseColor;
-    ctx.textAlign = 'center';
-    ctx.fillText(idText, labelX, labelY + 0.5);
+    // Render IDs piece-by-piece so each one can be coloured by its
+    // own visibility. Seen → bright white + bold; unseen → wall colour.
+    ctx.textAlign = 'left';
+    let cursor = labelX - totalW / 2;
+    pieces.forEach((p, i) => {
+      ctx.fillStyle = p.seen ? '#ffffff' : baseColor;
+      ctx.font = p.seen ? 'bold 11px monospace' : '11px monospace';
+      ctx.fillText(p.id, cursor, labelY + 0.5);
+      cursor += p.w;
+      if (i < pieces.length - 1) {
+        ctx.fillStyle = '#64748b';
+        ctx.font = '11px monospace';
+        ctx.fillText(sep, cursor, labelY + 0.5);
+        cursor += sepW;
+      }
+    });
+    ctx.font = 'bold 11px monospace';   // restore default for any later caller
   }
   ctx.textBaseline = 'alphabetic';  // restore default so downstream drawing is unaffected
 
@@ -4765,6 +4816,23 @@ async function fleetPoll() {
       if (window._arena3d && window._arena3d.updateDrones) {
         window._arena3d.updateDrones(d.observers);
         if (window._arena3d.syncTargetBoxes) window._arena3d.syncTargetBoxes();
+        // Aggregate which markers are currently visible / used as refs
+        // across the whole fleet so the 3D highlight matches the 2D
+        // halo. Prefer the position service's seen_markers field; fall
+        // back to ref_markers-only when the observer isn't running.
+        if (window._arena3d.updateVisibleMarkers) {
+          const seenAll = new Set();
+          const refAll  = new Set();
+          for (const st of Object.values(d.observers || {})) {
+            (st.seen_markers || []).forEach(m => seenAll.add(String(m)));
+            (st.ref_markers  || []).forEach(m => {
+              refAll.add(String(m));
+              seenAll.add(String(m));   // ref implies seen
+            });
+          }
+          window._arena3d.updateVisibleMarkers(
+            Array.from(seenAll), Array.from(refAll));
+        }
       }
     }
   } catch {}
@@ -5872,8 +5940,47 @@ let ARENA_W_dyn = 20, ARENA_D_dyn = 10;
     droneMeshes = {}; markerMeshes = {};
   }
 
+  // ── Visible-marker highlight for the 3D arena ─────────────────────
+  // Mirrors the 2D halo/white-border on seen markers. We cache each
+  // marker's base colour + emissive on first create and mutate only
+  // on state changes — cheaper than rebuilding materials per frame.
+  function updateVisibleMarkers(seenIds, refIds) {
+    if (!scene) return;
+    const seen = new Set((seenIds || []).map(String));
+    const refs = new Set((refIds  || []).map(String));
+    for (const [id, mesh] of Object.entries(markerMeshes)) {
+      if (!mesh || !mesh.material) continue;
+      if (mesh.userData._baseColor == null) {
+        // Cache originals the first time we touch this mesh.
+        mesh.userData._baseColor    = mesh.material.color.getHex();
+        mesh.userData._baseEmissive = mesh.material.emissive
+                                        ? mesh.material.emissive.getHex() : 0;
+        mesh.userData._baseScale    = mesh.scale.x;
+      }
+      const isSeen = seen.has(String(id));
+      const isRef  = refs.has(String(id));
+      if (isSeen) {
+        // Bright yellow (or green if actually used for pose fusion).
+        const highlightColor = isRef ? 0x22c55e : 0xfbbf24;
+        mesh.material.color.setHex(highlightColor);
+        if (mesh.material.emissive) {
+          mesh.material.emissive.setHex(highlightColor);
+          mesh.material.emissiveIntensity = 0.6;
+        }
+        mesh.scale.setScalar(mesh.userData._baseScale * 1.35);
+      } else {
+        mesh.material.color.setHex(mesh.userData._baseColor);
+        if (mesh.material.emissive) {
+          mesh.material.emissive.setHex(mesh.userData._baseEmissive);
+          mesh.material.emissiveIntensity = 0;
+        }
+        mesh.scale.setScalar(mesh.userData._baseScale);
+      }
+    }
+  }
+
   // Expose for fleetPoll()
-  window._arena3d = {updateDrones, syncTargetBoxes};
+  window._arena3d = {updateDrones, syncTargetBoxes, updateVisibleMarkers};
 
   // Toggle wiring — 3D view is shown BY DEFAULT below the 2D canvas.
   // The 2D canvas stays visible the whole time so operators have the
