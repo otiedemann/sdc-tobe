@@ -102,6 +102,35 @@ aruco_fleet = ObserverFleet(session=_http_session, allow_live=_aruco_allow_live)
 aruco_fleet.configure(DRONES)
 mission_manager = MissionManager(aruco_fleet)
 
+# ── Global PAUSE state ─────────────────────────────────────────────────
+# When True, every autonomous subsystem (missions, ArUco Seek LIVE) is
+# vetoed. Manual WASD / RC / keepalive remain active so the operator
+# can nudge a drone manually. Set by /proxy/pause_all, cleared by
+# /proxy/resume_all. UI hotkey is '9' (next to '0' = LAND ALL).
+_global_paused: bool = False
+_global_paused_at: float = 0.0
+_global_paused_src: str = ""
+_pause_lock = threading.Lock()
+
+
+def _is_paused() -> bool:
+    with _pause_lock:
+        return _global_paused
+
+
+def _pause_guard_response():
+    """Return a Flask response to reject an autonomous-control request
+    while the fleet is paused, or None if we're allowed to proceed."""
+    if _is_paused():
+        return jsonify(
+            ok=False,
+            error="fleet paused — autonomous control is disabled",
+            hint="press CONTINUE MISSION (button) or 9 (hotkey) to resume",
+            paused=True,
+        ), 409
+    return None
+
+
 command_log_enabled = os.getenv("REMOTE_COMMAND_LOG", "0") in {"1", "true", "True"}
 command_log_path = Path(os.getenv("REMOTE_COMMAND_LOG_PATH", "remote_command_log.jsonl"))
 command_log_last: dict[str, float] = {}
@@ -222,6 +251,14 @@ HTML = """
     #arc_live_banner { display:none; background:#b91c1c; color:#fee2e2; padding:6px 10px; border-radius:4px; font-weight:700; letter-spacing:0.04em; margin-bottom:8px; box-shadow:0 0 0 2px #fbbf24 inset; text-align:center; font-size:12px; }
     #arc_live_banner.show { display:block; animation:arcpulse 1.6s ease-in-out infinite; }
     @keyframes arcpulse { 0%,100% { box-shadow:0 0 0 2px #fbbf24 inset; } 50% { box-shadow:0 0 0 4px #fbbf24 inset; } }
+    /* PAUSED banner pulse (stronger, so it can't be missed) */
+    @keyframes pausepulse { 0%,100% { box-shadow:0 0 0 2px #facc15 inset; } 50% { box-shadow:0 0 0 5px #fde68a inset; } }
+    /* Dim autonomous-mode controls while paused to make the blocked
+       state obvious — operator can still see them, but they're clearly
+       disabled. Manual (WASD) controls remain at full opacity. */
+    body.paused-mode #mission_panel,
+    body.paused-mode #missions_panel,
+    body.paused-mode #aruco_panel { opacity:0.45; filter:grayscale(0.6); pointer-events:none; }
 
     /* Collapsible panels — click the header to toggle. State persists in
        localStorage so each operator keeps their preferred layout. */
@@ -427,8 +464,16 @@ HTML = """
   </div>
   <div style=\"display:flex;align-items:center;gap:8px;\">
     <div class=\"drone-bar\" id=\"drone_bar\" style=\"flex:1;\"></div>
+    <button id=\"pause_all_btn\" style=\"padding:6px 14px;font-size:13px;font-weight:700;background:#78350f;border-color:#f59e0b;color:#fde68a;letter-spacing:0.4px;\" title=\"Override any command and freeze every drone in place. Autonomous missions abort; drones hover with zero RC. Keyboard shortcut: 9\">&#9208;&#65039; PAUSE ALL (9)</button>
+    <button id=\"resume_all_btn\" style=\"padding:6px 14px;font-size:13px;font-weight:700;background:#065f46;border-color:#10b981;color:#d1fae5;letter-spacing:0.4px;display:none;\" title=\"Clear the pause — operators may re-arm missions manually. Keyboard shortcut: 9\">&#9654;&#65039; CONTINUE MISSION</button>
     <button id=\"land_all_btn\" style=\"padding:6px 14px;font-size:13px;font-weight:700;background:#7f1d1d;border-color:#ef4444;color:#fee2e2;letter-spacing:0.4px;\" title=\"Land every drone in the fleet safely. Keyboard shortcut: 0 (zero)\">&#11088; LAND ALL (0)</button>
     <button id=\"edit_drones_btn\" style=\"padding:4px 12px;font-size:12px;background:#1e3a5f;border-color:#3b82f6;\" title=\"Edit drone fleet config\">Config</button>
+  </div>
+  <!-- Global PAUSE banner — sits just below the drone bar, hidden until
+       the fleet is paused. Amber bg + animated pulse to make it impossible
+       to miss. Reminds the operator that WASD is the only active control. -->
+  <div id=\"global_pause_banner\" style=\"display:none;background:#ca8a04;color:#1c1917;padding:8px 14px;margin-top:6px;border-radius:6px;font-weight:700;letter-spacing:0.04em;text-align:center;box-shadow:0 0 0 2px #facc15 inset;animation:pausepulse 1.4s ease-in-out infinite;\">
+    &#9208;&#65039; PAUSED &mdash; autonomous control is disabled. Drones hover at current position. Only WASD / manual RC is live. Press <b>CONTINUE MISSION</b> or <b>9</b> to resume.
   </div>
   <div id=\"drone_config_modal\" style=\"display:none;position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,0.7);z-index:1000;justify-content:center;align-items:center;\">
     <div style=\"background:#1e293b;border:1px solid #334155;border-radius:8px;padding:20px;max-width:700px;width:90%;max-height:80vh;overflow-y:auto;\">
@@ -1330,7 +1375,7 @@ HTML = """
     arcPoll();
     // Version marker — if this string doesn't appear in the DOM,
     // you're running stale JS (restart the Python server or hard-refresh).
-    const BUILD = 'ay-precision-infoicons-theme';
+    const BUILD = 'az-pause-all-continue';
     console.log('[arc] init complete, build=' + BUILD);
     const ver = document.createElement('span');
     ver.id = 'arc_build_tag';
@@ -2330,6 +2375,23 @@ window.addEventListener('keydown', (e)=>{
     landAllDrones('0 hotkey').finally(() => { window._landAllInFlight = false; });
     return;
   }
+  // ── Global PAUSE/RESUME — '9' toggles fleet pause ──────────────────
+  // Same spirit as '0': far from the flight grid, can't be hit by
+  // accident while piloting. Toggles between pause (mid-air freeze,
+  // autonomous control disabled) and resume.
+  if (k === '9') {
+    e.preventDefault();
+    if (window._pauseInFlight) return;      // debounce
+    window._pauseInFlight = true;
+    if (window._globalPaused) {
+      console.log('[PAUSE] 9 pressed — resuming fleet');
+      resumeAllDrones('9 hotkey').finally(() => { window._pauseInFlight = false; });
+    } else {
+      console.log('[PAUSE] 9 pressed — pausing fleet');
+      pauseAllDrones('9 hotkey').finally(() => { window._pauseInFlight = false; });
+    }
+    return;
+  }
   // ── Drone switch hotkey: digits 1-5 select the Nth drone in the bar ──
   // Order follows Object.entries(drones) insertion order, same as the
   // drone-bar buttons top→bottom. '1' = first drone, '2' = second, etc.
@@ -2377,6 +2439,91 @@ window.addEventListener('keydown', (e)=>{
     console.log('[LAND_ALL] button clicked');
     landAllDrones('button').finally(() => { window._landAllInFlight = false; });
   });
+})();
+
+// ── PAUSE ALL / CONTINUE MISSION wiring ───────────────────────────────
+// The PAUSE button overrides any command — every drone freezes at its
+// current position (autonomous missions abort, ArUco Seek drops out of
+// LIVE, and a zero-RC brake goes out to every drone). Only manual WASD
+// / RC remains active. CONTINUE MISSION clears the flag; nothing
+// auto-restarts so the operator is never surprised by a darting drone.
+window._globalPaused = false;
+function applyPauseUI(paused, info) {
+  window._globalPaused = !!paused;
+  const pbtn = document.getElementById('pause_all_btn');
+  const rbtn = document.getElementById('resume_all_btn');
+  const ban  = document.getElementById('global_pause_banner');
+  if (pbtn) pbtn.style.display = paused ? 'none' : '';
+  if (rbtn) rbtn.style.display = paused ? '' : 'none';
+  if (ban)  ban.style.display  = paused ? '' : 'none';
+  document.body.classList.toggle('paused-mode', !!paused);
+  if (paused && info && info.source) {
+    if (ban) ban.title = 'paused via ' + info.source;
+  }
+}
+async function pauseAllDrones(source) {
+  try {
+    const r = await fetch('/proxy/pause_all', {
+      method: 'POST',
+      headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({source: source || 'ui'}),
+    });
+    const j = await r.json();
+    console.log('[PAUSE] result:', j);
+    applyPauseUI(true, j);
+    showLandAllBanner(
+      '\\u23f8 PAUSED — ' + (j.braked || 0) + '/' + (j.total || 0) +
+      ' drones braked' + (j.mission_stopped ? ' (mission stopped)' : ''),
+      '#78350f', '#fde68a', 4000);
+  } catch (err) {
+    console.error('[PAUSE] failed:', err);
+    showLandAllBanner('\\u2717 PAUSE failed: ' + err, '#7f1d1d', '#fecaca', 5000);
+  }
+}
+async function resumeAllDrones(source) {
+  try {
+    const r = await fetch('/proxy/resume_all', {
+      method: 'POST',
+      headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({source: source || 'ui'}),
+    });
+    const j = await r.json();
+    console.log('[RESUME] result:', j);
+    applyPauseUI(false, j);
+    showLandAllBanner('\\u25b6 RESUMED — autonomous control re-enabled',
+                      '#064e3b', '#a7f3d0', 3500);
+  } catch (err) {
+    console.error('[RESUME] failed:', err);
+    showLandAllBanner('\\u2717 RESUME failed: ' + err, '#7f1d1d', '#fecaca', 5000);
+  }
+}
+(function wirePauseButtons(){
+  const p = document.getElementById('pause_all_btn');
+  if (p) p.addEventListener('click', () => {
+    if (window._pauseInFlight) return;
+    window._pauseInFlight = true;
+    pauseAllDrones('button').finally(() => { window._pauseInFlight = false; });
+  });
+  const r = document.getElementById('resume_all_btn');
+  if (r) r.addEventListener('click', () => {
+    if (window._pauseInFlight) return;
+    window._pauseInFlight = true;
+    resumeAllDrones('button').finally(() => { window._pauseInFlight = false; });
+  });
+})();
+// Multi-tab sync — poll the server's pause flag every 2 s so all open
+// tabs reflect the same state. Fast enough that a pause from another
+// tab is near-instantly visible; slow enough not to hammer the API.
+(function syncPauseState(){
+  async function tick() {
+    try {
+      const r = await fetch('/proxy/pause_status');
+      const j = await r.json();
+      if (!!j.paused !== !!window._globalPaused) applyPauseUI(j.paused, j);
+    } catch {}
+  }
+  tick();
+  setInterval(tick, 2000);
 })();
 
 // Fleet-wide panic land — used by the 'q' hotkey and the big red
@@ -5156,6 +5303,123 @@ def proxy_land_all():
     )
 
 
+@app.post("/proxy/pause_all")
+def proxy_pause_all():
+    """Fleet-wide PAUSE. Overrides any command — every drone stays
+    airborne at its current position (Anafi auto-hovers with zero RC).
+
+    Side-effects, in order:
+      1. Raise the global pause flag (blocks mission start + ArUco LIVE).
+      2. Abort any running mission (do NOT land — the drones hover).
+      3. Yank every ArUco observer out of LIVE back to OBSERVE and clear
+         its search RC override, so it stops pushing commands.
+      4. Send a hard zero-RC (full brake) to each drone so any residual
+         translation command stops immediately.
+
+    The call is idempotent — pressing it again while already paused is
+    a no-op beyond re-issuing the zero-RC.
+    """
+    global _global_paused, _global_paused_at, _global_paused_src
+    data = request.get_json(silent=True) or {}
+    source = str(data.get("source") or "unknown")
+    log_command("pause_all", {"source": source})
+
+    # 1) Raise the flag first so guards start rejecting autonomous starts
+    #    even before we're done tearing down the existing activity.
+    with _pause_lock:
+        _global_paused = True
+        _global_paused_at = time.time()
+        _global_paused_src = source
+
+    # 2) Stop any running mission (don't land).
+    mission_stopped = False
+    try:
+        if mission_manager is not None and mission_manager.current is not None:
+            mission_stopped = mission_manager.stop(land=False)
+    except Exception as e:
+        print(f"[PAUSE_ALL] mission stop failed: {e}")
+
+    # 3) Observers → OBSERVE, clear search overrides.
+    try:
+        for did, obs in aruco_fleet._obs.items():
+            try:
+                obs.set_search_rc(0, 0, 0, 0)
+                obs.set_mode("observe")
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    # 4) Full brake — POST rc(0,0,0,0) to every drone in parallel-ish.
+    results: dict[str, dict] = {}
+    for did, info in DRONES.items():
+        base = (info or {}).get("base")
+        if not base:
+            results[str(did)] = {"ok": False, "error": "no base url"}
+            continue
+        try:
+            # Some APIs want the full RC tuple, others accept a rc_stop
+            # shortcut. The unified API exposes /api/rc; send zeros.
+            resp = _http_session.post(
+                f"{base.rstrip('/')}/api/rc",
+                json={"lr": 0, "fb": 0, "ud": 0, "yaw": 0},
+                timeout=2.0,
+            )
+            try:
+                j = resp.json()
+            except Exception:
+                j = {"raw": resp.text[:120]}
+            results[str(did)] = {
+                "ok": bool(j.get("ok", resp.status_code == 200)),
+                "status": resp.status_code,
+            }
+        except Exception as e:
+            results[str(did)] = {"ok": False, "error": str(e)[:120]}
+
+    ok_count = sum(1 for v in results.values() if v.get("ok"))
+    print(f"[PAUSE_ALL] fleet paused (source={source}) — "
+          f"{ok_count}/{len(results)} drones braked, "
+          f"mission_stopped={mission_stopped}")
+    return jsonify(
+        ok=True, paused=True,
+        source=source,
+        mission_stopped=mission_stopped,
+        braked=ok_count, total=len(results),
+        results=results,
+    )
+
+
+@app.post("/proxy/resume_all")
+def proxy_resume_all():
+    """Clear the global pause. Autonomous endpoints (missions, ArUco
+    LIVE) become reachable again, but nothing auto-restarts — the
+    operator must re-arm any mission themselves. That's intentional:
+    coming out of pause should never surprise the pilot with a drone
+    suddenly darting off."""
+    global _global_paused, _global_paused_at, _global_paused_src
+    data = request.get_json(silent=True) or {}
+    source = str(data.get("source") or "unknown")
+    log_command("resume_all", {"source": source})
+    with _pause_lock:
+        was_paused = _global_paused
+        _global_paused = False
+        _global_paused_at = time.time()
+        _global_paused_src = ""
+    print(f"[RESUME_ALL] fleet resumed (source={source}, was_paused={was_paused})")
+    return jsonify(ok=True, paused=False, source=source, was_paused=was_paused)
+
+
+@app.get("/proxy/pause_status")
+def proxy_pause_status():
+    """UI poll target — lets multiple open tabs sync their button state."""
+    with _pause_lock:
+        return jsonify(
+            paused=_global_paused,
+            since=_global_paused_at,
+            source=_global_paused_src,
+        )
+
+
 @app.post("/proxy/flip")
 def proxy_flip():
     data = request.get_json(silent=True) or {}
@@ -6022,6 +6286,13 @@ def proxy_aruco_mode():
     if obs is None:
         return jsonify(ok=False, error="unknown drone"), 404
     requested = (data.get("mode") or "").lower()
+    # Respect global PAUSE — switching to LIVE while paused is exactly
+    # the kind of autonomous-command surprise PAUSE exists to prevent.
+    # Going back to OBSERVE is always allowed (it's a safety downgrade).
+    if requested == "live":
+        guarded = _pause_guard_response()
+        if guarded is not None:
+            return guarded
     if requested == "live" and not obs.allow_live:
         return jsonify(ok=False, mode=obs.mode,
                        error="LIVE mode disabled on this server (REMOTE_NO_LIVE=1)"), 403
@@ -6157,6 +6428,9 @@ def proxy_missions_status():
 
 @app.post("/proxy/missions/scan_all/start")
 def proxy_missions_scan_all_start():
+    guarded = _pause_guard_response()
+    if guarded is not None:
+        return guarded
     data = request.get_json(silent=True) or {}
     drone_ids = data.get("drone_ids") or []
     if not isinstance(drone_ids, list) or not drone_ids:
@@ -6199,6 +6473,9 @@ def proxy_missions_capture_targets_start():
       "auto_takeoff":  false
     }
     """
+    guarded = _pause_guard_response()
+    if guarded is not None:
+        return guarded
     data = request.get_json(silent=True) or {}
     drone_ids = data.get("drone_ids") or []
     if not isinstance(drone_ids, list) or not drone_ids:

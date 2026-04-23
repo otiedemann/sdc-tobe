@@ -441,7 +441,8 @@ def build():
         ("1", "Introduction &amp; architecture"),
         ("2", "Starting the controller"),
         ("3", "UI layout at a glance"),
-        ("4", "Header row — drone bar, LAND ALL, Config, theme, logo"),
+        ("4", "Header row — drone bar, PAUSE ALL, LAND ALL, Config, theme, logo"),
+        ("4a","PAUSE ALL — behaviour detail"),
         ("5", "Latency widget"),
         ("6", "Keyboard shortcuts"),
         ("7", "WASD &amp; flight grid"),
@@ -538,6 +539,15 @@ def build():
          "Row of drone buttons (one per entry in "
          "<font name='Courier-Bold'>drones_config.json</font>). Click to "
          "switch active drone; hotkeys 1–5 do the same."),
+        ("PAUSE ALL (9)",
+         "Amber override. Freezes every drone mid-air at its current "
+         "position — missions abort, ArUco Seek drops to OBSERVE, a "
+         "zero-RC brake goes out. Only manual WASD is active after this. "
+         "See §5a for full behaviour."),
+        ("CONTINUE MISSION",
+         "Appears only while paused. Clears the flag so autonomous "
+         "endpoints become callable again. Nothing auto-restarts — the "
+         "operator must re-arm any mission manually."),
         ("LAND ALL (0)",
          "Red emergency button. Lands every drone in the fleet. Keyboard "
          "shortcut is the zero key (not in the movement map, safe to hit one-handed)."),
@@ -553,6 +563,53 @@ def build():
          "masked variant if present, falls back to the original)."),
     ]
     story.append(_button_table(header_rows, S))
+
+    # ─── 4a. PAUSE ALL detail ──────────────────────────────────────────
+    story.append(_h2("4a &nbsp; PAUSE ALL — behaviour detail", S))
+    story.append(_p(
+        "PAUSE ALL is a soft kill-switch that leaves the drones flying but "
+        "locks out autonomous control. Use it the moment something looks "
+        "wrong but you don't want the violence of a forced landing. The "
+        "order of operations when you press the button (or hit <b>9</b>) is:",
+        S))
+    story.append(_button_table([
+        ("1. Raise global flag",
+         "<font name='Courier-Bold'>_global_paused = True</font>. "
+         "Mission-start and ArUco-LIVE endpoints start returning "
+         "409 <i>paused</i> so nothing can re-arm behind your back."),
+        ("2. Abort mission",
+         "Any running mission is stopped with <b>land=False</b> — the "
+         "FSM tears down and the drone is left hovering."),
+        ("3. Observers → OBSERVE",
+         "Every ArUco Seek observer switches out of LIVE and its search-RC "
+         "overrides are cleared. The visual-servo loop stops sending RC."),
+        ("4. Zero-RC brake",
+         "A <font name='Courier-Bold'>POST /api/rc {lr:0,fb:0,ud:0,yaw:0}</font> "
+         "goes to every drone in parallel. Anafi firmware holds position "
+         "with no input, so this is an effective air-brake."),
+        ("5. UI banner",
+         "Amber pulsing banner appears; <b>PAUSE ALL</b> hides and "
+         "<b>CONTINUE MISSION</b> appears in its place. The Mission "
+         "Planner, Special Missions, and ArUco Seek panels dim + "
+         "become non-interactive (CSS <font name='Courier-Bold'>body.paused-mode</font>)."),
+        ("What still works",
+         "WASD / Q-E / R-F / X / Space — i.e. keyboard manual control. "
+         "The /proxy/rc, /proxy/key_down, /proxy/key_up routes are NOT "
+         "guarded. Takeoff / Land / LAND ALL also still work — they're "
+         "emergency-level controls."),
+        ("What is blocked",
+         "/proxy/missions/scan_all/start · /proxy/missions/capture_targets/start "
+         "· /proxy/aruco/mode when requested=live. Anything else passes "
+         "through unchanged."),
+        ("Tab sync",
+         "Every open UI tab polls <font name='Courier-Bold'>/proxy/pause_status</font> "
+         "every 2 s, so pausing from one tab is reflected in all others."),
+        ("Resume",
+         "CONTINUE MISSION (or hit <b>9</b> again) POSTs "
+         "<font name='Courier-Bold'>/proxy/resume_all</font>. Flag clears "
+         "immediately but <b>no mission auto-restarts</b> — the operator "
+         "must re-arm via the Mission Planner / Special Missions panel."),
+    ], S))
 
     # ─── 5. Latency widget ────────────────────────────────────────────
     story.append(_h1("5 &nbsp; Latency widget", S))
@@ -592,6 +649,9 @@ def build():
         ("X or Space", "Hard stop — zero all RC axes."),
         ("T",      "Takeoff on the active drone."),
         ("L",      "Land the active drone."),
+        ("9",      "<b>PAUSE / CONTINUE</b> — freezes the whole fleet in "
+                    "place (autonomous missions abort; only WASD remains "
+                    "active). Press again to resume."),
         ("0",      "<b>Panic: LAND ALL</b> — lands every drone in the fleet."),
         ("1 – 5",  "Switch active drone to fleet slot N."),
     ]
