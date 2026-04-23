@@ -1220,22 +1220,35 @@ HTML = """
   <div id=\"global_pause_banner\" style=\"display:none;background:#ca8a04;color:#1c1917;padding:8px 14px;margin-top:6px;border-radius:6px;font-weight:700;letter-spacing:0.04em;text-align:center;box-shadow:0 0 0 2px #facc15 inset;animation:pausepulse 1.4s ease-in-out infinite;\">
     &#9208;&#65039; PAUSED &mdash; autonomous control is disabled. Drones hover at current position. Only WASD / manual RC is live. Press <b>CONTINUE MISSION</b> or <b>9</b> to resume.
   </div>
-  <!-- Ceiling guard — enforced on every drone server-side in the RC tick
-       loop. Applies to both manual WASD and autonomous missions. Default
-       5 m above ground; adjustable. When ANY drone is at/near its ceiling,
-       the banner below pulses red. -->
+  <!-- Ceiling guard — the C2 UI sets the value, but the enforcement
+       runs ENTIRELY on each drone's flight-controller Pi (its 20 Hz
+       rc_loop using its own height_cm telemetry). If the C2 crashes,
+       disconnects, or even shuts down, the Pi keeps clamping upward
+       RC. The value persists to flight_config.json on the Pi so a
+       Pi restart also retains the ceiling. This is the last-line
+       safety — independent of C2 connection. -->
   <div style=\"display:flex;align-items:center;gap:10px;margin-top:6px;padding:4px 10px;background:#0b1424;border:1px solid #1e293b;border-radius:5px;font-size:12px;\">
-    <span style=\"color:#fca5a5;font-weight:600;letter-spacing:0.04em;\">&#128737;&#65039; Ceiling</span>
-    <label style=\"color:#94a3b8;display:flex;align-items:center;gap:4px;cursor:pointer;\" title=\"Hard maximum altitude above ground. Enforced in the Pi's RC tick loop during BOTH manual and autonomous flight. Active descent is forced if the drone overshoots.\">
+    <span style=\"color:#fca5a5;font-weight:600;letter-spacing:0.04em;\"
+          title=\"Safety ceiling — set here, enforced on every Pi independently\">
+      &#128737;&#65039; Ceiling
+    </span>
+    <label style=\"color:#94a3b8;display:flex;align-items:center;gap:4px;cursor:pointer;\"
+           title=\"Hard maximum altitude above ground. Stored and enforced LOCALLY on each drone's Pi (no C2 dependency). Proportional clamp within 50cm, hard stop at ceiling, forced descent above. Persists across Pi restarts via flight_config.json.\">
       max
       <input id=\"ceiling_input\" type=\"number\" min=\"0.5\" max=\"20\" step=\"0.1\" value=\"5.0\" style=\"width:64px;height:26px;font-size:12px;\" />
       m
       <span class=\"info-icon\" data-info=\"ceiling_m\">i</span>
     </label>
-    <button id=\"ceiling_apply_btn\" style=\"height:26px;font-size:11px;padding:0 10px;background:#7f1d1d;border-color:#ef4444;color:#fee2e2;\" title=\"Push this ceiling to every drone's Pi. Also updates the Anafi firmware MaxAltitude as a second-line defence.\">Apply to fleet</button>
+    <button id=\"ceiling_apply_btn\"
+            style=\"height:26px;font-size:11px;padding:0 10px;background:#7f1d1d;border-color:#ef4444;color:#fee2e2;\"
+            title=\"POST the new value to every drone's /api/config/ceiling. Each Pi then: (1) stores it in MAX_ALTITUDE_M for its local RC tick, (2) writes it to flight_config.json for persistence, (3) pushes it to the Anafi firmware MaxAltitude as a second-line guard.\">Apply to fleet</button>
     <span id=\"ceiling_status\" class=\"small\" style=\"color:#64748b;\"></span>
     <span id=\"ceiling_engaged_badge\" class=\"small\" style=\"display:none;color:#fde68a;background:#7f1d1d;padding:2px 8px;border-radius:4px;font-weight:700;letter-spacing:0.04em;animation:pausepulse 1.0s ease-in-out infinite;\">
       &#128680; CEILING ENGAGED
+    </span>
+    <span class=\"small\" style=\"color:#64748b;margin-left:auto;\"
+          title=\"The Pi enforces this ceiling on every RC tick regardless of C2 state — no remote connection required.\">
+      &#128274; Pi-enforced
     </span>
   </div>
   <div id=\"drone_config_modal\" style=\"display:none;position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,0.7);z-index:1000;justify-content:center;align-items:center;\">
@@ -2182,7 +2195,7 @@ HTML = """
     arcPoll();
     // Version marker — if this string doesn't appear in the DOM,
     // you're running stale JS (restart the Python server or hard-refresh).
-    const BUILD = 'bs-heartbeat-server-side';
+    const BUILD = 'bt-ceiling-pi-enforced';
     console.log('[arc] init complete, build=' + BUILD);
     const ver = document.createElement('span');
     ver.id = 'arc_build_tag';
@@ -5471,18 +5484,22 @@ window.PARAM_INFO = {
 
   // ===== Safety =====
   ceiling_m: {title:'Hard altitude ceiling', units:'metres', body:
-    "Maximum altitude above ground. Enforced server-side on every Pi, in "+
-    "the RC tick loop that drives the Anafi's PCMD. Applies to BOTH "+
-    "manual WASD and autonomous missions — no command path bypasses it.\\n\\n"+
+    "Maximum altitude above ground. The value is set from this UI, but "+
+    "the enforcement is ENTIRELY on each drone's flight-controller Pi — "+
+    "in its own 20 Hz RC tick loop, using its own height_cm telemetry. "+
+    "Independent of any C2 connection: if this browser or the C2 server "+
+    "crashes mid-flight, the Pi keeps clamping upward RC.\\n\\n"+
     "Behaviour:\\n"+
     "  • approaching (within 50 cm): climb RC clamped proportionally to "+
     "remaining clearance.\\n"+
     "  • at ceiling: all climb blocked.\\n"+
     "  • above ceiling (+20 cm): forced active descent regardless of any "+
-    "input.\\n\\n"+
-    "Default 5 m. The firmware MaxAltitude is also set to this value as "+
-    "a second line of defence — the software guard runs continuously "+
-    "regardless of GPS/indoor mode."},
+    "input — manual WASD or autonomous mission, no difference.\\n\\n"+
+    "Persistence: the Pi writes the chosen value to flight_config.json "+
+    "and reloads it on restart, so power-cycling the Pi still leaves "+
+    "your last-set ceiling active. The firmware MaxAltitude is also "+
+    "pushed to the Anafi as a second-line guard on every connect.\\n\\n"+
+    "Default 5 m."},
 };
 
 window.showParamInfo = function(key, ev) {

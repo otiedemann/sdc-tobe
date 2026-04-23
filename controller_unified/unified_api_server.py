@@ -743,7 +743,17 @@ def _save_arena_config(cfg: dict):
 
 
 def _load_flight_config():
-    """Apply persisted flight limits to globals on startup."""
+    """Apply persisted flight limits to globals on startup.
+
+    The ceiling (MAX_ALTITUDE_M) is the most important one here: it's
+    enforced by THIS process's RC tick loop (20 Hz, see rc_loop()) and
+    is independent of any remote/C2 connection. If the C2 is down, the
+    Pi still reads MAX_ALTITUDE_M every tick and clamps any upward RC
+    that would take the drone past it. That's why persisting the value
+    to disk matters — after a Pi restart the guard must come back up
+    with the operator's last-set value, not just the compile-time
+    default.
+    """
     global MAX_ALTITUDE_M, MAX_VERTICAL_SPEED, MAX_TILT, MAX_YAW_SPEED
     try:
         if FLIGHT_CONFIG_PATH.exists():
@@ -757,6 +767,8 @@ def _load_flight_config():
             if "max_yaw_speed" in data:
                 MAX_YAW_SPEED = float(data["max_yaw_speed"])
             print(f"[UNIFIED] Loaded flight config: alt={MAX_ALTITUDE_M} vs={MAX_VERTICAL_SPEED} tilt={MAX_TILT} yaw={MAX_YAW_SPEED}")
+            print(f"[CEILING] Pi-side safety ceiling: {MAX_ALTITUDE_M:.2f} m (loaded from {FLIGHT_CONFIG_PATH.name})")
+            print(f"[CEILING] Enforced every RC tick, independent of C2 connection.")
     except Exception as e:
         print(f"[UNIFIED] flight_config load error: {e}")
 
@@ -4134,6 +4146,17 @@ def api_diagnostics():
         video_frame_count=_video_frame_count,
         flying=flying,
         connected=bool(conn_state.get("connected", False)),
+        # Safety state — proves the ceiling is Pi-enforced even with
+        # no remote/C2 connection. `ceiling_source` tells you where
+        # the current value came from (config file or env default).
+        ceiling={
+            "ceiling_m":        round(float(MAX_ALTITUDE_M), 2),
+            "engaged":          bool(_ceiling_engaged),
+            "reason":           _ceiling_last_reason or "",
+            "config_file":      str(FLIGHT_CONFIG_PATH),
+            "config_persists":  FLIGHT_CONFIG_PATH.exists(),
+            "enforced_by":      "pi.rc_loop @ 20Hz (independent of C2)",
+        },
     )
 
 
