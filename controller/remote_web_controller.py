@@ -470,6 +470,11 @@ class DroneWS:
         self._last_rc_send_ts: float = 0.0
         self._rc_rtt_ms: float = 0.0
         self._ws_connected = {"telemetry": False, "position": False, "rc": False}
+        # Log-suppression state: only print on state transitions, not every
+        # reconnect attempt. Offline hosts would otherwise produce 3 lines
+        # every 5 s per drone = a flood that obscures every real log.
+        self._was_connected = {"telemetry": False, "position": False, "rc": False}
+        self._consec_failures = {"telemetry": 0, "position": 0, "rc": 0}
         self._running = False
 
     @staticmethod
@@ -604,7 +609,13 @@ class DroneWS:
         recv timeout must be comfortably longer than the server's
         _WS_PING_INTERVAL_S (currently 3 s) so idle channels don't
         false-positive as dead links. 30 s gives ~10× headroom and
-        still catches real link losses in under a minute."""
+        still catches real link losses in under a minute.
+
+        Logging discipline: an offline host would otherwise log every
+        reconnect attempt forever. We log only on state transitions
+        (first failure after connected, or first success after
+        failing). Backoff also ramps to 60 s so the log stays quiet
+        and bandwidth is minimal when a drone is simply offline."""
         backoff = 1.0
         while self._running:
             try:
@@ -612,6 +623,13 @@ class DroneWS:
                     url, timeout=4, sockopt=self._sockopt_low_latency())
                 ws.settimeout(30.0)
                 self._ws_connected[name] = True
+                # Transition FAIL → OK — log only once, reset counters.
+                if not self._was_connected[name]:
+                    if self._consec_failures[name] > 0:
+                        print(f"[WS] {self.drone_id} {name} connected "
+                              f"(after {self._consec_failures[name]} failure(s))")
+                    self._was_connected[name] = True
+                    self._consec_failures[name] = 0
                 backoff = 1.0          # reset on successful connect
                 while self._running:
                     try:
@@ -631,19 +649,36 @@ class DroneWS:
                 try: ws.close()
                 except Exception: pass
             except Exception as e:
-                # Connect failed or mid-stream error. Silence the noisy
-                # "Connection closed: 1000" that fires on every normal
-                # peer disconnect (Pi restart, drone disconnect, etc.)
-                # — only print real problems.
                 if self._running:
-                    msg = str(e)
-                    if "1000" not in msg and "Connection closed" not in msg:
-                        print(f"[WS] {self.drone_id} {name} reconnect: {e}")
+                    self._consec_failures[name] += 1
+                    # Log once on: (a) transition from connected → failed,
+                    # or (b) the very first failure at boot so the operator
+                    # knows a drone is unreachable. Subsequent reconnect
+                    # attempts stay silent so the log doesn't flood while
+                    # the drone sits offline.
+                    first_failure = (self._consec_failures[name] == 1
+                                      and not self._was_connected[name])
+                    if self._was_connected[name] or first_failure:
+                        self._was_connected[name] = False
+                        msg = str(e)
+                        if ("Connection refused" not in msg
+                                and "Connection closed" not in msg
+                                and "1000" not in msg):
+                            print(f"[WS] {self.drone_id} {name} disconnect: {e}")
+                        else:
+                            print(f"[WS] {self.drone_id} {name} offline "
+                                  f"(retries will stay silent until recovery)")
             finally:
                 self._ws_connected[name] = False
             if self._running:
                 time.sleep(backoff)
-                backoff = min(5.0, backoff * 1.5)
+                # Fast retries while we're likely just between frames (1-5 s),
+                # slow retries while the host is clearly offline (>10 failures
+                # → 60 s cap). Keeps the reconnect alive without spamming.
+                if self._consec_failures[name] <= 3:
+                    backoff = min(5.0, backoff * 1.6)
+                else:
+                    backoff = min(60.0, backoff * 2.0)
 
     def _rc_connect_loop(self):
         """Keeps the RC send socket alive.
@@ -668,6 +703,13 @@ class DroneWS:
                 with self._rc_ws_lock:
                     self._rc_ws = ws
                 self._ws_connected["rc"] = True
+                # Transition FAIL → OK — log only once.
+                if not self._was_connected["rc"]:
+                    if self._consec_failures["rc"] > 0:
+                        print(f"[WS] {self.drone_id} rc connected "
+                              f"(after {self._consec_failures['rc']} failure(s))")
+                    self._was_connected["rc"] = True
+                    self._consec_failures["rc"] = 0
                 backoff = 1.0
                 last_ping = 0.0
                 ping_pending: dict[int, float] = {}  # client_ts → send_monotonic
@@ -706,14 +748,29 @@ class DroneWS:
                                     self._rc_rtt_ms = round((time.monotonic() - sent_mono) * 1000.0, 1)
             except Exception as e:
                 if self._running:
-                    print(f"[WS] {self.drone_id} rc reconnect: {e}")
+                    self._consec_failures["rc"] += 1
+                    first_failure = (self._consec_failures["rc"] == 1
+                                      and not self._was_connected["rc"])
+                    if self._was_connected["rc"] or first_failure:
+                        self._was_connected["rc"] = False
+                        m = str(e)
+                        if ("Connection refused" not in m
+                                and "Connection closed" not in m
+                                and "1000" not in m):
+                            print(f"[WS] {self.drone_id} rc disconnect: {e}")
+                        else:
+                            print(f"[WS] {self.drone_id} rc offline "
+                                  f"(retries silent until recovery)")
             finally:
                 with self._rc_ws_lock:
                     self._rc_ws = None
                 self._ws_connected["rc"] = False
             if self._running:
                 time.sleep(backoff)
-                backoff = min(5.0, backoff * 1.5)
+                if self._consec_failures["rc"] <= 3:
+                    backoff = min(5.0, backoff * 1.6)
+                else:
+                    backoff = min(60.0, backoff * 2.0)
 
     def _on_telemetry_msg(self, data: dict):
         if data.get("type") not in (None, "telemetry"):
@@ -2022,7 +2079,7 @@ HTML = """
     arcPoll();
     // Version marker — if this string doesn't appear in the DOM,
     // you're running stale JS (restart the Python server or hard-refresh).
-    const BUILD = 'bj-unreachable-drone-shortcut';
+    const BUILD = 'bk-ws-quiet-offline';
     console.log('[arc] init complete, build=' + BUILD);
     const ver = document.createElement('span');
     ver.id = 'arc_build_tag';
