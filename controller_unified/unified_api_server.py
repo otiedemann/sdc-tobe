@@ -698,6 +698,12 @@ _pos_cfg: dict = {
     # Default 5 Hz cut-off smooths Anafi's noisy per-sample velocity
     # without dulling reaction to actual rapid moves.
     "imu_lowpass_hz":       5.0,
+    # Seen-marker hold time (seconds). A marker that's been detected
+    # within this window still appears as "seen" even if the current
+    # frame missed it. Stops the arena-view halos flickering on
+    # single-frame detection dropouts — the per-frame detection rate
+    # is still visible on seen_markers_raw for diagnostics.
+    "seen_hold_s":          0.6,
 }
 
 
@@ -4899,6 +4905,32 @@ def positioning_loop():
             _pos_fps_counter = 0
             _pos_fps_last_reset = _fps_now
 
+        # ── Seen-marker hold-time (hysteresis) ───────────────────────
+        # ArUco detection isn't perfectly reliable per frame — blur,
+        # glare, or extreme angle can cause a single-frame miss. The
+        # UI halos would then flicker even though the camera is still
+        # pointed at the marker. We keep a per-marker last-seen
+        # timestamp and treat any marker seen within HOLD_S as still
+        # visible, smoothing single-frame drops.
+        _SEEN_HOLD_S = float(_pos_cfg.get("seen_hold_s", 0.6))
+        fresh_ids = [str(m) for m in (result.get("seen_markers") or [])]
+        now_mono = time.monotonic()
+        if not hasattr(positioning_loop, "_seen_last"):
+            positioning_loop._seen_last = {}   # marker_id → last monotonic ts
+        seen_last: dict = positioning_loop._seen_last
+        for mid in fresh_ids:
+            seen_last[mid] = now_mono
+        # Prune really stale entries so the dict doesn't grow forever.
+        cutoff = now_mono - max(_SEEN_HOLD_S, 2.0)
+        for mid in [k for k, ts in seen_last.items() if ts < cutoff]:
+            del seen_last[mid]
+        # Build the hysteresis-smoothed list: every marker seen within
+        # HOLD_S counts. Preserve detection order: most recently-seen first.
+        held_ids = sorted(
+            (mid for mid, ts in seen_last.items() if (now_mono - ts) <= _SEEN_HOLD_S),
+            key=lambda m: seen_last[m], reverse=True,
+        )
+
         with _pos_st_lock:
             if cam is not None:
                 _pos_st["x"] = round(float(cam[0]), 4)
@@ -4910,7 +4942,11 @@ def positioning_loop():
             _pos_st["markers"] = {str(k): round(float(v), 4)
                                    for k, v in (result.get("marker_weights") or {}).items()}
             _pos_st["ref_markers"] = list(result.get("ref_markers") or [])
-            _pos_st["seen_markers"] = list(result.get("seen_markers") or [])
+            # Publish the SMOOTHED list so the UI halos don't flicker.
+            # The raw per-frame detections are still available for
+            # diagnostics / flight-log accuracy on "seen_markers_raw".
+            _pos_st["seen_markers"]     = held_ids
+            _pos_st["seen_markers_raw"] = fresh_ids
             _pos_st["seen_count"] = int(result.get("seen_count") or 0)
             _pos_st["stale"] = stale
             _pos_st["ts"] = ts
@@ -5166,6 +5202,11 @@ def api_pos_config_set():
             # above 100 Hz the filter adds nothing useful at TELEMETRY_HZ.
             v = float(data["imu_lowpass_hz"])
             _pos_cfg["imu_lowpass_hz"] = 0.0 if v <= 0 else max(0.1, min(100.0, v))
+        if "seen_hold_s" in data:
+            # 0 disables hysteresis (halo reflects per-frame detection
+            # exactly). Positive values clamped 0..3 s.
+            v = float(data["seen_hold_s"])
+            _pos_cfg["seen_hold_s"] = max(0.0, min(3.0, v))
         cfg_snap = dict(_pos_cfg)
 
     # Apply live filter changes to running processor
