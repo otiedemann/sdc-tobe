@@ -131,6 +131,16 @@ class HoverParams:
     # Physical marker size in meters — drives distance estimation.
     # Distance scale auto-adjusts via (marker_size_m / MARKER_SIZE_CALIB_M) ** CALIB_B.
     marker_size_m: float   = ASEEK.MARKER_SIZE_M
+    # ── Axis-locked (Manhattan) flight mode ──────────────────────────
+    # When True, all autonomous motion (waypoint nav + PD approach) is
+    # constrained to wall-parallel axes only:
+    #   • Yaw snaps to nearest 90° (0/90/180/270° in arena frame)
+    #   • At any tick, only ONE of {forward/back, left/right strafe} is
+    #     non-zero — no diagonals
+    #   • Vertical (up/down) always remains free
+    # Manual WASD and emergency/stop paths are UNAFFECTED. The switch
+    # applies exclusively to the autonomous motion decisions.
+    axis_locked: bool      = False
 
 
 def _clamp_int(v: float, lo: int, hi: int) -> int:
@@ -139,6 +149,34 @@ def _clamp_int(v: float, lo: int, hi: int) -> int:
 
 def _clamp_rc(v: int) -> int:
     return max(-100, min(100, int(v)))
+
+
+def _axis_lock_rc(lr: int, fb: int) -> tuple[int, int]:
+    """Keep only the dominant lateral axis. Used by HoverParams.axis_locked:
+    the drone never moves diagonally — at any tick it's either strafing
+    left/right OR moving forward/back, whichever direction has the
+    larger RC magnitude."""
+    if abs(lr) >= abs(fb):
+        return lr, 0
+    return 0, fb
+
+
+def _snap_yaw_to_cardinal(yaw_deg: float) -> float:
+    """Round a heading to the nearest 90° multiple, normalised to [0, 360)."""
+    y = yaw_deg % 360.0
+    return (round(y / 90.0) * 90.0) % 360.0
+
+
+def _yaw_error_to_cardinal(yaw_deg: float) -> float:
+    """Signed shortest-path error (deg) from current yaw to the nearest
+    cardinal (0°/90°/180°/270°). Positive = rotate CCW (increase yaw)."""
+    target = _snap_yaw_to_cardinal(yaw_deg)
+    err = target - (yaw_deg % 360.0)
+    if err > 180.0:
+        err -= 360.0
+    elif err < -180.0:
+        err += 360.0
+    return err
 
 
 # ─── Per-drone observer ─────────────────────────────────────────────────────
@@ -197,7 +235,13 @@ class DroneObserver:
             "y_min":   0.0, "y_max": 10.8,
             "z_min":   0.3, "z_max":  5.0,   # some ceiling headroom
         }
-        self._safety_margin_m = 1.0
+        # Autonomous-mode safety margin from arena borders. Increased
+        # from 1.0 → 1.5 m per ops policy: during autonomous flight the
+        # drone must NEVER approach the walls closer than 1.5 m. Manual
+        # flight is unaffected — this margin only kicks in when the
+        # observer is running with live RC output. Adjustable via
+        # set_arena_bounds(safety_margin_m=…).
+        self._safety_margin_m = 1.5
         self._last_guard_info = {}   # diagnostics for state snapshot
         # Search RC — commands the drone sends when in LIVE mode but not
         # actively tracking a marker (e.g. mission SEARCH maneuver).
@@ -329,6 +373,33 @@ class DroneObserver:
                 desired_yaw = math.degrees(math.atan2(dfx, dfy))
                 yaw_err = ((desired_yaw - yaw_deg + 180.0) % 360.0) - 180.0
                 yaw_rc = int(round(yaw_err * P_YAW))
+
+        # ── Axis-locked (Manhattan) mode ─────────────────────────────
+        # When enabled, the drone stays aligned to cardinal directions
+        # and never moves diagonally:
+        #   1. Yaw is driven to the nearest 90° (0/90/180/270°) in the
+        #      arena frame — overrides the face-point target until
+        #      aligned. Once aligned, yaw is held.
+        #   2. Of {forward/back, strafe}, only the dominant-magnitude
+        #      axis moves. The smaller one is zeroed.
+        if self.params.axis_locked:
+            # Step 1: lock yaw to nearest cardinal. Only rotate if the
+            # error exceeds a small deadband (~4°) so we don't buzz at
+            # the target heading.
+            yaw_err_card = _yaw_error_to_cardinal(yaw_deg)
+            if abs(yaw_err_card) > 4.0:
+                # Rotate toward the cardinal — P-control with a low gain
+                # for a smooth, predictable 90° increment movement.
+                yaw_rc = int(round(yaw_err_card * 1.2))
+                # While aligning yaw, keep horizontal motion stopped so
+                # the drone doesn't drift diagonally during the rotation.
+                fb_rc = 0
+                lr_rc = 0
+            else:
+                # Snap yaw command to zero — we're at a cardinal heading.
+                yaw_rc = 0
+                # Step 2: axis-lock horizontal motion.
+                lr_rc, fb_rc = _axis_lock_rc(lr_rc, fb_rc)
 
         # Clamps — safer than full-stick on waypoints
         fb_rc  = max(-40, min(40, fb_rc))
@@ -514,7 +585,16 @@ class DroneObserver:
                     continue
                 cur = getattr(self.params, k)
                 try:
-                    new_val = int(round(float(v))) if (isinstance(cur, int) and not isinstance(cur, bool)) else float(v)
+                    if isinstance(cur, bool):
+                        # Accept "true"/"false"/"1"/"0"/0/1/true/false.
+                        if isinstance(v, str):
+                            new_val = v.strip().lower() in ("1", "true", "yes", "on")
+                        else:
+                            new_val = bool(v)
+                    elif isinstance(cur, int):
+                        new_val = int(round(float(v)))
+                    else:
+                        new_val = float(v)
                     setattr(self.params, k, new_val)
                     applied[k] = new_val
                 except Exception:
@@ -937,6 +1017,24 @@ class DroneObserver:
         if abs(lr)     < p.rc_min: lr     = 0
         if abs(ud)     < p.rc_min: ud     = 0
         if abs(fb)     < p.rc_min: fb     = 0
+
+        # ── Axis-locked (Manhattan) mode ─────────────────────────────
+        # Mirrors the constraint applied in _compute_waypoint_rc. The
+        # marker-PD path skews the drone toward the marker; under
+        # axis-lock we:
+        #   1. Override the visual-servo yaw with a command that drives
+        #      the drone's compass yaw to the nearest 90° multiple.
+        #   2. Keep only the dominant horizontal axis (strafe OR fwd/back).
+        if p.axis_locked:
+            yaw_deg_now = float(snapshot.get("yaw", 0.0) or 0.0)
+            yaw_err_card = _yaw_error_to_cardinal(yaw_deg_now)
+            if abs(yaw_err_card) > 4.0:
+                yaw_rc = _clamp_int(yaw_err_card * 1.2, -p.yaw_max, p.yaw_max)
+                lr = 0
+                fb = 0
+            else:
+                yaw_rc = 0
+                lr, fb = _axis_lock_rc(lr, fb)
 
         snapshot.update({
             "marker_id": chosen,

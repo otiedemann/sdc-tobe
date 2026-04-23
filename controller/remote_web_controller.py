@@ -1251,6 +1251,28 @@ HTML = """
       &#128274; Pi-enforced
     </span>
   </div>
+  <!-- Autonomous flight guards — axis-lock + arena safety margin.
+       Both apply ONLY during autonomous motion (observer LIVE mode +
+       mission waypoints). Manual WASD is unaffected. -->
+  <div style=\"display:flex;align-items:center;gap:14px;margin-top:4px;padding:4px 10px;background:#0b1424;border:1px solid #1e293b;border-radius:5px;font-size:12px;flex-wrap:wrap;\">
+    <span style=\"color:#fbbf24;font-weight:600;letter-spacing:0.04em;\">&#129517; Autonomous guards</span>
+    <label style=\"color:#94a3b8;display:flex;align-items:center;gap:4px;cursor:pointer;\"
+           title=\"When ON: during missions and autonomous flight the drone only flies parallel to arena walls — yaw snaps to nearest 90°, lateral motion is strafe OR forward/back but never diagonal. Manual WASD is unchanged.\">
+      <input type=\"checkbox\" id=\"axis_locked_toggle\" style=\"accent-color:#fbbf24;\" />
+      Axis-lock (90° only, no diagonals)
+      <span class=\"info-icon\" data-info=\"axis_locked\">i</span>
+    </label>
+    <label style=\"color:#94a3b8;display:flex;align-items:center;gap:4px;cursor:pointer;\"
+           title=\"Minimum distance from any arena wall during autonomous flight. The boundary guard refuses to let any waypoint / PD command push the drone closer than this to a wall.\">
+      Arena margin
+      <input id=\"safety_margin_input\" type=\"number\" min=\"0.1\" max=\"5.0\" step=\"0.1\" value=\"1.5\" style=\"width:54px;height:24px;font-size:12px;\" />
+      m
+      <span class=\"info-icon\" data-info=\"safety_margin_m\">i</span>
+    </label>
+    <button id=\"safety_margin_apply\" style=\"height:24px;font-size:11px;padding:0 8px;background:#78350f;border-color:#f59e0b;color:#fde68a;\"
+            title=\"Push margin to every drone's observer\">Apply</button>
+    <span id=\"autonomous_guards_status\" class=\"small\" style=\"color:#64748b;\"></span>
+  </div>
   <div id=\"drone_config_modal\" style=\"display:none;position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,0.7);z-index:1000;justify-content:center;align-items:center;\">
     <div style=\"background:#1e293b;border:1px solid #334155;border-radius:8px;padding:20px;max-width:700px;width:90%;max-height:80vh;overflow-y:auto;\">
       <h3 style=\"margin:0 0 12px 0;color:#e2e8f0;\">Drone Fleet Configuration</h3>
@@ -2195,7 +2217,7 @@ HTML = """
     arcPoll();
     // Version marker — if this string doesn't appear in the DOM,
     // you're running stale JS (restart the Python server or hard-refresh).
-    const BUILD = 'bu-seen-markers-fix-sdk-ceiling';
+    const BUILD = 'bv-axis-lock-arena-margin';
     console.log('[arc] init complete, build=' + BUILD);
     const ver = document.createElement('span');
     ver.id = 'arc_build_tag';
@@ -3505,6 +3527,67 @@ async function resumeAllDrones(source) {
   if (btn) btn.onclick = refresh;
   refresh();
   setInterval(refresh, 15000);  // 15s — enough to see new flights appear
+})();
+
+// ── Autonomous guards: axis-lock toggle + arena safety margin ─────
+(function wireAutonomousGuards(){
+  const tog    = document.getElementById('axis_locked_toggle');
+  const inp    = document.getElementById('safety_margin_input');
+  const btn    = document.getElementById('safety_margin_apply');
+  const status = document.getElementById('autonomous_guards_status');
+  function flash(msg, col) {
+    if (!status) return;
+    status.textContent = msg;
+    status.style.color = col || '#64748b';
+    setTimeout(() => { if (status.textContent === msg) status.textContent = ''; }, 2500);
+  }
+
+  // Initial load — read current state from the active drone's params
+  // (axis_locked) + safety margin.
+  async function load() {
+    try {
+      const [pRes, sRes] = await Promise.all([
+        fetch('/proxy/aruco/params'),
+        fetch('/proxy/aruco/safety_margin'),
+      ]);
+      const p = await pRes.json();
+      const s = await sRes.json();
+      if (tog && typeof p.axis_locked !== 'undefined') tog.checked = !!p.axis_locked;
+      if (inp && s.safety_margin_m != null) inp.value = Number(s.safety_margin_m).toFixed(1);
+    } catch {}
+  }
+  load();
+
+  if (tog) tog.addEventListener('change', async () => {
+    try {
+      const r = await fetch('/proxy/aruco/params', {
+        method: 'POST',
+        headers: {'Content-Type':'application/json'},
+        body: JSON.stringify({axis_locked: tog.checked}),   // no id → fleet-wide
+      });
+      const j = await r.json();
+      if (j.ok) flash(tog.checked ? '\u2713 axis-lock ON (fleet)' : '\u2713 axis-lock OFF (fleet)', '#22c55e');
+      else flash('error: ' + (j.error || 'unknown'), '#ef4444');
+    } catch (e) { flash('request failed', '#ef4444'); }
+  });
+
+  if (btn) btn.onclick = async () => {
+    const v = parseFloat(inp.value);
+    if (!isFinite(v) || v < 0.1 || v > 5.0) {
+      flash('enter 0.1 - 5.0 m', '#ef4444');
+      return;
+    }
+    try {
+      const r = await fetch('/proxy/aruco/safety_margin', {
+        method: 'POST',
+        headers: {'Content-Type':'application/json'},
+        body: JSON.stringify({safety_margin_m: v}),
+      });
+      const j = await r.json();
+      if (j.ok) flash('\u2713 margin \u2192 ' + v + ' m (fleet)', '#22c55e');
+      else flash('error: ' + (j.error || 'unknown'), '#ef4444');
+    } catch (e) { flash('request failed', '#ef4444'); }
+  };
 })();
 
 // ── Ceiling safety wiring ─────────────────────────────────────────────
@@ -5483,6 +5566,31 @@ window.PARAM_INFO = {
     "distant markers may benefit from 3e-1."},
 
   // ===== Safety =====
+  axis_locked: {title:'Axis-locked (Manhattan) autonomous flight', body:
+    "When ON, autonomous motion (missions + ArUco LIVE + waypoint nav) "+
+    "is constrained to wall-parallel axes only:\\n\\n"+
+    "  1. Yaw snaps to the nearest 90° multiple (0° / 90° / 180° / 270° "+
+    "in arena frame). The drone aligns to a cardinal heading before "+
+    "moving. Rotations happen in 90° increments only.\\n"+
+    "  2. Only ONE horizontal axis moves at a time: either strafe (LR) "+
+    "or forward/back (FB), whichever has the larger magnitude. The "+
+    "drone never flies diagonally.\\n"+
+    "  3. Vertical (up/down) is unaffected.\\n\\n"+
+    "Manual WASD / Q-E / R-F is unaffected — this constraint applies "+
+    "exclusively to autonomous decisions (observer LIVE + waypoints).\\n\\n"+
+    "Typical use: structured arena navigation where diagonals invite "+
+    "unnecessary marker-tracking jitter. Default OFF."},
+  safety_margin_m: {title:'Arena safety margin', units:'metres', body:
+    "Minimum distance the drone will maintain from ANY arena wall "+
+    "during autonomous flight. The boundary guard runs per-tick at "+
+    "20 Hz and overrides any waypoint or PD command that would drive "+
+    "the drone closer to a wall than this margin.\\n\\n"+
+    "Defaults to 1.5 m per ops policy. Adjustable 0.1–5.0 m.\\n\\n"+
+    "The guard uses the latency-aware lookahead (GUARD_LOOKAHEAD_S = "+
+    "0.35 s) so it accounts for momentum — the drone brakes / retreats "+
+    "BEFORE it would cross the margin, not after. Only active during "+
+    "autonomous flight (observer LIVE / waypoint). Manual flight is "+
+    "bounded only by the hard altitude ceiling."},
   ceiling_m: {title:'Hard altitude ceiling', units:'metres', body:
     "Maximum altitude above ground. The value is set from this UI, but "+
     "the enforcement is ENTIRELY on each drone's flight-controller Pi — "+
@@ -8282,12 +8390,62 @@ def asdict_hover_defaults():
 @app.post("/proxy/aruco/params")
 def proxy_aruco_params_set():
     data = request.get_json(silent=True) or {}
-    did = str(data.pop("id", "") or request.args.get("id") or active_drone_id)
-    obs, did = _aruco_resolve(did)
+    # If no id, broadcast to EVERY observer (fleet-wide knobs like
+    # axis_locked should apply to the whole swarm, not just one drone).
+    did = data.pop("id", None) or request.args.get("id")
+    if did:
+        obs, did = _aruco_resolve(str(did))
+        if obs is None:
+            return jsonify(ok=False, error="unknown drone"), 404
+        applied = obs.update_params(data)
+        return jsonify(ok=True, applied=applied, drone_id=did)
+    # Fleet-wide fan-out
+    applied_all = {}
+    for d_id, o in aruco_fleet._obs.items():
+        try:
+            applied_all[d_id] = o.update_params(data)
+        except Exception as e:
+            applied_all[d_id] = {"error": str(e)[:80]}
+    return jsonify(ok=True, applied=applied_all, fleet=True)
+
+
+@app.get("/proxy/aruco/safety_margin")
+def proxy_aruco_safety_margin_get():
+    """Return the current autonomous-mode arena safety margin (metres).
+    Reads from the active drone's observer since the margin is
+    per-observer state; fleet-wide consistency is maintained by the
+    POST endpoint broadcasting to every observer."""
+    obs = aruco_fleet.get(str(active_drone_id))
     if obs is None:
-        return jsonify(ok=False, error="unknown drone"), 404
-    applied = obs.update_params(data)
-    return jsonify(ok=True, applied=applied)
+        return jsonify(ok=False, safety_margin_m=None), 200
+    with obs._lock:
+        return jsonify(
+            ok=True,
+            safety_margin_m=float(obs._safety_margin_m),
+            arena_bounds=dict(obs._arena_bounds),
+        )
+
+
+@app.post("/proxy/aruco/safety_margin")
+def proxy_aruco_safety_margin_set():
+    """Set the autonomous-mode arena safety margin. Body:
+        {"safety_margin_m": 1.5}
+    Broadcasts to every drone's observer so the fleet shares one value.
+    """
+    data = request.get_json(silent=True) or {}
+    try:
+        v = float(data.get("safety_margin_m"))
+    except (TypeError, ValueError):
+        return jsonify(ok=False, error="safety_margin_m required"), 400
+    v = max(0.1, min(5.0, v))   # clamp to a sane range
+    for d_id, o in aruco_fleet._obs.items():
+        try:
+            o.set_arena_bounds({}, safety_margin_m=v)
+        except Exception as e:
+            print(f"[SAFETY] drone {d_id} set failed: {e}")
+    log_command("safety_margin_set", {"safety_margin_m": v})
+    print(f"[SAFETY] arena margin set to {v}m (fleet-wide)")
+    return jsonify(ok=True, safety_margin_m=v)
 
 
 @app.post("/proxy/aruco/start")
