@@ -2317,7 +2317,7 @@ HTML = """
     arcPoll();
     // Version marker — if this string doesn't appear in the DOM,
     // you're running stale JS (restart the Python server or hard-refresh).
-    const BUILD = 'cj-detection-params-matched';
+    const BUILD = 'ck-auto-positioning-claude';
     console.log('[arc] init complete, build=' + BUILD);
     const ver = document.createElement('span');
     ver.id = 'arc_build_tag';
@@ -2866,6 +2866,19 @@ HTML = """
         </label>
         <span id=\"pos_status_badge\" class=\"small\" style=\"color:#64748b;\">disabled</span>
       </div>
+      <!-- Auto Positioning: single master toggle that overrides every user
+           filter/precision knob with the built-in Claude preset on the FC.
+           When ON, sliders below are greyed out and the operator can't
+           accidentally dial the pose into garbage. When OFF, full manual
+           tuning returns. Default ON for \"just works\" out of the box. -->
+      <div id=\"pos_auto_bar\" style=\"display:flex;align-items:center;gap:10px;margin-bottom:8px;padding:7px 10px;background:#052e16;border:1px solid #10b981;border-radius:6px;\">
+        <label style=\"display:flex;align-items:center;gap:6px;cursor:pointer;font-weight:600;\">
+          <input type=\"checkbox\" id=\"pos_auto_toggle\" checked style=\"accent-color:#10b981;transform:scale(1.3);\" />
+          <span style=\"color:#d1fae5;\">Auto Positioning (Claude algorithm)</span>
+        </label>
+        <span class=\"small\" style=\"color:#86efac;\">recommended · uses a field-log-tuned preset + pose-jump gate</span>
+        <span id=\"pos_auto_status\" class=\"small\" style=\"color:#64748b;margin-left:auto;\"></span>
+      </div>
       <div style=\"display:flex;gap:8px;align-items:center;margin-bottom:6px;\">
         <label class=\"small\" style=\"color:#94a3b8;display:flex;align-items:center;gap:4px;cursor:pointer;\">
           <input type=\"checkbox\" id=\"arena_show_3d\" checked style=\"accent-color:#0ea5e9;\" />
@@ -2994,6 +3007,9 @@ HTML = """
           <label class=\"small\" style=\"color:#94a3b8;\" title=\"First-order low-pass cut-off frequency applied to IMU velocity (vgx/vgy/vgz) at telemetry ingestion. 0 disables. Lower = more smoothing.\">IMU LPF (Hz) <span class=\"info-icon\" data-info=\"imu_lowpass_hz\">i</span>:
             <input id=\"pos_imu_lpf\" type=\"range\" min=\"0\" max=\"30\" step=\"0.5\" value=\"5\" style=\"width:90px;vertical-align:middle;accent-color:#a78bfa;\" />
             <span id=\"pos_imu_lpf_val\" style=\"font-size:11px;color:#a78bfa;font-weight:bold;min-width:42px;display:inline-block;\">5.0 Hz</span>
+          </label>
+          <label class=\"small\" style=\"color:#fbbf24;\" title=\"Pose-jump gate. Reject a fresh fix if it disagrees with the Kalman-predicted state by more than this many metres. Kills catastrophic single-marker solvePnP mirror-pose glitches (the 10+ m jumps). 0 disables.\">gate (m) <span class=\"info-icon\" data-info=\"max_pose_jump_m\">i</span>:
+            <input id=\"pos_max_jump\" type=\"number\" min=\"0\" max=\"20\" step=\"0.1\" value=\"0\" style=\"width:56px;\" title=\"0 = disabled, 3.0 is a good default\" />
           </label>
           <button id=\"pos_precision_apply\" class=\"pos-cfg\" style=\"height:26px;font-size:11px;padding:0 10px;\">Apply precision</button>
           <button id=\"pos_precision_reset\" class=\"pos-cfg\" style=\"height:26px;font-size:11px;padding:0 10px;background:#1e2a3a;\" title=\"Restore precision defaults\">Defaults</button>
@@ -5825,6 +5841,11 @@ async function loadPosConfig() {
     if (out && c.outlier_reject_m != null) out.value = c.outlier_reject_m;
     const ds = document.getElementById('pos_distance_scale');
     if (ds && c.distance_scale != null) ds.value = Number(c.distance_scale).toFixed(3);
+    // Sync the Auto Positioning master toggle — also re-locks/unlocks
+    // the manual tuning sliders accordingly.
+    if (typeof window._applyPosAutoUI === 'function') {
+      window._applyPosAutoUI(c.auto_positioning !== false);
+    }
     // ── Populate precision (advanced) controls ──
     const setIf = (id, val, formatter) => {
       const el = document.getElementById(id);
@@ -5839,6 +5860,7 @@ async function loadPosConfig() {
     setIf('pos_max_dt',     c.max_state_dt);
     setIf('pos_kf_q',       c.kalman_process_var, (v)=>Number(v).toPrecision(3));
     setIf('pos_kf_r',       c.kalman_meas_var,    (v)=>Number(v).toPrecision(3));
+    setIf('pos_max_jump',   c.max_pose_jump_m);
     // IMU LPF slider + its live-label
     if (c.imu_lowpass_hz != null) {
       const slider = document.getElementById('pos_imu_lpf');
@@ -5854,6 +5876,77 @@ async function loadPosConfig() {
     if (c.enabled) startPosEvents();
   } catch {}
 }
+
+// ── Auto Positioning toggle ─────────────────────────────────────────
+// Single master switch that forces the FC to use CLAUDE_AUTO_CONFIG
+// instead of whatever the operator has tuned. While on, the manual
+// slider/input controls below are disabled + visibly dimmed so the
+// operator can't accidentally change a value that isn't being applied.
+(function wireAutoPositioning(){
+  const tgl = document.getElementById('pos_auto_toggle');
+  const status = document.getElementById('pos_auto_status');
+  if (!tgl) return;
+  // Every ID of a control that belongs to the \"manual tuning\" surface.
+  // When auto is ON, they're disabled. They stay visible for reference.
+  const MANUAL_IDS = [
+    'pos_profile','pos_fov','pos_imu_weight',
+    'pos_kalman','pos_marker_size','pos_top_k','pos_outlier','pos_distance_scale',
+    'pos_filters_apply','pos_filters_reset',
+    'pos_pose_hold','pos_min_refs','pos_min_ref_w',
+    'pos_blend_min','pos_blend_max','pos_vel_blend','pos_max_dt',
+    'pos_kf_q','pos_kf_r','pos_imu_lpf',
+    'pos_precision_apply','pos_precision_reset',
+    'pos_preset_apply','pos_preset_name','pos_preset_save','pos_preset_delete','pos_preset_sel',
+  ];
+  function setManualEnabled(enabled) {
+    for (const id of MANUAL_IDS) {
+      const el = document.getElementById(id);
+      if (!el) continue;
+      el.disabled = !enabled;
+      // Also visually dim the surrounding <label> containers so it's
+      // obvious the whole row is frozen, not just the input field.
+      const lbl = el.closest('label');
+      if (lbl) lbl.style.opacity = enabled ? '1' : '0.45';
+      el.style.opacity = enabled ? '1' : '0.55';
+    }
+  }
+  function flash(msg, col) {
+    if (!status) return;
+    status.textContent = msg; status.style.color = col || '#86efac';
+    setTimeout(() => { if (status.textContent === msg) status.textContent = ''; }, 2500);
+  }
+  window._applyPosAutoUI = function(auto) {
+    tgl.checked = !!auto;
+    setManualEnabled(!auto);
+    if (status) status.textContent = auto
+      ? 'active — manual tuning locked'
+      : 'off — manual tuning active';
+    if (status) status.style.color = auto ? '#86efac' : '#fbbf24';
+  };
+  tgl.addEventListener('change', async () => {
+    const auto = tgl.checked;
+    window._applyPosAutoUI(auto);
+    try {
+      const r = await fetch('/proxy/position/config', {
+        method:'POST',
+        headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({auto_positioning: auto}),
+      });
+      const d = await r.json();
+      if (d.ok) {
+        flash(auto ? '\\u2713 Claude preset applied' : '\\u2713 manual mode', '#86efac');
+        if (typeof loadPosConfig === 'function') setTimeout(loadPosConfig, 300);
+      } else {
+        flash('\\u2717 ' + (d.error || 'apply failed'), '#ef4444');
+      }
+    } catch (e) {
+      flash('\\u2717 ' + e, '#ef4444');
+    }
+  });
+  // Apply initial UI state (will be overwritten by loadPosConfig once the
+  // FC replies with the persisted auto_positioning value).
+  window._applyPosAutoUI(true);
+})();
 
 // ── Filter controls — live-apply to running positioner ──
 (function wireFilterControls(){
@@ -5921,6 +6014,7 @@ async function loadPosConfig() {
       kalman_process_var:  num('pos_kf_q'),
       kalman_meas_var:     num('pos_kf_r'),
       imu_lowpass_hz:      num('pos_imu_lpf'),
+      max_pose_jump_m:     num('pos_max_jump'),
     };
     try {
       const r = await fetch('/proxy/position/config', {
@@ -5950,6 +6044,8 @@ async function loadPosConfig() {
       const lbl = document.getElementById('pos_imu_lpf_val');
       if (lbl) lbl.textContent = '5.0 Hz';
     }
+    const mj = document.getElementById('pos_max_jump');
+    if (mj) mj.value = '0';
     flash('defaults loaded — click Apply', '#94a3b8');
   };
 })();
@@ -6004,6 +6100,7 @@ async function loadPosConfig() {
       kalman_process_var:    v('pos_kf_q', 'float'),
       kalman_meas_var:       v('pos_kf_r', 'float'),
       imu_lowpass_hz:        v('pos_imu_lpf', 'float'),
+      max_pose_jump_m:       v('pos_max_jump', 'float'),
     };
   }
   async function refresh() {
@@ -6228,6 +6325,16 @@ window.PARAM_INFO = {
     "are rejected as outliers before re-averaging.\\n\\n"+
     "Default 2.5 m. Tighten to 1.0 m for a smaller, tidy arena; loosen to "+
     "3.5 m if markers are far apart."},
+  max_pose_jump_m:    {title:'Pose-jump gate', units:'metres (0 = disabled)', body:
+    "Safety limit on how far a fresh ArUco fix is allowed to disagree with "+
+    "the Kalman-predicted state before it's rejected as an outlier.\\n\\n"+
+    "Single-marker solvePnP occasionally produces mirror-pose glitches that "+
+    "put the drone 10-20 m from where it actually is. The gate silently "+
+    "drops those fixes (the filter keeps predicting forward) so the UI and "+
+    "missions don't see the spike.\\n\\n"+
+    "Default 0 = off. 3.0 m is a good starting value for indoor arenas — "+
+    "large enough not to block legitimate fast motion, small enough to "+
+    "catch the bad frames. Auto Positioning uses 3.0 m by default."},
   distance_scale:     {title:'Distance correction factor', units:'multiplier (1.0 = no correction)', body:
     "Multiplicative correction applied to the camera\\u2194marker translation "+
     "from solvePnP. Compensates for systematic scale error, usually caused "+
@@ -9713,6 +9820,35 @@ POSITION_PRESETS_PATH = Path(os.getenv(
 _position_presets_lock = threading.Lock()
 
 _POSITION_PRESETS_DEFAULTS: dict = {
+    # Rock-solid defaults derived from field-log analysis (flight 19:11:40
+    # tracked cleanly with 96 % fresh fixes and 0.06 m median step). The
+    # two tightenings over that baseline are min_ref_weight=0.15 (reject
+    # low-quality single detections) and max_pose_jump_m=3.0 (kills the
+    # occasional 10+ m single-marker solvePnP mirror-pose glitches).
+    # This preset is also what gets applied when auto_positioning=True.
+    "Claude": {
+        "detect_profile":     "balanced",
+        "fov_deg":             69,
+        "imu_weight":          0.30,
+        "latency_comp_s":      0.20,
+        "enable_kalman_filter": True,
+        "marker_size_m":       0.50,
+        "top_k_markers":       4,
+        "outlier_reject_m":    1.5,
+        "distance_scale":      1.0,
+        "pose_hold_sec":       0.5,
+        "min_ref_count":       1,
+        "min_ref_weight":      0.15,
+        "meas_blend_min":      0.20,
+        "meas_blend_max":      0.70,
+        "vel_blend":           0.30,
+        "max_state_dt":        0.5,
+        "kalman_process_var":  5e-4,
+        "kalman_meas_var":     0.15,
+        "imu_lowpass_hz":      5.0,
+        "seen_hold_s":         0.6,
+        "max_pose_jump_m":     3.0,
+    },
     "balanced": {
         "detect_profile":     "balanced",
         "fov_deg":             69,
@@ -9763,6 +9899,13 @@ _POSITION_PRESETS_DEFAULTS: dict = {
 
 
 def _load_position_presets() -> dict:
+    """Load operator-saved presets + auto-inject any missing built-ins.
+
+    The file on disk is the source of truth for anything the operator
+    has changed. We only add built-in presets that don't already exist
+    (so user edits are never overwritten). This is how the "Claude"
+    preset reaches existing installs without us having to rm the file.
+    """
     with _position_presets_lock:
         if not POSITION_PRESETS_PATH.exists():
             try:
@@ -9773,10 +9916,26 @@ def _load_position_presets() -> dict:
                 print(f"[PRESETS] position seed write failed: {e}")
             return json.loads(json.dumps(_POSITION_PRESETS_DEFAULTS))
         try:
-            return json.loads(POSITION_PRESETS_PATH.read_text())
+            data = json.loads(POSITION_PRESETS_PATH.read_text())
         except Exception as e:
             print(f"[PRESETS] position load failed ({e}) — using defaults")
             return json.loads(json.dumps(_POSITION_PRESETS_DEFAULTS))
+        # Auto-inject new built-ins without touching existing (possibly
+        # edited) presets. Write back to disk so the injection is stable.
+        added = []
+        for name, params in _POSITION_PRESETS_DEFAULTS.items():
+            if name not in data:
+                data[name] = json.loads(json.dumps(params))
+                added.append(name)
+        if added:
+            try:
+                tmp = POSITION_PRESETS_PATH.with_suffix(".json.tmp")
+                tmp.write_text(json.dumps(data, indent=2))
+                tmp.replace(POSITION_PRESETS_PATH)
+                print(f"[PRESETS] injected missing built-in presets: {added}")
+            except Exception as e:
+                print(f"[PRESETS] inject-write failed: {e}")
+        return data
 
 
 def _save_position_presets(data: dict):

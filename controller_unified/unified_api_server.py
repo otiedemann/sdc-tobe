@@ -737,7 +737,71 @@ _pos_cfg: dict = {
     # single-frame detection dropouts — the per-frame detection rate
     # is still visible on seen_markers_raw for diagnostics.
     "seen_hold_s":          0.6,
+    # Pose-jump gate (metres). Reject a fresh fix if it disagrees with
+    # the Kalman-predicted state by more than this. Kills the
+    # catastrophic >10 m single-marker glitches. 0 = disabled.
+    "max_pose_jump_m":      0.0,
+    # ── Auto Positioning ──────────────────────────────────────────
+    # When True, the FC ignores every user-tuned filter/precision knob
+    # in this dict (imu_weight, marker_size_m, top_k, outlier, all the
+    # Kalman vars, the blends, distance_scale, max_pose_jump_m, …) and
+    # uses a known-good built-in profile (CLAUDE_AUTO_CONFIG below)
+    # that was derived from field-log analysis. The operator's saved
+    # values are preserved in _pos_cfg but simply not applied to the
+    # running processor. Toggling this off re-applies the stored
+    # operator values. Default True for "just works" out of the box.
+    "auto_positioning":     True,
 }
+
+
+# ─────────────────────────────────────────────────────────────────
+# Built-in positioning profile — applied when auto_positioning=True.
+#
+# Derived from flight-log analysis of 19:11:40 (commit 91b87ce), which
+# tracked well with 96 % fresh fixes and 0.06 m median step. The two
+# additions over that baseline:
+#   - min_ref_count = 1 but min_ref_weight = 0.15 → still accept a
+#     single high-quality fix without letting junk detections in
+#   - max_pose_jump_m = 3.0 → gate blocks the 16 m outliers we saw
+#     in that same log (1.4 % rate of catastrophic single-frame
+#     glitches, which would now be silently discarded)
+# Anything NOT in this dict (e.g. `enabled`, `fps`, `latency_comp_s`,
+# `sync_max_gap_s`, `telemetry_buffer_s`) is left under operator
+# control — those are about pipeline cadence, not fusion behaviour.
+# ─────────────────────────────────────────────────────────────────
+CLAUDE_AUTO_CONFIG: dict = {
+    "detect_profile":       "balanced",
+    "imu_weight":           0.30,
+    "enable_kalman_filter": True,
+    "marker_size_m":        0.50,
+    "top_k_markers":        4,
+    "outlier_reject_m":     1.5,
+    "distance_scale":       1.0,
+    "pose_hold_sec":        0.5,
+    "min_ref_count":        1,
+    "min_ref_weight":       0.15,
+    "meas_blend_min":       0.20,
+    "meas_blend_max":       0.70,
+    "vel_blend":            0.30,
+    "max_state_dt":         0.5,
+    "kalman_process_var":   5e-4,
+    "kalman_meas_var":      0.15,
+    "imu_lowpass_hz":       5.0,
+    "seen_hold_s":          0.6,
+    "max_pose_jump_m":      3.0,
+}
+
+
+def _effective_pos_cfg() -> dict:
+    """Return the position config that should actually be applied to the
+    running processor. If auto_positioning is on, CLAUDE_AUTO_CONFIG wins;
+    otherwise the operator's saved _pos_cfg wins."""
+    with _pos_cfg_lock:
+        cfg = dict(_pos_cfg)
+    if cfg.get("auto_positioning", True):
+        for k, v in CLAUDE_AUTO_CONFIG.items():
+            cfg[k] = v
+    return cfg
 
 
 # ── IMU low-pass filter state ────────────────────────────────────────
@@ -5028,9 +5092,11 @@ def positioning_loop():
     calib_w = calib_h = None
 
     while running:
-        # Check if positioning and/or recording is active
-        with _pos_cfg_lock:
-            cfg = dict(_pos_cfg)
+        # Check if positioning and/or recording is active.
+        # Use _effective_pos_cfg() so auto_positioning overrides user
+        # params transparently — positioning_loop doesn't need to care
+        # whether the operator is in auto or manual mode.
+        cfg = _effective_pos_cfg()
         pos_enabled = cfg.get("enabled", False)
         with _rec_lock:
             rec_active = _rec_enabled
@@ -5079,19 +5145,24 @@ def positioning_loop():
                 global _pos_processor
                 with _arena_cfg_lock:
                     init_marker_size = float(_arena_cfg.get("marker_size_m", 0.5))
-                # Runtime overrides from _pos_cfg
-                with _pos_cfg_lock:
-                    cfg_marker = _pos_cfg.get("marker_size_m")
-                    if cfg_marker:
-                        init_marker_size = float(cfg_marker)
-                    init_kalman = bool(_pos_cfg.get("enable_kalman_filter", True))
-                    init_dist_scale = float(_pos_cfg.get("distance_scale", 1.0))
+                # Runtime overrides. `cfg` is already the _effective_ config
+                # (auto_positioning overrides user params transparently).
+                cfg_marker = cfg.get("marker_size_m")
+                if cfg_marker:
+                    init_marker_size = float(cfg_marker)
+                init_kalman = bool(cfg.get("enable_kalman_filter", True))
+                init_dist_scale = float(cfg.get("distance_scale", 1.0))
+                init_max_jump = float(cfg.get("max_pose_jump_m", 0.0))
                 processor = _HeadlessAruCo(cam_mat, dist, detect_profile=profile,
                                            marker_size=init_marker_size, enable_kalman_filter=init_kalman)
                 _apply_arena_cfg_to_processor(processor)
                 processor.distance_scale = init_dist_scale
+                processor.max_pose_jump_m = init_max_jump
                 _pos_processor = processor
-                print(f"[POS] Processor initialised (profile={profile}, distance_scale={init_dist_scale:.4f})")
+                auto_tag = " [auto]" if cfg.get("auto_positioning") else ""
+                print(f"[POS] Processor initialised (profile={profile}, "
+                      f"distance_scale={init_dist_scale:.4f}, "
+                      f"max_pose_jump_m={init_max_jump:.2f}){auto_tag}")
             except Exception as ie:
                 print(f"[POS] Processor init error: {ie}")
                 time.sleep(1)
@@ -5113,10 +5184,11 @@ def positioning_loop():
         # Match telemetry FIRST so we can feed IMU velocity to the processor
         # before pose estimation. This gives the motion model a fresh prediction
         # to blend against the upcoming vision measurement.
-        with _pos_cfg_lock:
-            latency_comp_s = max(0.0, float(_pos_cfg.get("latency_comp_s", 0.05)))
-            sync_max_gap_s = max(0.01, float(_pos_cfg.get("sync_max_gap_s", 0.20)))
-            imu_weight_cfg = float(_pos_cfg.get("imu_weight", 0.3))
+        # Read once from the already-fetched effective cfg so auto_positioning
+        # is respected: in auto mode, imu_weight comes from CLAUDE_AUTO_CONFIG.
+        latency_comp_s = max(0.0, float(cfg.get("latency_comp_s", 0.05)))
+        sync_max_gap_s = max(0.01, float(cfg.get("sync_max_gap_s", 0.20)))
+        imu_weight_cfg = float(cfg.get("imu_weight", 0.3))
         tel_target_ts = ts - latency_comp_s
         tel_match_pre = _telemetry_at(tel_target_ts, max_gap_s=sync_max_gap_s)
         tel_sample_pre = tel_match_pre.get("sample") or {}
@@ -5189,7 +5261,7 @@ def positioning_loop():
         # pointed at the marker. We keep a per-marker last-seen
         # timestamp and treat any marker seen within HOLD_S as still
         # visible, smoothing single-frame drops.
-        _SEEN_HOLD_S = float(_pos_cfg.get("seen_hold_s", 0.6))
+        _SEEN_HOLD_S = float(cfg.get("seen_hold_s", 0.6))
         fresh_ids = [str(m) for m in (result.get("seen_markers") or [])]
         now_mono = time.monotonic()
         if not hasattr(positioning_loop, "_seen_last"):
@@ -5578,13 +5650,31 @@ def api_pos_config_set():
             # exactly). Positive values clamped 0..3 s.
             v = float(data["seen_hold_s"])
             _pos_cfg["seen_hold_s"] = max(0.0, min(3.0, v))
+        if "max_pose_jump_m" in data:
+            # 0 disables the pose-jump gate. Positive values clamped 0..20 m.
+            v = float(data["max_pose_jump_m"])
+            _pos_cfg["max_pose_jump_m"] = max(0.0, min(20.0, v))
+        if "auto_positioning" in data:
+            # Toggling auto flips which set of values actually gets pushed
+            # to the processor. The user's manual values are preserved so
+            # turning auto off restores them. We re-apply effective cfg to
+            # the live processor immediately below.
+            _pos_cfg["auto_positioning"] = bool(data["auto_positioning"])
         cfg_snap = dict(_pos_cfg)
+    # If auto_positioning is toggled, every downstream filter knob
+    # effectively changes, so we apply the full effective-config sweep
+    # rather than only the keys present in `data`.
+    auto_toggled = "auto_positioning" in data
+    eff = _effective_pos_cfg()
 
-    # Apply live filter changes to running processor
+    # Apply live filter changes to running processor. When auto_positioning
+    # is toggled, we fan out the FULL effective config (since every knob
+    # effectively changes); otherwise only the keys present in `data`.
+    _touched = (lambda k: auto_toggled or k in data)
     try:
         if _pos_processor is not None:
-            if "enable_kalman_filter" in data:
-                _pos_processor.enable_kalman_filter = bool(data["enable_kalman_filter"])
+            if _touched("enable_kalman_filter"):
+                _pos_processor.enable_kalman_filter = bool(eff.get("enable_kalman_filter", True))
                 # Reset Kalman state so toggling doesn't carry stale history
                 try:
                     for kf in _pos_processor.kf_pos:
@@ -5592,56 +5682,62 @@ def api_pos_config_set():
                 except Exception:
                     pass
                 print(f"[POS] Kalman filter {'ENABLED' if _pos_processor.enable_kalman_filter else 'DISABLED'} (live)")
-            if apply_marker_size:
+            if apply_marker_size or (auto_toggled and "marker_size_m" in eff):
                 # Also reflect in arena_cfg so _apply_arena_cfg_to_processor can be used
                 with _arena_cfg_lock:
-                    _arena_cfg["marker_size_m"] = cfg_snap["marker_size_m"]
+                    _arena_cfg["marker_size_m"] = eff["marker_size_m"]
                 _apply_arena_cfg_to_processor(_pos_processor)
-                print(f"[POS] marker_size_m set to {cfg_snap['marker_size_m']}m (live)")
-            if "top_k_markers" in data:
-                tk = int(cfg_snap["top_k_markers"])
+                print(f"[POS] marker_size_m set to {eff['marker_size_m']}m (live)")
+            if _touched("top_k_markers"):
+                tk = int(eff.get("top_k_markers", 4))
                 _pos_processor.top_k_markers = tk if tk > 0 else 4
                 print(f"[POS] top_k_markers set to {tk if tk > 0 else '4 (auto)'} (live)")
-            if "outlier_reject_m" in data:
-                _pos_processor.outlier_reject_m = float(cfg_snap["outlier_reject_m"])
-                print(f"[POS] outlier_reject_m set to {cfg_snap['outlier_reject_m']}m (live)")
-            if "distance_scale" in data:
-                _pos_processor.distance_scale = float(cfg_snap["distance_scale"])
-                print(f"[POS] distance_scale = {cfg_snap['distance_scale']:.4f}× (live)")
+            if _touched("outlier_reject_m"):
+                _pos_processor.outlier_reject_m = float(eff.get("outlier_reject_m", 2.5))
+                print(f"[POS] outlier_reject_m set to {eff['outlier_reject_m']}m (live)")
+            if _touched("distance_scale"):
+                _pos_processor.distance_scale = float(eff.get("distance_scale", 1.0))
+                print(f"[POS] distance_scale = {eff['distance_scale']:.4f}× (live)")
+            if _touched("max_pose_jump_m"):
+                _pos_processor.max_pose_jump_m = float(eff.get("max_pose_jump_m", 0.0))
+                print(f"[POS] max_pose_jump_m = {eff['max_pose_jump_m']}m (live)")
             # ── Extended tuning → patched as module globals on ctrl_position
             # because the fusion code reads them as module-level constants. ──
             import ctrl_position as _cp
-            if "pose_hold_sec" in data:
-                _cp.POSE_HOLD_SEC = float(cfg_snap["pose_hold_sec"])
+            if _touched("pose_hold_sec"):
+                _cp.POSE_HOLD_SEC = float(eff.get("pose_hold_sec", 0.8))
                 print(f"[POS] pose_hold_sec = {_cp.POSE_HOLD_SEC}s (live)")
-            if "min_ref_count" in data:
-                _cp.MIN_REF_COUNT = int(cfg_snap["min_ref_count"])
+            if _touched("min_ref_count"):
+                _cp.MIN_REF_COUNT = int(eff.get("min_ref_count", 1))
                 print(f"[POS] min_ref_count = {_cp.MIN_REF_COUNT} (live)")
-            if "min_ref_weight" in data:
-                _cp.MIN_REF_WEIGHT = float(cfg_snap["min_ref_weight"])
+            if _touched("min_ref_weight"):
+                _cp.MIN_REF_WEIGHT = float(eff.get("min_ref_weight", 0.0))
                 print(f"[POS] min_ref_weight = {_cp.MIN_REF_WEIGHT} (live)")
-            if "meas_blend_min" in data:
-                _cp.MEAS_BLEND_MIN = float(cfg_snap["meas_blend_min"])
+            if _touched("meas_blend_min"):
+                _cp.MEAS_BLEND_MIN = float(eff.get("meas_blend_min", 0.35))
                 print(f"[POS] meas_blend_min = {_cp.MEAS_BLEND_MIN} (live)")
-            if "meas_blend_max" in data:
-                _cp.MEAS_BLEND_MAX = float(cfg_snap["meas_blend_max"])
+            if _touched("meas_blend_max"):
+                _cp.MEAS_BLEND_MAX = float(eff.get("meas_blend_max", 0.85))
                 print(f"[POS] meas_blend_max = {_cp.MEAS_BLEND_MAX} (live)")
-            if "vel_blend" in data:
-                _cp.VEL_BLEND = float(cfg_snap["vel_blend"])
+            if _touched("vel_blend"):
+                _cp.VEL_BLEND = float(eff.get("vel_blend", 0.25))
                 print(f"[POS] vel_blend = {_cp.VEL_BLEND} (live)")
-            if "max_state_dt" in data:
-                _cp.MAX_STATE_DT = float(cfg_snap["max_state_dt"])
+            if _touched("max_state_dt"):
+                _cp.MAX_STATE_DT = float(eff.get("max_state_dt", 1.0))
                 print(f"[POS] max_state_dt = {_cp.MAX_STATE_DT}s (live)")
-            if "kalman_process_var" in data:
-                v = float(cfg_snap["kalman_process_var"])
+            if _touched("kalman_process_var"):
+                v = float(eff.get("kalman_process_var", 1e-3))
                 for kf in _pos_processor.kf_pos:
                     kf.process_variance = v
                 print(f"[POS] kalman_process_var = {v} (live, per-axis)")
-            if "kalman_meas_var" in data:
-                v = float(cfg_snap["kalman_meas_var"])
+            if _touched("kalman_meas_var"):
+                v = float(eff.get("kalman_meas_var", 0.1))
                 for kf in _pos_processor.kf_pos:
                     kf.measurement_variance = v
                 print(f"[POS] kalman_meas_var = {v} (live, per-axis)")
+            if auto_toggled:
+                mode = "AUTO (Claude preset)" if cfg_snap.get("auto_positioning") else "MANUAL"
+                print(f"[POS] Positioning mode → {mode}")
     except Exception as e:
         print(f"[POS] live config apply error: {e}")
 
@@ -5792,7 +5888,7 @@ def main():
     print(f"[{tag}] Unified API server: http://{HTTP_HOST}:{HTTP_PORT}")
     print(f"[{tag}] Drone: {drone_type} @ {drone_ip} (auto-reconnect; watchdog={REMOTE_TIMEOUT_S}s)")
     print(f"[{tag}] SDKs available: tello={HAS_TELLO_SDK}, olympe={HAS_OLYMPE_SDK}")
-    print(f"[{tag}] Code version: 2026-04-23-ce (detection thresholds matched to C2 observer)")
+    print(f"[{tag}] Code version: 2026-04-23-cf (Auto Positioning + Claude preset + pose-jump gate)")
     app.run(host=HTTP_HOST, port=HTTP_PORT, threaded=True, use_reloader=False)
 
 

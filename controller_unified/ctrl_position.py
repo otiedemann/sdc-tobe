@@ -190,6 +190,16 @@ class HeadlessAruCoPositioning:
         # 7 m but the real distance to the marker is 9 m → set to 9/7
         # ≈ 1.286. Default 1.0 = no correction.
         self.distance_scale = 1.0
+        # ── Pose-jump gate ─────────────────────────────────────────────
+        # Reject a fused pose estimate if it disagrees with the Kalman-
+        # predicted state by more than this many metres. This kills the
+        # catastrophic >10 m single-marker glitches we saw in the field
+        # logs (single-marker solvePnP is occasionally wildly wrong, e.g.
+        # mirror-pose ambiguity at certain viewing angles). Set 0 to
+        # disable. Applies only when a prior state exists AND marker
+        # coverage has been continuous — after a reset, the first fresh
+        # fix is always accepted so tracking can bootstrap.
+        self.max_pose_jump_m = 0.0   # 0 = disabled by default
 
         # last valid pose cache for temporary marker loss
         self.last_valid_pose = None
@@ -670,6 +680,38 @@ class HeadlessAruCoPositioning:
             f_pos_meas = np.array([self.kf_pos[j].update(raw_pos[j]) for j in range(3)])
         else:
             f_pos_meas = raw_pos.copy()
+
+        # ── Pose-jump gate ────────────────────────────────────────────
+        # If the fresh fix disagrees with the predicted state by more
+        # than `max_pose_jump_m`, reject it rather than poisoning the
+        # filter. The gate only fires when we have an existing state
+        # AND tracking has been continuous (last valid fix within
+        # POSE_HOLD_SEC) — a bootstrap or a genuinely long dropout is
+        # allowed to re-center freely.
+        try:
+            gate_m = float(getattr(self, "max_pose_jump_m", 0.0))
+        except Exception:
+            gate_m = 0.0
+        gate_m = max(0.0, gate_m)
+        if gate_m > 0 and self.state_pos is not None and self.state_ts is not None:
+            tracking_fresh = (self.last_valid_pose is not None and
+                              (now_wall - self.last_valid_ts) <= POSE_HOLD_SEC)
+            if tracking_fresh:
+                pred_gate = self._predict_state(capture_ts)
+                if pred_gate is not None:
+                    jump = float(np.linalg.norm(f_pos_meas - pred_gate))
+                    if jump > gate_m:
+                        # Outlier — return a stale payload coasting on the
+                        # existing state. Next frame will try again with
+                        # fresh markers; if several in a row all agree on
+                        # the jump, POSE_HOLD_SEC eventually elapses and
+                        # the gate bootstraps to the new location.
+                        return _stale_payload(
+                            refs=[int(m) for m in ref_marker_ids],
+                            marker_weights={str(mid): float(w)
+                                            for mid, w in zip(ref_marker_ids, weights)},
+                            seen_ids=seen_ids,
+                        )
 
         # Apply delayed measurement update at capture time, then predict to evaluation time.
         quality = float(np.mean(weights)) * min(1.0, len(weights) / 3.0)
