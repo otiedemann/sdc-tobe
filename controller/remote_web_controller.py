@@ -409,27 +409,18 @@ class FlightLogger:
         # .mp4 and the .jsonl travel together. Annotated mode so the recording
         # has the detected-marker overlay for post-flight review.
         #
-        # IMPORTANT: the FC needs its MJPEG pipeline running BEFORE frames
-        # can flow into the recorder. /api/video/record/start now auto-starts
-        # MJPEG internally if it's off, but we also ping /api/video/start here
-        # so older FCs without the auto-start still record. No-op when the
-        # FC isn't reachable — video is nice-to-have, the log is the record.
+        # The FC's /api/video/record/start self-starts MJPEG if it's off, so
+        # we intentionally do NOT ping /api/video/start separately here —
+        # that endpoint always calls video_stop_all() + video_start_mjpeg()
+        # and would restart the decoder on every takeoff (dropping frames
+        # and freezing the position tracker for several seconds). No-op
+        # when the FC is unreachable — video is nice-to-have, log is the
+        # essential record.
         video_name = f"{stem}.mp4"
         video_started = False
         video_err = None
         base = (self.drones.get(did, {}) or {}).get("base")
         if base:
-            # Step 1: ensure MJPEG is running (idempotent on the FC side).
-            try:
-                self.session.post(
-                    f"{base.rstrip('/')}/api/video/start",
-                    json={"mode": "mjpeg"},
-                    timeout=1.5,
-                )
-            except Exception as ve:
-                # Not fatal — record/start on a newer FC will self-start MJPEG.
-                print(f"[FLIGHT_LOG] video/start pre-roll failed (non-fatal): {ve}")
-            # Step 2: arm recording with the matched flight-log basename.
             try:
                 r = self.session.post(
                     f"{base.rstrip('/')}/api/video/record/start",
@@ -2326,7 +2317,7 @@ HTML = """
     arcPoll();
     // Version marker — if this string doesn't appear in the DOM,
     // you're running stale JS (restart the Python server or hard-refresh).
-    const BUILD = 'cg-distance-scale-correction';
+    const BUILD = 'ch-no-takeoff-mjpeg-restart';
     console.log('[arc] init complete, build=' + BUILD);
     const ver = document.createElement('span');
     ver.id = 'arc_build_tag';
