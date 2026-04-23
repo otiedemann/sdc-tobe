@@ -2007,7 +2007,7 @@ HTML = """
     arcPoll();
     // Version marker — if this string doesn't appear in the DOM,
     // you're running stale JS (restart the Python server or hard-refresh).
-    const BUILD = 'bh-ws-clean-close';
+    const BUILD = 'bi-arena-labels-3d-hud';
     console.log('[arc] init complete, build=' + BUILD);
     const ver = document.createElement('span');
     ver.id = 'arc_build_tag';
@@ -4548,8 +4548,10 @@ function drawArena(pos, compPos, dir) {
   }
 
   for (const b of buckets.values()) {
-    // Sort low-altitude → high so "low/high" labels read naturally.
-    b.entries.sort((a, b) => a.z - b.z);
+    // Sort HIGH altitude first so the top row of the label is the
+    // upper marker (matches the physical stacking on the wall: low ID
+    // paints low, high ID paints high in the same pixel column).
+    b.entries.sort((a, b) => b.z - a.z);
     const mx = b.cx, my = b.cy;
     const anySeen = b.entries.some(e => e.seen);
     const anyRef  = b.entries.some(e => e.ref);
@@ -4575,51 +4577,46 @@ function drawArena(pos, compPos, dir) {
     ctx.lineWidth = anySeen ? 1.5 : 1;
     ctx.strokeRect(mx - 5.5, my - 5.5, 11, 11);
 
-    // Build a combined label text "id1/id2/…" and its total width so
-    // the pill is sized correctly. We draw each ID separately below
-    // with per-ID colouring.
-    const sep = '/';
-    const sepW = ctx.measureText(sep).width;
-    let totalW = 0;
-    const pieces = [];
-    b.entries.forEach((e, i) => {
-      const w = ctx.measureText(e.id).width;
-      pieces.push({id: e.id, seen: e.seen, w});
-      totalW += w;
-      if (i < b.entries.length - 1) totalW += sepW;
-    });
-    const pillW = totalW + 8, pillH = 15;
+    // Vertical label stack — one row per ID. Upper-altitude marker sits
+    // on the top row; lower marker on the bottom. This mirrors the
+    // physical layout of the stacked wall pairs (high above low).
+    const LINE_H = 13;
+    const pillW  = Math.max(...b.entries.map(e => ctx.measureText(e.id).width)) + 10;
+    const pillH  = b.entries.length * LINE_H + 4;
 
-    // Side of the wall opposite the BACK/FRONT/LEFT/RIGHT text.
+    // Side opposite the BACK/FRONT/LEFT/RIGHT text so the pill doesn't
+    // collide with it. Offset includes pillH now since the pill is taller.
     const wall = (b.wall || '').toLowerCase();
     let labelX, labelY;
-    if      (wall === 'front') { labelX = mx; labelY = my - 13; }
-    else if (wall === 'back')  { labelX = mx; labelY = my + 13; }
-    else if (wall === 'left')  { labelX = mx + 9 + pillW / 2; labelY = my; }
-    else if (wall === 'right') { labelX = mx - 9 - pillW / 2; labelY = my; }
-    else                        { labelX = mx; labelY = my - 13; }
+    if      (wall === 'front') { labelX = mx;                      labelY = my - pillH / 2 - 8; }
+    else if (wall === 'back')  { labelX = mx;                      labelY = my + pillH / 2 + 8; }
+    else if (wall === 'left')  { labelX = mx + 9 + pillW / 2;      labelY = my; }
+    else if (wall === 'right') { labelX = mx - 9 - pillW / 2;      labelY = my; }
+    else                        { labelX = mx;                      labelY = my - pillH / 2 - 8; }
 
-    // Pill background + border
+    // Pill background + border (brighter border when anything seen)
     ctx.fillStyle = 'rgba(15,23,42,0.9)';
     ctx.fillRect(labelX - pillW / 2, labelY - pillH / 2, pillW, pillH);
     ctx.strokeStyle = baseColor;
     ctx.lineWidth = anySeen ? 1.5 : 1;
     ctx.strokeRect(labelX - pillW / 2 + 0.5, labelY - pillH / 2 + 0.5, pillW - 1, pillH - 1);
 
-    // Render IDs piece-by-piece so each one can be coloured by its
-    // own visibility. Seen → bright white + bold; unseen → wall colour.
-    ctx.textAlign = 'left';
-    let cursor = labelX - totalW / 2;
-    pieces.forEach((p, i) => {
-      ctx.fillStyle = p.seen ? '#ffffff' : baseColor;
-      ctx.font = p.seen ? 'bold 11px monospace' : '11px monospace';
-      ctx.fillText(p.id, cursor, labelY + 0.5);
-      cursor += p.w;
-      if (i < pieces.length - 1) {
-        ctx.fillStyle = '#64748b';
-        ctx.font = '11px monospace';
-        ctx.fillText(sep, cursor, labelY + 0.5);
-        cursor += sepW;
+    // Render each ID on its own row; seen → bold white, unseen → wall
+    // colour. Thin separator line between rows makes the pair visually
+    // obvious when both IDs are unseen (same colour otherwise).
+    ctx.textAlign = 'center';
+    b.entries.forEach((e, i) => {
+      const rowY = labelY - pillH / 2 + (i + 0.5) * LINE_H + 2;
+      ctx.fillStyle = e.seen ? '#ffffff' : baseColor;
+      ctx.font      = e.seen ? 'bold 11px monospace' : '11px monospace';
+      ctx.fillText(e.id, labelX, rowY);
+      if (i < b.entries.length - 1) {
+        ctx.strokeStyle = 'rgba(100,116,139,0.5)';
+        ctx.lineWidth = 0.5;
+        ctx.beginPath();
+        ctx.moveTo(labelX - pillW / 2 + 2, labelY - pillH / 2 + (i + 1) * LINE_H + 2);
+        ctx.lineTo(labelX + pillW / 2 - 2, labelY - pillH / 2 + (i + 1) * LINE_H + 2);
+        ctx.stroke();
       }
     });
     ctx.font = 'bold 11px monospace';   // restore default for any later caller
@@ -4826,6 +4823,9 @@ async function fleetPoll() {
       if (window._arena3d && window._arena3d.updateDrones) {
         window._arena3d.updateDrones(d.observers);
         if (window._arena3d.syncTargetBoxes) window._arena3d.syncTargetBoxes();
+        if (window._arena3d.updateDronePositionHUD) {
+          window._arena3d.updateDronePositionHUD(d.observers);
+        }
         // Aggregate which markers are currently visible / used as refs
         // across the whole fleet so the 3D highlight matches the 2D
         // halo. Prefer the position service's seen_markers field; fall
@@ -5742,7 +5742,42 @@ let ARENA_W_dyn = 20, ARENA_D_dyn = 10;
     origin.position.set(0, 0.15, 0);
     scene.add(origin);
 
-    // Fetch + plot arena markers (from the arena_config we already fetched)
+    // Helper — build a floating canvas-sprite label with a given text.
+    // Canvas resolution is fixed; sprite.scale controls world size.
+    function _makeLabelSprite(text, bgRGBA, fgRGB, fontPx) {
+      const canvas = document.createElement('canvas');
+      canvas.width = 128; canvas.height = 56;
+      const c = canvas.getContext('2d');
+      c.fillStyle = bgRGBA;
+      // Rounded rect for a nicer badge look
+      const r = 8;
+      c.beginPath();
+      c.moveTo(r, 0);
+      c.lineTo(canvas.width - r, 0);
+      c.quadraticCurveTo(canvas.width, 0, canvas.width, r);
+      c.lineTo(canvas.width, canvas.height - r);
+      c.quadraticCurveTo(canvas.width, canvas.height, canvas.width - r, canvas.height);
+      c.lineTo(r, canvas.height);
+      c.quadraticCurveTo(0, canvas.height, 0, canvas.height - r);
+      c.lineTo(0, r);
+      c.quadraticCurveTo(0, 0, r, 0);
+      c.closePath();
+      c.fill();
+      c.fillStyle = fgRGB;
+      c.font = 'bold ' + (fontPx || 32) + 'px monospace';
+      c.textAlign = 'center';
+      c.textBaseline = 'middle';
+      c.fillText(String(text), canvas.width / 2, canvas.height / 2 + 2);
+      const tex = new THREE.CanvasTexture(canvas);
+      tex.minFilter = THREE.LinearFilter;
+      const sprite = new THREE.Sprite(new THREE.SpriteMaterial({map: tex, transparent: true, depthTest: false}));
+      sprite.renderOrder = 100;   // float on top of everything
+      return sprite;
+    }
+
+    // Fetch + plot arena markers (from the arena_config we already fetched).
+    // Each marker gets a coloured face cube AND a floating ID label so the
+    // 3D scene is immediately readable without hovering / guessing.
     if (window.arenaMarkers && Object.keys(window.arenaMarkers).length) {
       for (const [id, m] of Object.entries(window.arenaMarkers)) {
         if (!m.pos) continue;
@@ -5751,9 +5786,20 @@ let ARENA_W_dyn = 20, ARENA_D_dyn = 10;
                  : (m.wall === 'back')  ? 0xa855f7
                  : (m.wall === 'left')  ? 0x06b6d4
                  : (m.wall === 'right') ? 0x10b981 : 0x94a3b8;
+        // Wrap in a group so we can carry a label sprite alongside the cube.
+        const grp = new THREE.Group();
         const mesh = new THREE.Mesh(g, new THREE.MeshStandardMaterial({color: col}));
-        mesh.position.set(m.pos[0], m.pos[2] || 2, m.pos[1]);
-        scene.add(mesh);
+        grp.add(mesh);
+        const label = _makeLabelSprite(id, 'rgba(15,23,42,0.85)', '#e2e8f0', 34);
+        label.scale.set(0.55, 0.24, 1);     // world units — ~55 cm wide
+        label.position.set(0, 0.4, 0);      // above the cube
+        grp.add(label);
+        grp.position.set(m.pos[0], m.pos[2] || 2, m.pos[1]);
+        scene.add(grp);
+        // Keep the Mesh in markerMeshes (updateVisibleMarkers mutates the
+        // material on the cube, not the group).
+        mesh.userData._label = label;       // so updateVisibleMarkers can tint
+        mesh.userData._group = grp;
         markerMeshes[id] = mesh;
       }
     }
@@ -5948,6 +5994,12 @@ let ARENA_W_dyn = 20, ARENA_D_dyn = 10;
     }
     scene = null; camera = null; controls = null;
     droneMeshes = {}; markerMeshes = {};
+    // Remove the HUD overlay DIV so it doesn't show stale coordinates
+    // when the 3D view gets re-enabled later.
+    if (_hudEl && _hudEl.parentNode) {
+      _hudEl.parentNode.removeChild(_hudEl);
+    }
+    _hudEl = null;
   }
 
   // ── Visible-marker highlight for the 3D arena ─────────────────────
@@ -5969,6 +6021,7 @@ let ARENA_W_dyn = 20, ARENA_D_dyn = 10;
       }
       const isSeen = seen.has(String(id));
       const isRef  = refs.has(String(id));
+      const lbl = mesh.userData._label;
       if (isSeen) {
         // Bright yellow (or green if actually used for pose fusion).
         const highlightColor = isRef ? 0x22c55e : 0xfbbf24;
@@ -5978,6 +6031,7 @@ let ARENA_W_dyn = 20, ARENA_D_dyn = 10;
           mesh.material.emissiveIntensity = 0.6;
         }
         mesh.scale.setScalar(mesh.userData._baseScale * 1.35);
+        if (lbl) lbl.scale.set(0.75, 0.32, 1);  // grow label too
       } else {
         mesh.material.color.setHex(mesh.userData._baseColor);
         if (mesh.material.emissive) {
@@ -5985,12 +6039,65 @@ let ARENA_W_dyn = 20, ARENA_D_dyn = 10;
           mesh.material.emissiveIntensity = 0;
         }
         mesh.scale.setScalar(mesh.userData._baseScale);
+        if (lbl) lbl.scale.set(0.55, 0.24, 1);
       }
     }
   }
 
+  // ── Drone position HUD — floating DIV above the 3D container ──────
+  // Three.js scenes lack an obvious "show me the active drone's xyz"
+  // readout. Add a small top-left overlay that shows per-drone
+  // coordinates; falls out of the container's bottom if there are many
+  // drones, which is fine for up to ~5.
+  let _hudEl = null;
+  function _ensureHUD() {
+    if (_hudEl) return _hudEl;
+    const wrap = document.getElementById('arena3d_wrap');
+    if (!wrap) return null;
+    _hudEl = document.createElement('div');
+    _hudEl.id = 'arena3d_hud';
+    _hudEl.style.cssText = [
+      'position:absolute', 'top:6px', 'left:6px', 'z-index:10',
+      'padding:4px 8px',
+      'background:rgba(15,23,42,0.8)',
+      'color:#e2e8f0', 'font-family:monospace', 'font-size:11px',
+      'line-height:1.4', 'border:1px solid #334155', 'border-radius:4px',
+      'pointer-events:none', 'max-width:240px',
+    ].join(';') + ';';
+    wrap.appendChild(_hudEl);
+    return _hudEl;
+  }
+  function updateDronePositionHUD(observers) {
+    const el = _ensureHUD();
+    if (!el) return;
+    const lines = [];
+    const DRONE_COLORS = ['#f97316', '#38bdf8', '#a78bfa', '#f472b6', '#fbbf24'];
+    let idx = 0;
+    for (const [did, st] of Object.entries(observers || {})) {
+      const p = st && (st.pos || st.cam);
+      const col = DRONE_COLORS[idx % DRONE_COLORS.length];
+      idx++;
+      if (!Array.isArray(p) || p.length < 2) {
+        lines.push('<span style="color:#64748b;">drone ' + did + ': no fix</span>');
+        continue;
+      }
+      const x = Number(p[0]).toFixed(2);
+      const y = Number(p[1]).toFixed(2);
+      const z = (typeof p[2] === 'number' && isFinite(p[2])) ? Number(p[2]).toFixed(2) : '–';
+      const stale = st.pos_stale ? ' <span style="color:#fbbf24;">stale</span>' : '';
+      lines.push(
+        '<span style="color:' + col + ';font-weight:700;">drone ' + did + '</span> ' +
+        '<span style="color:#38bdf8;">x=' + x + '</span> ' +
+        '<span style="color:#4ade80;">y=' + y + '</span> ' +
+        '<span style="color:#fb923c;">z=' + z + '</span>' + stale
+      );
+    }
+    if (!lines.length) lines.push('<span style="color:#64748b;">no drones</span>');
+    el.innerHTML = lines.join('<br/>');
+  }
+
   // Expose for fleetPoll()
-  window._arena3d = {updateDrones, syncTargetBoxes, updateVisibleMarkers};
+  window._arena3d = {updateDrones, syncTargetBoxes, updateVisibleMarkers, updateDronePositionHUD};
 
   // Toggle wiring — 3D view is shown BY DEFAULT below the 2D canvas.
   // The 2D canvas stays visible the whole time so operators have the
