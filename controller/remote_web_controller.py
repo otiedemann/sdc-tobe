@@ -1281,6 +1281,12 @@ HTML = """
     <span id=\"arena_guard_engaged_badge\" class=\"small\" style=\"display:none;color:#fde68a;background:#7f1d1d;padding:2px 8px;border-radius:4px;font-weight:700;letter-spacing:0.04em;\">
       &#128680; ARENA GUARD ENGAGED
     </span>
+    <label style=\"color:#94a3b8;display:flex;align-items:center;gap:4px;cursor:pointer;\"
+           title=\"When ON: during ANY autonomous mission, the drone's camera aims at the arena centre (default x=0, y=5.4) regardless of which direction it's flying. This keeps the maximum number of ArUco markers in view at once, which in turn gives the position processor more references and a more accurate fused pose.\">
+      <input type=\"checkbox\" id=\"cam_face_center_toggle\" style=\"accent-color:#22d3ee;\" />
+      &#128247; Cam → arena centre
+      <span class=\"info-icon\" data-info=\"camera_face_center\">i</span>
+    </label>
     <span id=\"autonomous_guards_status\" class=\"small\" style=\"color:#64748b;\"></span>
   </div>
   <div id=\"drone_config_modal\" style=\"display:none;position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,0.7);z-index:1000;justify-content:center;align-items:center;\">
@@ -2256,7 +2262,7 @@ HTML = """
     arcPoll();
     // Version marker — if this string doesn't appear in the DOM,
     // you're running stale JS (restart the Python server or hard-refresh).
-    const BUILD = 'ca-safety-viz-batch-key';
+    const BUILD = 'cb-camera-face-center';
     console.log('[arc] init complete, build=' + BUILD);
     const ver = document.createElement('span');
     ver.id = 'arc_build_tag';
@@ -3810,6 +3816,7 @@ async function resumeAllDrones(source) {
 (function wireFlightGuards(){
   const axisTog   = document.getElementById('axis_locked_toggle');
   const arenaTog  = document.getElementById('arena_guard_toggle');
+  const camFaceTog = document.getElementById('cam_face_center_toggle');
   const inp       = document.getElementById('safety_margin_input');
   const btn       = document.getElementById('safety_margin_apply');
   const status    = document.getElementById('autonomous_guards_status');
@@ -3826,6 +3833,11 @@ async function resumeAllDrones(source) {
       // axis-lock (autonomous-observer param)
       const p = await (await fetch('/proxy/aruco/params')).json();
       if (axisTog && typeof p.axis_locked !== 'undefined') axisTog.checked = !!p.axis_locked;
+      // Camera-faces-arena-centre toggle (C2-local fleet-wide setting)
+      try {
+        const cf = await (await fetch('/proxy/config/camera_face_center')).json();
+        if (camFaceTog && typeof cf.enabled !== 'undefined') camFaceTog.checked = !!cf.enabled;
+      } catch {}
       // arena guard + margin (Pi-side, enforces on BOTH manual + auto)
       const a = await (await fetch('/proxy/config/arena_safety')).json();
       if (arenaTog && typeof a.enabled !== 'undefined') arenaTog.checked = !!a.enabled;
@@ -3882,6 +3894,22 @@ async function resumeAllDrones(source) {
         body: JSON.stringify({axis_locked: axisTog.checked}),
       });
       flash(axisTog.checked ? '\u2713 axis-lock ON' : '\u2713 axis-lock OFF', '#22c55e');
+    } catch (e) { flash('request failed', '#ef4444'); }
+  });
+
+  if (camFaceTog) camFaceTog.addEventListener('change', async () => {
+    try {
+      const r = await fetch('/proxy/config/camera_face_center', {
+        method: 'POST',
+        headers: {'Content-Type':'application/json'},
+        body: JSON.stringify({enabled: camFaceTog.checked}),
+      });
+      const j = await r.json();
+      if (j.ok) flash(camFaceTog.checked
+                        ? '\u2713 camera \u2192 arena centre (fleet)'
+                        : '\u2713 camera free (mission-driven)',
+                       '#22c55e');
+      else flash('error: ' + (j.error || 'unknown'), '#ef4444');
     } catch (e) { flash('request failed', '#ef4444'); }
   });
 
@@ -6195,6 +6223,23 @@ window.PARAM_INFO = {
     "exclusively to autonomous decisions (observer LIVE + waypoints).\\n\\n"+
     "Typical use: structured arena navigation where diagonals invite "+
     "unnecessary marker-tracking jitter. Default OFF."},
+  camera_face_center: {title:'Camera → arena centre', body:
+    "Fleet-wide toggle: when ON, every observer's waypoint face-target "+
+    "defaults to the arena centre (x=0, y=half-depth). During autonomous "+
+    "missions, the drone's camera then aims at the centre of the arena "+
+    "regardless of which direction it's flying — keeping the maximum "+
+    "number of ArUco markers in view at once.\\n\\n"+
+    "Why: the position processor fuses poses from every visible marker. "+
+    "More visible markers = tighter fused arena-frame pose. Pointing the "+
+    "camera at one specific marker (the mission's target) means only a "+
+    "handful of markers are in the FOV at a time; pointing at the centre "+
+    "typically keeps 4-6 markers visible throughout a flight.\\n\\n"+
+    "Missions can still override this on a per-call basis by passing an "+
+    "explicit face target. If OFF, missions that don't set a face leave "+
+    "the camera aligned with the drone's direction of travel.\\n\\n"+
+    "Arena centre defaults to (0, 5.4) for a 20×10.8m arena. The value "+
+    "is adjustable via POST /proxy/config/camera_face_center body "+
+    "{\\\"xy\\\": [x, y]}."},
   arena_guard_enabled: {title:'Arena guard (manual + auto)', body:
     "When ON (default), the Pi's own RC tick loop runs a boundary "+
     "guard on EVERY command — manual WASD, autonomous missions, "+
@@ -9171,6 +9216,72 @@ def proxy_aruco_params_set():
         except Exception as e:
             applied_all[d_id] = {"error": str(e)[:80]}
     return jsonify(ok=True, applied=applied_all, fleet=True)
+
+
+# ── Camera-faces-arena-centre toggle ──────────────────────────────────
+# Fleet-wide switch. When enabled, every observer's "face override" is
+# set to (0, arena_depth/2) so any mission waypoint with no explicit
+# face target automatically aims the drone's camera at the arena
+# centre — maximising marker visibility, which means better fused
+# arena-frame position.
+#
+# The toggle lives on the C2 so the UI can flip it, the value gets
+# broadcast to all observers, and capture_targets mission etc. pick
+# it up on the next set_waypoint(...) call.
+_camera_face_center_lock = threading.Lock()
+_camera_face_center_enabled: bool = os.getenv("C2_CAMERA_FACE_CENTER", "1") not in {"0", "false", "False"}
+_camera_face_center_xy: tuple = (0.0, 5.4)   # default arena centre (20×10.8 m)
+
+
+def _apply_camera_face_to_fleet():
+    """Push the current camera-face setting to every observer."""
+    with _camera_face_center_lock:
+        xy = _camera_face_center_xy if _camera_face_center_enabled else None
+    for d_id, o in aruco_fleet._obs.items():
+        try:
+            o.set_camera_face_override(xy)
+        except Exception as e:
+            print(f"[CAMERA_FACE] drone {d_id} set failed: {e}")
+
+
+# Apply at import time so observers created by configure() already
+# have the right override before any mission runs.
+_apply_camera_face_to_fleet()
+
+
+@app.get("/proxy/config/camera_face_center")
+def proxy_camera_face_center_get():
+    with _camera_face_center_lock:
+        return jsonify(
+            ok=True,
+            enabled=_camera_face_center_enabled,
+            xy=list(_camera_face_center_xy),
+        )
+
+
+@app.post("/proxy/config/camera_face_center")
+def proxy_camera_face_center_set():
+    """Enable/disable the toggle, optionally override the centre XY.
+    Body: {"enabled": true, "xy": [0, 5.4]}"""
+    global _camera_face_center_enabled, _camera_face_center_xy
+    data = request.get_json(silent=True) or {}
+    changed = {}
+    with _camera_face_center_lock:
+        if "enabled" in data:
+            _camera_face_center_enabled = bool(data["enabled"])
+            changed["enabled"] = _camera_face_center_enabled
+        if "xy" in data and isinstance(data["xy"], (list, tuple)) and len(data["xy"]) >= 2:
+            try:
+                _camera_face_center_xy = (float(data["xy"][0]), float(data["xy"][1]))
+                changed["xy"] = list(_camera_face_center_xy)
+            except (TypeError, ValueError):
+                pass
+    _apply_camera_face_to_fleet()
+    log_command("camera_face_center_set", changed)
+    print(f"[CAMERA_FACE] enabled={_camera_face_center_enabled} xy={_camera_face_center_xy}")
+    return jsonify(ok=True, changed=changed,
+                   enabled=_camera_face_center_enabled,
+                   xy=list(_camera_face_center_xy))
 
 
 @app.get("/proxy/aruco/safety_margin")

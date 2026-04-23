@@ -226,6 +226,10 @@ class DroneObserver:
         # marker-tracking PD loop when active.
         self._waypoint_xyz: Optional[tuple] = None     # (x, y, z) in arena frame
         self._waypoint_face_xy: Optional[tuple] = None  # (x, y) to aim camera at
+        # Fleet-wide override: when set, any set_waypoint(xyz, face_xy=None)
+        # falls back to this point. Typically (0, arena_depth/2) — the
+        # arena centre. Gives the camera maximum marker visibility.
+        self._camera_face_override_xy: Optional[tuple] = None
         # ── Arena safety bounds (world frame, metres) ────────────────
         # Drone must never leave this box. Default per SDC26 ruleset
         # (20 × 10.8 × 6 m field). Configurable via set_arena_bounds().
@@ -298,19 +302,55 @@ class DroneObserver:
         except Exception as e:
             return {"ok": False, "error": str(e)}
 
+    def set_camera_face_override(self, xy):
+        """Fleet-wide "camera always faces arena centre" override.
+
+        When set (not None), set_waypoint() uses this as the face target
+        whenever the caller doesn't supply one explicitly. That way any
+        mission — including future ones — automatically gets the
+        arena-centre-facing behaviour, which maximises the number of
+        markers visible at any moment and thus the quality of the
+        fused arena-frame pose.
+
+        Pass None to clear the override.
+        """
+        with self._lock:
+            if xy is None:
+                self._camera_face_override_xy = None
+            else:
+                self._camera_face_override_xy = (float(xy[0]), float(xy[1]))
+            # Retroactively apply to any active waypoint that has no
+            # explicit face — otherwise the camera stays wherever it was
+            # last pointed until the next waypoint fires.
+            if (self._waypoint_xyz is not None
+                    and self._waypoint_face_xy is None
+                    and self._camera_face_override_xy is not None):
+                self._waypoint_face_xy = self._camera_face_override_xy
+
     def set_waypoint(self, xyz, face_xy=None):
         """Fly to a world-frame (x, y, z) setpoint. If face_xy is given,
         the drone yaws to aim its camera at that world-XY point (typically
         the arena centre so more markers stay in view for triangulation).
         Pass None to cancel waypoint nav (drone returns to normal
-        marker-tracking PD)."""
+        marker-tracking PD).
+
+        If face_xy is None AND a fleet-wide "camera faces arena centre"
+        override is active (set via set_camera_face_override), the
+        override is used automatically. Missions can still provide an
+        explicit face_xy to opt out on a per-call basis.
+        """
         with self._lock:
             self._waypoint_xyz = (
                 (float(xyz[0]), float(xyz[1]), float(xyz[2])) if xyz is not None else None
             )
-            self._waypoint_face_xy = (
-                (float(face_xy[0]), float(face_xy[1])) if face_xy is not None else None
-            )
+            if face_xy is not None:
+                self._waypoint_face_xy = (float(face_xy[0]), float(face_xy[1]))
+            elif self._camera_face_override_xy is not None and xyz is not None:
+                # Fall back to the fleet-wide override. Only when there's
+                # an active waypoint — pure-None calls still clear face.
+                self._waypoint_face_xy = self._camera_face_override_xy
+            else:
+                self._waypoint_face_xy = None
 
     def clear_waypoint(self):
         self.set_waypoint(None, None)
