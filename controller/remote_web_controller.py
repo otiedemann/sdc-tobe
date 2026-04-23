@@ -330,8 +330,16 @@ class FlightLogger:
                     flt = None
                 if flt is None:
                     continue
-                # Active flight — emit a tick record
-                # Pull visible markers from the ArUco observer if we have one.
+                # Active flight — emit a tick record.
+                #
+                # Visible markers: the ArUco observer exposes a `visible_ids`
+                # list, but only when the observer thread is started (which
+                # happens when ArUco Seek is armed or a mission is running).
+                # During plain manual flight the observer is idle and that
+                # list is empty. The per-drone position service on the Pi
+                # runs its own detection pipeline and publishes `seen_markers`
+                # in /api/position — use it as a fallback so the flight log
+                # always reflects what the camera is actually seeing.
                 vis_markers = []
                 try:
                     obs = aruco_fleet.get(did)
@@ -340,6 +348,8 @@ class FlightLogger:
                         vis_markers = st.get("visible_ids") or []
                 except Exception:
                     pass
+                if not vis_markers:
+                    vis_markers = list(pos.get("seen_markers") or [])
                 rec = {
                     "type":    "tick",
                     "ts":      time.time(),
@@ -1987,7 +1997,7 @@ HTML = """
     arcPoll();
     // Version marker — if this string doesn't appear in the DOM,
     // you're running stale JS (restart the Python server or hard-refresh).
-    const BUILD = 'be-ws-latency-fix';
+    const BUILD = 'bf-wasd-keepalive-ws';
     console.log('[arc] init complete, build=' + BUILD);
     const ver = document.createElement('span');
     ver.id = 'arc_build_tag';
@@ -6060,16 +6070,46 @@ def proxy_key_up():
 
 @app.post("/proxy/key_batch")
 def proxy_key_batch():
-    """Batch key_down for all currently held keys in a single HTTP request."""
+    """Batch key_down for all currently held keys in a single request.
+
+    Fires at ~10 Hz from the browser — it's the keep-alive that stops
+    the Pi's KEY_STALE_S=1 timer from dropping keys mid-flight. Historic
+    path did N serial HTTP POSTs per batch which is the real WASD
+    latency culprit (3 held keys × 10 Hz × slow HTTP = backed-up fetch
+    queue).
+
+    New path: one WS send per held key on the persistent socket. With
+    fire-and-forget semantics, the whole batch clears in microseconds.
+    Fallback to HTTP on WS disconnect."""
     data = request.get_json(silent=True) or {}
     keys = data.get("keys", [])
+    if not keys:
+        return jsonify(ok=True)
+    # Dedup so the log and the wire don't carry redundant presses
+    uniq = list(dict.fromkeys(keys))
+
+    if WS_RC_ENABLED:
+        ws = drone_ws.get(str(active_drone_id))
+        if ws:
+            all_sent = True
+            for k in uniq:
+                if not ws.send_key(str(k), "down"):
+                    all_sent = False
+                    break
+            if all_sent:
+                # Only log one event for the batch to avoid 30Hz log spam.
+                log_command("key_batch", {"keys": uniq, "via": "ws"})
+                return jsonify(ok=True, via="ws", n=len(uniq))
+
+    # HTTP fallback — same shape as before, but also collapsed to one
+    # log entry rather than one per key.
+    log_command("key_batch", {"keys": uniq, "via": "http"})
     last_r = None
-    for k in keys:
-        payload = {"key": k}
-        log_command("key_down", payload)
-        last_r = pi_post("/api/key_down", payload)
+    for k in uniq:
+        last_r = pi_post("/api/key_down", {"key": k})
     if last_r is not None:
-        return (last_r.text, last_r.status_code, {"Content-Type": last_r.headers.get("Content-Type", "application/json")})
+        return (last_r.text, last_r.status_code,
+                {"Content-Type": last_r.headers.get("Content-Type", "application/json")})
     return jsonify(ok=True)
 
 
