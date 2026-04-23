@@ -81,6 +81,19 @@ if not IS_ARM:
         from olympe.messages.ardrone3.Animations import Flip
         from olympe.messages.ardrone3.SpeedSettings import MaxRotationSpeed, MaxVerticalSpeed
         from olympe.messages.ardrone3.PilotingSettings import MaxAltitude, MaxTilt
+        try:
+            # Confirmation state — drone ACKs the MaxAltitude command by
+            # emitting this message. Reading it back lets us VERIFY the
+            # firmware accepted the value (vs silently clamping to its
+            # own range). Some Olympe versions don't expose this — we
+            # just skip the verify if so.
+            from olympe.messages.ardrone3.PilotingSettingsState import (
+                MaxAltitudeChanged,
+            )
+            _HAS_MAXALT_STATE = True
+        except Exception:
+            MaxAltitudeChanged = None
+            _HAS_MAXALT_STATE = False
         HAS_OLYMPE_SDK = True
     except (ImportError, KeyError):
         pass
@@ -2347,9 +2360,33 @@ class OlympeBackend(DroneBackend):
         if "max_altitude_m" in data:
             v = max(0.5, min(150, float(data["max_altitude_m"])))
             try:
+                # Send the SDK command (ardrone3.PilotingSettings.MaxAltitude).
+                # This is exactly the "MaxAltitude" setting the Anafi
+                # autopilot uses internally — we send it via the Olympe
+                # SDK, not a custom layer.
                 d(MaxAltitude(v)).wait(_timeout=2)
                 MAX_ALTITUDE_M = v
                 results["max_altitude_m"] = v
+
+                # Verification — read the drone's CONFIRMED MaxAltitude
+                # state. The drone may clamp to its own [min..max] range
+                # silently; the state tells us what it actually accepted.
+                if _HAS_MAXALT_STATE:
+                    try:
+                        st = d.get_state(MaxAltitudeChanged)
+                        if st and "current" in st:
+                            accepted = float(st["current"])
+                            results["max_altitude_m_firmware_current"] = accepted
+                            if abs(accepted - v) > 0.05:
+                                print(f"[ANAFI] MaxAltitude: requested {v}m, "
+                                      f"drone accepted {accepted}m (clamped by firmware)")
+                            else:
+                                print(f"[ANAFI] MaxAltitude: {accepted}m confirmed by drone")
+                        if st and "min" in st and "max" in st:
+                            results["max_altitude_m_firmware_range"] = [
+                                float(st["min"]), float(st["max"])]
+                    except Exception as e:
+                        results["max_altitude_m_verify_error"] = str(e)[:120]
             except Exception as e:
                 results["max_altitude_m_error"] = str(e)
         if "max_vertical_speed" in data:
@@ -4058,14 +4095,34 @@ def api_settings_set():
 
 @app.get("/api/config/ceiling")
 def api_ceiling_get():
-    """Return the active soft-ceiling and live guard state. Read every
-    ~500 ms by the UI so operators can see clamping happening in real
-    time."""
+    """Return the active soft-ceiling and live guard state, plus the
+    drone's firmware-confirmed MaxAltitude so the operator can verify
+    the SDK-level limit matches our software guard.
+    """
+    firmware_current = None
+    firmware_range   = None
+    try:
+        b = backend
+        if b is not None and _HAS_MAXALT_STATE and MaxAltitudeChanged is not None:
+            d = getattr(b, "drone", None)
+            if d is not None:
+                st = d.get_state(MaxAltitudeChanged)
+                if st:
+                    if "current" in st:
+                        firmware_current = round(float(st["current"]), 2)
+                    if "min" in st and "max" in st:
+                        firmware_range = [round(float(st["min"]), 2),
+                                          round(float(st["max"]), 2)]
+    except Exception:
+        pass
     return jsonify(
         ok=True,
         ceiling_m=round(float(MAX_ALTITUDE_M), 2),
         engaged=bool(_ceiling_engaged),
         reason=_ceiling_last_reason,
+        firmware_max_altitude=firmware_current,
+        firmware_range=firmware_range,
+        persisted_to=str(FLIGHT_CONFIG_PATH),
     )
 
 
@@ -5235,7 +5292,7 @@ def main():
     print(f"[{tag}] Unified API server: http://{HTTP_HOST}:{HTTP_PORT}")
     print(f"[{tag}] Drone: {drone_type} @ {drone_ip} (auto-reconnect; watchdog={REMOTE_TIMEOUT_S}s)")
     print(f"[{tag}] SDKs available: tello={HAS_TELLO_SDK}, olympe={HAS_OLYMPE_SDK}")
-    print(f"[{tag}] Code version: 2026-04-23-bp (video-idempotent + diagnostics)")
+    print(f"[{tag}] Code version: 2026-04-23-bt (ceiling-sdk-verified + seen-markers-fix)")
     app.run(host=HTTP_HOST, port=HTTP_PORT, threaded=True, use_reloader=False)
 
 

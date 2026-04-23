@@ -2195,7 +2195,7 @@ HTML = """
     arcPoll();
     // Version marker — if this string doesn't appear in the DOM,
     // you're running stale JS (restart the Python server or hard-refresh).
-    const BUILD = 'bt-ceiling-pi-enforced';
+    const BUILD = 'bu-seen-markers-fix-sdk-ceiling';
     console.log('[arc] init complete, build=' + BUILD);
     const ver = document.createElement('span');
     ver.id = 'arc_build_tag';
@@ -8172,6 +8172,13 @@ def proxy_aruco_fleet():
                     entry["pos_stale"] = pj["stale"]
                 if entry.get("ref_markers") is None and pj.get("ref_markers") is not None:
                     entry["ref_markers"] = pj["ref_markers"]
+                # Currently-visible markers — MUST be propagated so the 2D
+                # halo + 3D highlight light up on manual flight too. When
+                # the DroneObserver isn't started, the per-drone position
+                # service is the only source for this, and we were dropping
+                # it in both the WS-cache and HTTP-fallback paths.
+                if entry.get("seen_markers") is None and pj.get("seen_markers") is not None:
+                    entry["seen_markers"] = pj["seen_markers"]
                 if entry.get("altitude_m") is None and pj.get("pos"):
                     try:
                         entry["altitude_m"] = float(pj["pos"][2])
@@ -8234,6 +8241,13 @@ def proxy_aruco_fleet():
                     entry["pos_stale"] = pj["stale"]
                 if entry.get("ref_markers") is None and pj.get("ref_markers") is not None:
                     entry["ref_markers"] = pj["ref_markers"]
+                # Currently-visible markers — MUST be propagated so the 2D
+                # halo + 3D highlight light up on manual flight too. When
+                # the DroneObserver isn't started, the per-drone position
+                # service is the only source for this, and we were dropping
+                # it in both the WS-cache and HTTP-fallback paths.
+                if entry.get("seen_markers") is None and pj.get("seen_markers") is not None:
+                    entry["seen_markers"] = pj["seen_markers"]
                 if entry.get("altitude_m") is None and pj.get("pos"):
                     try:
                         entry["altitude_m"] = float(pj["pos"][2])
