@@ -36,8 +36,11 @@ from aruco_seek_multi import (  # noqa: E402
 _http_session = requests.Session()
 _http_session.headers.update({"Connection": "keep-alive"})
 adapter = requests.adapters.HTTPAdapter(
-    pool_connections=8,    # one per drone + spare
-    pool_maxsize=16,       # concurrent requests per host
+    pool_connections=16,   # one per drone × multiple concurrent types (tel/pos/cmd)
+    pool_maxsize=64,       # bumped from 16: the browser fires ~13 polls/sec, each
+                           # can fan out to 5 Pis → pool was saturating within a
+                           # second and queueing everything else. 64 gives
+                           # comfortable headroom for the observed workload.
     max_retries=0,         # fail fast — don't retry on control commands
 )
 _http_session.mount("http://", adapter)
@@ -2132,11 +2135,11 @@ HTML = """
     document.getElementById('arc_emergency').onclick = () => arcPostCmd('/proxy/aruco/emergency', '⛔ EMERGENCY STOP — cut motors immediately. Confirm?');
 
     arcLoadParams();
-    setInterval(arcPoll, 250);
+    setInterval(arcPoll, 500);    // was 250ms/4Hz → 2Hz; 500ms is plenty for the readout
     arcPoll();
     // Version marker — if this string doesn't appear in the DOM,
     // you're running stale JS (restart the Python server or hard-refresh).
-    const BUILD = 'bp-video-idempotent-diagnostics';
+    const BUILD = 'bq-reduce-poll-rate';
     console.log('[arc] init complete, build=' + BUILD);
     const ver = document.createElement('span');
     ver.id = 'arc_build_tag';
@@ -2435,7 +2438,7 @@ HTML = """
     // If the drone config changes, the drones list in the ArUco section
     // repopulates via /proxy/drones poll — mirror that for missions.
     setInterval(misLoadDrones, 5000);
-    setInterval(misPoll, 500);
+    setInterval(misPoll, 1500);  // was 500ms → 1.5s; mission status barely changes between ticks
     misPoll();
 
     // Show/hide the capture-targets-specific rows based on mission type
@@ -3284,7 +3287,7 @@ async function resumeAllDrones(source) {
     } catch {}
   }
   tick();
-  setInterval(tick, 2000);
+  setInterval(tick, 5000);   // was 2s → 5s; pause state rarely changes
 })();
 
 // ── Transport selector (per-subsystem WS ↔ HTTP) ──────────────────────
@@ -3513,7 +3516,7 @@ async function resumeAllDrones(source) {
     }
   };
   load();
-  setInterval(load, 1000);   // 1 Hz — fast enough to flash engagement
+  setInterval(load, 3000);   // was 1s — 3s; ceiling change is a rare event
 })();
 
 // Fleet-wide panic land — used by the 'q' hotkey and the big red
@@ -3995,7 +3998,11 @@ setInterval(refreshVideoStatus, 5000);
 async function sendHeartbeat(){
   try { await fetch('/proxy/heartbeat', {cache:'no-store'}); } catch {}
 }
-setInterval(sendHeartbeat, 500);
+// Heartbeat frequency: Pi's REMOTE_TIMEOUT_S defaults to 2s. Firing
+// every 750ms gives 1.25s safety margin while cutting browser→C2→5×Pi
+// traffic by ~40% compared to the old 500ms. If watchdog is re-tuned
+// lower than 1.5s, this needs to come back down.
+setInterval(sendHeartbeat, 750);
 sendHeartbeat();
 
 // ── Telemetry SSE (replaces polling for near-real-time updates) ──
@@ -5045,7 +5052,7 @@ async function fleetPoll() {
     }
   } catch {}
 }
-setInterval(fleetPoll, 500);
+setInterval(fleetPoll, 1000);   // was 500ms/2Hz → 1Hz; fleet poll fans out to all drones, heaviest endpoint
 fleetPoll();
 
 function updatePosUI(d) {
@@ -7420,17 +7427,38 @@ def proxy_camera_zoom():
 
 @app.get("/proxy/heartbeat")
 def proxy_heartbeat():
-    """Send heartbeat to ALL drones in parallel to keep their watchdogs alive."""
+    """Send heartbeat to all REACHABLE drones in parallel.
+
+    Skips drones whose WS client reports every channel down — no point
+    spending 300 ms × N offline drones every 750 ms. That was the main
+    reason the heartbeat poll stalled the HTTP pool when most of the
+    fleet was offline.
+    """
     def _ping(did_info):
         did, info = did_info
         try:
-            r = _http_session.get(f"{info['base']}/api/heartbeat", timeout=0.3)
+            r = _http_session.get(f"{info['base']}/api/heartbeat", timeout=0.25)
             return did, r.status_code
         except Exception:
             return did, "timeout"
 
-    futures = list(_heartbeat_pool.map(_ping, DRONES.items()))
-    results = dict(futures)
+    # Filter out offline drones using the WS client's health flag.
+    live_items = []
+    skipped = {}
+    for did, info in DRONES.items():
+        did_s = str(did)
+        cli = drone_ws.get(did_s) if 'drone_ws' in globals() else None
+        if cli is not None:
+            all_down = (not cli._ws_connected.get("telemetry") and
+                        not cli._ws_connected.get("position") and
+                        not cli._ws_connected.get("rc"))
+            if all_down:
+                skipped[did_s] = "offline"
+                continue
+        live_items.append((did, info))
+
+    results = dict(_heartbeat_pool.map(_ping, live_items)) if live_items else {}
+    results.update(skipped)
     return jsonify(ok=True, drones=results)
 
 
