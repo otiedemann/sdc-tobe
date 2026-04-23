@@ -1262,6 +1262,36 @@ HTML = """
     </label>
     <span id=\"ws_status_badge\" class=\"small\" title=\"WebSocket channel between C2 and flight controller. Tel/Pos/RC are pushed on a persistent connection — no per-call HTTP framing overhead.\" style=\"padding:2px 8px;border-radius:3px;font-family:monospace;font-size:10.5px;letter-spacing:0.03em;font-weight:700;background:#334155;color:#94a3b8;\">WS —</span>
   </div>
+  <!-- ── Transport selector — per-subsystem WS ↔ HTTP switches ──
+       auto = prefer WS, fall back to HTTP when WS is down (default)
+       ws   = force WS only (503 if WS disconnected)
+       http = force HTTP only (never use WS)
+       Persisted on the server + mirrored in localStorage so every tab
+       reflects the same choice. -->
+  <div id=\"transport_widget\" class=\"small\" style=\"display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-top:4px;padding:4px 8px;background:#0f172a;border:1px solid #1e293b;border-radius:4px;\">
+    <b style=\"color:#e2e8f0;\">Transport:</b>
+    <span style=\"color:#64748b;\">Controls (RC/WASD)</span>
+    <select id=\"transport_rc\" class=\"transport-sel\" data-subsys=\"rc\" style=\"height:22px;font-size:11px;padding:0 4px;\">
+      <option value=\"auto\">auto</option>
+      <option value=\"ws\">ws</option>
+      <option value=\"http\">http</option>
+    </select>
+    <span style=\"color:#64748b;\">Telemetry</span>
+    <select id=\"transport_telemetry\" class=\"transport-sel\" data-subsys=\"telemetry\" style=\"height:22px;font-size:11px;padding:0 4px;\">
+      <option value=\"auto\">auto</option>
+      <option value=\"ws\">ws</option>
+      <option value=\"http\">http</option>
+    </select>
+    <span style=\"color:#64748b;\">Position</span>
+    <select id=\"transport_position\" class=\"transport-sel\" data-subsys=\"position\" style=\"height:22px;font-size:11px;padding:0 4px;\">
+      <option value=\"auto\">auto</option>
+      <option value=\"ws\">ws</option>
+      <option value=\"http\">http</option>
+    </select>
+    <button id=\"transport_all_http\" style=\"height:22px;font-size:11px;padding:0 8px;background:#1e293b;border-color:#475569;\" title=\"Force every subsystem to HTTP (legacy transport). Useful for diagnosing WS as the source of latency.\">All HTTP</button>
+    <button id=\"transport_all_auto\" style=\"height:22px;font-size:11px;padding:0 8px;background:#1e293b;border-color:#475569;\" title=\"Reset: prefer WS with HTTP fallback\">All auto</button>
+    <span id=\"transport_status\" class=\"small\" style=\"color:#64748b;\"></span>
+  </div>
   <!-- ── Tuning Parameters — one place for all live-tunable knobs ──
        The Observer PD gains (approach speed, skew correction, IMU damping,
        clamps, etc.) AND the Position Tracker config (profile, FOV, latency,
@@ -2079,7 +2109,7 @@ HTML = """
     arcPoll();
     // Version marker — if this string doesn't appear in the DOM,
     // you're running stale JS (restart the Python server or hard-refresh).
-    const BUILD = 'bk-ws-quiet-offline';
+    const BUILD = 'bl-transport-selector';
     console.log('[arc] init complete, build=' + BUILD);
     const ver = document.createElement('span');
     ver.id = 'arc_build_tag';
@@ -3228,6 +3258,71 @@ async function resumeAllDrones(source) {
   }
   tick();
   setInterval(tick, 2000);
+})();
+
+// ── Transport selector (per-subsystem WS ↔ HTTP) ──────────────────────
+// Populated from /proxy/config/transport on load + every time the
+// server is polled via the WS status check. POSTs on every dropdown
+// change so the server state always matches the UI.
+(function wireTransport(){
+  const selectors = document.querySelectorAll('.transport-sel');
+  const status = document.getElementById('transport_status');
+  function flash(msg, col) {
+    if (!status) return;
+    status.textContent = msg;
+    status.style.color = col || '#64748b';
+    setTimeout(() => { if (status.textContent === msg) status.textContent = ''; }, 2500);
+  }
+  async function apply(patch, label) {
+    try {
+      const r = await fetch('/proxy/config/transport', {
+        method: 'POST',
+        headers: {'Content-Type':'application/json'},
+        body: JSON.stringify(patch),
+      });
+      const j = await r.json();
+      if (j.ok) {
+        // Reflect server's authoritative state in case some keys were rejected.
+        Object.keys(j.transport || {}).forEach(k => {
+          const el = document.getElementById('transport_' + k);
+          if (el) el.value = j.transport[k];
+        });
+        flash('\\u2713 ' + (label || 'applied'), '#22c55e');
+      } else {
+        flash('error: ' + (j.error || 'unknown'), '#ef4444');
+      }
+    } catch (e) { flash('request failed', '#ef4444'); }
+  }
+  selectors.forEach(el => {
+    el.addEventListener('change', () => {
+      apply({[el.dataset.subsys]: el.value}, el.dataset.subsys + '=' + el.value);
+    });
+  });
+  const allHttp = document.getElementById('transport_all_http');
+  if (allHttp) allHttp.onclick = () =>
+    apply({rc: 'http', telemetry: 'http', position: 'http'}, 'all → http');
+  const allAuto = document.getElementById('transport_all_auto');
+  if (allAuto) allAuto.onclick = () =>
+    apply({rc: 'auto', telemetry: 'auto', position: 'auto'}, 'all → auto');
+
+  // Initial load — fetch current state from the server.
+  (async () => {
+    try {
+      const j = await (await fetch('/proxy/config/transport')).json();
+      Object.keys(j.transport || {}).forEach(k => {
+        const el = document.getElementById('transport_' + k);
+        if (el) el.value = j.transport[k];
+      });
+      if (!j.ws_available) {
+        document.querySelectorAll('.transport-sel').forEach(el => {
+          // Disable the WS option when the client library is missing
+          el.querySelectorAll('option[value="ws"]').forEach(o => o.disabled = true);
+          if (el.value === 'ws') el.value = 'http';
+        });
+        flash('WS library missing — selectors locked to http/auto', '#fbbf24');
+      }
+    } catch {}
+  })();
 })();
 
 // ── WebSocket status badge ────────────────────────────────────────────
@@ -6328,11 +6423,44 @@ def proxy_drones_config_save():
     return jsonify(ok=True, drones=DRONES)
 
 
-# WS-for-RC can be disabled at boot with C2_WS_RC=0. The HTTP path is
-# measured and reliable; WS gains are ~3-15 ms but any misconfiguration
-# can make it slower than HTTP. Flip this to 0 if WASD feels sluggish
-# and you want the old behaviour back without rebuilding.
-WS_RC_ENABLED = os.getenv("C2_WS_RC", "1") not in {"0", "false", "False"}
+# ── Per-subsystem transport preference ────────────────────────────────
+# Three values accepted:
+#   "auto" — prefer WS, fall back to HTTP when WS is down
+#   "ws"   — force WS; if WS is down, endpoint returns 503 immediately
+#            (no HTTP fallback at all — useful to diagnose whether WS
+#            itself is slow)
+#   "http" — force HTTP; never use the WS path (useful to confirm WS
+#            isn't the source of latency without restarting the server)
+#
+# Initial values come from env for backward-compat (C2_WS_RC=0 still
+# disables WS RC at boot), then overridden at runtime via
+# /proxy/config/transport.
+_transport_lock = threading.Lock()
+_transport = {
+    "rc":        "http" if os.getenv("C2_WS_RC", "1") in {"0", "false", "False"} else "auto",
+    "telemetry": "auto",
+    "position":  "auto",
+}
+
+
+def _transport_mode(subsystem: str) -> str:
+    with _transport_lock:
+        return _transport.get(subsystem, "auto")
+
+
+def _ws_enabled_for(subsystem: str) -> bool:
+    """Should we attempt the WS path for this subsystem?"""
+    return _transport_mode(subsystem) in ("auto", "ws")
+
+
+def _http_fallback_allowed_for(subsystem: str) -> bool:
+    """Should we fall back to HTTP if WS fails?"""
+    return _transport_mode(subsystem) in ("auto", "http")
+
+
+# Legacy alias — still read by a couple of old log messages. Keeps
+# existing behaviour if anyone ships a patch that checks this directly.
+WS_RC_ENABLED = _ws_enabled_for("rc")
 
 
 def _active_drone_reachable() -> bool:
@@ -6351,17 +6479,17 @@ def _active_drone_reachable() -> bool:
 def proxy_key_down():
     data = request.get_json(silent=True) or {}
     log_command("key_down", data)
-    # WS fast path — persistent socket with TCP_NODELAY, fire-and-forget
-    # (no ACKs). Falls back transparently to HTTP when not connected or
-    # when WS_RC_ENABLED=0.
-    if WS_RC_ENABLED:
+    mode = _transport_mode("rc")
+    if mode in ("auto", "ws"):
         k = str(data.get("key", ""))
         ws = drone_ws.get(str(active_drone_id))
         if ws and ws.send_key(k, "down"):
             return jsonify(ok=True, via="ws")
-    # Don't fall back to HTTP if we know the Pi is down — it'll just
-    # burn TIMEOUT_CMD seconds and make the UI feel frozen. Return 503
-    # immediately so the browser can keep its queue moving.
+        if mode == "ws":
+            # Forced WS and it failed — don't mask the problem by quietly
+            # switching to HTTP. Return 503 so the operator sees reality.
+            return jsonify(ok=False, error="ws forced but not connected",
+                           via="ws"), 503
     if not _active_drone_reachable():
         return jsonify(ok=False, error="drone unreachable", via="none"), 503
     r = pi_post("/api/key_down", data)
@@ -6372,11 +6500,15 @@ def proxy_key_down():
 def proxy_key_up():
     data = request.get_json(silent=True) or {}
     log_command("key_up", data)
-    if WS_RC_ENABLED:
+    mode = _transport_mode("rc")
+    if mode in ("auto", "ws"):
         k = str(data.get("key", ""))
         ws = drone_ws.get(str(active_drone_id))
         if ws and ws.send_key(k, "up"):
             return jsonify(ok=True, via="ws")
+        if mode == "ws":
+            return jsonify(ok=False, error="ws forced but not connected",
+                           via="ws"), 503
     if not _active_drone_reachable():
         return jsonify(ok=False, error="drone unreachable", via="none"), 503
     r = pi_post("/api/key_up", data)
@@ -6403,7 +6535,8 @@ def proxy_key_batch():
     # Dedup so the log and the wire don't carry redundant presses
     uniq = list(dict.fromkeys(keys))
 
-    if WS_RC_ENABLED:
+    mode = _transport_mode("rc")
+    if mode in ("auto", "ws"):
         ws = drone_ws.get(str(active_drone_id))
         if ws:
             all_sent = True
@@ -6412,17 +6545,15 @@ def proxy_key_batch():
                     all_sent = False
                     break
             if all_sent:
-                # Only log one event for the batch to avoid 30Hz log spam.
                 log_command("key_batch", {"keys": uniq, "via": "ws"})
                 return jsonify(ok=True, via="ws", n=len(uniq))
+        if mode == "ws":
+            return jsonify(ok=False, error="ws forced but not connected",
+                           via="ws"), 503
 
-    # Skip HTTP fallback if the Pi is unreachable — otherwise every
-    # 100 ms keep-alive tick burns 2 s × N keys of Flask thread time.
     if not _active_drone_reachable():
         return jsonify(ok=False, error="drone unreachable", via="none"), 503
 
-    # HTTP fallback — same shape as before, but also collapsed to one
-    # log entry rather than one per key.
     log_command("key_batch", {"keys": uniq, "via": "http"})
     last_r = None
     for k in uniq:
@@ -7216,23 +7347,24 @@ def proxy_latency():
 
 @app.get("/proxy/telemetry")
 def proxy_telemetry():
-    # WS cache first — if we have a frame < 1.5s old, return that (no
-    # network round-trip at all). The 1.5s window allows for one missed
-    # push at TELEMETRY_HZ=2 before we bother going over HTTP.
-    ws = drone_ws.get(str(active_drone_id))
-    if ws:
-        tel, age = ws.latest_telemetry()
-        if tel is not None and age < 1.5:
-            tel = dict(tel)
-            tel["_source"] = "ws"
-            tel["_age_ms"] = int(age * 1000)
-            headers = {
-                "Content-Type": "application/json",
-                "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
-                "Pragma": "no-cache",
-                "Expires": "0",
-            }
-            return (json.dumps(tel, default=str), 200, headers)
+    mode = _transport_mode("telemetry")
+    if mode in ("auto", "ws"):
+        ws = drone_ws.get(str(active_drone_id))
+        if ws:
+            tel, age = ws.latest_telemetry()
+            if tel is not None and age < 1.5:
+                tel = dict(tel)
+                tel["_source"] = "ws"
+                tel["_age_ms"] = int(age * 1000)
+                headers = {
+                    "Content-Type": "application/json",
+                    "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
+                    "Pragma": "no-cache",
+                    "Expires": "0",
+                }
+                return (json.dumps(tel, default=str), 200, headers)
+        if mode == "ws":
+            return jsonify(ok=False, error="ws forced but not connected", via="ws"), 503
     try:
         r = pi_get("/api/telemetry", timeout=TIMEOUT_STATUS)
         headers = {
@@ -7255,6 +7387,42 @@ def proxy_ws_status():
         available=HAS_WSCLIENT,
         drones=out,
     )
+
+
+@app.get("/proxy/config/transport")
+def proxy_transport_get():
+    """Return the current per-subsystem transport preference."""
+    with _transport_lock:
+        snap = dict(_transport)
+    return jsonify(ok=True, transport=snap, ws_available=HAS_WSCLIENT)
+
+
+@app.post("/proxy/config/transport")
+def proxy_transport_set():
+    """Update the transport preference for one or more subsystems.
+    Body: {"rc":"http", "telemetry":"auto", "position":"ws"}
+
+    Valid values: "auto" (WS if up, HTTP fallback), "ws" (force WS),
+    "http" (force HTTP). Unknown subsystems / values are ignored.
+    """
+    global WS_RC_ENABLED
+    data = request.get_json(silent=True) or {}
+    allowed = {"auto", "ws", "http"}
+    changed = {}
+    with _transport_lock:
+        for subsys in ("rc", "telemetry", "position"):
+            v = data.get(subsys)
+            if v is None:
+                continue
+            v = str(v).lower()
+            if v in allowed:
+                _transport[subsys] = v
+                changed[subsys] = v
+        snap = dict(_transport)
+    WS_RC_ENABLED = snap["rc"] in ("auto", "ws")
+    log_command("transport_set", {"changed": changed, "active": snap})
+    print(f"[TRANSPORT] updated: {changed} → now {snap}")
+    return jsonify(ok=True, transport=snap, changed=changed)
 
 
 # ── Positioning subsystem proxy ───────────────────────────────────────────────
@@ -7552,13 +7720,14 @@ def proxy_aruco_fleet():
     # the real cause of the "500 timeout" and button-press delays (the fleet
     # poll was holding up Flask threads that other endpoints needed).
     need_http: list[tuple[str, str]] = []
+    pos_mode = _transport_mode("position")
     for did, info in DRONES.items():
         did = str(did)
         base = (info or {}).get("base")
         if not base:
             continue
-        # WS cache first
-        cli = drone_ws.get(did)
+        # WS cache first (unless position transport is forced to http)
+        cli = drone_ws.get(did) if pos_mode in ("auto", "ws") else None
         if cli is not None:
             pj, age = cli.latest_position()
             if pj is not None and age < 1.5:
@@ -7589,6 +7758,10 @@ def proxy_aruco_fleet():
             if all_down:
                 observers.setdefault(did, {"drone_id": did, "ws_all_down": True})
                 continue
+        # Position forced to ws-only: don't attempt HTTP.
+        if pos_mode == "ws":
+            observers.setdefault(did, {"drone_id": did, "ws_only": True})
+            continue
         need_http.append((did, base))
 
     def _fetch(did: str, base: str):
