@@ -1729,6 +1729,35 @@ HTML = """
       </label>
     </div>
 
+    <!-- ── Mission-as-code + presets ──────────────────────────────────
+         Every mission type has its own JSON parameter block. The
+         editor below is the canonical source of truth; the form
+         fields above auto-sync into it when you click "From form".
+         Presets are saved server-side in controller/mission_presets.json
+         so they survive server restarts and are shared across browser
+         tabs. -->
+    <div class=\"mis-row\" style=\"margin-top:8px;\">
+      <label style=\"color:#94a3b8;\">Preset:</label>
+      <select id=\"mis_preset_sel\" style=\"min-width:180px;\"></select>
+      <button id=\"mis_preset_load\" style=\"background:#1e293b;border-color:#475569;\" title=\"Load the selected preset's JSON into the editor\">Load</button>
+      <input id=\"mis_preset_name\" type=\"text\" placeholder=\"preset name\" style=\"width:140px;\" />
+      <button id=\"mis_preset_save\" style=\"background:#1e293b;border-color:#475569;\" title=\"Save the current JSON as a named preset (overwrites if name exists)\">Save</button>
+      <button id=\"mis_preset_delete\" style=\"background:#450a0a;border-color:#b91c1c;color:#fecaca;\" title=\"Delete the selected preset\">Delete</button>
+      <span id=\"mis_preset_status\" class=\"small\" style=\"color:#64748b;\"></span>
+    </div>
+    <div class=\"mis-row\">
+      <label style=\"color:#94a3b8;align-self:flex-start;\">Code (JSON):</label>
+      <textarea id=\"mis_code\" rows=\"10\" spellcheck=\"false\"
+                style=\"width:100%;max-width:680px;background:#0f172a;color:#e2e8f0;border:1px solid #334155;border-radius:4px;padding:6px;font-family:monospace;font-size:11px;line-height:1.4;\"
+                placeholder=\"JSON parameters for the selected mission…\"></textarea>
+    </div>
+    <div class=\"mis-row\">
+      <button id=\"mis_code_from_form\" style=\"background:#1e293b;border-color:#475569;\" title=\"Rebuild the JSON from the form fields above\">&#8689; From form</button>
+      <button id=\"mis_code_to_form\" style=\"background:#1e293b;border-color:#475569;\" title=\"Apply the JSON values to the form fields (where possible)\">&#8690; To form</button>
+      <button id=\"mis_code_run\" style=\"background:#065f46;border-color:#10b981;\" title=\"Parse the JSON and start the mission using those parameters — bypasses the form\">&#9654; Run from code</button>
+      <span id=\"mis_code_status\" class=\"small\" style=\"color:#64748b;\"></span>
+    </div>
+
     <div class=\"mis-row\" style=\"margin-top:8px;\">
       <button id=\"mis_start\" style=\"background:#065f46;border-color:#10b981;\">&#9654; Start mission</button>
       <button id=\"mis_stop\" style=\"background:#7f1d1d;border-color:#ef4444;\">&#9632; Stop</button>
@@ -2217,7 +2246,7 @@ HTML = """
     arcPoll();
     // Version marker — if this string doesn't appear in the DOM,
     // you're running stale JS (restart the Python server or hard-refresh).
-    const BUILD = 'bx-auto-latency-default-on';
+    const BUILD = 'by-mission-code-presets';
     console.log('[arc] init complete, build=' + BUILD);
     const ver = document.createElement('span');
     ver.id = 'arc_build_tag';
@@ -2530,6 +2559,209 @@ HTML = """
     }
     if (misTypeSel) { misTypeSel.addEventListener('change', syncMissionUI); syncMissionUI(); }
 
+    // ── Mission-as-code + preset management ─────────────────────────
+    // Each mission type has its own JSON block. The editor is the
+    // canonical source of truth: "Run from code" parses it and starts
+    // directly. "From form" rebuilds the JSON from the form fields so
+    // the editor stays in sync with traditional click-around editing.
+    // Presets are persisted server-side in mission_presets.json.
+    (function wireMissionCode(){
+      const code  = document.getElementById('mis_code');
+      const sel   = document.getElementById('mis_preset_sel');
+      const nameI = document.getElementById('mis_preset_name');
+      const psBtn = document.getElementById('mis_preset_save');
+      const pdBtn = document.getElementById('mis_preset_delete');
+      const plBtn = document.getElementById('mis_preset_load');
+      const ffBtn = document.getElementById('mis_code_from_form');
+      const tfBtn = document.getElementById('mis_code_to_form');
+      const runBtn = document.getElementById('mis_code_run');
+      const psStatus = document.getElementById('mis_preset_status');
+      const cStatus  = document.getElementById('mis_code_status');
+      if (!code) return;
+      let _presets = {};
+
+      function flash(el, msg, col) {
+        if (!el) return;
+        el.textContent = msg;
+        el.style.color = col || '#64748b';
+        setTimeout(() => { if (el.textContent === msg) el.textContent = ''; }, 3000);
+      }
+      function currentType() {
+        return (misTypeSel && misTypeSel.value) || 'scan_all';
+      }
+      function renderPresetList() {
+        if (!sel) return;
+        const t = currentType();
+        const names = Object.keys((_presets[t]) || {}).sort();
+        sel.innerHTML = '';
+        if (!names.length) {
+          const opt = document.createElement('option');
+          opt.value = ''; opt.textContent = '(no presets)';
+          sel.appendChild(opt);
+          return;
+        }
+        names.forEach(n => {
+          const opt = document.createElement('option');
+          opt.value = n; opt.textContent = n;
+          sel.appendChild(opt);
+        });
+        if (names.includes('default')) sel.value = 'default';
+      }
+      async function loadPresets() {
+        try {
+          const j = await (await fetch('/proxy/missions/presets')).json();
+          _presets = j.presets || {};
+          renderPresetList();
+          // Auto-populate the code editor with the default preset on first load
+          if (!code.value.trim()) loadIntoEditor('default');
+        } catch (e) { console.warn('[mis] preset load failed', e); }
+      }
+      function loadIntoEditor(name) {
+        const t = currentType();
+        const params = (_presets[t] || {})[name];
+        if (!params) return;
+        code.value = JSON.stringify(params, null, 2);
+        if (nameI) nameI.value = name;
+        flash(psStatus, '\u2713 loaded "' + name + '"', '#22c55e');
+      }
+      function buildFromForm() {
+        // Reuse the same logic as mis_start but return the payload
+        // instead of POSTing. Everything below mirrors the existing
+        // build in mis_start.
+        const drone_ids = misSelectedDroneIds();
+        const auto_takeoff = document.getElementById('mis_auto_takeoff').checked;
+        if (currentType() === 'capture_targets') {
+          let boxes = [];
+          try { boxes = JSON.parse(document.getElementById('mis_boxes_json').value); }
+          catch {}
+          return {
+            drone_ids, target_boxes: boxes,
+            home_xy: [
+              parseFloat(document.getElementById('mis_home_x').value) || 0,
+              parseFloat(document.getElementById('mis_home_y').value) || 0,
+            ],
+            arena_face_xy: [
+              parseFloat(document.getElementById('mis_face_x').value) || 0,
+              parseFloat(document.getElementById('mis_face_y').value) || 0,
+            ],
+            hover_above_m: parseFloat(document.getElementById('mis_alt').value) || 1.5,
+            hover_seconds: parseFloat(document.getElementById('mis_cap_hover_s').value) || 4.0,
+            auto_takeoff,
+          };
+        }
+        return {
+          drone_ids,
+          target_markers: document.getElementById('mis_markers').value,
+          hover_seconds: parseFloat(document.getElementById('mis_hover_s').value) || 3.0,
+          approach_tolerance_m: parseFloat(document.getElementById('mis_tol_m').value) || 0.30,
+          approach_skew_tol: parseFloat(document.getElementById('mis_skew_tol').value) || 0.12,
+          auto_takeoff,
+        };
+      }
+      function applyCodeToForm() {
+        try {
+          const p = JSON.parse(code.value);
+          if (currentType() === 'capture_targets') {
+            if (Array.isArray(p.target_boxes))
+              document.getElementById('mis_boxes_json').value = JSON.stringify(p.target_boxes, null, 2);
+            if (Array.isArray(p.home_xy)) {
+              document.getElementById('mis_home_x').value = p.home_xy[0];
+              document.getElementById('mis_home_y').value = p.home_xy[1];
+            }
+            if (Array.isArray(p.arena_face_xy)) {
+              document.getElementById('mis_face_x').value = p.arena_face_xy[0];
+              document.getElementById('mis_face_y').value = p.arena_face_xy[1];
+            }
+            if (p.hover_above_m != null) document.getElementById('mis_alt').value = p.hover_above_m;
+            if (p.hover_seconds != null) document.getElementById('mis_cap_hover_s').value = p.hover_seconds;
+          } else {
+            if (p.target_markers != null) document.getElementById('mis_markers').value = p.target_markers;
+            if (p.hover_seconds != null) document.getElementById('mis_hover_s').value = p.hover_seconds;
+            if (p.approach_tolerance_m != null) document.getElementById('mis_tol_m').value = p.approach_tolerance_m;
+            if (p.approach_skew_tol != null) document.getElementById('mis_skew_tol').value = p.approach_skew_tol;
+          }
+          if (typeof p.auto_takeoff === 'boolean')
+            document.getElementById('mis_auto_takeoff').checked = p.auto_takeoff;
+          flash(cStatus, '\u2713 form populated from JSON', '#22c55e');
+        } catch (e) { flash(cStatus, '\u2717 JSON parse error: ' + e.message, '#ef4444'); }
+      }
+      // Wire buttons
+      if (ffBtn) ffBtn.onclick = () => {
+        code.value = JSON.stringify(buildFromForm(), null, 2);
+        flash(cStatus, '\u2713 JSON rebuilt from form', '#22c55e');
+      };
+      if (tfBtn) tfBtn.onclick = applyCodeToForm;
+      if (plBtn) plBtn.onclick = () => { if (sel && sel.value) loadIntoEditor(sel.value); };
+      if (psBtn) psBtn.onclick = async () => {
+        const name = (nameI && nameI.value.trim()) || (sel && sel.value) || '';
+        if (!name) { flash(psStatus, '\u2717 enter a preset name', '#ef4444'); return; }
+        let params;
+        try { params = JSON.parse(code.value); }
+        catch (e) { flash(psStatus, '\u2717 invalid JSON: ' + e.message, '#ef4444'); return; }
+        try {
+          const r = await fetch('/proxy/missions/presets', {
+            method: 'POST',
+            headers: {'Content-Type':'application/json'},
+            body: JSON.stringify({
+              mission_type: currentType(), name, params,
+            }),
+          });
+          const j = await r.json();
+          if (j.ok) { flash(psStatus, '\u2713 saved "' + name + '"', '#22c55e'); await loadPresets(); }
+          else flash(psStatus, '\u2717 ' + (j.error || 'save failed'), '#ef4444');
+        } catch (e) { flash(psStatus, '\u2717 ' + e, '#ef4444'); }
+      };
+      if (pdBtn) pdBtn.onclick = async () => {
+        const name = (sel && sel.value) || '';
+        if (!name) return;
+        if (!confirm('Delete preset "' + name + '" for ' + currentType() + '?')) return;
+        try {
+          const u = '/proxy/missions/presets?mission_type=' + encodeURIComponent(currentType())
+                    + '&name=' + encodeURIComponent(name);
+          const r = await fetch(u, {method:'DELETE'});
+          const j = await r.json();
+          if (j.ok) { flash(psStatus, '\u2713 deleted "' + name + '"', '#22c55e'); await loadPresets(); }
+          else flash(psStatus, '\u2717 ' + (j.error || 'delete failed'), '#ef4444');
+        } catch (e) { flash(psStatus, '\u2717 ' + e, '#ef4444'); }
+      };
+      if (runBtn) runBtn.onclick = async () => {
+        let payload;
+        try { payload = JSON.parse(code.value); }
+        catch (e) { flash(cStatus, '\u2717 JSON parse error: ' + e.message, '#ef4444'); return; }
+        // Fill drone_ids from selector if JSON didn't provide any
+        if (!Array.isArray(payload.drone_ids) || !payload.drone_ids.length) {
+          payload.drone_ids = misSelectedDroneIds();
+        }
+        if (!payload.drone_ids || !payload.drone_ids.length) {
+          flash(cStatus, '\u2717 drone_ids missing — select drone(s) or include in JSON', '#ef4444');
+          return;
+        }
+        const endpoint = (currentType() === 'capture_targets')
+          ? '/proxy/missions/capture_targets/start'
+          : '/proxy/missions/scan_all/start';
+        try {
+          const r = await fetch(endpoint, {
+            method: 'POST',
+            headers: {'Content-Type':'application/json'},
+            body: JSON.stringify(payload),
+          });
+          const j = await r.json();
+          if (r.ok && j.ok) flash(cStatus, '\u2713 mission started', '#22c55e');
+          else flash(cStatus, '\u2717 ' + (j.error || j.message || ('HTTP ' + r.status)), '#ef4444');
+          misPoll();
+        } catch (e) { flash(cStatus, '\u2717 ' + e, '#ef4444'); }
+      };
+      // Re-render preset list when the user flips mission type
+      if (misTypeSel) misTypeSel.addEventListener('change', () => {
+        renderPresetList();
+        // Also auto-load the default preset of the new type so the
+        // editor shows something relevant instead of stale JSON.
+        const def = (_presets[currentType()] || {}).default;
+        if (def) code.value = JSON.stringify(def, null, 2);
+      });
+      loadPresets();
+    })();
+
     // Mission panel click counter — same idea as the ArUco one. Proves the
     // Start / Stop buttons receive the click event, independent of what
     // the server does with the request afterwards.
@@ -2684,6 +2916,20 @@ HTML = """
           <button id=\"pos_precision_apply\" class=\"pos-cfg\" style=\"height:26px;font-size:11px;padding:0 10px;\">Apply precision</button>
           <button id=\"pos_precision_reset\" class=\"pos-cfg\" style=\"height:26px;font-size:11px;padding:0 10px;background:#1e2a3a;\" title=\"Restore precision defaults\">Defaults</button>
           <span id=\"pos_precision_status\" class=\"small\" style=\"color:#64748b;\"></span>
+        </div>
+        <!-- ── Position-tracker presets ─────────────────────────────
+             Stored server-side in controller/position_presets.json.
+             Loading a preset fans out to every drone via
+             /proxy/position/config so the whole fleet gets the new
+             tuning in one click. -->
+        <div style=\"display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:6px;padding:6px;background:#0f172a;border:1px solid #1e293b;border-radius:4px;\">
+          <span class=\"small\" style=\"color:#4ade80;min-width:70px;font-weight:600;\">Presets:</span>
+          <select id=\"pos_preset_sel\" style=\"min-width:140px;height:22px;font-size:11px;\"></select>
+          <button id=\"pos_preset_apply\" style=\"height:22px;font-size:11px;padding:0 8px;background:#065f46;border-color:#10b981;color:#d1fae5;\" title=\"Apply the selected preset to every drone in the fleet\">Apply to fleet</button>
+          <input id=\"pos_preset_name\" type=\"text\" placeholder=\"preset name\" style=\"width:120px;height:22px;font-size:11px;\" />
+          <button id=\"pos_preset_save\" style=\"height:22px;font-size:11px;padding:0 8px;background:#1e293b;border-color:#475569;\" title=\"Save the current values as a named preset (overwrites if name exists)\">Save</button>
+          <button id=\"pos_preset_delete\" style=\"height:22px;font-size:11px;padding:0 8px;background:#450a0a;border-color:#b91c1c;color:#fecaca;\" title=\"Delete the selected preset\">Delete</button>
+          <span id=\"pos_preset_status\" class=\"small\" style=\"color:#64748b;\"></span>
         </div>
         <div style=\"display:flex;gap:8px;flex-wrap:wrap;align-items:center;\">
           <button id=\"pos_cfg_save\" class=\"pos-cfg\">Apply Config</button>
@@ -5414,6 +5660,123 @@ async function loadPosConfig() {
     }
     flash('defaults loaded — click Apply', '#94a3b8');
   };
+})();
+
+// ── Position-tracker preset management ─────────────────────────────
+// Mirrors the mission preset system. Apply fans out to every drone
+// via /proxy/position/config; Save gathers current UI values and
+// POSTs to /proxy/position/presets.
+(function wirePositionPresets(){
+  const sel   = document.getElementById('pos_preset_sel');
+  const aBtn  = document.getElementById('pos_preset_apply');
+  const sBtn  = document.getElementById('pos_preset_save');
+  const dBtn  = document.getElementById('pos_preset_delete');
+  const nameI = document.getElementById('pos_preset_name');
+  const status = document.getElementById('pos_preset_status');
+  if (!sel) return;
+  function flash(msg, col) {
+    if (!status) return;
+    status.textContent = msg;
+    status.style.color = col || '#64748b';
+    setTimeout(() => { if (status.textContent === msg) status.textContent = ''; }, 3000);
+  }
+  function readCurrentParams() {
+    // Gather everything live-tunable on the Position Tracker panel.
+    // The server accepts unknown keys gracefully; we send a superset.
+    const v = (id, parser) => {
+      const el = document.getElementById(id);
+      if (!el) return undefined;
+      const raw = el.value;
+      if (parser === 'float') { const f = parseFloat(raw); return isFinite(f) ? f : undefined; }
+      if (parser === 'int')   { const i = parseInt(raw, 10); return isFinite(i) ? i : undefined; }
+      if (parser === 'bool')  return !!el.checked;
+      return raw;
+    };
+    return {
+      detect_profile:        v('pos_profile'),
+      fov_deg:               v('pos_fov', 'float'),
+      imu_weight:            (v('pos_imu_weight', 'float') || 0) / 100.0,
+      latency_ms:            v('pos_latency', 'float'),
+      enable_kalman_filter:  v('pos_kalman', 'bool'),
+      marker_size_m:         v('pos_marker_size', 'float'),
+      top_k_markers:         v('pos_top_k', 'int'),
+      outlier_reject_m:      v('pos_outlier', 'float'),
+      pose_hold_sec:         v('pos_pose_hold', 'float'),
+      min_ref_count:         v('pos_min_refs', 'int'),
+      min_ref_weight:        v('pos_min_ref_w', 'float'),
+      meas_blend_min:        v('pos_blend_min', 'float'),
+      meas_blend_max:        v('pos_blend_max', 'float'),
+      vel_blend:             v('pos_vel_blend', 'float'),
+      max_state_dt:          v('pos_max_dt', 'float'),
+      kalman_process_var:    v('pos_kf_q', 'float'),
+      kalman_meas_var:       v('pos_kf_r', 'float'),
+      imu_lowpass_hz:        v('pos_imu_lpf', 'float'),
+    };
+  }
+  async function refresh() {
+    try {
+      const j = await (await fetch('/proxy/position/presets')).json();
+      const presets = j.presets || {};
+      const names = Object.keys(presets).sort();
+      sel.innerHTML = '';
+      if (!names.length) {
+        const opt = document.createElement('option');
+        opt.value = ''; opt.textContent = '(no presets)';
+        sel.appendChild(opt);
+      } else {
+        names.forEach(n => {
+          const opt = document.createElement('option');
+          opt.value = n; opt.textContent = n;
+          sel.appendChild(opt);
+        });
+        if (names.includes('balanced')) sel.value = 'balanced';
+      }
+    } catch {}
+  }
+  if (aBtn) aBtn.onclick = async () => {
+    const name = sel.value;
+    if (!name) { flash('no preset selected', '#ef4444'); return; }
+    try {
+      const r = await fetch('/proxy/position/presets/apply', {
+        method:'POST',
+        headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({name}),
+      });
+      const j = await r.json();
+      if (j.ok) {
+        flash('\u2713 "' + name + '" \u2192 ' + (j.applied_to || 0) + '/' + (j.total || 0) + ' drones', '#22c55e');
+        if (typeof loadPosConfig === 'function') loadPosConfig();   // pull fresh UI values
+      } else flash('\u2717 ' + (j.error || 'apply failed'), '#ef4444');
+    } catch (e) { flash('\u2717 ' + e, '#ef4444'); }
+  };
+  if (sBtn) sBtn.onclick = async () => {
+    const name = (nameI.value.trim()) || sel.value;
+    if (!name) { flash('enter a preset name', '#ef4444'); return; }
+    const params = readCurrentParams();
+    try {
+      const r = await fetch('/proxy/position/presets', {
+        method:'POST',
+        headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({name, params}),
+      });
+      const j = await r.json();
+      if (j.ok) { flash('\u2713 saved "' + name + '"', '#22c55e'); await refresh(); }
+      else flash('\u2717 ' + (j.error || 'save failed'), '#ef4444');
+    } catch (e) { flash('\u2717 ' + e, '#ef4444'); }
+  };
+  if (dBtn) dBtn.onclick = async () => {
+    const name = sel.value;
+    if (!name) return;
+    if (!confirm('Delete position preset "' + name + '"?')) return;
+    try {
+      const r = await fetch('/proxy/position/presets?name=' + encodeURIComponent(name),
+                             {method:'DELETE'});
+      const j = await r.json();
+      if (j.ok) { flash('\u2713 deleted', '#22c55e'); await refresh(); }
+      else flash('\u2717 ' + (j.error || 'delete failed'), '#ef4444');
+    } catch (e) { flash('\u2717 ' + e, '#ef4444'); }
+  };
+  refresh();
 })();
 
 // ── IMU LPF slider live-label + debounced apply ─────────────────────
@@ -8700,6 +9063,297 @@ def _parse_marker_list(raw) -> list[int]:
 @app.get("/proxy/missions/status")
 def proxy_missions_status():
     return jsonify(mission_manager.status())
+
+
+# ── Position-tracker presets ──────────────────────────────────────────
+# Mirror of the mission-preset system but for Position Tracker tuning.
+# Stored on the C2 (controller/position_presets.json) because:
+#   - presets should be shared across the whole fleet (one drone's
+#     position setup usually applies to all)
+#   - loading a preset fans out to every Pi via /proxy/position/config
+#   - C2 is the single authority for operator-facing config
+POSITION_PRESETS_PATH = Path(os.getenv(
+    "POSITION_PRESETS_PATH",
+    str(Path(__file__).with_name("position_presets.json"))))
+_position_presets_lock = threading.Lock()
+
+_POSITION_PRESETS_DEFAULTS: dict = {
+    "balanced": {
+        "detect_profile":     "balanced",
+        "fov_deg":             69,
+        "imu_weight":          0.30,
+        "latency_comp_s":      0.20,
+        "enable_kalman_filter": True,
+        "marker_size_m":       0.50,
+        "top_k_markers":       0,
+        "outlier_reject_m":    2.5,
+        "pose_hold_sec":       0.8,
+        "min_ref_count":       1,
+        "min_ref_weight":      0.0,
+        "meas_blend_min":      0.35,
+        "meas_blend_max":      0.85,
+        "vel_blend":           0.25,
+        "max_state_dt":        1.0,
+        "kalman_process_var":  1e-3,
+        "kalman_meas_var":     1e-1,
+        "imu_lowpass_hz":      5.0,
+        "seen_hold_s":         0.6,
+    },
+    "smooth": {
+        "detect_profile":     "balanced",
+        "fov_deg":             69,
+        "imu_weight":          0.50,
+        "enable_kalman_filter": True,
+        "kalman_process_var":  5e-4,
+        "kalman_meas_var":     2e-1,
+        "imu_lowpass_hz":      3.0,
+        "pose_hold_sec":       1.2,
+        "meas_blend_min":      0.20,
+        "meas_blend_max":      0.60,
+    },
+    "responsive": {
+        "detect_profile":     "sensitive",
+        "fov_deg":             69,
+        "imu_weight":          0.15,
+        "enable_kalman_filter": True,
+        "kalman_process_var":  5e-3,
+        "kalman_meas_var":     5e-2,
+        "imu_lowpass_hz":      15.0,
+        "pose_hold_sec":       0.4,
+        "meas_blend_min":      0.60,
+        "meas_blend_max":      0.95,
+    },
+}
+
+
+def _load_position_presets() -> dict:
+    with _position_presets_lock:
+        if not POSITION_PRESETS_PATH.exists():
+            try:
+                POSITION_PRESETS_PATH.parent.mkdir(parents=True, exist_ok=True)
+                POSITION_PRESETS_PATH.write_text(
+                    json.dumps(_POSITION_PRESETS_DEFAULTS, indent=2))
+            except Exception as e:
+                print(f"[PRESETS] position seed write failed: {e}")
+            return json.loads(json.dumps(_POSITION_PRESETS_DEFAULTS))
+        try:
+            return json.loads(POSITION_PRESETS_PATH.read_text())
+        except Exception as e:
+            print(f"[PRESETS] position load failed ({e}) — using defaults")
+            return json.loads(json.dumps(_POSITION_PRESETS_DEFAULTS))
+
+
+def _save_position_presets(data: dict):
+    with _position_presets_lock:
+        tmp = POSITION_PRESETS_PATH.with_suffix(".json.tmp")
+        POSITION_PRESETS_PATH.parent.mkdir(parents=True, exist_ok=True)
+        tmp.write_text(json.dumps(data, indent=2))
+        tmp.replace(POSITION_PRESETS_PATH)
+
+
+@app.get("/proxy/position/presets")
+def proxy_position_presets_list():
+    return jsonify(ok=True, presets=_load_position_presets(),
+                   path=str(POSITION_PRESETS_PATH))
+
+
+@app.post("/proxy/position/presets")
+def proxy_position_presets_save():
+    """Save a named preset. Body: {"name": "X", "params": {...}}"""
+    data = request.get_json(silent=True) or {}
+    name = str(data.get("name", "")).strip()
+    params = data.get("params")
+    if not name or not isinstance(params, dict):
+        return jsonify(ok=False, error="name + params required"), 400
+    presets = _load_position_presets()
+    presets[name] = params
+    try:
+        _save_position_presets(presets)
+    except Exception as e:
+        return jsonify(ok=False, error=f"save failed: {e}"), 500
+    log_command("position_preset_save", {"name": name})
+    return jsonify(ok=True, name=name)
+
+
+@app.delete("/proxy/position/presets")
+def proxy_position_presets_delete():
+    name = str(request.args.get("name", "")).strip()
+    if not name:
+        return jsonify(ok=False, error="name required"), 400
+    presets = _load_position_presets()
+    if name not in presets:
+        return jsonify(ok=False, error="preset not found"), 404
+    del presets[name]
+    try:
+        _save_position_presets(presets)
+    except Exception as e:
+        return jsonify(ok=False, error=f"save failed: {e}"), 500
+    log_command("position_preset_delete", {"name": name})
+    return jsonify(ok=True)
+
+
+@app.post("/proxy/position/presets/apply")
+def proxy_position_presets_apply():
+    """Load a preset and fan it out to every drone via /proxy/position/config.
+    Body: {"name": "..."} — any unknown keys in the preset are accepted
+    by the position config endpoint (it silently ignores unknown fields)."""
+    data = request.get_json(silent=True) or {}
+    name = str(data.get("name", "")).strip()
+    if not name:
+        return jsonify(ok=False, error="name required"), 400
+    presets = _load_position_presets()
+    params = presets.get(name)
+    if not isinstance(params, dict):
+        return jsonify(ok=False, error="preset not found"), 404
+    # Fan out to every drone's /api/position/config
+    results = {}
+    for did, info in DRONES.items():
+        base = (info or {}).get("base")
+        if not base:
+            results[str(did)] = {"ok": False, "error": "no base url"}
+            continue
+        try:
+            r = _http_session.post(f"{base.rstrip('/')}/api/position/config",
+                                   json=params, timeout=2.0)
+            results[str(did)] = r.json() if r.ok else {"ok": False, "status": r.status_code}
+        except Exception as e:
+            results[str(did)] = {"ok": False, "error": str(e)[:120]}
+    log_command("position_preset_apply", {"name": name})
+    ok_count = sum(1 for v in results.values() if v.get("ok"))
+    return jsonify(ok=True, name=name, applied_to=ok_count,
+                   total=len(results), results=results)
+
+
+# ── Mission presets ───────────────────────────────────────────────────
+# Each special-mission type has its own JSON parameter block. Operators
+# can edit it as code in the UI and save named presets here. Storage is
+# a single JSON file on the C2 (the mission runner lives here, not on
+# the FC), loaded lazily and written atomically on save/delete.
+MISSION_PRESETS_PATH = Path(os.getenv(
+    "MISSION_PRESETS_PATH",
+    str(Path(__file__).with_name("mission_presets.json"))))
+_mission_presets_lock = threading.Lock()
+
+
+# Built-in starter presets — so the editor never starts empty. Users
+# can override or delete them; they re-appear on missing-file.
+_MISSION_PRESETS_DEFAULTS: dict = {
+    "scan_all": {
+        "default": {
+            "drone_ids": ["1"],
+            "target_markers": "1-12",
+            "hover_seconds": 1.5,
+            "approach_tolerance_m": 0.30,
+            "approach_skew_tol": 0.12,
+            "approach_err_x_tol": 0.15,
+            "auto_takeoff": False,
+        },
+    },
+    "capture_targets": {
+        "default": {
+            "drone_ids": ["1"],
+            "target_boxes": [
+                {"id": 1, "x": -7.0, "y": 2.5, "home_team": "red"},
+                {"id": 2, "x": -5.0, "y": 5.4, "home_team": "red"},
+                {"id": 3, "x": -7.0, "y": 8.3, "home_team": "red"},
+                {"id": 4, "x":  7.0, "y": 2.5, "home_team": "blue"},
+                {"id": 5, "x":  5.0, "y": 5.4, "home_team": "blue"},
+                {"id": 6, "x":  7.0, "y": 8.3, "home_team": "blue"},
+            ],
+            "home_xy":        [0.0, 9.0],
+            "arena_face_xy":  [0.0, 5.4],
+            "hover_above_m":  1.5,
+            "hover_seconds":  4.0,
+            "nav_tol_xy_m":   0.3,
+            "auto_takeoff":   False,
+        },
+    },
+}
+
+
+def _load_mission_presets() -> dict:
+    """Load presets, seeding from defaults on first access."""
+    with _mission_presets_lock:
+        if not MISSION_PRESETS_PATH.exists():
+            try:
+                MISSION_PRESETS_PATH.parent.mkdir(parents=True, exist_ok=True)
+                MISSION_PRESETS_PATH.write_text(
+                    json.dumps(_MISSION_PRESETS_DEFAULTS, indent=2))
+            except Exception as e:
+                print(f"[PRESETS] seed write failed: {e}")
+            return json.loads(json.dumps(_MISSION_PRESETS_DEFAULTS))   # deep copy
+        try:
+            return json.loads(MISSION_PRESETS_PATH.read_text())
+        except Exception as e:
+            print(f"[PRESETS] load failed ({e}) — using in-memory defaults")
+            return json.loads(json.dumps(_MISSION_PRESETS_DEFAULTS))
+
+
+def _save_mission_presets(data: dict):
+    """Atomic write — avoids truncated file on crash mid-write."""
+    with _mission_presets_lock:
+        tmp = MISSION_PRESETS_PATH.with_suffix(".json.tmp")
+        MISSION_PRESETS_PATH.parent.mkdir(parents=True, exist_ok=True)
+        tmp.write_text(json.dumps(data, indent=2))
+        tmp.replace(MISSION_PRESETS_PATH)
+
+
+@app.get("/proxy/missions/presets")
+def proxy_mission_presets_list():
+    """Return all presets grouped by mission type."""
+    return jsonify(ok=True, presets=_load_mission_presets(),
+                   path=str(MISSION_PRESETS_PATH))
+
+
+@app.post("/proxy/missions/presets")
+def proxy_mission_presets_save():
+    """Create or overwrite a named preset.
+    Body: {"mission_type": "scan_all", "name": "tight-margin",
+           "params": {...}}"""
+    data = request.get_json(silent=True) or {}
+    mtype = str(data.get("mission_type", "")).strip()
+    name  = str(data.get("name", "")).strip()
+    params = data.get("params")
+    if not mtype or not name or not isinstance(params, dict):
+        return jsonify(ok=False, error="mission_type, name, params required"), 400
+    if mtype not in ("scan_all", "capture_targets"):
+        return jsonify(ok=False, error=f"unknown mission_type: {mtype}"), 400
+    # Minimal sanity checks per mission type — we don't want a broken
+    # preset to silently save.
+    if mtype == "scan_all":
+        if "target_markers" not in params:
+            return jsonify(ok=False, error="target_markers required for scan_all"), 400
+    if mtype == "capture_targets":
+        if not isinstance(params.get("target_boxes"), list):
+            return jsonify(ok=False, error="target_boxes (list) required for capture_targets"), 400
+    presets = _load_mission_presets()
+    presets.setdefault(mtype, {})[name] = params
+    try:
+        _save_mission_presets(presets)
+    except Exception as e:
+        return jsonify(ok=False, error=f"save failed: {e}"), 500
+    log_command("mission_preset_save", {"mission_type": mtype, "name": name})
+    return jsonify(ok=True, mission_type=mtype, name=name)
+
+
+@app.delete("/proxy/missions/presets")
+def proxy_mission_presets_delete():
+    """Delete a named preset. Query: ?mission_type=X&name=Y"""
+    mtype = str(request.args.get("mission_type", "")).strip()
+    name  = str(request.args.get("name", "")).strip()
+    if not mtype or not name:
+        return jsonify(ok=False, error="mission_type, name required"), 400
+    presets = _load_mission_presets()
+    bucket  = presets.get(mtype, {})
+    if name not in bucket:
+        return jsonify(ok=False, error="preset not found"), 404
+    del bucket[name]
+    try:
+        _save_mission_presets(presets)
+    except Exception as e:
+        return jsonify(ok=False, error=f"save failed: {e}"), 500
+    log_command("mission_preset_delete", {"mission_type": mtype, "name": name})
+    return jsonify(ok=True)
 
 
 @app.post("/proxy/missions/scan_all/start")
