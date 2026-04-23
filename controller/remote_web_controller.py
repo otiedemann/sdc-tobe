@@ -2139,7 +2139,7 @@ HTML = """
     arcPoll();
     // Version marker — if this string doesn't appear in the DOM,
     // you're running stale JS (restart the Python server or hard-refresh).
-    const BUILD = 'bq-reduce-poll-rate';
+    const BUILD = 'br-unified-poll';
     console.log('[arc] init complete, build=' + BUILD);
     const ver = document.createElement('span');
     ver.id = 'arc_build_tag';
@@ -3275,20 +3275,8 @@ async function resumeAllDrones(source) {
     resumeAllDrones('button').finally(() => { window._pauseInFlight = false; });
   });
 })();
-// Multi-tab sync — poll the server's pause flag every 2 s so all open
-// tabs reflect the same state. Fast enough that a pause from another
-// tab is near-instantly visible; slow enough not to hammer the API.
-(function syncPauseState(){
-  async function tick() {
-    try {
-      const r = await fetch('/proxy/pause_status');
-      const j = await r.json();
-      if (!!j.paused !== !!window._globalPaused) applyPauseUI(j.paused, j);
-    } catch {}
-  }
-  tick();
-  setInterval(tick, 5000);   // was 2s → 5s; pause state rarely changes
-})();
+// Pause state sync is now handled by the unified uiStatePoll() above.
+// Retained applyPauseUI() — it's called from there and from hotkey handlers.
 
 // ── Transport selector (per-subsystem WS ↔ HTTP) ──────────────────────
 // Populated from /proxy/config/transport on load + every time the
@@ -3364,55 +3352,56 @@ async function resumeAllDrones(source) {
   if (!el) return;
   async function tick() {
     try {
-      const r = await fetch('/proxy/ws/status', {cache:'no-store'});
-      const j = await r.json();
-      if (!j.available) {
-        el.style.background = '#7f1d1d';
-        el.style.color = '#fecaca';
-        el.textContent = 'WS off';
-        el.title = 'websocket-client not installed on C2 — falling back to HTTP';
-        return;
-      }
-      const did = String(window.activeDroneId || activeDroneId);
-      const st = (j.drones || {})[did];
-      if (!st) {
-        el.style.background = '#334155';
-        el.style.color = '#94a3b8';
-        el.textContent = 'WS —';
-        return;
-      }
-      const up = (st.telemetry ? 1 : 0) + (st.position ? 1 : 0) + (st.rc ? 1 : 0);
-      if (up === 3) {
-        // Amber if the most recent RC send was slow (TCP back-pressure);
-        // green only when everything is snappy.
-        const slowSend = (st.rc_send_ms != null && st.rc_send_ms > 50);
-        el.style.background = slowSend ? '#78350f' : '#064e3b';
-        el.style.color      = slowSend ? '#fde68a' : '#86efac';
-        const parts = [];
-        if (st.rc_send_ms     != null) parts.push('send ' + Math.round(st.rc_send_ms) + 'ms');
-        if (st.rc_rtt_ms      != null) parts.push('rtt ' + st.rc_rtt_ms + 'ms');
-        if (st.telemetry_age_ms != null) parts.push('tel ' + st.telemetry_age_ms + 'ms');
-        if (st.position_age_ms  != null) parts.push('pos ' + st.position_age_ms  + 'ms');
-        el.textContent = (slowSend ? 'WS \u26a0 ' : 'WS \u2713 ') + parts.join(' · ');
-      } else if (up > 0) {
-        el.style.background = '#78350f';
-        el.style.color = '#fde68a';
-        const flags = (st.telemetry?'T':'·') + (st.position?'P':'·') + (st.rc?'R':'·');
-        el.textContent = 'WS ' + flags;
-      } else {
-        el.style.background = '#7f1d1d';
-        el.style.color = '#fecaca';
-        el.textContent = 'WS down';
-      }
-      el.title = 'tel=' + st.telemetry + ' pos=' + st.position + ' rc=' + st.rc;
+      applyWs(await (await fetch('/proxy/ws/status', {cache:'no-store'})).json());
     } catch {
       el.style.background = '#334155';
       el.style.color = '#94a3b8';
       el.textContent = 'WS ?';
     }
   }
-  tick();
-  setInterval(tick, 2000);
+  // Exposed on window so the unified uiStatePoll() can drive it without
+  // the local timer firing separate /proxy/ws/status requests.
+  function applyWs(j) {
+    if (!j || !j.available) {
+      el.style.background = '#7f1d1d';
+      el.style.color = '#fecaca';
+      el.textContent = 'WS off';
+      el.title = 'websocket-client not installed on C2 — falling back to HTTP';
+      return;
+    }
+    const did = String(window.activeDroneId || activeDroneId);
+    const st = (j.drones || {})[did];
+    if (!st) {
+      el.style.background = '#334155';
+      el.style.color = '#94a3b8';
+      el.textContent = 'WS —';
+      return;
+    }
+    const up = (st.telemetry ? 1 : 0) + (st.position ? 1 : 0) + (st.rc ? 1 : 0);
+    if (up === 3) {
+      const slowSend = (st.rc_send_ms != null && st.rc_send_ms > 50);
+      el.style.background = slowSend ? '#78350f' : '#064e3b';
+      el.style.color      = slowSend ? '#fde68a' : '#86efac';
+      const parts = [];
+      if (st.rc_send_ms     != null) parts.push('send ' + Math.round(st.rc_send_ms) + 'ms');
+      if (st.rc_rtt_ms      != null) parts.push('rtt ' + st.rc_rtt_ms + 'ms');
+      if (st.telemetry_age_ms != null) parts.push('tel ' + st.telemetry_age_ms + 'ms');
+      if (st.position_age_ms  != null) parts.push('pos ' + st.position_age_ms  + 'ms');
+      el.textContent = (slowSend ? 'WS \u26a0 ' : 'WS \u2713 ') + parts.join(' · ');
+    } else if (up > 0) {
+      el.style.background = '#78350f';
+      el.style.color = '#fde68a';
+      const flags = (st.telemetry?'T':'·') + (st.position?'P':'·') + (st.rc?'R':'·');
+      el.textContent = 'WS ' + flags;
+    } else {
+      el.style.background = '#7f1d1d';
+      el.style.color = '#fecaca';
+      el.textContent = 'WS down';
+    }
+    el.title = 'tel=' + st.telemetry + ' pos=' + st.position + ' rc=' + st.rc;
+  }
+  window._applyWsStatus = applyWs;
+  tick();  // one-time initial fetch; steady state is pushed by uiStatePoll()
 })();
 
 // ── Flight Logs list ──────────────────────────────────────────────────
@@ -3472,23 +3461,27 @@ async function resumeAllDrones(source) {
   const btn = document.getElementById('ceiling_apply_btn');
   const badge = document.getElementById('ceiling_engaged_badge');
   const status = document.getElementById('ceiling_status');
+  function apply(j) {
+    if (!j) return;
+    if (typeof j.ceiling_m === 'number') {
+      if (document.activeElement !== inp) inp.value = Number(j.ceiling_m).toFixed(1);
+    }
+    if (badge) badge.style.display = j.engaged ? '' : 'none';
+    if (status) {
+      if (j.engaged && j.reasons && j.reasons.length) {
+        status.textContent = '\u26a0 ' + j.reasons[0];
+        status.style.color = '#fbbf24';
+      } else {
+        status.textContent = '';
+      }
+    }
+  }
+  // Exposed for the unified uiStatePoll — no local setInterval anymore.
+  window._applyCeilingStatus = apply;
   async function load() {
     try {
-      const r = await fetch('/proxy/config/ceiling', {cache:'no-store'});
-      const j = await r.json();
-      if (j && typeof j.ceiling_m === 'number') {
-        // Only update the input if the operator isn't currently editing it
-        if (document.activeElement !== inp) inp.value = Number(j.ceiling_m).toFixed(1);
-      }
-      if (badge) badge.style.display = j.engaged ? '' : 'none';
-      if (status) {
-        if (j.engaged && j.reasons && j.reasons.length) {
-          status.textContent = '\u26a0 ' + j.reasons[0];
-          status.style.color = '#fbbf24';
-        } else {
-          status.textContent = '';
-        }
-      }
+      const j = await (await fetch('/proxy/config/ceiling', {cache:'no-store'})).json();
+      apply(j);
     } catch {}
   }
   if (btn) btn.onclick = async () => {
@@ -3515,8 +3508,7 @@ async function resumeAllDrones(source) {
       status.style.color = '#ef4444';
     }
   };
-  load();
-  setInterval(load, 3000);   // was 1s — 3s; ceiling change is a rare event
+  load();   // one-time initial fetch; steady state pushed by uiStatePoll()
 })();
 
 // Fleet-wide panic land — used by the 'q' hotkey and the big red
@@ -3995,15 +3987,43 @@ async function refreshVideoStatus() {
 setInterval(refreshVideoStatus, 5000);
 
 // Heartbeat — keeps the drone watchdog alive so it doesn't auto-land
-async function sendHeartbeat(){
-  try { await fetch('/proxy/heartbeat', {cache:'no-store'}); } catch {}
+// ── UNIFIED STATUS POLL ─────────────────────────────────────────────
+// Replaces /proxy/heartbeat + /proxy/pause_status + /proxy/ws/status +
+// /proxy/config/ceiling + /proxy/config/transport + /proxy/missions/status
+// with ONE request at 1 Hz. The C2 aggregates them all locally (all are
+// in-memory dict reads) — this frees the browser's 6-connection pool so
+// CONTROL traffic (WASD, takeoff, rc) goes through without queueing.
+//
+// Control latency (keypress → drone) is completely unaffected: those go
+// via /proxy/key_down | key_up | key_batch which are NOT part of this
+// unified poll. Only the low-frequency UI bookkeeping lives here.
+let _uiPollSeq = 0;
+async function uiStatePoll(){
+  const mySeq = ++_uiPollSeq;
+  try {
+    const r = await fetch('/proxy/ui_state', {cache:'no-store'});
+    if (_uiPollSeq !== mySeq) return;   // a newer poll already fired
+    const j = await r.json();
+    // Distribute to the individual consumers
+    if (j.pause && typeof applyPauseUI === 'function') {
+      if (!!j.pause.paused !== !!window._globalPaused) applyPauseUI(j.pause.paused, j.pause);
+    }
+    if (j.ceiling && typeof window._applyCeilingStatus === 'function') {
+      window._applyCeilingStatus(j.ceiling);
+    }
+    if (j.ws && typeof window._applyWsStatus === 'function') {
+      window._applyWsStatus(j.ws);
+    }
+    if (j.transport && typeof window._applyTransportState === 'function') {
+      window._applyTransportState(j.transport);
+    }
+    if (j.missions && typeof window._applyMissionsStatus === 'function') {
+      window._applyMissionsStatus(j.missions);
+    }
+  } catch {}
 }
-// Heartbeat frequency: Pi's REMOTE_TIMEOUT_S defaults to 2s. Firing
-// every 750ms gives 1.25s safety margin while cutting browser→C2→5×Pi
-// traffic by ~40% compared to the old 500ms. If watchdog is re-tuned
-// lower than 1.5s, this needs to come back down.
-setInterval(sendHeartbeat, 750);
-sendHeartbeat();
+setInterval(uiStatePoll, 1000);
+uiStatePoll();
 
 // ── Telemetry SSE (replaces polling for near-real-time updates) ──
 let telEvtSource = null;
@@ -7529,6 +7549,118 @@ def proxy_telemetry():
         return (r.text, r.status_code, headers)
     except Exception as e:
         return jsonify(ok=False, error=str(e)), 502
+
+
+@app.get("/proxy/ui_state")
+def proxy_ui_state():
+    """Single consolidated poll — replaces the many 0.5-5Hz polls the UI
+    used to fire for tiny pieces of state (heartbeat, pause, ws_status,
+    ceiling, transport, mission status). All of them are cheap reads
+    of local C2 state; making them one request means the browser keeps
+    its 6 HTTP/1.1 connections free for real traffic (takeoff, key
+    events) instead of queueing behind 8 small polls.
+
+    Heartbeat to the Pi is STILL sent here so the Pi watchdog stays
+    happy — we reuse the existing parallel-ping logic.
+    """
+    out: dict = {}
+
+    # --- Pause state ---
+    with _pause_lock:
+        out["pause"] = {
+            "paused":  _global_paused,
+            "since":   _global_paused_at,
+            "source":  _global_paused_src,
+        }
+
+    # --- Ceiling (aggregated) ---
+    try:
+        ceilings = []
+        any_engaged = False
+        reasons = []
+        for did, info in DRONES.items():
+            base = (info or {}).get("base")
+            if not base: continue
+            cli = drone_ws.get(str(did)) if 'drone_ws' in globals() else None
+            if cli is not None:
+                all_down = (not cli._ws_connected.get("telemetry") and
+                            not cli._ws_connected.get("position") and
+                            not cli._ws_connected.get("rc"))
+                if all_down:
+                    continue
+            try:
+                r = _http_session.get(f"{base.rstrip('/')}/api/config/ceiling",
+                                       timeout=0.3)
+                if r.status_code == 200:
+                    j = r.json()
+                    if j.get("ceiling_m") is not None:
+                        ceilings.append(float(j["ceiling_m"]))
+                    if j.get("engaged"):
+                        any_engaged = True
+                        if j.get("reason"):
+                            reasons.append(f"{did}: {j['reason']}")
+            except Exception:
+                pass
+        out["ceiling"] = {
+            "ceiling_m": min(ceilings) if ceilings else None,
+            "engaged":   any_engaged,
+            "reasons":   reasons,
+        }
+    except Exception:
+        out["ceiling"] = {"ceiling_m": None, "engaged": False, "reasons": []}
+
+    # --- WS status (per drone) ---
+    try:
+        out["ws"] = {
+            "available": HAS_WSCLIENT,
+            "drones": {did: cli.status() for did, cli in drone_ws.items()},
+        }
+    except Exception:
+        out["ws"] = {"available": HAS_WSCLIENT, "drones": {}}
+
+    # --- Transport selector state ---
+    try:
+        with _transport_lock:
+            out["transport"] = dict(_transport)
+    except Exception:
+        out["transport"] = {}
+
+    # --- Missions ---
+    try:
+        out["missions"] = mission_manager.status()
+    except Exception:
+        out["missions"] = {}
+
+    # --- Heartbeat (fire-and-forget) — reuse the existing parallel map
+    # so we don't block on any single drone. Collapses 4-5 short
+    # request/response cycles into 1 C2→Pi fan-out cycle per tick.
+    def _ping(did_info):
+        did, info = did_info
+        try:
+            r = _http_session.get(f"{info['base']}/api/heartbeat", timeout=0.25)
+            return did, r.status_code
+        except Exception:
+            return did, "timeout"
+    live_items = []
+    for did, info in DRONES.items():
+        did_s = str(did)
+        cli = drone_ws.get(did_s) if 'drone_ws' in globals() else None
+        if cli is not None:
+            all_down = (not cli._ws_connected.get("telemetry") and
+                        not cli._ws_connected.get("position") and
+                        not cli._ws_connected.get("rc"))
+            if all_down:
+                continue
+        live_items.append((did, info))
+    if live_items:
+        try:
+            out["heartbeat"] = dict(_heartbeat_pool.map(_ping, live_items))
+        except Exception:
+            out["heartbeat"] = {}
+    else:
+        out["heartbeat"] = {}
+
+    return jsonify(ok=True, **out)
 
 
 @app.get("/proxy/diagnostics")
