@@ -473,6 +473,24 @@ except Exception as _e:
     HAS_WS = False
     print(f"[WS] flask-sock not available ({_e}) — WS endpoints disabled")
 
+# Grab simple-websocket's ConnectionClosed so we can silence the (very
+# chatty) "Connection closed: 1000" message on clean client disconnects.
+# 1000 is the RFC 6455 "normal closure" code — not an error condition.
+try:
+    from simple_websocket import ConnectionClosed as _WSConnectionClosed
+except Exception:
+    _WSConnectionClosed = None
+
+
+def _ws_is_clean_close(exc: Exception) -> bool:
+    """True if the exception represents a clean peer disconnect. We
+    treat these as info, not errors — otherwise every reconnect logs
+    a scary-looking stack trace."""
+    if _WSConnectionClosed is not None and isinstance(exc, _WSConnectionClosed):
+        return True
+    msg = str(exc)
+    return "Connection closed" in msg or "1000" in msg
+
 
 # Enum-aware JSON encoder. Olympe returns enum instances (class `band`,
 # `selection_type`, etc.) in its state dicts; Flask's stock encoder raises
@@ -4038,16 +4056,20 @@ def api_ceiling_set():
 # missing, the HTTP endpoints keep working unchanged.
 
 if HAS_WS:
-    _WS_PING_INTERVAL_S = 15.0    # keep NATs / firewalls happy
+    # Server-side heartbeat cadence. Short enough that the C2 client's
+    # recv timeout (8 s on telemetry/position pull loops) sees a ping
+    # before it gives up and reconnects — otherwise every 5–8 seconds
+    # of idle positions / telemetry caused a churn cycle.
+    _WS_PING_INTERVAL_S = 3.0
 
     @sock.route("/ws/telemetry")
     def ws_telemetry(ws):
         """Pushes one telemetry JSON per (1/TELEMETRY_HZ) seconds. Stops
         the moment the client disconnects. Wrapped in try/except because
-        the receiver can close mid-send and raises ConnectionError."""
+        the receiver can close mid-send and raises ConnectionClosed —
+        that's a clean close, not an error condition."""
         _ws_set_nodelay(ws)
         try:
-            # Hello packet lets the C2 check connectivity + read drone_type
             ws.send(json.dumps({
                 "type": "hello", "service": "telemetry",
                 "drone_type": drone_type, "hz": TELEMETRY_HZ,
@@ -4062,25 +4084,34 @@ if HAS_WS:
                 payload["server_ts"] = t0
                 try:
                     ws.send(json.dumps(payload, default=str))
-                except Exception:
-                    return
-                # Opportunistic ping to keep the NAT entry alive
+                except Exception as e:
+                    if _ws_is_clean_close(e):
+                        return
+                    raise
                 if t0 - last_ping > _WS_PING_INTERVAL_S:
                     try:
                         ws.send(json.dumps({"type": "ping", "server_ts": t0}))
-                    except Exception:
-                        return
-                    last_ping = t0
+                        last_ping = t0
+                    except Exception as e:
+                        if _ws_is_clean_close(e):
+                            return
+                        raise
                 dt = time.time() - t0
                 time.sleep(max(0.01, period - dt))
         except Exception as e:
-            print(f"[WS] /ws/telemetry error: {e}")
+            if not _ws_is_clean_close(e):
+                print(f"[WS] /ws/telemetry error: {e}")
 
     @sock.route("/ws/position")
     def ws_position(ws):
         """Pushes a payload on every position update. Piggybacks the
         existing broadcast queue (_pos_ws_queues) so there's zero extra
-        work in the positioner loop."""
+        work in the positioner loop.
+
+        Idle behaviour: the positioner only emits when detections arrive.
+        Between frames we send a heartbeat every _WS_PING_INTERVAL_S so
+        the client's recv never times out; otherwise a parked drone with
+        no detections produces a reconnect loop (see _ws_is_clean_close)."""
         _ws_set_nodelay(ws)
         q: queue.Queue = queue.Queue(maxsize=30)
         with _pos_sse_lock:
@@ -4093,17 +4124,28 @@ if HAS_WS:
             last_ping = time.time()
             while running:
                 try:
-                    msg = q.get(timeout=5.0)
+                    # Short queue timeout so we can issue heartbeats even
+                    # when the positioner is silent.
+                    msg = q.get(timeout=2.0)
                     ws.send(msg)
                 except queue.Empty:
                     now = time.time()
                     if now - last_ping > _WS_PING_INTERVAL_S:
-                        ws.send(json.dumps({"type": "ping", "server_ts": now}))
-                        last_ping = now
-                except Exception:
-                    return
+                        try:
+                            ws.send(json.dumps({"type": "ping", "server_ts": now}))
+                            last_ping = now
+                        except Exception as e:
+                            if _ws_is_clean_close(e):
+                                return
+                            raise
+                except Exception as e:
+                    # Clean peer close is expected — don't log as error.
+                    if _ws_is_clean_close(e):
+                        return
+                    raise
         except Exception as e:
-            print(f"[WS] /ws/position error: {e}")
+            if not _ws_is_clean_close(e):
+                print(f"[WS] /ws/position error: {e}")
         finally:
             with _pos_sse_lock:
                 try:
@@ -4185,7 +4227,8 @@ if HAS_WS:
                     except Exception:
                         return
         except Exception as e:
-            print(f"[WS] /ws/rc error: {e}")
+            if not _ws_is_clean_close(e):
+                print(f"[WS] /ws/rc error: {e}")
 
 
 # --- Telemetry endpoints ---

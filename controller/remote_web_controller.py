@@ -584,13 +584,18 @@ class DroneWS:
 
     def _rx_pull_loop(self, name: str, url: str, handler):
         """Generic pull loop — opens a WS, reads until it closes, marks
-        disconnected, retries with backoff."""
+        disconnected, retries with backoff.
+
+        recv timeout must be comfortably longer than the server's
+        _WS_PING_INTERVAL_S (currently 3 s) so idle channels don't
+        false-positive as dead links. 30 s gives ~10× headroom and
+        still catches real link losses in under a minute."""
         backoff = 1.0
         while self._running:
             try:
                 ws = _wsclient.create_connection(
                     url, timeout=4, sockopt=self._sockopt_low_latency())
-                ws.settimeout(8.0)     # receive timeout → detects dead links
+                ws.settimeout(30.0)
                 self._ws_connected[name] = True
                 backoff = 1.0          # reset on successful connect
                 while self._running:
@@ -611,9 +616,14 @@ class DroneWS:
                 try: ws.close()
                 except Exception: pass
             except Exception as e:
-                # Connect failed — sleep before retry
+                # Connect failed or mid-stream error. Silence the noisy
+                # "Connection closed: 1000" that fires on every normal
+                # peer disconnect (Pi restart, drone disconnect, etc.)
+                # — only print real problems.
                 if self._running:
-                    print(f"[WS] {self.drone_id} {name} reconnect: {e}")
+                    msg = str(e)
+                    if "1000" not in msg and "Connection closed" not in msg:
+                        print(f"[WS] {self.drone_id} {name} reconnect: {e}")
             finally:
                 self._ws_connected[name] = False
             if self._running:
@@ -1997,7 +2007,7 @@ HTML = """
     arcPoll();
     // Version marker — if this string doesn't appear in the DOM,
     // you're running stale JS (restart the Python server or hard-refresh).
-    const BUILD = 'bg-stacked-markers-3d-highlight';
+    const BUILD = 'bh-ws-clean-close';
     console.log('[arc] init complete, build=' + BUILD);
     const ver = document.createElement('span');
     ver.id = 'arc_build_tag';
