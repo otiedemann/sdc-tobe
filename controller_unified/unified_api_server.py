@@ -39,7 +39,11 @@ except ImportError:
 import json as _json
 
 # ---------------------------------------------------------------------------
-# Architecture detection — skip Olympe on Raspberry Pi (ARM)
+# Architecture detection. The SDC26 flight controller is an x86 Linux
+# box running Olympe + Anafi (NOT a Raspberry Pi — comments and module
+# names may still say "Pi" for historical reasons, but the host is x86).
+# The ARM / Tello-only fallback below is legacy for older deployments;
+# safe to leave in place, simply not exercised in the current fleet.
 # ---------------------------------------------------------------------------
 import platform
 
@@ -468,7 +472,9 @@ def detect_drone_type() -> Tuple[str, str]:
 
     print("[UNIFIED] Auto-detecting drone type...")
 
-    # On ARM (Raspberry Pi), only Tello is supported (no Olympe SDK)
+    # On ARM hosts only Tello is supported (no Olympe SDK). The
+    # current SDC26 flight controller is x86 Linux, so this branch
+    # is only hit on legacy setups.
     if IS_ARM:
         if _host_reachable(tello_ip):
             print(f"[UNIFIED] Tello detected at {tello_ip}")
