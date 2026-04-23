@@ -405,23 +405,47 @@ class FlightLogger:
         stem = f"flight_{ts}_drone-{did}_{name}"
         path = self.log_dir / f"{stem}.jsonl"
         fh = path.open("w", encoding="utf-8", buffering=1)  # line-buffered
-        # Kick off video recording on the Pi with a matching basename so
-        # the .mp4 and the .jsonl travel together. Annotated mode so the
-        # recording has the detected-marker overlay for post-flight
-        # review. No-op if the Pi isn't reachable — video is nice-to-have,
-        # the log is the essential record.
+        # Kick off video recording on the FC with a matching basename so the
+        # .mp4 and the .jsonl travel together. Annotated mode so the recording
+        # has the detected-marker overlay for post-flight review.
+        #
+        # IMPORTANT: the FC needs its MJPEG pipeline running BEFORE frames
+        # can flow into the recorder. /api/video/record/start now auto-starts
+        # MJPEG internally if it's off, but we also ping /api/video/start here
+        # so older FCs without the auto-start still record. No-op when the
+        # FC isn't reachable — video is nice-to-have, the log is the record.
         video_name = f"{stem}.mp4"
         video_started = False
+        video_err = None
         base = (self.drones.get(did, {}) or {}).get("base")
         if base:
+            # Step 1: ensure MJPEG is running (idempotent on the FC side).
+            try:
+                self.session.post(
+                    f"{base.rstrip('/')}/api/video/start",
+                    json={"mode": "mjpeg"},
+                    timeout=1.5,
+                )
+            except Exception as ve:
+                # Not fatal — record/start on a newer FC will self-start MJPEG.
+                print(f"[FLIGHT_LOG] video/start pre-roll failed (non-fatal): {ve}")
+            # Step 2: arm recording with the matched flight-log basename.
             try:
                 r = self.session.post(
                     f"{base.rstrip('/')}/api/video/record/start",
                     json={"filename": video_name, "raw": False},
-                    timeout=1.0,
+                    timeout=2.0,
                 )
-                video_started = r.ok and (r.json().get("ok") is True)
+                if r.ok:
+                    body = r.json() if r.content else {}
+                    if body.get("ok") is True:
+                        video_started = True
+                    else:
+                        video_err = body.get("error") or "record/start returned ok=false"
+                else:
+                    video_err = f"HTTP {r.status_code}"
             except Exception as e:
+                video_err = str(e)
                 print(f"[FLIGHT_LOG] video record start failed: {e}")
 
         header = {
@@ -437,8 +461,10 @@ class FlightLogger:
             "fh": fh, "path": path, "opened_at": time.time(), "records": 1,
             "stem": stem, "video_name": video_name if video_started else None,
         }
-        print(f"[FLIGHT_LOG] takeoff → {path}"
-              + (f"  + video → {video_name}" if video_started else "  (no video)"))
+        if video_started:
+            print(f"[FLIGHT_LOG] takeoff → {path}  + video → {video_name}")
+        else:
+            print(f"[FLIGHT_LOG] takeoff → {path}  (no video: {video_err or 'FC unreachable'})")
 
     def _close_unlocked(self, did: str, reason: str = "landed"):
         flt = self._flights.pop(did, None)
@@ -2300,7 +2326,7 @@ HTML = """
     arcPoll();
     // Version marker — if this string doesn't appear in the DOM,
     // you're running stale JS (restart the Python server or hard-refresh).
-    const BUILD = 'ce-fc-is-x86';
+    const BUILD = 'cf-auto-record-on-takeoff';
     console.log('[arc] init complete, build=' + BUILD);
     const ver = document.createElement('span');
     ver.id = 'arc_build_tag';
@@ -7728,27 +7754,24 @@ def proxy_land_all():
 
 
 def _collect_fleet_videos() -> dict:
-    """Gather the set of available recording filenames across all Pis.
+    """Gather the set of available recording filenames across all FCs.
     Key = filename (basename), value = {drone_id, size, mtime}. We only
     care about the flight-named ones (prefixed "flight_"). Other
     recordings from the manual Record button are ignored.
+
+    Note: we deliberately do NOT pre-filter by WS status — the WS channel
+    can be down while HTTP still works (fallback mode), and we want the
+    operator to be able to download videos in that case. A 0.6 s HTTP
+    timeout keeps the cost of a fully-offline drone low enough.
     """
     out: dict = {}
     for did, info in DRONES.items():
         base = (info or {}).get("base")
         if not base:
             continue
-        # Skip offline drones so we don't burn 1-2 s per poll on them.
-        cli = drone_ws.get(str(did)) if 'drone_ws' in globals() else None
-        if cli is not None:
-            all_down = (not cli._ws_connected.get("telemetry") and
-                        not cli._ws_connected.get("position") and
-                        not cli._ws_connected.get("rc"))
-            if all_down:
-                continue
         try:
             r = _http_session.get(f"{base.rstrip('/')}/api/video/recordings",
-                                   timeout=0.5)
+                                   timeout=0.6)
             if not r.ok:
                 continue
             for f in (r.json().get("files") or []):

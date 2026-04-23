@@ -3851,6 +3851,31 @@ def api_key_batch():
     return jsonify(ok=True, n=len(keys))
 
 
+def _auto_record_after_takeoff(grace_s: float = 2.5):
+    """Background one-shot: wait `grace_s` for the C2-side FlightLogger to
+    start its own (matched-name) recording; if nothing is recording by then,
+    start a fallback recording with a default timestamp filename. Ensures
+    every flight leaves a video on disk even without a C2 in the loop.
+    """
+    try:
+        time.sleep(grace_s)
+        if not flying:
+            return  # already landed in the grace window
+        with _rec_lock:
+            already = _rec_enabled
+        if already:
+            return  # C2 FlightLogger (or someone else) won the race — good
+        ts = time.strftime("%Y-%m-%d_%H-%M-%S", time.localtime())
+        fname = f"flight_{ts}_auto.mp4"
+        ok, payload = _start_recording_internal(fname=fname, raw=False)
+        if ok:
+            print(f"[REC] Auto-record fallback triggered after takeoff: {fname}")
+        else:
+            print(f"[REC] Auto-record fallback skipped: {payload}")
+    except Exception as e:
+        print(f"[REC] Auto-record fallback error: {e}")
+
+
 @app.post("/api/takeoff")
 def api_takeoff():
     global flying, takeoff_cooldown_until
@@ -3869,6 +3894,18 @@ def api_takeoff():
             if ok:
                 flying = True
                 takeoff_cooldown_until = time.time() + hold_s
+                # Belt-and-braces: ensure every flight is recorded. The C2
+                # FlightLogger normally fires /api/video/record/start with a
+                # matched-name mp4 within ~1 s of seeing flying=True; this
+                # thread is the fallback for C2-less operation.
+                try:
+                    threading.Thread(
+                        target=_auto_record_after_takeoff,
+                        kwargs={"grace_s": 2.5},
+                        daemon=True, name="auto-record",
+                    ).start()
+                except Exception as te:
+                    print(f"[REC] Could not spawn auto-record thread: {te}")
             else:
                 print(f"[{drone_type.upper()}] Takeoff returned ok=False msg={msg}")
                 return jsonify(ok=False, error=msg), 500
@@ -3906,6 +3943,15 @@ def api_land():
         b.after_discrete_command()
         if ok:
             flying = False
+            # Close any auto-started recording so its mp4 is properly
+            # finalised on disk. If C2's FlightLogger is the one driving
+            # recording it will call /api/video/record/stop itself; doing
+            # it here as well is idempotent (the second call returns
+            # ok=False "not recording", which we ignore).
+            try:
+                _stop_recording_internal(reason="land")
+            except Exception as se:
+                print(f"[REC] Auto-stop on land failed: {se}")
             return jsonify(ok=True, flying=False)
         print(f"[{drone_type.upper()}] Land returned ok=False msg={msg}")
         return jsonify(ok=False, error=msg), 500
@@ -5296,18 +5342,49 @@ def api_rec_status():
         return jsonify(ok=True, recording=_rec_enabled, raw=_rec_raw, path=_rec_path, frames=_rec_frame_count)
 
 
-@app.post("/api/video/record/start")
-def api_rec_start():
+def _ensure_mjpeg_streaming(reason: str = "recording") -> tuple[bool, str]:
+    """Make sure the MJPEG video pipeline is actively streaming so that the
+    video callback fires and feeds _pos_frame_q. Without this, `_rec_enabled`
+    flips to True but no frames ever arrive → VideoWriter never gets created
+    → the mp4 file is never written (the old "no video" bug).
+
+    Idempotent — safe to call whether or not the stream is already running.
+    """
+    global _video_mode
+    b = backend
+    if b is None:
+        return False, "backend not ready"
+    if _video_streaming and _video_mode == "mjpeg":
+        return True, "already streaming"
+    try:
+        ok, msg = b.video_start_mjpeg()
+        if ok:
+            _video_mode = "mjpeg"
+            print(f"[REC] Auto-started MJPEG pipeline for {reason}")
+            return True, msg
+        print(f"[REC] Auto-start MJPEG failed ({reason}): {msg}")
+        return False, msg
+    except Exception as e:
+        print(f"[REC] Auto-start MJPEG exception ({reason}): {e}")
+        return False, str(e)
+
+
+def _start_recording_internal(fname: str | None, raw: bool) -> tuple[bool, dict]:
+    """Internal helper shared by /api/video/record/start and the post-takeoff
+    auto-record fallback. Arms recording (deferred writer) and ensures the
+    MJPEG pipeline is running so frames actually flow.
+
+    Returns (ok, payload). On conflict (already recording) ok=False with
+    error='already recording' and the current path.
+    """
     global _rec_enabled, _rec_raw, _rec_writer, _rec_path, _rec_frame_count
     global _rec_fname, _rec_fps_target, _rec_writer_size
-    data = request.get_json(silent=True) or {}
     with _rec_lock:
         if _rec_enabled:
-            return jsonify(ok=False, error="already recording", path=_rec_path)
-        raw_mode = bool(data.get("raw", False))
+            return False, {"error": "already recording", "path": _rec_path}
+        raw_mode = bool(raw)
         suffix = "_raw" if raw_mode else "_ann"
-        fname = data.get("filename") or f"rec{suffix}_{int(time.time())}.mp4"
-        # Ensure recordings dir exists
+        fname = fname or f"rec{suffix}_{int(time.time())}.mp4"
         rec_dir = Path(__file__).parent / "recordings"
         rec_dir.mkdir(exist_ok=True)
         full_path = str(rec_dir / fname)
@@ -5324,15 +5401,33 @@ def api_rec_start():
         _rec_fps_target = float(_pos_fps_current or 5.0)
         _rec_enabled = True
         print(f"[REC] Recording armed ({'raw' if raw_mode else 'annotated'}): {full_path} — waiting for first frame")
-        return jsonify(ok=True, path=full_path)
+    # Kick the MJPEG pipeline AFTER releasing the rec lock to avoid any
+    # lock-ordering surprises with the video callback.
+    mjpeg_ok, mjpeg_msg = _ensure_mjpeg_streaming(reason="record/start")
+    return True, {"path": full_path, "mjpeg_ok": mjpeg_ok, "mjpeg_msg": mjpeg_msg}
 
 
-@app.post("/api/video/record/stop")
-def api_rec_stop():
+@app.post("/api/video/record/start")
+def api_rec_start():
+    data = request.get_json(silent=True) or {}
+    ok, payload = _start_recording_internal(
+        fname=data.get("filename"),
+        raw=bool(data.get("raw", False)),
+    )
+    if not ok:
+        return jsonify(ok=False, **payload)
+    return jsonify(ok=True, **payload)
+
+
+def _stop_recording_internal(reason: str = "manual") -> tuple[bool, dict]:
+    """Internal helper shared by /api/video/record/stop and the auto-stop
+    on land. Returns (ok, payload). Idempotent — returns ok=False with
+    'not recording' if nothing is active.
+    """
     global _rec_enabled, _rec_writer, _rec_path, _rec_frame_count
     with _rec_lock:
         if not _rec_enabled:
-            return jsonify(ok=False, error="not recording")
+            return False, {"error": "not recording"}
         _rec_enabled = False
         frames = _rec_frame_count
         path = _rec_path
@@ -5342,8 +5437,16 @@ def api_rec_stop():
                 _rec_writer = None
         except Exception:
             pass
-        print(f"[REC] Recording stopped: {path} ({frames} frames)")
-    return jsonify(ok=True, path=path, frames=frames)
+        print(f"[REC] Recording stopped ({reason}): {path} ({frames} frames)")
+    return True, {"path": path, "frames": frames}
+
+
+@app.post("/api/video/record/stop")
+def api_rec_stop():
+    ok, payload = _stop_recording_internal(reason="api")
+    if not ok:
+        return jsonify(ok=False, **payload)
+    return jsonify(ok=True, **payload)
 
 
 @app.get("/api/video/recordings")
@@ -5664,7 +5767,7 @@ def main():
     print(f"[{tag}] Unified API server: http://{HTTP_HOST}:{HTTP_PORT}")
     print(f"[{tag}] Drone: {drone_type} @ {drone_ip} (auto-reconnect; watchdog={REMOTE_TIMEOUT_S}s)")
     print(f"[{tag}] SDKs available: tello={HAS_TELLO_SDK}, olympe={HAS_OLYMPE_SDK}")
-    print(f"[{tag}] Code version: 2026-04-23-bz (pi-side-arena-guard + safety-hotkey-priority)")
+    print(f"[{tag}] Code version: 2026-04-23-ca (auto-record-on-takeoff + mjpeg-self-start)")
     app.run(host=HTTP_HOST, port=HTTP_PORT, threaded=True, use_reloader=False)
 
 
