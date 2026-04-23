@@ -3825,6 +3825,26 @@ def api_key_up():
     return jsonify(ok=True)
 
 
+@app.post("/api/key_batch")
+def api_key_batch():
+    """Refresh a batch of held keys in a single request.
+
+    Replaces the pattern where the C2 used to fire N separate POSTs —
+    one per held key — every 100 ms. At 3 held keys × 10 Hz that was
+    30 HTTP requests/sec just for key-holding, and it saturated the
+    browser's 6-connection pool whenever a WS fallback was in play.
+    Body: {"keys": ["w", "a"]}
+    """
+    data = request.get_json(silent=True) or {}
+    keys = data.get("keys", [])
+    if not isinstance(keys, list):
+        return jsonify(ok=False, error="keys must be a list"), 400
+    for k in keys:
+        if k:
+            add_key(str(k))
+    return jsonify(ok=True, n=len(keys))
+
+
 @app.post("/api/takeoff")
 def api_takeoff():
     global flying, takeoff_cooldown_until

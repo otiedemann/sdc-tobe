@@ -2256,7 +2256,7 @@ HTML = """
     arcPoll();
     // Version marker — if this string doesn't appear in the DOM,
     // you're running stale JS (restart the Python server or hard-refresh).
-    const BUILD = 'bz-arena-guard-pi-side';
+    const BUILD = 'ca-safety-viz-batch-key';
     console.log('[arc] init complete, build=' + BUILD);
     const ver = document.createElement('span');
     ver.id = 'arc_build_tag';
@@ -2840,6 +2840,14 @@ HTML = """
         Ax:&nbsp;<span id=\"tel_ax\">—</span>&nbsp;
         Ay:&nbsp;<span id=\"tel_ay\">—</span>&nbsp;
         Az:&nbsp;<span id=\"tel_az\">—</span>&nbsp;cm/s²
+      </div>
+      <!-- Safety distance readout — shows how far the active drone is from
+           the nearest safety boundary. Green when inside the safe zone,
+           amber when approaching, red when outside the margin. Updated on
+           every SSE position event. -->
+      <div class=\"small\" style=\"margin-top:2px;font-family:monospace;\">
+        <span style=\"color:#94a3b8;\">Safety:</span>
+        <span id=\"pos_safety_readout\" style=\"color:#64748b;\">—</span>
       </div>
       <div class=\"pos-cfg\">
         <div style=\"display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:6px;\">
@@ -3824,11 +3832,47 @@ async function resumeAllDrones(source) {
       if (inp && a.margin_m != null && document.activeElement !== inp)
         inp.value = Number(a.margin_m).toFixed(1);
       if (badge) badge.style.display = a.engaged ? '' : 'none';
+      // Cache on window so drawArena + 3D + position readout can render
+      // the dashed safety boundary + distance-to-wall readout.
+      window._arenaSafety = {
+        enabled:  !!a.enabled,
+        margin_m: a.margin_m,
+        engaged:  !!a.engaged,
+        reasons:  a.reasons || [],
+      };
+      // Redraw the 2D arena so the updated margin rectangle appears
+      // even if no fresh position event has arrived (e.g. operator
+      // changed the margin value while the drone is stationary).
+      if (typeof drawArena === 'function') drawArena();
+      // Update the 3D highlight too — safety overlay mesh refresh
+      if (window._arena3d && window._arena3d.updateSafetyMargin) {
+        window._arena3d.updateSafetyMargin(a.margin_m, !!a.engaged);
+      }
     } catch {}
   }
+  // Initial load only — subsequent updates ride on the unified 1Hz
+  // /proxy/ui_state poll (see uiStatePoll). Avoids adding another
+  // per-2s fetch cycle that would compete with the browser's 6-
+  // connection HTTP/1.1 pool alongside keydown/batch traffic.
   load();
-  // Poll every 2s so the "ARENA GUARD ENGAGED" badge reflects live state.
-  setInterval(load, 2000);
+  // Expose for the unified poller
+  window._applyArenaSafety = (a) => {
+    if (!a) return;
+    if (arenaTog && typeof a.enabled !== 'undefined') arenaTog.checked = !!a.enabled;
+    if (inp && a.margin_m != null && document.activeElement !== inp)
+      inp.value = Number(a.margin_m).toFixed(1);
+    if (badge) badge.style.display = a.engaged ? '' : 'none';
+    window._arenaSafety = {
+      enabled:  !!a.enabled,
+      margin_m: a.margin_m,
+      engaged:  !!a.engaged,
+      reasons:  a.reasons || [],
+    };
+    if (typeof drawArena === 'function') drawArena();
+    if (window._arena3d && window._arena3d.updateSafetyMargin) {
+      window._arena3d.updateSafetyMargin(a.margin_m, !!a.engaged);
+    }
+  };
 
   if (axisTog) axisTog.addEventListener('change', async () => {
     try {
@@ -4444,6 +4488,9 @@ async function uiStatePoll(){
     }
     if (j.ceiling && typeof window._applyCeilingStatus === 'function') {
       window._applyCeilingStatus(j.ceiling);
+    }
+    if (j.arena_safety && typeof window._applyArenaSafety === 'function') {
+      window._applyArenaSafety(j.arena_safety);
     }
     if (j.ws && typeof window._applyWsStatus === 'function') {
       window._applyWsStatus(j.ws);
@@ -5145,6 +5192,42 @@ function drawArena(pos, compPos, dir) {
   ctx.strokeStyle = '#475569'; ctx.lineWidth = 2;
   ctx.strokeRect(ax0, ay0, ax1 - ax0, ay1 - ay0);
 
+  // ── Safety margin rectangle ────────────────────────────────────
+  // Draws the Pi-side arena guard's inner boundary as a dashed red
+  // outline and shades the restricted zone (between the outline and
+  // the arena wall) with a faint red tint. The drone is not allowed
+  // to cross the inner boundary during autonomous flight OR manual
+  // flight (when the guard is ON). Value comes from the last
+  // /proxy/config/arena_safety poll, cached in window._arenaSafety.
+  (function drawSafetyMargin() {
+    const sa = window._arenaSafety || {};
+    const margin = (typeof sa.margin_m === 'number' && sa.margin_m > 0)
+                     ? sa.margin_m : null;
+    if (margin == null) return;
+    // Inner boundary rectangle — arena bounds minus margin.
+    const [sx0, sy0] = arenaToCanvas(arenaOX + margin, arenaOY + arenaD - margin);
+    const [sx1, sy1] = arenaToCanvas(arenaOX + arenaW - margin, arenaOY + margin);
+    // Faint red shading in the restricted band (between margin and wall).
+    // We paint four rectangles: top/bottom/left/right edges.
+    ctx.fillStyle = 'rgba(239,68,68,0.08)';
+    ctx.fillRect(ax0, ay0, ax1 - ax0, sy0 - ay0);                  // top (y=max zone)
+    ctx.fillRect(ax0, sy1, ax1 - ax0, ay1 - sy1);                  // bottom
+    ctx.fillRect(ax0, sy0, sx0 - ax0, sy1 - sy0);                  // left
+    ctx.fillRect(sx1, sy0, ax1 - sx1, sy1 - sy0);                  // right
+    // Dashed inner boundary — brighter if the guard is currently engaged.
+    ctx.save();
+    ctx.setLineDash([6, 4]);
+    ctx.lineWidth = sa.engaged ? 2 : 1.5;
+    ctx.strokeStyle = sa.engaged ? '#ef4444' : '#f87171';
+    ctx.strokeRect(sx0, sy0, sx1 - sx0, sy1 - sy0);
+    ctx.restore();
+    // Tiny label so operators know what the dashed rect means
+    ctx.font = '9px monospace';
+    ctx.fillStyle = '#fca5a5';
+    ctx.textAlign = 'left';
+    ctx.fillText('safe @ -' + margin.toFixed(1) + 'm', sx0 + 4, sy0 + 11);
+  })();
+
   // Outer view border
   ctx.strokeStyle = '#1e293b'; ctx.lineWidth = 1;
   ctx.strokeRect(PAD, PAD, W - 2*PAD, H - 2*PAD);
@@ -5525,6 +5608,67 @@ function updatePosUI(d) {
   const spd = vel ? Math.sqrt((vel[0]||0)**2 + (vel[1]||0)**2).toFixed(2) : '\\u2014';
   document.getElementById('pos_vel').textContent = spd + ' m/s';
   document.getElementById('pos_refs').textContent = d.ref_markers ? d.ref_markers.length : '\\u2014';
+
+  // ── Safety distance readout ───────────────────────────────────────
+  // How close is the drone to the nearest safety boundary? Green =
+  // safe zone with margin; amber = within 30 cm of the boundary; red
+  // = past the margin (i.e. inside the restricted band between the
+  // dashed safety line and the arena wall).
+  (function updateSafetyReadout() {
+    const el = document.getElementById('pos_safety_readout');
+    if (!el) return;
+    const sa = window._arenaSafety || {};
+    if (!sa.enabled) {
+      el.textContent = 'guard OFF — operator owns boundaries';
+      el.style.color = '#fbbf24';
+      return;
+    }
+    if (sa.margin_m == null || !Array.isArray(pos) || pos.length < 2) {
+      el.textContent = '—';
+      el.style.color = '#64748b';
+      return;
+    }
+    const m = sa.margin_m;
+    const x = Number(pos[0]), y = Number(pos[1]);
+    // Distance to nearest wall, then distance to the SAFE inner boundary.
+    // Negative value = drone is inside the restricted band (past the margin).
+    const dWall = Math.min(
+      (arenaOX + arenaW) - x,      // right wall
+      x - arenaOX,                  // left wall
+      (arenaOY + arenaD) - y,      // back wall (y_max)
+      y - arenaOY,                  // front wall (y_min)
+    );
+    const dSafe = dWall - m;        // metres from safe boundary
+    const wallNames = {
+      xr: (arenaOX + arenaW) - x,
+      xl: x - arenaOX,
+      yb: (arenaOY + arenaD) - y,
+      yf: y - arenaOY,
+    };
+    let closest = 'right';
+    let closestD = wallNames.xr;
+    if (wallNames.xl < closestD) { closest = 'left';  closestD = wallNames.xl; }
+    if (wallNames.yb < closestD) { closest = 'back';  closestD = wallNames.yb; }
+    if (wallNames.yf < closestD) { closest = 'front'; closestD = wallNames.yf; }
+
+    if (dSafe < 0) {
+      // Inside restricted band — or worse, outside arena.
+      el.textContent = '\u26a0 RESTRICTED — ' + Math.abs(dSafe).toFixed(2) +
+                        ' m past ' + closest + ' margin  (wall ' +
+                        closestD.toFixed(2) + ' m away)';
+      el.style.color = '#ef4444';
+    } else if (dSafe < 0.3) {
+      el.textContent = '\u26a1 approaching ' + closest + ' — ' +
+                        dSafe.toFixed(2) + ' m to margin  (' +
+                        closestD.toFixed(2) + ' m to wall)';
+      el.style.color = '#fbbf24';
+    } else {
+      el.textContent = '\u2713 safe — ' + dSafe.toFixed(2) +
+                        ' m to ' + closest + ' margin  (' +
+                        closestD.toFixed(2) + ' m to wall)';
+      el.style.color = '#22c55e';
+    }
+  })();
   document.getElementById('pos_fps').textContent = d.fps != null ? d.fps : '\\u2014';
   document.getElementById('pos_stale').style.display = d.stale ? '' : 'none';
 
@@ -6973,8 +7117,51 @@ let ARENA_W_dyn = 20, ARENA_D_dyn = 10;
     el.innerHTML = lines.join('<br/>');
   }
 
+  // ── Safety-margin box in the 3D arena ─────────────────────────────
+  // A translucent red wireframe cuboid indicating the Pi-side arena
+  // guard boundary. Created lazily the first time updateSafetyMargin
+  // is called; subsequent calls just rescale it.
+  let safetyBoxMesh = null;
+  function updateSafetyMargin(marginM, engaged) {
+    if (!scene) return;
+    if (marginM == null || marginM <= 0) {
+      if (safetyBoxMesh) { scene.remove(safetyBoxMesh); safetyBoxMesh = null; }
+      return;
+    }
+    // Dimensions: arena minus 2×margin on each horizontal axis; height
+    // matches the ceiling (MAX_ALTITUDE_M comes from the safety bar).
+    const w = Math.max(0.2, ARENA_W - 2 * marginM);
+    const d = Math.max(0.2, ARENA_D - 2 * marginM);
+    const ceilM = (window._arenaSafety && window._arenaSafety.ceiling_m)
+                    || parseFloat((document.getElementById('ceiling_input') || {}).value)
+                    || 5.0;
+    const h = Math.max(0.5, ceilM);
+    if (!safetyBoxMesh) {
+      const geom = new THREE.BoxGeometry(w, h, d);
+      const edges = new THREE.EdgesGeometry(geom);
+      const mat = new THREE.LineBasicMaterial({
+        color: 0xef4444, transparent: true, opacity: 0.35,
+      });
+      safetyBoxMesh = new THREE.LineSegments(edges, mat);
+      scene.add(safetyBoxMesh);
+    } else {
+      // Rebuild geometry on dimension change — simpler than scaling.
+      safetyBoxMesh.geometry.dispose();
+      const geom = new THREE.BoxGeometry(w, h, d);
+      safetyBoxMesh.geometry = new THREE.EdgesGeometry(geom);
+    }
+    // Centre of arena: x=0, depth=arena_depth/2, y=height/2.
+    safetyBoxMesh.position.set(0, h / 2, ARENA_D / 2);
+    // Brighter + thicker line when guard is actively clamping.
+    if (safetyBoxMesh.material) {
+      safetyBoxMesh.material.opacity = engaged ? 0.85 : 0.35;
+      safetyBoxMesh.material.color.setHex(engaged ? 0xfca5a5 : 0xef4444);
+    }
+  }
+
   // Expose for fleetPoll()
-  window._arena3d = {updateDrones, syncTargetBoxes, updateVisibleMarkers, updateDronePositionHUD};
+  window._arena3d = {updateDrones, syncTargetBoxes, updateVisibleMarkers,
+                     updateDronePositionHUD, updateSafetyMargin};
 
   // Toggle wiring — 3D view is shown BY DEFAULT below the 2D canvas.
   // The 2D canvas stays visible the whole time so operators have the
@@ -7324,16 +7511,15 @@ def proxy_key_batch():
                            via="ws"), 503
 
     log_command("key_batch", {"keys": uniq, "via": "http"})
-    last_r = None
+    # SINGLE HTTP POST to the Pi's batch endpoint — was N serial
+    # per-key calls previously, which saturated the browser's
+    # 6-connection pool whenever WS fell back to HTTP.
     try:
-        for k in uniq:
-            last_r = pi_post("/api/key_down", {"key": k}, timeout=TIMEOUT_FAST)
+        r = pi_post("/api/key_batch", {"keys": uniq}, timeout=TIMEOUT_FAST)
+        return (r.text, r.status_code,
+                {"Content-Type": r.headers.get("Content-Type", "application/json")})
     except Exception as e:
         return jsonify(ok=False, error=f"http: {e}", via="http"), 502
-    if last_r is not None:
-        return (last_r.text, last_r.status_code,
-                {"Content-Type": last_r.headers.get("Content-Type", "application/json")})
-    return jsonify(ok=True)
 
 
 @app.post("/proxy/takeoff")
@@ -8287,11 +8473,19 @@ def proxy_ui_state():
             "source":  _global_paused_src,
         }
 
-    # --- Ceiling (aggregated) ---
+    # --- Ceiling + arena-safety (aggregated from per-drone endpoints) ---
+    # Combined fan-out: for every live drone we fetch BOTH endpoints in
+    # sequence. That's 2 HTTP calls per drone per uiStatePoll tick (1Hz)
+    # instead of two separate per-2s polls issued by the browser — less
+    # load on the C2's HTTP pool and on the browser's 6-connection limit.
     try:
         ceilings = []
-        any_engaged = False
-        reasons = []
+        any_c_engaged = False
+        c_reasons = []
+        margins = []
+        all_arena_enabled = True
+        any_a_engaged = False
+        a_reasons = []
         for did, info in DRONES.items():
             base = (info or {}).get("base")
             if not base: continue
@@ -8302,26 +8496,51 @@ def proxy_ui_state():
                             not cli._ws_connected.get("rc"))
                 if all_down:
                     continue
+            # Ceiling
             try:
                 r = _http_session.get(f"{base.rstrip('/')}/api/config/ceiling",
-                                       timeout=0.3)
+                                       timeout=0.25)
                 if r.status_code == 200:
                     j = r.json()
                     if j.get("ceiling_m") is not None:
                         ceilings.append(float(j["ceiling_m"]))
                     if j.get("engaged"):
-                        any_engaged = True
+                        any_c_engaged = True
                         if j.get("reason"):
-                            reasons.append(f"{did}: {j['reason']}")
+                            c_reasons.append(f"{did}: {j['reason']}")
+            except Exception:
+                pass
+            # Arena safety
+            try:
+                r = _http_session.get(f"{base.rstrip('/')}/api/config/arena_safety",
+                                       timeout=0.25)
+                if r.status_code == 200:
+                    j = r.json()
+                    if j.get("margin_m") is not None:
+                        margins.append(float(j["margin_m"]))
+                    if not j.get("enabled", True):
+                        all_arena_enabled = False
+                    if j.get("engaged"):
+                        any_a_engaged = True
+                        if j.get("reason"):
+                            a_reasons.append(f"{did}: {j['reason']}")
             except Exception:
                 pass
         out["ceiling"] = {
             "ceiling_m": min(ceilings) if ceilings else None,
-            "engaged":   any_engaged,
-            "reasons":   reasons,
+            "engaged":   any_c_engaged,
+            "reasons":   c_reasons,
+        }
+        out["arena_safety"] = {
+            "enabled":  all_arena_enabled,
+            "margin_m": min(margins) if margins else None,
+            "engaged":  any_a_engaged,
+            "reasons":  a_reasons,
         }
     except Exception:
         out["ceiling"] = {"ceiling_m": None, "engaged": False, "reasons": []}
+        out["arena_safety"] = {"enabled": True, "margin_m": None,
+                                "engaged": False, "reasons": []}
 
     # --- WS status (per drone) ---
     try:
