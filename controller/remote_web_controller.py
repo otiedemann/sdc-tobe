@@ -56,7 +56,7 @@ except ImportError:
 # Runs on remote PC. Proxies to Pi API server.
 HTTP_HOST = "0.0.0.0"
 HTTP_PORT = 8090
-TIMEOUT_CMD = float(os.getenv("PI_TIMEOUT_CMD", "12"))
+TIMEOUT_CMD = float(os.getenv("PI_TIMEOUT_CMD", "2.0"))
 TIMEOUT_STATUS = float(os.getenv("PI_TIMEOUT_STATUS", "0.5"))
 VIDEO_UDP_FORWARD_PORT = int(os.getenv("VIDEO_UDP_FORWARD_PORT", "55004"))
 VIDEO_FPS = int(os.getenv("VIDEO_FPS", "30"))
@@ -300,13 +300,28 @@ class FlightLogger:
             base = (info or {}).get("base")
             if not base:
                 continue
+            # Skip HTTP polls entirely for drones whose WS is fully down —
+            # otherwise each unreachable Pi burns 1.5 s per tick and the
+            # whole fleet-logger thread falls behind at 5 Hz.
+            cli = drone_ws.get(did) if 'drone_ws' in globals() else None
+            if cli is not None:
+                all_down = (not cli._ws_connected.get("telemetry") and
+                            not cli._ws_connected.get("position") and
+                            not cli._ws_connected.get("rc"))
+                if all_down:
+                    # Close any open flight for this drone (we can't log
+                    # what we can't see) and move on.
+                    with self._lock:
+                        if did in self._flights:
+                            self._close_unlocked(did, reason="unreachable")
+                    continue
             try:
-                tr  = self.session.get(f"{base.rstrip('/')}/api/telemetry", timeout=1.0)
+                tr  = self.session.get(f"{base.rstrip('/')}/api/telemetry", timeout=0.6)
                 tel = tr.json() if tr.ok else {}
             except Exception:
                 tel = {}
             try:
-                pr  = self.session.get(f"{base.rstrip('/')}/api/position", timeout=0.5)
+                pr  = self.session.get(f"{base.rstrip('/')}/api/position", timeout=0.3)
                 pos = pr.json() if pr.ok else {}
             except Exception:
                 pos = {}
@@ -2007,7 +2022,7 @@ HTML = """
     arcPoll();
     // Version marker — if this string doesn't appear in the DOM,
     // you're running stale JS (restart the Python server or hard-refresh).
-    const BUILD = 'bi-arena-labels-3d-hud';
+    const BUILD = 'bj-unreachable-drone-shortcut';
     console.log('[arc] init complete, build=' + BUILD);
     const ver = document.createElement('span');
     ver.id = 'arc_build_tag';
@@ -6263,6 +6278,18 @@ def proxy_drones_config_save():
 WS_RC_ENABLED = os.getenv("C2_WS_RC", "1") not in {"0", "false", "False"}
 
 
+def _active_drone_reachable() -> bool:
+    """Cheap check — is the active drone's WS up on any channel? When
+    everything is down we can skip slow HTTP fallbacks to avoid blocking
+    the Flask request for the full TIMEOUT_CMD (2 s) per keypress."""
+    ws = drone_ws.get(str(active_drone_id))
+    if ws is None:
+        return True   # assume reachable if no WS client (tello, HTTP-only)
+    return (ws._ws_connected.get("rc")
+            or ws._ws_connected.get("telemetry")
+            or ws._ws_connected.get("position"))
+
+
 @app.post("/proxy/key_down")
 def proxy_key_down():
     data = request.get_json(silent=True) or {}
@@ -6275,6 +6302,11 @@ def proxy_key_down():
         ws = drone_ws.get(str(active_drone_id))
         if ws and ws.send_key(k, "down"):
             return jsonify(ok=True, via="ws")
+    # Don't fall back to HTTP if we know the Pi is down — it'll just
+    # burn TIMEOUT_CMD seconds and make the UI feel frozen. Return 503
+    # immediately so the browser can keep its queue moving.
+    if not _active_drone_reachable():
+        return jsonify(ok=False, error="drone unreachable", via="none"), 503
     r = pi_post("/api/key_down", data)
     return (r.text, r.status_code, {"Content-Type": r.headers.get("Content-Type", "application/json")})
 
@@ -6288,6 +6320,8 @@ def proxy_key_up():
         ws = drone_ws.get(str(active_drone_id))
         if ws and ws.send_key(k, "up"):
             return jsonify(ok=True, via="ws")
+    if not _active_drone_reachable():
+        return jsonify(ok=False, error="drone unreachable", via="none"), 503
     r = pi_post("/api/key_up", data)
     return (r.text, r.status_code, {"Content-Type": r.headers.get("Content-Type", "application/json")})
 
@@ -6324,6 +6358,11 @@ def proxy_key_batch():
                 # Only log one event for the batch to avoid 30Hz log spam.
                 log_command("key_batch", {"keys": uniq, "via": "ws"})
                 return jsonify(ok=True, via="ws", n=len(uniq))
+
+    # Skip HTTP fallback if the Pi is unreachable — otherwise every
+    # 100 ms keep-alive tick burns 2 s × N keys of Flask thread time.
+    if not _active_drone_reachable():
+        return jsonify(ok=False, error="drone unreachable", via="none"), 503
 
     # HTTP fallback — same shape as before, but also collapsed to one
     # log entry rather than one per key.
@@ -7448,16 +7487,20 @@ def proxy_aruco_fleet():
 
     # Two data paths, in order of preference:
     #   1. WS cache (zero HTTP on the fleet-poll tick — <1 ms)
-    #   2. Parallel fan-out to each Pi's /api/position (300 ms timeout)
-    # Any drone whose WS has a fresh frame (<1.5 s old) short-circuits
-    # the HTTP call entirely. The remainder fall through to the fan-out.
+    #   2. Parallel fan-out to each Pi's /api/position
+    #
+    # We SKIP the HTTP fan-out for any drone whose WS is known-disconnected.
+    # If the WS can't reach the Pi, HTTP won't either — trying anyway wastes
+    # ~200 ms per drone per poll on connection-refused / timeout, which was
+    # the real cause of the "500 timeout" and button-press delays (the fleet
+    # poll was holding up Flask threads that other endpoints needed).
     need_http: list[tuple[str, str]] = []
     for did, info in DRONES.items():
         did = str(did)
         base = (info or {}).get("base")
         if not base:
             continue
-        # Check WS cache
+        # WS cache first
         cli = drone_ws.get(did)
         if cli is not None:
             pj, age = cli.latest_position()
@@ -7480,6 +7523,15 @@ def proxy_aruco_fleet():
                         pass
                 entry["_pos_source"] = "ws"
                 continue
+            # WS exists but stale — skip HTTP if ALL three sockets are down
+            # (i.e. the Pi is unreachable). Keep trying HTTP if only position
+            # is down but telemetry/rc still connected (different failure mode).
+            all_down = (not cli._ws_connected.get("telemetry") and
+                        not cli._ws_connected.get("position") and
+                        not cli._ws_connected.get("rc"))
+            if all_down:
+                observers.setdefault(did, {"drone_id": did, "ws_all_down": True})
+                continue
         need_http.append((did, base))
 
     def _fetch(did: str, base: str):
@@ -7493,13 +7545,20 @@ def proxy_aruco_fleet():
 
     if need_http:
         import concurrent.futures as _cf
-        jobs = []
-        with _cf.ThreadPoolExecutor(max_workers=max(1, len(need_http))) as pool:
+        jobs = {}
+        pool = _cf.ThreadPoolExecutor(max_workers=max(1, len(need_http)))
+        try:
             for did, base in need_http:
-                jobs.append(pool.submit(_fetch, did, base))
-            for fut in _cf.as_completed(jobs, timeout=0.6):
+                jobs[pool.submit(_fetch, did, base)] = did
+            # Loop with a per-future timeout rather than as_completed's
+            # global timeout — that one raises TimeoutError instead of
+            # returning partial results, which used to bubble up as a
+            # 500 whenever any Pi was slow/unreachable.
+            deadline = time.time() + 0.6
+            for fut in list(jobs):
+                remaining = max(0.0, deadline - time.time())
                 try:
-                    did, pj = fut.result()
+                    did, pj = fut.result(timeout=remaining)
                 except Exception:
                     continue
                 if not pj:
@@ -7521,6 +7580,11 @@ def proxy_aruco_fleet():
                     except (IndexError, TypeError, ValueError):
                         pass
                 entry["_pos_source"] = "http"
+        finally:
+            # Don't wait for slow workers — let them finish in the
+            # background. If we joined here the endpoint could block 4+
+            # seconds when a drone is unreachable.
+            pool.shutdown(wait=False)
 
     return jsonify(active=active_drone_id,
                    allow_live=aruco_fleet.allow_live,
