@@ -1251,26 +1251,36 @@ HTML = """
       &#128274; Pi-enforced
     </span>
   </div>
-  <!-- Autonomous flight guards — axis-lock + arena safety margin.
-       Both apply ONLY during autonomous motion (observer LIVE mode +
-       mission waypoints). Manual WASD is unaffected. -->
+  <!-- Flight safety guards — axis-lock (autonomous only), arena
+       boundary (BOTH manual + autonomous when 'Manual guard' is on),
+       and safety margin. The arena guard is enforced on each Pi in
+       the RC tick loop so it works independently of the C2. -->
   <div style=\"display:flex;align-items:center;gap:14px;margin-top:4px;padding:4px 10px;background:#0b1424;border:1px solid #1e293b;border-radius:5px;font-size:12px;flex-wrap:wrap;\">
-    <span style=\"color:#fbbf24;font-weight:600;letter-spacing:0.04em;\">&#129517; Autonomous guards</span>
+    <span style=\"color:#fbbf24;font-weight:600;letter-spacing:0.04em;\">&#129517; Flight guards</span>
     <label style=\"color:#94a3b8;display:flex;align-items:center;gap:4px;cursor:pointer;\"
            title=\"When ON: during missions and autonomous flight the drone only flies parallel to arena walls — yaw snaps to nearest 90°, lateral motion is strafe OR forward/back but never diagonal. Manual WASD is unchanged.\">
       <input type=\"checkbox\" id=\"axis_locked_toggle\" style=\"accent-color:#fbbf24;\" />
-      Axis-lock (90° only, no diagonals)
+      Axis-lock (autonomous)
       <span class=\"info-icon\" data-info=\"axis_locked\">i</span>
     </label>
     <label style=\"color:#94a3b8;display:flex;align-items:center;gap:4px;cursor:pointer;\"
-           title=\"Minimum distance from any arena wall during autonomous flight. The boundary guard refuses to let any waypoint / PD command push the drone closer than this to a wall.\">
-      Arena margin
+           title=\"When ON: every RC command on the Pi — manual WASD, keystroke, autonomous mission, everything — is clamped so the drone never approaches an arena wall closer than the margin. Enforced by the Pi's own RC tick at 20 Hz, independent of C2 connection. Falls back silently when position is unknown (operator is responsible).\">
+      <input type=\"checkbox\" id=\"arena_guard_toggle\" checked style=\"accent-color:#f87171;\" />
+      Arena guard (manual+auto)
+      <span class=\"info-icon\" data-info=\"arena_guard_enabled\">i</span>
+    </label>
+    <label style=\"color:#94a3b8;display:flex;align-items:center;gap:4px;cursor:pointer;\"
+           title=\"Minimum distance from any arena wall. The Pi-side RC tick clamps any command that would push the drone closer than this.\">
+      margin
       <input id=\"safety_margin_input\" type=\"number\" min=\"0.1\" max=\"5.0\" step=\"0.1\" value=\"1.5\" style=\"width:54px;height:24px;font-size:12px;\" />
       m
       <span class=\"info-icon\" data-info=\"safety_margin_m\">i</span>
     </label>
     <button id=\"safety_margin_apply\" style=\"height:24px;font-size:11px;padding:0 8px;background:#78350f;border-color:#f59e0b;color:#fde68a;\"
-            title=\"Push margin to every drone's observer\">Apply</button>
+            title=\"Push margin to every drone's Pi (arena guard) + every observer (autonomous guard)\">Apply</button>
+    <span id=\"arena_guard_engaged_badge\" class=\"small\" style=\"display:none;color:#fde68a;background:#7f1d1d;padding:2px 8px;border-radius:4px;font-weight:700;letter-spacing:0.04em;\">
+      &#128680; ARENA GUARD ENGAGED
+    </span>
     <span id=\"autonomous_guards_status\" class=\"small\" style=\"color:#64748b;\"></span>
   </div>
   <div id=\"drone_config_modal\" style=\"display:none;position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,0.7);z-index:1000;justify-content:center;align-items:center;\">
@@ -2246,7 +2256,7 @@ HTML = """
     arcPoll();
     // Version marker — if this string doesn't appear in the DOM,
     // you're running stale JS (restart the Python server or hard-refresh).
-    const BUILD = 'by-mission-code-presets';
+    const BUILD = 'bz-arena-guard-pi-side';
     console.log('[arc] init complete, build=' + BUILD);
     const ver = document.createElement('span');
     ver.id = 'arc_build_tag';
@@ -3453,28 +3463,35 @@ function _isTyping() {
   return t === 'INPUT' || t === 'TEXTAREA' || document.activeElement?.isContentEditable;
 }
 window.addEventListener('keydown', (e)=>{
-  if (_isTyping()) return;
   const k = e.key.toLowerCase();
-  // ── Global panic-button: '0' lands EVERY drone in the fleet ────────
-  // Using the zero key because it's not in the movement keymap (Q is
-  // yaw-CCW, W/A/S/D are translation, R/F are altitude, so letters are
-  // risky). '0' is far from the flight grid and easy to hit one-handed.
+  // ── SAFETY HOTKEYS — always top priority ────────────────────────────
+  // 0 (LAND ALL) and 9 (PAUSE / CONTINUE) are the fleet-level emergency
+  // controls. They MUST fire even when a preset-name textbox, slider,
+  // code editor, or any other input has focus — otherwise "press 0 to
+  // land" becomes "sometimes presses 0 to land" which is unacceptable
+  // for safety. We bypass the _isTyping() guard for these two keys.
+  // Movement keys still respect _isTyping() so typing "w" in a textbox
+  // doesn't fly the drone.
   if (k === '0') {
     e.preventDefault();
-    if (window._landAllInFlight) return;    // debounce
+    // Blur any text field so the keystroke doesn't also land in it.
+    if (document.activeElement && document.activeElement !== document.body) {
+      try { document.activeElement.blur(); } catch {}
+    }
+    if (window._landAllInFlight) return;
     window._landAllInFlight = true;
-    console.log('[LAND_ALL] 0 pressed — landing every drone');
+    console.log('[LAND_ALL] 0 pressed — landing every drone (top-priority hotkey)');
     landAllDrones('0 hotkey').finally(() => { window._landAllInFlight = false; });
     return;
   }
-  // ── Global PAUSE/RESUME — '9' toggles fleet pause ──────────────────
-  // Same spirit as '0': far from the flight grid, can't be hit by
-  // accident while piloting. Toggles between pause (mid-air freeze,
-  // autonomous control disabled) and resume.
   if (k === '9') {
     e.preventDefault();
-    if (window._pauseInFlight) return;      // debounce
+    if (document.activeElement && document.activeElement !== document.body) {
+      try { document.activeElement.blur(); } catch {}
+    }
+    if (window._pauseInFlight) return;
     window._pauseInFlight = true;
+    console.log('[PAUSE] 9 pressed — toggling fleet pause (top-priority hotkey)');
     if (window._globalPaused) {
       console.log('[PAUSE] 9 pressed — resuming fleet');
       resumeAllDrones('9 hotkey').finally(() => { window._pauseInFlight = false; });
@@ -3484,6 +3501,8 @@ window.addEventListener('keydown', (e)=>{
     }
     return;
   }
+  // Below this point, non-safety keys respect the typing guard.
+  if (_isTyping()) return;
   // ── Drone switch hotkey: digits 1-5 select the Nth drone in the bar ──
   // Order follows Object.entries(drones) insertion order, same as the
   // drone-bar buttons top→bottom. '1' = first drone, '2' = second, etc.
@@ -3779,12 +3798,14 @@ async function resumeAllDrones(source) {
   setInterval(refresh, 15000);  // 15s — enough to see new flights appear
 })();
 
-// ── Autonomous guards: axis-lock toggle + arena safety margin ─────
-(function wireAutonomousGuards(){
-  const tog    = document.getElementById('axis_locked_toggle');
-  const inp    = document.getElementById('safety_margin_input');
-  const btn    = document.getElementById('safety_margin_apply');
-  const status = document.getElementById('autonomous_guards_status');
+// ── Flight guards: axis-lock + arena safety (manual + autonomous) ─
+(function wireFlightGuards(){
+  const axisTog   = document.getElementById('axis_locked_toggle');
+  const arenaTog  = document.getElementById('arena_guard_toggle');
+  const inp       = document.getElementById('safety_margin_input');
+  const btn       = document.getElementById('safety_margin_apply');
+  const status    = document.getElementById('autonomous_guards_status');
+  const badge     = document.getElementById('arena_guard_engaged_badge');
   function flash(msg, col) {
     if (!status) return;
     status.textContent = msg;
@@ -3792,31 +3813,46 @@ async function resumeAllDrones(source) {
     setTimeout(() => { if (status.textContent === msg) status.textContent = ''; }, 2500);
   }
 
-  // Initial load — read current state from the active drone's params
-  // (axis_locked) + safety margin.
   async function load() {
     try {
-      const [pRes, sRes] = await Promise.all([
-        fetch('/proxy/aruco/params'),
-        fetch('/proxy/aruco/safety_margin'),
-      ]);
-      const p = await pRes.json();
-      const s = await sRes.json();
-      if (tog && typeof p.axis_locked !== 'undefined') tog.checked = !!p.axis_locked;
-      if (inp && s.safety_margin_m != null) inp.value = Number(s.safety_margin_m).toFixed(1);
+      // axis-lock (autonomous-observer param)
+      const p = await (await fetch('/proxy/aruco/params')).json();
+      if (axisTog && typeof p.axis_locked !== 'undefined') axisTog.checked = !!p.axis_locked;
+      // arena guard + margin (Pi-side, enforces on BOTH manual + auto)
+      const a = await (await fetch('/proxy/config/arena_safety')).json();
+      if (arenaTog && typeof a.enabled !== 'undefined') arenaTog.checked = !!a.enabled;
+      if (inp && a.margin_m != null && document.activeElement !== inp)
+        inp.value = Number(a.margin_m).toFixed(1);
+      if (badge) badge.style.display = a.engaged ? '' : 'none';
     } catch {}
   }
   load();
+  // Poll every 2s so the "ARENA GUARD ENGAGED" badge reflects live state.
+  setInterval(load, 2000);
 
-  if (tog) tog.addEventListener('change', async () => {
+  if (axisTog) axisTog.addEventListener('change', async () => {
     try {
-      const r = await fetch('/proxy/aruco/params', {
+      await fetch('/proxy/aruco/params', {
         method: 'POST',
         headers: {'Content-Type':'application/json'},
-        body: JSON.stringify({axis_locked: tog.checked}),   // no id → fleet-wide
+        body: JSON.stringify({axis_locked: axisTog.checked}),
+      });
+      flash(axisTog.checked ? '\u2713 axis-lock ON' : '\u2713 axis-lock OFF', '#22c55e');
+    } catch (e) { flash('request failed', '#ef4444'); }
+  });
+
+  if (arenaTog) arenaTog.addEventListener('change', async () => {
+    try {
+      const r = await fetch('/proxy/config/arena_safety', {
+        method: 'POST',
+        headers: {'Content-Type':'application/json'},
+        body: JSON.stringify({enabled: arenaTog.checked}),
       });
       const j = await r.json();
-      if (j.ok) flash(tog.checked ? '\u2713 axis-lock ON (fleet)' : '\u2713 axis-lock OFF (fleet)', '#22c55e');
+      if (j.ok) flash(arenaTog.checked
+                        ? '\u2713 arena guard ON (manual + auto)'
+                        : '\u26a0 arena guard OFF — operator owns boundaries',
+                       arenaTog.checked ? '#22c55e' : '#fbbf24');
       else flash('error: ' + (j.error || 'unknown'), '#ef4444');
     } catch (e) { flash('request failed', '#ef4444'); }
   });
@@ -3827,15 +3863,23 @@ async function resumeAllDrones(source) {
       flash('enter 0.1 - 5.0 m', '#ef4444');
       return;
     }
+    // Push to BOTH the Pi-side guard (manual + auto) AND the observer
+    // autonomous guard so they share a single source of truth.
     try {
-      const r = await fetch('/proxy/aruco/safety_margin', {
-        method: 'POST',
-        headers: {'Content-Type':'application/json'},
-        body: JSON.stringify({safety_margin_m: v}),
-      });
-      const j = await r.json();
-      if (j.ok) flash('\u2713 margin \u2192 ' + v + ' m (fleet)', '#22c55e');
-      else flash('error: ' + (j.error || 'unknown'), '#ef4444');
+      const [a, b] = await Promise.all([
+        fetch('/proxy/config/arena_safety', {
+          method: 'POST',
+          headers: {'Content-Type':'application/json'},
+          body: JSON.stringify({margin_m: v}),
+        }).then(r => r.json()).catch(e => ({ok:false, error:String(e)})),
+        fetch('/proxy/aruco/safety_margin', {
+          method: 'POST',
+          headers: {'Content-Type':'application/json'},
+          body: JSON.stringify({safety_margin_m: v}),
+        }).then(r => r.json()).catch(e => ({ok:false, error:String(e)})),
+      ]);
+      if (a.ok && b.ok) flash('\u2713 margin \u2192 ' + v + ' m (Pi + observers)', '#22c55e');
+      else flash('partial: pi=' + (a.ok?'ok':'err') + ' obs=' + (b.ok?'ok':'err'), '#fbbf24');
     } catch (e) { flash('request failed', '#ef4444'); }
   };
 })();
@@ -6007,6 +6051,18 @@ window.PARAM_INFO = {
     "exclusively to autonomous decisions (observer LIVE + waypoints).\\n\\n"+
     "Typical use: structured arena navigation where diagonals invite "+
     "unnecessary marker-tracking jitter. Default OFF."},
+  arena_guard_enabled: {title:'Arena guard (manual + auto)', body:
+    "When ON (default), the Pi's own RC tick loop runs a boundary "+
+    "guard on EVERY command — manual WASD, autonomous missions, "+
+    "ArUco LIVE, everything. If the drone is within the safety "+
+    "margin of any arena wall AND the command would push it closer, "+
+    "that axis of the command is clamped to zero.\\n\\n"+
+    "Independent of C2 connection — the guard runs on the flight "+
+    "controller itself using the position processor's arena-frame "+
+    "pose. If the position fix is stale or missing, the guard "+
+    "gracefully falls back (no clamping) and the operator owns the "+
+    "boundary decision.\\n\\n"+
+    "Turn OFF for test/debug flights where you want raw control."},
   safety_margin_m: {title:'Arena safety margin', units:'metres', body:
     "Minimum distance the drone will maintain from ANY arena wall "+
     "during autonomous flight. The boundary guard runs per-tick at "+
@@ -7440,6 +7496,68 @@ def proxy_ceiling_get():
         reasons=reasons,
         per_drone=results,
     )
+
+
+@app.get("/proxy/config/arena_safety")
+def proxy_arena_safety_get():
+    """Aggregate arena-safety state across the fleet — min margin wins,
+    any engaged → engaged, any disabled → disabled (most conservative)."""
+    results = {}
+    any_engaged = False
+    all_enabled = True
+    min_margin = None
+    reasons = []
+    for did, info in DRONES.items():
+        base = (info or {}).get("base")
+        if not base:
+            results[str(did)] = {"ok": False, "error": "no base url"}
+            continue
+        try:
+            r = _http_session.get(f"{base.rstrip('/')}/api/config/arena_safety",
+                                   timeout=1.0)
+            j = r.json() if r.ok else {"ok": False}
+            results[str(did)] = j
+            if j.get("engaged"):
+                any_engaged = True
+                if j.get("reason"):
+                    reasons.append(f"{did}: {j['reason']}")
+            if not j.get("enabled", True):
+                all_enabled = False
+            m = j.get("margin_m")
+            if isinstance(m, (int, float)):
+                if min_margin is None or m < min_margin:
+                    min_margin = float(m)
+        except Exception as e:
+            results[str(did)] = {"ok": False, "error": str(e)[:120]}
+    return jsonify(
+        ok=True,
+        enabled=all_enabled,
+        margin_m=min_margin,
+        engaged=any_engaged,
+        reasons=reasons,
+        per_drone=results,
+    )
+
+
+@app.post("/proxy/config/arena_safety")
+def proxy_arena_safety_set():
+    """Fan-out arena safety settings to every drone's Pi."""
+    data = request.get_json(silent=True) or {}
+    log_command("arena_safety_set", data)
+    results = {}
+    for did, info in DRONES.items():
+        base = (info or {}).get("base")
+        if not base:
+            continue
+        try:
+            r = _http_session.post(f"{base.rstrip('/')}/api/config/arena_safety",
+                                    json=data, timeout=2.0)
+            results[str(did)] = r.json() if r.ok else {"ok": False, "status": r.status_code}
+        except Exception as e:
+            results[str(did)] = {"ok": False, "error": str(e)[:120]}
+    ok_count = sum(1 for v in results.values() if v.get("ok"))
+    print(f"[ARENA] fleet-wide: {data} → {ok_count}/{len(results)} drones acknowledged")
+    return jsonify(ok=True, applied=ok_count, total=len(results), results=results)
 
 
 @app.post("/proxy/config/ceiling")

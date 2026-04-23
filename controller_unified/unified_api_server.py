@@ -332,6 +332,27 @@ MAX_ALTITUDE_M = float(os.getenv("MAX_ALTITUDE_M", "5.0"))
 # human-readable explanation surfaced in /api/telemetry for UI banners.
 _ceiling_engaged: bool = False
 _ceiling_last_reason: str = ""
+
+# ── Arena XY boundary guard (Pi-side, applies to ALL RC) ─────────────
+# Previously only the autonomous observer enforced a safety margin from
+# arena walls. If the operator flew manually (WASD) or took off near a
+# wall, nothing clamped the RC — which is how a recent flight ended up
+# inside the net at y=10.95 (arena back wall y=10.8). This guard runs
+# in the Pi's own rc_loop so it applies to BOTH transport paths (WS +
+# HTTP) and BOTH control modes (manual + autonomous). Values persisted
+# to flight_config.json.
+_ARENA_BOUNDS_DEFAULT = {
+    "x_min": -10.0, "x_max": 10.0,
+    "y_min":   0.0, "y_max": 10.8,
+}
+_arena_bounds: dict = dict(_ARENA_BOUNDS_DEFAULT)
+_arena_margin_m: float = float(os.getenv("ARENA_SAFETY_MARGIN_M", "1.5"))
+# Toggle: applies to BOTH manual and autonomous flight. Default ON.
+# When OFF the Pi's RC tick makes no XY boundary decisions — operator
+# takes full responsibility. The altitude ceiling remains on regardless.
+_arena_guard_enabled: bool = os.getenv("ARENA_GUARD_ENABLED", "1") not in {"0", "false", "False"}
+_arena_engaged: bool = False
+_arena_last_reason: str = ""
 MAX_VERTICAL_SPEED = float(os.getenv("MAX_VERTICAL_SPEED", "0.5"))
 MAX_TILT = float(os.getenv("MAX_TILT", "15"))
 CONNECT_RETRY_S = 3.0
@@ -841,6 +862,7 @@ def _load_flight_config():
     default.
     """
     global MAX_ALTITUDE_M, MAX_VERTICAL_SPEED, MAX_TILT, MAX_YAW_SPEED
+    global _arena_margin_m, _arena_bounds
     try:
         if FLIGHT_CONFIG_PATH.exists():
             data = json.loads(FLIGHT_CONFIG_PATH.read_text())
@@ -852,16 +874,26 @@ def _load_flight_config():
                 MAX_TILT = float(data["max_tilt"])
             if "max_yaw_speed" in data:
                 MAX_YAW_SPEED = float(data["max_yaw_speed"])
+            if "arena_safety_margin_m" in data:
+                _arena_margin_m = float(data["arena_safety_margin_m"])
+            if "arena_bounds" in data and isinstance(data["arena_bounds"], dict):
+                for k, v in data["arena_bounds"].items():
+                    if k in _arena_bounds:
+                        _arena_bounds[k] = float(v)
             print(f"[UNIFIED] Loaded flight config: alt={MAX_ALTITUDE_M} vs={MAX_VERTICAL_SPEED} tilt={MAX_TILT} yaw={MAX_YAW_SPEED}")
             print(f"[CEILING] Pi-side safety ceiling: {MAX_ALTITUDE_M:.2f} m (loaded from {FLIGHT_CONFIG_PATH.name})")
             print(f"[CEILING] Enforced every RC tick, independent of C2 connection.")
+            print(f"[ARENA]   Pi-side safety margin: {_arena_margin_m:.2f} m "
+                  f"bounds=x[{_arena_bounds['x_min']},{_arena_bounds['x_max']}] "
+                  f"y[{_arena_bounds['y_min']},{_arena_bounds['y_max']}]")
     except Exception as e:
         print(f"[UNIFIED] flight_config load error: {e}")
 
 
 def _save_flight_config(results: dict):
     """Persist any successfully-updated flight limit to flight_config.json."""
-    keys = {"max_altitude_m", "max_vertical_speed", "max_tilt", "max_yaw_speed"}
+    keys = {"max_altitude_m", "max_vertical_speed", "max_tilt", "max_yaw_speed",
+            "arena_safety_margin_m", "arena_bounds"}
     if not any(k in results for k in keys):
         return
     try:
@@ -3126,6 +3158,99 @@ def rc_loop():
         if cur_h_cm is not None and cur_h_cm <= FLOOR_CM and ud < 0:
             ud = 0
 
+        # ══════════════════════════════════════════════════════════════
+        # Arena XY boundary guard — enforced on EVERY RC command,
+        # manual or autonomous. Reads the arena-frame pose published by
+        # the position processor (_pos_st) and, if the drone is within
+        # _arena_margin_m of any wall AND the current RC vector would
+        # push it closer, clamps the offending axis to zero (or reverses
+        # it if we've already overshot the margin).
+        #
+        # Applies to manual WASD → the old path where this was missing
+        # — that's how the recent flight ended up at y=10.95 past the
+        # y=10.8 back wall.
+        #
+        # Falls back silently when the positioner has no fresh fix
+        # (stale=True or never published). In that case the boundary
+        # guard contributes nothing; the operator is responsible.
+        global _arena_engaged, _arena_last_reason
+        _arena_engaged = False
+        _arena_last_reason = ""
+        try:
+            with _pos_st_lock:
+                px = _pos_st.get("x")
+                py = _pos_st.get("y")
+                pos_stale = _pos_st.get("stale", True)
+                dx_dir    = _pos_st.get("dx")
+                dy_dir    = _pos_st.get("dy")
+        except Exception:
+            px = py = None
+            pos_stale = True
+            dx_dir = dy_dir = None
+
+        if (_arena_guard_enabled and
+                px is not None and py is not None and not pos_stale):
+            margin = float(_arena_margin_m)
+            xmin, xmax = _arena_bounds["x_min"], _arena_bounds["x_max"]
+            ymin, ymax = _arena_bounds["y_min"], _arena_bounds["y_max"]
+
+            # Distance to each wall — negative means already past the margin.
+            clearance = {
+                "x_max": xmax - px - margin,
+                "x_min": (px - xmin) - margin,
+                "y_max": ymax - py - margin,
+                "y_min": (py - ymin) - margin,
+            }
+
+            # RC interpretation: convert body-frame RC (lr, fb) to world-
+            # frame intent using the drone's current heading (from the
+            # position processor's dx/dy direction vector — already
+            # normalised). Using position-processor direction avoids
+            # chasing compass-yaw drift.
+            #
+            # Convention (matches _apply_boundary_guard in aruco_seek):
+            #   body +fb  → world  dir  (dx, dy)
+            #   body +lr  → world  right (cos, -sin) where yaw atan2(dx,dy)
+            dx = float(dx_dir) if dx_dir is not None else 0.0
+            dy = float(dy_dir) if dy_dir is not None else 1.0
+            # Right-vector perpendicular to heading (90° CW in world XY):
+            rx = dy
+            ry = -dx
+            wdx = lr * rx + fb * dx
+            wdy = lr * ry + fb * dy
+
+            actions = []
+            # x max (right wall)
+            if clearance["x_max"] <= 0 and wdx > 0:
+                wdx = 0
+                actions.append("clamp-x_max")
+            # x min (left wall)
+            if clearance["x_min"] <= 0 and wdx < 0:
+                wdx = 0
+                actions.append("clamp-x_min")
+            # y max (back wall / net)
+            if clearance["y_max"] <= 0 and wdy > 0:
+                wdy = 0
+                actions.append("clamp-y_max")
+            # y min (front wall)
+            if clearance["y_min"] <= 0 and wdy < 0:
+                wdy = 0
+                actions.append("clamp-y_min")
+
+            if actions:
+                # Convert world-frame intent back to body-frame RC.
+                # inv rotation: lr = wdx·rx + wdy·ry; fb = wdx·dx + wdy·dy
+                # (rx,ry) and (dx,dy) are orthonormal so transpose = inverse.
+                lr = int(round(wdx * rx + wdy * ry))
+                fb = int(round(wdx * dx + wdy * dy))
+                _arena_engaged = True
+                _arena_last_reason = (
+                    f"near wall: pos=({px:.2f},{py:.2f}) "
+                    f"clear=x[{clearance['x_max']:.2f},{clearance['x_min']:.2f}] "
+                    f"y[{clearance['y_max']:.2f},{clearance['y_min']:.2f}] "
+                    f"actions={','.join(actions)}"
+                )
+
         with discrete_lock:
             in_discrete = now < discrete_until
 
@@ -4244,6 +4369,65 @@ def api_ceiling_set():
     return jsonify(ok=True, ceiling_m=v, firmware_result=firmware_result)
 
 
+@app.get("/api/config/arena_safety")
+def api_arena_safety_get():
+    """Return Pi-side arena boundary guard state + config.
+
+    The guard runs in rc_loop() for EVERY RC tick (manual + autonomous),
+    so it enforces the margin whether the operator is piloting by hand
+    or a mission is active. Independent of C2 connection.
+    """
+    return jsonify(
+        ok=True,
+        enabled=bool(_arena_guard_enabled),
+        margin_m=round(float(_arena_margin_m), 2),
+        bounds=dict(_arena_bounds),
+        engaged=bool(_arena_engaged),
+        reason=_arena_last_reason,
+        persisted_to=str(FLIGHT_CONFIG_PATH),
+    )
+
+
+@app.post("/api/config/arena_safety")
+def api_arena_safety_set():
+    """Update arena safety: any subset of
+      {"enabled": bool, "margin_m": float, "bounds": {x_min, x_max, y_min, y_max}}"""
+    global _arena_guard_enabled, _arena_margin_m, _arena_bounds
+    data = request.get_json(silent=True) or {}
+    changed: dict = {}
+    if "enabled" in data:
+        _arena_guard_enabled = bool(data["enabled"])
+        changed["enabled"] = _arena_guard_enabled
+    if "margin_m" in data:
+        try:
+            v = max(0.0, min(5.0, float(data["margin_m"])))
+            _arena_margin_m = v
+            changed["margin_m"] = v
+        except (TypeError, ValueError):
+            pass
+    if "bounds" in data and isinstance(data["bounds"], dict):
+        for k, v in data["bounds"].items():
+            if k in _arena_bounds:
+                try:
+                    _arena_bounds[k] = float(v)
+                except (TypeError, ValueError):
+                    pass
+        changed["bounds"] = dict(_arena_bounds)
+    # Persist so a Pi restart keeps operator intent
+    try:
+        _save_flight_config({
+            "arena_safety_margin_m": _arena_margin_m,
+            "arena_bounds":           dict(_arena_bounds),
+        })
+    except Exception:
+        pass
+    print(f"[ARENA] guard {_arena_guard_enabled and 'ON' or 'OFF'} margin={_arena_margin_m}m "
+          f"bounds={_arena_bounds} (changed={changed})")
+    return jsonify(ok=True, changed=changed,
+                   enabled=_arena_guard_enabled, margin_m=_arena_margin_m,
+                   bounds=dict(_arena_bounds))
+
+
 @app.get("/api/diagnostics")
 def api_diagnostics():
     """Pi-side health snapshot — thread count, internal buffer sizes.
@@ -4513,6 +4697,9 @@ def _build_telemetry_payload() -> dict:
     payload["ceiling_m"] = round(float(MAX_ALTITUDE_M), 2)
     payload["ceiling_engaged"] = bool(_ceiling_engaged)
     payload["ceiling_reason"] = _ceiling_last_reason or ""
+    payload["arena_margin_m"] = round(float(_arena_margin_m), 2)
+    payload["arena_engaged"] = bool(_arena_engaged)
+    payload["arena_reason"] = _arena_last_reason or ""
     try:
         b = backend
         reader = getattr(b, "_read_magnetometer_state", None) if b else None
@@ -5418,7 +5605,7 @@ def main():
     print(f"[{tag}] Unified API server: http://{HTTP_HOST}:{HTTP_PORT}")
     print(f"[{tag}] Drone: {drone_type} @ {drone_ip} (auto-reconnect; watchdog={REMOTE_TIMEOUT_S}s)")
     print(f"[{tag}] SDKs available: tello={HAS_TELLO_SDK}, olympe={HAS_OLYMPE_SDK}")
-    print(f"[{tag}] Code version: 2026-04-23-bt (ceiling-sdk-verified + seen-markers-fix)")
+    print(f"[{tag}] Code version: 2026-04-23-bz (pi-side-arena-guard + safety-hotkey-priority)")
     app.run(host=HTTP_HOST, port=HTTP_PORT, threaded=True, use_reloader=False)
 
 
