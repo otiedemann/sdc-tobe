@@ -4045,6 +4045,7 @@ if HAS_WS:
         """Pushes one telemetry JSON per (1/TELEMETRY_HZ) seconds. Stops
         the moment the client disconnects. Wrapped in try/except because
         the receiver can close mid-send and raises ConnectionError."""
+        _ws_set_nodelay(ws)
         try:
             # Hello packet lets the C2 check connectivity + read drone_type
             ws.send(json.dumps({
@@ -4080,6 +4081,7 @@ if HAS_WS:
         """Pushes a payload on every position update. Piggybacks the
         existing broadcast queue (_pos_ws_queues) so there's zero extra
         work in the positioner loop."""
+        _ws_set_nodelay(ws)
         q: queue.Queue = queue.Queue(maxsize=30)
         with _pos_sse_lock:
             _pos_ws_queues.append(q)
@@ -4109,19 +4111,35 @@ if HAS_WS:
                 except ValueError:
                     pass
 
+    def _ws_set_nodelay(ws):
+        """Set TCP_NODELAY on the underlying socket so small RC frames
+        aren't batched by Nagle's algorithm. flask-sock exposes the raw
+        socket via `ws.sock` (simple-websocket) — grab it defensively
+        in case the API varies."""
+        try:
+            import socket as _sock
+            raw = getattr(ws, "sock", None) or getattr(ws, "_sock", None)
+            if raw is not None and hasattr(raw, "setsockopt"):
+                raw.setsockopt(_sock.IPPROTO_TCP, _sock.TCP_NODELAY, 1)
+                raw.setsockopt(_sock.SOL_SOCKET,  _sock.SO_KEEPALIVE, 1)
+        except Exception:
+            pass
+
     @sock.route("/ws/rc")
     def ws_rc(ws):
-        """Bidirectional RC channel. Accepts two message shapes:
+        """Bidirectional RC channel.
 
             {"type":"rc",  "lr":0, "fb":0, "ud":0, "yaw":0, "duration_ms":250}
             {"type":"key", "event":"down"|"up", "key":"w"}
+            {"type":"ping","client_ts":<unix>}  → replies with pong
 
-        Replies with {"type":"ack","seq":N} if the client included a seq,
-        otherwise stays silent (fire-and-forget). Applies to the same
-        rc_override / pressed_web globals that /api/rc and /api/key_down
-        write — so the tick loop picks it up without caring about the
-        transport."""
+        Fire-and-forget by default — no ACKs. The client prefers short
+        latency over confirmation; a missed frame is corrected on the
+        next one. Applies to the same rc_override / pressed_web globals
+        that /api/rc and /api/key_down write, so the tick loop picks it
+        up without caring about the transport."""
         global rc_override, rc_override_until
+        _ws_set_nodelay(ws)
         try:
             ws.send(json.dumps({
                 "type": "hello", "service": "rc", "server_ts": time.time(),
@@ -4138,7 +4156,6 @@ if HAS_WS:
                 except Exception:
                     continue
                 mtype = data.get("type")
-                seq = data.get("seq")
                 if mtype == "rc":
                     def clamp(v):
                         try:    return max(-100, min(100, int(v)))
@@ -4151,23 +4168,14 @@ if HAS_WS:
                     with rc_lock:
                         rc_override = (lr, fb, ud, yaw)
                         rc_override_until = time.time() + (dur / 1000.0)
-                    if seq is not None:
-                        try:
-                            ws.send(json.dumps({"type": "ack", "seq": seq}))
-                        except Exception:
-                            return
                 elif mtype == "key":
                     ev = (data.get("event") or "").lower()
                     k  = str(data.get("key") or "").lower()
                     if k:
                         if ev == "down": add_key(k)
                         elif ev == "up": remove_key(k)
-                    if seq is not None:
-                        try:
-                            ws.send(json.dumps({"type": "ack", "seq": seq}))
-                        except Exception:
-                            return
                 elif mtype == "ping":
+                    # Respond so the client can measure RTT.
                     try:
                         ws.send(json.dumps({
                             "type": "pong",

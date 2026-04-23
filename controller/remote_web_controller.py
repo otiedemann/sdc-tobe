@@ -442,8 +442,22 @@ class DroneWS:
         self._rc_ws = None                    # websocket.WebSocket
         self._rc_ws_lock = threading.Lock()
         self._rc_seq = 0
+        self._last_rc_send_ts: float = 0.0
+        self._rc_rtt_ms: float = 0.0
         self._ws_connected = {"telemetry": False, "position": False, "rc": False}
         self._running = False
+
+    @staticmethod
+    def _sockopt_low_latency():
+        """TCP_NODELAY kills Nagle's 40 ms batching delay on small
+        frames — RC/key events are tiny (50-80 bytes) so without this
+        the OS would buffer them. SO_KEEPALIVE on the socket helps us
+        notice dead links faster than a timeout."""
+        import socket as _sock
+        return [
+            (_sock.IPPROTO_TCP, _sock.TCP_NODELAY, 1),
+            (_sock.SOL_SOCKET,  _sock.SO_KEEPALIVE, 1),
+        ]
 
     # --- Public API ---
     def start(self):
@@ -504,6 +518,8 @@ class DroneWS:
         """Connection snapshot for /proxy/ws/status + UI badge."""
         _, tel_age = self.latest_telemetry()
         _, pos_age = self.latest_position()
+        with self._lock:
+            rc_rtt = self._rc_rtt_ms
         return {
             "drone_id": self.drone_id,
             "rc":        self._ws_connected["rc"],
@@ -511,29 +527,42 @@ class DroneWS:
             "position":  self._ws_connected["position"],
             "telemetry_age_ms": int(tel_age * 1000) if tel_age < 1e6 else None,
             "position_age_ms":  int(pos_age * 1000) if pos_age < 1e6 else None,
+            "rc_rtt_ms":        rc_rtt if rc_rtt > 0 else None,
         }
 
     # --- Internals ---
     def _send_rc_message(self, msg: dict) -> bool:
+        """Send fire-and-forget. Does NOT hold our lock around the
+        socket write — that was a latency bug: a single stalled send
+        serialised every other Flask thread waiting on the same lock.
+        The websocket-client library has its own internal write lock,
+        which is enough to keep frames intact.
+
+        No sequence numbers / no ACKs — RC is idempotent and bandwidth
+        is tiny, round-tripping every frame just doubled the traffic
+        and gated sends on the receiver draining its write buffer."""
         if not HAS_WSCLIENT:
             return False
-        with self._rc_ws_lock:
-            ws = self._rc_ws
-            if ws is None:
-                return False
-            self._rc_seq += 1
-            msg["seq"] = self._rc_seq
-            try:
-                ws.send(json.dumps(msg))
-                return True
-            except Exception as e:
-                # Connection died — flag and let the reconnect loop handle it
-                print(f"[WS] {self.drone_id} rc send failed: {e}")
-                try: ws.close()
-                except Exception: pass
-                self._rc_ws = None
-                self._ws_connected["rc"] = False
-                return False
+        ws = self._rc_ws        # snapshot ref — no lock needed
+        if ws is None:
+            return False
+        try:
+            ws.send(json.dumps(msg))
+            with self._lock:
+                self._last_rc_send_ts = time.time()
+            return True
+        except Exception as e:
+            # Connection died — flag and let the reconnect loop handle it.
+            # Guard the state mutation with the lock so we don't race the
+            # reconnect thread which is (re)assigning self._rc_ws.
+            print(f"[WS] {self.drone_id} rc send failed: {e}")
+            with self._rc_ws_lock:
+                if self._rc_ws is ws:
+                    try: ws.close()
+                    except Exception: pass
+                    self._rc_ws = None
+                    self._ws_connected["rc"] = False
+            return False
 
     def _rx_telemetry_loop(self):
         self._rx_pull_loop("telemetry", f"{self.ws_base}/ws/telemetry",
@@ -549,7 +578,8 @@ class DroneWS:
         backoff = 1.0
         while self._running:
             try:
-                ws = _wsclient.create_connection(url, timeout=4)
+                ws = _wsclient.create_connection(
+                    url, timeout=4, sockopt=self._sockopt_low_latency())
                 ws.settimeout(8.0)     # receive timeout → detects dead links
                 self._ws_connected[name] = True
                 backoff = 1.0          # reset on successful connect
@@ -581,34 +611,64 @@ class DroneWS:
                 backoff = min(5.0, backoff * 1.5)
 
     def _rc_connect_loop(self):
-        """Keeps the RC send socket alive. Unlike the pull loops this
-        socket mostly just sits idle — we reuse it on demand from
-        send_rc()/send_key()."""
+        """Keeps the RC send socket alive.
+
+        Crucial latency details:
+          - TCP_NODELAY via sockopt — without it, Nagle's 40 ms delay
+            batches small RC frames and key events feel sluggish.
+          - settimeout(0.3) — short. The timeout applies to BOTH recv
+            and send on the socket, so a big value (old: 2 s) meant a
+            single stalled send blocked the caller for 2 s. 0.3 s is
+            long enough for LAN round-trips but short enough that a
+            dropped link fails fast and falls back to HTTP.
+          - Ping every ~2 s and measure the round-trip — exposed as
+            rc_rtt_ms so operators can see the actual latency."""
         url = f"{self.ws_base}/ws/rc"
         backoff = 1.0
         while self._running:
             try:
-                ws = _wsclient.create_connection(url, timeout=4)
-                # Shortish send timeout — we'd rather fail fast and fall
-                # back to HTTP than block for 30s.
-                ws.settimeout(2.0)
+                ws = _wsclient.create_connection(
+                    url, timeout=4, sockopt=self._sockopt_low_latency())
+                ws.settimeout(0.3)
                 with self._rc_ws_lock:
                     self._rc_ws = ws
                 self._ws_connected["rc"] = True
                 backoff = 1.0
-                # Keep the connection alive by reading ACKs / pongs. When
-                # the server closes we break out and retry.
+                last_ping = 0.0
+                ping_pending: dict[int, float] = {}  # client_ts → send_monotonic
                 while self._running:
+                    # Opportunistic ping for RTT measurement
+                    now = time.time()
+                    if now - last_ping > 2.0:
+                        last_ping = now
+                        mono = time.monotonic()
+                        try:
+                            ws.send(json.dumps({
+                                "type": "ping",
+                                "client_ts": now,
+                            }))
+                            ping_pending[int(now * 1000)] = mono
+                        except Exception:
+                            break
                     try:
                         msg = ws.recv()
                     except _wsclient._exceptions.WebSocketTimeoutException:
-                        # normal — just keep looping; send() updates the socket
                         continue
                     except Exception:
                         break
                     if not msg:
                         break
-                    # ACK messages are fine, nothing to do
+                    try:
+                        data = json.loads(msg)
+                    except Exception:
+                        continue
+                    if data.get("type") == "pong":
+                        echo = data.get("echo")
+                        if echo is not None:
+                            sent_mono = ping_pending.pop(int(float(echo) * 1000), None)
+                            if sent_mono is not None:
+                                with self._lock:
+                                    self._rc_rtt_ms = round((time.monotonic() - sent_mono) * 1000.0, 1)
             except Exception as e:
                 if self._running:
                     print(f"[WS] {self.drone_id} rc reconnect: {e}")
@@ -1927,7 +1987,7 @@ HTML = """
     arcPoll();
     // Version marker — if this string doesn't appear in the DOM,
     // you're running stale JS (restart the Python server or hard-refresh).
-    const BUILD = 'bd-websocket-channel';
+    const BUILD = 'be-ws-latency-fix';
     console.log('[arc] init complete, build=' + BUILD);
     const ver = document.createElement('span');
     ver.id = 'arc_build_tag';
@@ -3109,6 +3169,7 @@ async function resumeAllDrones(source) {
         el.style.background = '#064e3b';
         el.style.color = '#86efac';
         const parts = [];
+        if (st.rc_rtt_ms       != null) parts.push('rc ' + st.rc_rtt_ms + 'ms');
         if (st.telemetry_age_ms != null) parts.push('tel ' + st.telemetry_age_ms + 'ms');
         if (st.position_age_ms  != null) parts.push('pos ' + st.position_age_ms  + 'ms');
         el.textContent = 'WS \u2713 ' + parts.join(' · ');
@@ -5961,17 +6022,25 @@ def proxy_drones_config_save():
     return jsonify(ok=True, drones=DRONES)
 
 
+# WS-for-RC can be disabled at boot with C2_WS_RC=0. The HTTP path is
+# measured and reliable; WS gains are ~3-15 ms but any misconfiguration
+# can make it slower than HTTP. Flip this to 0 if WASD feels sluggish
+# and you want the old behaviour back without rebuilding.
+WS_RC_ENABLED = os.getenv("C2_WS_RC", "1") not in {"0", "false", "False"}
+
+
 @app.post("/proxy/key_down")
 def proxy_key_down():
     data = request.get_json(silent=True) or {}
     log_command("key_down", data)
-    # WS fast path — per-key RTT on a persistent socket is ~1ms vs
-    # ~5-15ms for a fresh HTTP POST over wireless. Fall back to HTTP
-    # transparently when the WS isn't connected.
-    k = str(data.get("key", ""))
-    ws = drone_ws.get(str(active_drone_id))
-    if ws and ws.send_key(k, "down"):
-        return jsonify(ok=True, via="ws")
+    # WS fast path — persistent socket with TCP_NODELAY, fire-and-forget
+    # (no ACKs). Falls back transparently to HTTP when not connected or
+    # when WS_RC_ENABLED=0.
+    if WS_RC_ENABLED:
+        k = str(data.get("key", ""))
+        ws = drone_ws.get(str(active_drone_id))
+        if ws and ws.send_key(k, "down"):
+            return jsonify(ok=True, via="ws")
     r = pi_post("/api/key_down", data)
     return (r.text, r.status_code, {"Content-Type": r.headers.get("Content-Type", "application/json")})
 
@@ -5980,10 +6049,11 @@ def proxy_key_down():
 def proxy_key_up():
     data = request.get_json(silent=True) or {}
     log_command("key_up", data)
-    k = str(data.get("key", ""))
-    ws = drone_ws.get(str(active_drone_id))
-    if ws and ws.send_key(k, "up"):
-        return jsonify(ok=True, via="ws")
+    if WS_RC_ENABLED:
+        k = str(data.get("key", ""))
+        ws = drone_ws.get(str(active_drone_id))
+        if ws and ws.send_key(k, "up"):
+            return jsonify(ok=True, via="ws")
     r = pi_post("/api/key_up", data)
     return (r.text, r.status_code, {"Content-Type": r.headers.get("Content-Type", "application/json")})
 
