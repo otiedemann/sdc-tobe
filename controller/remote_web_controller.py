@@ -2262,7 +2262,7 @@ HTML = """
     arcPoll();
     // Version marker — if this string doesn't appear in the DOM,
     // you're running stale JS (restart the Python server or hard-refresh).
-    const BUILD = 'cb-camera-face-center';
+    const BUILD = 'cc-flight-log-viewer';
     console.log('[arc] init complete, build=' + BUILD);
     const ver = document.createElement('span');
     ver.id = 'arc_build_tag';
@@ -3793,12 +3793,16 @@ async function resumeAllDrones(source) {
         return;
       }
       list.innerHTML = j.files.map(f =>
-        '<div style="display:flex;gap:10px;padding:2px 0;">' +
+        '<div style="display:flex;gap:10px;padding:2px 0;align-items:center;">' +
           '<span style="flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">' +
             '<a href="/proxy/flight_logs/' + encodeURIComponent(f.name) + '" ' +
                'style="color:#38bdf8;text-decoration:none;" title="Download ' + f.name + '">' +
                f.name + '</a>' +
           '</span>' +
+          '<a href="/flight_log_viewer?file=' + encodeURIComponent(f.name) + '" ' +
+             'target="_blank" ' +
+             'style="color:#fbbf24;text-decoration:none;font-weight:600;" ' +
+             'title="Open replay viewer in a new tab">&#128065; View</a>' +
           '<span style="color:#94a3b8;width:70px;text-align:right;">' + fmtSize(f.size) + '</span>' +
           '<span style="color:#64748b;width:70px;text-align:right;">' + fmtAge(f.mtime) + '</span>' +
         '</div>'
@@ -7688,8 +7692,26 @@ def proxy_flight_logs_download(name):
     p = flight_logger.file_path(name)
     if p is None:
         return jsonify(ok=False, error="file not found"), 404
+    # Inline when "as_attachment=false" so the viewer can fetch-and-parse
+    # rather than trigger a download.
+    as_att = request.args.get("dl", "1") != "0"
     return send_file(str(p), mimetype="application/jsonlines",
-                     as_attachment=True, download_name=p.name)
+                     as_attachment=as_att, download_name=p.name)
+
+
+@app.get("/flight_log_viewer")
+def serve_flight_log_viewer():
+    """Interactive replay UI for flight logs.
+
+    Opens ?file=<name> auto-loaded via /proxy/flight_logs/<name>?dl=0.
+    Visualises trajectory + events + timeline so an operator can scrub
+    through a flight and see exactly where something went wrong.
+    """
+    from pathlib import Path as _P
+    p = _P(__file__).with_name("flight_log_viewer.html")
+    if not p.exists():
+        return jsonify(ok=False, error="viewer html missing"), 404
+    return send_file(str(p), mimetype="text/html", max_age=0)
 
 
 @app.get("/proxy/config/ceiling")
