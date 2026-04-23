@@ -233,3 +233,7 @@ __marimo__/
 /controller/logs/
 !/controller/logs/.gitkeep
 
+# Per-flight automatic logs (FlightLogger — one JSONL per drone per flight)
+/controller/flight_logs/
+/flight_logs/
+

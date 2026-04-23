@@ -313,6 +313,12 @@ STICK = 60
 YAW_STICK_ANAFI = 90
 MAX_YAW_SPEED = 150
 MAX_ALTITUDE_M = float(os.getenv("MAX_ALTITUDE_M", "5.0"))
+# Hard ceiling guard — runtime state surfaced via /api/config/ceiling and
+# read in the RC tick loop. `_ceiling_engaged` flashes True whenever the
+# guard clamps or overrides an RC command; `_ceiling_last_reason` is a
+# human-readable explanation surfaced in /api/telemetry for UI banners.
+_ceiling_engaged: bool = False
+_ceiling_last_reason: str = ""
 MAX_VERTICAL_SPEED = float(os.getenv("MAX_VERTICAL_SPEED", "0.5"))
 MAX_TILT = float(os.getenv("MAX_TILT", "15"))
 CONNECT_RETRY_S = 3.0
@@ -2831,12 +2837,77 @@ def rc_loop():
             elif rc_override is not None:
                 rc_override = None
 
-        # Altitude fence (Anafi)
-        if b.has_altitude_fence():
-            with telemetry_lock:
-                cur_h = telemetry.get("height_cm")
-            if cur_h is not None and cur_h >= MAX_ALTITUDE_M * 100 and ud > 0:
-                ud = 0
+        # ══════════════════════════════════════════════════════════════
+        # Hard altitude ceiling — active in BOTH manual and autonomous flight.
+        #
+        # Our drone crashed into the roof once because:
+        #   - The firmware MaxAltitude setting can be relaxed / ignored
+        #     in indoor mode (where there's no GPS, only TOF/baro).
+        #   - The old fence only zeroed positive ud when already at/above
+        #     ceiling — no anticipation, no forced descent.
+        #
+        # New behaviour:
+        #   - approaching zone  (h ≥ ceiling − APPROACH_MARGIN)  → clamp ud
+        #                                                         proportionally
+        #                                                         to remaining
+        #                                                         clearance.
+        #   - at ceiling        (h ≥ ceiling)                   → block all
+        #                                                         upward RC.
+        #   - above ceiling     (h ≥ ceiling + HARD_OVERSHOOT)   → force
+        #                                                         active descent
+        #                                                         regardless of
+        #                                                         any input. The
+        #                                                         drone yields
+        #                                                         before the
+        #                                                         pilot does.
+        #
+        # Applies unconditionally (no has_altitude_fence() gate) because we
+        # don't care whether the firmware thinks it has a fence — height_cm
+        # comes from TOF/baro and is what matters.
+        global _ceiling_engaged, _ceiling_last_reason
+        with telemetry_lock:
+            cur_h_cm = telemetry.get("height_cm")
+        _ceiling_engaged = False
+        _ceiling_last_reason = ""
+        if cur_h_cm is not None:
+            ceil_cm = max(30, int(MAX_ALTITUDE_M * 100))
+            APPROACH_MARGIN_CM = 50   # start easing off 50 cm below ceiling
+            HARD_OVERSHOOT_CM = 20    # force descent if >20 cm above ceiling
+            DESCENT_RC = 18           # gentle but authoritative push-down
+            over_cm = cur_h_cm - ceil_cm
+            if over_cm >= HARD_OVERSHOOT_CM:
+                # Already above the ceiling by a meaningful margin — stop
+                # arguing with the operator, push the drone down ourselves.
+                ud = -max(DESCENT_RC, abs(int(ud))) if ud < 0 else -DESCENT_RC
+                _ceiling_engaged = True
+                _ceiling_last_reason = (
+                    f"above ceiling: {cur_h_cm/100:.2f}m > {MAX_ALTITUDE_M:.2f}m, forcing descent"
+                )
+            elif over_cm >= 0:
+                # Right at or just above — block any climb, allow descent.
+                if ud > 0:
+                    ud = 0
+                _ceiling_engaged = True
+                _ceiling_last_reason = (
+                    f"at ceiling: {cur_h_cm/100:.2f}m ≥ {MAX_ALTITUDE_M:.2f}m, climb blocked"
+                )
+            elif over_cm >= -APPROACH_MARGIN_CM and ud > 0:
+                # Approaching — clamp proportionally. 50cm→full input,
+                # 0cm→zero. Prevents the drone from smashing the ceiling
+                # under its own momentum when the pilot releases the stick.
+                remaining = (-over_cm) / APPROACH_MARGIN_CM   # 0..1
+                cap = max(1, int(STICK * remaining))
+                if ud > cap:
+                    ud = cap
+                _ceiling_engaged = True
+                _ceiling_last_reason = (
+                    f"approaching ceiling: {cur_h_cm/100:.2f}m, climb capped to {cap}% "
+                    f"(clearance {-over_cm}cm)"
+                )
+        # Soft floor — never let a descent command push us into the ground.
+        FLOOR_CM = 15    # Anafi TOF minimum, roughly
+        if cur_h_cm is not None and cur_h_cm <= FLOOR_CM and ud < 0:
+            ud = 0
 
         with command_lock:
             in_discrete = now < discrete_until
@@ -3890,6 +3961,52 @@ def api_settings_set():
     return jsonify(ok=True, **results)
 
 
+@app.get("/api/config/ceiling")
+def api_ceiling_get():
+    """Return the active soft-ceiling and live guard state. Read every
+    ~500 ms by the UI so operators can see clamping happening in real
+    time."""
+    return jsonify(
+        ok=True,
+        ceiling_m=round(float(MAX_ALTITUDE_M), 2),
+        engaged=bool(_ceiling_engaged),
+        reason=_ceiling_last_reason,
+    )
+
+
+@app.post("/api/config/ceiling")
+def api_ceiling_set():
+    """Set the soft ceiling (metres above ground). Also pushes the same
+    value to the Anafi firmware MaxAltitude where supported — belt and
+    braces, because the firmware limit gets enforced by the drone's own
+    autopilot and is a useful second line of defence."""
+    global MAX_ALTITUDE_M
+    data = request.get_json(silent=True) or {}
+    try:
+        v = float(data.get("ceiling_m") or data.get("max_altitude_m"))
+    except (TypeError, ValueError):
+        return jsonify(ok=False, error="ceiling_m required (float, metres)"), 400
+    v = max(0.5, min(150.0, v))
+    MAX_ALTITUDE_M = v
+    firmware_result = None
+    # Also try to apply the firmware cap — don't let its failure veto
+    # the software ceiling, since the software one is the real safety.
+    b = backend
+    try:
+        if b is not None and hasattr(b, "set_settings"):
+            r = b.set_settings({"max_altitude_m": v})
+            firmware_result = r.get("max_altitude_m", r.get("max_altitude_m_error"))
+    except Exception as e:
+        firmware_result = f"firmware_error: {e}"
+    # Persist so a server restart keeps the value
+    try:
+        _save_flight_config({"max_altitude_m": v})
+    except Exception:
+        pass
+    print(f"[CEILING] set to {v}m (firmware={firmware_result})")
+    return jsonify(ok=True, ceiling_m=v, firmware_result=firmware_result)
+
+
 # --- Telemetry endpoints ---
 @app.get("/api/telemetry")
 def api_telemetry():
@@ -3905,6 +4022,10 @@ def api_telemetry():
         payload["connected"] = bool(conn_state.get("connected", False))
         payload["reconnect_failures"] = int(conn_state.get("consecutive_failures", 0))
         payload["reconnect_last_error"] = conn_state.get("last_error", "") or ""
+    # Ceiling guard state — UI banners + flight logs consume this
+    payload["ceiling_m"] = round(float(MAX_ALTITUDE_M), 2)
+    payload["ceiling_engaged"] = bool(_ceiling_engaged)
+    payload["ceiling_reason"] = _ceiling_last_reason or ""
     # Magnetometer calibration status (Anafi only) so the C2 can show a
     # "CAL NEEDED" indicator. Read defensively because older Olympe versions
     # may not have the calibration messages at all.

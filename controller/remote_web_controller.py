@@ -135,6 +135,228 @@ command_log_enabled = os.getenv("REMOTE_COMMAND_LOG", "0") in {"1", "true", "Tru
 command_log_path = Path(os.getenv("REMOTE_COMMAND_LOG_PATH", "remote_command_log.jsonl"))
 command_log_last: dict[str, float] = {}
 
+# ── Automatic per-flight logging ───────────────────────────────────────
+# Every take-off opens a fresh JSONL file under FLIGHT_LOG_DIR; every
+# land (or loss-of-flying-state) closes it. Records are either
+# "tick" (5 Hz telemetry + position + visible markers) or "cmd"
+# (every command logged through log_command). Files are readable via
+# /proxy/flight_logs (list + download).
+FLIGHT_LOG_DIR = Path(os.getenv("FLIGHT_LOG_DIR", "flight_logs")).resolve()
+FLIGHT_LOG_HZ  = float(os.getenv("FLIGHT_LOG_HZ", "5.0"))
+
+
+class FlightLogger:
+    """Per-drone flight logger.
+
+    Runs one background thread that polls /api/telemetry + /api/position +
+    /proxy/aruco/state for every configured drone at FLIGHT_LOG_HZ. On the
+    rising edge of ``flying`` (or airborne detected by height_cm > 30) a
+    new JSONL file is opened; on the falling edge it's closed. Commands
+    logged via ``log_command()`` are funnelled into the active files so
+    every per-flight file is a complete, timestamped audit trail of:
+      - telemetry (battery, attitude, velocity, ceiling state, ...)
+      - fused arena position (x, y, z, dir, vel, stale)
+      - visible ArUco markers (seen + reference lists)
+      - every command sent (takeoff, land, rc, mission-start, pause, ...)
+
+    Files land in ``<FLIGHT_LOG_DIR>/flight_<timestamp>_drone-<id>.jsonl``.
+    """
+
+    def __init__(self, drones: dict, session, log_dir: Path, hz: float = 5.0):
+        self.drones  = drones
+        self.session = session
+        self.log_dir = log_dir
+        self.period  = max(0.1, 1.0 / float(hz or 5.0))
+        self._flights: dict[str, dict] = {}
+        self._lock    = threading.Lock()
+        self._running = False
+        self.log_dir.mkdir(parents=True, exist_ok=True)
+
+    def start(self):
+        if self._running:
+            return
+        self._running = True
+        t = threading.Thread(target=self._loop, daemon=True, name="flight-logger")
+        t.start()
+        print(f"[FLIGHT_LOG] started, dir={self.log_dir}, period={self.period:.2f}s")
+
+    def stop(self):
+        self._running = False
+        with self._lock:
+            for did in list(self._flights.keys()):
+                self._close_unlocked(did, reason="shutdown")
+
+    # Public — called from log_command
+    def record_command(self, drone_id, event: str, payload: dict | None):
+        """Append a command record to the active flight log(s). If
+        drone_id is None we broadcast to every active flight (fleet-wide
+        commands like PAUSE_ALL / LAND_ALL apply to all airborne drones)."""
+        if not self._running:
+            return
+        did = str(drone_id) if drone_id else None
+        with self._lock:
+            targets = [did] if did and did in self._flights else list(self._flights.keys())
+            for d in targets:
+                flt = self._flights.get(d)
+                if not flt:
+                    continue
+                self._write_unlocked(flt, {
+                    "type":    "cmd",
+                    "ts":      time.time(),
+                    "drone_id": d,
+                    "event":   event,
+                    "payload": payload or {},
+                })
+
+    def list_files(self) -> list[dict]:
+        """For /proxy/flight_logs — list all flight files with basic meta."""
+        out = []
+        try:
+            for p in sorted(self.log_dir.glob("flight_*.jsonl"), reverse=True):
+                try:
+                    st = p.stat()
+                    out.append({
+                        "name": p.name,
+                        "size": st.st_size,
+                        "mtime": st.st_mtime,
+                    })
+                except Exception:
+                    continue
+        except Exception:
+            pass
+        return out
+
+    def file_path(self, name: str) -> Path | None:
+        """Resolve a filename to a path inside log_dir. Rejects path
+        traversal attempts."""
+        p = (self.log_dir / name).resolve()
+        try:
+            p.relative_to(self.log_dir)
+        except ValueError:
+            return None
+        return p if p.exists() else None
+
+    # ── internals ──
+    def _loop(self):
+        while self._running:
+            t0 = time.time()
+            try:
+                self._tick()
+            except Exception as e:
+                print(f"[FLIGHT_LOG] tick error: {e}")
+            dt = time.time() - t0
+            time.sleep(max(0.02, self.period - dt))
+
+    def _tick(self):
+        for did, info in list(self.drones.items()):
+            did  = str(did)
+            base = (info or {}).get("base")
+            if not base:
+                continue
+            try:
+                tr  = self.session.get(f"{base.rstrip('/')}/api/telemetry", timeout=1.0)
+                tel = tr.json() if tr.ok else {}
+            except Exception:
+                tel = {}
+            try:
+                pr  = self.session.get(f"{base.rstrip('/')}/api/position", timeout=0.5)
+                pos = pr.json() if pr.ok else {}
+            except Exception:
+                pos = {}
+
+            # Airborne detection: trust "flying" but fall back to height_cm
+            flying   = bool(tel.get("flying"))
+            height_cm = (tel.get("height_cm") or 0)
+            airborne = flying or (height_cm and height_cm > 30)
+
+            with self._lock:
+                flt = self._flights.get(did)
+                if airborne and flt is None:
+                    self._open_unlocked(did, tel)
+                    flt = self._flights.get(did)
+                elif not airborne and flt is not None:
+                    self._write_unlocked(flt, {
+                        "type": "land", "ts": time.time(), "drone_id": did,
+                        "telemetry": tel,
+                    })
+                    self._close_unlocked(did, reason="landed")
+                    flt = None
+                if flt is None:
+                    continue
+                # Active flight — emit a tick record
+                # Pull visible markers from the ArUco observer if we have one.
+                vis_markers = []
+                try:
+                    obs = aruco_fleet.get(did)
+                    if obs is not None:
+                        st = obs.get_state()
+                        vis_markers = st.get("visible_ids") or []
+                except Exception:
+                    pass
+                rec = {
+                    "type":    "tick",
+                    "ts":      time.time(),
+                    "drone_id": did,
+                    "telemetry": {k: tel.get(k) for k in (
+                        "battery", "height_cm", "altitude_m", "flying",
+                        "connected", "yaw", "pitch", "roll",
+                        "vgx", "vgy", "vgz", "agx", "agy", "agz",
+                        "ceiling_m", "ceiling_engaged", "ceiling_reason",
+                        "state_age_s", "state_fresh",
+                    ) if k in tel},
+                    "position": pos.get("pos"),
+                    "direction": pos.get("dir"),
+                    "pos_vel": pos.get("vel"),
+                    "pos_stale": pos.get("stale"),
+                    "visible_markers": vis_markers,
+                    "ref_markers":  pos.get("ref_markers") or [],
+                    "seen_markers": pos.get("seen_markers") or [],
+                }
+                self._write_unlocked(flt, rec)
+
+    def _open_unlocked(self, did: str, tel: dict):
+        ts = time.strftime("%Y-%m-%d_%H-%M-%S", time.localtime())
+        name = (self.drones.get(did, {}).get("name") or did).replace(" ", "_")
+        path = self.log_dir / f"flight_{ts}_drone-{did}_{name}.jsonl"
+        fh = path.open("w", encoding="utf-8", buffering=1)  # line-buffered
+        fh.write(json.dumps({
+            "type": "takeoff", "ts": time.time(), "drone_id": did,
+            "drone_name": self.drones.get(did, {}).get("name"),
+            "telemetry": tel,
+        }, default=str) + "\n")
+        self._flights[did] = {
+            "fh": fh, "path": path, "opened_at": time.time(), "records": 1,
+        }
+        print(f"[FLIGHT_LOG] takeoff → {path}")
+
+    def _close_unlocked(self, did: str, reason: str = "landed"):
+        flt = self._flights.pop(did, None)
+        if flt is None:
+            return
+        try:
+            dur = time.time() - flt["opened_at"]
+            flt["fh"].write(json.dumps({
+                "type": "close", "ts": time.time(), "reason": reason,
+                "duration_s": round(dur, 2), "records": flt["records"],
+            }) + "\n")
+            flt["fh"].close()
+        except Exception:
+            pass
+        print(f"[FLIGHT_LOG] closed {flt['path']} "
+              f"(reason={reason}, records={flt['records']}, "
+              f"duration={time.time() - flt['opened_at']:.1f}s)")
+
+    def _write_unlocked(self, flt: dict, rec: dict):
+        try:
+            flt["fh"].write(json.dumps(rec, default=str) + "\n")
+            flt["records"] += 1
+        except Exception as e:
+            print(f"[FLIGHT_LOG] write error: {e}")
+
+
+flight_logger = FlightLogger(DRONES, _http_session, FLIGHT_LOG_DIR, FLIGHT_LOG_HZ)
+flight_logger.start()
+
 HTML = """
 <!doctype html>
 <html>
@@ -475,6 +697,24 @@ HTML = """
   <div id=\"global_pause_banner\" style=\"display:none;background:#ca8a04;color:#1c1917;padding:8px 14px;margin-top:6px;border-radius:6px;font-weight:700;letter-spacing:0.04em;text-align:center;box-shadow:0 0 0 2px #facc15 inset;animation:pausepulse 1.4s ease-in-out infinite;\">
     &#9208;&#65039; PAUSED &mdash; autonomous control is disabled. Drones hover at current position. Only WASD / manual RC is live. Press <b>CONTINUE MISSION</b> or <b>9</b> to resume.
   </div>
+  <!-- Ceiling guard — enforced on every drone server-side in the RC tick
+       loop. Applies to both manual WASD and autonomous missions. Default
+       5 m above ground; adjustable. When ANY drone is at/near its ceiling,
+       the banner below pulses red. -->
+  <div style=\"display:flex;align-items:center;gap:10px;margin-top:6px;padding:4px 10px;background:#0b1424;border:1px solid #1e293b;border-radius:5px;font-size:12px;\">
+    <span style=\"color:#fca5a5;font-weight:600;letter-spacing:0.04em;\">&#128737;&#65039; Ceiling</span>
+    <label style=\"color:#94a3b8;display:flex;align-items:center;gap:4px;cursor:pointer;\" title=\"Hard maximum altitude above ground. Enforced in the Pi's RC tick loop during BOTH manual and autonomous flight. Active descent is forced if the drone overshoots.\">
+      max
+      <input id=\"ceiling_input\" type=\"number\" min=\"0.5\" max=\"20\" step=\"0.1\" value=\"5.0\" style=\"width:64px;height:26px;font-size:12px;\" />
+      m
+      <span class=\"info-icon\" data-info=\"ceiling_m\">i</span>
+    </label>
+    <button id=\"ceiling_apply_btn\" style=\"height:26px;font-size:11px;padding:0 10px;background:#7f1d1d;border-color:#ef4444;color:#fee2e2;\" title=\"Push this ceiling to every drone's Pi. Also updates the Anafi firmware MaxAltitude as a second-line defence.\">Apply to fleet</button>
+    <span id=\"ceiling_status\" class=\"small\" style=\"color:#64748b;\"></span>
+    <span id=\"ceiling_engaged_badge\" class=\"small\" style=\"display:none;color:#fde68a;background:#7f1d1d;padding:2px 8px;border-radius:4px;font-weight:700;letter-spacing:0.04em;animation:pausepulse 1.0s ease-in-out infinite;\">
+      &#128680; CEILING ENGAGED
+    </span>
+  </div>
   <div id=\"drone_config_modal\" style=\"display:none;position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,0.7);z-index:1000;justify-content:center;align-items:center;\">
     <div style=\"background:#1e293b;border:1px solid #334155;border-radius:8px;padding:20px;max-width:700px;width:90%;max-height:80vh;overflow-y:auto;\">
       <h3 style=\"margin:0 0 12px 0;color:#e2e8f0;\">Drone Fleet Configuration</h3>
@@ -627,6 +867,19 @@ HTML = """
         <button id=\"toggle_cmd_log\">Command Logging: OFF</button>
         <button id=\"download_cmd_log\">Download Command Log</button>
         <button id=\"clear_cmd_log\">Clear Command Log</button>
+      </div>
+      <!-- Automatic per-flight logs — a fresh JSONL file per takeoff → land
+           pair, containing telemetry + commands + arena position + visible
+           ArUco markers. Archived list below; click a row to download. -->
+      <div class=\"adv\" style=\"margin-top:10px;\">
+        <div class=\"small\" style=\"margin-bottom:6px;\">
+          <b>Flight Logs</b> <span style=\"color:#64748b;\">— auto-recorded per takeoff</span>
+          <button id=\"flight_logs_refresh\" style=\"height:24px;font-size:11px;padding:0 8px;margin-left:10px;background:#1e293b;\">Refresh</button>
+        </div>
+        <div id=\"flight_logs_list\" class=\"small\"
+             style=\"font-family:monospace;font-size:11px;max-height:180px;overflow-y:auto;border:1px solid #334155;border-radius:4px;padding:6px;background:#0b1220;color:#cbd5e1;\">
+          <i style=\"color:#64748b;\">loading…</i>
+        </div>
       </div>
       <div class=\"adv\">
         <div class=\"small\" style=\"margin-bottom:6px;\">Advanced SDK controls</div>
@@ -1375,7 +1628,7 @@ HTML = """
     arcPoll();
     // Version marker — if this string doesn't appear in the DOM,
     // you're running stale JS (restart the Python server or hard-refresh).
-    const BUILD = 'bb-fleet-3d-panic-rotate';
+    const BUILD = 'bc-ceiling-flight-logs';
     console.log('[arc] init complete, build=' + BUILD);
     const ver = document.createElement('span');
     ver.id = 'arc_build_tag';
@@ -2524,6 +2777,110 @@ async function resumeAllDrones(source) {
   }
   tick();
   setInterval(tick, 2000);
+})();
+
+// ── Flight Logs list ──────────────────────────────────────────────────
+// Lists archived per-flight JSONL files. Polls occasionally so a live
+// recording's size updates visibly (the file grows as ticks accumulate).
+(function wireFlightLogs(){
+  const list = document.getElementById('flight_logs_list');
+  const btn  = document.getElementById('flight_logs_refresh');
+  if (!list) return;
+  function fmtSize(n) {
+    if (n < 1024) return n + ' B';
+    if (n < 1024*1024) return (n/1024).toFixed(1) + ' KB';
+    return (n/1024/1024).toFixed(2) + ' MB';
+  }
+  function fmtAge(ts) {
+    const dt = Math.max(0, Date.now()/1000 - ts);
+    if (dt < 60) return Math.round(dt) + 's ago';
+    if (dt < 3600) return Math.round(dt/60) + 'm ago';
+    if (dt < 86400) return Math.round(dt/3600) + 'h ago';
+    return Math.round(dt/86400) + 'd ago';
+  }
+  async function refresh() {
+    try {
+      const r = await fetch('/proxy/flight_logs');
+      const j = await r.json();
+      if (!j.files || !j.files.length) {
+        list.innerHTML = '<i style="color:#64748b;">no flights recorded yet</i>';
+        return;
+      }
+      list.innerHTML = j.files.map(f =>
+        '<div style="display:flex;gap:10px;padding:2px 0;">' +
+          '<span style="flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">' +
+            '<a href="/proxy/flight_logs/' + encodeURIComponent(f.name) + '" ' +
+               'style="color:#38bdf8;text-decoration:none;" title="Download ' + f.name + '">' +
+               f.name + '</a>' +
+          '</span>' +
+          '<span style="color:#94a3b8;width:70px;text-align:right;">' + fmtSize(f.size) + '</span>' +
+          '<span style="color:#64748b;width:70px;text-align:right;">' + fmtAge(f.mtime) + '</span>' +
+        '</div>'
+      ).join('');
+    } catch (e) {
+      list.innerHTML = '<i style="color:#ef4444;">error: ' + e + '</i>';
+    }
+  }
+  if (btn) btn.onclick = refresh;
+  refresh();
+  setInterval(refresh, 15000);  // 15s — enough to see new flights appear
+})();
+
+// ── Ceiling safety wiring ─────────────────────────────────────────────
+// The ceiling is enforced on the Pi (can't be bypassed by client code),
+// but the UI mirrors its value and flashes an alert banner when the
+// guard is actively clamping any drone. Poll every ~1 s so operators
+// see engagement immediately on overshoot.
+(function wireCeiling(){
+  const inp = document.getElementById('ceiling_input');
+  const btn = document.getElementById('ceiling_apply_btn');
+  const badge = document.getElementById('ceiling_engaged_badge');
+  const status = document.getElementById('ceiling_status');
+  async function load() {
+    try {
+      const r = await fetch('/proxy/config/ceiling', {cache:'no-store'});
+      const j = await r.json();
+      if (j && typeof j.ceiling_m === 'number') {
+        // Only update the input if the operator isn't currently editing it
+        if (document.activeElement !== inp) inp.value = Number(j.ceiling_m).toFixed(1);
+      }
+      if (badge) badge.style.display = j.engaged ? '' : 'none';
+      if (status) {
+        if (j.engaged && j.reasons && j.reasons.length) {
+          status.textContent = '\u26a0 ' + j.reasons[0];
+          status.style.color = '#fbbf24';
+        } else {
+          status.textContent = '';
+        }
+      }
+    } catch {}
+  }
+  if (btn) btn.onclick = async () => {
+    const v = parseFloat(inp.value);
+    if (!isFinite(v) || v < 0.5 || v > 20) {
+      status.textContent = 'enter 0.5 - 20 m';
+      status.style.color = '#ef4444';
+      return;
+    }
+    status.textContent = 'applying...';
+    status.style.color = '#94a3b8';
+    try {
+      const r = await fetch('/proxy/config/ceiling', {
+        method:'POST',
+        headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({ceiling_m: v}),
+      });
+      const j = await r.json();
+      status.textContent = '\u2713 ' + (j.applied || 0) + '/' + (j.total || 0) + ' drones → ' + v + ' m';
+      status.style.color = '#22c55e';
+      console.log('[CEILING] apply result:', j);
+    } catch (err) {
+      status.textContent = 'failed: ' + err;
+      status.style.color = '#ef4444';
+    }
+  };
+  load();
+  setInterval(load, 1000);   // 1 Hz — fast enough to flash engagement
 })();
 
 // Fleet-wide panic land — used by the 'q' hotkey and the big red
@@ -4339,6 +4696,21 @@ window.PARAM_INFO = {
     "but may lag).\\n\\n"+
     "Default 1e-1. Large markers at short range can use 1e-2; noisy, "+
     "distant markers may benefit from 3e-1."},
+
+  // ===== Safety =====
+  ceiling_m: {title:'Hard altitude ceiling', units:'metres', body:
+    "Maximum altitude above ground. Enforced server-side on every Pi, in "+
+    "the RC tick loop that drives the Anafi's PCMD. Applies to BOTH "+
+    "manual WASD and autonomous missions — no command path bypasses it.\\n\\n"+
+    "Behaviour:\\n"+
+    "  • approaching (within 50 cm): climb RC clamped proportionally to "+
+    "remaining clearance.\\n"+
+    "  • at ceiling: all climb blocked.\\n"+
+    "  • above ceiling (+20 cm): forced active descent regardless of any "+
+    "input.\\n\\n"+
+    "Default 5 m. The firmware MaxAltitude is also set to this value as "+
+    "a second line of defence — the software guard runs continuously "+
+    "regardless of GPS/indoor mode."},
 };
 
 window.showParamInfo = function(key, ev) {
@@ -5109,6 +5481,17 @@ let ARENA_W_dyn = 20, ARENA_D_dyn = 10;
 
 
 def log_command(event: str, payload: dict | None = None):
+    # Always feed the per-flight logger — that path runs regardless of the
+    # optional debug command log file. When no drones are airborne the
+    # call is a cheap no-op.
+    try:
+        did = None
+        if payload is not None:
+            did = payload.get("id") or payload.get("drone_id")
+        flight_logger.record_command(did, event, payload)
+    except Exception:
+        pass
+
     if not command_log_enabled:
         return
     try:
@@ -5331,6 +5714,86 @@ def proxy_land_all():
         mission_stopped=mission_stopped,
         results=results,
     )
+
+
+@app.get("/proxy/flight_logs")
+def proxy_flight_logs_list():
+    """List archived per-flight log files (newest first)."""
+    return jsonify(ok=True, files=flight_logger.list_files())
+
+
+@app.get("/proxy/flight_logs/<path:name>")
+def proxy_flight_logs_download(name):
+    p = flight_logger.file_path(name)
+    if p is None:
+        return jsonify(ok=False, error="file not found"), 404
+    return send_file(str(p), mimetype="application/jsonlines",
+                     as_attachment=True, download_name=p.name)
+
+
+@app.get("/proxy/config/ceiling")
+def proxy_ceiling_get():
+    """Aggregate the soft ceiling and engaged state from every drone in
+    the fleet. Returns the minimum ceiling across drones (most
+    conservative) and engaged=True if ANY drone is currently clamped."""
+    results = {}
+    any_engaged = False
+    min_ceiling = None
+    reasons = []
+    for did, info in DRONES.items():
+        base = (info or {}).get("base")
+        if not base:
+            results[str(did)] = {"ok": False, "error": "no base url"}
+            continue
+        try:
+            r = _http_session.get(f"{base.rstrip('/')}/api/config/ceiling", timeout=1.0)
+            j = r.json()
+            results[str(did)] = j
+            if j.get("engaged"):
+                any_engaged = True
+                if j.get("reason"):
+                    reasons.append(f"{did}: {j['reason']}")
+            if j.get("ceiling_m") is not None:
+                c = float(j["ceiling_m"])
+                if min_ceiling is None or c < min_ceiling:
+                    min_ceiling = c
+        except Exception as e:
+            results[str(did)] = {"ok": False, "error": str(e)[:120]}
+    return jsonify(
+        ok=True,
+        ceiling_m=min_ceiling,
+        engaged=any_engaged,
+        reasons=reasons,
+        per_drone=results,
+    )
+
+
+@app.post("/proxy/config/ceiling")
+def proxy_ceiling_set():
+    """Push a new soft ceiling to every drone in the fleet. Body:
+        {"ceiling_m": <float, metres>}
+    """
+    data = request.get_json(silent=True) or {}
+    try:
+        v = float(data.get("ceiling_m") or data.get("max_altitude_m"))
+    except (TypeError, ValueError):
+        return jsonify(ok=False, error="ceiling_m required"), 400
+    log_command("ceiling_set", {"ceiling_m": v})
+    results = {}
+    for did, info in DRONES.items():
+        base = (info or {}).get("base")
+        if not base:
+            results[str(did)] = {"ok": False, "error": "no base url"}
+            continue
+        try:
+            r = _http_session.post(f"{base.rstrip('/')}/api/config/ceiling",
+                                   json={"ceiling_m": v}, timeout=2.0)
+            results[str(did)] = r.json()
+        except Exception as e:
+            results[str(did)] = {"ok": False, "error": str(e)[:120]}
+    ok_count = sum(1 for v in results.values() if v.get("ok"))
+    print(f"[CEILING] fleet-wide set to {v}m: {ok_count}/{len(results)} drones acknowledged")
+    return jsonify(ok=True, ceiling_m=v, applied=ok_count, total=len(results), results=results)
 
 
 @app.post("/proxy/pause_all")
