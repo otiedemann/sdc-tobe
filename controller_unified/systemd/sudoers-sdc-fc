@@ -1,0 +1,29 @@
+# /etc/sudoers.d/sdc-fc — installed by controller_unified/systemd/install.sh
+#
+# Grants the sdc user passwordless sudo for the FC-management commands
+# below, so remote operators can re-run install.sh and (re)start the
+# flight controller without typing a password. Everything else still
+# requires a password.
+
+Cmnd_Alias SDC_FC_SYSTEMCTL = /usr/bin/systemctl start sdc-fc.service, \
+                              /usr/bin/systemctl stop sdc-fc.service, \
+                              /usr/bin/systemctl restart sdc-fc.service, \
+                              /usr/bin/systemctl enable sdc-fc.service, \
+                              /usr/bin/systemctl disable sdc-fc.service, \
+                              /usr/bin/systemctl reset-failed sdc-fc.service, \
+                              /usr/bin/systemctl reset-failed sdc-fc, \
+                              /usr/bin/systemctl daemon-reload, \
+                              /usr/bin/systemctl edit sdc-fc.service, \
+                              /usr/bin/systemctl status sdc-fc.service
+Cmnd_Alias SDC_FC_INSTALL   = /home/sdc/sdc-tobe/controller_unified/systemd/install.sh
+sdc ALL=(root) NOPASSWD: SDC_FC_SYSTEMCTL, SDC_FC_INSTALL
+
+# ── Blanket alternative (NOT recommended) ──────────────────────────
+# If you need passwordless sudo for arbitrary commands on this box,
+# replace the scoped rule above with the line below and re-run
+# install.sh. This lets ANY process running as `sdc` — including the
+# flight-controller server itself — escalate to root; if the server is
+# ever compromised through a malicious API request, the attacker gets
+# root on the box.
+#
+# sdc ALL=(ALL) NOPASSWD: ALL

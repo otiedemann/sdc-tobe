@@ -34,6 +34,20 @@ install -m 0644 "$HERE/sdc-fc.service" /etc/systemd/system/sdc-fc.service
 systemctl daemon-reload
 systemctl enable sdc-fc.service
 
+# Passwordless sudo for the sdc user, scoped to FC-management commands.
+# Validate with visudo -c BEFORE installing — a bad sudoers drop-in can
+# lock the box out of sudo entirely.
+SUDOERS_SRC="$HERE/sudoers-sdc-fc"
+SUDOERS_DST=/etc/sudoers.d/sdc-fc
+if [[ -f "$SUDOERS_SRC" ]]; then
+    if visudo -c -f "$SUDOERS_SRC" >/dev/null; then
+        install -m 0440 -o root -g root "$SUDOERS_SRC" "$SUDOERS_DST"
+        echo "installed $SUDOERS_DST (scoped NOPASSWD for sdc user)"
+    else
+        echo "WARN: $SUDOERS_SRC failed visudo validation — skipping sudoers install"
+    fi
+fi
+
 echo
 echo "installed + enabled. start now without rebooting:"
 echo "    systemctl start sdc-fc.service"

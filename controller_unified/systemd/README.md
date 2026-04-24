@@ -18,6 +18,8 @@ sudo systemctl start sdc-fc.service    # first-time start without reboot
 
 The installer is idempotent — re-run after editing unit files. It also cleans up the legacy two-unit layout (`sdc-fc-update.service`) if an older install ever put one in place.
 
+`install.sh` drops a scoped [`/etc/sudoers.d/sdc-fc`](sudoers-sdc-fc) so the `sdc` user can run the FC-management `systemctl` commands and re-run `install.sh` without a password. Everything else still prompts. Swap to a blanket `NOPASSWD: ALL` by editing the drop-in (there's a commented alternative in the same file) and re-running the installer — but be aware it means a compromised FC server can escalate to root.
+
 ## Operate
 
 ```bash
