@@ -914,21 +914,19 @@ _ARENA_CONFIG_DEFAULT: dict = {
         {"id": 24, "label": "Back D high",  "x":   6.0, "y": 10.0,   "z":  4.0, "wall": "back"},
     ],
     # ── Target boxes ─────────────────────────────────────────────
-    # SDC26 target stickers are 19 cm (vs 50 cm arena markers). IDs ≥ 30.
-    # The map below assigns a team + colour to each ID range; the C2's
-    # "Target Boxes" panel uses it to label detected targets. Editable —
-    # operator can add specific per-ID entries to override a range.
+    # SDC26 target stickers are 19 cm (vs 50 cm arena markers). Only two
+    # teams: Blue and Red. Marker IDs encode team + box number:
+    #   - IDs 31-36 → Blue box 1-6 (first digit 3 = blue)
+    #   - IDs 41-46 → Red  box 1-6 (first digit 4 = red)
+    # The UI derives the box number from `id % 10` and the team name from
+    # the range mapping below.
     "target_marker_size_m": 0.19,
     "target_teams": [
-        {"id_range": [30, 39], "team": "Red",    "color": "#ef4444"},
-        {"id_range": [40, 49], "team": "Blue",   "color": "#3b82f6"},
-        {"id_range": [50, 59], "team": "Green",  "color": "#22c55e"},
-        {"id_range": [60, 69], "team": "Yellow", "color": "#eab308"},
-        {"id_range": [70, 79], "team": "Purple", "color": "#a855f7"},
-        {"id_range": [80, 89], "team": "Orange", "color": "#f97316"},
-        {"id_range": [90, 99], "team": "Cyan",   "color": "#06b6d4"},
+        {"id_range": [31, 36], "team": "Blue", "color": "#3b82f6"},
+        {"id_range": [41, 46], "team": "Red",  "color": "#ef4444"},
     ],
-    # Optional per-ID overrides: {"id": 34, "team": "Red 4", "color": "#..."}
+    # Optional per-ID overrides: {"id": 34, "team": "Blue 4", "color": "#..."}
+    # Leave empty to use the range mapping above.
     "target_overrides": [],
 }
 _arena_cfg: dict = {}
@@ -6255,7 +6253,7 @@ def main():
     print(f"[{tag}] Unified API server: http://{HTTP_HOST}:{HTTP_PORT}")
     print(f"[{tag}] Drone: {drone_type} @ {drone_ip} (auto-reconnect; watchdog={REMOTE_TIMEOUT_S}s)")
     print(f"[{tag}] SDKs available: tello={HAS_TELLO_SDK}, olympe={HAS_OLYMPE_SDK}")
-    print(f"[{tag}] Code version: 2026-04-24-ch (target marker size + ZUPT + target boxes panel)")
+    print(f"[{tag}] Code version: 2026-04-24-ci (Blue/Red target teams only)")
     app.run(host=HTTP_HOST, port=HTTP_PORT, threaded=True, use_reloader=False)
 
 

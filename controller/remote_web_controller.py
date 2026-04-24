@@ -2317,7 +2317,7 @@ HTML = """
     arcPoll();
     // Version marker — if this string doesn't appear in the DOM,
     // you're running stale JS (restart the Python server or hard-refresh).
-    const BUILD = 'cm-target-boxes-zupt';
+    const BUILD = 'cn-scan-and-capture';
     console.log('[arc] init complete, build=' + BUILD);
     const ver = document.createElement('span');
     ver.id = 'arc_build_tag';
@@ -3152,7 +3152,54 @@ HTML = """
       </table>
       <div class=\"small\" style=\"color:#64748b;margin-top:6px;\">
         Team/colour assignments come from <b>Arena Configuration → Target Teams</b>
-        (ID ranges) with optional per-ID overrides. Unknown IDs show as <i>Unknown</i>.
+        (ID ranges) with optional per-ID overrides. SDC26 convention:
+        IDs 31-36 = Blue (box 1-6), IDs 41-46 = Red (box 1-6).
+      </div>
+
+      <!-- ── Scan & Capture Targets mission ─────────────────────────
+           Autonomous: drone takes off (if grounded), rotates 360° to
+           discover the boxes via ArUco, then hands off to the standard
+           CaptureAllTargetsMission which flies over each box for the
+           configured hover time. -->
+      <div style=\"margin-top:10px;padding:8px 10px;background:#0c1a2e;border:1px solid #334155;border-radius:6px;\">
+        <div style=\"display:flex;align-items:center;gap:10px;margin-bottom:6px;\">
+          <b style=\"color:#fbbf24;\">🎯 Scan &amp; Capture Targets</b>
+          <span class=\"small\" style=\"color:#94a3b8;\">
+            rotate to discover, then fly exactly over each box for N seconds
+          </span>
+        </div>
+        <div style=\"display:flex;gap:10px;align-items:center;flex-wrap:wrap;\">
+          <button id=\"scan_cap_start_btn\"
+                  style=\"background:#713f12;border:1px solid #fbbf24;color:#fef3c7;padding:4px 12px;border-radius:4px;cursor:pointer;font-weight:600;\"
+                  title=\"Drone takes off (if needed), rotates 6×60° scanning for target markers, then visits each box in nearest-neighbour order.\">
+            ▶ Start Scan &amp; Capture
+          </button>
+          <button id=\"scan_cap_abort_btn\"
+                  style=\"display:none;background:#450a0a;border:1px solid #b91c1c;color:#fecaca;padding:4px 12px;border-radius:4px;cursor:pointer;font-weight:600;\"
+                  title=\"Abort the scan/capture — drone continues its current moveBy command, then stays airborne.\">
+            ✕ Abort
+          </button>
+          <label class=\"small\" style=\"color:#94a3b8;\">
+            hover <input id=\"scan_cap_hover\" type=\"number\" min=\"1\" max=\"20\" step=\"0.5\" value=\"3\" style=\"width:50px;height:22px;font-size:11px;\" /> s
+          </label>
+          <label class=\"small\" style=\"color:#94a3b8;\">
+            above <input id=\"scan_cap_above\" type=\"number\" min=\"0.5\" max=\"5\" step=\"0.1\" value=\"1.5\" style=\"width:50px;height:22px;font-size:11px;\" /> m
+          </label>
+          <span id=\"scan_cap_status_txt\" class=\"small\" style=\"color:#64748b;\">idle</span>
+        </div>
+        <div id=\"scan_cap_progress\" style=\"display:none;margin-top:6px;\">
+          <div style=\"height:8px;background:#1e293b;border-radius:4px;overflow:hidden;\">
+            <div id=\"scan_cap_progress_bar\" style=\"height:100%;width:0%;background:linear-gradient(90deg,#fbbf24,#f59e0b);transition:width 0.3s;\"></div>
+          </div>
+          <div class=\"small\" style=\"color:#94a3b8;margin-top:4px;\">
+            <span id=\"scan_cap_phase\" style=\"color:#fbbf24;\">—</span>:
+            <span id=\"scan_cap_step\">—</span>
+            <span style=\"color:#64748b;margin-left:8px;\">
+              <span id=\"scan_cap_ndet\">0</span> target(s) found
+              &nbsp;·&nbsp; elapsed <span id=\"scan_cap_elapsed\">0.0</span>s
+            </span>
+          </div>
+        </div>
       </div>
     </div>
   </div>
@@ -5841,23 +5888,30 @@ function updatePosUI(d) {
     if (!tbody || !badge) return;
     const targets = d.targets || {};
     const ids = Object.keys(targets);
-    // Resolve team+colour from the cached arena config.
+    // Resolve team+colour+box-number. SDC26 convention:
+    //   - Marker ID = 10·(team_code) + box_number
+    //   - First digit 3 → Blue team, first digit 4 → Red team
+    //   - Box number = id % 10 (1..6)
     function teamFor(tid) {
+      const n = Number(tid);
       const ac = window._arenaCfgCache || {};
-      const overrides = ac.target_overrides || [];
-      for (const o of overrides) {
-        if (Number(o.id) === Number(tid)) {
-          return { team: o.team || 'Override', color: o.color || '#64748b' };
+      // Per-ID overrides always win
+      for (const o of (ac.target_overrides || [])) {
+        if (Number(o.id) === n) {
+          return { team: o.team || 'Override', color: o.color || '#64748b',
+                   box_num: (n % 10) || null };
         }
       }
-      const ranges = ac.target_teams || [];
-      for (const r of ranges) {
+      // Range mapping from arena config
+      for (const r of (ac.target_teams || [])) {
         const rng = r.id_range || [0, 0];
-        if (Number(tid) >= Number(rng[0]) && Number(tid) <= Number(rng[1])) {
-          return { team: r.team || 'Team?', color: r.color || '#64748b' };
+        if (n >= Number(rng[0]) && n <= Number(rng[1])) {
+          const box = n % 10;
+          const label = r.team + (box >= 1 && box <= 9 ? ' Box ' + box : '');
+          return { team: label, color: r.color || '#64748b', box_num: box };
         }
       }
-      return { team: 'Unknown', color: '#64748b' };
+      return { team: 'Unknown', color: '#64748b', box_num: null };
     }
     badge.textContent = ids.length + ' visible';
     badge.style.color = ids.length > 0 ? '#fbbf24' : '#64748b';
@@ -6367,6 +6421,135 @@ async function loadPosConfig() {
 //   4. On completion, show the download hint pointing to Flight Logs
 //   5. Provide an Import Preset box so the operator can paste Claude's
 //      tuned JSON and save it as a named preset via /proxy/position/presets
+// ── Scan & Capture Targets mission ─────────────────────────────
+// Kicks off /proxy/missions/scan_and_capture/start and polls
+// /proxy/missions/scan_and_capture/status every 500 ms to drive the
+// progress readout in the Target Boxes panel.
+(function wireScanAndCapture(){
+  const startBtn  = document.getElementById('scan_cap_start_btn');
+  const abortBtn  = document.getElementById('scan_cap_abort_btn');
+  const statusTxt = document.getElementById('scan_cap_status_txt');
+  const progWrap  = document.getElementById('scan_cap_progress');
+  const progBar   = document.getElementById('scan_cap_progress_bar');
+  const phaseEl   = document.getElementById('scan_cap_phase');
+  const stepEl    = document.getElementById('scan_cap_step');
+  const ndetEl    = document.getElementById('scan_cap_ndet');
+  const elapsedEl = document.getElementById('scan_cap_elapsed');
+  const hoverI    = document.getElementById('scan_cap_hover');
+  const aboveI    = document.getElementById('scan_cap_above');
+  if (!startBtn) return;
+
+  let pollTimer = null;
+  let active = false;
+
+  function setStatus(msg, col) {
+    if (!statusTxt) return;
+    statusTxt.textContent = msg;
+    statusTxt.style.color = col || '#94a3b8';
+  }
+  function setActiveUI(on) {
+    active = on;
+    startBtn.style.display = on ? 'none' : '';
+    abortBtn.style.display = on ? '' : 'none';
+    progWrap.style.display = on ? '' : 'none';
+    if (!on) progBar.style.width = '0%';
+  }
+  // Phase → percentage (rough progress bar). "scanning" 10-70%,
+  // "capture" 70-100% (the capture mission runs after the handoff).
+  function phaseProgress(phase, elapsed, n_detected) {
+    if (phase === 'takeoff' || phase === 'starting') return 5;
+    if (phase === 'scanning') {
+      // 10s scan ≈ 70% target → scale with elapsed (after takeoff ~5s)
+      return Math.min(70, 10 + elapsed * 6);
+    }
+    if (phase === 'capture' || phase === 'done')     return 90;
+    if (phase === 'error' || phase === 'aborted')    return 100;
+    return 0;
+  }
+  async function refreshStatus() {
+    try {
+      const r = await fetch('/proxy/missions/scan_and_capture/status');
+      const d = await r.json();
+      if (!d.ok) { setStatus('status error', '#ef4444'); return; }
+      phaseEl.textContent = d.phase || '—';
+      stepEl.textContent  = d.step_name || '—';
+      ndetEl.textContent  = d.n_detected || 0;
+      elapsedEl.textContent = (d.elapsed_s || 0).toFixed(1);
+      progBar.style.width = phaseProgress(d.phase, d.elapsed_s || 0, d.n_detected || 0) + '%';
+      if (d.active) {
+        setActiveUI(true);
+        setStatus('in progress — ' + (d.phase || ''), '#fbbf24');
+      } else {
+        if (active) {
+          setActiveUI(false);
+          if (d.result === 'ok') {
+            setStatus('\u2713 scan done — ' + (d.n_detected || 0) +
+                      ' target(s), capture mission launched', '#22c55e');
+          } else if (d.result === 'aborted') {
+            setStatus('aborted', '#f59e0b');
+          } else if (d.result === 'error') {
+            setStatus('\u2717 ' + (d.last_error || 'unknown error'), '#ef4444');
+          }
+          if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
+        }
+      }
+    } catch (e) {
+      setStatus('network error: ' + e, '#ef4444');
+    }
+  }
+
+  startBtn.addEventListener('click', async () => {
+    if (!confirm(
+      'Scan & Capture Targets:\\n\\n' +
+      '• The drone will take off (if not already flying) and rotate 360°\\n' +
+      '  to discover target boxes via ArUco (IDs 31-36 Blue, 41-46 Red).\\n' +
+      '• It then flies exactly over each discovered box, hovering\\n' +
+      '  ' + (hoverI.value||'3') + ' s at ' + (aboveI.value||'1.5') + ' m altitude above the marker.\\n' +
+      '• Arena boundary guard + ceiling stay active throughout.\\n\\n' +
+      'Start now?'
+    )) return;
+    setStatus('starting...', '#fbbf24');
+    try {
+      const body = {
+        hover_seconds: parseFloat(hoverI.value || '3.0'),
+        hover_above_m: parseFloat(aboveI.value || '1.5'),
+      };
+      const r = await fetch('/proxy/missions/scan_and_capture/start', {
+        method: 'POST',
+        headers: {'Content-Type':'application/json'},
+        body: JSON.stringify(body),
+      });
+      const d = await r.json();
+      if (!d.ok) {
+        setStatus('\u2717 ' + (d.error || 'start failed'), '#ef4444');
+        return;
+      }
+      setActiveUI(true);
+      setStatus('in progress', '#fbbf24');
+      if (pollTimer) clearInterval(pollTimer);
+      pollTimer = setInterval(refreshStatus, 500);
+      refreshStatus();
+    } catch (e) {
+      setStatus('\u2717 ' + e, '#ef4444');
+    }
+  });
+
+  abortBtn.addEventListener('click', async () => {
+    if (!confirm('Abort scan & capture?\\n\\nThe drone will stop rotating/visiting; it stays airborne — land it manually.')) return;
+    try {
+      const r = await fetch('/proxy/missions/scan_and_capture/abort', {method:'POST'});
+      const d = await r.json();
+      if (d.ok) setStatus('abort requested...', '#f59e0b');
+      else setStatus('\u2717 ' + (d.error || 'abort failed'), '#ef4444');
+    } catch (e) {
+      setStatus('\u2717 ' + e, '#ef4444');
+    }
+  });
+
+  // One status poll at page load in case a mission is already running
+  refreshStatus();
+})();
+
 (function wireCalibrationFlight(){
   const startBtn  = document.getElementById('calib_start_btn');
   const abortBtn  = document.getElementById('calib_abort_btn');
@@ -10729,6 +10912,320 @@ def proxy_missions_stop():
     ok = mission_manager.stop(land=land)
     log_command("mission_stop", {"land": land, "ok": ok})
     return jsonify(ok=ok, status=mission_manager.status())
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Scan & Capture Targets — dynamic-discovery variant of capture_targets
+#
+# Flow:
+#   1. Ensure drone is airborne (takeoff if needed)
+#   2. Rotate the drone through a full 360° in 60° steps, with a ~2 s
+#      dwell after each step so the positioner can accumulate a clean
+#      target-position estimate for whatever it can see.
+#   3. Build a target_boxes list from the accumulated ArUco detections
+#      (IDs 31-36 = Blue, 41-46 = Red — SDC26 convention). Order the
+#      boxes by nearest-neighbour from the drone's current position so
+#      the flight path is short.
+#   4. Hand the list off to mission_manager.start_capture_all_targets()
+#      — from that point the standard capture mission takes over: it
+#      navigates to each target using ArUco-fused position, hovers
+#      `hover_seconds` over the box centre, then continues.
+#
+# Runs in a background thread so the HTTP request returns immediately.
+# ═══════════════════════════════════════════════════════════════════════
+
+_scan_cap_state: dict = {
+    "active":        False,
+    "phase":         "idle",  # "takeoff"|"scanning"|"capture"|"done"|"error"|"aborted"
+    "drone_id":      None,
+    "step_name":     "idle",
+    "n_detected":    0,
+    "targets_found": {},   # {tid: [x, y, z]}
+    "target_boxes":  [],   # [{id, x, y, home_team}, ...] (ordered visit list)
+    "started_at":    0.0,
+    "ended_at":      0.0,
+    "elapsed_s":     0.0,
+    "last_error":    None,
+    "result":        None,
+}
+_scan_cap_lock = threading.Lock()
+_scan_cap_abort = threading.Event()
+
+
+def _scan_cap_team_for(tid: int) -> str | None:
+    """Return 'blue' / 'red' for the SDC26 ID ranges, else None."""
+    if 31 <= tid <= 36:
+        return "blue"
+    if 41 <= tid <= 46:
+        return "red"
+    return None
+
+
+def _scan_cap_nn_order(start_xy, targets: dict) -> list:
+    """Nearest-neighbour ordering over XY. `targets` is {tid:[x,y,z]}.
+    Returns [{id, x, y, home_team}, ...] in visit order."""
+    remaining = {int(tid): [float(p[0]), float(p[1])] for tid, p in targets.items()}
+    cx, cy = float(start_xy[0]), float(start_xy[1])
+    order = []
+    while remaining:
+        best_tid = min(
+            remaining,
+            key=lambda t: (remaining[t][0] - cx) ** 2 + (remaining[t][1] - cy) ** 2,
+        )
+        bx, by = remaining.pop(best_tid)
+        order.append({
+            "id":        best_tid,
+            "x":         round(bx, 3),
+            "y":         round(by, 3),
+            "home_team": _scan_cap_team_for(best_tid),
+        })
+        cx, cy = bx, by
+    return order
+
+
+def _scan_cap_set(**kwargs):
+    with _scan_cap_lock:
+        _scan_cap_state.update(kwargs)
+        if _scan_cap_state.get("started_at"):
+            _scan_cap_state["elapsed_s"] = time.time() - _scan_cap_state["started_at"]
+
+
+def _scan_and_capture_thread(
+    drone_id: str,
+    rotation_deg: int,
+    rotation_steps: int,
+    dwell_s: float,
+    hover_seconds: float,
+    hover_above_m: float,
+    home_xy: tuple,
+    arena_face_xy: tuple,
+    nav_tol_xy_m: float,
+):
+    info = DRONES.get(drone_id) or {}
+    base = (info or {}).get("base")
+    if not base:
+        _scan_cap_set(active=False, phase="error", result="error",
+                      last_error=f"drone {drone_id} has no base URL",
+                      ended_at=time.time())
+        return
+    base = base.rstrip("/")
+    try:
+        # ── Phase 1: ensure airborne ─────────────────────────────
+        _scan_cap_set(phase="takeoff", step_name="Checking flight state")
+        tel = {}
+        try:
+            r = _http_session.get(f"{base}/api/telemetry", timeout=TIMEOUT_FAST)
+            if r.ok:
+                tel = r.json() or {}
+        except Exception:
+            pass
+        if not tel.get("flying"):
+            _scan_cap_set(step_name="Taking off")
+            r = _http_session.post(f"{base}/api/takeoff", json={}, timeout=TIMEOUT_SLOW)
+            if not r.ok:
+                raise RuntimeError(f"takeoff failed: HTTP {r.status_code}")
+            body = r.json() if r.content else {}
+            if not body.get("ok"):
+                raise RuntimeError(f"takeoff failed: {body.get('error','unknown')}")
+            time.sleep(4.0)  # settle — same as safe_takeoff_s
+        else:
+            _scan_cap_set(step_name="Already airborne")
+
+        # Brief settle hover before we start rotating — lets the
+        # positioner latch onto the arena references cleanly.
+        for _ in range(20):
+            if _scan_cap_abort.is_set(): break
+            time.sleep(0.1)
+
+        # ── Phase 2: scan (rotate + accumulate targets) ──────────
+        _scan_cap_set(phase="scanning", step_name=f"Rotating 360° in {rotation_steps}×{rotation_deg}° steps")
+        accumulated: dict = {}
+        accept_ids = set(range(31, 37)) | set(range(41, 47))  # Blue 1-6, Red 1-6
+        for step in range(rotation_steps):
+            if _scan_cap_abort.is_set():
+                raise RuntimeError("aborted during scan")
+            _scan_cap_set(step_name=f"Rotation {step+1}/{rotation_steps} — CW {rotation_deg}°")
+            try:
+                r = _http_session.post(
+                    f"{base}/api/rotate",
+                    json={"dir": "cw", "deg": rotation_deg},
+                    timeout=TIMEOUT_SLOW,
+                )
+                if not r.ok:
+                    print(f"[SCAN_CAP] rotate {step+1} HTTP {r.status_code}: {r.text[:120]}")
+            except Exception as e:
+                print(f"[SCAN_CAP] rotate {step+1} failed: {e}")
+            # Observation dwell — poll targets at 3-4 Hz, latch positions
+            t_end = time.time() + dwell_s
+            while time.time() < t_end:
+                if _scan_cap_abort.is_set():
+                    raise RuntimeError("aborted during dwell")
+                try:
+                    r = _http_session.get(f"{base}/api/position", timeout=TIMEOUT_FAST)
+                    if r.ok:
+                        state = r.json() or {}
+                        targets = state.get("targets") or {}
+                        for tid_str, tinfo in targets.items():
+                            try:
+                                tid = int(tid_str)
+                            except Exception:
+                                continue
+                            if tid not in accept_ids:
+                                continue
+                            # Only accept a FRESH observation (seen in the
+                            # latest frame) so we don't latch onto a stale
+                            # TTL entry from before the rotation started.
+                            if not tinfo.get("fresh"):
+                                continue
+                            pos = tinfo.get("pos")
+                            if isinstance(pos, (list, tuple)) and len(pos) >= 3:
+                                accumulated[tid] = [float(pos[0]), float(pos[1]), float(pos[2])]
+                except Exception:
+                    pass
+                time.sleep(0.28)
+            _scan_cap_set(n_detected=len(accumulated), targets_found=dict(accumulated))
+
+        if not accumulated:
+            raise RuntimeError("no target boxes detected during scan — nothing to visit")
+
+        # ── Phase 3: plan visit order + start capture mission ────
+        _scan_cap_set(phase="capture", step_name="Building visit plan")
+        # Start from current drone XY (from /api/position), fall back to home_xy
+        plan_start = home_xy
+        try:
+            r = _http_session.get(f"{base}/api/position", timeout=TIMEOUT_FAST)
+            if r.ok:
+                pos = (r.json() or {}).get("pos")
+                if pos and len(pos) >= 2:
+                    plan_start = (float(pos[0]), float(pos[1]))
+        except Exception:
+            pass
+        target_boxes = _scan_cap_nn_order(plan_start, accumulated)
+        _scan_cap_set(target_boxes=target_boxes,
+                      step_name=f"Visiting {len(target_boxes)} targets")
+
+        ok, msg = mission_manager.start_capture_all_targets(
+            drone_ids=[drone_id],
+            target_boxes=target_boxes,
+            home_xy=tuple(home_xy),
+            arena_face_xy=tuple(arena_face_xy),
+            hover_above_m=hover_above_m,
+            hover_seconds=hover_seconds,
+            nav_tol_xy_m=nav_tol_xy_m,
+            auto_takeoff=False,   # drone is already flying
+        )
+        if not ok:
+            raise RuntimeError(f"capture mission refused to start: {msg}")
+        _scan_cap_set(phase="done", result="ok", step_name="Handed off to capture mission",
+                      ended_at=time.time())
+        log_command("scan_and_capture_done", {
+            "drone_id": drone_id,
+            "n_detected": len(accumulated),
+            "target_boxes": target_boxes,
+        })
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        aborted = _scan_cap_abort.is_set()
+        _scan_cap_set(
+            phase="aborted" if aborted else "error",
+            result="aborted" if aborted else "error",
+            last_error=str(e),
+            ended_at=time.time(),
+        )
+    finally:
+        _scan_cap_set(active=False)
+
+
+@app.post("/proxy/missions/scan_and_capture/start")
+def proxy_scan_and_capture_start():
+    """Scan-and-capture: drone takes off (if needed), rotates to discover
+    SDC26 target boxes via ArUco, then visits each using the standard
+    CaptureAllTargetsMission. Body:
+      {
+        "drone_id":       "2",              # optional; active drone if omitted
+        "rotation_deg":   60,               # degrees per rotate step
+        "rotation_steps": 6,                # full 360° by default
+        "dwell_s":        2.0,              # observation window per step
+        "hover_seconds":  3.0,              # dwell over each target box
+        "hover_above_m":  1.5,              # altitude above the target marker
+        "home_xy":        [0.0, 1.5],       # landing / return point
+        "arena_face_xy":  [0.0, 5.4],       # where camera points during capture
+        "nav_tol_xy_m":   0.3               # arrival tolerance
+      }
+    """
+    with _scan_cap_lock:
+        if _scan_cap_state["active"]:
+            return jsonify(ok=False, error="scan-and-capture already active",
+                           state=dict(_scan_cap_state)), 409
+    guarded = _pause_guard_response()
+    if guarded is not None:
+        return guarded
+    data = request.get_json(silent=True) or {}
+    drone_id = str(data.get("drone_id") or active_drone_id)
+    if not DRONES.get(drone_id):
+        return jsonify(ok=False, error=f"unknown drone_id {drone_id}"), 400
+    rotation_deg   = max(10, min(180, int(data.get("rotation_deg", 60))))
+    rotation_steps = max(1, min(24, int(data.get("rotation_steps", 6))))
+    dwell_s        = max(0.5, min(10.0, float(data.get("dwell_s", 2.0))))
+    hover_seconds  = max(1.0, min(20.0, float(data.get("hover_seconds", 3.0))))
+    hover_above_m  = max(0.5, min(5.0, float(data.get("hover_above_m", 1.5))))
+    home_xy        = data.get("home_xy") or [0.0, 1.5]
+    arena_face_xy  = data.get("arena_face_xy") or [0.0, 5.4]
+    nav_tol_xy_m   = max(0.1, min(2.0, float(data.get("nav_tol_xy_m", 0.3))))
+    with _scan_cap_lock:
+        _scan_cap_state.update({
+            "active":        True,
+            "phase":         "starting",
+            "drone_id":      drone_id,
+            "step_name":     "starting",
+            "n_detected":    0,
+            "targets_found": {},
+            "target_boxes":  [],
+            "started_at":    time.time(),
+            "ended_at":      0.0,
+            "elapsed_s":     0.0,
+            "last_error":    None,
+            "result":        None,
+        })
+    _scan_cap_abort.clear()
+    threading.Thread(
+        target=_scan_and_capture_thread,
+        args=(drone_id, rotation_deg, rotation_steps, dwell_s,
+              hover_seconds, hover_above_m,
+              tuple(home_xy), tuple(arena_face_xy), nav_tol_xy_m),
+        daemon=True, name="scan-and-capture",
+    ).start()
+    log_command("scan_and_capture_start", {
+        "drone_id": drone_id, "rotation_steps": rotation_steps,
+        "hover_seconds": hover_seconds,
+    })
+    return jsonify(ok=True, message="scan-and-capture started",
+                   drone_id=drone_id)
+
+
+@app.get("/proxy/missions/scan_and_capture/status")
+def proxy_scan_and_capture_status():
+    with _scan_cap_lock:
+        snap = dict(_scan_cap_state)
+    return jsonify(ok=True, **snap)
+
+
+@app.post("/proxy/missions/scan_and_capture/abort")
+def proxy_scan_and_capture_abort():
+    """Abort the scan-and-capture. Sets a flag that the background thread
+    checks; the thread exits at the next dwell boundary. If the capture
+    mission has already handed off to mission_manager, also stop that."""
+    _scan_cap_abort.set()
+    # Also try to stop any running mission (best-effort — might not be ours)
+    try:
+        if _scan_cap_state.get("phase") in {"capture", "done"}:
+            mission_manager.stop(land=False)
+    except Exception:
+        pass
+    with _scan_cap_lock:
+        active = _scan_cap_state["active"]
+    return jsonify(ok=True, message="abort requested", active=active)
 
 
 @app.get("/proxy/missions/trace")
