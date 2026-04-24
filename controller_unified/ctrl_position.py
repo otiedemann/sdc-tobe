@@ -572,7 +572,13 @@ class HeadlessAruCoPositioning:
                 cached_poses[mid] = (rvec, tvec.reshape(3))
         ref_indices = [i for i, mid in enumerate(seen_ids) if
                        int(mid) in self.marker_positions and int(mid) in cached_poses]
-        tgt_indices = [i for i, mid in enumerate(seen_ids) if int(mid) >= 30 and int(mid) in cached_poses]
+        # SDC26 target boxes: Blue 31-36, Red 41-46. Anything else in the
+        # ≥30 range (30, 33, 37-40, 47-99) is NOT a valid target box and
+        # must be ignored — otherwise a phantom detection can pollute the
+        # targets dict and confuse the capture mission.
+        _SDC26_TARGET_IDS = {31,32,33,34,35,36,41,42,43,44,45,46}
+        tgt_indices = [i for i, mid in enumerate(seen_ids)
+                       if int(mid) in _SDC26_TARGET_IDS and int(mid) in cached_poses]
         if not ref_indices:
             if self.last_valid_pose is not None and (now_wall - self.last_valid_ts) <= POSE_HOLD_SEC:
                 return _stale_payload(seen_ids=seen_ids)

@@ -2317,7 +2317,7 @@ HTML = """
     arcPoll();
     // Version marker — if this string doesn't appear in the DOM,
     // you're running stale JS (restart the Python server or hard-refresh).
-    const BUILD = 'cr-hover-above-target';
+    const BUILD = 'cs-multidrone-sdc26-filter';
     console.log('[arc] init complete, build=' + BUILD);
     const ver = document.createElement('span');
     ver.id = 'arc_build_tag';
@@ -3168,10 +3168,25 @@ HTML = """
             rotate to discover, then fly exactly over each box for N seconds
           </span>
         </div>
+        <!-- Drone selection — one checkbox per known drone. Multi-select:
+             each selected drone gets an altitude layer (1.0 m stacks) so
+             they can work concurrently without colliding. Target
+             claiming in CaptureAllTargetsMission already prevents two
+             drones from visiting the same box. -->
+        <div style=\"display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-bottom:6px;\">
+          <span class=\"small\" style=\"color:#94a3b8;min-width:60px;\">Drones:</span>
+          <span id=\"scan_cap_drones\" style=\"display:flex;gap:10px;flex-wrap:wrap;\"></span>
+          <label class=\"small\" style=\"color:#94a3b8;margin-left:auto;\" title=\"When multiple drones are selected, each gets an extra altitude offset of N × this value (N = selection order). Keeps 3-D paths separated. Set 0 to disable altitude layering (rely on target claiming + XY separation only).\">
+            alt stack <input id=\"scan_cap_stack\" type=\"number\" min=\"0\" max=\"3\" step=\"0.1\" value=\"1.0\" style=\"width:50px;height:22px;font-size:11px;\" /> m
+          </label>
+          <label class=\"small\" style=\"color:#94a3b8;\" title=\"Minimum 3-D separation between drones during capture. If another drone comes closer than this, the second drone pauses in place until it's clear.\">
+            sep &gt; <input id=\"scan_cap_sep\" type=\"number\" min=\"0\" max=\"5\" step=\"0.1\" value=\"1.2\" style=\"width:50px;height:22px;font-size:11px;\" /> m
+          </label>
+        </div>
         <div style=\"display:flex;gap:10px;align-items:center;flex-wrap:wrap;\">
           <button id=\"scan_cap_start_btn\"
                   style=\"background:#713f12;border:1px solid #fbbf24;color:#fef3c7;padding:4px 12px;border-radius:4px;cursor:pointer;font-weight:600;\"
-                  title=\"Drone takes off (if needed), rotates 6×60° scanning for target markers, then visits each box in nearest-neighbour order.\">
+                  title=\"Drone takes off (if needed), rotates 6×60° scanning for target markers, then visits each box in nearest-neighbour order. With multiple drones selected: the first drone scans, then all selected drones capture concurrently at stacked altitudes.\">
             ▶ Start Scan &amp; Capture
           </button>
           <button id=\"scan_cap_abort_btn\"
@@ -5886,7 +5901,17 @@ function updatePosUI(d) {
     const table = document.getElementById('targets_table');
     const empty = document.getElementById('targets_empty');
     if (!tbody || !badge) return;
-    const targets = d.targets || {};
+    // SDC26 convention: only IDs 31-36 (Blue) and 41-46 (Red) are real
+    // target boxes. Any other ArUco ID — including rogue detections at
+    // 30, 37-40, 47+, or reference-marker IDs that happened to land in
+    // the tgt_indices pass — must be ignored so the operator doesn't
+    // see (and the drone doesn't try to capture) a phantom target.
+    const VALID_TARGET_IDS = new Set([31,32,33,34,35,36,41,42,43,44,45,46]);
+    const allTargets = d.targets || {};
+    const targets = {};
+    for (const k of Object.keys(allTargets)) {
+      if (VALID_TARGET_IDS.has(Number(k))) targets[k] = allTargets[k];
+    }
     const ids = Object.keys(targets);
     // Resolve team+colour+box-number. SDC26 convention:
     //   - Marker ID = 10·(team_code) + box_number
@@ -6437,10 +6462,51 @@ async function loadPosConfig() {
   const elapsedEl = document.getElementById('scan_cap_elapsed');
   const hoverI    = document.getElementById('scan_cap_hover');
   const aboveI    = document.getElementById('scan_cap_above');
+  const stackI    = document.getElementById('scan_cap_stack');
+  const sepI      = document.getElementById('scan_cap_sep');
+  const dronesDiv = document.getElementById('scan_cap_drones');
   if (!startBtn) return;
 
   let pollTimer = null;
   let active = false;
+
+  // Populate drone checkboxes so operator can select one-or-many.
+  // Defaults to the currently-active drone. Re-polled every 10 s so a
+  // drone coming online mid-session becomes selectable.
+  async function loadDroneChecklist() {
+    try {
+      const r = await fetch('/proxy/drones');
+      const d = await r.json();
+      const drones = d.drones || {};
+      const prev = {};
+      dronesDiv.querySelectorAll('input[type=checkbox]').forEach(cb => {
+        prev[cb.dataset.id] = cb.checked;
+      });
+      dronesDiv.innerHTML = '';
+      const activeId = (d.active && String(d.active)) || '';
+      const ids = Object.keys(drones).sort();
+      ids.forEach(id => {
+        const info = drones[id] || {};
+        const wrap = document.createElement('label');
+        wrap.style.cssText = 'display:flex;gap:4px;align-items:center;font-size:12px;color:#e2e8f0;cursor:pointer;';
+        // If we've seen this drone before, preserve previous selection.
+        // Otherwise default: only the active drone is checked so operators
+        // don't accidentally fly every drone at once.
+        const checked = (id in prev) ? prev[id] : (id === activeId);
+        wrap.innerHTML = '<input type=\"checkbox\" data-id=\"' + id + '\"'
+          + (checked ? ' checked' : '') + ' /> '
+          + (info.name || ('Drone ' + id))
+          + ' <span style=\"color:#64748b;\">#' + id + '</span>';
+        dronesDiv.appendChild(wrap);
+      });
+    } catch (e) {}
+  }
+  function getSelectedDroneIds() {
+    return Array.from(dronesDiv.querySelectorAll('input[type=checkbox]'))
+      .filter(cb => cb.checked).map(cb => cb.dataset.id);
+  }
+  loadDroneChecklist();
+  setInterval(loadDroneChecklist, 10000);
 
   function setStatus(msg, col) {
     if (!statusTxt) return;
@@ -6499,21 +6565,42 @@ async function loadPosConfig() {
   }
 
   startBtn.addEventListener('click', async () => {
+    const selected = getSelectedDroneIds();
+    if (!selected.length) {
+      setStatus('\u2717 select at least one drone', '#ef4444');
+      return;
+    }
+    const stackM = Math.max(0, parseFloat(stackI.value || '1.0'));
+    const sepM   = Math.max(0, parseFloat(sepI.value || '1.2'));
+    const multi = selected.length > 1;
+    const altLines = multi
+      ? ('\\n• Each drone flies at a stacked altitude (drone N = baseline + '
+         + stackM.toFixed(1) + ' m × N) so they cannot collide vertically.\\n'
+         + '• Minimum 3-D separation enforced at ' + sepM.toFixed(1) + ' m — if two drones\\n'
+         + '  get closer than that, the one about to move pauses in place.\\n'
+         + '• No two drones will approach the same target box (claim-based).')
+      : '';
     if (!confirm(
       'Scan & Capture Targets:\\n\\n' +
-      '• The drone will take off (if not already flying) and rotate 360°\\n' +
-      '  to discover target boxes via ArUco (IDs 31-36 Blue, 41-46 Red).\\n' +
-      '• It then flies exactly over each discovered box, hovering for\\n' +
+      '• ' + selected.length + ' drone' + (multi?'s':'') + ' selected'
+        + (multi?' ('+selected.join(', ')+').':'.') + '\\n' +
+      '• First selected drone takes off and rotates 360° to discover boxes\\n' +
+      '  (only valid SDC26 IDs: 31-36 Blue, 41-46 Red — others ignored).\\n' +
+      '• All selected drones then fly over detected boxes, hovering for\\n' +
       '  ' + (hoverI.value||'3') + ' s at ' + (aboveI.value||'1.5') +
-      ' m ABOVE each marker (waypoint z = marker_z + ' + (aboveI.value||'1.5') + ').\\n' +
+      ' m ABOVE each marker (waypoint z = marker_z + ' + (aboveI.value||'1.5') + ').' +
+      altLines + '\\n' +
       '• Arena boundary guard + ceiling stay active throughout.\\n\\n' +
       'Start now?'
     )) return;
     setStatus('starting...', '#fbbf24');
     try {
       const body = {
-        hover_seconds: parseFloat(hoverI.value || '3.0'),
-        hover_above_m: parseFloat(aboveI.value || '1.5'),
+        drone_ids:      selected,
+        hover_seconds:  parseFloat(hoverI.value || '3.0'),
+        hover_above_m:  parseFloat(aboveI.value || '1.5'),
+        altitude_stack_m: stackM,
+        min_separation_m: sepM,
       };
       const r = await fetch('/proxy/missions/scan_and_capture/start', {
         method: 'POST',
@@ -11011,7 +11098,7 @@ def _scan_cap_set(**kwargs):
 
 
 def _scan_and_capture_thread(
-    drone_id: str,
+    drone_ids: list,
     rotation_deg: int,
     rotation_steps: int,
     dwell_s: float,
@@ -11020,12 +11107,22 @@ def _scan_and_capture_thread(
     home_xy: tuple,
     arena_face_xy: tuple,
     nav_tol_xy_m: float,
+    altitude_stack_m: float,
+    min_separation_m: float,
 ):
-    info = DRONES.get(drone_id) or {}
+    # First selected drone does the scan (rotation) alone; all selected
+    # drones then participate in the capture mission concurrently at
+    # stacked altitudes.
+    if not drone_ids:
+        _scan_cap_set(active=False, phase="error", result="error",
+                      last_error="no drones selected", ended_at=time.time())
+        return
+    scan_drone = drone_ids[0]
+    info = DRONES.get(scan_drone) or {}
     base = (info or {}).get("base")
     if not base:
         _scan_cap_set(active=False, phase="error", result="error",
-                      last_error=f"drone {drone_id} has no base URL",
+                      last_error=f"drone {scan_drone} has no base URL",
                       ended_at=time.time())
         return
     base = base.rstrip("/")
@@ -11124,23 +11221,31 @@ def _scan_and_capture_thread(
         _scan_cap_set(target_boxes=target_boxes,
                       step_name=f"Visiting {len(target_boxes)} targets")
 
+        # All selected drones participate in the capture phase. If multiple
+        # are selected, they MUST take off themselves (or be pre-airborne)
+        # before the capture mission reaches for them — auto_takeoff=True
+        # on the mission handles any still on the ground.
         ok, msg = mission_manager.start_capture_all_targets(
-            drone_ids=[drone_id],
+            drone_ids=drone_ids,
             target_boxes=target_boxes,
             home_xy=tuple(home_xy),
             arena_face_xy=tuple(arena_face_xy),
             hover_above_m=hover_above_m,
             hover_seconds=hover_seconds,
             nav_tol_xy_m=nav_tol_xy_m,
-            auto_takeoff=False,   # drone is already flying
+            auto_takeoff=(len(drone_ids) > 1),  # single drone already airborne
+            altitude_stack_m=altitude_stack_m,
+            min_separation_m=min_separation_m,
         )
         if not ok:
             raise RuntimeError(f"capture mission refused to start: {msg}")
         _scan_cap_set(phase="done", result="ok", step_name="Handed off to capture mission",
                       ended_at=time.time())
         log_command("scan_and_capture_done", {
-            "drone_id": drone_id,
+            "drone_ids": drone_ids,
             "n_detected": len(accumulated),
+            "altitude_stack_m": altitude_stack_m,
+            "min_separation_m": min_separation_m,
             "target_boxes": target_boxes,
         })
     except Exception as e:
@@ -11159,19 +11264,25 @@ def _scan_and_capture_thread(
 
 @app.post("/proxy/missions/scan_and_capture/start")
 def proxy_scan_and_capture_start():
-    """Scan-and-capture: drone takes off (if needed), rotates to discover
-    SDC26 target boxes via ArUco, then visits each using the standard
-    CaptureAllTargetsMission. Body:
+    """Scan-and-capture: the first selected drone rotates to discover
+    SDC26 target boxes (IDs 31-36 Blue, 41-46 Red) via ArUco. All
+    selected drones then visit boxes concurrently at stacked altitudes
+    using the standard CaptureAllTargetsMission (target-claim prevents
+    two drones from approaching the same box; per-drone altitude offset
+    keeps 3-D paths separated). Body:
       {
-        "drone_id":       "2",              # optional; active drone if omitted
+        "drone_ids":      ["2", "1"],       # multi-drone list; first scans
+        "drone_id":       "2",              # (legacy single-drone fallback)
         "rotation_deg":   60,               # degrees per rotate step
         "rotation_steps": 6,                # full 360° by default
         "dwell_s":        2.0,              # observation window per step
         "hover_seconds":  3.0,              # dwell over each target box
-        "hover_above_m":  1.5,              # altitude above the target marker
+        "hover_above_m":  1.5,              # HEIGHT above the target marker
         "home_xy":        [0.0, 1.5],       # landing / return point
         "arena_face_xy":  [0.0, 5.4],       # where camera points during capture
-        "nav_tol_xy_m":   0.3               # arrival tolerance
+        "nav_tol_xy_m":   0.3,              # arrival tolerance
+        "altitude_stack_m": 1.0,            # per-drone Z-offset step
+        "min_separation_m": 1.2             # inter-drone 3-D proximity pause
       }
     """
     with _scan_cap_lock:
@@ -11182,22 +11293,32 @@ def proxy_scan_and_capture_start():
     if guarded is not None:
         return guarded
     data = request.get_json(silent=True) or {}
-    drone_id = str(data.get("drone_id") or active_drone_id)
-    if not DRONES.get(drone_id):
-        return jsonify(ok=False, error=f"unknown drone_id {drone_id}"), 400
+    # Accept either `drone_ids: [list]` (preferred, multi-drone) or the
+    # legacy `drone_id: str` (single-drone). Falls back to active drone.
+    drone_ids_raw = data.get("drone_ids")
+    if isinstance(drone_ids_raw, list) and drone_ids_raw:
+        drone_ids = [str(d) for d in drone_ids_raw if str(d) in DRONES]
+    else:
+        did = str(data.get("drone_id") or active_drone_id)
+        drone_ids = [did] if did in DRONES else []
+    if not drone_ids:
+        return jsonify(ok=False, error="no valid drones selected"), 400
     rotation_deg   = max(10, min(180, int(data.get("rotation_deg", 60))))
     rotation_steps = max(1, min(24, int(data.get("rotation_steps", 6))))
     dwell_s        = max(0.5, min(10.0, float(data.get("dwell_s", 2.0))))
     hover_seconds  = max(1.0, min(20.0, float(data.get("hover_seconds", 3.0))))
-    hover_above_m  = max(0.5, min(5.0, float(data.get("hover_above_m", 1.5))))
+    hover_above_m  = max(0.3, min(5.0, float(data.get("hover_above_m", 1.5))))
     home_xy        = data.get("home_xy") or [0.0, 1.5]
     arena_face_xy  = data.get("arena_face_xy") or [0.0, 5.4]
     nav_tol_xy_m   = max(0.1, min(2.0, float(data.get("nav_tol_xy_m", 0.3))))
+    altitude_stack_m = max(0.0, min(3.0, float(data.get("altitude_stack_m", 1.0))))
+    min_separation_m = max(0.0, min(5.0, float(data.get("min_separation_m", 1.2))))
     with _scan_cap_lock:
         _scan_cap_state.update({
             "active":        True,
             "phase":         "starting",
-            "drone_id":      drone_id,
+            "drone_id":      drone_ids[0],    # legacy single-id field — first drone
+            "drone_ids":     drone_ids,
             "step_name":     "starting",
             "n_detected":    0,
             "targets_found": {},
@@ -11211,17 +11332,20 @@ def proxy_scan_and_capture_start():
     _scan_cap_abort.clear()
     threading.Thread(
         target=_scan_and_capture_thread,
-        args=(drone_id, rotation_deg, rotation_steps, dwell_s,
+        args=(drone_ids, rotation_deg, rotation_steps, dwell_s,
               hover_seconds, hover_above_m,
-              tuple(home_xy), tuple(arena_face_xy), nav_tol_xy_m),
+              tuple(home_xy), tuple(arena_face_xy), nav_tol_xy_m,
+              altitude_stack_m, min_separation_m),
         daemon=True, name="scan-and-capture",
     ).start()
     log_command("scan_and_capture_start", {
-        "drone_id": drone_id, "rotation_steps": rotation_steps,
+        "drone_ids": drone_ids, "rotation_steps": rotation_steps,
         "hover_seconds": hover_seconds,
+        "altitude_stack_m": altitude_stack_m,
+        "min_separation_m": min_separation_m,
     })
     return jsonify(ok=True, message="scan-and-capture started",
-                   drone_id=drone_id)
+                   drone_ids=drone_ids)
 
 
 @app.get("/proxy/missions/scan_and_capture/status")

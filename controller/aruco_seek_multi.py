@@ -1851,9 +1851,23 @@ class CaptureAllTargetsMission:
         nav_tol_xy_m: float = 0.3,
         nav_tol_z_m: float = 0.3,
         auto_takeoff: bool = False,
+        altitude_stack_m: float = 1.0,
+        min_separation_m: float = 1.2,
     ):
         self.fleet = fleet
         self.drone_ids = [str(d) for d in drone_ids]
+        # Per-drone altitude offset: drone N in the selection list gets N *
+        # altitude_stack_m added to every waypoint Z. Keeps 3-D paths
+        # separated vertically so two drones crossing the same XY don't
+        # collide. altitude_stack_m = 0 disables (drones share altitudes;
+        # target-claim + XY separation are then the only guards).
+        self.altitude_stack_m = max(0.0, float(altitude_stack_m))
+        self._drone_alt = {did: i * self.altitude_stack_m
+                           for i, did in enumerate(self.drone_ids)}
+        # Inter-drone 3-D proximity pause — if during NAV_TO_TARGET another
+        # drone comes closer than this, this drone pauses in place until
+        # the space is clear. 0 disables.
+        self.min_separation_m = max(0.0, float(min_separation_m))
         # Normalise and index boxes. Optional `z` field = marker height
         # above the arena floor (typically the top of the box where the
         # sticker sits). When present, the drone flies to `z +
@@ -2069,6 +2083,35 @@ class CaptureAllTargetsMission:
         cands.sort(key=lambda b: (b["x"] - cx) ** 2 + (b["y"] - cy) ** 2)
         return cands[0]["idx"]
 
+    def _nearest_other_drone_distance(self, did: str, my_pos) -> Optional[float]:
+        """3-D distance to the nearest OTHER drone in this mission.
+        Returns None if no other drones have a known position. Used to
+        pause NAV_TO_TARGET when we'd otherwise fly into another drone."""
+        if my_pos is None or len(my_pos) < 2:
+            return None
+        mx, my = float(my_pos[0]), float(my_pos[1])
+        mz = float(my_pos[2]) if len(my_pos) >= 3 else 0.0
+        best = None
+        for other_did in self.drone_ids:
+            if other_did == did:
+                continue
+            obs = self.fleet.get(other_did) if self.fleet else None
+            if obs is None:
+                continue
+            try:
+                snap = obs.get_state()
+            except Exception:
+                continue
+            other_pos = snap.get("pos") or snap.get("cam")
+            if not isinstance(other_pos, (list, tuple)) or len(other_pos) < 2:
+                continue
+            ox, oy = float(other_pos[0]), float(other_pos[1])
+            oz = float(other_pos[2]) if len(other_pos) >= 3 else 0.0
+            d = ((ox - mx) ** 2 + (oy - my) ** 2 + (oz - mz) ** 2) ** 0.5
+            if best is None or d < best:
+                best = d
+        return best
+
     def _tick_drone(self, did: str, obs: "DroneObserver"):
         now = time.time()
         snap = obs.get_state()
@@ -2106,13 +2149,13 @@ class CaptureAllTargetsMission:
                              hover_start=None,
                              note=f"flying to box {box['id']} @ "
                                   f"({box['x']:.1f},{box['y']:.1f})")
-                # Waypoint Z = box marker height + operator-set clearance.
-                # With box["z"]=0 (unknown) this collapses to hover_above_m
-                # — same as before. With a measured box height (e.g. 0.5 m
-                # stand) the drone correctly hovers `hover_above_m` ABOVE
-                # the box rather than at a fixed absolute altitude that
-                # would clip a tall stand or miss a short one.
-                wp_z = float(box["z"]) + self.hover_above_m
+                # Waypoint Z = box marker height + operator-set clearance
+                # + this drone's altitude-stack offset. Multi-drone note:
+                # drone N in the selection gets N × altitude_stack_m added,
+                # so two drones never share a Z layer even if their XY
+                # paths cross.
+                wp_z = (float(box["z"]) + self.hover_above_m
+                        + self._drone_alt.get(did, 0.0))
                 obs.set_waypoint((box["x"], box["y"], wp_z),
                                  self.arena_face_xy)
                 if self._trace:
@@ -2139,8 +2182,25 @@ class CaptureAllTargetsMission:
                 dy = box["y"] - float(pos[1])
                 dist_xy = (dx * dx + dy * dy) ** 0.5
                 cur_z = float(pos[2]) if len(pos) >= 3 else (snap.get("altitude_m") or 0)
-                target_z = float(box["z"]) + self.hover_above_m
+                target_z = (float(box["z"]) + self.hover_above_m
+                            + self._drone_alt.get(did, 0.0))
                 dz = target_z - cur_z
+                # ── Inter-drone proximity pause ─────────────────────
+                # If another active drone is within min_separation_m in
+                # 3-D, pause the waypoint so we don't fly into each
+                # other. The other drone continues — the one that HAPPENS
+                # to be checking first yields. In practice this is the
+                # one that just freshly ticked; over a few seconds both
+                # drones naturally re-separate via their altitude stack.
+                if self.min_separation_m > 0:
+                    too_close = self._nearest_other_drone_distance(did, pos)
+                    if too_close is not None and too_close < self.min_separation_m:
+                        state["note"] = (
+                            f"→ box {box['id']} paused — {too_close:.2f}m "
+                            f"from another drone (<{self.min_separation_m:.2f}m)"
+                        )
+                        # Don't claim arrival while paused.
+                        return
                 if dist_xy <= self.nav_tol_xy_m and abs(dz) <= self.nav_tol_z_m:
                     # Arrived — start the capture hover
                     state.update(phase="HOVER", hover_start=now,
@@ -2179,7 +2239,8 @@ class CaptureAllTargetsMission:
                         state.update(phase="NAV_TO_TARGET", target_idx=nxt,
                                      hover_start=None,
                                      note=f"captured {box['id']}, → box {nbox['id']}")
-                        nwp_z = float(nbox["z"]) + self.hover_above_m
+                        nwp_z = (float(nbox["z"]) + self.hover_above_m
+                                 + self._drone_alt.get(did, 0.0))
                         obs.set_waypoint(
                             (nbox["x"], nbox["y"], nwp_z),
                             self.arena_face_xy)
@@ -2281,8 +2342,16 @@ class MissionManager:
         hover_seconds: float = 4.0,
         nav_tol_xy_m: float = 0.3,
         auto_takeoff: bool = False,
+        altitude_stack_m: float = 1.0,
+        min_separation_m: float = 1.2,
     ) -> tuple[bool, str]:
-        """Launch the capture-all-targets mission (SDC26 box-capture scoring)."""
+        """Launch the capture-all-targets mission (SDC26 box-capture scoring).
+
+        Multi-drone: each drone in `drone_ids` gets an altitude offset of
+        `index × altitude_stack_m` added to every waypoint Z so their
+        3-D paths never collide. `min_separation_m` additionally pauses a
+        drone mid-approach if another comes closer than this 3-D distance.
+        """
         with self._lock:
             if self._current is not None and self._current._active:
                 return False, "a mission is already running — stop it first"
@@ -2294,6 +2363,8 @@ class MissionManager:
                 hover_seconds=hover_seconds,
                 nav_tol_xy_m=nav_tol_xy_m,
                 auto_takeoff=auto_takeoff,
+                altitude_stack_m=altitude_stack_m,
+                min_separation_m=min_separation_m,
             )
             ok = m.start()
             if not ok:
