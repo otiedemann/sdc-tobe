@@ -2654,29 +2654,114 @@ class DirectTargetPursuitMission:
             tpos = state["target_pos"]
             if tpos is None:
                 return
-            # Waypoint = target XY + (target Z + hover clearance + drone stack)
-            # face_xy = target XY so the camera points AT the box during approach.
-            wp_z = float(tpos[2]) + self.hover_above_m + self._drone_alt.get(did, 0.0)
-            obs.set_waypoint((float(tpos[0]), float(tpos[1]), wp_z),
-                             (float(tpos[0]), float(tpos[1])))
 
-            # Check arrival
-            if pos is not None and len(pos) >= 2:
-                dx = float(tpos[0]) - float(pos[0])
-                dy = float(tpos[1]) - float(pos[1])
-                dist_xy = (dx * dx + dy * dy) ** 0.5
-                cur_z = float(pos[2]) if len(pos) >= 3 else 0.0
-                dz = wp_z - cur_z
-                if dist_xy <= self.nav_tol_xy_m and abs(dz) <= self.nav_tol_z_m:
-                    with self._lock:
-                        state.update(phase="HOVER", hover_start=now,
-                                     note=f"over {tid} — capturing")
-                    if self._trace:
-                        self._trace.write("arrived", {
-                            "drone": did, "target_id": tid,
-                            "dist_xy": round(dist_xy, 2), "dz": round(dz, 2)})
-                else:
-                    state["note"] = (f"→ {tid} d={dist_xy:.2f}m dz={dz:+.2f}m")
+            # ── Direct RC approach (rotate-first, then translate forward) ──
+            # Log 10:44 showed the set_waypoint path producing catastrophic
+            # yaw oscillation + ±2.6 m/s velocity spikes, because the
+            # built-in waypoint PID chases translation and yaw simultaneously
+            # even when the bearing to the target changes faster than the
+            # drone can rotate. That produced ~3 m pose jumps and a net
+            # crash. We switch to a hand-tuned direct-RC approach that:
+            #   1. Gates translation behind yaw alignment (≤ 20° error)
+            #   2. Gates everything behind a pose-glitch check — if the
+            #      position jumps > 1 m in one tick while IMU doesn't
+            #      support it, we hold in place until tracking settles.
+            #   3. Caps translation RC to ±15 % (~0.5 m/s) and yaw to ±25 %
+            #      for a calm, predictable approach that always keeps the
+            #      target in the camera's line of sight.
+            if pos is None or len(pos) < 2:
+                try: obs.cmd_rc(0, 0, 0, 0)
+                except Exception: pass
+                state["note"] = "no position fix — hold"
+                return
+            cx, cy = float(pos[0]), float(pos[1])
+            cz = float(pos[2]) if len(pos) >= 3 else 0.0
+
+            # Pose-glitch gate: cross-check arena-frame XY delta against
+            # the IMU-integrated speed. A 0.3 s tick at 2 m/s = 0.6 m of
+            # legitimate motion. Anything > 1.0 m plus the IMU budget is
+            # a positioner glitch; hover and wait rather than chasing it.
+            prev_pos = state.get("_prev_pos_xy")
+            prev_ts = state.get("_prev_pos_ts", 0.0)
+            tel_speed_m_s = (abs(float(snap.get("vx_cms", 0) or 0)) +
+                             abs(float(snap.get("vy_cms", 0) or 0))) / 100.0
+            pose_glitch = False
+            if prev_pos is not None and prev_ts > 0:
+                dt = max(0.1, now - prev_ts)
+                jumped = ((cx - prev_pos[0]) ** 2 + (cy - prev_pos[1]) ** 2) ** 0.5
+                max_allowed = max(0.6, tel_speed_m_s * dt * 1.6)
+                if jumped > max_allowed:
+                    pose_glitch = True
+            state["_prev_pos_xy"] = (cx, cy)
+            state["_prev_pos_ts"] = now
+            if pose_glitch:
+                state["note"] = (f"pose-glitch gate ({jumped:.2f}m vs "
+                                 f"{max_allowed:.2f}m budget) — holding")
+                try: obs.cmd_rc(0, 0, 0, 0)
+                except Exception: pass
+                return
+
+            tx, ty = float(tpos[0]), float(tpos[1])
+            tz = float(tpos[2]) + self.hover_above_m + self._drone_alt.get(did, 0.0)
+            dx = tx - cx
+            dy = ty - cy
+            dist_xy = (dx * dx + dy * dy) ** 0.5
+            dz = tz - cz
+
+            # Arrival check — before any RC command so HOVER doesn't fight
+            # a lingering translation.
+            if dist_xy <= self.nav_tol_xy_m and abs(dz) <= self.nav_tol_z_m:
+                try: obs.cmd_rc(0, 0, 0, 0)
+                except Exception: pass
+                with self._lock:
+                    state.update(phase="HOVER", hover_start=now,
+                                 note=f"over {tid} — capturing")
+                if self._trace:
+                    self._trace.write("arrived", {
+                        "drone": did, "target_id": tid,
+                        "dist_xy": round(dist_xy, 2), "dz": round(dz, 2)})
+                return
+
+            # Compute bearing to target in arena frame. Anafi yaw
+            # convention: 0° = drone nose along world +Y, positive yaw = CW.
+            yaw_deg = float(snap.get("yaw", 0.0) or 0.0)
+            desired_yaw = math.degrees(math.atan2(dx, dy)) if dist_xy > 0.05 else yaw_deg
+            yaw_err = ((desired_yaw - yaw_deg + 180.0) % 360.0) - 180.0
+
+            # Clear any stale waypoint so _compute_waypoint_rc doesn't
+            # contend with the direct RC we're sending.
+            try:
+                obs.clear_waypoint()
+            except Exception:
+                pass
+
+            # Rotate-first: if nose is > 20° off target, pure yaw. No
+            # translation until the target is centred in the camera view.
+            if abs(yaw_err) > 20.0:
+                yaw_rc = int(max(-25, min(25, yaw_err * 1.0)))
+                try: obs.cmd_rc(0, 0, 0, yaw_rc)
+                except Exception: pass
+                state["note"] = (f"→ {tid}: rotating to face "
+                                 f"(yaw_err={yaw_err:+.0f}°)")
+                return
+
+            # Yaw is acceptable — translate forward toward the target while
+            # holding a small yaw trim. Anafi's body +X is forward; since
+            # we're aligned to the target, flying forward IS flying toward
+            # the target.
+            P_FB = 10        # RC% per metre of forward distance
+            P_UD = 20        # RC% per metre of altitude error
+            P_YAW = 1.0      # RC% per degree trim
+            fb_rc  = int(max(-15, min(15, dist_xy * P_FB)))
+            ud_rc  = int(max(-15, min(15, dz * P_UD)))
+            yaw_rc = int(max(-15, min(15, yaw_err * P_YAW)))
+            # lr_rc = 0 by design — we do NOT strafe. The rotate-first gate
+            # guarantees the target is ahead of us, so body-forward is the
+            # only translation we ever need.
+            try: obs.cmd_rc(0, fb_rc, ud_rc, yaw_rc)
+            except Exception: pass
+            state["note"] = (f"→ {tid} d={dist_xy:.2f}m dz={dz:+.2f}m "
+                             f"yaw_err={yaw_err:+.0f}°")
             return
 
         # ── HOVER ───────────────────────────────────────────────
@@ -2695,15 +2780,18 @@ class DirectTargetPursuitMission:
                     self._trace.write("target_captured", {
                         "drone": did, "target_id": tid,
                         "hover_elapsed": round(elapsed, 2)})
-                # Waypoint stays on the box for 1 more tick; the next
-                # SEARCH tick will clear it.
                 return
-            # Still hovering — keep the waypoint locked on the target.
-            tpos = state.get("target_pos")
-            if tpos is not None:
-                wp_z = float(tpos[2]) + self.hover_above_m + self._drone_alt.get(did, 0.0)
-                obs.set_waypoint((float(tpos[0]), float(tpos[1]), wp_z),
-                                 (float(tpos[0]), float(tpos[1])))
+            # Still hovering — zero RC and let Anafi's onboard stabilisation
+            # hold position. Any lingering set_waypoint() from a previous
+            # mission phase is cleared once so _compute_waypoint_rc doesn't
+            # sneak in a translation command against our hold.
+            try:
+                obs.clear_waypoint()
+                obs.cmd_rc(0, 0, 0, 0)
+            except Exception:
+                pass
+            state["note"] = (f"hovering over {tid} "
+                             f"({elapsed:.1f}/{self.hover_seconds:.1f}s)")
             return
 
 
