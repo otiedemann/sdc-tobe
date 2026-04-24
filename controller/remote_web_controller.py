@@ -2317,7 +2317,7 @@ HTML = """
     arcPoll();
     // Version marker — if this string doesn't appear in the DOM,
     // you're running stale JS (restart the Python server or hard-refresh).
-    const BUILD = 'cl-calibration-flight';
+    const BUILD = 'cm-target-boxes-zupt';
     console.log('[arc] init complete, build=' + BUILD);
     const ver = document.createElement('span');
     ver.id = 'arc_build_tag';
@@ -3011,6 +3011,15 @@ HTML = """
           <label class=\"small\" style=\"color:#fbbf24;\" title=\"Pose-jump gate. Reject a fresh fix if it disagrees with the Kalman-predicted state by more than this many metres. Kills catastrophic single-marker solvePnP mirror-pose glitches (the 10+ m jumps). 0 disables.\">gate (m) <span class=\"info-icon\" data-info=\"max_pose_jump_m\">i</span>:
             <input id=\"pos_max_jump\" type=\"number\" min=\"0\" max=\"20\" step=\"0.1\" value=\"0\" style=\"width:56px;\" title=\"0 = disabled, 3.0 is a good default\" />
           </label>
+          <label class=\"small\" style=\"color:#f97316;\" title=\"SDC26 target-box marker side length in metres. Wall markers use the \\\"Marker size\\\" field above. Target markers (ID ≥ 30) solvePnP against THIS size instead, so target world positions don't get over-reported by 50/19 ≈ 2.6×.\">target size (m) <span class=\"info-icon\" data-info=\"target_marker_size_m\">i</span>:
+            <input id=\"pos_target_size\" type=\"number\" min=\"0.02\" max=\"2.0\" step=\"0.01\" value=\"0.19\" style=\"width:60px;\" />
+          </label>
+          <label class=\"small\" style=\"color:#06b6d4;\" title=\"Zero-Velocity Update. When IMU speed stays below this threshold for &quot;hold&quot; frames, the positioner snaps to the last valid pose instead of integrating noisy ArUco fixes — eliminates the parked-drone drift. 0 disables.\">ZUPT &lt; (m/s) <span class=\"info-icon\" data-info=\"zupt_speed_m_s\">i</span>:
+            <input id=\"pos_zupt_speed\" type=\"number\" min=\"0\" max=\"1\" step=\"0.01\" value=\"0.05\" style=\"width:56px;\" />
+          </label>
+          <label class=\"small\" style=\"color:#06b6d4;\" title=\"Consecutive slow frames needed before ZUPT engages. Higher = more robust (fewer false engagements during slow moves), lower = quicker to freeze when parked. 3 frames ≈ 0.6s at 5Hz is a reasonable default.\">hold <span class=\"info-icon\" data-info=\"zupt_hold_frames\">i</span>:
+            <input id=\"pos_zupt_hold\" type=\"number\" min=\"0\" max=\"30\" step=\"1\" value=\"3\" style=\"width:50px;\" />
+          </label>
           <button id=\"pos_precision_apply\" class=\"pos-cfg\" style=\"height:26px;font-size:11px;padding:0 10px;\">Apply precision</button>
           <button id=\"pos_precision_reset\" class=\"pos-cfg\" style=\"height:26px;font-size:11px;padding:0 10px;background:#1e2a3a;\" title=\"Restore precision defaults\">Defaults</button>
           <span id=\"pos_precision_status\" class=\"small\" style=\"color:#64748b;\"></span>
@@ -3106,6 +3115,44 @@ HTML = """
         <div id=\"pos_video_container\" style=\"display:none;margin-top:6px;\">
           <img id=\"pos_video_img\" src=\"\" style=\"max-width:100%;border-radius:6px;background:#000;\" />
         </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ══════════════════════════════════════════════════════════════
+       Target Boxes — identified SDC26 target markers (IDs ≥ 30) with
+       team/colour assignment and arena-frame position. Driven by the
+       FC's /proxy/ui_state → _pos_st.targets stream. Team & colour
+       are resolved from arena_config.target_teams (ID ranges) +
+       target_overrides (per-ID override table).
+       ══════════════════════════════════════════════════════════════ -->
+  <div class=\"row\" style=\"margin-top:12px;\">
+    <div class=\"panel\" style=\"min-width:340px;flex:1;\">
+      <div style=\"display:flex;align-items:center;gap:10px;margin-bottom:8px;\">
+        <b>🎯 Target Boxes</b>
+        <span class=\"small\" style=\"color:#94a3b8;\">detected SDC target markers (ID ≥ 30, 19 cm stickers)</span>
+        <span id=\"targets_badge\" class=\"small\" style=\"margin-left:auto;color:#64748b;\">0 visible</span>
+      </div>
+      <div id=\"targets_empty\" class=\"small\" style=\"color:#64748b;font-style:italic;\">
+        No target boxes detected yet. Fly the drone so its camera points at a box.
+      </div>
+      <table id=\"targets_table\" style=\"display:none;width:100%;border-collapse:collapse;font-size:13px;\">
+        <thead>
+          <tr style=\"text-align:left;color:#94a3b8;border-bottom:1px solid #334155;\">
+            <th style=\"padding:4px 6px;\">ID</th>
+            <th style=\"padding:4px 6px;\">Team</th>
+            <th style=\"padding:4px 6px;\">X (m)</th>
+            <th style=\"padding:4px 6px;\">Y (m)</th>
+            <th style=\"padding:4px 6px;\">Z (m)</th>
+            <th style=\"padding:4px 6px;\">Age</th>
+            <th style=\"padding:4px 6px;\">Status</th>
+          </tr>
+        </thead>
+        <tbody id=\"targets_tbody\"></tbody>
+      </table>
+      <div class=\"small\" style=\"color:#64748b;margin-top:6px;\">
+        Team/colour assignments come from <b>Arena Configuration → Target Teams</b>
+        (ID ranges) with optional per-ID overrides. Unknown IDs show as <i>Unknown</i>.
       </div>
     </div>
   </div>
@@ -5780,6 +5827,77 @@ function updatePosUI(d) {
   document.getElementById('pos_vel').textContent = spd + ' m/s';
   document.getElementById('pos_refs').textContent = d.ref_markers ? d.ref_markers.length : '\\u2014';
 
+  // ── Target Boxes table update ────────────────────────────────────
+  // Resolves team/colour from the currently-loaded arena_cfg.target_teams
+  // (ID-range list) + target_overrides (per-ID explicit). Targets carry
+  // a 3 s TTL so a target briefly out of view doesn't flicker off; a
+  // \"stale\" status flag is set when we haven't seen it in the latest
+  // frame.
+  (function updateTargetsPanel() {
+    const tbody = document.getElementById('targets_tbody');
+    const badge = document.getElementById('targets_badge');
+    const table = document.getElementById('targets_table');
+    const empty = document.getElementById('targets_empty');
+    if (!tbody || !badge) return;
+    const targets = d.targets || {};
+    const ids = Object.keys(targets);
+    // Resolve team+colour from the cached arena config.
+    function teamFor(tid) {
+      const ac = window._arenaCfgCache || {};
+      const overrides = ac.target_overrides || [];
+      for (const o of overrides) {
+        if (Number(o.id) === Number(tid)) {
+          return { team: o.team || 'Override', color: o.color || '#64748b' };
+        }
+      }
+      const ranges = ac.target_teams || [];
+      for (const r of ranges) {
+        const rng = r.id_range || [0, 0];
+        if (Number(tid) >= Number(rng[0]) && Number(tid) <= Number(rng[1])) {
+          return { team: r.team || 'Team?', color: r.color || '#64748b' };
+        }
+      }
+      return { team: 'Unknown', color: '#64748b' };
+    }
+    badge.textContent = ids.length + ' visible';
+    badge.style.color = ids.length > 0 ? '#fbbf24' : '#64748b';
+    if (ids.length === 0) {
+      table.style.display = 'none';
+      empty.style.display = '';
+      return;
+    }
+    table.style.display = '';
+    empty.style.display = 'none';
+    // Sort by ID for stability
+    ids.sort((a, b) => Number(a) - Number(b));
+    const rows = ids.map(tid => {
+      const t = targets[tid];
+      const p = t.pos || [0, 0, 0];
+      const age = t.age_s || 0;
+      const fresh = !!t.fresh;
+      const team = teamFor(tid);
+      const statusHtml = fresh
+        ? '<span style=\"color:#22c55e;\">● live</span>'
+        : '<span style=\"color:#94a3b8;\">○ held ' + age.toFixed(1) + 's</span>';
+      return (
+        '<tr style=\"border-bottom:1px solid #1e293b;\">' +
+        '<td style=\"padding:4px 6px;font-family:monospace;color:#94a3b8;\">' + tid + '</td>' +
+        '<td style=\"padding:4px 6px;\">' +
+          '<span style=\"display:inline-block;width:12px;height:12px;border-radius:2px;' +
+          'background:' + team.color + ';vertical-align:middle;margin-right:6px;\"></span>' +
+          '<span style=\"color:' + team.color + ';font-weight:600;\">' + team.team + '</span>' +
+        '</td>' +
+        '<td style=\"padding:4px 6px;font-family:monospace;\">' + p[0].toFixed(2) + '</td>' +
+        '<td style=\"padding:4px 6px;font-family:monospace;\">' + p[1].toFixed(2) + '</td>' +
+        '<td style=\"padding:4px 6px;font-family:monospace;\">' + p[2].toFixed(2) + '</td>' +
+        '<td style=\"padding:4px 6px;font-family:monospace;color:#64748b;\">' + age.toFixed(1) + 's</td>' +
+        '<td style=\"padding:4px 6px;\">' + statusHtml + '</td>' +
+        '</tr>'
+      );
+    });
+    tbody.innerHTML = rows.join('');
+  })();
+
   // ── Safety distance readout ───────────────────────────────────────
   // How close is the drone to the nearest safety boundary? Green =
   // safe zone with margin; amber = within 30 cm of the boundary; red
@@ -5918,6 +6036,9 @@ async function loadPosConfig() {
     setIf('pos_kf_q',       c.kalman_process_var, (v)=>Number(v).toPrecision(3));
     setIf('pos_kf_r',       c.kalman_meas_var,    (v)=>Number(v).toPrecision(3));
     setIf('pos_max_jump',   c.max_pose_jump_m);
+    setIf('pos_target_size', c.target_marker_size_m);
+    setIf('pos_zupt_speed',  c.zupt_speed_m_s);
+    setIf('pos_zupt_hold',   c.zupt_hold_frames);
     // IMU LPF slider + its live-label
     if (c.imu_lowpass_hz != null) {
       const slider = document.getElementById('pos_imu_lpf');
@@ -6072,6 +6193,9 @@ async function loadPosConfig() {
       kalman_meas_var:     num('pos_kf_r'),
       imu_lowpass_hz:      num('pos_imu_lpf'),
       max_pose_jump_m:     num('pos_max_jump'),
+      target_marker_size_m: num('pos_target_size'),
+      zupt_speed_m_s:      num('pos_zupt_speed'),
+      zupt_hold_frames:    int('pos_zupt_hold'),
     };
     try {
       const r = await fetch('/proxy/position/config', {
@@ -6103,6 +6227,12 @@ async function loadPosConfig() {
     }
     const mj = document.getElementById('pos_max_jump');
     if (mj) mj.value = '0';
+    const ts = document.getElementById('pos_target_size');
+    if (ts) ts.value = '0.19';
+    const zs = document.getElementById('pos_zupt_speed');
+    if (zs) zs.value = '0.05';
+    const zh = document.getElementById('pos_zupt_hold');
+    if (zh) zh.value = '3';
     flash('defaults loaded — click Apply', '#94a3b8');
   };
 })();
@@ -6158,6 +6288,9 @@ async function loadPosConfig() {
       kalman_meas_var:       v('pos_kf_r', 'float'),
       imu_lowpass_hz:        v('pos_imu_lpf', 'float'),
       max_pose_jump_m:       v('pos_max_jump', 'float'),
+      target_marker_size_m:  v('pos_target_size', 'float'),
+      zupt_speed_m_s:        v('pos_zupt_speed', 'float'),
+      zupt_hold_frames:      v('pos_zupt_hold', 'int'),
     };
   }
   async function refresh() {
@@ -6578,6 +6711,32 @@ window.PARAM_INFO = {
     "are rejected as outliers before re-averaging.\\n\\n"+
     "Default 2.5 m. Tighten to 1.0 m for a smaller, tidy arena; loosen to "+
     "3.5 m if markers are far apart."},
+  target_marker_size_m: {title:'Target-box marker size', units:'metres', body:
+    "Physical side length of the ArUco stickers on SDC26 target boxes.\\n\\n"+
+    "The drone's ArUco dictionary (DICT_4X4_100) has 100 IDs. IDs 0-29 are "+
+    "reserved for arena wall/reference markers (50 cm) and IDs \\u226530 for "+
+    "target boxes (19 cm SDC26 default).\\n\\n"+
+    "This matters because solvePnP needs the real marker size to compute "+
+    "distance correctly — if we measure 19 cm markers with a 50 cm template, "+
+    "we get distances 50/19 \\u2248 2.6\\u00d7 too large, and the target lands far "+
+    "from where it really is.\\n\\n"+
+    "Default 0.19 m. Adjust only if your arena uses a different sticker size."},
+  zupt_speed_m_s:     {title:'ZUPT speed threshold', units:'m/s (0 = disabled)', body:
+    "Zero-Velocity Update. When the IMU reports speed below this threshold "+
+    "for \\\"hold\\\" consecutive frames, the positioner snaps the fresh ArUco "+
+    "measurement to the last valid pose — eliminates the parked-drone drift "+
+    "caused by sub-pixel corner noise + IPPE mirror ambiguity.\\n\\n"+
+    "Below 0.05 m/s is \\\"not moving\\\" in practice. Raise to 0.10 m/s for "+
+    "very noisy indoor flight (it'll also freeze during slow hovers), or "+
+    "drop to 0.02 m/s if you want aggressive drift suppression.\\n\\n"+
+    "0 disables."},
+  zupt_hold_frames:   {title:'ZUPT hold frames', units:'frames', body:
+    "How many consecutive slow frames are required before ZUPT engages. "+
+    "Stops false-triggering during quick directional changes (where IMU "+
+    "speed dips briefly as the drone reverses).\\n\\n"+
+    "At 5 Hz positioning: 3 frames \\u2248 600 ms. That's a good balance — long "+
+    "enough to ignore brief lulls, short enough to lock in quickly when "+
+    "actually parked."},
   max_pose_jump_m:    {title:'Pose-jump gate', units:'metres (0 = disabled)', body:
     "Safety limit on how far a fresh ArUco fix is allowed to disagree with "+
     "the Kalman-predicted state before it's rejected as an outlier.\\n\\n"+
@@ -6950,6 +7109,13 @@ async function loadArenaConfig() {
     }
     if (d.marker_size_m != null) document.getElementById('ac_msize').value = d.marker_size_m;
     if (d.markers) { arenaMarkers = JSON.parse(JSON.stringify(d.markers)); renderMarkerTable(); }
+    // Cache target-box metadata for the Target Boxes panel — team &
+    // colour come from here, keyed by marker ID.
+    window._arenaCfgCache = {
+      target_marker_size_m: d.target_marker_size_m,
+      target_teams:      d.target_teams || [],
+      target_overrides:  d.target_overrides || [],
+    };
     // Update arena canvas world dimensions
     if (d.arena) {
       arenaW = d.arena.width_m  || 20;
@@ -6961,6 +7127,12 @@ async function loadArenaConfig() {
     }
   } catch {}
 }
+// Load arena config once at startup so the Target Boxes panel has
+// team/colour metadata immediately (operator doesn't need to click
+// \"Show\" on Arena Configuration first).
+window.addEventListener('load', () => {
+  try { loadArenaConfig(); } catch (e) {}
+});
 
 document.getElementById('arena_cfg_toggle').onclick = function() {
   const body = document.getElementById('arena_cfg_body');
@@ -9517,6 +9689,10 @@ def _pi_arena_to_js(d: dict) -> dict:
             entry["label"] = m["label"]
         markers_dict[mid] = entry
     out["markers"] = markers_dict
+    # Pass through target-box metadata so the C2 UI can render team labels
+    out["target_marker_size_m"] = d.get("target_marker_size_m", 0.19)
+    out["target_teams"] = d.get("target_teams") or []
+    out["target_overrides"] = d.get("target_overrides") or []
     return out
 
 

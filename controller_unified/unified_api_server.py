@@ -741,6 +741,16 @@ _pos_cfg: dict = {
     # the Kalman-predicted state by more than this. Kills the
     # catastrophic >10 m single-marker glitches. 0 = disabled.
     "max_pose_jump_m":      0.0,
+    # Target-box marker size. SDC26 target boxes use 19 cm ArUco
+    # stickers; arena walls use 50 cm. Markers with ID ≥ 30 are
+    # solvePnP-ed against this smaller corner set so target positions
+    # land at their true location instead of being over-reported by
+    # 50/19 ≈ 2.6 ×.
+    "target_marker_size_m": 0.19,
+    # Zero-Velocity Update — freezes position when IMU says stationary,
+    # so ArUco noise doesn't walk the parked drone around.
+    "zupt_speed_m_s":       0.05,  # threshold below which IMU says "still"
+    "zupt_hold_frames":     3,     # consecutive slow frames before engage
     # ── Auto Positioning ──────────────────────────────────────────
     # When True, the FC ignores every user-tuned filter/precision knob
     # in this dict (imu_weight, marker_size_m, top_k, outlier, all the
@@ -789,6 +799,9 @@ CLAUDE_AUTO_CONFIG: dict = {
     "imu_lowpass_hz":       5.0,
     "seen_hold_s":          0.6,
     "max_pose_jump_m":      3.0,
+    "target_marker_size_m": 0.19,
+    "zupt_speed_m_s":       0.05,
+    "zupt_hold_frames":     3,
 }
 
 
@@ -900,6 +913,23 @@ _ARENA_CONFIG_DEFAULT: dict = {
         {"id": 23, "label": "Back D low",   "x":   6.0, "y": 10.0,   "z":  2.0, "wall": "back"},
         {"id": 24, "label": "Back D high",  "x":   6.0, "y": 10.0,   "z":  4.0, "wall": "back"},
     ],
+    # ── Target boxes ─────────────────────────────────────────────
+    # SDC26 target stickers are 19 cm (vs 50 cm arena markers). IDs ≥ 30.
+    # The map below assigns a team + colour to each ID range; the C2's
+    # "Target Boxes" panel uses it to label detected targets. Editable —
+    # operator can add specific per-ID entries to override a range.
+    "target_marker_size_m": 0.19,
+    "target_teams": [
+        {"id_range": [30, 39], "team": "Red",    "color": "#ef4444"},
+        {"id_range": [40, 49], "team": "Blue",   "color": "#3b82f6"},
+        {"id_range": [50, 59], "team": "Green",  "color": "#22c55e"},
+        {"id_range": [60, 69], "team": "Yellow", "color": "#eab308"},
+        {"id_range": [70, 79], "team": "Purple", "color": "#a855f7"},
+        {"id_range": [80, 89], "team": "Orange", "color": "#f97316"},
+        {"id_range": [90, 99], "team": "Cyan",   "color": "#06b6d4"},
+    ],
+    # Optional per-ID overrides: {"id": 34, "team": "Red 4", "color": "#..."}
+    "target_overrides": [],
 }
 _arena_cfg: dict = {}
 _arena_cfg_lock = threading.Lock()
@@ -5277,6 +5307,7 @@ def _pos_snapshot_to_js(snapshot: dict) -> dict:
         "ref_markers": snapshot.get("ref_markers", []),
         "seen_markers": snapshot.get("seen_markers", []),
         "seen_count": snapshot.get("seen_count", 0),
+        "targets":     snapshot.get("targets", {}),
         "stale": snapshot.get("stale", True),
         "enabled": enabled,
         "latency_ms": lat_ms,
@@ -5424,16 +5455,25 @@ def positioning_loop():
                 init_kalman = bool(cfg.get("enable_kalman_filter", True))
                 init_dist_scale = float(cfg.get("distance_scale", 1.0))
                 init_max_jump = float(cfg.get("max_pose_jump_m", 0.0))
+                init_tgt_size = float(cfg.get("target_marker_size_m", 0.19))
+                init_zupt_speed = float(cfg.get("zupt_speed_m_s", 0.05))
+                init_zupt_hold = int(cfg.get("zupt_hold_frames", 3))
                 processor = _HeadlessAruCo(cam_mat, dist, detect_profile=profile,
                                            marker_size=init_marker_size, enable_kalman_filter=init_kalman)
                 _apply_arena_cfg_to_processor(processor)
                 processor.distance_scale = init_dist_scale
                 processor.max_pose_jump_m = init_max_jump
+                processor.target_marker_size = init_tgt_size
+                processor.zupt_speed_m_s = init_zupt_speed
+                processor.zupt_hold_frames = init_zupt_hold
+                processor._build_marker_point_sets()
                 _pos_processor = processor
                 auto_tag = " [auto]" if cfg.get("auto_positioning") else ""
                 print(f"[POS] Processor initialised (profile={profile}, "
+                      f"ref={init_marker_size:.3f}m, target={init_tgt_size:.3f}m, "
                       f"distance_scale={init_dist_scale:.4f}, "
-                      f"max_pose_jump_m={init_max_jump:.2f}){auto_tag}")
+                      f"max_pose_jump_m={init_max_jump:.2f}, "
+                      f"zupt={init_zupt_speed}m/s/{init_zupt_hold}f){auto_tag}")
             except Exception as ie:
                 print(f"[POS] Processor init error: {ie}")
                 time.sleep(1)
@@ -5562,6 +5602,39 @@ def positioning_loop():
             _pos_st["markers"] = {str(k): round(float(v), 4)
                                    for k, v in (result.get("marker_weights") or {}).items()}
             _pos_st["ref_markers"] = list(result.get("ref_markers") or [])
+            # Target boxes — marker-ID → arena-frame [x,y,z] dict. These
+            # are the SDC26 target markers (ID ≥ 30) projected into world
+            # space via each visible reference marker, weighted-fused and
+            # EMA-smoothed. The C2 renders them in the "Target Boxes"
+            # panel with team/colour derived from arena_config.
+            raw_targets = result.get("targets") or {}
+            # Carry forward targets seen in earlier frames that haven't
+            # been observed in this one — with a TTL so old entries age
+            # out. Without this the UI flickers per-frame as the drone
+            # glances away from a target. State kept on the loop func.
+            if not hasattr(positioning_loop, "_target_last_seen"):
+                positioning_loop._target_last_seen = {}   # id → (pos, mono_ts)
+            _tgt_ttl_s = 3.0
+            _tgt_now = time.monotonic()
+            for tid_str, tpos in raw_targets.items():
+                try:
+                    tid = int(tid_str)
+                except Exception:
+                    continue
+                if isinstance(tpos, (list, tuple)) and len(tpos) == 3:
+                    positioning_loop._target_last_seen[tid] = (list(tpos), _tgt_now)
+            # Prune expired
+            for tid in [k for k, (_, t) in positioning_loop._target_last_seen.items()
+                        if _tgt_now - t > _tgt_ttl_s]:
+                del positioning_loop._target_last_seen[tid]
+            _pos_st["targets"] = {
+                str(tid): {
+                    "pos":    [round(p[0], 3), round(p[1], 3), round(p[2], 3)],
+                    "age_s":  round(_tgt_now - ts_mono, 2),
+                    "fresh":  (tid in {int(k) for k in raw_targets.keys()}),
+                }
+                for tid, (p, ts_mono) in positioning_loop._target_last_seen.items()
+            }
             # Publish the SMOOTHED list so the UI halos don't flicker.
             # The raw per-frame detections are still available for
             # diagnostics / flight-log accuracy on "seen_markers_raw".
@@ -5925,6 +5998,18 @@ def api_pos_config_set():
             # 0 disables the pose-jump gate. Positive values clamped 0..20 m.
             v = float(data["max_pose_jump_m"])
             _pos_cfg["max_pose_jump_m"] = max(0.0, min(20.0, v))
+        if "target_marker_size_m" in data:
+            # SDC26 defaults: 0.19 m. Clamped to [0.02, 2.0] m.
+            v = float(data["target_marker_size_m"])
+            _pos_cfg["target_marker_size_m"] = max(0.02, min(2.0, v))
+        if "zupt_speed_m_s" in data:
+            # 0 disables ZUPT. Positive values clamped 0..1 m/s.
+            v = float(data["zupt_speed_m_s"])
+            _pos_cfg["zupt_speed_m_s"] = max(0.0, min(1.0, v))
+        if "zupt_hold_frames" in data:
+            # 0 disables (alongside speed==0). Clamped 0..30 frames.
+            v = int(data["zupt_hold_frames"])
+            _pos_cfg["zupt_hold_frames"] = max(0, min(30, v))
         if "auto_positioning" in data:
             # Toggling auto flips which set of values actually gets pushed
             # to the processor. The user's manual values are preserved so
@@ -5972,6 +6057,17 @@ def api_pos_config_set():
             if _touched("max_pose_jump_m"):
                 _pos_processor.max_pose_jump_m = float(eff.get("max_pose_jump_m", 0.0))
                 print(f"[POS] max_pose_jump_m = {eff['max_pose_jump_m']}m (live)")
+            if _touched("target_marker_size_m"):
+                _pos_processor.target_marker_size = float(eff.get("target_marker_size_m", 0.19))
+                _pos_processor._build_marker_point_sets()
+                print(f"[POS] target_marker_size_m = {eff['target_marker_size_m']}m (live)")
+            if _touched("zupt_speed_m_s"):
+                _pos_processor.zupt_speed_m_s = float(eff.get("zupt_speed_m_s", 0.0))
+                _pos_processor._zupt_slow_count = 0
+                print(f"[POS] zupt_speed_m_s = {eff['zupt_speed_m_s']} (live)")
+            if _touched("zupt_hold_frames"):
+                _pos_processor.zupt_hold_frames = int(eff.get("zupt_hold_frames", 0))
+                print(f"[POS] zupt_hold_frames = {eff['zupt_hold_frames']} (live)")
             # ── Extended tuning → patched as module globals on ctrl_position
             # because the fusion code reads them as module-level constants. ──
             import ctrl_position as _cp
@@ -6159,7 +6255,7 @@ def main():
     print(f"[{tag}] Unified API server: http://{HTTP_HOST}:{HTTP_PORT}")
     print(f"[{tag}] Drone: {drone_type} @ {drone_ip} (auto-reconnect; watchdog={REMOTE_TIMEOUT_S}s)")
     print(f"[{tag}] SDKs available: tello={HAS_TELLO_SDK}, olympe={HAS_OLYMPE_SDK}")
-    print(f"[{tag}] Code version: 2026-04-24-cg (calibration flight + import preset)")
+    print(f"[{tag}] Code version: 2026-04-24-ch (target marker size + ZUPT + target boxes panel)")
     app.run(host=HTTP_HOST, port=HTTP_PORT, threaded=True, use_reloader=False)
 
 
