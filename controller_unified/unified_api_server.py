@@ -2044,6 +2044,30 @@ class OlympeBackend(DroneBackend):
         print(f"[ANAFI]   sensors    = {pre_sensors if pre_sensors else '(all OK)'}")
         print(f"[ANAFI]   magneto    = {pre_magneto if pre_magneto else '(not available)'}")
 
+        # ── Refuse early on known-bad pre-flight conditions ─────────
+        # Prior versions waited up to 10 s for Olympe's TakeOff().wait()
+        # to time out before reading the failure reason — the C2 then
+        # also timed out (15 s) and surfaced a useless "takeoff timed
+        # out" message instead of the actual fault. These checks
+        # short-circuit those cases: if magneto / alert / motor state
+        # says takeoff will fail, return the specific reason
+        # immediately so the UI can show it.
+        if _magneto_needs_calibration(pre_magneto):
+            self._start_piloting()
+            return False, (
+                f"magnetometer_calibration_required|"
+                f"Magnetometer needs figure-8 calibration via FreeFlight app "
+                f"before takeoff (status: {pre_magneto})"
+            )
+        if pre_alert and pre_alert.lower() not in {"none", "", "null"}:
+            # Common values: "user", "cut_out", "critical_battery", "low_battery",
+            # "too_much_angle", "too_much_speed", "almost_empty_battery"
+            self._start_piloting()
+            return False, f"alert_state|Drone alert: {pre_alert}"
+        if pre_motor:
+            self._start_piloting()
+            return False, f"motor_error|Motor fault: {pre_motor}"
+
         self._stop_piloting()
         time.sleep(0.2)
         print("[ANAFI] Sending TakeOff command...")
@@ -2075,18 +2099,30 @@ class OlympeBackend(DroneBackend):
         post_motor   = self._read_motor_error_state()
         post_sensors = self._read_sensors_state()
         post_magneto = self._read_magnetometer_state()
-        reason_parts = []
-        if post_alert and post_alert != "none":
-            reason_parts.append(f"alert={post_alert}")
-        if post_motor:
-            reason_parts.append(f"motor={post_motor}")
-        if post_sensors:
-            reason_parts.append(f"sensors={post_sensors}")
-        # The magnetometer is the top recurring cause of Anafi takeoff refusals
-        # in this project — surface it prominently.
+        # Pick the single most actionable reason_code, then append a
+        # comma-joined summary so the UI can render a hint. Order matters:
+        # magnetometer is the most common offender — surface it first.
+        reason_code = None
+        reason_bits = []
         if _magneto_needs_calibration(post_magneto):
-            reason_parts.append(f"magneto={post_magneto}")
-        reason = "takeoff_failed" + (f" ({', '.join(reason_parts)})" if reason_parts else "")
+            reason_code = "magnetometer_calibration_required"
+            reason_bits.append(f"magneto={post_magneto}")
+        if post_alert and post_alert.lower() not in {"none", "", "null"}:
+            reason_code = reason_code or "alert_state"
+            reason_bits.append(f"alert={post_alert}")
+        if post_motor:
+            reason_code = reason_code or "motor_error"
+            reason_bits.append(f"motor={post_motor}")
+        if post_sensors:
+            reason_code = reason_code or "sensor_fault"
+            reason_bits.append(f"sensors={post_sensors}")
+        if reason_code is None:
+            reason_code = "takeoff_failed"
+        human = (", ".join(reason_bits)
+                 if reason_bits else "Olympe did not accept the takeoff "
+                                      "(no specific fault reported; try FreeFlight "
+                                      "magnetometer calibration + battery check)")
+        reason = f"{reason_code}|{human}"
         print(f"[ANAFI] takeoff refused — {reason}")
         if post_magneto:
             print(f"[ANAFI] Post-takeoff magneto status: {post_magneto}")
@@ -4006,7 +4042,30 @@ def api_takeoff():
                     print(f"[REC] Could not spawn auto-record thread: {te}")
             else:
                 print(f"[{drone_type.upper()}] Takeoff returned ok=False msg={msg}")
-                return jsonify(ok=False, error=msg), 500
+                # Parse the "code|message" format the backend returns for
+                # known-bad pre-flight conditions; fall through to plain
+                # string for older code paths / Tello.
+                reason_code = None
+                detail_msg = msg
+                if isinstance(msg, str) and "|" in msg:
+                    reason_code, _, detail_msg = msg.partition("|")
+                # Re-read diagnostic state so the UI can show what's wrong.
+                diag = {}
+                try:
+                    diag["magneto"] = b._read_magnetometer_state()
+                    diag["alert"]   = b._read_alert_state()
+                    diag["motor"]   = b._read_motor_error_state()
+                    diag["sensors"] = b._read_sensors_state()
+                    if diag["magneto"]:
+                        diag["magneto_needs_calibration"] = _magneto_needs_calibration(diag["magneto"])
+                except Exception:
+                    pass
+                return jsonify(
+                    ok=False,
+                    error=detail_msg,
+                    reason_code=reason_code or "takeoff_failed",
+                    diagnostic=diag,
+                ), 500
         return jsonify(ok=True, flying=flying, safe_takeoff=safe_takeoff_enabled)
     except Exception as e:
         import traceback
@@ -6253,7 +6312,7 @@ def main():
     print(f"[{tag}] Unified API server: http://{HTTP_HOST}:{HTTP_PORT}")
     print(f"[{tag}] Drone: {drone_type} @ {drone_ip} (auto-reconnect; watchdog={REMOTE_TIMEOUT_S}s)")
     print(f"[{tag}] SDKs available: tello={HAS_TELLO_SDK}, olympe={HAS_OLYMPE_SDK}")
-    print(f"[{tag}] Code version: 2026-04-24-ci (Blue/Red target teams only)")
+    print(f"[{tag}] Code version: 2026-04-24-cj (structured takeoff failure reasons)")
     app.run(host=HTTP_HOST, port=HTTP_PORT, threaded=True, use_reloader=False)
 
 
