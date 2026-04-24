@@ -801,8 +801,8 @@ CLAUDE_AUTO_CONFIG: dict = {
     "imu_lowpass_hz":       5.0,
     "seen_hold_s":          0.6,
     "max_pose_jump_m":      3.0,
-    "target_marker_size_m": 0.50,   # match wall size — dual-size path reverted
-    "zupt_speed_m_s":       0.0,    # reverted (see _pos_cfg comments above)
+    "target_marker_size_m": 0.19,   # SDC26 target stickers (dual-size re-enabled)
+    "zupt_speed_m_s":       0.0,    # ZUPT stays off (was the real revert culprit)
     "zupt_hold_frames":     0,
 }
 
@@ -6281,7 +6281,7 @@ def main():
     print(f"[{tag}] Unified API server: http://{HTTP_HOST}:{HTTP_PORT}")
     print(f"[{tag}] Drone: {drone_type} @ {drone_ip} (auto-reconnect; watchdog={REMOTE_TIMEOUT_S}s)")
     print(f"[{tag}] SDKs available: tello={HAS_TELLO_SDK}, olympe={HAS_OLYMPE_SDK}")
-    print(f"[{tag}] Code version: 2026-04-24-cp (pursuit: age-based filter + live candidate status)")
+    print(f"[{tag}] Code version: 2026-04-24-cq (target marker size 19cm solvePnP + target Z unclamped)")
     app.run(host=HTTP_HOST, port=HTTP_PORT, threaded=True, use_reloader=False)
 
 

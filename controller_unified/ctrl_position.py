@@ -159,13 +159,14 @@ class HeadlessAruCoPositioning:
         self.camera_matrix = camera_matrix
         self.dist_coeffs = dist_coeffs
         self.marker_size = marker_size if marker_size is not None else MARKER_SIZE
-        half = self.marker_size / 2.0
-        self.MARKER_3D_POINTS = np.array([
-            [-half,  half, 0.0],
-            [ half,  half, 0.0],
-            [ half, -half, 0.0],
-            [-half, -half, 0.0],
-        ], dtype=np.float32)
+        # SDC26 target boxes wear 19 cm ArUco stickers, while the arena
+        # wall markers are 50 cm. solvePnP needs the RIGHT physical
+        # size for each to return a correct distance — if we measure a
+        # 19 cm target with 50 cm corners we get distances 50/19 ≈ 2.63×
+        # too large and the target lands ~30 m away from reality.
+        # Kept as a per-instance attribute so the FC can live-patch it.
+        self.target_marker_size = 0.19
+        self._build_marker_point_sets()
         self.aruco_dict = aruco.getPredefinedDictionary(aruco.DICT_4X4_100)
         self.aruco_params = aruco.DetectorParameters()
         self._apply_detection_profile(detect_profile)
@@ -221,6 +222,41 @@ class HeadlessAruCoPositioning:
         self.imu_vel = np.zeros(3, dtype=float)
         self.imu_vel_ts = 0.0
         self.imu_weight = float(np.clip(imu_weight, 0.0, 1.0))
+
+    def _build_marker_point_sets(self):
+        """(Re)build the two 3D corner arrays used for solvePnP — one at
+        the reference-marker size (arena walls, 0.5 m default) and one
+        at the target-marker size (SDC26 target boxes, 0.19 m default).
+        Call this after changing either self.marker_size or
+        self.target_marker_size at runtime."""
+        half_ref = self.marker_size / 2.0
+        self.MARKER_3D_POINTS = np.array([
+            [-half_ref,  half_ref, 0.0],
+            [ half_ref,  half_ref, 0.0],
+            [ half_ref, -half_ref, 0.0],
+            [-half_ref, -half_ref, 0.0],
+        ], dtype=np.float32)
+        half_tgt = self.target_marker_size / 2.0
+        self.MARKER_3D_POINTS_TARGET = np.array([
+            [-half_tgt,  half_tgt, 0.0],
+            [ half_tgt,  half_tgt, 0.0],
+            [ half_tgt, -half_tgt, 0.0],
+            [-half_tgt, -half_tgt, 0.0],
+        ], dtype=np.float32)
+
+    def _marker_points_for_id(self, mid: int) -> np.ndarray:
+        """Pick the correct 3D corner set for a given marker ID.
+
+        SDC26 convention: IDs ≥ 30 are target boxes (19 cm stickers);
+        anything below is an arena reference (50 cm wall marker). The
+        tgt_indices filter later restricts which target IDs are
+        actually *used* (strict {31-36, 41-46}); this helper just
+        makes sure solvePnP uses the right corners so the distance is
+        right whichever class the marker turns out to belong to.
+        """
+        if int(mid) >= 30:
+            return self.MARKER_3D_POINTS_TARGET
+        return self.MARKER_3D_POINTS
 
     def set_imu_velocity(self, vel_arena, ts=None):
         """
@@ -547,9 +583,15 @@ class HeadlessAruCoPositioning:
 
         seen_ids = [int(mid) for mid in ids.flatten()]
         cached_poses = {}
-        # Use self.MARKER_3D_POINTS so that the configured marker_size_m is
-        # taken into account when estimating camera-to-marker distance via solvePnP.
-        marker_points = self.MARKER_3D_POINTS.astype(np.float32)
+        # Pick the correct 3D-corner array PER MARKER ID. Arena wall
+        # markers (IDs < 30) use self.MARKER_3D_POINTS (0.5 m corners);
+        # SDC26 target boxes (IDs ≥ 30) use self.MARKER_3D_POINTS_TARGET
+        # (0.19 m corners). Before this per-ID split, every target was
+        # measured at 2.63× its real distance (50/19 = 2.63), which put
+        # detected targets at X≈34 m — 20 m outside the arena — and
+        # made pursuit completely fail to find them.
+        ref_points = self.MARKER_3D_POINTS.astype(np.float32)
+        tgt_points = self.MARKER_3D_POINTS_TARGET.astype(np.float32)
         # Optional camera↔marker-distance correction. We keep the RAW
         # tvec in the cache because downstream needs it at its original
         # scale for:
@@ -566,7 +608,8 @@ class HeadlessAruCoPositioning:
             dist_scale = 1.0
         for i, mid_raw in enumerate(seen_ids):
             mid = int(mid_raw)
-            ok, rvec, tvec = cv2.solvePnP(marker_points, corners[i].reshape(-1, 2), self.camera_matrix,
+            pts = tgt_points if mid >= 30 else ref_points
+            ok, rvec, tvec = cv2.solvePnP(pts, corners[i].reshape(-1, 2), self.camera_matrix,
                                           self.dist_coeffs, flags=cv2.SOLVEPNP_IPPE_SQUARE)
             if ok:
                 cached_poses[mid] = (rvec, tvec.reshape(3))
@@ -762,8 +805,19 @@ class HeadlessAruCoPositioning:
             for est, w in zip(target_estimates, w_ref):
                 t_w += est * w
 
-            # Keep target on fixed height axis (arena Y)
-            t_w[2] = TARGET_Z_POS
+            # Clamp the target Z to a physically-sane band instead of
+            # forcing it to the legacy TARGET_Z_POS constant. With the
+            # correct 19 cm marker size the per-marker Z estimate is now
+            # meaningful (target box sits on the floor ≈ 0.1-0.5 m, stand-
+            # mounted up to ~1 m). Anything way outside that range is a
+            # mirror-pose / noise artefact; fall back to 0 instead of
+            # propagating a Z that would send the drone into the floor
+            # or the ceiling.
+            z_meas = float(t_w[2])
+            if z_meas < -0.5 or z_meas > 2.0 or not np.isfinite(z_meas):
+                t_w[2] = 0.0
+            else:
+                t_w[2] = max(0.0, z_meas)
 
             if tid not in self.target_filters:
                 self.target_filters[tid] = ExponentialMovingAverage(alpha=0.15)
