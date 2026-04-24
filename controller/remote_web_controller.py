@@ -2317,7 +2317,7 @@ HTML = """
     arcPoll();
     // Version marker — if this string doesn't appear in the DOM,
     // you're running stale JS (restart the Python server or hard-refresh).
-    const BUILD = 'cv-pursuit-status-visibility';
+    const BUILD = 'cw-pursuit-live-candidates';
     console.log('[arc] init complete, build=' + BUILD);
     const ver = document.createElement('span');
     ver.id = 'arc_build_tag';
@@ -6590,13 +6590,48 @@ async function loadPosConfig() {
         const phase = st.phase || 'IDLE';
         const tid = st.target_id;
         const note = st.note || '';
+        const phaseReason = st.phase_reason || '';
         const tgt = (tid != null) ? targetLabel(tid) : '<span style=\"color:#64748b;\">—</span>';
+        // Render the "camera currently sees" chips — one per SDC26-valid
+        // target within TARGET_MAX_AGE_S, coloured by team, with the
+        // detection age and a "taken" / "claimed" tag when another
+        // drone already owns it.
+        const inView = Array.isArray(st.targets_in_view) ? st.targets_in_view : [];
+        const chips = inView.map(c => {
+          const n = Number(c.id);
+          const team = (n >= 31 && n <= 36) ? 'Blue' : (n >= 41 && n <= 46) ? 'Red' : '?';
+          const col  = team === 'Blue' ? '#3b82f6' : team === 'Red' ? '#ef4444' : '#94a3b8';
+          const box = n % 10;
+          const isMe = Number(tid) === n;
+          const tagLabel = c.taken
+            ? (isMe ? ' • mine' : ' • taken')
+            : (c.fresh ? '' : ' • ' + Number(c.age_s).toFixed(1) + 's');
+          const border = isMe ? '2px solid ' + col : '1px solid ' + col + '55';
+          return '<span style=\"display:inline-block;padding:1px 7px;border:' + border
+               + ';color:' + col + ';border-radius:10px;font-size:11px;font-weight:600;margin-right:4px;background:rgba(0,0,0,0.25);\">'
+               + team + ' ' + box + tagLabel + '</span>';
+        }).join('');
+        const viewLine = inView.length
+          ? '<div style=\"margin-top:2px;padding-left:56px;font-size:11px;color:#94a3b8;\">'
+            + '<span style=\"color:#64748b;\">sees:</span> ' + chips
+            + '</div>'
+          : '';
+        // If the drone is stuck in SEARCH, phase_reason explains WHY —
+        // no valid SDC26 in view, or all targets claimed by others, etc.
+        const reasonLine = (phase === 'SEARCH' && phaseReason)
+          ? '<div style=\"margin-top:2px;padding-left:56px;font-size:11px;color:#fbbf24;\">'
+            + '↳ ' + phaseReason + '</div>'
+          : '';
         return (
-          '<div style=\"display:flex;gap:10px;align-items:center;padding:2px 0;\">' +
+          '<div style=\"padding:3px 0;\">' +
+          '<div style=\"display:flex;gap:10px;align-items:center;\">' +
           '<span style=\"color:#e2e8f0;font-weight:600;min-width:56px;\">Drone ' + did + '</span>' +
           phaseBadge(phase) +
           '<span style=\"margin-left:6px;\">' + tgt + '</span>' +
           '<span style=\"color:#94a3b8;margin-left:auto;font-size:11px;\">' + note + '</span>' +
+          '</div>' +
+          viewLine +
+          reasonLine +
           '</div>'
         );
       });

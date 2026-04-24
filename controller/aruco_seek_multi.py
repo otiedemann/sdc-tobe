@@ -2345,7 +2345,15 @@ class DirectTargetPursuitMission:
     """Reactive pursuit — no pre-computed target list. Chases detections
     as they come in from the positioner."""
 
-    TICK_S = 0.3
+    # 5 Hz mission loop — matches the FC positioner's publish rate so we
+    # don't miss fresh frames, and gives smoother RC cadence on the wire.
+    TICK_S = 0.2
+    # Accept any target that's been observed in the last N seconds as a
+    # candidate, not just this-frame "fresh" ones. The positioner's
+    # `fresh` flag flickers on/off for markers near the camera edge or
+    # under motion blur, and at 5 Hz ticks a strict fresh=True filter
+    # means we frequently miss a target that's consistently in view.
+    TARGET_MAX_AGE_S = 1.5
 
     def __init__(
         self,
@@ -2409,9 +2417,17 @@ class DirectTargetPursuitMission:
                     "target_id": None,
                     "target_pos": None,      # last seen [x, y, z]
                     "hover_start": None,
-                    "note": "searching",
+                    "note": "initialising…",
+                    "phase_reason": "mission just started",
                     "boxes_done": 0,
                     "last_target_seen_at": 0.0,
+                    # Live diagnostic: per-tick snapshot of every
+                    # SDC26-valid target currently visible to the
+                    # camera, with age + taken flags. Surfaced to the
+                    # operator via /proxy/missions/status so the UI can
+                    # explain "why isn't it pursuing?" in real time.
+                    "targets_in_view": [],
+                    "candidates_summary": "",
                 }
                 for did in self.drone_ids
             }
@@ -2531,8 +2547,15 @@ class DirectTargetPursuitMission:
         return best
 
     def _fresh_valid_targets(self, snap: dict) -> dict:
-        """Return {tid: [x, y, z]} for currently-fresh SDC26-valid target
-        detections in this drone's snapshot."""
+        """Return {tid: {pos, age_s, fresh}} for SDC26-valid target
+        detections seen within TARGET_MAX_AGE_S in this drone's snapshot.
+
+        Kept as a dict of dicts (not just positions) so the mission can
+        show the operator *every* candidate it's considering plus how
+        stale each detection is — critical for diagnosing "why isn't it
+        pursuing?" episodes where the camera sees a target but the
+        fresh=True frame doesn't line up with a tick boundary.
+        """
         raw = snap.get("targets") or {}
         out = {}
         for tid_str, info in raw.items():
@@ -2542,17 +2565,25 @@ class DirectTargetPursuitMission:
                 continue
             if tid not in _SDC26_VALID_TARGET_IDS:
                 continue
-            if not isinstance(info, dict) or not info.get("fresh"):
+            if not isinstance(info, dict):
+                continue
+            age = float(info.get("age_s", 0.0) or 0.0)
+            if age > self.TARGET_MAX_AGE_S:
                 continue
             pos = info.get("pos")
             if not isinstance(pos, (list, tuple)) or len(pos) < 3:
                 continue
-            out[tid] = [float(pos[0]), float(pos[1]), float(pos[2])]
+            out[tid] = {
+                "pos": [float(pos[0]), float(pos[1]), float(pos[2])],
+                "age_s": age,
+                "fresh": bool(info.get("fresh", False)),
+            }
         return out
 
     def _pick_target(self, did: str, my_pos, visible: dict) -> Optional[int]:
-        """Nearest unclaimed + uncaptured target from the visible set."""
-        cands = [(tid, p) for tid, p in visible.items()
+        """Nearest unclaimed + uncaptured target from the visible set.
+        `visible` is {tid: {pos, age_s, fresh}} (new dict shape)."""
+        cands = [(tid, info["pos"]) for tid, info in visible.items()
                  if tid not in self.captured
                  and tid not in self.claimed.values()]
         if not cands:
@@ -2562,6 +2593,36 @@ class DirectTargetPursuitMission:
         cx, cy = float(my_pos[0]), float(my_pos[1])
         cands.sort(key=lambda kv: (kv[1][0] - cx) ** 2 + (kv[1][1] - cy) ** 2)
         return cands[0][0]
+
+    @staticmethod
+    def _target_label(tid: int) -> str:
+        """Short human-readable label (e.g. 'Blue Box 4' / 'Red Box 2')."""
+        if 31 <= tid <= 36:
+            return f"Blue Box {tid - 30}"
+        if 41 <= tid <= 46:
+            return f"Red Box {tid - 40}"
+        return f"#{tid}"
+
+    @staticmethod
+    def _summarise_candidates(visible: dict,
+                              taken: set, captured: set) -> str:
+        """Compact 'what this drone is currently seeing' string for UI."""
+        if not visible:
+            return "none"
+        parts = []
+        for tid in sorted(visible.keys()):
+            info = visible[tid]
+            age = info.get("age_s", 0.0)
+            fresh = info.get("fresh")
+            tag = ""
+            if tid in captured:
+                tag = " (captured)"
+            elif tid in taken:
+                tag = " (taken)"
+            elif not fresh and age > 0.3:
+                tag = f" ({age:.1f}s)"
+            parts.append(f"{tid}{tag}")
+        return ", ".join(parts)
 
     def _tick_drone(self, did: str, obs: "DroneObserver"):
         now = time.time()
@@ -2584,31 +2645,64 @@ class DirectTargetPursuitMission:
         pos = snap.get("pos") or snap.get("cam")
         visible = self._fresh_valid_targets(snap)
 
+        # Live candidate diagnostic — every tick, regardless of phase.
+        # The operator needs to see what the drone is SEEING, not just
+        # what phase it's in. `candidates` surfaces every valid SDC26
+        # target currently within the TARGET_MAX_AGE_S window; `taken`
+        # tags which ones are already claimed by another drone.
+        taken_by_others = {t for d, t in self.claimed.items() if d != did}
+        state["targets_in_view"] = [
+            {"id": tid,
+             "label": self._target_label(tid),
+             "pos": info["pos"],
+             "age_s": info["age_s"],
+             "fresh": info["fresh"],
+             "taken": tid in taken_by_others or tid in self.captured}
+            for tid, info in sorted(visible.items())
+        ]
+        state["candidates_summary"] = self._summarise_candidates(
+            visible, taken_by_others, self.captured)
+
         # ── SEARCH ──────────────────────────────────────────────
         if phase == "SEARCH":
             tid = self._pick_target(did, pos, visible)
             if tid is not None:
+                tpos = visible[tid]["pos"]
                 with self._lock:
                     self.claimed[did] = tid
                     state["target_id"] = tid
-                    state["target_pos"] = visible[tid]
+                    state["target_pos"] = tpos
                     state["last_target_seen_at"] = now
                     state["phase"] = "PURSUE"
-                    state["note"] = f"locked {tid} — pursuing"
+                    state["phase_reason"] = f"claimed {self._target_label(tid)} (ID {tid})"
+                    state["note"] = f"locked {self._target_label(tid)} (ID {tid}) — pursuing"
                 if self._trace:
                     self._trace.write("target_claimed", {
-                        "drone": did, "target_id": tid, "pos": visible[tid]})
+                        "drone": did, "target_id": tid, "pos": tpos})
                 return
-            # No target visible → rotate slowly via yaw-only RC to scan.
-            # Avoid stepping on the observer's own position-track by
-            # writing to its waypoint layer: clear waypoint and use the
-            # per-tick RC override.
+            # No claimable target visible → rotate slowly to scan. We
+            # distinguish "camera sees nothing valid" from "sees
+            # candidates but they're all already claimed by other
+            # drones or captured" so the operator can tell.
             obs.clear_waypoint()
             try:
                 obs.cmd_rc(0, 0, 0, self.search_yaw_rc)
             except Exception:
                 pass
-            state["note"] = "searching — no valid target in view"
+            if visible:
+                claimed_ids = [t for t in visible.keys()
+                               if t in taken_by_others or t in self.captured]
+                if len(claimed_ids) == len(visible):
+                    state["phase_reason"] = (
+                        f"all {len(visible)} visible target(s) already claimed "
+                        f"/ captured — rotating to find others")
+                else:
+                    # Shouldn't happen because _pick_target would have grabbed
+                    # one. If it does, fallback message.
+                    state["phase_reason"] = "no unclaimed target could be picked"
+            else:
+                state["phase_reason"] = "no valid SDC26 target in camera view"
+            state["note"] = "searching — " + state["phase_reason"]
             return
 
         # ── PURSUE ──────────────────────────────────────────────
@@ -2623,11 +2717,11 @@ class DirectTargetPursuitMission:
                 return
             if tid in visible:
                 # Fresh fix — update target_pos
-                state["target_pos"] = visible[tid]
+                state["target_pos"] = visible[tid]["pos"]
                 state["last_target_seen_at"] = now
-            # Even if NOT freshly visible, keep flying toward the last-known
-            # position for up to 3 s — brief dropouts shouldn't trigger a
-            # full re-search.
+            # Even if NOT visible right now, keep flying toward the
+            # last-known position for up to 3 s — brief dropouts shouldn't
+            # trigger a full re-search.
             if (now - state.get("last_target_seen_at", 0)) > 3.0 \
                     and tid not in visible:
                 # Lost for too long — give it up, back to search
@@ -2635,7 +2729,9 @@ class DirectTargetPursuitMission:
                     self.claimed.pop(did, None)
                     state.update(phase="SEARCH", target_id=None,
                                  target_pos=None,
-                                 note=f"lost {tid} — re-search")
+                                 phase_reason=f"lost {self._target_label(tid)} "
+                                              f"(ID {tid}) for >3s",
+                                 note=f"lost {self._target_label(tid)} — re-search")
                 return
 
             # Inter-drone proximity pause
