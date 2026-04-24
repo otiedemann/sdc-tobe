@@ -623,8 +623,18 @@ BUILD_AT = time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime())
 
 @app.get("/api/version")
 def api_version():
-    return jsonify(ok=True, build=BUILD_TAG, build_at=BUILD_AT,
-                   file=__file__)
+    """Return the FC's code version, git revision, and legacy BUILD_TAG
+    so the C2 can detect when it's running a newer build than the FC
+    (the single most confusing bug source — a code update that only
+    lands on one side of the link)."""
+    return jsonify(
+        ok=True,
+        code_version=CODE_VERSION,
+        git_revision=_FC_GIT_REVISION,
+        build=BUILD_TAG,
+        build_at=BUILD_AT,
+        file=__file__,
+    )
 running = True
 flying = False
 drone_type = "unknown"
@@ -3507,20 +3517,6 @@ def api_heartbeat():
     with conn_lock:
         connected = conn_state["connected"]
     return jsonify(ok=True, flying=flying, connected=connected, drone_type=drone_type, t=time.time())
-
-
-@app.get("/api/version")
-def api_version():
-    """Return the FC's code version + git revision so the C2 can detect
-    when the FC is running an older build than itself. Included in every
-    flight log header so the operator-visible mismatch diagnosis is
-    trivial after the fact."""
-    return jsonify(
-        ok=True,
-        code_version=CODE_VERSION,
-        git_revision=_FC_GIT_REVISION,
-        drone_type=drone_type,
-    )
 
 
 @app.get("/api/drone_ping")
