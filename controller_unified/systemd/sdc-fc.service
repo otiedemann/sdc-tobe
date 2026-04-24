@@ -1,0 +1,38 @@
+[Unit]
+Description=SDC flight controller (unified_api_server.py)
+Documentation=file:/home/sdc/sdc-tobe/controller_unified/systemd/README.md
+After=network-online.target sdc-fc-update.service
+Wants=network-online.target sdc-fc-update.service
+# Watchdog rate-limit (these live under [Unit], not [Service]):
+# if the process crash-loops 5× in 120s systemd gives up and marks the
+# unit 'failed'. Clear with `systemctl reset-failed sdc-fc`.
+StartLimitIntervalSec=120
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=sdc
+Group=sdc
+WorkingDirectory=/home/sdc/sdc-tobe/controller_unified
+Environment=HOME=/home/sdc
+Environment=SDC_FC_REPO=/home/sdc/sdc-tobe
+# Additional env vars (DRONE_TYPE, DRONE_IP, …) can be set in a drop-in
+# override: /etc/systemd/system/sdc-fc.service.d/override.conf
+ExecStart=/home/sdc/sdc-tobe/controller_unified/systemd/sdc-fc-start.sh
+
+# ── Watchdog: restart on crash ──────────────────────────────────────
+Restart=always
+RestartSec=3s
+
+# ── Signal handling ─────────────────────────────────────────────────
+# unified_api_server has a SIGINT handler that lands the drone cleanly.
+KillSignal=SIGINT
+TimeoutStopSec=15
+
+# ── Logging ─────────────────────────────────────────────────────────
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=sdc-fc
+
+[Install]
+WantedBy=multi-user.target

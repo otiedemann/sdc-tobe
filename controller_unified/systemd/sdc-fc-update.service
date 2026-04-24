@@ -1,0 +1,24 @@
+[Unit]
+Description=SDC flight-controller — sync git to origin before startup
+Documentation=file:/home/sdc/sdc-tobe/controller_unified/systemd/README.md
+After=network-online.target
+Wants=network-online.target
+Before=sdc-fc.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+User=sdc
+Group=sdc
+WorkingDirectory=/home/sdc/sdc-tobe
+Environment=HOME=/home/sdc
+Environment=SDC_FC_REPO=/home/sdc/sdc-tobe
+Environment=SDC_FC_BRANCH=main
+ExecStart=/home/sdc/sdc-tobe/controller_unified/systemd/sdc-fc-update.sh
+# Don't wedge boot if github hangs: script's own timeouts + this hard cap.
+TimeoutStartSec=90s
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
