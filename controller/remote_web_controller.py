@@ -2317,7 +2317,7 @@ HTML = """
     arcPoll();
     // Version marker — if this string doesn't appear in the DOM,
     // you're running stale JS (restart the Python server or hard-refresh).
-    const BUILD = 'cu-rotate-first-pursuit';
+    const BUILD = 'cv-pursuit-status-visibility';
     console.log('[arc] init complete, build=' + BUILD);
     const ver = document.createElement('span');
     ver.id = 'arc_build_tag';
@@ -3213,6 +3213,13 @@ HTML = """
               <span id=\"scan_cap_ndet\">0</span> target(s) found
               &nbsp;·&nbsp; elapsed <span id=\"scan_cap_elapsed\">0.0</span>s
             </span>
+          </div>
+          <!-- Per-drone pursuit state — populated from /proxy/missions/status
+               whenever the DirectTargetPursuitMission is running. Shows
+               exactly which VALID SDC26 target each drone is chasing
+               (IDs 31-36 Blue, 41-46 Red — never anything else). -->
+          <div id=\"scan_cap_drones_state\" class=\"small\"
+               style=\"margin-top:6px;padding:6px 8px;background:#0b1324;border:1px solid #1e293b;border-radius:4px;display:none;\">
           </div>
         </div>
       </div>
@@ -6532,6 +6539,79 @@ async function loadPosConfig() {
     if (phase === 'error' || phase === 'aborted')    return 100;
     return 0;
   }
+  // Resolve a target ID to a human-readable "Team Box N (ID nn)" label
+  // using the SDC26 convention: first digit = team, last digit = box.
+  function targetLabel(tid) {
+    const n = Number(tid);
+    if (!Number.isFinite(n)) return String(tid);
+    const team = (n >= 31 && n <= 36) ? 'Blue'
+               : (n >= 41 && n <= 46) ? 'Red'
+               : '?';
+    const col  = team === 'Blue' ? '#3b82f6'
+               : team === 'Red'  ? '#ef4444'
+               : '#94a3b8';
+    const box = n % 10;
+    return '<span style=\"color:' + col + ';font-weight:600;\">'
+         + team + ' Box ' + box + '</span>'
+         + ' <span style=\"color:#64748b;\">(ID ' + n + ')</span>';
+  }
+
+  function phaseBadge(phase) {
+    const p = String(phase || '').toUpperCase();
+    const bg = p === 'PURSUE' ? '#713f12' :
+               p === 'HOVER'  ? '#065f46' :
+               p === 'SEARCH' ? '#1e293b' : '#1e293b';
+    const fg = p === 'PURSUE' ? '#fde68a' :
+               p === 'HOVER'  ? '#a7f3d0' :
+               p === 'SEARCH' ? '#94a3b8' : '#94a3b8';
+    return '<span style=\"padding:1px 7px;background:' + bg
+         + ';color:' + fg + ';border-radius:10px;font-size:11px;font-weight:700;letter-spacing:0.3px;\">'
+         + (p || 'IDLE') + '</span>';
+  }
+
+  async function renderPursuitStatus() {
+    // Pull the currently-running mission's status so we can surface
+    // per-drone pursuit state (phase + target ID + note).
+    const box = document.getElementById('scan_cap_drones_state');
+    if (!box) return;
+    try {
+      const r = await fetch('/proxy/missions/status');
+      const m = await r.json();
+      if (!m || !m.has_mission || m.kind !== 'direct_target_pursuit') {
+        box.style.display = 'none';
+        return;
+      }
+      const drones = m.drones || {};
+      const ids = Object.keys(drones).sort();
+      if (!ids.length) { box.style.display = 'none'; return; }
+      box.style.display = '';
+      const rows = ids.map(did => {
+        const st = drones[did] || {};
+        const phase = st.phase || 'IDLE';
+        const tid = st.target_id;
+        const note = st.note || '';
+        const tgt = (tid != null) ? targetLabel(tid) : '<span style=\"color:#64748b;\">—</span>';
+        return (
+          '<div style=\"display:flex;gap:10px;align-items:center;padding:2px 0;\">' +
+          '<span style=\"color:#e2e8f0;font-weight:600;min-width:56px;\">Drone ' + did + '</span>' +
+          phaseBadge(phase) +
+          '<span style=\"margin-left:6px;\">' + tgt + '</span>' +
+          '<span style=\"color:#94a3b8;margin-left:auto;font-size:11px;\">' + note + '</span>' +
+          '</div>'
+        );
+      });
+      // Header explains the "what's being approached" contract so the
+      // operator sees it straight on the panel, not just in docs.
+      box.innerHTML =
+        '<div style=\"color:#64748b;margin-bottom:4px;font-size:11px;\">' +
+        'Only valid SDC26 target IDs are approached: <b style=\"color:#3b82f6;\">31-36 Blue</b>, '
+        + '<b style=\"color:#ef4444;\">41-46 Red</b>. Wall markers and other ArUco IDs are ignored.' +
+        '</div>' + rows.join('');
+    } catch (e) {
+      box.style.display = 'none';
+    }
+  }
+
   async function refreshStatus() {
     try {
       const r = await fetch('/proxy/missions/scan_and_capture/status');
@@ -6542,6 +6622,11 @@ async function loadPosConfig() {
       ndetEl.textContent  = d.n_detected || 0;
       elapsedEl.textContent = (d.elapsed_s || 0).toFixed(1);
       progBar.style.width = phaseProgress(d.phase, d.elapsed_s || 0, d.n_detected || 0) + '%';
+      // Always refresh the per-drone pursuit readout — it stays live as
+      // long as the underlying CaptureAllTargetsMission /
+      // DirectTargetPursuitMission is running, even after the outer
+      // scan-and-capture thread has finished its handoff.
+      renderPursuitStatus();
       if (d.active) {
         setActiveUI(true);
         setStatus('in progress — ' + (d.phase || ''), '#fbbf24');
@@ -6639,6 +6724,11 @@ async function loadPosConfig() {
 
   // One status poll at page load in case a mission is already running
   refreshStatus();
+  // Keep the per-drone pursuit state live even after the outer
+  // scan_and_capture thread finishes its handoff — the
+  // DirectTargetPursuitMission continues running and this is the
+  // operator's window into what each drone is actually doing.
+  setInterval(renderPursuitStatus, 700);
 })();
 
 (function wireCalibrationFlight(){
