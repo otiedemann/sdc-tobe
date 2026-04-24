@@ -747,10 +747,12 @@ _pos_cfg: dict = {
     # land at their true location instead of being over-reported by
     # 50/19 ≈ 2.6 ×.
     "target_marker_size_m": 0.19,
-    # Zero-Velocity Update — freezes position when IMU says stationary,
-    # so ArUco noise doesn't walk the parked drone around.
-    "zupt_speed_m_s":       0.05,  # threshold below which IMU says "still"
-    "zupt_hold_frames":     3,     # consecutive slow frames before engage
+    # Zero-Velocity Update — reverted per operator request (the dual-
+    # marker-size path that shipped alongside ZUPT blew the tracker's
+    # pose up outside the arena). Defaults are 0 so the feature is
+    # inactive even if an older ctrl_position.py exposes the hooks.
+    "zupt_speed_m_s":       0.0,   # 0 = disabled
+    "zupt_hold_frames":     0,     # 0 = disabled
     # ── Auto Positioning ──────────────────────────────────────────
     # When True, the FC ignores every user-tuned filter/precision knob
     # in this dict (imu_weight, marker_size_m, top_k, outlier, all the
@@ -799,9 +801,9 @@ CLAUDE_AUTO_CONFIG: dict = {
     "imu_lowpass_hz":       5.0,
     "seen_hold_s":          0.6,
     "max_pose_jump_m":      3.0,
-    "target_marker_size_m": 0.19,
-    "zupt_speed_m_s":       0.05,
-    "zupt_hold_frames":     3,
+    "target_marker_size_m": 0.50,   # match wall size — dual-size path reverted
+    "zupt_speed_m_s":       0.0,    # reverted (see _pos_cfg comments above)
+    "zupt_hold_frames":     0,
 }
 
 
@@ -5512,25 +5514,35 @@ def positioning_loop():
                 init_kalman = bool(cfg.get("enable_kalman_filter", True))
                 init_dist_scale = float(cfg.get("distance_scale", 1.0))
                 init_max_jump = float(cfg.get("max_pose_jump_m", 0.0))
-                init_tgt_size = float(cfg.get("target_marker_size_m", 0.19))
-                init_zupt_speed = float(cfg.get("zupt_speed_m_s", 0.05))
-                init_zupt_hold = int(cfg.get("zupt_hold_frames", 3))
                 processor = _HeadlessAruCo(cam_mat, dist, detect_profile=profile,
                                            marker_size=init_marker_size, enable_kalman_filter=init_kalman)
                 _apply_arena_cfg_to_processor(processor)
                 processor.distance_scale = init_dist_scale
                 processor.max_pose_jump_m = init_max_jump
-                processor.target_marker_size = init_tgt_size
-                processor.zupt_speed_m_s = init_zupt_speed
-                processor.zupt_hold_frames = init_zupt_hold
-                processor._build_marker_point_sets()
+                # Target-marker-size + ZUPT reverted per operator request — the
+                # dual-size solvePnP path caused a massive position blow-up in
+                # the field. The attributes below are guarded so this code
+                # continues to work if a future ctrl_position.py adds them
+                # back cleanly.
+                if hasattr(processor, "target_marker_size"):
+                    try:
+                        processor.target_marker_size = float(cfg.get("target_marker_size_m", 0.19))
+                        if hasattr(processor, "_build_marker_point_sets"):
+                            processor._build_marker_point_sets()
+                    except Exception as se:
+                        print(f"[POS] target_marker_size apply skipped: {se}")
+                if hasattr(processor, "zupt_speed_m_s"):
+                    try:
+                        processor.zupt_speed_m_s = float(cfg.get("zupt_speed_m_s", 0.0))
+                        processor.zupt_hold_frames = int(cfg.get("zupt_hold_frames", 0))
+                    except Exception as se:
+                        print(f"[POS] ZUPT apply skipped: {se}")
                 _pos_processor = processor
                 auto_tag = " [auto]" if cfg.get("auto_positioning") else ""
                 print(f"[POS] Processor initialised (profile={profile}, "
-                      f"ref={init_marker_size:.3f}m, target={init_tgt_size:.3f}m, "
+                      f"marker_size={init_marker_size:.3f}m, "
                       f"distance_scale={init_dist_scale:.4f}, "
-                      f"max_pose_jump_m={init_max_jump:.2f}, "
-                      f"zupt={init_zupt_speed}m/s/{init_zupt_hold}f){auto_tag}")
+                      f"max_pose_jump_m={init_max_jump:.2f}){auto_tag}")
             except Exception as ie:
                 print(f"[POS] Processor init error: {ie}")
                 time.sleep(1)
@@ -6114,17 +6126,33 @@ def api_pos_config_set():
             if _touched("max_pose_jump_m"):
                 _pos_processor.max_pose_jump_m = float(eff.get("max_pose_jump_m", 0.0))
                 print(f"[POS] max_pose_jump_m = {eff['max_pose_jump_m']}m (live)")
-            if _touched("target_marker_size_m"):
-                _pos_processor.target_marker_size = float(eff.get("target_marker_size_m", 0.19))
-                _pos_processor._build_marker_point_sets()
-                print(f"[POS] target_marker_size_m = {eff['target_marker_size_m']}m (live)")
-            if _touched("zupt_speed_m_s"):
-                _pos_processor.zupt_speed_m_s = float(eff.get("zupt_speed_m_s", 0.0))
-                _pos_processor._zupt_slow_count = 0
-                print(f"[POS] zupt_speed_m_s = {eff['zupt_speed_m_s']} (live)")
-            if _touched("zupt_hold_frames"):
-                _pos_processor.zupt_hold_frames = int(eff.get("zupt_hold_frames", 0))
-                print(f"[POS] zupt_hold_frames = {eff['zupt_hold_frames']} (live)")
+            # target_marker_size_m + zupt_* reverted in ctrl_position.py.
+            # The _pos_cfg fields are still accepted (so saved presets +
+            # UI sliders keep working) but we only live-patch when the
+            # processor actually exposes the attribute — a no-op on the
+            # reverted code path.
+            if _touched("target_marker_size_m") and hasattr(_pos_processor, "target_marker_size"):
+                try:
+                    _pos_processor.target_marker_size = float(eff.get("target_marker_size_m", 0.19))
+                    if hasattr(_pos_processor, "_build_marker_point_sets"):
+                        _pos_processor._build_marker_point_sets()
+                    print(f"[POS] target_marker_size_m = {eff['target_marker_size_m']}m (live)")
+                except Exception as se:
+                    print(f"[POS] target_marker_size_m live skipped: {se}")
+            if _touched("zupt_speed_m_s") and hasattr(_pos_processor, "zupt_speed_m_s"):
+                try:
+                    _pos_processor.zupt_speed_m_s = float(eff.get("zupt_speed_m_s", 0.0))
+                    if hasattr(_pos_processor, "_zupt_slow_count"):
+                        _pos_processor._zupt_slow_count = 0
+                    print(f"[POS] zupt_speed_m_s = {eff['zupt_speed_m_s']} (live)")
+                except Exception as se:
+                    print(f"[POS] zupt_speed_m_s live skipped: {se}")
+            if _touched("zupt_hold_frames") and hasattr(_pos_processor, "zupt_hold_frames"):
+                try:
+                    _pos_processor.zupt_hold_frames = int(eff.get("zupt_hold_frames", 0))
+                    print(f"[POS] zupt_hold_frames = {eff['zupt_hold_frames']} (live)")
+                except Exception as se:
+                    print(f"[POS] zupt_hold_frames live skipped: {se}")
             # ── Extended tuning → patched as module globals on ctrl_position
             # because the fusion code reads them as module-level constants. ──
             import ctrl_position as _cp
@@ -6312,7 +6340,7 @@ def main():
     print(f"[{tag}] Unified API server: http://{HTTP_HOST}:{HTTP_PORT}")
     print(f"[{tag}] Drone: {drone_type} @ {drone_ip} (auto-reconnect; watchdog={REMOTE_TIMEOUT_S}s)")
     print(f"[{tag}] SDKs available: tello={HAS_TELLO_SDK}, olympe={HAS_OLYMPE_SDK}")
-    print(f"[{tag}] Code version: 2026-04-24-cj (structured takeoff failure reasons)")
+    print(f"[{tag}] Code version: 2026-04-24-ck (revert dual marker size + ZUPT — position blown up)")
     app.run(host=HTTP_HOST, port=HTTP_PORT, threaded=True, use_reloader=False)
 
 

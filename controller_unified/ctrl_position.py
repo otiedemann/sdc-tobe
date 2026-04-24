@@ -159,14 +159,13 @@ class HeadlessAruCoPositioning:
         self.camera_matrix = camera_matrix
         self.dist_coeffs = dist_coeffs
         self.marker_size = marker_size if marker_size is not None else MARKER_SIZE
-        # Target boxes use a SMALLER marker than the arena wall markers.
-        # SDC26 default: 19 cm target stickers vs 50 cm wall markers. If
-        # we solvePnP target markers against 50 cm corners, the estimated
-        # distance is wrong by 50/19 ≈ 2.6× → target world positions land
-        # far from reality. The fix is to keep two corner sets and pick
-        # by ID class in process_frame.
-        self.target_marker_size = 0.19
-        self._build_marker_point_sets()
+        half = self.marker_size / 2.0
+        self.MARKER_3D_POINTS = np.array([
+            [-half,  half, 0.0],
+            [ half,  half, 0.0],
+            [ half, -half, 0.0],
+            [-half, -half, 0.0],
+        ], dtype=np.float32)
         self.aruco_dict = aruco.getPredefinedDictionary(aruco.DICT_4X4_100)
         self.aruco_params = aruco.DetectorParameters()
         self._apply_detection_profile(detect_profile)
@@ -202,18 +201,6 @@ class HeadlessAruCoPositioning:
         # fix is always accepted so tracking can bootstrap.
         self.max_pose_jump_m = 0.0   # 0 = disabled by default
 
-        # ── Zero-Velocity Update (ZUPT) ────────────────────────────────
-        # When the IMU reports the drone is stationary for N consecutive
-        # frames, freeze position updates so the ArUco corner noise and
-        # IPPE mirror-pose ambiguity don't walk the state around. When
-        # IMU speed rises again the filter unfreezes and resumes full
-        # measurement integration. Default: active (zupt_speed = 0.05
-        # m/s, zupt_hold_frames = 3 ≈ 0.6 s @ 5 Hz).
-        self.zupt_speed_m_s = 0.05   # threshold: below this = "stationary"
-        self.zupt_hold_frames = 3    # need N consecutive slow frames to engage
-        self._zupt_slow_count = 0    # internal counter
-        self._zupt_active = False    # whether ZUPT is currently holding
-
         # last valid pose cache for temporary marker loss
         self.last_valid_pose = None
         self.last_valid_dir = None
@@ -234,34 +221,6 @@ class HeadlessAruCoPositioning:
         self.imu_vel = np.zeros(3, dtype=float)
         self.imu_vel_ts = 0.0
         self.imu_weight = float(np.clip(imu_weight, 0.0, 1.0))
-
-    def _build_marker_point_sets(self):
-        """(Re)build the two 3D corner arrays used for solvePnP — one at
-        the reference-marker size (arena walls, typically 0.5 m) and one
-        at the target-marker size (target boxes, typically 0.19 m).
-        Called on init and after live-patches to either size."""
-        half_ref = self.marker_size / 2.0
-        self.MARKER_3D_POINTS = np.array([
-            [-half_ref,  half_ref, 0.0],
-            [ half_ref,  half_ref, 0.0],
-            [ half_ref, -half_ref, 0.0],
-            [-half_ref, -half_ref, 0.0],
-        ], dtype=np.float32)
-        half_tgt = self.target_marker_size / 2.0
-        self.MARKER_3D_POINTS_TARGET = np.array([
-            [-half_tgt,  half_tgt, 0.0],
-            [ half_tgt,  half_tgt, 0.0],
-            [ half_tgt, -half_tgt, 0.0],
-            [-half_tgt, -half_tgt, 0.0],
-        ], dtype=np.float32)
-
-    def _marker_points_for_id(self, mid: int) -> np.ndarray:
-        """Pick the correct 3D corner set for a given marker ID.
-        IDs ≥ 30 are SDC target boxes (small markers); IDs < 30 are
-        arena reference markers (large wall markers)."""
-        if int(mid) >= 30:
-            return self.MARKER_3D_POINTS_TARGET
-        return self.MARKER_3D_POINTS
 
     def set_imu_velocity(self, vel_arena, ts=None):
         """
@@ -588,14 +547,9 @@ class HeadlessAruCoPositioning:
 
         seen_ids = [int(mid) for mid in ids.flatten()]
         cached_poses = {}
-        # Pick the right 3D corner array per marker ID — SDC target boxes
-        # use a 19 cm marker while the arena walls use 50 cm. If we
-        # solvePnP target corners against 50 cm 3D points, the estimated
-        # marker→camera distance is over-reported by 50/19 ≈ 2.6×, so
-        # target world positions land far from where the drone actually
-        # sees them.
-        ref_points_f32 = self.MARKER_3D_POINTS.astype(np.float32)
-        tgt_points_f32 = self.MARKER_3D_POINTS_TARGET.astype(np.float32)
+        # Use self.MARKER_3D_POINTS so that the configured marker_size_m is
+        # taken into account when estimating camera-to-marker distance via solvePnP.
+        marker_points = self.MARKER_3D_POINTS.astype(np.float32)
         # Optional camera↔marker-distance correction. We keep the RAW
         # tvec in the cache because downstream needs it at its original
         # scale for:
@@ -612,8 +566,7 @@ class HeadlessAruCoPositioning:
             dist_scale = 1.0
         for i, mid_raw in enumerate(seen_ids):
             mid = int(mid_raw)
-            pts = tgt_points_f32 if mid >= 30 else ref_points_f32
-            ok, rvec, tvec = cv2.solvePnP(pts, corners[i].reshape(-1, 2), self.camera_matrix,
+            ok, rvec, tvec = cv2.solvePnP(marker_points, corners[i].reshape(-1, 2), self.camera_matrix,
                                           self.dist_coeffs, flags=cv2.SOLVEPNP_IPPE_SQUARE)
             if ok:
                 cached_poses[mid] = (rvec, tvec.reshape(3))
@@ -727,34 +680,6 @@ class HeadlessAruCoPositioning:
             f_pos_meas = np.array([self.kf_pos[j].update(raw_pos[j]) for j in range(3)])
         else:
             f_pos_meas = raw_pos.copy()
-
-        # ── Zero-Velocity Update (ZUPT) ────────────────────────────────
-        # When IMU velocity is consistently below zupt_speed_m_s for
-        # zupt_hold_frames consecutive frames, snap the measurement to
-        # the last valid pose. This kills the "parked-drone drift" where
-        # sub-pixel corner noise and IPPE mirror ambiguity walk the
-        # Kalman state around while the drone is actually stationary.
-        # When the IMU speed rises again we drop out of ZUPT
-        # immediately and resume normal fusion.
-        try:
-            zupt_speed = float(getattr(self, "zupt_speed_m_s", 0.0))
-            zupt_hold = int(getattr(self, "zupt_hold_frames", 0))
-        except Exception:
-            zupt_speed, zupt_hold = 0.0, 0
-        if zupt_speed > 0 and zupt_hold > 0:
-            imu_speed = float(np.linalg.norm(self.imu_vel))
-            if imu_speed < zupt_speed:
-                self._zupt_slow_count = min(self._zupt_slow_count + 1, zupt_hold + 10)
-            else:
-                self._zupt_slow_count = 0
-                self._zupt_active = False
-            if self._zupt_slow_count >= zupt_hold and self.last_valid_pose is not None:
-                # Anchor to the last good position so the state doesn't walk.
-                f_pos_meas = self.last_valid_pose.copy()
-                if not self._zupt_active:
-                    print(f"[ZUPT] Engaged — IMU speed {imu_speed:.3f} m/s < {zupt_speed} m/s for "
-                          f"{self._zupt_slow_count} frames; freezing position")
-                self._zupt_active = True
 
         # ── Pose-jump gate ────────────────────────────────────────────
         # If the fresh fix disagrees with the predicted state by more
