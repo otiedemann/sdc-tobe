@@ -1513,11 +1513,6 @@ HTML = """
         <div class=\"hdr\">&#9888; Cannot take off</div>
         <div class=\"reason\" id=\"takeoff_err_reason\">—</div>
         <div class=\"small\" id=\"takeoff_err_hint\" style=\"color:#fecaca;\"></div>
-        <!-- Diagnostic state table — populated from the proxy's
-             `diagnostic` field (magnetometer status, battery, alert,
-             motor, sensors) so the operator sees exactly why the FC
-             refused and can act on it. -->
-        <div id=\"takeoff_err_diag\" style=\"display:none;margin-top:6px;padding:6px 8px;background:rgba(0,0,0,0.25);border-radius:4px;font-size:12px;color:#fecaca;\"></div>
         <div class=\"actions\">
           <button class=\"magneto\" id=\"takeoff_err_mag\" style=\"display:none;\">Recalibrate Magnetometer</button>
           <button class=\"dismiss\" id=\"takeoff_err_dismiss\">Dismiss</button>
@@ -2322,7 +2317,7 @@ HTML = """
     arcPoll();
     // Version marker — if this string doesn't appear in the DOM,
     // you're running stale JS (restart the Python server or hard-refresh).
-    const BUILD = 'cp-revert-dual-size-zupt';
+    const BUILD = 'cq-revert-magneto-precheck';
     console.log('[arc] init complete, build=' + BUILD);
     const ver = document.createElement('span');
     ver.id = 'arc_build_tag';
@@ -3411,10 +3406,9 @@ holdButtons.forEach(btn=>{
 });
 
 // Takeoff + surface any server-side refusal (magneto / sensors / battery / …).
-// The proxy now returns a structured JSON shape:
-//   { ok:false, error:"<short title>", reason_code:"<slug>", hint:"<actionable text>",
-//     diagnostic:{ magneto_status, magneto_required, battery, flying, ... } }
-// The short_title already explains WHAT failed; hint explains WHAT TO DO.
+// /api/takeoff on Anafi returns a message like
+//   "takeoff_failed (magneto=REQUIRED, axes=x0y0z0)"
+// so we parse it, show it, and offer the magneto wizard if that's the cause.
 async function tryTakeoff(){
   hideTakeoffError();
   let resp, body;
@@ -3423,70 +3417,34 @@ async function tryTakeoff(){
                        headers:{'Content-Type':'application/json'}, body:'{}'});
     body = await resp.json().catch(()=>({ok:false, error:'non-JSON response'}));
   } catch (e) {
-    showTakeoffError('Network error contacting drone: ' + e, '', '', {});
+    showTakeoffError('network error contacting drone: ' + e, '');
     return;
   }
   if (!resp.ok || body.ok === false) {
-    // Structured proxy shape (new)
-    const title = (body && body.error) || ('HTTP ' + resp.status);
-    let hint = (body && body.hint) || '';
-    const code = (body && body.reason_code) || '';
-    const diag = (body && body.diagnostic) || {};
-    // Legacy fallback — if the proxy didn't format and we only have a
-    // raw string, do keyword-based hinting as before.
-    if (!hint) {
-      if (/magneto/i.test(title))
-        hint = 'Magnetometer needs figure-8 calibration before the drone will arm.';
-      else if (/sensor/i.test(title))
-        hint = 'A sensor check failed — verify battery, motor state.';
-      else if (/battery|low/i.test(title))
-        hint = 'Battery too low for takeoff.';
-      else if (/motor/i.test(title))
-        hint = 'Motor fault — inspect props and power-cycle the drone.';
-      else if (/not.?ready|not.?connected/i.test(title))
-        hint = 'Controller is not connected. Check Wi-Fi link and API server logs.';
-      else if (/angle|tilt|level/i.test(title))
-        hint = 'Drone is not level — place on a flat surface and retry.';
-    }
-    showTakeoffError(title, hint, code, diag);
+    const err = (body && body.error) || ('HTTP ' + resp.status);
+    let hint = '';
+    if (/magneto/i.test(err))
+      hint = 'Magnetometer needs figure-8 calibration before the drone will arm.';
+    else if (/sensor/i.test(err))
+      hint = 'A sensor check failed — verify GPS lock (outdoor mode), battery, and motor state.';
+    else if (/battery|low/i.test(err))
+      hint = 'Battery too low for takeoff.';
+    else if (/motor/i.test(err))
+      hint = 'Motor fault — inspect props and power-cycle the drone.';
+    else if (/not.?ready|not.?connected/i.test(err))
+      hint = 'Controller is not connected. Check Wi-Fi link and API server logs.';
+    else if (/angle|tilt|level/i.test(err))
+      hint = 'Drone is not level — place on a flat surface and retry.';
+    showTakeoffError(err, hint);
   }
 }
 
-function showTakeoffError(title, hint, code, diagnostic){
+function showTakeoffError(reason, hint){
   const box = document.getElementById('takeoff_err');
-  document.getElementById('takeoff_err_reason').textContent = title;
+  document.getElementById('takeoff_err_reason').textContent = reason;
   document.getElementById('takeoff_err_hint').textContent = hint || '';
-  // Show magneto-wizard shortcut when the failure is magnetometer-related
-  const isMag = (code === 'magnetometer_calibration_required') ||
-                /magneto/i.test(title) ||
-                (diagnostic && (diagnostic.magneto_required === true ||
-                 (typeof diagnostic.magneto_status === 'string' &&
-                  /required/i.test(diagnostic.magneto_status))));
-  document.getElementById('takeoff_err_mag').style.display = isMag ? '' : 'none';
-  // Render any diagnostic state inline so the operator sees WHY
-  const dl = document.getElementById('takeoff_err_diag');
-  if (dl && diagnostic && Object.keys(diagnostic).length) {
-    const rows = [];
-    if (diagnostic.magneto_status)
-      rows.push(['magnetometer', String(diagnostic.magneto_status)]);
-    if (diagnostic.magneto_required !== undefined)
-      rows.push(['magneto calibration', diagnostic.magneto_required ? 'REQUIRED' : 'ok']);
-    if (diagnostic.battery !== undefined)
-      rows.push(['battery', String(diagnostic.battery) + '%']);
-    if (diagnostic.alert) rows.push(['alert', String(diagnostic.alert)]);
-    if (diagnostic.motor) rows.push(['motor', String(diagnostic.motor)]);
-    if (diagnostic.sensors) rows.push(['sensors', String(diagnostic.sensors)]);
-    dl.innerHTML = rows.length
-      ? rows.map(([k,v]) =>
-          '<div style="display:flex;gap:10px;"><span style="color:#94a3b8;min-width:130px;">' +
-          k + '</span><span style="font-family:monospace;">' + v + '</span></div>'
-        ).join('')
-      : '';
-    dl.style.display = rows.length ? '' : 'none';
-  } else if (dl) {
-    dl.innerHTML = '';
-    dl.style.display = 'none';
-  }
+  document.getElementById('takeoff_err_mag').style.display =
+    /magneto/i.test(reason) ? '' : 'none';
   box.classList.add('show');
 }
 function hideTakeoffError(){
@@ -8412,121 +8370,30 @@ def proxy_key_batch():
         return jsonify(ok=False, error=f"http: {e}", via="http"), 502
 
 
-def _fetch_takeoff_failure_reason(base_url: str) -> dict:
-    """After a takeoff timeout/error, best-effort fetch the FC's live
-    diagnostic state so we can tell the operator WHAT went wrong instead
-    of just "timed out". Short 1.5 s timeout so an unreachable FC
-    doesn't compound the problem."""
-    out: dict = {}
-    base = base_url.rstrip("/")
-    try:
-        r = _http_session.get(f"{base}/api/telemetry", timeout=1.5)
-        if r.ok:
-            tel = r.json() or {}
-            for k in ("magneto_status", "magneto_required", "battery",
-                      "flying", "connected"):
-                if k in tel:
-                    out[k] = tel[k]
-    except Exception:
-        pass
-    return out
-
-
-def _format_takeoff_error(raw_error: str, diag: dict) -> tuple[str, str, str]:
-    """Map a backend (reason_code|detail) or plain string into
-    (reason_code, short_title, long_hint) for the UI.
-
-    Returns ("magnetometer_calibration_required", "Magnetometer needs
-    calibration", "Lay the drone flat ... FreeFlight ...") etc."""
-    # Parse reason_code from the FC's "code|message" wire format
-    code = None
-    detail = raw_error or ""
-    if isinstance(detail, str) and "|" in detail:
-        code, _, detail = detail.partition("|")
-    # Magneto is the single most common cause — detect from diagnostic too
-    mag_bad = bool(diag.get("magneto_required")) or (
-        isinstance(diag.get("magneto_status"), str)
-        and "required" in diag["magneto_status"].lower().split(",")
-    )
-    if code == "magnetometer_calibration_required" or mag_bad:
-        return (
-            "magnetometer_calibration_required",
-            "Magnetometer needs calibration",
-            "Pick up the drone and rotate it through a figure-8 on each "
-            "axis (roll, pitch, yaw) until the Parrot FreeFlight app "
-            "reports all axes OK. Then retry takeoff.",
-        )
-    if code == "alert_state":
-        return ("alert_state", f"Drone alert: {detail}",
-                "Clear the alert state and retry. Common causes: low "
-                "battery (swap pack), excessive tilt (level the drone), "
-                "motor cut-out (wait 5 s then retry).")
-    if code == "motor_error":
-        return ("motor_error", f"Motor fault: {detail}",
-                "Power-cycle the drone, check props aren't obstructed.")
-    if code == "sensor_fault":
-        return ("sensor_fault", f"Sensor fault: {detail}",
-                "Restart the drone and let it re-initialise on a level surface.")
-    if code == "takeoff_timeout":
-        return ("takeoff_timeout", "Takeoff command timed out",
-                f"The FC didn't respond within {TIMEOUT_SLOW} s. The drone "
-                f"may still be arming; check telemetry for flying=true "
-                f"before retrying.")
-    return (code or "takeoff_failed", detail or "takeoff failed",
-            "Check the FC log — no specific fault flagged by Olympe.")
-
-
 @app.post("/proxy/takeoff")
 def proxy_takeoff():
     """Relay takeoff to the active drone's Pi.
 
-    Uses TIMEOUT_SLOW (default 15s) because Anafi takeoff takes 3-5 s
-    for armament + motor spin-up before /api/takeoff returns. On
-    timeout or FC-side failure we best-effort fetch the drone's live
-    diagnostic state (magnetometer, alert, battery) so the operator
-    sees the ACTUAL reason instead of just "timed out".
+    Uses TIMEOUT_SLOW (default 15s) not the default TIMEOUT_CMD (8s)
+    because Anafi takeoff routinely takes 3-5 seconds for the armament
+    sensors + motor spin-up before /api/takeoff returns success. The
+    earlier 2s default truncated this and led to "network error
+    contacting drone: TypeError: Failed to fetch" on every attempt.
+    Also wraps the call in try/except so a slow drone returns clean
+    JSON to the UI instead of a Flask stack-trace HTML page.
     """
     log_command("takeoff")
-    base = PI_BASE
     try:
         r = pi_post("/api/takeoff", timeout=TIMEOUT_SLOW)
     except Exception as e:
         import requests as _rq
-        diag = _fetch_takeoff_failure_reason(base)
-        # Did we find a magneto-calibration-needed flag even though the
-        # call timed out? Surface that as the real reason.
-        code, title, hint = _format_takeoff_error(
-            "takeoff_timeout|" + (
-                f"takeoff timed out after {TIMEOUT_SLOW}s — FC did not respond"
-                if isinstance(e, _rq.exceptions.ReadTimeout)
-                else f"network error: {e}"
-            ),
-            diag,
-        )
-        return jsonify(
-            ok=False, error=title, reason_code=code, hint=hint,
-            diagnostic=diag,
-        ), (504 if isinstance(e, _rq.exceptions.ReadTimeout) else 502)
-    # FC responded — parse the body so we can normalise the error shape
-    try:
-        body = r.json() if r.content else {}
-    except Exception:
-        body = {}
-    if r.ok and body.get("ok") is not False:
-        return (r.text, r.status_code,
-                {"Content-Type": r.headers.get("Content-Type", "application/json")})
-    # FC-side refusal → surface structured reason
-    diag = body.get("diagnostic") or {}
-    if not diag:
-        diag = _fetch_takeoff_failure_reason(base)
-    raw_err = body.get("error") or ""
-    # If the FC's error string is in the "code|message" format, it's
-    # already structured. Otherwise, let the formatter infer from diag.
-    code, title, hint = _format_takeoff_error(raw_err, diag)
-    return jsonify(
-        ok=False, error=title, reason_code=code, hint=hint,
-        diagnostic=diag,
-    ), r.status_code if r.status_code >= 400 else 500
+        if isinstance(e, _rq.exceptions.ReadTimeout):
+            return jsonify(ok=False,
+                           error=f"takeoff timed out after {TIMEOUT_SLOW}s — "
+                                 f"drone may still be arming; check telemetry"), 504
+        return jsonify(ok=False, error=f"network error: {e}"), 502
+    return (r.text, r.status_code,
+            {"Content-Type": r.headers.get("Content-Type", "application/json")})
 
 
 @app.post("/proxy/land")
