@@ -2360,7 +2360,7 @@ HTML = """
     arcPoll();
     // Version marker — if this string doesn't appear in the DOM,
     // you're running stale JS (restart the Python server or hard-refresh).
-    const BUILD = 'cy-fc-version-mismatch-warn';
+    const BUILD = 'cz-start-btn-paused-visibility';
     console.log('[arc] init complete, build=' + BUILD);
     // FC/C2 version poll. Fires once at init + every 30 s. If the FC
     // reports a code_version that doesn't match the C2's, flash the
@@ -6757,9 +6757,74 @@ async function loadPosConfig() {
     }
   }
 
+  // Reflect the global pause state on the Start button itself — the
+  // #1 cause of "nothing happens" was the server rejecting starts with
+  // a tiny "fleet paused" status message that the operator missed.
+  // The button now shows its own state clearly.
+  function refreshPausedState() {
+    const paused = !!window._globalPaused;
+    if (paused) {
+      startBtn.style.background = '#450a0a';
+      startBtn.style.borderColor = '#b91c1c';
+      startBtn.style.color = '#fecaca';
+      startBtn.textContent = '⏸ Fleet paused — press 9 or click to resume';
+      startBtn.title = 'The fleet is paused (hotkey 9). Clicking will offer '
+        + 'to resume autonomy and then start the mission.';
+    } else {
+      startBtn.style.background = '#713f12';
+      startBtn.style.borderColor = '#fbbf24';
+      startBtn.style.color = '#fef3c7';
+      startBtn.textContent = '▶ Start Scan & Capture';
+      startBtn.title = 'Drone takes off (if needed), rotates 6×60° scanning '
+        + 'for target markers, then visits each box in nearest-neighbour order.';
+    }
+  }
+  setInterval(refreshPausedState, 600);
+  refreshPausedState();
+
+  async function _resumeFleetIfPaused() {
+    if (!window._globalPaused) return true;
+    try {
+      const r = await fetch('/proxy/resume_all', {
+        method: 'POST',
+        headers: {'Content-Type':'application/json'},
+        body: JSON.stringify({source: 'scan_and_capture_start'}),
+      });
+      const j = await r.json();
+      if (j && j.ok) {
+        window._globalPaused = false;
+        if (typeof applyPauseUI === 'function') applyPauseUI(false, j);
+        refreshPausedState();
+        return true;
+      }
+      alert('Could not resume fleet — check the main PAUSED banner at the top of the page and click CONTINUE MISSION, then try again.');
+      return false;
+    } catch (e) {
+      alert('Resume failed: ' + e);
+      return false;
+    }
+  }
+
   startBtn.addEventListener('click', async () => {
+    // Paused? Offer to resume first — don't silently fail with a status
+    // line that's easy to miss.
+    if (window._globalPaused) {
+      const go = confirm(
+        '⏸  Fleet is currently PAUSED (hotkey 9 / Pause All).\\n\\n' +
+        'Resume the fleet AND start Scan & Capture now?\\n\\n' +
+        'OK = resume and start\\n' +
+        'Cancel = leave paused (press 9 or CONTINUE MISSION to resume manually)'
+      );
+      if (!go) {
+        setStatus('\u2717 fleet paused — cancelled', '#f59e0b');
+        return;
+      }
+      const resumed = await _resumeFleetIfPaused();
+      if (!resumed) return;
+    }
     const selected = getSelectedDroneIds();
     if (!selected.length) {
+      alert('✗ Select at least one drone (tick a Drones checkbox).');
       setStatus('\u2717 select at least one drone', '#ef4444');
       return;
     }
@@ -6805,7 +6870,11 @@ async function loadPosConfig() {
       });
       const d = await r.json();
       if (!d.ok) {
-        setStatus('\u2717 ' + (d.error || 'start failed'), '#ef4444');
+        const msg = (d.error || 'start failed') + (d.hint ? ' — ' + d.hint : '');
+        // Loud: an alert() guarantees the operator sees the failure reason
+        // rather than missing a 12-pixel status line in the corner.
+        alert('✗ Could not start Scan & Capture:\\n\\n' + msg);
+        setStatus('\u2717 ' + msg, '#ef4444');
         return;
       }
       setActiveUI(true);
@@ -6814,6 +6883,7 @@ async function loadPosConfig() {
       pollTimer = setInterval(refreshStatus, 500);
       refreshStatus();
     } catch (e) {
+      alert('✗ Scan & Capture request failed:\\n\\n' + e);
       setStatus('\u2717 ' + e, '#ef4444');
     }
   });
