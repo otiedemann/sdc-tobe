@@ -2317,7 +2317,7 @@ HTML = """
     arcPoll();
     // Version marker — if this string doesn't appear in the DOM,
     // you're running stale JS (restart the Python server or hard-refresh).
-    const BUILD = 'ck-auto-positioning-claude';
+    const BUILD = 'cl-calibration-flight';
     console.log('[arc] init complete, build=' + BUILD);
     const ver = document.createElement('span');
     ver.id = 'arc_build_tag';
@@ -3036,6 +3036,63 @@ HTML = """
             <input type=\"file\" id=\"pos_calib_file\" accept=\".npz\" style=\"display:none;\" />
           </label>
           <span id=\"pos_calib_status\" class=\"small\" style=\"color:#94a3b8;\"></span>
+        </div>
+        <!-- ── Claude Automatic Calibration ────────────────────────────
+             Autonomous arena-scanning flight that generates a log + video
+             the operator can upload to Claude for analysis. Claude returns
+             a tuned preset JSON which the operator pastes into "Import"
+             below; it's saved as a named preset and can be applied to the
+             fleet from the Presets dropdown above. -->
+        <div style=\"margin-top:8px;padding:8px 10px;background:#0c1a2e;border:1px solid #334155;border-radius:6px;\">
+          <div style=\"display:flex;align-items:center;gap:10px;margin-bottom:6px;\">
+            <b style=\"color:#fbbf24;\">🎯 Claude Automatic Calibration</b>
+            <span class=\"small\" style=\"color:#94a3b8;\">
+              Place drone in arena centre → Start → upload log+video → paste returned preset
+            </span>
+          </div>
+          <div style=\"display:flex;gap:8px;align-items:center;flex-wrap:wrap;\">
+            <button id=\"calib_start_btn\"
+                    style=\"background:#713f12;border:1px solid #fbbf24;color:#fef3c7;padding:4px 12px;border-radius:4px;cursor:pointer;font-weight:600;\"
+                    title=\"Drone takes off, flies a ~90 s scan pattern (two 360° sweeps + translation cross + altitude change), then lands. Flight log + video are recorded automatically.\">
+              ▶ Start Calibration Flight
+            </button>
+            <button id=\"calib_abort_btn\"
+                    style=\"display:none;background:#450a0a;border:1px solid #b91c1c;color:#fecaca;padding:4px 12px;border-radius:4px;cursor:pointer;font-weight:600;\"
+                    title=\"Abort the running calibration — the drone will land at the next safe point.\">
+              ✕ Abort
+            </button>
+            <span id=\"calib_status_txt\" class=\"small\" style=\"color:#64748b;\">idle</span>
+          </div>
+          <div id=\"calib_progress_wrap\" style=\"display:none;margin-top:6px;\">
+            <div style=\"height:8px;background:#1e293b;border-radius:4px;overflow:hidden;\">
+              <div id=\"calib_progress_bar\" style=\"height:100%;width:0%;background:linear-gradient(90deg,#fbbf24,#f59e0b);transition:width 0.3s;\"></div>
+            </div>
+            <div class=\"small\" style=\"color:#94a3b8;margin-top:4px;\">
+              Step <span id=\"calib_step_num\">0</span>/<span id=\"calib_step_total\">0</span>:
+              <span id=\"calib_step_name\" style=\"color:#fbbf24;\">—</span>
+              <span style=\"color:#64748b;margin-left:8px;\">elapsed <span id=\"calib_elapsed\">0</span>s</span>
+            </div>
+          </div>
+          <div id=\"calib_download_hint\" style=\"display:none;margin-top:8px;padding:6px 8px;background:#052e16;border:1px solid #10b981;border-radius:4px;font-size:12px;color:#d1fae5;\">
+            ✓ Calibration flight complete. Download the matching log + video from the
+            <b>Flight Logs</b> panel below (newest entry), then upload both files to Claude.
+            Claude will return a preset JSON that you can paste into the <b>Import Preset</b>
+            box below to apply it to the fleet.
+          </div>
+          <!-- Import preset: paste a JSON blob (e.g. Claude's tuned output)
+               and save it as a named preset. -->
+          <div style=\"margin-top:8px;display:flex;gap:6px;align-items:flex-start;flex-wrap:wrap;\">
+            <input id=\"calib_preset_name\" type=\"text\" placeholder=\"preset name (e.g. Claude calibrated 2026-04-24)\"
+                   style=\"flex:1;min-width:260px;height:26px;font-size:12px;\" />
+            <button id=\"calib_import_btn\"
+                    style=\"background:#1e293b;border:1px solid #475569;color:#e2e8f0;padding:3px 10px;border-radius:4px;cursor:pointer;font-size:12px;\"
+                    title=\"Paste a preset JSON below and save it under the name above.\">
+              Import from JSON ↓
+            </button>
+          </div>
+          <textarea id=\"calib_preset_json\" rows=\"3\" placeholder='{\"detect_profile\":\"balanced\",\"distance_scale\":1.0,...}'
+                    style=\"display:none;width:100%;margin-top:6px;font-family:monospace;font-size:11px;background:#0f172a;color:#e2e8f0;border:1px solid #334155;border-radius:4px;padding:6px;\"></textarea>
+          <div id=\"calib_preset_status\" class=\"small\" style=\"color:#64748b;margin-top:4px;\"></div>
         </div>
         <div style=\"margin-top:6px;display:flex;gap:8px;align-items:center;\">
           <button id=\"pos_video_toggle\" class=\"pos-cfg\">Show ArUco Video</button>
@@ -6169,6 +6226,202 @@ async function loadPosConfig() {
   refresh();
 })();
 
+// ── Claude Automatic Calibration ───────────────────────────────────
+// Orchestrates the autonomous calibration flight:
+//   1. Pre-flight warning (operator must have drone centred in arena)
+//   2. POST /proxy/calibration/start to kick off the ~90 s sequence
+//   3. Poll /proxy/calibration/status at 500 ms to drive the progress bar
+//   4. On completion, show the download hint pointing to Flight Logs
+//   5. Provide an Import Preset box so the operator can paste Claude's
+//      tuned JSON and save it as a named preset via /proxy/position/presets
+(function wireCalibrationFlight(){
+  const startBtn  = document.getElementById('calib_start_btn');
+  const abortBtn  = document.getElementById('calib_abort_btn');
+  const statusTxt = document.getElementById('calib_status_txt');
+  const progWrap  = document.getElementById('calib_progress_wrap');
+  const progBar   = document.getElementById('calib_progress_bar');
+  const stepNum   = document.getElementById('calib_step_num');
+  const stepTotal = document.getElementById('calib_step_total');
+  const stepName  = document.getElementById('calib_step_name');
+  const elapsed   = document.getElementById('calib_elapsed');
+  const dlHint    = document.getElementById('calib_download_hint');
+  const importBtn = document.getElementById('calib_import_btn');
+  const presetJsonEl = document.getElementById('calib_preset_json');
+  const presetNameEl = document.getElementById('calib_preset_name');
+  const presetStatus = document.getElementById('calib_preset_status');
+  if (!startBtn) return;
+
+  let pollTimer = null;
+  let active = false;
+
+  function setStatus(msg, col) {
+    if (!statusTxt) return;
+    statusTxt.textContent = msg;
+    statusTxt.style.color = col || '#94a3b8';
+  }
+  function setActiveUI(on) {
+    active = on;
+    startBtn.style.display = on ? 'none' : '';
+    abortBtn.style.display = on ? '' : 'none';
+    progWrap.style.display = on ? '' : 'none';
+    if (!on) {
+      progBar.style.width = '0%';
+    }
+  }
+  async function refreshStatus() {
+    try {
+      const r = await fetch('/proxy/calibration/status');
+      const d = await r.json();
+      if (!d.ok) { setStatus('status error', '#ef4444'); return; }
+      const total = d.total_steps || 1;
+      const cur = d.current_step || 0;
+      const pct = Math.round((cur / total) * 100);
+      progBar.style.width = pct + '%';
+      stepNum.textContent = cur;
+      stepTotal.textContent = total;
+      stepName.textContent = d.step_name || '—';
+      elapsed.textContent = (d.elapsed_s || 0).toFixed(1);
+      if (d.active) {
+        setActiveUI(true);
+        setStatus('in progress — step ' + cur + '/' + total, '#fbbf24');
+      } else {
+        if (active) {
+          // Just finished
+          setActiveUI(false);
+          if (d.result === 'ok') {
+            setStatus('\u2713 completed (' + (d.elapsed_s||0).toFixed(1) + 's)', '#22c55e');
+            dlHint.style.display = '';
+            // Refresh flight-logs list so the new calibration flight appears
+            const fr = document.getElementById('flight_logs_refresh');
+            if (fr) setTimeout(() => fr.click(), 800);
+          } else if (d.result === 'aborted') {
+            setStatus('aborted', '#f59e0b');
+            dlHint.style.display = '';
+          } else if (d.result === 'error') {
+            setStatus('\u2717 error: ' + (d.last_error || 'unknown'), '#ef4444');
+            dlHint.style.display = '';
+          }
+          if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
+        }
+      }
+    } catch (e) {
+      setStatus('network error: ' + e, '#ef4444');
+    }
+  }
+
+  startBtn.addEventListener('click', async () => {
+    if (!confirm(
+      'Calibration Flight:\\n\\n' +
+      '• The drone will take off, fly a ~90 s scan pattern, and land.\\n' +
+      '• It stays within \u00b11.5 m of its current position — make sure\\n' +
+      '  the drone is placed in the arena CENTRE before continuing.\\n' +
+      '• Arena boundary guard and ceiling remain active.\\n\\n' +
+      'Start now?'
+    )) return;
+    setStatus('starting...', '#fbbf24');
+    try {
+      const r = await fetch('/proxy/calibration/start', {method:'POST'});
+      const d = await r.json();
+      if (!d.ok) {
+        setStatus('\u2717 ' + (d.error || 'start failed'), '#ef4444');
+        return;
+      }
+      stepTotal.textContent = d.total_steps || '?';
+      setActiveUI(true);
+      dlHint.style.display = 'none';
+      setStatus('in progress', '#fbbf24');
+      // Begin polling
+      if (pollTimer) clearInterval(pollTimer);
+      pollTimer = setInterval(refreshStatus, 500);
+      refreshStatus();
+    } catch (e) {
+      setStatus('\u2717 ' + e, '#ef4444');
+    }
+  });
+
+  abortBtn.addEventListener('click', async () => {
+    if (!confirm('Abort calibration? The drone will land at the next safe point.')) return;
+    try {
+      const r = await fetch('/proxy/calibration/abort', {method:'POST'});
+      const d = await r.json();
+      if (d.ok) setStatus('abort requested...', '#f59e0b');
+      else setStatus('\u2717 ' + (d.error || 'abort failed'), '#ef4444');
+    } catch (e) {
+      setStatus('\u2717 ' + e, '#ef4444');
+    }
+  });
+
+  // Toggle the paste-JSON textarea when operator clicks Import.
+  importBtn.addEventListener('click', async () => {
+    if (presetJsonEl.style.display === 'none') {
+      presetJsonEl.style.display = '';
+      presetJsonEl.focus();
+      presetStatus.textContent = 'paste JSON above, then click Import again to save';
+      presetStatus.style.color = '#fbbf24';
+      return;
+    }
+    // Actually import
+    const raw = presetJsonEl.value.trim();
+    const name = (presetNameEl.value || '').trim();
+    if (!name) {
+      presetStatus.textContent = '\u2717 enter a preset name first';
+      presetStatus.style.color = '#ef4444';
+      return;
+    }
+    let parsed;
+    try {
+      parsed = JSON.parse(raw);
+    } catch (e) {
+      presetStatus.textContent = '\u2717 invalid JSON: ' + e.message;
+      presetStatus.style.color = '#ef4444';
+      return;
+    }
+    if (typeof parsed !== 'object' || Array.isArray(parsed)) {
+      presetStatus.textContent = '\u2717 JSON must be an object';
+      presetStatus.style.color = '#ef4444';
+      return;
+    }
+    try {
+      const r = await fetch('/proxy/position/presets', {
+        method: 'POST',
+        headers: {'Content-Type':'application/json'},
+        body: JSON.stringify({name, params: parsed}),
+      });
+      const d = await r.json();
+      if (d.ok) {
+        presetStatus.textContent = '\u2713 saved "' + name + '" — apply from Presets dropdown above';
+        presetStatus.style.color = '#22c55e';
+        presetJsonEl.style.display = 'none';
+        presetJsonEl.value = '';
+        // Refresh presets dropdown
+        const presetSel = document.getElementById('pos_preset_sel');
+        if (presetSel) {
+          fetch('/proxy/position/presets').then(r=>r.json()).then(j=>{
+            if (!j.presets) return;
+            const names = Object.keys(j.presets).sort();
+            presetSel.innerHTML = '';
+            names.forEach(n => {
+              const opt = document.createElement('option');
+              opt.value = n; opt.textContent = n;
+              presetSel.appendChild(opt);
+            });
+            presetSel.value = name;
+          });
+        }
+      } else {
+        presetStatus.textContent = '\u2717 save failed: ' + (d.error || 'unknown');
+        presetStatus.style.color = '#ef4444';
+      }
+    } catch (e) {
+      presetStatus.textContent = '\u2717 ' + e;
+      presetStatus.style.color = '#ef4444';
+    }
+  });
+
+  // One initial status poll — useful if operator loads page mid-flight
+  refreshStatus();
+})();
+
 // ── IMU LPF slider live-label + debounced apply ─────────────────────
 // Updates the 'X.X Hz' / 'OFF' label on every frame of the drag, and
 // POSTs the value once the user stops moving it (~200 ms debounce).
@@ -9147,6 +9400,66 @@ def proxy_position_config_set():
     data = request.get_json(silent=True) or {}
     r = pi_post("/api/position/config", data)
     return (r.text, r.status_code, {"Content-Type": r.headers.get("Content-Type", "application/json")})
+
+
+# ── Calibration flight proxies ────────────────────────────────────────
+# Operator workflow:
+#   1. Place drone in arena centre
+#   2. Click "Start Calibration Flight"  →  POST /proxy/calibration/start
+#   3. Poll /proxy/calibration/status every 500 ms to drive progress bar
+#   4. On completion, the matched flight-log + video show up in the
+#      regular Flight Logs panel — user downloads them and uploads to
+#      Claude for analysis.
+# Any drone in the fleet may be the calibration subject; target is
+# passed via `drone_id` query param. Default: the active drone.
+
+def _calib_target_base(drone_id: str | None):
+    """Return the base URL for the target drone's FC, or None."""
+    did = (drone_id or "").strip() or active_drone_id
+    info = DRONES.get(str(did)) if did else None
+    return did, (info or {}).get("base")
+
+
+@app.post("/proxy/calibration/start")
+def proxy_calibration_start():
+    did, base = _calib_target_base(request.args.get("drone_id"))
+    if not base:
+        return jsonify(ok=False, error=f"drone {did} not configured"), 404
+    try:
+        r = _http_session.post(f"{base.rstrip('/')}/api/calibration/start",
+                               json={}, timeout=TIMEOUT_CMD)
+        return (r.text, r.status_code,
+                {"Content-Type": r.headers.get("Content-Type", "application/json")})
+    except Exception as e:
+        return jsonify(ok=False, error=str(e)), 502
+
+
+@app.get("/proxy/calibration/status")
+def proxy_calibration_status():
+    did, base = _calib_target_base(request.args.get("drone_id"))
+    if not base:
+        return jsonify(ok=False, error=f"drone {did} not configured"), 404
+    try:
+        r = _http_session.get(f"{base.rstrip('/')}/api/calibration/status",
+                              timeout=TIMEOUT_FAST)
+        return (r.text, r.status_code,
+                {"Content-Type": r.headers.get("Content-Type", "application/json")})
+    except Exception as e:
+        return jsonify(ok=False, error=str(e)), 502
+
+
+@app.post("/proxy/calibration/abort")
+def proxy_calibration_abort():
+    did, base = _calib_target_base(request.args.get("drone_id"))
+    if not base:
+        return jsonify(ok=False, error=f"drone {did} not configured"), 404
+    try:
+        r = _http_session.post(f"{base.rstrip('/')}/api/calibration/abort",
+                               json={}, timeout=TIMEOUT_CMD)
+        return (r.text, r.status_code,
+                {"Content-Type": r.headers.get("Content-Type", "application/json")})
+    except Exception as e:
+        return jsonify(ok=False, error=str(e)), 502
 
 
 @app.post("/proxy/position/calibration")

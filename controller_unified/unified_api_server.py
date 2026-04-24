@@ -4034,6 +4034,277 @@ def api_land():
         return jsonify(ok=False, error=str(e)), 500
 
 
+# ═══════════════════════════════════════════════════════════════════════════
+# Calibration flight — autonomous pattern that scans the arena for Claude
+# Automatic Calibration analysis.
+#
+# Design: stay within ±1.5 m of the arena centre at two altitudes, with
+# two full 360° sweeps and a translation cross. Existing boundary guard
+# and ceiling enforcement stay active, so even if the operator's preset
+# is miscalibrated, the arena keeps the drone safe.
+# ═══════════════════════════════════════════════════════════════════════════
+
+CALIBRATION_STEPS: list = [
+    # Phase 1 — takeoff + initial fix acquisition
+    {"op": "takeoff",                          "name": "Takeoff"},
+    {"op": "hover", "s": 4.0,                  "name": "Initial hover — acquire fix"},
+    # Phase 2 — full 360° sweep at takeoff altitude, in 90° steps
+    {"op": "rotate", "dir": "cw", "deg": 90,   "name": "Rotate CW 90° (1/4)"},
+    {"op": "hover", "s": 1.5,                  "name": "Rotation hover"},
+    {"op": "rotate", "dir": "cw", "deg": 90,   "name": "Rotate CW 90° (2/4)"},
+    {"op": "hover", "s": 1.5,                  "name": "Rotation hover"},
+    {"op": "rotate", "dir": "cw", "deg": 90,   "name": "Rotate CW 90° (3/4)"},
+    {"op": "hover", "s": 1.5,                  "name": "Rotation hover"},
+    {"op": "rotate", "dir": "cw", "deg": 90,   "name": "Rotate CW 90° (4/4) — back to heading 0"},
+    {"op": "hover", "s": 2.0,                  "name": "Settle after sweep"},
+    # Phase 3 — translation cross (±1.5 m on both axes)
+    {"op": "move", "dir": "forward", "cm": 150, "name": "Forward 1.5 m"},
+    {"op": "hover", "s": 2.0,                   "name": "Forward hover"},
+    {"op": "move", "dir": "back",    "cm": 300, "name": "Back 3.0 m"},
+    {"op": "hover", "s": 2.0,                   "name": "Back hover"},
+    {"op": "move", "dir": "forward", "cm": 150, "name": "Return to centre (Y)"},
+    {"op": "hover", "s": 1.5,                   "name": "Centre hover"},
+    {"op": "move", "dir": "right",   "cm": 150, "name": "Right 1.5 m"},
+    {"op": "hover", "s": 2.0,                   "name": "Right hover"},
+    {"op": "move", "dir": "left",    "cm": 300, "name": "Left 3.0 m"},
+    {"op": "hover", "s": 2.0,                   "name": "Left hover"},
+    {"op": "move", "dir": "right",   "cm": 150, "name": "Return to centre (X)"},
+    {"op": "hover", "s": 2.0,                   "name": "Centre hover"},
+    # Phase 4 — altitude change
+    {"op": "move", "dir": "up",      "cm": 100, "name": "Up 1.0 m"},
+    {"op": "hover", "s": 2.0,                   "name": "High-altitude hover"},
+    # Phase 5 — second sweep at high altitude, opposite direction
+    {"op": "rotate", "dir": "ccw", "deg": 90,  "name": "Rotate CCW 90° (1/4, high)"},
+    {"op": "hover", "s": 1.5,                  "name": "Rotation hover"},
+    {"op": "rotate", "dir": "ccw", "deg": 90,  "name": "Rotate CCW 90° (2/4, high)"},
+    {"op": "hover", "s": 1.5,                  "name": "Rotation hover"},
+    {"op": "rotate", "dir": "ccw", "deg": 90,  "name": "Rotate CCW 90° (3/4, high)"},
+    {"op": "hover", "s": 1.5,                  "name": "Rotation hover"},
+    {"op": "rotate", "dir": "ccw", "deg": 90,  "name": "Rotate CCW 90° (4/4, high)"},
+    {"op": "hover", "s": 2.0,                  "name": "Settle after second sweep"},
+    # Phase 6 — descent + land
+    {"op": "move", "dir": "down",    "cm": 100, "name": "Down 1.0 m"},
+    {"op": "hover", "s": 2.0,                   "name": "Pre-land hover"},
+    {"op": "land",                              "name": "Land"},
+]
+
+
+_calib_state: dict = {
+    "active":        False,
+    "current_step":  0,
+    "total_steps":   len(CALIBRATION_STEPS),
+    "step_name":     "idle",
+    "started_at":    0.0,
+    "ended_at":      0.0,
+    "elapsed_s":     0.0,
+    "aborted":       False,
+    "result":        None,   # "ok" | "aborted" | "error" | None (in progress)
+    "last_error":    None,
+    # Stored after a flight — lets the UI find the matching log + video
+    "last_flight_window": None,  # {"start_ts", "end_ts"} — UTC epoch seconds
+}
+_calib_state_lock = threading.Lock()
+_calib_abort = threading.Event()
+
+
+def _execute_calibration_step(step: dict) -> tuple[bool, str]:
+    """Dispatch a single calibration step. Returns (ok, msg)."""
+    global flying, takeoff_cooldown_until
+    b = backend
+    if b is None:
+        return False, "backend not ready"
+    op = step.get("op")
+
+    if op == "hover":
+        # Abort-aware sleep — polls every 100 ms so operator-triggered
+        # PAUSE/LAND is honoured promptly.
+        dur = float(step.get("s", 1.0))
+        start = time.time()
+        while time.time() - start < dur:
+            if _calib_abort.is_set() or not flying:
+                return True, "aborted/landed"
+            time.sleep(0.1)
+        return True, "ok"
+
+    if op == "takeoff":
+        if flying:
+            return True, "already flying"
+        hold_s = SAFE_TAKEOFF_S if safe_takeoff_enabled else 3.0
+        start_discrete_window(hold_s)
+        b.before_discrete_command()
+        ok, msg = b.takeoff()
+        b.after_discrete_command()
+        if ok:
+            flying = True
+            takeoff_cooldown_until = time.time() + hold_s
+            # Auto-record kicks in 2.5 s post-takeoff via api_takeoff's
+            # fallback thread. But we're bypassing api_takeoff here — so
+            # spawn the auto-record fallback manually so the calibration
+            # flight gets captured on video.
+            try:
+                threading.Thread(
+                    target=_auto_record_after_takeoff,
+                    kwargs={"grace_s": 2.5},
+                    daemon=True, name="calib-auto-record",
+                ).start()
+            except Exception as te:
+                print(f"[CALIB] Could not spawn auto-record thread: {te}")
+        return (ok, msg)
+
+    if op == "land":
+        if not flying:
+            return True, "already landed"
+        start_discrete_window(3.0)
+        b.before_discrete_command()
+        ok, msg = b.land()
+        b.after_discrete_command()
+        if ok:
+            flying = False
+            try:
+                _stop_recording_internal(reason="calib-land")
+            except Exception:
+                pass
+        return (ok, msg)
+
+    if op == "move":
+        direction = step["dir"]
+        cm = int(step["cm"])
+        start_discrete_window(max(2.0, cm / 50))
+        return b.move(direction, cm)
+
+    if op == "rotate":
+        direction = step["dir"]
+        deg = int(step["deg"])
+        start_discrete_window(max(1.5, deg / 60))
+        return b.rotate(direction, deg)
+
+    return False, f"unknown op: {op}"
+
+
+def _run_calibration_flight():
+    """Background thread: runs through CALIBRATION_STEPS sequentially."""
+    global flying
+    print(f"[CALIB] Calibration flight starting ({len(CALIBRATION_STEPS)} steps)")
+    start_ts = time.time()
+    with _calib_state_lock:
+        _calib_state.update({
+            "active":       True,
+            "current_step": 0,
+            "total_steps":  len(CALIBRATION_STEPS),
+            "step_name":    CALIBRATION_STEPS[0]["name"],
+            "started_at":   start_ts,
+            "ended_at":     0.0,
+            "elapsed_s":    0.0,
+            "aborted":      False,
+            "result":       None,
+            "last_error":   None,
+        })
+    _calib_abort.clear()
+    last_err = None
+    try:
+        for i, step in enumerate(CALIBRATION_STEPS):
+            if _calib_abort.is_set():
+                print("[CALIB] Abort requested — stopping sequence")
+                break
+            with _calib_state_lock:
+                _calib_state["current_step"] = i + 1
+                _calib_state["step_name"] = step["name"]
+                _calib_state["elapsed_s"] = time.time() - start_ts
+            print(f"[CALIB] Step {i+1}/{len(CALIBRATION_STEPS)}: {step['name']}")
+            ok, msg = _execute_calibration_step(step)
+            if not ok:
+                last_err = f"Step {i+1} ({step['name']}): {msg}"
+                print(f"[CALIB] ABORTED — {last_err}")
+                break
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        last_err = str(e)
+    finally:
+        end_ts = time.time()
+        # Emergency-land if still in the air
+        if flying:
+            print("[CALIB] Still airborne at end of sequence — emergency land")
+            try:
+                b = backend
+                if b is not None:
+                    start_discrete_window(3.0)
+                    b.before_discrete_command()
+                    b.land()
+                    b.after_discrete_command()
+                    flying = False
+                    try:
+                        _stop_recording_internal(reason="calib-final-land")
+                    except Exception:
+                        pass
+            except Exception as e:
+                print(f"[CALIB] Final land failed: {e}")
+        with _calib_state_lock:
+            if _calib_abort.is_set():
+                _calib_state["aborted"] = True
+                _calib_state["result"] = "aborted"
+            elif last_err is not None:
+                _calib_state["result"] = "error"
+                _calib_state["last_error"] = last_err
+            else:
+                _calib_state["result"] = "ok"
+            _calib_state["ended_at"] = end_ts
+            _calib_state["elapsed_s"] = end_ts - start_ts
+            _calib_state["active"] = False
+            _calib_state["last_flight_window"] = {
+                "start_ts": start_ts, "end_ts": end_ts,
+            }
+        print(f"[CALIB] Done — result={_calib_state['result']} "
+              f"elapsed={end_ts - start_ts:.1f}s")
+
+
+@app.post("/api/calibration/start")
+def api_calib_start():
+    """Kick off an autonomous calibration flight. Preconditions:
+    controller connected, drone on the ground, no calibration already
+    in progress. The operator should place the drone in the arena
+    centre before calling this."""
+    with _calib_state_lock:
+        if _calib_state["active"]:
+            return jsonify(ok=False,
+                           error="calibration already active",
+                           state=dict(_calib_state)), 409
+    with conn_lock:
+        connected = conn_state["connected"]
+    if not connected:
+        return jsonify(ok=False, error="drone not connected"), 503
+    if flying:
+        return jsonify(ok=False,
+                       error="drone already flying — land first, then start calibration"), 409
+    threading.Thread(
+        target=_run_calibration_flight,
+        daemon=True, name="calibration",
+    ).start()
+    return jsonify(
+        ok=True,
+        message="calibration flight started",
+        total_steps=len(CALIBRATION_STEPS),
+        steps=[{"op": s["op"], "name": s["name"]} for s in CALIBRATION_STEPS],
+    )
+
+
+@app.get("/api/calibration/status")
+def api_calib_status():
+    with _calib_state_lock:
+        snap = dict(_calib_state)
+    return jsonify(ok=True, **snap)
+
+
+@app.post("/api/calibration/abort")
+def api_calib_abort():
+    """Abort a running calibration flight. Sets the flag that each step
+    checks; the drone then lands on the next abort-checkpoint."""
+    _calib_abort.set()
+    with _calib_state_lock:
+        active = _calib_state["active"]
+    return jsonify(ok=True, message="abort requested", active=active)
+
+
 @app.post("/api/flip")
 def api_flip():
     b = backend
@@ -5888,7 +6159,7 @@ def main():
     print(f"[{tag}] Unified API server: http://{HTTP_HOST}:{HTTP_PORT}")
     print(f"[{tag}] Drone: {drone_type} @ {drone_ip} (auto-reconnect; watchdog={REMOTE_TIMEOUT_S}s)")
     print(f"[{tag}] SDKs available: tello={HAS_TELLO_SDK}, olympe={HAS_OLYMPE_SDK}")
-    print(f"[{tag}] Code version: 2026-04-23-cf (Auto Positioning + Claude preset + pose-jump gate)")
+    print(f"[{tag}] Code version: 2026-04-24-cg (calibration flight + import preset)")
     app.run(host=HTTP_HOST, port=HTTP_PORT, threaded=True, use_reloader=False)
 
 
