@@ -2317,7 +2317,7 @@ HTML = """
     arcPoll();
     // Version marker — if this string doesn't appear in the DOM,
     // you're running stale JS (restart the Python server or hard-refresh).
-    const BUILD = 'cs-multidrone-sdc26-filter';
+    const BUILD = 'ct-direct-target-pursuit';
     console.log('[arc] init complete, build=' + BUILD);
     const ver = document.createElement('span');
     ver.id = 'arc_build_tag';
@@ -6581,14 +6581,17 @@ async function loadPosConfig() {
          + '• No two drones will approach the same target box (claim-based).')
       : '';
     if (!confirm(
-      'Scan & Capture Targets:\\n\\n' +
+      'Target Capture (reactive pursuit):\\n\\n' +
       '• ' + selected.length + ' drone' + (multi?'s':'') + ' selected'
         + (multi?' ('+selected.join(', ')+').':'.') + '\\n' +
-      '• First selected drone takes off and rotates 360° to discover boxes\\n' +
-      '  (only valid SDC26 IDs: 31-36 Blue, 41-46 Red — others ignored).\\n' +
-      '• All selected drones then fly over detected boxes, hovering for\\n' +
-      '  ' + (hoverI.value||'3') + ' s at ' + (aboveI.value||'1.5') +
-      ' m ABOVE each marker (waypoint z = marker_z + ' + (aboveI.value||'1.5') + ').' +
+      '• Each drone takes off, then slowly rotates to search for valid\\n' +
+      '  SDC26 targets (IDs 31-36 Blue, 41-46 Red — others ignored).\\n' +
+      '• As soon as a target appears in the camera, the drone flies\\n' +
+      '  directly toward it (camera stays pointed at the target), then\\n' +
+      '  hovers ' + (hoverI.value||'3') + ' s at ' + (aboveI.value||'1.5') +
+      ' m ABOVE the marker (waypoint z = marker_z + ' + (aboveI.value||'1.5') + ').\\n' +
+      '• After a capture the drone immediately looks for the next target —\\n' +
+      '  no pre-planned waypoint list.' +
       altLines + '\\n' +
       '• Arena boundary guard + ceiling stay active throughout.\\n\\n' +
       'Start now?'
@@ -11099,9 +11102,9 @@ def _scan_cap_set(**kwargs):
 
 def _scan_and_capture_thread(
     drone_ids: list,
-    rotation_deg: int,
-    rotation_steps: int,
-    dwell_s: float,
+    rotation_deg: int,       # kept for backward compat, unused in pursuit mode
+    rotation_steps: int,     # kept for backward compat, unused in pursuit mode
+    dwell_s: float,          # kept for backward compat, unused in pursuit mode
     hover_seconds: float,
     hover_above_m: float,
     home_xy: tuple,
@@ -11110,143 +11113,80 @@ def _scan_and_capture_thread(
     altitude_stack_m: float,
     min_separation_m: float,
 ):
-    # First selected drone does the scan (rotation) alone; all selected
-    # drones then participate in the capture mission concurrently at
-    # stacked altitudes.
+    # Pursuit mode: no pre-scan, no pre-planned waypoints. Takeoff (if
+    # needed) for every selected drone, then hand control to the reactive
+    # DirectTargetPursuitMission — each drone rotates slowly to search,
+    # and as soon as a valid SDC26 target appears in its camera, it
+    # pursues that target and hovers over it.
     if not drone_ids:
         _scan_cap_set(active=False, phase="error", result="error",
                       last_error="no drones selected", ended_at=time.time())
         return
-    scan_drone = drone_ids[0]
-    info = DRONES.get(scan_drone) or {}
-    base = (info or {}).get("base")
-    if not base:
-        _scan_cap_set(active=False, phase="error", result="error",
-                      last_error=f"drone {scan_drone} has no base URL",
-                      ended_at=time.time())
-        return
-    base = base.rstrip("/")
     try:
-        # ── Phase 1: ensure airborne ─────────────────────────────
-        _scan_cap_set(phase="takeoff", step_name="Checking flight state")
-        tel = {}
-        try:
-            r = _http_session.get(f"{base}/api/telemetry", timeout=TIMEOUT_FAST)
-            if r.ok:
-                tel = r.json() or {}
-        except Exception:
-            pass
-        if not tel.get("flying"):
-            _scan_cap_set(step_name="Taking off")
-            r = _http_session.post(f"{base}/api/takeoff", json={}, timeout=TIMEOUT_SLOW)
-            if not r.ok:
-                raise RuntimeError(f"takeoff failed: HTTP {r.status_code}")
-            body = r.json() if r.content else {}
-            if not body.get("ok"):
-                raise RuntimeError(f"takeoff failed: {body.get('error','unknown')}")
-            time.sleep(4.0)  # settle — same as safe_takeoff_s
-        else:
-            _scan_cap_set(step_name="Already airborne")
-
-        # Brief settle hover before we start rotating — lets the
-        # positioner latch onto the arena references cleanly.
-        for _ in range(20):
+        # ── Phase 1: takeoff every selected drone that's still grounded
+        _scan_cap_set(phase="takeoff", step_name="Ensuring all selected drones are airborne")
+        for did in drone_ids:
+            if _scan_cap_abort.is_set():
+                raise RuntimeError("aborted before takeoff")
+            info = DRONES.get(did) or {}
+            b = (info.get("base") or "").rstrip("/")
+            if not b:
+                print(f"[SCAN_CAP] drone {did} has no base URL — skipping")
+                continue
+            tel = {}
+            try:
+                r = _http_session.get(f"{b}/api/telemetry", timeout=TIMEOUT_FAST)
+                if r.ok:
+                    tel = r.json() or {}
+            except Exception:
+                pass
+            if tel.get("flying"):
+                _scan_cap_set(step_name=f"Drone {did}: already airborne")
+                continue
+            _scan_cap_set(step_name=f"Drone {did}: taking off")
+            try:
+                r = _http_session.post(f"{b}/api/takeoff", json={},
+                                        timeout=TIMEOUT_SLOW)
+                body = r.json() if r.ok and r.content else {}
+                if not (r.ok and body.get("ok")):
+                    raise RuntimeError(
+                        f"takeoff failed: HTTP {r.status_code} {body.get('error','')}")
+            except Exception as te:
+                raise RuntimeError(f"drone {did} takeoff: {te}")
+            # Stagger takeoffs by ~1 s so the drones don't all spin up in lockstep.
+            time.sleep(1.0)
+        # Brief settle before handing off — positioner needs a couple
+        # of seconds to latch onto arena markers post-takeoff.
+        _scan_cap_set(step_name="Settle before pursuit")
+        for _ in range(40):   # ~4 s
             if _scan_cap_abort.is_set(): break
             time.sleep(0.1)
 
-        # ── Phase 2: scan (rotate + accumulate targets) ──────────
-        _scan_cap_set(phase="scanning", step_name=f"Rotating 360° in {rotation_steps}×{rotation_deg}° steps")
-        accumulated: dict = {}
-        accept_ids = set(range(31, 37)) | set(range(41, 47))  # Blue 1-6, Red 1-6
-        for step in range(rotation_steps):
-            if _scan_cap_abort.is_set():
-                raise RuntimeError("aborted during scan")
-            _scan_cap_set(step_name=f"Rotation {step+1}/{rotation_steps} — CW {rotation_deg}°")
-            try:
-                r = _http_session.post(
-                    f"{base}/api/rotate",
-                    json={"dir": "cw", "deg": rotation_deg},
-                    timeout=TIMEOUT_SLOW,
-                )
-                if not r.ok:
-                    print(f"[SCAN_CAP] rotate {step+1} HTTP {r.status_code}: {r.text[:120]}")
-            except Exception as e:
-                print(f"[SCAN_CAP] rotate {step+1} failed: {e}")
-            # Observation dwell — poll targets at 3-4 Hz, latch positions
-            t_end = time.time() + dwell_s
-            while time.time() < t_end:
-                if _scan_cap_abort.is_set():
-                    raise RuntimeError("aborted during dwell")
-                try:
-                    r = _http_session.get(f"{base}/api/position", timeout=TIMEOUT_FAST)
-                    if r.ok:
-                        state = r.json() or {}
-                        targets = state.get("targets") or {}
-                        for tid_str, tinfo in targets.items():
-                            try:
-                                tid = int(tid_str)
-                            except Exception:
-                                continue
-                            if tid not in accept_ids:
-                                continue
-                            # Only accept a FRESH observation (seen in the
-                            # latest frame) so we don't latch onto a stale
-                            # TTL entry from before the rotation started.
-                            if not tinfo.get("fresh"):
-                                continue
-                            pos = tinfo.get("pos")
-                            if isinstance(pos, (list, tuple)) and len(pos) >= 3:
-                                accumulated[tid] = [float(pos[0]), float(pos[1]), float(pos[2])]
-                except Exception:
-                    pass
-                time.sleep(0.28)
-            _scan_cap_set(n_detected=len(accumulated), targets_found=dict(accumulated))
-
-        if not accumulated:
-            raise RuntimeError("no target boxes detected during scan — nothing to visit")
-
-        # ── Phase 3: plan visit order + start capture mission ────
-        _scan_cap_set(phase="capture", step_name="Building visit plan")
-        # Start from current drone XY (from /api/position), fall back to home_xy
-        plan_start = home_xy
-        try:
-            r = _http_session.get(f"{base}/api/position", timeout=TIMEOUT_FAST)
-            if r.ok:
-                pos = (r.json() or {}).get("pos")
-                if pos and len(pos) >= 2:
-                    plan_start = (float(pos[0]), float(pos[1]))
-        except Exception:
-            pass
-        target_boxes = _scan_cap_nn_order(plan_start, accumulated)
-        _scan_cap_set(target_boxes=target_boxes,
-                      step_name=f"Visiting {len(target_boxes)} targets")
-
-        # All selected drones participate in the capture phase. If multiple
-        # are selected, they MUST take off themselves (or be pre-airborne)
-        # before the capture mission reaches for them — auto_takeoff=True
-        # on the mission handles any still on the ground.
-        ok, msg = mission_manager.start_capture_all_targets(
+        # ── Phase 2: hand off to DirectTargetPursuitMission ──────
+        # No pre-scan, no pre-planned visit list. Each drone slowly
+        # rotates to search; the instant a valid SDC26 target is spotted
+        # the drone flies directly toward it and hovers.
+        _scan_cap_set(phase="pursuit",
+                      step_name="Reactive pursuit active — drones chase targets live")
+        ok, msg = mission_manager.start_direct_target_pursuit(
             drone_ids=drone_ids,
-            target_boxes=target_boxes,
-            home_xy=tuple(home_xy),
-            arena_face_xy=tuple(arena_face_xy),
             hover_above_m=hover_above_m,
             hover_seconds=hover_seconds,
             nav_tol_xy_m=nav_tol_xy_m,
-            auto_takeoff=(len(drone_ids) > 1),  # single drone already airborne
             altitude_stack_m=altitude_stack_m,
             min_separation_m=min_separation_m,
+            arena_face_xy=tuple(arena_face_xy),
         )
         if not ok:
-            raise RuntimeError(f"capture mission refused to start: {msg}")
-        _scan_cap_set(phase="done", result="ok", step_name="Handed off to capture mission",
+            raise RuntimeError(f"pursuit mission refused to start: {msg}")
+        _scan_cap_set(phase="done", result="ok",
+                      step_name="Handed off to pursuit mission",
                       ended_at=time.time())
         log_command("scan_and_capture_done", {
             "drone_ids": drone_ids,
-            "n_detected": len(accumulated),
+            "mode": "direct_target_pursuit",
             "altitude_stack_m": altitude_stack_m,
             "min_separation_m": min_separation_m,
-            "target_boxes": target_boxes,
         })
     except Exception as e:
         import traceback

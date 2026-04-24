@@ -685,6 +685,12 @@ class DroneObserver:
     def cmd_rc_stop(self) -> dict:
         return self._send_rc_stop()
 
+    def cmd_rc(self, lr: int = 0, fb: int = 0, ud: int = 0, yaw: int = 0) -> dict:
+        """Public RC setter — lets missions send raw stick values. Used
+        by DirectTargetPursuitMission's SEARCH phase to rotate slowly
+        without needing a waypoint. All axes in RC% (-100..+100)."""
+        return self._send_rc(lr, fb, ud, yaw)
+
     # ── State snapshot ──
     def get_state(self) -> dict:
         with self._lock:
@@ -803,6 +809,11 @@ class DroneObserver:
                     snapshot["ref_markers"] = pos_snap["ref_markers"]
                 if pos_snap.get("seen_markers") is not None:
                     snapshot["seen_markers"] = pos_snap["seen_markers"]
+                # Forward live target-box detections (SDC26 IDs 31-36 / 41-46)
+                # through to the mission layer. Each entry:
+                #   {"pos": [x,y,z], "age_s": float, "fresh": bool}
+                if pos_snap.get("targets") is not None:
+                    snapshot["targets"] = pos_snap["targets"]
                 if pos_snap.get("stale") is not None:
                     snapshot["pos_stale"]  = pos_snap["stale"]
                 if pos_snap.get("fps") is not None:
@@ -2297,6 +2308,405 @@ class CaptureAllTargetsMission:
             # DONE — do nothing
 
 
+# ═══════════════════════════════════════════════════════════════════════
+# DirectTargetPursuitMission — reactive "see a target, chase it" variant
+# of the capture mission.
+#
+# Unlike CaptureAllTargetsMission, which takes a pre-computed list of box
+# positions and visits them in nearest-neighbour order, this mission has
+# NO pre-planned waypoints. Each drone:
+#
+#   SEARCH  — slow yaw rotation, reading its own observer's live
+#             `targets` dict for any SDC26-valid marker (IDs 31-36 or
+#             41-46). As soon as one is seen (fresh + unclaimed +
+#             uncaptured), the drone claims it and transitions to PURSUE.
+#
+#   PURSUE  — waypoint is updated EVERY TICK from the latest detected
+#             target position. Camera (yaw) continuously aimed at the
+#             target so the operator always sees where the drone is
+#             going. When the XY distance drops below nav_tol_xy_m AND
+#             altitude error is small, transition to HOVER.
+#
+#   HOVER   — hold position over the box for hover_seconds. On elapse,
+#             mark the target captured, release the claim, go to SEARCH.
+#
+#   DONE    — no more unclaimed/uncaptured targets visible AND no more
+#             visible; operator lands manually.
+#
+# Multi-drone: same altitude-stack + min_separation + target-claim logic
+# as CaptureAllTargetsMission — no two drones on the same box.
+# ═══════════════════════════════════════════════════════════════════════
+
+_SDC26_VALID_TARGET_IDS = frozenset({31, 32, 33, 34, 35, 36,
+                                     41, 42, 43, 44, 45, 46})
+
+
+class DirectTargetPursuitMission:
+    """Reactive pursuit — no pre-computed target list. Chases detections
+    as they come in from the positioner."""
+
+    TICK_S = 0.3
+
+    def __init__(
+        self,
+        fleet: "ObserverFleet",
+        drone_ids: list,
+        hover_above_m: float = 1.5,
+        hover_seconds: float = 3.0,
+        nav_tol_xy_m: float = 0.3,
+        nav_tol_z_m: float = 0.3,
+        arena_face_xy: tuple = (0.0, 5.4),
+        altitude_stack_m: float = 1.0,
+        min_separation_m: float = 1.2,
+        search_yaw_rc: int = 22,
+    ):
+        self.fleet = fleet
+        self.drone_ids = [str(d) for d in drone_ids]
+        self.hover_above_m = float(hover_above_m)
+        self.hover_seconds = float(hover_seconds)
+        self.nav_tol_xy_m  = float(nav_tol_xy_m)
+        self.nav_tol_z_m   = float(nav_tol_z_m)
+        self.arena_face_xy = (float(arena_face_xy[0]), float(arena_face_xy[1]))
+        self.altitude_stack_m = max(0.0, float(altitude_stack_m))
+        self._drone_alt = {did: i * self.altitude_stack_m
+                           for i, did in enumerate(self.drone_ids)}
+        self.min_separation_m = max(0.0, float(min_separation_m))
+        self.search_yaw_rc = int(search_yaw_rc)
+
+        self._lock = threading.RLock()
+        self._active = False
+        self._thread: Optional[threading.Thread] = None
+        self.captured: set[int] = set()       # target IDs already hovered over
+        self.claimed: dict[str, int] = {}     # drone_id → target_id
+        self.drones: dict[str, dict] = {}
+        self.started_at: Optional[float] = None
+        self.ended_at: Optional[float] = None
+        self.error: Optional[str] = None
+        self._trace: Optional[MissionTraceLogger] = None
+        self.trace_path: Optional[str] = None
+
+    # ── Lifecycle ─────────────────────────────────────────────────
+    def start(self) -> bool:
+        with self._lock:
+            if self._active:
+                return False
+            for did in self.drone_ids:
+                if self.fleet.get(did) is None:
+                    self.error = f"unknown drone id {did}"
+                    return False
+            if not self.fleet.allow_live:
+                self.error = "mission requires LIVE mode (REMOTE_NO_LIVE is set)"
+                return False
+            self._active = True
+            self.started_at = time.time()
+            self.ended_at = None
+            self.error = None
+            self.captured.clear()
+            self.claimed.clear()
+            self.drones = {
+                did: {
+                    "phase": "SEARCH",
+                    "target_id": None,
+                    "target_pos": None,      # last seen [x, y, z]
+                    "hover_start": None,
+                    "note": "searching",
+                    "boxes_done": 0,
+                    "last_target_seen_at": 0.0,
+                }
+                for did in self.drone_ids
+            }
+            ts_tag = time.strftime("%Y%m%d_%H%M%S")
+            log_path = MISSION_LOG_DIR / f"mission_pursuit_{ts_tag}.jsonl"
+            try:
+                self._trace = MissionTraceLogger(log_path, "direct_target_pursuit")
+                self.trace_path = str(log_path)
+                self._trace.write("mission_start", {
+                    "drone_ids": list(self.drone_ids),
+                    "hover_above_m": self.hover_above_m,
+                    "hover_seconds": self.hover_seconds,
+                    "altitude_stack_m": self.altitude_stack_m,
+                    "min_separation_m": self.min_separation_m,
+                })
+                print(f"[MISSION] DirectTargetPursuit trace → {log_path}")
+            except Exception as e:
+                print(f"[MISSION] Trace init failed: {e}")
+                self._trace = None
+
+            for did in self.drone_ids:
+                obs = self.fleet.get(did)
+                if obs is None:
+                    continue
+                try:
+                    obs.start()
+                    obs.set_mode("live")
+                except Exception as e:
+                    print(f"[MISSION] {did} observer start failed: {e}")
+
+            self._thread = threading.Thread(
+                target=self._run_loop, daemon=True, name=f"pursuit-{ts_tag}")
+            self._thread.start()
+        return True
+
+    def stop(self, land: bool = False):
+        with self._lock:
+            if not self._active:
+                return
+            self._active = False
+            self.ended_at = time.time()
+        # Clear waypoints + stop yaw search for every drone
+        for did in self.drone_ids:
+            obs = self.fleet.get(did)
+            if obs is None:
+                continue
+            try:
+                obs.clear_waypoint()
+            except Exception:
+                pass
+            if land:
+                try:
+                    obs.cmd_land()
+                except Exception:
+                    pass
+        if self._trace:
+            try:
+                self._trace.write("mission_end", {
+                    "captured": sorted(self.captured),
+                    "reason": "land" if land else "stop",
+                })
+                self._trace.close()
+            except Exception:
+                pass
+
+    def get_status(self) -> dict:
+        with self._lock:
+            return {
+                "active":    bool(self._active),
+                "kind":      "direct_target_pursuit",
+                "drone_ids": list(self.drone_ids),
+                "captured":  sorted(self.captured),
+                "claimed":   dict(self.claimed),
+                "drones":    {d: dict(s) for d, s in self.drones.items()},
+                "started_at": self.started_at,
+                "ended_at":   self.ended_at,
+                "error":      self.error,
+            }
+
+    # ── Core loop ─────────────────────────────────────────────────
+    def _run_loop(self):
+        while self._active:
+            for did in self.drone_ids:
+                obs = self.fleet.get(did)
+                if obs is None:
+                    continue
+                try:
+                    self._tick_drone(did, obs)
+                except Exception as e:
+                    print(f"[PURSUIT] {did} tick error: {e}")
+            time.sleep(self.TICK_S)
+
+    def _nearest_other_drone_distance(self, did: str, my_pos) -> Optional[float]:
+        if my_pos is None or len(my_pos) < 2:
+            return None
+        mx, my = float(my_pos[0]), float(my_pos[1])
+        mz = float(my_pos[2]) if len(my_pos) >= 3 else 0.0
+        best = None
+        for other_did in self.drone_ids:
+            if other_did == did:
+                continue
+            obs = self.fleet.get(other_did) if self.fleet else None
+            if obs is None:
+                continue
+            try:
+                snap = obs.get_state()
+            except Exception:
+                continue
+            other_pos = snap.get("pos") or snap.get("cam")
+            if not isinstance(other_pos, (list, tuple)) or len(other_pos) < 2:
+                continue
+            ox, oy = float(other_pos[0]), float(other_pos[1])
+            oz = float(other_pos[2]) if len(other_pos) >= 3 else 0.0
+            d = ((ox - mx) ** 2 + (oy - my) ** 2 + (oz - mz) ** 2) ** 0.5
+            if best is None or d < best:
+                best = d
+        return best
+
+    def _fresh_valid_targets(self, snap: dict) -> dict:
+        """Return {tid: [x, y, z]} for currently-fresh SDC26-valid target
+        detections in this drone's snapshot."""
+        raw = snap.get("targets") or {}
+        out = {}
+        for tid_str, info in raw.items():
+            try:
+                tid = int(tid_str)
+            except Exception:
+                continue
+            if tid not in _SDC26_VALID_TARGET_IDS:
+                continue
+            if not isinstance(info, dict) or not info.get("fresh"):
+                continue
+            pos = info.get("pos")
+            if not isinstance(pos, (list, tuple)) or len(pos) < 3:
+                continue
+            out[tid] = [float(pos[0]), float(pos[1]), float(pos[2])]
+        return out
+
+    def _pick_target(self, did: str, my_pos, visible: dict) -> Optional[int]:
+        """Nearest unclaimed + uncaptured target from the visible set."""
+        cands = [(tid, p) for tid, p in visible.items()
+                 if tid not in self.captured
+                 and tid not in self.claimed.values()]
+        if not cands:
+            return None
+        if my_pos is None or len(my_pos) < 2:
+            return cands[0][0]
+        cx, cy = float(my_pos[0]), float(my_pos[1])
+        cands.sort(key=lambda kv: (kv[1][0] - cx) ** 2 + (kv[1][1] - cy) ** 2)
+        return cands[0][0]
+
+    def _tick_drone(self, did: str, obs: "DroneObserver"):
+        now = time.time()
+        snap = obs.get_state()
+        running = snap.get("running")
+        if not running:
+            try:
+                obs.start()
+                obs.set_mode("live")
+            except Exception:
+                pass
+            return
+
+        with self._lock:
+            if did not in self.drones:
+                return
+            state = self.drones[did]
+            phase = state["phase"]
+
+        pos = snap.get("pos") or snap.get("cam")
+        visible = self._fresh_valid_targets(snap)
+
+        # ── SEARCH ──────────────────────────────────────────────
+        if phase == "SEARCH":
+            tid = self._pick_target(did, pos, visible)
+            if tid is not None:
+                with self._lock:
+                    self.claimed[did] = tid
+                    state["target_id"] = tid
+                    state["target_pos"] = visible[tid]
+                    state["last_target_seen_at"] = now
+                    state["phase"] = "PURSUE"
+                    state["note"] = f"locked {tid} — pursuing"
+                if self._trace:
+                    self._trace.write("target_claimed", {
+                        "drone": did, "target_id": tid, "pos": visible[tid]})
+                return
+            # No target visible → rotate slowly via yaw-only RC to scan.
+            # Avoid stepping on the observer's own position-track by
+            # writing to its waypoint layer: clear waypoint and use the
+            # per-tick RC override.
+            obs.clear_waypoint()
+            try:
+                obs.cmd_rc(0, 0, 0, self.search_yaw_rc)
+            except Exception:
+                pass
+            state["note"] = "searching — no valid target in view"
+            return
+
+        # ── PURSUE ──────────────────────────────────────────────
+        if phase == "PURSUE":
+            tid = state.get("target_id")
+            if tid is None or tid in self.captured:
+                # Someone else got it — back to search
+                with self._lock:
+                    self.claimed.pop(did, None)
+                    state.update(phase="SEARCH", target_id=None,
+                                 target_pos=None, note="target taken — re-search")
+                return
+            if tid in visible:
+                # Fresh fix — update target_pos
+                state["target_pos"] = visible[tid]
+                state["last_target_seen_at"] = now
+            # Even if NOT freshly visible, keep flying toward the last-known
+            # position for up to 3 s — brief dropouts shouldn't trigger a
+            # full re-search.
+            if (now - state.get("last_target_seen_at", 0)) > 3.0 \
+                    and tid not in visible:
+                # Lost for too long — give it up, back to search
+                with self._lock:
+                    self.claimed.pop(did, None)
+                    state.update(phase="SEARCH", target_id=None,
+                                 target_pos=None,
+                                 note=f"lost {tid} — re-search")
+                return
+
+            # Inter-drone proximity pause
+            if self.min_separation_m > 0 and pos is not None:
+                near = self._nearest_other_drone_distance(did, pos)
+                if near is not None and near < self.min_separation_m:
+                    state["note"] = (f"pursuing {tid} — paused "
+                                     f"({near:.2f}m < {self.min_separation_m:.2f}m)")
+                    # Zero RC — hold position until the gap opens
+                    try:
+                        obs.cmd_rc(0, 0, 0, 0)
+                    except Exception:
+                        pass
+                    return
+
+            tpos = state["target_pos"]
+            if tpos is None:
+                return
+            # Waypoint = target XY + (target Z + hover clearance + drone stack)
+            # face_xy = target XY so the camera points AT the box during approach.
+            wp_z = float(tpos[2]) + self.hover_above_m + self._drone_alt.get(did, 0.0)
+            obs.set_waypoint((float(tpos[0]), float(tpos[1]), wp_z),
+                             (float(tpos[0]), float(tpos[1])))
+
+            # Check arrival
+            if pos is not None and len(pos) >= 2:
+                dx = float(tpos[0]) - float(pos[0])
+                dy = float(tpos[1]) - float(pos[1])
+                dist_xy = (dx * dx + dy * dy) ** 0.5
+                cur_z = float(pos[2]) if len(pos) >= 3 else 0.0
+                dz = wp_z - cur_z
+                if dist_xy <= self.nav_tol_xy_m and abs(dz) <= self.nav_tol_z_m:
+                    with self._lock:
+                        state.update(phase="HOVER", hover_start=now,
+                                     note=f"over {tid} — capturing")
+                    if self._trace:
+                        self._trace.write("arrived", {
+                            "drone": did, "target_id": tid,
+                            "dist_xy": round(dist_xy, 2), "dz": round(dz, 2)})
+                else:
+                    state["note"] = (f"→ {tid} d={dist_xy:.2f}m dz={dz:+.2f}m")
+            return
+
+        # ── HOVER ───────────────────────────────────────────────
+        if phase == "HOVER":
+            tid = state.get("target_id")
+            elapsed = now - (state.get("hover_start") or now)
+            if tid is not None and elapsed >= self.hover_seconds:
+                with self._lock:
+                    self.captured.add(tid)
+                    self.claimed.pop(did, None)
+                    state["boxes_done"] = state.get("boxes_done", 0) + 1
+                    state.update(phase="SEARCH", target_id=None,
+                                 target_pos=None, hover_start=None,
+                                 note=f"captured {tid} — searching for more")
+                if self._trace:
+                    self._trace.write("target_captured", {
+                        "drone": did, "target_id": tid,
+                        "hover_elapsed": round(elapsed, 2)})
+                # Waypoint stays on the box for 1 more tick; the next
+                # SEARCH tick will clear it.
+                return
+            # Still hovering — keep the waypoint locked on the target.
+            tpos = state.get("target_pos")
+            if tpos is not None:
+                wp_z = float(tpos[2]) + self.hover_above_m + self._drone_alt.get(did, 0.0)
+                obs.set_waypoint((float(tpos[0]), float(tpos[1]), wp_z),
+                                 (float(tpos[0]), float(tpos[1])))
+            return
+
+
 class MissionManager:
     """Single-slot holder for the currently-running special mission.
 
@@ -2365,6 +2775,37 @@ class MissionManager:
                 auto_takeoff=auto_takeoff,
                 altitude_stack_m=altitude_stack_m,
                 min_separation_m=min_separation_m,
+            )
+            ok = m.start()
+            if not ok:
+                return False, m.error or "failed to start"
+            self._current = m
+            return True, "mission started"
+
+    def start_direct_target_pursuit(
+        self, drone_ids: list[str],
+        hover_above_m: float = 1.5,
+        hover_seconds: float = 3.0,
+        nav_tol_xy_m: float = 0.3,
+        altitude_stack_m: float = 1.0,
+        min_separation_m: float = 1.2,
+        arena_face_xy: tuple = (0.0, 5.4),
+    ) -> tuple[bool, str]:
+        """Launch the reactive target-pursuit mission. No pre-planned
+        waypoints — each drone independently searches for an SDC26 target
+        via slow yaw-rotation and chases it the moment a fresh detection
+        arrives."""
+        with self._lock:
+            if self._current is not None and self._current._active:
+                return False, "a mission is already running — stop it first"
+            m = DirectTargetPursuitMission(
+                self.fleet, drone_ids,
+                hover_above_m=hover_above_m,
+                hover_seconds=hover_seconds,
+                nav_tol_xy_m=nav_tol_xy_m,
+                altitude_stack_m=altitude_stack_m,
+                min_separation_m=min_separation_m,
+                arena_face_xy=arena_face_xy,
             )
             ok = m.start()
             if not ok:
