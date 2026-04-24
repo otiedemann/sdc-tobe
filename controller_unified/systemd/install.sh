@@ -1,12 +1,14 @@
 #!/usr/bin/env bash
-# Idempotent installer for the flight-controller systemd units.
-# Run on a fresh flight-controller box, or after pulling updated unit files:
+# Idempotent installer for the flight-controller systemd unit.
+# Run on a fresh flight-controller box, or after pulling updated unit
+# files:
 #
 #   cd /home/sdc/sdc-tobe/controller_unified/systemd
 #   sudo ./install.sh
 #
-# After install the service starts on every boot, pulls the latest revision
-# from origin/main (stashing any local changes), and restarts on crash.
+# After install the service starts on every boot, pulls the latest
+# revision from origin/main on every (re)start — stashing any local
+# changes — and restarts on crash.
 
 set -euo pipefail
 
@@ -20,17 +22,22 @@ fi
 # Make sure the scripts themselves are executable in the installed tree.
 chmod +x "$HERE/sdc-fc-update.sh" "$HERE/sdc-fc-start.sh"
 
-install -m 0644 "$HERE/sdc-fc-update.service" /etc/systemd/system/sdc-fc-update.service
-install -m 0644 "$HERE/sdc-fc.service"        /etc/systemd/system/sdc-fc.service
+# Clean up the previous two-unit layout if it was installed earlier.
+if [[ -f /etc/systemd/system/sdc-fc-update.service ]]; then
+    systemctl disable sdc-fc-update.service 2>/dev/null || true
+    rm -f /etc/systemd/system/sdc-fc-update.service
+    echo "removed legacy sdc-fc-update.service"
+fi
+
+install -m 0644 "$HERE/sdc-fc.service" /etc/systemd/system/sdc-fc.service
 
 systemctl daemon-reload
-systemctl enable sdc-fc-update.service sdc-fc.service
+systemctl enable sdc-fc.service
 
 echo
-echo "installed + enabled. one-shot start now:"
+echo "installed + enabled. start now without rebooting:"
 echo "    systemctl start sdc-fc.service"
 echo
 echo "status / logs:"
 echo "    systemctl status sdc-fc.service"
 echo "    journalctl -u sdc-fc.service -f"
-echo "    journalctl -u sdc-fc-update.service -b"

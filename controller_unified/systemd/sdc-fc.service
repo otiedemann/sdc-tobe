@@ -1,12 +1,14 @@
 [Unit]
 Description=SDC flight controller (unified_api_server.py)
 Documentation=file:/home/sdc/sdc-tobe/controller_unified/systemd/README.md
-After=network-online.target sdc-fc-update.service
-Wants=network-online.target sdc-fc-update.service
+After=network-online.target
+Wants=network-online.target
 # Watchdog rate-limit (these live under [Unit], not [Service]):
-# if the process crash-loops 5× in 120s systemd gives up and marks the
+# if the process crash-loops 5× in 300s systemd gives up and marks the
 # unit 'failed'. Clear with `systemctl reset-failed sdc-fc`.
-StartLimitIntervalSec=120
+# 300s window picked to comfortably cover ExecStartPre worst-case (~90s
+# network+pip) × a couple of restarts before systemd's burst limit trips.
+StartLimitIntervalSec=300
 StartLimitBurst=5
 
 [Service]
@@ -16,9 +18,19 @@ Group=sdc
 WorkingDirectory=/home/sdc/sdc-tobe/controller_unified
 Environment=HOME=/home/sdc
 Environment=SDC_FC_REPO=/home/sdc/sdc-tobe
+Environment=SDC_FC_BRANCH=main
 # Additional env vars (DRONE_TYPE, DRONE_IP, …) can be set in a drop-in
 # override: /etc/systemd/system/sdc-fc.service.d/override.conf
+
+# Pull latest on EVERY (re)start — boot, manual restart, watchdog restart.
+# The update script exits 0 when origin is unreachable so a flaky network
+# never prevents the server from starting.
+ExecStartPre=/home/sdc/sdc-tobe/controller_unified/systemd/sdc-fc-update.sh
 ExecStart=/home/sdc/sdc-tobe/controller_unified/systemd/sdc-fc-start.sh
+
+# Cap the total startup window (ExecStartPre + server ready). Script's own
+# timeouts (15s ls-remote, 30s fetch) keep worst case well under this.
+TimeoutStartSec=120s
 
 # ── Watchdog: restart on crash ──────────────────────────────────────
 Restart=always
