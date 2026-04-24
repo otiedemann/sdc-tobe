@@ -1773,8 +1773,8 @@ HTML = """
         <label style=\"color:#94a3b8;margin-left:12px;\" title=\"World-frame XY the drone's camera aims at while moving (typically arena centre so many markers stay in view for triangulation).\">Face XY:</label>
         <input id=\"mis_face_x\" type=\"number\" step=\"0.1\" value=\"0.0\" style=\"width:70px;\" />
         <input id=\"mis_face_y\" type=\"number\" step=\"0.1\" value=\"5.4\" style=\"width:70px;\" />
-        <label style=\"color:#94a3b8;margin-left:12px;\" title=\"Altitude above the floor for the capture hover.\">Altitude (m):</label>
-        <input id=\"mis_alt\" type=\"number\" step=\"0.1\" min=\"0.5\" value=\"1.5\" style=\"width:70px;\" />
+        <label style=\"color:#94a3b8;margin-left:12px;\" title=\"Height in metres that the drone hovers ABOVE each target marker. Waypoint Z = box.z + this value — so a box sticker at z=0.5 m with hover height 1.5 m puts the drone at z=2.0 m. If the box's z field is missing, it's treated as 0 (floor level) so this becomes the absolute hover altitude.\">Hover height above target (m):</label>
+        <input id=\"mis_alt\" type=\"number\" step=\"0.1\" min=\"0.3\" max=\"5.0\" value=\"1.5\" style=\"width:80px;\" />
         <label style=\"color:#94a3b8;margin-left:12px;\" title=\"Hover duration above each box. Must be ≥ the 2s capture-hold from SDC26 rules.\">Hover s:</label>
         <input id=\"mis_cap_hover_s\" type=\"number\" step=\"0.5\" min=\"2.0\" value=\"4.0\" style=\"width:70px;\" />
       </div>
@@ -2317,7 +2317,7 @@ HTML = """
     arcPoll();
     // Version marker — if this string doesn't appear in the DOM,
     // you're running stale JS (restart the Python server or hard-refresh).
-    const BUILD = 'cq-revert-magneto-precheck';
+    const BUILD = 'cr-hover-above-target';
     console.log('[arc] init complete, build=' + BUILD);
     const ver = document.createElement('span');
     ver.id = 'arc_build_tag';
@@ -3179,11 +3179,11 @@ HTML = """
                   title=\"Abort the scan/capture — drone continues its current moveBy command, then stays airborne.\">
             ✕ Abort
           </button>
-          <label class=\"small\" style=\"color:#94a3b8;\">
+          <label class=\"small\" style=\"color:#94a3b8;\" title=\"How long the drone hovers above each target box before moving on. SDC26 rules require \\u22652 s of steady hover for a capture to count.\">
             hover <input id=\"scan_cap_hover\" type=\"number\" min=\"1\" max=\"20\" step=\"0.5\" value=\"3\" style=\"width:50px;height:22px;font-size:11px;\" /> s
           </label>
-          <label class=\"small\" style=\"color:#94a3b8;\">
-            above <input id=\"scan_cap_above\" type=\"number\" min=\"0.5\" max=\"5\" step=\"0.1\" value=\"1.5\" style=\"width:50px;height:22px;font-size:11px;\" /> m
+          <label class=\"small\" style=\"color:#94a3b8;\" title=\"Hover HEIGHT above the target marker (metres). Drone flies to z = marker_z + this value. Typical: 1.5 m clears most boxes while keeping the marker inside the camera FOV for confirmation.\">
+            hover height <input id=\"scan_cap_above\" type=\"number\" min=\"0.3\" max=\"5\" step=\"0.1\" value=\"1.5\" style=\"width:50px;height:22px;font-size:11px;\" /> m above target
           </label>
           <span id=\"scan_cap_status_txt\" class=\"small\" style=\"color:#64748b;\">idle</span>
         </div>
@@ -6503,8 +6503,9 @@ async function loadPosConfig() {
       'Scan & Capture Targets:\\n\\n' +
       '• The drone will take off (if not already flying) and rotate 360°\\n' +
       '  to discover target boxes via ArUco (IDs 31-36 Blue, 41-46 Red).\\n' +
-      '• It then flies exactly over each discovered box, hovering\\n' +
-      '  ' + (hoverI.value||'3') + ' s at ' + (aboveI.value||'1.5') + ' m altitude above the marker.\\n' +
+      '• It then flies exactly over each discovered box, hovering for\\n' +
+      '  ' + (hoverI.value||'3') + ' s at ' + (aboveI.value||'1.5') +
+      ' m ABOVE each marker (waypoint z = marker_z + ' + (aboveI.value||'1.5') + ').\\n' +
       '• Arena boundary guard + ceiling stay active throughout.\\n\\n' +
       'Start now?'
     )) return;
@@ -10862,10 +10863,15 @@ def proxy_missions_capture_targets_start():
     """Launch the SDC26 capture-all-targets mission. Body:
     {
       "drone_ids":    ["1", "2", ...],
-      "target_boxes": [{"id":1,"x":-5.0,"y":2.0}, ...],
+      "target_boxes": [{"id":1,"x":-5.0,"y":2.0,"z":0.0}, ...],
+                                                  # z optional — marker
+                                                  # height above floor
+                                                  # (e.g. 0.5 for a stand)
       "home_xy":      [x, y],                    # team home coord
       "arena_face_xy":[x, y],                    # where the camera aims
-      "hover_above_m": 1.5,
+      "hover_above_m": 1.5,                      # HEIGHT above the target
+                                                  # marker; waypoint Z =
+                                                  # box.z + hover_above_m
       "hover_seconds": 4.0,
       "auto_takeoff":  false
     }
@@ -10963,8 +10969,13 @@ def _scan_cap_team_for(tid: int) -> str | None:
 
 def _scan_cap_nn_order(start_xy, targets: dict) -> list:
     """Nearest-neighbour ordering over XY. `targets` is {tid:[x,y,z]}.
-    Returns [{id, x, y, home_team}, ...] in visit order."""
-    remaining = {int(tid): [float(p[0]), float(p[1])] for tid, p in targets.items()}
+    Returns [{id, x, y, z, home_team}, ...] in visit order. Z is the
+    detected marker height — clamped to [0, 2.5] m so an over-reported
+    detection (e.g. from a mis-sized marker template) can't make the
+    capture mission fly absurdly high. Pass z=0 when we don't trust it."""
+    # Keep full (x, y, z) so we can forward the detected Z per box.
+    remaining = {int(tid): [float(p[0]), float(p[1]), float(p[2])]
+                 for tid, p in targets.items()}
     cx, cy = float(start_xy[0]), float(start_xy[1])
     order = []
     while remaining:
@@ -10972,11 +10983,20 @@ def _scan_cap_nn_order(start_xy, targets: dict) -> list:
             remaining,
             key=lambda t: (remaining[t][0] - cx) ** 2 + (remaining[t][1] - cy) ** 2,
         )
-        bx, by = remaining.pop(best_tid)
+        bx, by, bz = remaining.pop(best_tid)
+        # Clamp Z to a physically-reasonable range for a box on the floor.
+        # Anything outside this range is almost certainly a detection
+        # error (e.g. mirror-pose ambiguity) — fall back to z=0 so the
+        # hover altitude becomes pure hover_above_m.
+        if bz < -0.5 or bz > 2.5:
+            bz = 0.0
+        else:
+            bz = max(0.0, bz)
         order.append({
             "id":        best_tid,
             "x":         round(bx, 3),
             "y":         round(by, 3),
+            "z":         round(bz, 3),
             "home_team": _scan_cap_team_for(best_tid),
         })
         cx, cy = bx, by

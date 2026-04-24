@@ -1854,7 +1854,11 @@ class CaptureAllTargetsMission:
     ):
         self.fleet = fleet
         self.drone_ids = [str(d) for d in drone_ids]
-        # Normalise and index boxes
+        # Normalise and index boxes. Optional `z` field = marker height
+        # above the arena floor (typically the top of the box where the
+        # sticker sits). When present, the drone flies to `z +
+        # hover_above_m`; when absent, assume z=0 so the hover altitude
+        # is exactly `hover_above_m` (preserves pre-change behaviour).
         self.target_boxes = []
         for i, b in enumerate(target_boxes or []):
             try:
@@ -1863,6 +1867,7 @@ class CaptureAllTargetsMission:
                     "id": b.get("id", i + 1),
                     "x":  float(b["x"]),
                     "y":  float(b["y"]),
+                    "z":  float(b["z"]) if b.get("z") is not None else 0.0,
                     "home_team": b.get("home_team"),
                 })
             except (KeyError, TypeError, ValueError):
@@ -2101,8 +2106,14 @@ class CaptureAllTargetsMission:
                              hover_start=None,
                              note=f"flying to box {box['id']} @ "
                                   f"({box['x']:.1f},{box['y']:.1f})")
-                # Set waypoint: box xy, hover_above_m altitude, camera at arena centre
-                obs.set_waypoint((box["x"], box["y"], self.hover_above_m),
+                # Waypoint Z = box marker height + operator-set clearance.
+                # With box["z"]=0 (unknown) this collapses to hover_above_m
+                # — same as before. With a measured box height (e.g. 0.5 m
+                # stand) the drone correctly hovers `hover_above_m` ABOVE
+                # the box rather than at a fixed absolute altitude that
+                # would clip a tall stand or miss a short one.
+                wp_z = float(box["z"]) + self.hover_above_m
+                obs.set_waypoint((box["x"], box["y"], wp_z),
                                  self.arena_face_xy)
                 if self._trace:
                     self._trace.write("box_claimed", {
@@ -2128,7 +2139,8 @@ class CaptureAllTargetsMission:
                 dy = box["y"] - float(pos[1])
                 dist_xy = (dx * dx + dy * dy) ** 0.5
                 cur_z = float(pos[2]) if len(pos) >= 3 else (snap.get("altitude_m") or 0)
-                dz = self.hover_above_m - cur_z
+                target_z = float(box["z"]) + self.hover_above_m
+                dz = target_z - cur_z
                 if dist_xy <= self.nav_tol_xy_m and abs(dz) <= self.nav_tol_z_m:
                     # Arrived — start the capture hover
                     state.update(phase="HOVER", hover_start=now,
@@ -2167,8 +2179,9 @@ class CaptureAllTargetsMission:
                         state.update(phase="NAV_TO_TARGET", target_idx=nxt,
                                      hover_start=None,
                                      note=f"captured {box['id']}, → box {nbox['id']}")
+                        nwp_z = float(nbox["z"]) + self.hover_above_m
                         obs.set_waypoint(
-                            (nbox["x"], nbox["y"], self.hover_above_m),
+                            (nbox["x"], nbox["y"], nwp_z),
                             self.arena_face_xy)
                         if self._trace:
                             self._trace.write("box_captured", {
