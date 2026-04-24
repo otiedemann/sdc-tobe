@@ -325,6 +325,43 @@ if HAS_CV2 and not IS_ARM:
 # ---------------------------------------------------------------------------
 HTTP_HOST = "0.0.0.0"
 HTTP_PORT = int(os.getenv("HTTP_PORT", "8080"))
+
+# ── Version / git revision reporting ───────────────────────────────
+# Surfaced via /api/version so the C2 can detect when it's running a
+# newer/older build than the FC (the single most confusing bug source:
+# "I updated the code but it still behaves like the old version" —
+# because only one of the two was actually restarted).
+CODE_VERSION = "2026-04-24-cr (FC version endpoint + C2/FC mismatch check)"
+
+
+def _read_fc_git_revision() -> dict:
+    """Read the FC's git HEAD info — sha, short_sha, branch, subject,
+    dirty-flag. Runs once at startup; result is static until restart."""
+    import subprocess
+    repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    def _git(*args) -> str:
+        try:
+            return subprocess.check_output(
+                ["git", "-C", repo] + list(args),
+                stderr=subprocess.DEVNULL, text=True, timeout=3,
+            ).strip()
+        except Exception:
+            return ""
+    sha = _git("rev-parse", "HEAD")
+    if not sha:
+        return {"sha": "", "short_sha": "", "branch": "",
+                "subject": "", "dirty": False}
+    short = sha[:7]
+    branch = _git("rev-parse", "--abbrev-ref", "HEAD")
+    subject = _git("log", "-1", "--pretty=%s")
+    dirty_out = _git("status", "--porcelain")
+    return {
+        "sha": sha, "short_sha": short, "branch": branch,
+        "subject": subject, "dirty": bool(dirty_out),
+    }
+
+
+_FC_GIT_REVISION = _read_fc_git_revision()
 RC_HZ = 20
 STICK = 60
 YAW_STICK_ANAFI = 90
@@ -3472,6 +3509,20 @@ def api_heartbeat():
     return jsonify(ok=True, flying=flying, connected=connected, drone_type=drone_type, t=time.time())
 
 
+@app.get("/api/version")
+def api_version():
+    """Return the FC's code version + git revision so the C2 can detect
+    when the FC is running an older build than itself. Included in every
+    flight log header so the operator-visible mismatch diagnosis is
+    trivial after the fact."""
+    return jsonify(
+        ok=True,
+        code_version=CODE_VERSION,
+        git_revision=_FC_GIT_REVISION,
+        drone_type=drone_type,
+    )
+
+
 @app.get("/api/drone_ping")
 def api_drone_ping():
     """Return the flight-controller → drone ICMP ping RTT in milliseconds.
@@ -6281,7 +6332,12 @@ def main():
     print(f"[{tag}] Unified API server: http://{HTTP_HOST}:{HTTP_PORT}")
     print(f"[{tag}] Drone: {drone_type} @ {drone_ip} (auto-reconnect; watchdog={REMOTE_TIMEOUT_S}s)")
     print(f"[{tag}] SDKs available: tello={HAS_TELLO_SDK}, olympe={HAS_OLYMPE_SDK}")
-    print(f"[{tag}] Code version: 2026-04-24-cq (target marker size 19cm solvePnP + target Z unclamped)")
+    print(f"[{tag}] Code version: {CODE_VERSION}")
+    if _FC_GIT_REVISION.get("short_sha"):
+        print(f"[{tag}] git revision: {_FC_GIT_REVISION.get('short_sha')} "
+              f"({_FC_GIT_REVISION.get('branch','?')}"
+              f"{' dirty' if _FC_GIT_REVISION.get('dirty') else ''}) — "
+              f"{_FC_GIT_REVISION.get('subject','')[:80]}")
     app.run(host=HTTP_HOST, port=HTTP_PORT, threaded=True, use_reloader=False)
 
 

@@ -204,6 +204,11 @@ print(f"[GIT] {_GIT_REVISION.get('branch') or '?'} @ {_GIT_REVISION.get('short_s
       f"{' (dirty)' if _GIT_REVISION.get('dirty') else ''} "
       f"— {_GIT_REVISION.get('subject') or ''}")
 
+# ── C2 version string (matches the FC's CODE_VERSION format) ──────
+# Used by /proxy/fc_version to flag a mismatch when the FC has been
+# started from an older build than the C2.
+C2_CODE_VERSION = "2026-04-24-cr (FC version endpoint + C2/FC mismatch check)"
+
 
 class FlightLogger:
     """Per-drone flight logger.
@@ -439,10 +444,28 @@ class FlightLogger:
                 video_err = str(e)
                 print(f"[FLIGHT_LOG] video record start failed: {e}")
 
+        # Fetch the FC's version info so the flight log header captures
+        # BOTH the C2 git sha (self) and the FC code_version/git_sha.
+        # Short 1 s timeout — if the FC is down we'd rather have a
+        # no-fc-version log than no log at all.
+        fc_version = {}
+        if base:
+            try:
+                vr = self.session.get(f"{base.rstrip('/')}/api/version",
+                                       timeout=1.0)
+                if vr.ok:
+                    vdata = vr.json() or {}
+                    fc_version = {
+                        "code_version": vdata.get("code_version"),
+                        "git_revision": vdata.get("git_revision") or {},
+                    }
+            except Exception as ve:
+                print(f"[FLIGHT_LOG] FC version fetch failed: {ve}")
         header = {
             "type": "takeoff", "ts": time.time(), "drone_id": did,
             "drone_name": self.drones.get(did, {}).get("name"),
-            "git_revision": _GIT_REVISION,
+            "git_revision": _GIT_REVISION,         # C2 side
+            "fc_version":   fc_version,            # FC side
             "drone_base": base,
             "video_filename": video_name if video_started else None,
             "telemetry": tel,
@@ -1509,6 +1532,26 @@ HTML = """
         <button id=\"recover\">Recover</button>
         <button id=\"safe_takeoff\">Safe Takeoff: OFF</button>
       </div>
+      <!-- FC/C2 version mismatch warning — shown only when /proxy/fc_version
+           reports match:false. Catches the single most common cause of
+           "my fix isn't working": the C2 was updated but the FC wasn't
+           restarted (or vice-versa). -->
+      <div id=\"version_mismatch_banner\" role=\"alert\"
+           style=\"display:none;margin-top:8px;padding:8px 12px;background:#7f1d1d;border:1px solid #ef4444;border-radius:6px;color:#fecaca;font-size:13px;\">
+        <b style=\"color:#fff;\">⚠️ Version mismatch</b>
+        — the flight controller is running an older build than this
+        web UI. Fixes you deployed to the C2 may not be active yet.
+        <div id=\"version_mismatch_detail\" style=\"margin-top:4px;font-family:monospace;font-size:11px;opacity:0.85;\"></div>
+        <div style=\"margin-top:4px;font-size:12px;\">
+          Restart the flight-controller's unified_api_server process
+          (<code>systemctl restart sdc-fc</code> on the FC box, or
+          re-run <code>python3 unified_api_server.py</code>) and reload
+          this page. You can also click
+          <a href=\"/proxy/fc_version\" target=\"_blank\" style=\"color:#fde68a;\">/proxy/fc_version</a>
+          to see the exact versions.
+        </div>
+      </div>
+
       <div id=\"takeoff_err\" role=\"alert\">
         <div class=\"hdr\">&#9888; Cannot take off</div>
         <div class=\"reason\" id=\"takeoff_err_reason\">—</div>
@@ -2317,8 +2360,38 @@ HTML = """
     arcPoll();
     // Version marker — if this string doesn't appear in the DOM,
     // you're running stale JS (restart the Python server or hard-refresh).
-    const BUILD = 'cx-dual-marker-size-fix';
+    const BUILD = 'cy-fc-version-mismatch-warn';
     console.log('[arc] init complete, build=' + BUILD);
+    // FC/C2 version poll. Fires once at init + every 30 s. If the FC
+    // reports a code_version that doesn't match the C2's, flash the
+    // red banner at the top of the page with both versions so the
+    // operator sees immediately they need to restart the FC.
+    (function pollFcVersion() {
+      async function check() {
+        try {
+          const r = await fetch('/proxy/fc_version');
+          const d = await r.json();
+          const box = document.getElementById('version_mismatch_banner');
+          const detail = document.getElementById('version_mismatch_detail');
+          if (!box || !detail) return;
+          if (d.match) {
+            box.style.display = 'none';
+            return;
+          }
+          const fcVer = d.fc_code_version || (d.fc_error ? ('FC unreachable: ' + d.fc_error) : 'unknown');
+          detail.innerHTML =
+            '<span style=\"color:#fde68a;\">C2:</span> ' + (d.c2_code_version || '?') +
+            (d.c2_git_sha ? ' <span style=\"color:#86efac;\">[' + d.c2_git_sha + ']</span>' : '') +
+            '<br><span style=\"color:#fde68a;\">FC:</span> ' + fcVer +
+            (d.fc_git_sha ? ' <span style=\"color:#fca5a5;\">[' + d.fc_git_sha + ']</span>' : '');
+          box.style.display = '';
+        } catch (e) {
+          // Network hiccup — ignore; we'll try again on the next tick.
+        }
+      }
+      check();
+      setInterval(check, 30000);
+    })();
     const ver = document.createElement('span');
     ver.id = 'arc_build_tag';
     ver.style.cssText = 'font-size:10px;color:#10b981;margin-left:8px;font-weight:700;';
@@ -9612,6 +9685,48 @@ def proxy_telemetry():
         return (r.text, r.status_code, headers)
     except Exception as e:
         return jsonify(ok=False, error=str(e)), 502
+
+
+@app.get("/proxy/fc_version")
+def proxy_fc_version():
+    """Fetch the active drone's FC /api/version (short 1 s timeout) and
+    compare its code_version string to the C2's. Lets the UI flash a
+    banner when the operator deployed a fix to C2 but the FC is still
+    running old code — which was silently happening for days."""
+    did = str(request.args.get("drone_id") or active_drone_id)
+    info = DRONES.get(did) or {}
+    base = (info.get("base") or "").rstrip("/")
+    fc_code = None
+    fc_sha = None
+    fc_err = None
+    if base:
+        try:
+            r = _http_session.get(f"{base}/api/version", timeout=1.0)
+            if r.ok:
+                j = r.json() or {}
+                fc_code = j.get("code_version")
+                fc_sha = (j.get("git_revision") or {}).get("short_sha")
+            else:
+                fc_err = f"HTTP {r.status_code}"
+        except Exception as e:
+            fc_err = str(e)
+    # Match = version strings are equal ignoring the trailing parenthetical
+    # description (so a small comment change doesn't flag every restart).
+    def _strip_tag(v):
+        if not v: return ""
+        return str(v).split(" ", 1)[0].strip()
+    match = (fc_code is not None
+             and _strip_tag(fc_code) == _strip_tag(C2_CODE_VERSION))
+    return jsonify(
+        ok=True,
+        drone_id=did,
+        c2_code_version=C2_CODE_VERSION,
+        c2_git_sha=_GIT_REVISION.get("short_sha"),
+        fc_code_version=fc_code,
+        fc_git_sha=fc_sha,
+        fc_error=fc_err,
+        match=match,
+    )
 
 
 @app.get("/proxy/ui_state")
