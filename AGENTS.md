@@ -172,3 +172,33 @@ If added later, treat them as higher-priority instructions and update this file.
 - Keep changes minimal and module-scoped unless broader refactor is requested.
 - After behavior changes, run at least one relevant command from above.
 - When adding tests, include a documented single-test invocation in your notes.
+
+## Position tracker invariants (`controller_unified/ctrl_position.py`)
+The FC positioner is a long-lived process whose internal state can leak
+between flights. Three guards keep the published position trustworthy:
+
+1. **Takeoff resets full tracker state.** `/api/takeoff` calls
+   `HeadlessAruCoPositioning.reset_tracker_state()` before commanding the
+   drone up. This clears `state_pos`, `state_vel`, `last_valid_pose`,
+   the per-axis Kalman filters, the direction filter, the recovery
+   candidate, and the per-target EMAs. Without this, a previous flight's
+   poisoned `state_pos` (e.g. Z = −1866 m from a bad single-marker fix)
+   carries into the new takeoff and the EMA needs ~5 s to drag the
+   published position back to reality. **Do not bypass.**
+2. **Pose-jump gate (`max_pose_jump_m`, default 3.0 m).** While tracking
+   is continuous (`now − last_valid_ts ≤ POSE_HOLD_SEC`), a fresh fix
+   that disagrees with the predicted state by more than this is
+   rejected and we coast on the prediction. Set 0 to disable for
+   debugging.
+3. **Re-acquisition consensus (`RECOVERY_*` constants).** After a stale
+   gap longer than `POSE_HOLD_SEC`, the next fresh fix becomes a
+   *candidate* and we keep coasting; only when a second fresh fix lands
+   within `RECOVERY_DT_S` and `RECOVERY_DIST_M` of the candidate is it
+   confirmed and accepted (with the measurement partially blended toward
+   the predicted state via `RECOVERY_ALPHA_SCALE` so the position
+   doesn't snap).
+
+When changing the position tracker, keep these three guards in place
+unless field-log analysis shows a clearly better alternative. Live-tune
+via `/api/position/config` (knob: `max_pose_jump_m`); recovery and
+takeoff-reset behaviour are intentionally not exposed as runtime knobs.
