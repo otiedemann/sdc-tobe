@@ -987,8 +987,13 @@ def main():
         history_seconds=2.0,
         nominal_dt=motion_dt,
         initial_pose=(0.0, 0.0, 0.0, 0.0),
+        initial_velocity=(0.0, 0.0, 0.0, 0.0),
         initial_variance=(0.01, 0.01, 0.01, 0.01),
         yaw_positive_is_ccw=True,
+        max_acc_x=1.0,
+        max_acc_y=1.0,
+        max_acc_z=1.0,
+        max_acc_yaw_rate=1.0,
     )
 
     last_motion_state: Optional[MotionState] = motion_estimator.get_current_state()

@@ -13,6 +13,60 @@ def wrap_angle_pi(angle_rad: float) -> float:
     return angle_rad
 
 
+def spielfeld_to_ned(pos_spiel: Tuple[float, float, float], yaw_spiel: float,
+                     vx_spiel: float = 0.0, vy_spiel: float = 0.0, vz_spiel: float = 0.0, yaw_rate_spiel: float = 0.0) -> Tuple[float, float, float, float, float, float, float, float]:
+    """
+    Transformiert Position, Yaw und Geschwindigkeiten vom Spielfeld-System (X East, Y Up, Z North) zu NED (X North, Y East, Z Down).
+    
+    Rückgabe: (x_ned, y_ned, z_ned, yaw_ned, vx_ned, vy_ned, vz_ned, yaw_rate_ned)
+    """
+    x_spiel, y_spiel, z_spiel = pos_spiel
+    
+    # Position
+    x_ned = z_spiel      # Z_spiel (North) -> X_ned (North)
+    y_ned = x_spiel      # X_spiel (East) -> Y_ned (East)
+    z_ned = -y_spiel     # Y_spiel (Up) -> -Z_ned (Down)
+    
+    # Yaw bleibt gleich, da die vertikale Achse (Up/Down) und die Drehrichtung um sie herum konsistent sind
+    yaw_ned = yaw_spiel
+    
+    # Geschwindigkeiten
+    vx_ned = vz_spiel      # vz_spiel -> vx_ned
+    vy_ned = vx_spiel      # vx_spiel -> vy_ned
+    vz_ned = -vy_spiel     # vy_spiel -> -vz_ned
+    
+    yaw_rate_ned = yaw_rate_spiel  # Gleich
+    
+    return x_ned, y_ned, z_ned, yaw_ned, vx_ned, vy_ned, vz_ned, yaw_rate_ned
+
+
+def ned_to_spielfeld(pos_ned: Tuple[float, float, float], yaw_ned: float,
+                     vx_ned: float = 0.0, vy_ned: float = 0.0, vz_ned: float = 0.0, yaw_rate_ned: float = 0.0) -> Tuple[float, float, float, float, float, float, float, float]:
+    """
+    Transformiert Position, Yaw und Geschwindigkeiten von NED (X North, Y East, Z Down) zum Spielfeld-System (X East, Y Up, Z North).
+    
+    Rückgabe: (x_spiel, y_spiel, z_spiel, yaw_spiel, vx_spiel, vy_spiel, vz_spiel, yaw_rate_spiel)
+    """
+    x_ned, y_ned, z_ned = pos_ned
+    
+    # Position
+    x_spiel = y_ned       # Y_ned (East) -> X_spiel (East)
+    y_spiel = -z_ned      # -Z_ned (Down) -> Y_spiel (Up)
+    z_spiel = x_ned       # X_ned (North) -> Z_spiel (North)
+    
+    # Yaw
+    yaw_spiel = yaw_ned
+    
+    # Geschwindigkeiten
+    vx_spiel = vy_ned       # vy_ned -> vx_spiel
+    vy_spiel = -vz_ned      # -vz_ned -> vy_spiel
+    vz_spiel = vx_ned       # vx_ned -> vz_spiel
+    
+    yaw_rate_spiel = yaw_rate_ned
+    
+    return x_spiel, y_spiel, z_spiel, yaw_spiel, vx_spiel, vy_spiel, vz_spiel, yaw_rate_spiel
+
+
 def rotate_xy(x: float, y: float, yaw: float) -> Tuple[float, float]:
     c = math.cos(yaw)
     s = math.sin(yaw)
@@ -24,9 +78,9 @@ def kalman_update_scalar(prior_mean: float, prior_var: float, meas_mean: float, 
     Returns:
         posterior_mean, posterior_var, innovation
     """
-    if meas_var <= 0.0:
+    if meas_var <= 1e-9: #c apping close to zero division
         meas_var = 1e-9
-    if prior_var <= 0.0:
+    if prior_var <= 1e-9: # capping close to zero division
         prior_var = 1e-9
 
     innovation = meas_mean - prior_mean
@@ -234,7 +288,17 @@ def fuse_delayed_vision_update(
             "used_vision": None,
         }
 
-    ref_idx = find_closest_state_index(motion_history, meas["timestamp"])
+    # Transformiere Vision-Messung von Spielfeld zu NED
+    pos_spiel = (meas["x"], meas["y"], meas["z"])
+    yaw_spiel = meas.get("yaw", 0.0)
+    x_ned, y_ned, z_ned, yaw_ned, _, _, _, _ = spielfeld_to_ned(pos_spiel, yaw_spiel)
+    meas_ned = meas.copy()
+    meas_ned["x"] = x_ned
+    meas_ned["y"] = y_ned
+    meas_ned["z"] = z_ned
+    meas_ned["yaw"] = yaw_ned
+
+    ref_idx = find_closest_state_index(motion_history, meas_ned["timestamp"])
     if ref_idx is None:
         return {
             "updated_history": motion_history,
@@ -247,12 +311,12 @@ def fuse_delayed_vision_update(
     old_ref = motion_history[ref_idx]
 
     # Kalman Update für Position
-    new_x, new_var_x, innov_x = kalman_update_scalar(old_ref.x, old_ref.var_x, meas["x"], meas["var_x"])
-    new_y, new_var_y, innov_y = kalman_update_scalar(old_ref.y, old_ref.var_y, meas["y"], meas["var_y"])
-    new_z, new_var_z, innov_z = kalman_update_scalar(old_ref.z, old_ref.var_z, meas["z"], meas["var_z"])
+    new_x, new_var_x, innov_x = kalman_update_scalar(old_ref.x, old_ref.var_x, meas_ned["x"], meas_ned["var_x"])
+    new_y, new_var_y, innov_y = kalman_update_scalar(old_ref.y, old_ref.var_y, meas_ned["y"], meas_ned["var_y"])
+    new_z, new_var_z, innov_z = kalman_update_scalar(old_ref.z, old_ref.var_z, meas_ned["z"], meas_ned["var_z"])
 
-    if use_yaw_if_available and "yaw" in meas:
-        meas_yaw = wrap_angle_pi(meas["yaw"])
+    if use_yaw_if_available and "yaw" in meas_ned:
+        meas_yaw = wrap_angle_pi(meas_ned["yaw"])
         yaw_innov = wrap_angle_pi(meas_yaw - old_ref.yaw)
 
         # Update um Winkelumschlag korrekt zu behandeln
@@ -261,7 +325,7 @@ def fuse_delayed_vision_update(
             old_ref.yaw,
             old_ref.var_yaw,
             tmp_yaw_meas,
-            meas.get("var_yaw", 0.05),
+            meas_ned.get("var_yaw", 0.05),
         )
         new_yaw = wrap_angle_pi(new_yaw_raw)
         innov_yaw = yaw_innov
@@ -280,6 +344,10 @@ def fuse_delayed_vision_update(
         var_y=new_var_y,
         var_z=new_var_z,
         var_yaw=new_var_yaw,
+        vx=old_ref.vx,
+        vy=old_ref.vy,
+        vz=old_ref.vz,
+        yaw_rate=old_ref.yaw_rate,
     )
 
     updated_history = list(motion_history)
@@ -296,6 +364,34 @@ def fuse_delayed_vision_update(
     else:
         # Fallback: starre Korrektur inkl. yaw-Hebelarm
         updated_history = transform_newer_points_rigid(updated_history, ref_idx, dx, dy, dz, dyaw)
+
+    # Transformiere die gesamte Historie von NED zurück zu Spielfeld
+    transformed_history = []
+    for state in updated_history:
+        pos_ned = (state.x, state.y, state.z)
+        yaw_ned = state.yaw
+        vx_ned = state.vx
+        vy_ned = state.vy
+        vz_ned = state.vz
+        yaw_rate_ned = state.yaw_rate
+        x_spiel, y_spiel, z_spiel, yaw_spiel, vx_spiel, vy_spiel, vz_spiel, yaw_rate_spiel = ned_to_spielfeld(
+            pos_ned, yaw_ned, vx_ned, vy_ned, vz_ned, yaw_rate_ned
+        )
+        # Setze yaw_rate auf 0 nach Fusion, da sie nach der Korrektur inkonsistent ist.
+        # Die nächste Messung wird neue yaw_rate aus dem absoluten Yaw generieren.
+        transformed_state = replace(
+            state,
+            x=x_spiel,
+            y=y_spiel,
+            z=z_spiel,
+            yaw=yaw_spiel,
+            vx=vx_spiel,
+            vy=vy_spiel,
+            vz=vz_spiel,
+            yaw_rate=0.0,  # Reset nach Fusion
+        )
+        transformed_history.append(transformed_state)
+    updated_history = transformed_history
 
     return {
         "updated_history": updated_history,
