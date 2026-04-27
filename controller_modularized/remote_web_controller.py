@@ -46,6 +46,11 @@ from controller_modularized.model.flight_logger import FlightLogger
 from controller_modularized.model.drone_ws import DroneWS, drone_ws, start_fleet as _init_drone_ws
 from controller_modularized.model.git_rev import read_git_revision as _read_git_revision
 from controller_modularized.controller import heartbeat as _heartbeat
+from controller_modularized.api import (
+    bp_system, bp_drones, bp_flight, bp_safety, bp_camera, bp_telemetry,
+    bp_settings, bp_magneto, bp_logs, bp_arena, bp_aruco, bp_missions,
+    register_all as _register_blueprints,
+)
 
 # ── Connection-pooled HTTP session ───────────────────────────────────────────
 # Reuses TCP connections (keep-alive) instead of opening a new one per request.
@@ -336,12 +341,12 @@ def pi_get(path: str, timeout: float | None = None):
         _record_pi_call("GET", path, time.time() - t0, status, err)
 
 
-@app.get("/")
+@bp_system.get("/")
 def index():
     return render_template("index.html")
 
 
-@app.get("/logo.png")
+@bp_system.get("/logo.png")
 def serve_logo():
     """Serve the team logo for the header of the UI.
 
@@ -360,12 +365,12 @@ def serve_logo():
     return jsonify(ok=False, error="logo not found"), 404
 
 
-@app.get("/proxy/drones")
+@bp_drones.get("/proxy/drones")
 def proxy_drones():
     return jsonify(drones=DRONES, active=active_drone_id)
 
 
-@app.post("/proxy/switch")
+@bp_drones.post("/proxy/switch")
 def proxy_switch():
     global active_drone_id, PI_BASE
     data = request.get_json(silent=True) or {}
@@ -379,13 +384,13 @@ def proxy_switch():
     return jsonify(ok=True, active=drone_id, name=DRONES[drone_id]["name"], base=PI_BASE)
 
 
-@app.get("/proxy/drones/config")
+@bp_drones.get("/proxy/drones/config")
 def proxy_drones_config():
     """Return full drone config for editing."""
     return jsonify(drones=DRONES, config_path=str(DRONES_CONFIG_PATH))
 
 
-@app.post("/proxy/drones/config")
+@bp_drones.post("/proxy/drones/config")
 def proxy_drones_config_save():
     """Save updated drone config. Expects {drones: {id: {name, type, base}, ...}}"""
     global DRONES, PI_BASE
@@ -464,7 +469,7 @@ def _active_drone_reachable() -> bool:
             or ws._ws_connected.get("position"))
 
 
-@app.post("/proxy/key_down")
+@bp_flight.post("/proxy/key_down")
 def proxy_key_down():
     data = request.get_json(silent=True) or {}
     log_command("key_down", data)
@@ -490,7 +495,7 @@ def proxy_key_down():
         return jsonify(ok=False, error=f"http: {e}", via="http"), 502
 
 
-@app.post("/proxy/key_up")
+@bp_flight.post("/proxy/key_up")
 def proxy_key_up():
     data = request.get_json(silent=True) or {}
     log_command("key_up", data)
@@ -511,7 +516,7 @@ def proxy_key_up():
         return jsonify(ok=False, error=f"http: {e}", via="http"), 502
 
 
-@app.post("/proxy/key_batch")
+@bp_flight.post("/proxy/key_batch")
 def proxy_key_batch():
     """Batch key_down for all currently held keys in a single request.
 
@@ -559,7 +564,7 @@ def proxy_key_batch():
         return jsonify(ok=False, error=f"http: {e}", via="http"), 502
 
 
-@app.post("/proxy/takeoff")
+@bp_flight.post("/proxy/takeoff")
 def proxy_takeoff():
     """Relay takeoff to the active drone's Pi.
 
@@ -585,7 +590,7 @@ def proxy_takeoff():
             {"Content-Type": r.headers.get("Content-Type", "application/json")})
 
 
-@app.post("/proxy/land")
+@bp_flight.post("/proxy/land")
 def proxy_land():
     """Relay land to the active drone's Pi. Same slow-command timeout
     as takeoff — Anafi land waits for ground-contact before returning."""
@@ -603,7 +608,7 @@ def proxy_land():
             {"Content-Type": r.headers.get("Content-Type", "application/json")})
 
 
-@app.post("/proxy/land_all")
+@bp_flight.post("/proxy/land_all")
 def proxy_land_all():
     """Emergency panic-button: land every configured drone and halt any
     running mission. Used by the 'q' hotkey in the UI. Tolerates
@@ -700,7 +705,7 @@ def _collect_fleet_videos() -> dict:
     return out
 
 
-@app.get("/proxy/flight_logs")
+@bp_logs.get("/proxy/flight_logs")
 def proxy_flight_logs_list():
     """List archived per-flight log files (newest first), with video
     metadata attached when a matching .mp4 lives on any Pi."""
@@ -720,7 +725,7 @@ def proxy_flight_logs_list():
     return jsonify(ok=True, files=files)
 
 
-@app.get("/proxy/flight_video/<path:name>")
+@bp_logs.get("/proxy/flight_video/<path:name>")
 def proxy_flight_video_download(name):
     """Stream a flight video from whichever Pi has it. Filename is the
     mp4 basename produced by FlightLogger (flight_YYYY-..._drone-N_X.mp4);
@@ -756,7 +761,7 @@ def proxy_flight_video_download(name):
     return Response(gen(), headers=headers)
 
 
-@app.get("/proxy/flight_logs/<path:name>")
+@bp_logs.get("/proxy/flight_logs/<path:name>")
 def proxy_flight_logs_download(name):
     p = flight_logger.file_path(name)
     if p is None:
@@ -768,7 +773,7 @@ def proxy_flight_logs_download(name):
                      as_attachment=as_att, download_name=p.name)
 
 
-@app.get("/flight_log_viewer")
+@bp_system.get("/flight_log_viewer")
 def serve_flight_log_viewer():
     """Interactive replay UI for flight logs.
 
@@ -783,7 +788,7 @@ def serve_flight_log_viewer():
     return send_file(str(p), mimetype="text/html", max_age=0)
 
 
-@app.get("/proxy/config/ceiling")
+@bp_safety.get("/proxy/config/ceiling")
 def proxy_ceiling_get():
     """Aggregate the soft ceiling and engaged state from every drone in
     the fleet. Returns the minimum ceiling across drones (most
@@ -820,7 +825,7 @@ def proxy_ceiling_get():
     )
 
 
-@app.get("/proxy/config/arena_safety")
+@bp_safety.get("/proxy/config/arena_safety")
 def proxy_arena_safety_get():
     """Aggregate arena-safety state across the fleet — min margin wins,
     any engaged → engaged, any disabled → disabled (most conservative)."""
@@ -861,7 +866,7 @@ def proxy_arena_safety_get():
     )
 
 
-@app.post("/proxy/config/arena_safety")
+@bp_safety.post("/proxy/config/arena_safety")
 def proxy_arena_safety_set():
     """Fan-out arena safety settings to every drone's Pi."""
     data = request.get_json(silent=True) or {}
@@ -882,7 +887,7 @@ def proxy_arena_safety_set():
     return jsonify(ok=True, applied=ok_count, total=len(results), results=results)
 
 
-@app.post("/proxy/config/ceiling")
+@bp_safety.post("/proxy/config/ceiling")
 def proxy_ceiling_set():
     """Push a new soft ceiling to every drone in the fleet. Body:
         {"ceiling_m": <float, metres>}
@@ -910,7 +915,7 @@ def proxy_ceiling_set():
     return jsonify(ok=True, ceiling_m=v, applied=ok_count, total=len(results), results=results)
 
 
-@app.post("/proxy/pause_all")
+@bp_safety.post("/proxy/pause_all")
 def proxy_pause_all():
     """Fleet-wide PAUSE. Overrides any command — every drone stays
     airborne at its current position (Anafi auto-hovers with zero RC).
@@ -996,7 +1001,7 @@ def proxy_pause_all():
     )
 
 
-@app.post("/proxy/resume_all")
+@bp_safety.post("/proxy/resume_all")
 def proxy_resume_all():
     """Clear the global pause. Autonomous endpoints (missions, ArUco
     LIVE) become reachable again, but nothing auto-restarts — the
@@ -1016,7 +1021,7 @@ def proxy_resume_all():
     return jsonify(ok=True, paused=False, source=source, was_paused=was_paused)
 
 
-@app.get("/proxy/pause_status")
+@bp_safety.get("/proxy/pause_status")
 def proxy_pause_status():
     """UI poll target — lets multiple open tabs sync their button state."""
     with _pause_lock:
@@ -1027,7 +1032,7 @@ def proxy_pause_status():
         )
 
 
-@app.post("/proxy/flip")
+@bp_flight.post("/proxy/flip")
 def proxy_flip():
     data = request.get_json(silent=True) or {}
     log_command("flip", data)
@@ -1035,21 +1040,21 @@ def proxy_flip():
     return (r.text, r.status_code, {"Content-Type": r.headers.get("Content-Type", "application/json")})
 
 
-@app.post("/proxy/recover")
+@bp_flight.post("/proxy/recover")
 def proxy_recover():
     log_command("recover")
     r = pi_post("/api/recover")
     return (r.text, r.status_code, {"Content-Type": r.headers.get("Content-Type", "application/json")})
 
 
-@app.post("/proxy/emergency")
+@bp_flight.post("/proxy/emergency")
 def proxy_emergency():
     log_command("emergency")
     r = pi_post("/api/emergency")
     return (r.text, r.status_code, {"Content-Type": r.headers.get("Content-Type", "application/json")})
 
 
-@app.post("/proxy/speed")
+@bp_flight.post("/proxy/speed")
 def proxy_speed():
     data = request.get_json(silent=True) or {}
     log_command("speed", data)
@@ -1057,7 +1062,7 @@ def proxy_speed():
     return (r.text, r.status_code, {"Content-Type": r.headers.get("Content-Type", "application/json")})
 
 
-@app.post("/proxy/move")
+@bp_flight.post("/proxy/move")
 def proxy_move():
     data = request.get_json(silent=True) or {}
     log_command("move", data)
@@ -1065,7 +1070,7 @@ def proxy_move():
     return (r.text, r.status_code, {"Content-Type": r.headers.get("Content-Type", "application/json")})
 
 
-@app.post("/proxy/rotate")
+@bp_flight.post("/proxy/rotate")
 def proxy_rotate():
     data = request.get_json(silent=True) or {}
     log_command("rotate", data)
@@ -1073,7 +1078,7 @@ def proxy_rotate():
     return (r.text, r.status_code, {"Content-Type": r.headers.get("Content-Type", "application/json")})
 
 
-@app.post("/proxy/go")
+@bp_flight.post("/proxy/go")
 def proxy_go():
     data = request.get_json(silent=True) or {}
     log_command("go", data)
@@ -1081,7 +1086,7 @@ def proxy_go():
     return (r.text, r.status_code, {"Content-Type": r.headers.get("Content-Type", "application/json")})
 
 
-@app.post("/proxy/curve")
+@bp_flight.post("/proxy/curve")
 def proxy_curve():
     data = request.get_json(silent=True) or {}
     log_command("curve", data)
@@ -1089,7 +1094,7 @@ def proxy_curve():
     return (r.text, r.status_code, {"Content-Type": r.headers.get("Content-Type", "application/json")})
 
 
-@app.post("/proxy/stream")
+@bp_camera.post("/proxy/stream")
 def proxy_stream():
     data = request.get_json(silent=True) or {}
     log_command("stream", data)
@@ -1097,7 +1102,7 @@ def proxy_stream():
     return (r.text, r.status_code, {"Content-Type": r.headers.get("Content-Type", "application/json")})
 
 
-@app.post("/proxy/sdk")
+@bp_flight.post("/proxy/sdk")
 def proxy_sdk():
     data = request.get_json(silent=True) or {}
     log_command("sdk", data)
@@ -1107,28 +1112,28 @@ def proxy_sdk():
 
 # -- Anafi / Olympe proxy routes --
 
-@app.post("/proxy/camera/photo")
+@bp_camera.post("/proxy/camera/photo")
 def proxy_camera_photo():
     log_command("camera_photo")
     r = pi_post("/api/camera/photo")
     return (r.text, r.status_code, {"Content-Type": r.headers.get("Content-Type", "application/json")})
 
 
-@app.post("/proxy/camera/record/start")
+@bp_camera.post("/proxy/camera/record/start")
 def proxy_camera_record_start():
     log_command("camera_record_start")
     r = pi_post("/api/camera/record/start")
     return (r.text, r.status_code, {"Content-Type": r.headers.get("Content-Type", "application/json")})
 
 
-@app.post("/proxy/camera/record/stop")
+@bp_camera.post("/proxy/camera/record/stop")
 def proxy_camera_record_stop():
     log_command("camera_record_stop")
     r = pi_post("/api/camera/record/stop")
     return (r.text, r.status_code, {"Content-Type": r.headers.get("Content-Type", "application/json")})
 
 
-@app.post("/proxy/gimbal")
+@bp_camera.post("/proxy/gimbal")
 def proxy_gimbal():
     data = request.get_json(silent=True) or {}
     log_command("gimbal", data)
@@ -1136,7 +1141,7 @@ def proxy_gimbal():
     return (r.text, r.status_code, {"Content-Type": r.headers.get("Content-Type", "application/json")})
 
 
-@app.post("/proxy/rth")
+@bp_flight.post("/proxy/rth")
 def proxy_rth():
     data = request.get_json(silent=True) or {}
     log_command("rth", data)
@@ -1144,7 +1149,7 @@ def proxy_rth():
     return (r.text, r.status_code, {"Content-Type": r.headers.get("Content-Type", "application/json")})
 
 
-@app.post("/proxy/moveto")
+@bp_flight.post("/proxy/moveto")
 def proxy_moveto():
     data = request.get_json(silent=True) or {}
     log_command("moveto", data)
@@ -1152,7 +1157,7 @@ def proxy_moveto():
     return (r.text, r.status_code, {"Content-Type": r.headers.get("Content-Type", "application/json")})
 
 
-@app.get("/proxy/settings")
+@bp_settings.get("/proxy/settings")
 def proxy_settings_get():
     try:
         r = pi_get("/api/settings", timeout=TIMEOUT_STATUS)
@@ -1161,7 +1166,7 @@ def proxy_settings_get():
         return jsonify(ok=False, error=str(e)), 502
 
 
-@app.post("/proxy/settings")
+@bp_settings.post("/proxy/settings")
 def proxy_settings_set():
     data = request.get_json(silent=True) or {}
     log_command("settings", data)
@@ -1169,7 +1174,7 @@ def proxy_settings_set():
     return (r.text, r.status_code, {"Content-Type": r.headers.get("Content-Type", "application/json")})
 
 
-@app.get("/proxy/safety/takeoff")
+@bp_safety.get("/proxy/safety/takeoff")
 def proxy_safe_takeoff_get():
     try:
         r = pi_get("/api/safety/takeoff", timeout=TIMEOUT_STATUS)
@@ -1178,7 +1183,7 @@ def proxy_safe_takeoff_get():
         return jsonify(ok=False, error=str(e)), 502
 
 
-@app.post("/proxy/safety/takeoff")
+@bp_safety.post("/proxy/safety/takeoff")
 def proxy_safe_takeoff_set():
     data = request.get_json(silent=True) or {}
     log_command("safe_takeoff_set", data)
@@ -1186,12 +1191,12 @@ def proxy_safe_takeoff_set():
     return (r.text, r.status_code, {"Content-Type": r.headers.get("Content-Type", "application/json")})
 
 
-@app.get("/proxy/logging/commands")
+@bp_logs.get("/proxy/logging/commands")
 def proxy_command_log_status():
     return jsonify(enabled=command_log_enabled, path=str(command_log_path))
 
 
-@app.post("/proxy/logging/commands")
+@bp_logs.post("/proxy/logging/commands")
 def proxy_command_log_config():
     global command_log_enabled, command_log_path
     data = request.get_json(silent=True) or {}
@@ -1209,7 +1214,7 @@ def proxy_command_log_config():
     return jsonify(ok=True, enabled=command_log_enabled, path=str(command_log_path))
 
 
-@app.get("/proxy/logging/commands/download")
+@bp_logs.get("/proxy/logging/commands/download")
 def proxy_command_log_download():
     p = command_log_path
     if not p.exists():
@@ -1217,7 +1222,7 @@ def proxy_command_log_download():
     return send_file(p, as_attachment=True, download_name=p.name, mimetype="application/x-ndjson")
 
 
-@app.post("/proxy/logging/commands/clear")
+@bp_logs.post("/proxy/logging/commands/clear")
 def proxy_command_log_clear():
     p = command_log_path
     try:
@@ -1228,7 +1233,7 @@ def proxy_command_log_clear():
         return jsonify(ok=False, error=str(e), path=str(p)), 500
 
 
-@app.get("/proxy/logging/telemetry")
+@bp_logs.get("/proxy/logging/telemetry")
 def proxy_log_status():
     try:
         r = pi_get("/api/logging/telemetry", timeout=TIMEOUT_STATUS)
@@ -1237,7 +1242,7 @@ def proxy_log_status():
         return jsonify(ok=False, error=str(e)), 502
 
 
-@app.post("/proxy/logging/telemetry")
+@bp_logs.post("/proxy/logging/telemetry")
 def proxy_log_config():
     data = request.get_json(silent=True) or {}
     log_command("telemetry_log_set", data)
@@ -1245,7 +1250,7 @@ def proxy_log_config():
     return (r.text, r.status_code, {"Content-Type": r.headers.get("Content-Type", "application/json")})
 
 
-@app.get("/proxy/logging/telemetry/download")
+@bp_logs.get("/proxy/logging/telemetry/download")
 def proxy_log_download():
     r = pi_get("/api/logging/telemetry/download")
     headers = {
@@ -1255,14 +1260,14 @@ def proxy_log_download():
     return (r.content, r.status_code, headers)
 
 
-@app.post("/proxy/logging/telemetry/clear")
+@bp_logs.post("/proxy/logging/telemetry/clear")
 def proxy_log_clear():
     log_command("telemetry_log_clear")
     r = pi_post("/api/logging/telemetry/clear")
     return (r.text, r.status_code, {"Content-Type": r.headers.get("Content-Type", "application/json")})
 
 
-@app.get("/proxy/video")
+@bp_camera.get("/proxy/video")
 def proxy_video_feed():
     """Proxy the MJPEG video stream from the Pi API server."""
     try:
@@ -1275,7 +1280,7 @@ def proxy_video_feed():
         return jsonify(ok=False, error=str(e)), 502
 
 
-@app.post("/proxy/video/start")
+@bp_camera.post("/proxy/video/start")
 def proxy_video_start():
     data = request.get_json(silent=True) or {}
     mode = data.get("mode", "mjpeg")
@@ -1304,7 +1309,7 @@ def proxy_video_start():
     return (r.text, r.status_code, {"Content-Type": r.headers.get("Content-Type", "application/json")})
 
 
-@app.post("/proxy/video/stop")
+@bp_camera.post("/proxy/video/stop")
 def proxy_video_stop():
     log_command("video_stop")
     _stop_udp_receiver()
@@ -1312,7 +1317,7 @@ def proxy_video_stop():
     return (r.text, r.status_code, {"Content-Type": r.headers.get("Content-Type", "application/json")})
 
 
-@app.get("/proxy/video/status")
+@bp_camera.get("/proxy/video/status")
 def proxy_video_status():
     try:
         r = pi_get("/api/video/status", timeout=TIMEOUT_STATUS)
@@ -1457,7 +1462,7 @@ def _udp_receiver_loop():
     print(f"[C2-VIDEO] Receiver stopped ({frame_count} frames decoded)")
 
 
-@app.get("/proxy/video/forward_stream")
+@bp_camera.get("/proxy/video/forward_stream")
 def proxy_video_forward_stream():
     """Serve decoded UDP forward frames as MJPEG stream."""
     def gen():
@@ -1470,7 +1475,7 @@ def proxy_video_forward_stream():
     return Response(gen(), mimetype="multipart/x-mixed-replace; boundary=frame")
 
 
-@app.post("/proxy/camera/zoom")
+@bp_camera.post("/proxy/camera/zoom")
 def proxy_camera_zoom():
     data = request.get_json(silent=True) or {}
     try:
@@ -1481,7 +1486,7 @@ def proxy_camera_zoom():
         return jsonify(ok=False, error=str(e)), 502
 
 
-@app.get("/proxy/heartbeat")
+@bp_telemetry.get("/proxy/heartbeat")
 def proxy_heartbeat():
     """Send heartbeat to all REACHABLE drones in parallel.
 
@@ -1519,7 +1524,7 @@ def proxy_heartbeat():
 
 
 # ─── Latency ping (C2 → flight controller + flight controller → drone) ──────
-@app.get("/proxy/latency")
+@bp_flight.get("/proxy/latency")
 def proxy_latency():
     """Returns the three-leg latency picture for the ACTIVE drone:
       c2_to_fc_ms     — fresh HTTP round-trip to /api/heartbeat on the Pi
@@ -1554,7 +1559,7 @@ def proxy_latency():
     return jsonify(resp)
 
 
-@app.get("/proxy/telemetry")
+@bp_telemetry.get("/proxy/telemetry")
 def proxy_telemetry():
     mode = _transport_mode("telemetry")
     if mode in ("auto", "ws"):
@@ -1587,7 +1592,7 @@ def proxy_telemetry():
         return jsonify(ok=False, error=str(e)), 502
 
 
-@app.get("/proxy/fc_version")
+@bp_system.get("/proxy/fc_version")
 def proxy_fc_version():
     """Fetch the active drone's FC /api/version (short 1 s timeout) and
     compare its code_version string to the C2's. Lets the UI flash a
@@ -1629,7 +1634,7 @@ def proxy_fc_version():
     )
 
 
-@app.get("/proxy/ui_state")
+@bp_flight.get("/proxy/ui_state")
 def proxy_ui_state():
     """Single consolidated poll — replaces the many 0.5-5Hz polls the UI
     used to fire for tiny pieces of state (heartbeat, pause, ws_status,
@@ -1749,7 +1754,7 @@ def proxy_ui_state():
     return jsonify(ok=True, **out)
 
 
-@app.get("/proxy/diagnostics")
+@bp_system.get("/proxy/diagnostics")
 def proxy_diagnostics():
     """C2-side + Pi-side diagnostic snapshot.
 
@@ -1858,7 +1863,7 @@ def proxy_diagnostics():
     )
 
 
-@app.get("/proxy/ws/status")
+@bp_flight.get("/proxy/ws/status")
 def proxy_ws_status():
     """Per-drone WS connection snapshot for the UI badge."""
     out = {did: cli.status() for did, cli in drone_ws.items()}
@@ -1869,7 +1874,7 @@ def proxy_ws_status():
     )
 
 
-@app.get("/proxy/config/transport")
+@bp_settings.get("/proxy/config/transport")
 def proxy_transport_get():
     """Return the current per-subsystem transport preference."""
     with _transport_lock:
@@ -1877,7 +1882,7 @@ def proxy_transport_get():
     return jsonify(ok=True, transport=snap, ws_available=HAS_WSCLIENT)
 
 
-@app.post("/proxy/config/transport")
+@bp_settings.post("/proxy/config/transport")
 def proxy_transport_set():
     """Update the transport preference for one or more subsystems.
     Body: {"rc":"http", "telemetry":"auto", "position":"ws"}
@@ -1907,7 +1912,7 @@ def proxy_transport_set():
 
 # ── Positioning subsystem proxy ───────────────────────────────────────────────
 
-@app.get("/proxy/position")
+@bp_telemetry.get("/proxy/position")
 def proxy_position_get():
     try:
         r = pi_get("/api/position", timeout=TIMEOUT_STATUS)
@@ -1916,7 +1921,7 @@ def proxy_position_get():
         return jsonify(ok=False, error=str(e)), 502
 
 
-@app.get("/proxy/position/events")
+@bp_telemetry.get("/proxy/position/events")
 def proxy_position_events():
     """SSE proxy — streams ArUco position events from Pi to browser."""
     pi_url = PI_BASE + "/api/position/events"
@@ -1935,7 +1940,7 @@ def proxy_position_events():
                     headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
 
-@app.get("/proxy/telemetry/stream")
+@bp_telemetry.get("/proxy/telemetry/stream")
 def proxy_telemetry_stream():
     """SSE proxy — streams telemetry events from Pi to browser (replaces polling)."""
     pi_url = PI_BASE + "/api/telemetry/stream"
@@ -1954,7 +1959,7 @@ def proxy_telemetry_stream():
                     headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
 
-@app.get("/proxy/position/video")
+@bp_telemetry.get("/proxy/position/video")
 def proxy_position_video():
     """MJPEG proxy — streams ArUco-annotated frames from Pi."""
     pi_url = PI_BASE + "/api/position/video"
@@ -1972,7 +1977,7 @@ def proxy_position_video():
                     headers={"Cache-Control": "no-store"})
 
 
-@app.get("/proxy/position/config")
+@bp_arena.get("/proxy/position/config")
 def proxy_position_config_get():
     try:
         r = pi_get("/api/position/config", timeout=TIMEOUT_STATUS)
@@ -1981,7 +1986,7 @@ def proxy_position_config_get():
         return jsonify(ok=False, error=str(e)), 502
 
 
-@app.post("/proxy/position/config")
+@bp_arena.post("/proxy/position/config")
 def proxy_position_config_set():
     data = request.get_json(silent=True) or {}
     r = pi_post("/api/position/config", data)
@@ -2006,7 +2011,7 @@ def _calib_target_base(drone_id: str | None):
     return did, (info or {}).get("base")
 
 
-@app.post("/proxy/calibration/start")
+@bp_arena.post("/proxy/calibration/start")
 def proxy_calibration_start():
     did, base = _calib_target_base(request.args.get("drone_id"))
     if not base:
@@ -2020,7 +2025,7 @@ def proxy_calibration_start():
         return jsonify(ok=False, error=str(e)), 502
 
 
-@app.get("/proxy/calibration/status")
+@bp_arena.get("/proxy/calibration/status")
 def proxy_calibration_status():
     did, base = _calib_target_base(request.args.get("drone_id"))
     if not base:
@@ -2034,7 +2039,7 @@ def proxy_calibration_status():
         return jsonify(ok=False, error=str(e)), 502
 
 
-@app.post("/proxy/calibration/abort")
+@bp_arena.post("/proxy/calibration/abort")
 def proxy_calibration_abort():
     did, base = _calib_target_base(request.args.get("drone_id"))
     if not base:
@@ -2048,7 +2053,7 @@ def proxy_calibration_abort():
         return jsonify(ok=False, error=str(e)), 502
 
 
-@app.post("/proxy/position/calibration")
+@bp_arena.post("/proxy/position/calibration")
 def proxy_position_calibration():
     """Proxy NPZ calibration file upload to Pi."""
     if "file" not in request.files:
@@ -2150,7 +2155,7 @@ def _js_arena_to_pi(data: dict) -> dict:
     return out
 
 
-@app.get("/proxy/arena/config")
+@bp_arena.get("/proxy/arena/config")
 def proxy_arena_config_get():
     try:
         r = pi_get("/api/arena/config", timeout=TIMEOUT_STATUS)
@@ -2160,7 +2165,7 @@ def proxy_arena_config_get():
         return jsonify(ok=False, error=str(e)), 502
 
 
-@app.post("/proxy/arena/config")
+@bp_arena.post("/proxy/arena/config")
 def proxy_arena_config_set():
     data = request.get_json(silent=True) or {}
     try:
@@ -2172,7 +2177,7 @@ def proxy_arena_config_set():
         return jsonify(ok=False, error=str(e)), 502
 
 
-@app.post("/proxy/arena/config/reset")
+@bp_arena.post("/proxy/arena/config/reset")
 def proxy_arena_config_reset():
     try:
         r = pi_post("/api/arena/config/reset", {})
@@ -2181,7 +2186,7 @@ def proxy_arena_config_reset():
         return jsonify(ok=False, error=str(e)), 502
 
 
-@app.get("/proxy/video/record/status")
+@bp_camera.get("/proxy/video/record/status")
 def proxy_rec_status():
     try:
         r = pi_get("/api/video/record/status", timeout=TIMEOUT_STATUS)
@@ -2190,7 +2195,7 @@ def proxy_rec_status():
         return jsonify(ok=False, error=str(e)), 502
 
 
-@app.post("/proxy/video/record/start")
+@bp_camera.post("/proxy/video/record/start")
 def proxy_rec_start():
     try:
         data = request.get_json(silent=True) or {}
@@ -2200,7 +2205,7 @@ def proxy_rec_start():
         return jsonify(ok=False, error=str(e)), 502
 
 
-@app.post("/proxy/video/record/stop")
+@bp_camera.post("/proxy/video/record/stop")
 def proxy_rec_stop():
     try:
         r = pi_post("/api/video/record/stop", {})
@@ -2221,7 +2226,7 @@ def _aruco_resolve(drone_id: str | None):
     return obs, did
 
 
-@app.get("/proxy/aruco/state")
+@bp_aruco.get("/proxy/aruco/state")
 def proxy_aruco_state():
     """Snapshot of ONE observer (query ?id=1, defaults to active drone)."""
     did = request.args.get("id") or active_drone_id
@@ -2231,7 +2236,7 @@ def proxy_aruco_state():
     return jsonify(obs.get_state())
 
 
-@app.get("/proxy/aruco/fleet")
+@bp_aruco.get("/proxy/aruco/fleet")
 def proxy_aruco_fleet():
     """Snapshot of every observer in the fleet.
 
@@ -2379,7 +2384,7 @@ def proxy_aruco_fleet():
                    observers=observers)
 
 
-@app.get("/proxy/aruco/params")
+@bp_aruco.get("/proxy/aruco/params")
 def proxy_aruco_params_get():
     did = request.args.get("id") or active_drone_id
     obs, did = _aruco_resolve(did)
@@ -2393,7 +2398,7 @@ def asdict_hover_defaults():
     return asdict(AsHoverParams())
 
 
-@app.post("/proxy/aruco/params")
+@bp_aruco.post("/proxy/aruco/params")
 def proxy_aruco_params_set():
     data = request.get_json(silent=True) or {}
     # If no id, broadcast to EVERY observer (fleet-wide knobs like
@@ -2446,7 +2451,7 @@ def _apply_camera_face_to_fleet():
 _apply_camera_face_to_fleet()
 
 
-@app.get("/proxy/config/camera_face_center")
+@bp_settings.get("/proxy/config/camera_face_center")
 def proxy_camera_face_center_get():
     with _camera_face_center_lock:
         return jsonify(
@@ -2456,7 +2461,7 @@ def proxy_camera_face_center_get():
         )
 
 
-@app.post("/proxy/config/camera_face_center")
+@bp_settings.post("/proxy/config/camera_face_center")
 def proxy_camera_face_center_set():
     """Enable/disable the toggle, optionally override the centre XY.
     Body: {"enabled": true, "xy": [0, 5.4]}"""
@@ -2481,7 +2486,7 @@ def proxy_camera_face_center_set():
                    xy=list(_camera_face_center_xy))
 
 
-@app.get("/proxy/aruco/safety_margin")
+@bp_aruco.get("/proxy/aruco/safety_margin")
 def proxy_aruco_safety_margin_get():
     """Return the current autonomous-mode arena safety margin (metres).
     Reads from the active drone's observer since the margin is
@@ -2498,7 +2503,7 @@ def proxy_aruco_safety_margin_get():
         )
 
 
-@app.post("/proxy/aruco/safety_margin")
+@bp_aruco.post("/proxy/aruco/safety_margin")
 def proxy_aruco_safety_margin_set():
     """Set the autonomous-mode arena safety margin. Body:
         {"safety_margin_m": 1.5}
@@ -2520,7 +2525,7 @@ def proxy_aruco_safety_margin_set():
     return jsonify(ok=True, safety_margin_m=v)
 
 
-@app.post("/proxy/aruco/start")
+@bp_aruco.post("/proxy/aruco/start")
 def proxy_aruco_start():
     data = request.get_json(silent=True) or {}
     did = str(data.get("id") or request.args.get("id") or active_drone_id)
@@ -2532,7 +2537,7 @@ def proxy_aruco_start():
     return jsonify(ok=True, drone_id=did)
 
 
-@app.post("/proxy/aruco/stop")
+@bp_aruco.post("/proxy/aruco/stop")
 def proxy_aruco_stop():
     data = request.get_json(silent=True) or {}
     did = str(data.get("id") or request.args.get("id") or active_drone_id)
@@ -2544,7 +2549,7 @@ def proxy_aruco_stop():
     return jsonify(ok=True, drone_id=did)
 
 
-@app.post("/proxy/aruco/target")
+@bp_aruco.post("/proxy/aruco/target")
 def proxy_aruco_target():
     data = request.get_json(silent=True) or {}
     did = str(data.get("id") or request.args.get("id") or active_drone_id)
@@ -2562,7 +2567,7 @@ def proxy_aruco_target():
     return jsonify(ok=True, drone_id=did, marker=mid)
 
 
-@app.post("/proxy/aruco/mode")
+@bp_aruco.post("/proxy/aruco/mode")
 def proxy_aruco_mode():
     data = request.get_json(silent=True) or {}
     did = str(data.get("id") or request.args.get("id") or active_drone_id)
@@ -2594,7 +2599,7 @@ def _aruco_require_live(obs):
     return None
 
 
-@app.post("/proxy/aruco/takeoff")
+@bp_aruco.post("/proxy/aruco/takeoff")
 def proxy_aruco_takeoff():
     data = request.get_json(silent=True) or {}
     did = str(data.get("id") or request.args.get("id") or active_drone_id)
@@ -2606,7 +2611,7 @@ def proxy_aruco_takeoff():
     return jsonify(ok=True, drone_id=did, result=obs.cmd_takeoff())
 
 
-@app.post("/proxy/aruco/land")
+@bp_aruco.post("/proxy/aruco/land")
 def proxy_aruco_land():
     data = request.get_json(silent=True) or {}
     did = str(data.get("id") or request.args.get("id") or active_drone_id)
@@ -2618,7 +2623,7 @@ def proxy_aruco_land():
     return jsonify(ok=True, drone_id=did, result=obs.cmd_land())
 
 
-@app.post("/proxy/aruco/emergency")
+@bp_aruco.post("/proxy/aruco/emergency")
 def proxy_aruco_emergency():
     # Allowed at any mode — killswitch must always be reachable
     data = request.get_json(silent=True) or {}
@@ -2630,7 +2635,7 @@ def proxy_aruco_emergency():
     return jsonify(ok=True, drone_id=did, result=obs.cmd_emergency())
 
 
-@app.post("/proxy/aruco/rc_stop")
+@bp_aruco.post("/proxy/aruco/rc_stop")
 def proxy_aruco_rc_stop():
     data = request.get_json(silent=True) or {}
     did = str(data.get("id") or request.args.get("id") or active_drone_id)
@@ -2641,7 +2646,7 @@ def proxy_aruco_rc_stop():
     return jsonify(ok=True, drone_id=did, result=obs.cmd_rc_stop())
 
 
-@app.get("/proxy/aruco/video.mjpg")
+@bp_aruco.get("/proxy/aruco/video.mjpg")
 def proxy_aruco_video():
     """Pass-through MJPEG for the observer's drone (separate from /proxy/video
     so the main UI's video stream and the ArUco Seek panel don't collide)."""
@@ -2705,7 +2710,7 @@ def _parse_marker_list(raw) -> list[int]:
     return sorted(out)
 
 
-@app.get("/proxy/missions/status")
+@bp_missions.get("/proxy/missions/status")
 def proxy_missions_status():
     return jsonify(mission_manager.status())
 
@@ -2849,13 +2854,13 @@ def _save_position_presets(data: dict):
         tmp.replace(POSITION_PRESETS_PATH)
 
 
-@app.get("/proxy/position/presets")
+@bp_arena.get("/proxy/position/presets")
 def proxy_position_presets_list():
     return jsonify(ok=True, presets=_load_position_presets(),
                    path=str(POSITION_PRESETS_PATH))
 
 
-@app.post("/proxy/position/presets")
+@bp_arena.post("/proxy/position/presets")
 def proxy_position_presets_save():
     """Save a named preset. Body: {"name": "X", "params": {...}}"""
     data = request.get_json(silent=True) or {}
@@ -2873,7 +2878,7 @@ def proxy_position_presets_save():
     return jsonify(ok=True, name=name)
 
 
-@app.delete("/proxy/position/presets")
+@bp_arena.delete("/proxy/position/presets")
 def proxy_position_presets_delete():
     name = str(request.args.get("name", "")).strip()
     if not name:
@@ -2890,7 +2895,7 @@ def proxy_position_presets_delete():
     return jsonify(ok=True)
 
 
-@app.post("/proxy/position/presets/apply")
+@bp_arena.post("/proxy/position/presets/apply")
 def proxy_position_presets_apply():
     """Load a preset and fan it out to every drone via /proxy/position/config.
     Body: {"name": "..."} — any unknown keys in the preset are accepted
@@ -2996,14 +3001,14 @@ def _save_mission_presets(data: dict):
         tmp.replace(MISSION_PRESETS_PATH)
 
 
-@app.get("/proxy/missions/presets")
+@bp_missions.get("/proxy/missions/presets")
 def proxy_mission_presets_list():
     """Return all presets grouped by mission type."""
     return jsonify(ok=True, presets=_load_mission_presets(),
                    path=str(MISSION_PRESETS_PATH))
 
 
-@app.post("/proxy/missions/presets")
+@bp_missions.post("/proxy/missions/presets")
 def proxy_mission_presets_save():
     """Create or overwrite a named preset.
     Body: {"mission_type": "scan_all", "name": "tight-margin",
@@ -3034,7 +3039,7 @@ def proxy_mission_presets_save():
     return jsonify(ok=True, mission_type=mtype, name=name)
 
 
-@app.delete("/proxy/missions/presets")
+@bp_missions.delete("/proxy/missions/presets")
 def proxy_mission_presets_delete():
     """Delete a named preset. Query: ?mission_type=X&name=Y"""
     mtype = str(request.args.get("mission_type", "")).strip()
@@ -3054,7 +3059,7 @@ def proxy_mission_presets_delete():
     return jsonify(ok=True)
 
 
-@app.post("/proxy/missions/scan_all/start")
+@bp_missions.post("/proxy/missions/scan_all/start")
 def proxy_missions_scan_all_start():
     guarded = _pause_guard_response()
     if guarded is not None:
@@ -3088,7 +3093,7 @@ def proxy_missions_scan_all_start():
     return jsonify(ok=ok, message=msg, status=mission_manager.status()), status
 
 
-@app.post("/proxy/missions/capture_targets/start")
+@bp_missions.post("/proxy/missions/capture_targets/start")
 def proxy_missions_capture_targets_start():
     """Launch the SDC26 capture-all-targets mission. Body:
     {
@@ -3141,7 +3146,7 @@ def proxy_missions_capture_targets_start():
     return jsonify(ok=ok, message=msg, status=mission_manager.status()), status
 
 
-@app.post("/proxy/missions/stop")
+@bp_missions.post("/proxy/missions/stop")
 def proxy_missions_stop():
     data = request.get_json(silent=True) or {}
     land = bool(data.get("land", False))
@@ -3342,7 +3347,7 @@ def _scan_and_capture_thread(
         _scan_cap_set(active=False)
 
 
-@app.post("/proxy/missions/scan_and_capture/start")
+@bp_missions.post("/proxy/missions/scan_and_capture/start")
 def proxy_scan_and_capture_start():
     """Scan-and-capture: the first selected drone rotates to discover
     SDC26 target boxes (IDs 31-36 Blue, 41-46 Red) via ArUco. All
@@ -3428,14 +3433,14 @@ def proxy_scan_and_capture_start():
                    drone_ids=drone_ids)
 
 
-@app.get("/proxy/missions/scan_and_capture/status")
+@bp_missions.get("/proxy/missions/scan_and_capture/status")
 def proxy_scan_and_capture_status():
     with _scan_cap_lock:
         snap = dict(_scan_cap_state)
     return jsonify(ok=True, **snap)
 
 
-@app.post("/proxy/missions/scan_and_capture/abort")
+@bp_missions.post("/proxy/missions/scan_and_capture/abort")
 def proxy_scan_and_capture_abort():
     """Abort the scan-and-capture. Sets a flag that the background thread
     checks; the thread exits at the next dwell boundary. If the capture
@@ -3452,7 +3457,7 @@ def proxy_scan_and_capture_abort():
     return jsonify(ok=True, message="abort requested", active=active)
 
 
-@app.get("/proxy/missions/trace")
+@bp_missions.get("/proxy/missions/trace")
 def proxy_missions_trace():
     """Download the trace log for the most recent mission. The mission
     class writes a JSONL file per run; we return the current one (or the
@@ -3482,7 +3487,7 @@ def proxy_missions_trace():
                      download_name=_P(path).name)
 
 
-@app.get("/proxy/missions/traces")
+@bp_missions.get("/proxy/missions/traces")
 def proxy_missions_traces():
     """List all mission trace files on disk with size and mtime."""
     import glob as _glob
@@ -3504,7 +3509,7 @@ def proxy_missions_traces():
 
 # ─── Environment & Wi-Fi control — pass-through to active drone ─────────────
 
-@app.get("/proxy/environment")
+@bp_settings.get("/proxy/environment")
 def proxy_environment_get():
     try:
         r = _http_session.get(f"{PI_BASE}/api/environment", timeout=3)
@@ -3514,7 +3519,7 @@ def proxy_environment_get():
         return jsonify(ok=False, error=str(e)), 502
 
 
-@app.post("/proxy/environment")
+@bp_settings.post("/proxy/environment")
 def proxy_environment_set():
     data = request.get_json(silent=True) or {}
     log_command("environment_set", data)
@@ -3526,7 +3531,7 @@ def proxy_environment_set():
         return jsonify(ok=False, error=str(e)), 502
 
 
-@app.get("/proxy/wifi/status")
+@bp_settings.get("/proxy/wifi/status")
 def proxy_wifi_status():
     try:
         r = _http_session.get(f"{PI_BASE}/api/wifi/status", timeout=3)
@@ -3536,7 +3541,7 @@ def proxy_wifi_status():
         return jsonify(ok=False, error=str(e)), 502
 
 
-@app.post("/proxy/wifi/channel")
+@bp_settings.post("/proxy/wifi/channel")
 def proxy_wifi_channel():
     data = request.get_json(silent=True) or {}
     log_command("wifi_channel_set", data)
@@ -3548,7 +3553,7 @@ def proxy_wifi_channel():
         return jsonify(ok=False, error=str(e)), 502
 
 
-@app.post("/proxy/wifi/scan")
+@bp_settings.post("/proxy/wifi/scan")
 def proxy_wifi_scan():
     data = request.get_json(silent=True) or {}
     try:
@@ -3565,7 +3570,7 @@ def proxy_wifi_scan():
 # raw GET /api/magneto and POST /api/magneto/calibrate; here we expose a
 # higher-level /proxy/magneto/recalibrate that drives the full cycle.
 
-@app.get("/proxy/magneto")
+@bp_magneto.get("/proxy/magneto")
 def proxy_magneto_status():
     """Current magnetometer calibration status for the active drone."""
     try:
@@ -3576,7 +3581,7 @@ def proxy_magneto_status():
         return jsonify(ok=False, error=str(e)), 502
 
 
-@app.post("/proxy/magneto/calibrate")
+@bp_magneto.post("/proxy/magneto/calibrate")
 def proxy_magneto_calibrate():
     """One-shot: send the StartMagnetoCalibration command and return.
     The caller is then responsible for the figure-8 dance and for polling
@@ -3727,7 +3732,7 @@ def _magneto_cycle(timeout_s: float, poll_s: float):
            "message": msg}
 
 
-@app.post("/proxy/magneto/recalibrate")
+@bp_magneto.post("/proxy/magneto/recalibrate")
 def proxy_magneto_recalibrate():
     """Blocking orchestrator: runs the full recalibration cycle and returns a
     single summary JSON. See /proxy/magneto/recalibrate/stream for live
@@ -3751,7 +3756,7 @@ def proxy_magneto_recalibrate():
     return jsonify(final), 200
 
 
-@app.get("/proxy/magneto/recalibrate/stream")
+@bp_magneto.get("/proxy/magneto/recalibrate/stream")
 def proxy_magneto_recalibrate_stream():
     """SSE stream of the recalibration cycle. Used by the wizard GUI to light
     up each step + per-axis indicator as it happens.
@@ -3774,6 +3779,12 @@ def proxy_magneto_recalibrate_stream():
                     headers={"Cache-Control": "no-cache",
                              "X-Accel-Buffering": "no"})
 
+
+
+# ── Wire blueprints (Phase 3) ─────────────────────────────────
+# Every @bp_X.<method>(...) decorator above attached its route to the
+# corresponding blueprint object. Now register them all on the Flask app.
+_register_blueprints(app)
 
 def main():
     print("[REMOTE UI] Starting server...")
