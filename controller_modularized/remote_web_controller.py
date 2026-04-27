@@ -15,6 +15,17 @@ _PKG_PARENT = str(Path(__file__).resolve().parent.parent)
 if _PKG_PARENT not in sys.path:
     sys.path.insert(0, _PKG_PARENT)
 
+# When invoked as a script, this module loads as ``__main__``. Anything
+# that later does ``from controller_modularized.remote_web_controller
+# import …`` would otherwise trigger a SECOND load of the same file under
+# the qualified name — causing duplicate blueprint registrations and the
+# infamous "setup method ... can no longer be called" Flask error. Alias
+# the qualified name to this module's slot in sys.modules now, before any
+# transitive imports run.
+if __name__ == "__main__":
+    sys.modules.setdefault("controller_modularized.remote_web_controller",
+                            sys.modules[__name__])
+
 import requests
 from flask import render_template, Flask, Response, jsonify, request, send_file
 
@@ -341,80 +352,16 @@ def pi_get(path: str, timeout: float | None = None):
         _record_pi_call("GET", path, time.time() - t0, status, err)
 
 
-@bp_system.get("/")
-def index():
-    return render_template("index.html")
 
 
-@bp_system.get("/logo.png")
-def serve_logo():
-    """Serve the team logo for the header of the UI.
-
-    Prefers the alpha-masked variant (team_logo_transparent.png) so the
-    logo blends with the page's dark background rather than showing a
-    white rectangle. Falls back to the original PNG if the masked file
-    isn't present.
-    """
-    from pathlib import Path as _P
-    base = _P(__file__).resolve().parent.parent / "1_Doc"
-    for name in ("team_logo_transparent.png", "team_logo.png"):
-        p = base / name
-        if p.exists():
-            return send_file(str(p), mimetype="image/png",
-                             max_age=86400)   # cache-1-day
-    return jsonify(ok=False, error="logo not found"), 404
 
 
-@bp_drones.get("/proxy/drones")
-def proxy_drones():
-    return jsonify(drones=DRONES, active=active_drone_id)
 
 
-@bp_drones.post("/proxy/switch")
-def proxy_switch():
-    global active_drone_id, PI_BASE
-    data = request.get_json(silent=True) or {}
-    drone_id = str(data.get("id", ""))
-    if drone_id not in DRONES:
-        return jsonify(ok=False, error="unknown drone id"), 400
-    active_drone_id = drone_id
-    PI_BASE = DRONES[drone_id]["base"]
-    log_command("switch_drone", {"id": drone_id, "name": DRONES[drone_id]["name"]})
-    print(f"[REMOTE UI] Switched to {DRONES[drone_id]['name']} @ {PI_BASE}")
-    return jsonify(ok=True, active=drone_id, name=DRONES[drone_id]["name"], base=PI_BASE)
 
 
-@bp_drones.get("/proxy/drones/config")
-def proxy_drones_config():
-    """Return full drone config for editing."""
-    return jsonify(drones=DRONES, config_path=str(DRONES_CONFIG_PATH))
 
 
-@bp_drones.post("/proxy/drones/config")
-def proxy_drones_config_save():
-    """Save updated drone config. Expects {drones: {id: {name, type, base}, ...}}"""
-    global DRONES, PI_BASE
-    data = request.get_json(silent=True) or {}
-    new_drones = data.get("drones")
-    if not new_drones or not isinstance(new_drones, dict):
-        return jsonify(ok=False, error="drones dict required"), 400
-    for did, info in new_drones.items():
-        if not all(k in info for k in ("name", "type", "base")):
-            return jsonify(ok=False, error=f"drone {did} missing name/type/base"), 400
-        if info["type"] not in ("tello", "anafi"):
-            return jsonify(ok=False, error=f"drone {did} type must be tello or anafi"), 400
-    DRONES.clear()
-    DRONES.update(new_drones)
-    if active_drone_id in DRONES:
-        PI_BASE = DRONES[active_drone_id]["base"]
-    save_drones_config(DRONES)
-    # Keep ArUco fleet in sync with drone config
-    try:
-        aruco_fleet.configure(DRONES)
-    except Exception as e:
-        print(f"[ARUCO] fleet reconfigure failed: {e}")
-    print(f"[CONFIG] Saved {len(DRONES)} drones to {DRONES_CONFIG_PATH}")
-    return jsonify(ok=True, drones=DRONES)
 
 
 # ── Per-subsystem transport preference ────────────────────────────────
@@ -469,209 +416,16 @@ def _active_drone_reachable() -> bool:
             or ws._ws_connected.get("position"))
 
 
-@bp_flight.post("/proxy/key_down")
-def proxy_key_down():
-    data = request.get_json(silent=True) or {}
-    log_command("key_down", data)
-    mode = _transport_mode("rc")
-    if mode in ("auto", "ws"):
-        k = str(data.get("key", ""))
-        ws = drone_ws.get(str(active_drone_id))
-        if ws and ws.send_key(k, "down"):
-            return jsonify(ok=True, via="ws")
-        if mode == "ws":
-            return jsonify(ok=False, error="ws forced but not connected",
-                           via="ws"), 503
-    # HTTP path — tight TIMEOUT_FAST so an unreachable drone fails fast
-    # (was TIMEOUT_CMD=8s, which made every key burn 8s when the Pi
-    # didn't answer — the real cause of "HTTP controls don't work").
-    # No more _active_drone_reachable() gate: HTTP shouldn't be vetoed
-    # by WS status. If HTTP itself is broken the timeout tells us.
-    try:
-        r = pi_post("/api/key_down", data, timeout=TIMEOUT_FAST)
-        return (r.text, r.status_code,
-                {"Content-Type": r.headers.get("Content-Type", "application/json")})
-    except Exception as e:
-        return jsonify(ok=False, error=f"http: {e}", via="http"), 502
 
 
-@bp_flight.post("/proxy/key_up")
-def proxy_key_up():
-    data = request.get_json(silent=True) or {}
-    log_command("key_up", data)
-    mode = _transport_mode("rc")
-    if mode in ("auto", "ws"):
-        k = str(data.get("key", ""))
-        ws = drone_ws.get(str(active_drone_id))
-        if ws and ws.send_key(k, "up"):
-            return jsonify(ok=True, via="ws")
-        if mode == "ws":
-            return jsonify(ok=False, error="ws forced but not connected",
-                           via="ws"), 503
-    try:
-        r = pi_post("/api/key_up", data, timeout=TIMEOUT_FAST)
-        return (r.text, r.status_code,
-                {"Content-Type": r.headers.get("Content-Type", "application/json")})
-    except Exception as e:
-        return jsonify(ok=False, error=f"http: {e}", via="http"), 502
 
 
-@bp_flight.post("/proxy/key_batch")
-def proxy_key_batch():
-    """Batch key_down for all currently held keys in a single request.
-
-    Fires at ~10 Hz from the browser — it's the keep-alive that stops
-    the Pi's KEY_STALE_S=1 timer from dropping keys mid-flight. Historic
-    path did N serial HTTP POSTs per batch which is the real WASD
-    latency culprit (3 held keys × 10 Hz × slow HTTP = backed-up fetch
-    queue).
-
-    New path: one WS send per held key on the persistent socket. With
-    fire-and-forget semantics, the whole batch clears in microseconds.
-    Fallback to HTTP on WS disconnect."""
-    data = request.get_json(silent=True) or {}
-    keys = data.get("keys", [])
-    if not keys:
-        return jsonify(ok=True)
-    # Dedup so the log and the wire don't carry redundant presses
-    uniq = list(dict.fromkeys(keys))
-
-    mode = _transport_mode("rc")
-    if mode in ("auto", "ws"):
-        ws = drone_ws.get(str(active_drone_id))
-        if ws:
-            all_sent = True
-            for k in uniq:
-                if not ws.send_key(str(k), "down"):
-                    all_sent = False
-                    break
-            if all_sent:
-                log_command("key_batch", {"keys": uniq, "via": "ws"})
-                return jsonify(ok=True, via="ws", n=len(uniq))
-        if mode == "ws":
-            return jsonify(ok=False, error="ws forced but not connected",
-                           via="ws"), 503
-
-    log_command("key_batch", {"keys": uniq, "via": "http"})
-    # SINGLE HTTP POST to the Pi's batch endpoint — was N serial
-    # per-key calls previously, which saturated the browser's
-    # 6-connection pool whenever WS fell back to HTTP.
-    try:
-        r = pi_post("/api/key_batch", {"keys": uniq}, timeout=TIMEOUT_FAST)
-        return (r.text, r.status_code,
-                {"Content-Type": r.headers.get("Content-Type", "application/json")})
-    except Exception as e:
-        return jsonify(ok=False, error=f"http: {e}", via="http"), 502
 
 
-@bp_flight.post("/proxy/takeoff")
-def proxy_takeoff():
-    """Relay takeoff to the active drone's Pi.
-
-    Uses TIMEOUT_SLOW (default 15s) not the default TIMEOUT_CMD (8s)
-    because Anafi takeoff routinely takes 3-5 seconds for the armament
-    sensors + motor spin-up before /api/takeoff returns success. The
-    earlier 2s default truncated this and led to "network error
-    contacting drone: TypeError: Failed to fetch" on every attempt.
-    Also wraps the call in try/except so a slow drone returns clean
-    JSON to the UI instead of a Flask stack-trace HTML page.
-    """
-    log_command("takeoff")
-    try:
-        r = pi_post("/api/takeoff", timeout=TIMEOUT_SLOW)
-    except Exception as e:
-        import requests as _rq
-        if isinstance(e, _rq.exceptions.ReadTimeout):
-            return jsonify(ok=False,
-                           error=f"takeoff timed out after {TIMEOUT_SLOW}s — "
-                                 f"drone may still be arming; check telemetry"), 504
-        return jsonify(ok=False, error=f"network error: {e}"), 502
-    return (r.text, r.status_code,
-            {"Content-Type": r.headers.get("Content-Type", "application/json")})
 
 
-@bp_flight.post("/proxy/land")
-def proxy_land():
-    """Relay land to the active drone's Pi. Same slow-command timeout
-    as takeoff — Anafi land waits for ground-contact before returning."""
-    log_command("land")
-    try:
-        r = pi_post("/api/land", timeout=TIMEOUT_SLOW)
-    except Exception as e:
-        import requests as _rq
-        if isinstance(e, _rq.exceptions.ReadTimeout):
-            return jsonify(ok=False,
-                           error=f"land timed out after {TIMEOUT_SLOW}s — "
-                                 f"check drone state before retrying"), 504
-        return jsonify(ok=False, error=f"network error: {e}"), 502
-    return (r.text, r.status_code,
-            {"Content-Type": r.headers.get("Content-Type", "application/json")})
 
 
-@bp_flight.post("/proxy/land_all")
-def proxy_land_all():
-    """Emergency panic-button: land every configured drone and halt any
-    running mission. Used by the 'q' hotkey in the UI. Tolerates
-    individual drones being unreachable — collects per-drone outcomes
-    and always returns 200 so the client can render the summary."""
-    log_command("land_all")
-
-    # 1) Stop any running mission first so its LIVE-mode state machine
-    #    doesn't immediately re-push RC commands that conflict with land.
-    mission_stopped = False
-    try:
-        if mission_manager is not None and mission_manager.current is not None:
-            mission_stopped = mission_manager.stop(land=False)
-    except Exception as e:
-        print(f"[LAND_ALL] mission stop failed: {e}")
-
-    # 2) Send /api/land to every configured drone in parallel-ish
-    #    (sequentially but with a short timeout per drone).
-    results: dict[str, dict] = {}
-    for did, info in DRONES.items():
-        base = (info or {}).get("base")
-        if not base:
-            results[str(did)] = {"ok": False, "error": "no base url"}
-            continue
-        try:
-            # Use the slow-command timeout — Anafi land blocks until
-            # ground contact. 3s wasn't enough for gentle descent.
-            resp = _http_session.post(f"{base.rstrip('/')}/api/land",
-                                      json={}, timeout=TIMEOUT_SLOW)
-            try:
-                j = resp.json()
-            except Exception:
-                j = {"raw": resp.text[:120]}
-            results[str(did)] = {
-                "ok": bool(j.get("ok", resp.status_code == 200)),
-                "status": resp.status_code,
-                "msg": j.get("msg") or j.get("error") or "",
-            }
-        except Exception as e:
-            results[str(did)] = {"ok": False, "error": str(e)[:120]}
-
-    # 3) Also put every ArUco observer back into OBSERVE mode and clear
-    #    any lingering search RC so the drones don't fight the land.
-    try:
-        for did, obs in aruco_fleet._obs.items():
-            try:
-                obs.set_search_rc(0, 0, 0, 0)
-                obs.set_mode("observe")
-            except Exception:
-                pass
-    except Exception:
-        pass
-
-    ok_count = sum(1 for v in results.values() if v.get("ok"))
-    print(f"[LAND_ALL] {ok_count}/{len(results)} drones acknowledged land "
-          f"(mission_stopped={mission_stopped})")
-    return jsonify(
-        ok=True,
-        landed=ok_count,
-        total=len(results),
-        mission_stopped=mission_stopped,
-        results=results,
-    )
 
 
 def _collect_fleet_videos() -> dict:
@@ -705,625 +459,92 @@ def _collect_fleet_videos() -> dict:
     return out
 
 
-@bp_logs.get("/proxy/flight_logs")
-def proxy_flight_logs_list():
-    """List archived per-flight log files (newest first), with video
-    metadata attached when a matching .mp4 lives on any Pi."""
-    files = flight_logger.list_files()
-    vids = _collect_fleet_videos()
-    for f in files:
-        stem = f["name"][:-len(".jsonl")] if f["name"].endswith(".jsonl") else f["name"]
-        video_name = stem + ".mp4"
-        v = vids.get(video_name)
-        if v:
-            f["video"] = {
-                "name":     video_name,
-                "drone_id": v["drone_id"],
-                "size":     v["size"],
-                "mtime":    v["mtime"],
-            }
-    return jsonify(ok=True, files=files)
 
 
-@bp_logs.get("/proxy/flight_video/<path:name>")
-def proxy_flight_video_download(name):
-    """Stream a flight video from whichever Pi has it. Filename is the
-    mp4 basename produced by FlightLogger (flight_YYYY-..._drone-N_X.mp4);
-    we look up the drone id from the filename and proxy straight through."""
-    # Locate the video across the fleet
-    vids = _collect_fleet_videos()
-    entry = vids.get(name)
-    if not entry:
-        return jsonify(ok=False, error="video not found on any drone"), 404
-    did = entry["drone_id"]
-    base = (DRONES.get(did, {}) or {}).get("base")
-    if not base:
-        return jsonify(ok=False, error="drone has no base url"), 500
-    try:
-        upstream = _http_session.get(
-            f"{base.rstrip('/')}/api/video/recordings/{name}",
-            stream=True, timeout=(3, 60))
-        if not upstream.ok:
-            return jsonify(ok=False, error=f"drone returned {upstream.status_code}"), 502
-    except Exception as e:
-        return jsonify(ok=False, error=str(e)), 502
-    def gen():
-        for chunk in upstream.iter_content(chunk_size=64 * 1024):
-            if chunk:
-                yield chunk
-    headers = {
-        "Content-Type": "video/mp4",
-        "Content-Disposition": f'attachment; filename="{name}"',
-    }
-    size = upstream.headers.get("Content-Length")
-    if size:
-        headers["Content-Length"] = size
-    return Response(gen(), headers=headers)
 
 
-@bp_logs.get("/proxy/flight_logs/<path:name>")
-def proxy_flight_logs_download(name):
-    p = flight_logger.file_path(name)
-    if p is None:
-        return jsonify(ok=False, error="file not found"), 404
-    # Inline when "as_attachment=false" so the viewer can fetch-and-parse
-    # rather than trigger a download.
-    as_att = request.args.get("dl", "1") != "0"
-    return send_file(str(p), mimetype="application/jsonlines",
-                     as_attachment=as_att, download_name=p.name)
 
 
-@bp_system.get("/flight_log_viewer")
-def serve_flight_log_viewer():
-    """Interactive replay UI for flight logs.
-
-    Opens ?file=<name> auto-loaded via /proxy/flight_logs/<name>?dl=0.
-    Visualises trajectory + events + timeline so an operator can scrub
-    through a flight and see exactly where something went wrong.
-    """
-    from pathlib import Path as _P
-    p = _P(__file__).with_name("flight_log_viewer.html")
-    if not p.exists():
-        return jsonify(ok=False, error="viewer html missing"), 404
-    return send_file(str(p), mimetype="text/html", max_age=0)
 
 
-@bp_safety.get("/proxy/config/ceiling")
-def proxy_ceiling_get():
-    """Aggregate the soft ceiling and engaged state from every drone in
-    the fleet. Returns the minimum ceiling across drones (most
-    conservative) and engaged=True if ANY drone is currently clamped."""
-    results = {}
-    any_engaged = False
-    min_ceiling = None
-    reasons = []
-    for did, info in DRONES.items():
-        base = (info or {}).get("base")
-        if not base:
-            results[str(did)] = {"ok": False, "error": "no base url"}
-            continue
-        try:
-            r = _http_session.get(f"{base.rstrip('/')}/api/config/ceiling", timeout=1.0)
-            j = r.json()
-            results[str(did)] = j
-            if j.get("engaged"):
-                any_engaged = True
-                if j.get("reason"):
-                    reasons.append(f"{did}: {j['reason']}")
-            if j.get("ceiling_m") is not None:
-                c = float(j["ceiling_m"])
-                if min_ceiling is None or c < min_ceiling:
-                    min_ceiling = c
-        except Exception as e:
-            results[str(did)] = {"ok": False, "error": str(e)[:120]}
-    return jsonify(
-        ok=True,
-        ceiling_m=min_ceiling,
-        engaged=any_engaged,
-        reasons=reasons,
-        per_drone=results,
-    )
 
 
-@bp_safety.get("/proxy/config/arena_safety")
-def proxy_arena_safety_get():
-    """Aggregate arena-safety state across the fleet — min margin wins,
-    any engaged → engaged, any disabled → disabled (most conservative)."""
-    results = {}
-    any_engaged = False
-    all_enabled = True
-    min_margin = None
-    reasons = []
-    for did, info in DRONES.items():
-        base = (info or {}).get("base")
-        if not base:
-            results[str(did)] = {"ok": False, "error": "no base url"}
-            continue
-        try:
-            r = _http_session.get(f"{base.rstrip('/')}/api/config/arena_safety",
-                                   timeout=1.0)
-            j = r.json() if r.ok else {"ok": False}
-            results[str(did)] = j
-            if j.get("engaged"):
-                any_engaged = True
-                if j.get("reason"):
-                    reasons.append(f"{did}: {j['reason']}")
-            if not j.get("enabled", True):
-                all_enabled = False
-            m = j.get("margin_m")
-            if isinstance(m, (int, float)):
-                if min_margin is None or m < min_margin:
-                    min_margin = float(m)
-        except Exception as e:
-            results[str(did)] = {"ok": False, "error": str(e)[:120]}
-    return jsonify(
-        ok=True,
-        enabled=all_enabled,
-        margin_m=min_margin,
-        engaged=any_engaged,
-        reasons=reasons,
-        per_drone=results,
-    )
 
 
-@bp_safety.post("/proxy/config/arena_safety")
-def proxy_arena_safety_set():
-    """Fan-out arena safety settings to every drone's Pi."""
-    data = request.get_json(silent=True) or {}
-    log_command("arena_safety_set", data)
-    results = {}
-    for did, info in DRONES.items():
-        base = (info or {}).get("base")
-        if not base:
-            continue
-        try:
-            r = _http_session.post(f"{base.rstrip('/')}/api/config/arena_safety",
-                                    json=data, timeout=2.0)
-            results[str(did)] = r.json() if r.ok else {"ok": False, "status": r.status_code}
-        except Exception as e:
-            results[str(did)] = {"ok": False, "error": str(e)[:120]}
-    ok_count = sum(1 for v in results.values() if v.get("ok"))
-    print(f"[ARENA] fleet-wide: {data} → {ok_count}/{len(results)} drones acknowledged")
-    return jsonify(ok=True, applied=ok_count, total=len(results), results=results)
 
 
-@bp_safety.post("/proxy/config/ceiling")
-def proxy_ceiling_set():
-    """Push a new soft ceiling to every drone in the fleet. Body:
-        {"ceiling_m": <float, metres>}
-    """
-    data = request.get_json(silent=True) or {}
-    try:
-        v = float(data.get("ceiling_m") or data.get("max_altitude_m"))
-    except (TypeError, ValueError):
-        return jsonify(ok=False, error="ceiling_m required"), 400
-    log_command("ceiling_set", {"ceiling_m": v})
-    results = {}
-    for did, info in DRONES.items():
-        base = (info or {}).get("base")
-        if not base:
-            results[str(did)] = {"ok": False, "error": "no base url"}
-            continue
-        try:
-            r = _http_session.post(f"{base.rstrip('/')}/api/config/ceiling",
-                                   json={"ceiling_m": v}, timeout=2.0)
-            results[str(did)] = r.json()
-        except Exception as e:
-            results[str(did)] = {"ok": False, "error": str(e)[:120]}
-    ok_count = sum(1 for v in results.values() if v.get("ok"))
-    print(f"[CEILING] fleet-wide set to {v}m: {ok_count}/{len(results)} drones acknowledged")
-    return jsonify(ok=True, ceiling_m=v, applied=ok_count, total=len(results), results=results)
 
 
-@bp_safety.post("/proxy/pause_all")
-def proxy_pause_all():
-    """Fleet-wide PAUSE. Overrides any command — every drone stays
-    airborne at its current position (Anafi auto-hovers with zero RC).
-
-    Side-effects, in order:
-      1. Raise the global pause flag (blocks mission start + ArUco LIVE).
-      2. Abort any running mission (do NOT land — the drones hover).
-      3. Yank every ArUco observer out of LIVE back to OBSERVE and clear
-         its search RC override, so it stops pushing commands.
-      4. Send a hard zero-RC (full brake) to each drone so any residual
-         translation command stops immediately.
-
-    The call is idempotent — pressing it again while already paused is
-    a no-op beyond re-issuing the zero-RC.
-    """
-    global _global_paused, _global_paused_at, _global_paused_src
-    data = request.get_json(silent=True) or {}
-    source = str(data.get("source") or "unknown")
-    log_command("pause_all", {"source": source})
-
-    # 1) Raise the flag first so guards start rejecting autonomous starts
-    #    even before we're done tearing down the existing activity.
-    with _pause_lock:
-        _global_paused = True
-        _global_paused_at = time.time()
-        _global_paused_src = source
-
-    # 2) Stop any running mission (don't land).
-    mission_stopped = False
-    try:
-        if mission_manager is not None and mission_manager.current is not None:
-            mission_stopped = mission_manager.stop(land=False)
-    except Exception as e:
-        print(f"[PAUSE_ALL] mission stop failed: {e}")
-
-    # 3) Observers → OBSERVE, clear search overrides.
-    try:
-        for did, obs in aruco_fleet._obs.items():
-            try:
-                obs.set_search_rc(0, 0, 0, 0)
-                obs.set_mode("observe")
-            except Exception:
-                pass
-    except Exception:
-        pass
-
-    # 4) Full brake — POST rc(0,0,0,0) to every drone in parallel-ish.
-    results: dict[str, dict] = {}
-    for did, info in DRONES.items():
-        base = (info or {}).get("base")
-        if not base:
-            results[str(did)] = {"ok": False, "error": "no base url"}
-            continue
-        try:
-            # Some APIs want the full RC tuple, others accept a rc_stop
-            # shortcut. The unified API exposes /api/rc; send zeros.
-            resp = _http_session.post(
-                f"{base.rstrip('/')}/api/rc",
-                json={"lr": 0, "fb": 0, "ud": 0, "yaw": 0},
-                timeout=2.0,
-            )
-            try:
-                j = resp.json()
-            except Exception:
-                j = {"raw": resp.text[:120]}
-            results[str(did)] = {
-                "ok": bool(j.get("ok", resp.status_code == 200)),
-                "status": resp.status_code,
-            }
-        except Exception as e:
-            results[str(did)] = {"ok": False, "error": str(e)[:120]}
-
-    ok_count = sum(1 for v in results.values() if v.get("ok"))
-    print(f"[PAUSE_ALL] fleet paused (source={source}) — "
-          f"{ok_count}/{len(results)} drones braked, "
-          f"mission_stopped={mission_stopped}")
-    return jsonify(
-        ok=True, paused=True,
-        source=source,
-        mission_stopped=mission_stopped,
-        braked=ok_count, total=len(results),
-        results=results,
-    )
 
 
-@bp_safety.post("/proxy/resume_all")
-def proxy_resume_all():
-    """Clear the global pause. Autonomous endpoints (missions, ArUco
-    LIVE) become reachable again, but nothing auto-restarts — the
-    operator must re-arm any mission themselves. That's intentional:
-    coming out of pause should never surprise the pilot with a drone
-    suddenly darting off."""
-    global _global_paused, _global_paused_at, _global_paused_src
-    data = request.get_json(silent=True) or {}
-    source = str(data.get("source") or "unknown")
-    log_command("resume_all", {"source": source})
-    with _pause_lock:
-        was_paused = _global_paused
-        _global_paused = False
-        _global_paused_at = time.time()
-        _global_paused_src = ""
-    print(f"[RESUME_ALL] fleet resumed (source={source}, was_paused={was_paused})")
-    return jsonify(ok=True, paused=False, source=source, was_paused=was_paused)
 
 
-@bp_safety.get("/proxy/pause_status")
-def proxy_pause_status():
-    """UI poll target — lets multiple open tabs sync their button state."""
-    with _pause_lock:
-        return jsonify(
-            paused=_global_paused,
-            since=_global_paused_at,
-            source=_global_paused_src,
-        )
 
 
-@bp_flight.post("/proxy/flip")
-def proxy_flip():
-    data = request.get_json(silent=True) or {}
-    log_command("flip", data)
-    r = pi_post("/api/flip", data)
-    return (r.text, r.status_code, {"Content-Type": r.headers.get("Content-Type", "application/json")})
 
 
-@bp_flight.post("/proxy/recover")
-def proxy_recover():
-    log_command("recover")
-    r = pi_post("/api/recover")
-    return (r.text, r.status_code, {"Content-Type": r.headers.get("Content-Type", "application/json")})
 
 
-@bp_flight.post("/proxy/emergency")
-def proxy_emergency():
-    log_command("emergency")
-    r = pi_post("/api/emergency")
-    return (r.text, r.status_code, {"Content-Type": r.headers.get("Content-Type", "application/json")})
 
 
-@bp_flight.post("/proxy/speed")
-def proxy_speed():
-    data = request.get_json(silent=True) or {}
-    log_command("speed", data)
-    r = pi_post("/api/speed", data)
-    return (r.text, r.status_code, {"Content-Type": r.headers.get("Content-Type", "application/json")})
 
 
-@bp_flight.post("/proxy/move")
-def proxy_move():
-    data = request.get_json(silent=True) or {}
-    log_command("move", data)
-    r = pi_post("/api/move", data)
-    return (r.text, r.status_code, {"Content-Type": r.headers.get("Content-Type", "application/json")})
 
 
-@bp_flight.post("/proxy/rotate")
-def proxy_rotate():
-    data = request.get_json(silent=True) or {}
-    log_command("rotate", data)
-    r = pi_post("/api/rotate", data)
-    return (r.text, r.status_code, {"Content-Type": r.headers.get("Content-Type", "application/json")})
 
 
-@bp_flight.post("/proxy/go")
-def proxy_go():
-    data = request.get_json(silent=True) or {}
-    log_command("go", data)
-    r = pi_post("/api/go", data)
-    return (r.text, r.status_code, {"Content-Type": r.headers.get("Content-Type", "application/json")})
 
 
-@bp_flight.post("/proxy/curve")
-def proxy_curve():
-    data = request.get_json(silent=True) or {}
-    log_command("curve", data)
-    r = pi_post("/api/curve", data)
-    return (r.text, r.status_code, {"Content-Type": r.headers.get("Content-Type", "application/json")})
 
 
-@bp_camera.post("/proxy/stream")
-def proxy_stream():
-    data = request.get_json(silent=True) or {}
-    log_command("stream", data)
-    r = pi_post("/api/stream", data)
-    return (r.text, r.status_code, {"Content-Type": r.headers.get("Content-Type", "application/json")})
 
 
-@bp_flight.post("/proxy/sdk")
-def proxy_sdk():
-    data = request.get_json(silent=True) or {}
-    log_command("sdk", data)
-    r = pi_post("/api/sdk", data)
-    return (r.text, r.status_code, {"Content-Type": r.headers.get("Content-Type", "application/json")})
 
 
 # -- Anafi / Olympe proxy routes --
 
-@bp_camera.post("/proxy/camera/photo")
-def proxy_camera_photo():
-    log_command("camera_photo")
-    r = pi_post("/api/camera/photo")
-    return (r.text, r.status_code, {"Content-Type": r.headers.get("Content-Type", "application/json")})
 
 
-@bp_camera.post("/proxy/camera/record/start")
-def proxy_camera_record_start():
-    log_command("camera_record_start")
-    r = pi_post("/api/camera/record/start")
-    return (r.text, r.status_code, {"Content-Type": r.headers.get("Content-Type", "application/json")})
 
 
-@bp_camera.post("/proxy/camera/record/stop")
-def proxy_camera_record_stop():
-    log_command("camera_record_stop")
-    r = pi_post("/api/camera/record/stop")
-    return (r.text, r.status_code, {"Content-Type": r.headers.get("Content-Type", "application/json")})
 
 
-@bp_camera.post("/proxy/gimbal")
-def proxy_gimbal():
-    data = request.get_json(silent=True) or {}
-    log_command("gimbal", data)
-    r = pi_post("/api/gimbal", data)
-    return (r.text, r.status_code, {"Content-Type": r.headers.get("Content-Type", "application/json")})
 
 
-@bp_flight.post("/proxy/rth")
-def proxy_rth():
-    data = request.get_json(silent=True) or {}
-    log_command("rth", data)
-    r = pi_post("/api/rth", data)
-    return (r.text, r.status_code, {"Content-Type": r.headers.get("Content-Type", "application/json")})
 
 
-@bp_flight.post("/proxy/moveto")
-def proxy_moveto():
-    data = request.get_json(silent=True) or {}
-    log_command("moveto", data)
-    r = pi_post("/api/moveto", data, timeout=65)
-    return (r.text, r.status_code, {"Content-Type": r.headers.get("Content-Type", "application/json")})
 
 
-@bp_settings.get("/proxy/settings")
-def proxy_settings_get():
-    try:
-        r = pi_get("/api/settings", timeout=TIMEOUT_STATUS)
-        return (r.text, r.status_code, {"Content-Type": r.headers.get("Content-Type", "application/json")})
-    except Exception as e:
-        return jsonify(ok=False, error=str(e)), 502
 
 
-@bp_settings.post("/proxy/settings")
-def proxy_settings_set():
-    data = request.get_json(silent=True) or {}
-    log_command("settings", data)
-    r = pi_post("/api/settings", data)
-    return (r.text, r.status_code, {"Content-Type": r.headers.get("Content-Type", "application/json")})
 
 
-@bp_safety.get("/proxy/safety/takeoff")
-def proxy_safe_takeoff_get():
-    try:
-        r = pi_get("/api/safety/takeoff", timeout=TIMEOUT_STATUS)
-        return (r.text, r.status_code, {"Content-Type": r.headers.get("Content-Type", "application/json")})
-    except Exception as e:
-        return jsonify(ok=False, error=str(e)), 502
 
 
-@bp_safety.post("/proxy/safety/takeoff")
-def proxy_safe_takeoff_set():
-    data = request.get_json(silent=True) or {}
-    log_command("safe_takeoff_set", data)
-    r = pi_post("/api/safety/takeoff", data)
-    return (r.text, r.status_code, {"Content-Type": r.headers.get("Content-Type", "application/json")})
 
 
-@bp_logs.get("/proxy/logging/commands")
-def proxy_command_log_status():
-    return jsonify(enabled=command_log_enabled, path=str(command_log_path))
 
 
-@bp_logs.post("/proxy/logging/commands")
-def proxy_command_log_config():
-    global command_log_enabled, command_log_path
-    data = request.get_json(silent=True) or {}
-    enabled = data.get("enabled")
-    path = data.get("path")
-    if enabled is not None and not isinstance(enabled, bool):
-        return jsonify(ok=False, error="enabled must be boolean"), 400
-    if path is not None and (not isinstance(path, str) or not path.strip()):
-        return jsonify(ok=False, error="path must be non-empty string"), 400
-    if isinstance(enabled, bool):
-        command_log_enabled = enabled
-    if isinstance(path, str) and path.strip():
-        command_log_path = Path(path.strip())
-    print(f"[REMOTE CMD] command logging {'enabled' if command_log_enabled else 'disabled'}")
-    return jsonify(ok=True, enabled=command_log_enabled, path=str(command_log_path))
 
 
-@bp_logs.get("/proxy/logging/commands/download")
-def proxy_command_log_download():
-    p = command_log_path
-    if not p.exists():
-        return jsonify(ok=False, error="command log file not found", path=str(p)), 404
-    return send_file(p, as_attachment=True, download_name=p.name, mimetype="application/x-ndjson")
 
 
-@bp_logs.post("/proxy/logging/commands/clear")
-def proxy_command_log_clear():
-    p = command_log_path
-    try:
-        p.parent.mkdir(parents=True, exist_ok=True)
-        p.write_text("", encoding="utf-8")
-        return jsonify(ok=True, cleared=True, path=str(p))
-    except Exception as e:
-        return jsonify(ok=False, error=str(e), path=str(p)), 500
 
 
-@bp_logs.get("/proxy/logging/telemetry")
-def proxy_log_status():
-    try:
-        r = pi_get("/api/logging/telemetry", timeout=TIMEOUT_STATUS)
-        return (r.text, r.status_code, {"Content-Type": r.headers.get("Content-Type", "application/json")})
-    except Exception as e:
-        return jsonify(ok=False, error=str(e)), 502
 
 
-@bp_logs.post("/proxy/logging/telemetry")
-def proxy_log_config():
-    data = request.get_json(silent=True) or {}
-    log_command("telemetry_log_set", data)
-    r = pi_post("/api/logging/telemetry", data)
-    return (r.text, r.status_code, {"Content-Type": r.headers.get("Content-Type", "application/json")})
 
 
-@bp_logs.get("/proxy/logging/telemetry/download")
-def proxy_log_download():
-    r = pi_get("/api/logging/telemetry/download")
-    headers = {
-        "Content-Type": r.headers.get("Content-Type", "application/octet-stream"),
-        "Content-Disposition": r.headers.get("Content-Disposition", "attachment; filename=telemetry_log.jsonl"),
-    }
-    return (r.content, r.status_code, headers)
 
 
-@bp_logs.post("/proxy/logging/telemetry/clear")
-def proxy_log_clear():
-    log_command("telemetry_log_clear")
-    r = pi_post("/api/logging/telemetry/clear")
-    return (r.text, r.status_code, {"Content-Type": r.headers.get("Content-Type", "application/json")})
 
 
-@bp_camera.get("/proxy/video")
-def proxy_video_feed():
-    """Proxy the MJPEG video stream from the Pi API server."""
-    try:
-        r = _http_session.get(f"{PI_BASE}/api/video", stream=True, timeout=30)
-        return Response(
-            r.iter_content(chunk_size=32768),
-            mimetype=r.headers.get("Content-Type", "multipart/x-mixed-replace; boundary=frame"),
-        )
-    except Exception as e:
-        return jsonify(ok=False, error=str(e)), 502
 
 
-@bp_camera.post("/proxy/video/start")
-def proxy_video_start():
-    data = request.get_json(silent=True) or {}
-    mode = data.get("mode", "mjpeg")
-    # For forward mode, auto-detect C2 IP (this machine) so the Pi sends UDP here
-    if mode == "forward" and not data.get("target_host"):
-        # Use the host part of request.host (what the browser connected to)
-        c2_host = request.host.split(":")[0]
-        if c2_host in ("127.0.0.1", "localhost"):
-            # Try to get our real IP
-            try:
-                s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-                s.connect(("8.8.8.8", 80))
-                c2_host = s.getsockname()[0]
-                s.close()
-            except Exception:
-                pass
-        data["target_host"] = c2_host
-        data["target_port"] = data.get("target_port", VIDEO_UDP_FORWARD_PORT)
-    log_command("video_start", data)
-    # For forward mode, start the UDP receiver BEFORE telling the Pi to forward
-    # so ffmpeg is already listening when packets arrive
-    if mode == "forward":
-        _start_udp_receiver()
-        time.sleep(0.5)  # Give ffmpeg time to bind the UDP port
-    r = pi_post("/api/video/start", data)
-    return (r.text, r.status_code, {"Content-Type": r.headers.get("Content-Type", "application/json")})
 
 
-@bp_camera.post("/proxy/video/stop")
-def proxy_video_stop():
-    log_command("video_stop")
-    _stop_udp_receiver()
-    r = pi_post("/api/video/stop")
-    return (r.text, r.status_code, {"Content-Type": r.headers.get("Content-Type", "application/json")})
 
 
-@bp_camera.get("/proxy/video/status")
-def proxy_video_status():
-    try:
-        r = pi_get("/api/video/status", timeout=TIMEOUT_STATUS)
-        return (r.text, r.status_code, {"Content-Type": "application/json"})
-    except Exception as e:
-        return jsonify(ok=False, error=str(e), mode="off"), 502
 
 
 # ---------------------------------------------------------------------------
@@ -1462,535 +683,41 @@ def _udp_receiver_loop():
     print(f"[C2-VIDEO] Receiver stopped ({frame_count} frames decoded)")
 
 
-@bp_camera.get("/proxy/video/forward_stream")
-def proxy_video_forward_stream():
-    """Serve decoded UDP forward frames as MJPEG stream."""
-    def gen():
-        while _udp_receiver_running:
-            with _udp_last_frame_lock:
-                jpg = _udp_last_jpeg
-            if jpg:
-                yield b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + jpg + b"\r\n"
-            time.sleep(1.0 / max(1, VIDEO_FPS))
-    return Response(gen(), mimetype="multipart/x-mixed-replace; boundary=frame")
 
 
-@bp_camera.post("/proxy/camera/zoom")
-def proxy_camera_zoom():
-    data = request.get_json(silent=True) or {}
-    try:
-        r = _http_session.post(f"{PI_BASE}/api/camera/zoom", json=data, timeout=1.5)
-        return (r.text, r.status_code,
-                {"Content-Type": r.headers.get("Content-Type", "application/json")})
-    except Exception as e:
-        return jsonify(ok=False, error=str(e)), 502
 
 
-@bp_telemetry.get("/proxy/heartbeat")
-def proxy_heartbeat():
-    """Send heartbeat to all REACHABLE drones in parallel.
-
-    Skips drones whose WS client reports every channel down — no point
-    spending 300 ms × N offline drones every 750 ms. That was the main
-    reason the heartbeat poll stalled the HTTP pool when most of the
-    fleet was offline.
-    """
-    def _ping(did_info):
-        did, info = did_info
-        try:
-            r = _http_session.get(f"{info['base']}/api/heartbeat", timeout=0.25)
-            return did, r.status_code
-        except Exception:
-            return did, "timeout"
-
-    # Filter out offline drones using the WS client's health flag.
-    live_items = []
-    skipped = {}
-    for did, info in DRONES.items():
-        did_s = str(did)
-        cli = drone_ws.get(did_s) if 'drone_ws' in globals() else None
-        if cli is not None:
-            all_down = (not cli._ws_connected.get("telemetry") and
-                        not cli._ws_connected.get("position") and
-                        not cli._ws_connected.get("rc"))
-            if all_down:
-                skipped[did_s] = "offline"
-                continue
-        live_items.append((did, info))
-
-    results = dict(_heartbeat_pool.map(_ping, live_items)) if live_items else {}
-    results.update(skipped)
-    return jsonify(ok=True, drones=results)
 
 
 # ─── Latency ping (C2 → flight controller + flight controller → drone) ──────
-@bp_flight.get("/proxy/latency")
-def proxy_latency():
-    """Returns the three-leg latency picture for the ACTIVE drone:
-      c2_to_fc_ms     — fresh HTTP round-trip to /api/heartbeat on the Pi
-      fc_to_drone_ms  — cached flight-controller-to-drone ICMP ping from /api/drone_ping
-      sample_age_s    — age of the fc_to_drone sample
-    The client adds these together (plus a user-tuned video-processing
-    offset) to get the total command-loop latency."""
-    t0 = time.time()
-    c2_rtt = None
-    fc = None
-    try:
-        r = _http_session.get(f"{PI_BASE}/api/heartbeat", timeout=1.0)
-        c2_rtt = (time.time() - t0) * 1000.0
-        fc_ok = (r.status_code == 200)
-    except Exception:
-        fc_ok = False
-    try:
-        r2 = _http_session.get(f"{PI_BASE}/api/drone_ping", timeout=1.0)
-        if r2.ok:
-            fc = r2.json()
-    except Exception:
-        pass
-    resp = {
-        "ok": True,
-        "c2_to_fc_ms": round(c2_rtt, 2) if c2_rtt is not None else None,
-        "fc_reachable": fc_ok,
-        "fc_to_drone_ms": (fc.get("rtt_ms") if fc else None),
-        "fc_to_drone_host": (fc.get("host") if fc else None),
-        "fc_to_drone_sample_age_s": (fc.get("sample_age_s") if fc else None),
-        "pi_base": PI_BASE,
-    }
-    return jsonify(resp)
 
 
-@bp_telemetry.get("/proxy/telemetry")
-def proxy_telemetry():
-    mode = _transport_mode("telemetry")
-    if mode in ("auto", "ws"):
-        ws = drone_ws.get(str(active_drone_id))
-        if ws:
-            tel, age = ws.latest_telemetry()
-            if tel is not None and age < 1.5:
-                tel = dict(tel)
-                tel["_source"] = "ws"
-                tel["_age_ms"] = int(age * 1000)
-                headers = {
-                    "Content-Type": "application/json",
-                    "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
-                    "Pragma": "no-cache",
-                    "Expires": "0",
-                }
-                return (json.dumps(tel, default=str), 200, headers)
-        if mode == "ws":
-            return jsonify(ok=False, error="ws forced but not connected", via="ws"), 503
-    try:
-        r = pi_get("/api/telemetry", timeout=TIMEOUT_STATUS)
-        headers = {
-            "Content-Type": r.headers.get("Content-Type", "application/json"),
-            "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
-            "Pragma": "no-cache",
-            "Expires": "0",
-        }
-        return (r.text, r.status_code, headers)
-    except Exception as e:
-        return jsonify(ok=False, error=str(e)), 502
 
 
-@bp_system.get("/proxy/fc_version")
-def proxy_fc_version():
-    """Fetch the active drone's FC /api/version (short 1 s timeout) and
-    compare its code_version string to the C2's. Lets the UI flash a
-    banner when the operator deployed a fix to C2 but the FC is still
-    running old code — which was silently happening for days."""
-    did = str(request.args.get("drone_id") or active_drone_id)
-    info = DRONES.get(did) or {}
-    base = (info.get("base") or "").rstrip("/")
-    fc_code = None
-    fc_sha = None
-    fc_err = None
-    if base:
-        try:
-            r = _http_session.get(f"{base}/api/version", timeout=1.0)
-            if r.ok:
-                j = r.json() or {}
-                fc_code = j.get("code_version")
-                fc_sha = (j.get("git_revision") or {}).get("short_sha")
-            else:
-                fc_err = f"HTTP {r.status_code}"
-        except Exception as e:
-            fc_err = str(e)
-    # Match = version strings are equal ignoring the trailing parenthetical
-    # description (so a small comment change doesn't flag every restart).
-    def _strip_tag(v):
-        if not v: return ""
-        return str(v).split(" ", 1)[0].strip()
-    match = (fc_code is not None
-             and _strip_tag(fc_code) == _strip_tag(C2_CODE_VERSION))
-    return jsonify(
-        ok=True,
-        drone_id=did,
-        c2_code_version=C2_CODE_VERSION,
-        c2_git_sha=_GIT_REVISION.get("short_sha"),
-        fc_code_version=fc_code,
-        fc_git_sha=fc_sha,
-        fc_error=fc_err,
-        match=match,
-    )
 
 
-@bp_flight.get("/proxy/ui_state")
-def proxy_ui_state():
-    """Single consolidated poll — replaces the many 0.5-5Hz polls the UI
-    used to fire for tiny pieces of state (heartbeat, pause, ws_status,
-    ceiling, transport, mission status). All of them are cheap reads
-    of local C2 state; making them one request means the browser keeps
-    its 6 HTTP/1.1 connections free for real traffic (takeoff, key
-    events) instead of queueing behind 8 small polls.
-
-    Heartbeat to the Pi is STILL sent here so the Pi watchdog stays
-    happy — we reuse the existing parallel-ping logic.
-    """
-    out: dict = {}
-
-    # --- Pause state ---
-    with _pause_lock:
-        out["pause"] = {
-            "paused":  _global_paused,
-            "since":   _global_paused_at,
-            "source":  _global_paused_src,
-        }
-
-    # --- Ceiling + arena-safety (aggregated from per-drone endpoints) ---
-    # Combined fan-out: for every live drone we fetch BOTH endpoints in
-    # sequence. That's 2 HTTP calls per drone per uiStatePoll tick (1Hz)
-    # instead of two separate per-2s polls issued by the browser — less
-    # load on the C2's HTTP pool and on the browser's 6-connection limit.
-    try:
-        ceilings = []
-        any_c_engaged = False
-        c_reasons = []
-        margins = []
-        all_arena_enabled = True
-        any_a_engaged = False
-        a_reasons = []
-        for did, info in DRONES.items():
-            base = (info or {}).get("base")
-            if not base: continue
-            cli = drone_ws.get(str(did)) if 'drone_ws' in globals() else None
-            if cli is not None:
-                all_down = (not cli._ws_connected.get("telemetry") and
-                            not cli._ws_connected.get("position") and
-                            not cli._ws_connected.get("rc"))
-                if all_down:
-                    continue
-            # Ceiling
-            try:
-                r = _http_session.get(f"{base.rstrip('/')}/api/config/ceiling",
-                                       timeout=0.25)
-                if r.status_code == 200:
-                    j = r.json()
-                    if j.get("ceiling_m") is not None:
-                        ceilings.append(float(j["ceiling_m"]))
-                    if j.get("engaged"):
-                        any_c_engaged = True
-                        if j.get("reason"):
-                            c_reasons.append(f"{did}: {j['reason']}")
-            except Exception:
-                pass
-            # Arena safety
-            try:
-                r = _http_session.get(f"{base.rstrip('/')}/api/config/arena_safety",
-                                       timeout=0.25)
-                if r.status_code == 200:
-                    j = r.json()
-                    if j.get("margin_m") is not None:
-                        margins.append(float(j["margin_m"]))
-                    if not j.get("enabled", True):
-                        all_arena_enabled = False
-                    if j.get("engaged"):
-                        any_a_engaged = True
-                        if j.get("reason"):
-                            a_reasons.append(f"{did}: {j['reason']}")
-            except Exception:
-                pass
-        out["ceiling"] = {
-            "ceiling_m": min(ceilings) if ceilings else None,
-            "engaged":   any_c_engaged,
-            "reasons":   c_reasons,
-        }
-        out["arena_safety"] = {
-            "enabled":  all_arena_enabled,
-            "margin_m": min(margins) if margins else None,
-            "engaged":  any_a_engaged,
-            "reasons":  a_reasons,
-        }
-    except Exception:
-        out["ceiling"] = {"ceiling_m": None, "engaged": False, "reasons": []}
-        out["arena_safety"] = {"enabled": True, "margin_m": None,
-                                "engaged": False, "reasons": []}
-
-    # --- WS status (per drone) ---
-    try:
-        out["ws"] = {
-            "available": HAS_WSCLIENT,
-            "drones": {did: cli.status() for did, cli in drone_ws.items()},
-        }
-    except Exception:
-        out["ws"] = {"available": HAS_WSCLIENT, "drones": {}}
-
-    # --- Transport selector state ---
-    try:
-        with _transport_lock:
-            out["transport"] = dict(_transport)
-    except Exception:
-        out["transport"] = {}
-
-    # --- Missions ---
-    try:
-        out["missions"] = mission_manager.status()
-    except Exception:
-        out["missions"] = {}
-
-    # Heartbeat removed — now handled by the C2's _heartbeat_loop()
-    # background thread directly. No reason for the browser to be
-    # involved in keeping the Pi watchdog alive.
-
-    return jsonify(ok=True, **out)
 
 
-@bp_system.get("/proxy/diagnostics")
-def proxy_diagnostics():
-    """C2-side + Pi-side diagnostic snapshot.
-
-    Everything that SHOULD NOT grow monotonically across flights is
-    here. If a counter keeps climbing flight-after-flight, that's the
-    leak. To use:
-      1. Open this URL in a browser tab before flight 1.
-      2. Note the thread_count + flight_logger.active_files + http_pool counts.
-      3. Fly, land, fly, land.
-      4. Refresh. Any number growing is a direct clue.
-    """
-    import threading as _th, gc as _gc
-    with _slow_calls_lock:
-        slow = list(_slow_calls)
-
-    # --- C2 threads ---
-    threads = _th.enumerate()
-    by_name: dict[str, int] = {}
-    for t in threads:
-        n = t.name
-        for prefix in ("ThreadPoolExecutor-", "Thread-", "obs-", "ws-"):
-            if n.startswith(prefix):
-                n = prefix + "*"
-                break
-        by_name[n] = by_name.get(n, 0) + 1
-
-    # --- HTTP session connection pool ---
-    http_pool_stats = {}
-    try:
-        adapter = _http_session.get_adapter("http://x")
-        if hasattr(adapter, "poolmanager"):
-            pm = adapter.poolmanager
-            http_pool_stats = {
-                "pool_connections_limit": getattr(adapter, "_pool_connections", None),
-                "pool_maxsize_limit":     getattr(adapter, "_pool_maxsize",     None),
-                "pools_cached":           len(pm.pools) if hasattr(pm, "pools") else None,
-            }
-    except Exception as e:
-        http_pool_stats = {"error": str(e)[:120]}
-
-    # --- FlightLogger ---
-    try:
-        with flight_logger._lock:
-            fl_state = {
-                "active_files": len(flight_logger._flights),
-                "drone_ids":    list(flight_logger._flights.keys()),
-                "running":      flight_logger._running,
-                "log_dir":      str(flight_logger.log_dir),
-            }
-    except Exception as e:
-        fl_state = {"error": str(e)[:120]}
-
-    # --- DroneWS clients ---
-    ws_clients = {}
-    for did, cli in drone_ws.items():
-        try:
-            s = cli.status()
-            ws_clients[did] = {
-                "rc": s.get("rc"),
-                "telemetry": s.get("telemetry"),
-                "position":  s.get("position"),
-                "rc_rtt_ms": s.get("rc_rtt_ms"),
-                "rc_send_ms": s.get("rc_send_ms"),
-                "consec_failures": dict(cli._consec_failures),
-            }
-        except Exception as e:
-            ws_clients[did] = {"error": str(e)[:80]}
-
-    # --- Per-drone Pi diagnostics ---
-    per_drone = {}
-    for did, info in DRONES.items():
-        base = (info or {}).get("base")
-        if not base:
-            continue
-        # Skip fan-out for drones whose WS is all-down — same pattern
-        # as fleet poll. Keeps this endpoint responsive under partial
-        # outage.
-        cli = drone_ws.get(str(did))
-        if cli is not None:
-            all_down = (not cli._ws_connected.get("telemetry") and
-                        not cli._ws_connected.get("position") and
-                        not cli._ws_connected.get("rc"))
-            if all_down:
-                per_drone[str(did)] = {"error": "offline (ws all down)"}
-                continue
-        try:
-            r = _http_session.get(f"{base.rstrip('/')}/api/diagnostics", timeout=0.5)
-            per_drone[str(did)] = r.json() if r.ok else {"error": f"http {r.status_code}"}
-        except Exception as e:
-            per_drone[str(did)] = {"error": str(e)[:120]}
-
-    return jsonify(
-        ok=True,
-        # C2-side counters — these are what usually leak
-        c2={
-            "thread_count":    len(threads),
-            "threads_by_name": by_name,
-            "gc_counts":       list(_gc.get_count()),
-            "http_pool":       http_pool_stats,
-            "flight_logger":   fl_state,
-            "ws_clients":      ws_clients,
-            "slow_calls":      slow,
-        },
-        per_drone=per_drone,
-        active_drone=active_drone_id,
-    )
 
 
-@bp_flight.get("/proxy/ws/status")
-def proxy_ws_status():
-    """Per-drone WS connection snapshot for the UI badge."""
-    out = {did: cli.status() for did, cli in drone_ws.items()}
-    return jsonify(
-        ok=True,
-        available=HAS_WSCLIENT,
-        drones=out,
-    )
 
 
-@bp_settings.get("/proxy/config/transport")
-def proxy_transport_get():
-    """Return the current per-subsystem transport preference."""
-    with _transport_lock:
-        snap = dict(_transport)
-    return jsonify(ok=True, transport=snap, ws_available=HAS_WSCLIENT)
 
 
-@bp_settings.post("/proxy/config/transport")
-def proxy_transport_set():
-    """Update the transport preference for one or more subsystems.
-    Body: {"rc":"http", "telemetry":"auto", "position":"ws"}
-
-    Valid values: "auto" (WS if up, HTTP fallback), "ws" (force WS),
-    "http" (force HTTP). Unknown subsystems / values are ignored.
-    """
-    global WS_RC_ENABLED
-    data = request.get_json(silent=True) or {}
-    allowed = {"auto", "ws", "http"}
-    changed = {}
-    with _transport_lock:
-        for subsys in ("rc", "telemetry", "position"):
-            v = data.get(subsys)
-            if v is None:
-                continue
-            v = str(v).lower()
-            if v in allowed:
-                _transport[subsys] = v
-                changed[subsys] = v
-        snap = dict(_transport)
-    WS_RC_ENABLED = snap["rc"] in ("auto", "ws")
-    log_command("transport_set", {"changed": changed, "active": snap})
-    print(f"[TRANSPORT] updated: {changed} → now {snap}")
-    return jsonify(ok=True, transport=snap, changed=changed)
 
 
 # ── Positioning subsystem proxy ───────────────────────────────────────────────
 
-@bp_telemetry.get("/proxy/position")
-def proxy_position_get():
-    try:
-        r = pi_get("/api/position", timeout=TIMEOUT_STATUS)
-        return (r.text, r.status_code, {"Content-Type": r.headers.get("Content-Type", "application/json")})
-    except Exception as e:
-        return jsonify(ok=False, error=str(e)), 502
 
 
-@bp_telemetry.get("/proxy/position/events")
-def proxy_position_events():
-    """SSE proxy — streams ArUco position events from Pi to browser."""
-    pi_url = PI_BASE + "/api/position/events"
-
-    def generate():
-        try:
-            with _http_session.get(pi_url, stream=True, timeout=(3, 300)) as resp:
-                for chunk in resp.iter_content(chunk_size=None):
-                    if chunk:
-                        yield chunk
-        except Exception as e:
-            import json as _json
-            yield f"data: {_json.dumps({'error': str(e)})}\n\n".encode()
-
-    return Response(generate(), mimetype="text/event-stream",
-                    headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
 
-@bp_telemetry.get("/proxy/telemetry/stream")
-def proxy_telemetry_stream():
-    """SSE proxy — streams telemetry events from Pi to browser (replaces polling)."""
-    pi_url = PI_BASE + "/api/telemetry/stream"
-
-    def generate():
-        try:
-            with _http_session.get(pi_url, stream=True, timeout=(3, 300)) as resp:
-                for chunk in resp.iter_content(chunk_size=None):
-                    if chunk:
-                        yield chunk
-        except Exception as e:
-            import json as _json
-            yield f"data: {_json.dumps({'error': str(e)})}\n\n".encode()
-
-    return Response(generate(), mimetype="text/event-stream",
-                    headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
 
-@bp_telemetry.get("/proxy/position/video")
-def proxy_position_video():
-    """MJPEG proxy — streams ArUco-annotated frames from Pi."""
-    pi_url = PI_BASE + "/api/position/video"
-
-    def generate():
-        try:
-            with _http_session.get(pi_url, stream=True, timeout=(3, 300)) as resp:
-                for chunk in resp.iter_content(chunk_size=16384):
-                    if chunk:
-                        yield chunk
-        except Exception:
-            pass
-
-    return Response(generate(), mimetype="multipart/x-mixed-replace; boundary=frame",
-                    headers={"Cache-Control": "no-store"})
 
 
-@bp_arena.get("/proxy/position/config")
-def proxy_position_config_get():
-    try:
-        r = pi_get("/api/position/config", timeout=TIMEOUT_STATUS)
-        return (r.text, r.status_code, {"Content-Type": r.headers.get("Content-Type", "application/json")})
-    except Exception as e:
-        return jsonify(ok=False, error=str(e)), 502
 
 
-@bp_arena.post("/proxy/position/config")
-def proxy_position_config_set():
-    data = request.get_json(silent=True) or {}
-    r = pi_post("/api/position/config", data)
-    return (r.text, r.status_code, {"Content-Type": r.headers.get("Content-Type", "application/json")})
 
 
 # ── Calibration flight proxies ────────────────────────────────────────
@@ -2011,64 +738,12 @@ def _calib_target_base(drone_id: str | None):
     return did, (info or {}).get("base")
 
 
-@bp_arena.post("/proxy/calibration/start")
-def proxy_calibration_start():
-    did, base = _calib_target_base(request.args.get("drone_id"))
-    if not base:
-        return jsonify(ok=False, error=f"drone {did} not configured"), 404
-    try:
-        r = _http_session.post(f"{base.rstrip('/')}/api/calibration/start",
-                               json={}, timeout=TIMEOUT_CMD)
-        return (r.text, r.status_code,
-                {"Content-Type": r.headers.get("Content-Type", "application/json")})
-    except Exception as e:
-        return jsonify(ok=False, error=str(e)), 502
 
 
-@bp_arena.get("/proxy/calibration/status")
-def proxy_calibration_status():
-    did, base = _calib_target_base(request.args.get("drone_id"))
-    if not base:
-        return jsonify(ok=False, error=f"drone {did} not configured"), 404
-    try:
-        r = _http_session.get(f"{base.rstrip('/')}/api/calibration/status",
-                              timeout=TIMEOUT_FAST)
-        return (r.text, r.status_code,
-                {"Content-Type": r.headers.get("Content-Type", "application/json")})
-    except Exception as e:
-        return jsonify(ok=False, error=str(e)), 502
 
 
-@bp_arena.post("/proxy/calibration/abort")
-def proxy_calibration_abort():
-    did, base = _calib_target_base(request.args.get("drone_id"))
-    if not base:
-        return jsonify(ok=False, error=f"drone {did} not configured"), 404
-    try:
-        r = _http_session.post(f"{base.rstrip('/')}/api/calibration/abort",
-                               json={}, timeout=TIMEOUT_CMD)
-        return (r.text, r.status_code,
-                {"Content-Type": r.headers.get("Content-Type", "application/json")})
-    except Exception as e:
-        return jsonify(ok=False, error=str(e)), 502
 
 
-@bp_arena.post("/proxy/position/calibration")
-def proxy_position_calibration():
-    """Proxy NPZ calibration file upload to Pi."""
-    if "file" not in request.files:
-        return jsonify(ok=False, error="no file"), 400
-    f = request.files["file"]
-    try:
-        resp = _http_session.post(
-            PI_BASE + "/api/position/calibration",
-            files={"file": (f.filename, f.read(), "application/octet-stream")},
-            timeout=15,
-        )
-        return Response(resp.content, status=resp.status_code,
-                        content_type=resp.headers.get("Content-Type", "application/json"))
-    except Exception as e:
-        return jsonify(ok=False, error=str(e)), 500
 
 
 # ── Arena configuration proxy ─────────────────────────────────────────────────
@@ -2155,63 +830,16 @@ def _js_arena_to_pi(data: dict) -> dict:
     return out
 
 
-@bp_arena.get("/proxy/arena/config")
-def proxy_arena_config_get():
-    try:
-        r = pi_get("/api/arena/config", timeout=TIMEOUT_STATUS)
-        d = r.json()
-        return jsonify(**_pi_arena_to_js(d))
-    except Exception as e:
-        return jsonify(ok=False, error=str(e)), 502
 
 
-@bp_arena.post("/proxy/arena/config")
-def proxy_arena_config_set():
-    data = request.get_json(silent=True) or {}
-    try:
-        pi_payload = _js_arena_to_pi(data)
-        r = pi_post("/api/arena/config", pi_payload)
-        d = r.json()
-        return jsonify(**_pi_arena_to_js(d))
-    except Exception as e:
-        return jsonify(ok=False, error=str(e)), 502
 
 
-@bp_arena.post("/proxy/arena/config/reset")
-def proxy_arena_config_reset():
-    try:
-        r = pi_post("/api/arena/config/reset", {})
-        return (r.text, r.status_code, {"Content-Type": r.headers.get("Content-Type", "application/json")})
-    except Exception as e:
-        return jsonify(ok=False, error=str(e)), 502
 
 
-@bp_camera.get("/proxy/video/record/status")
-def proxy_rec_status():
-    try:
-        r = pi_get("/api/video/record/status", timeout=TIMEOUT_STATUS)
-        return (r.text, r.status_code, {"Content-Type": r.headers.get("Content-Type", "application/json")})
-    except Exception as e:
-        return jsonify(ok=False, error=str(e)), 502
 
 
-@bp_camera.post("/proxy/video/record/start")
-def proxy_rec_start():
-    try:
-        data = request.get_json(silent=True) or {}
-        r = pi_post("/api/video/record/start", data)
-        return (r.text, r.status_code, {"Content-Type": r.headers.get("Content-Type", "application/json")})
-    except Exception as e:
-        return jsonify(ok=False, error=str(e)), 502
 
 
-@bp_camera.post("/proxy/video/record/stop")
-def proxy_rec_stop():
-    try:
-        r = pi_post("/api/video/record/stop", {})
-        return (r.text, r.status_code, {"Content-Type": r.headers.get("Content-Type", "application/json")})
-    except Exception as e:
-        return jsonify(ok=False, error=str(e)), 502
 
 
 # ─── ArUco Seek (multi-drone hover-in-front-of-marker) ─────────────────────
@@ -2226,171 +854,10 @@ def _aruco_resolve(drone_id: str | None):
     return obs, did
 
 
-@bp_aruco.get("/proxy/aruco/state")
-def proxy_aruco_state():
-    """Snapshot of ONE observer (query ?id=1, defaults to active drone)."""
-    did = request.args.get("id") or active_drone_id
-    obs, did = _aruco_resolve(did)
-    if obs is None:
-        return jsonify(running=False, drone_id=did, error="unknown drone"), 404
-    return jsonify(obs.get_state())
 
 
-@bp_aruco.get("/proxy/aruco/fleet")
-def proxy_aruco_fleet():
-    """Snapshot of every observer in the fleet.
-
-    Merged data flow:
-      1. Start from the observer's own state dict (pos + telemetry) if
-         the observer thread is actually running on this drone.
-      2. For every drone in DRONES, fan out a lightweight GET to
-         <base>/api/position in parallel (300 ms timeout). That endpoint
-         returns the live fused pose even when no observer is started,
-         which is exactly what manual-flight mode needs — otherwise the
-         3D arena view stays empty until someone arms ArUco Seek.
-
-    Merge policy: the observer's pos wins if present (it's been cached
-    with IMU dead-reckoning); the /api/position fallback fills any gap.
-    """
-    observers = dict(aruco_fleet.all_states())
-    # Ensure every configured drone has at least an entry to populate
-    for did in DRONES.keys():
-        did = str(did)
-        if did not in observers:
-            observers[did] = {"drone_id": did, "running": False}
-
-    # Two data paths, in order of preference:
-    #   1. WS cache (zero HTTP on the fleet-poll tick — <1 ms)
-    #   2. Parallel fan-out to each Pi's /api/position
-    #
-    # We SKIP the HTTP fan-out for any drone whose WS is known-disconnected.
-    # If the WS can't reach the Pi, HTTP won't either — trying anyway wastes
-    # ~200 ms per drone per poll on connection-refused / timeout, which was
-    # the real cause of the "500 timeout" and button-press delays (the fleet
-    # poll was holding up Flask threads that other endpoints needed).
-    need_http: list[tuple[str, str]] = []
-    pos_mode = _transport_mode("position")
-    for did, info in DRONES.items():
-        did = str(did)
-        base = (info or {}).get("base")
-        if not base:
-            continue
-        # WS cache first (unless position transport is forced to http)
-        cli = drone_ws.get(did) if pos_mode in ("auto", "ws") else None
-        if cli is not None:
-            pj, age = cli.latest_position()
-            if pj is not None and age < 1.5:
-                entry = observers.setdefault(did, {"drone_id": did})
-                if entry.get("pos") is None and pj.get("pos") is not None:
-                    entry["pos"] = pj["pos"]
-                if entry.get("dir") is None and pj.get("dir") is not None:
-                    entry["dir"] = pj["dir"]
-                if entry.get("pos_vel") is None and pj.get("vel") is not None:
-                    entry["pos_vel"] = pj["vel"]
-                if entry.get("pos_stale") is None and pj.get("stale") is not None:
-                    entry["pos_stale"] = pj["stale"]
-                if entry.get("ref_markers") is None and pj.get("ref_markers") is not None:
-                    entry["ref_markers"] = pj["ref_markers"]
-                # Currently-visible markers — MUST be propagated so the 2D
-                # halo + 3D highlight light up on manual flight too. When
-                # the DroneObserver isn't started, the per-drone position
-                # service is the only source for this, and we were dropping
-                # it in both the WS-cache and HTTP-fallback paths.
-                if entry.get("seen_markers") is None and pj.get("seen_markers") is not None:
-                    entry["seen_markers"] = pj["seen_markers"]
-                if entry.get("altitude_m") is None and pj.get("pos"):
-                    try:
-                        entry["altitude_m"] = float(pj["pos"][2])
-                    except (IndexError, TypeError, ValueError):
-                        pass
-                entry["_pos_source"] = "ws"
-                continue
-            # WS exists but stale — skip HTTP if ALL three sockets are down
-            # (i.e. the Pi is unreachable). Keep trying HTTP if only position
-            # is down but telemetry/rc still connected (different failure mode).
-            all_down = (not cli._ws_connected.get("telemetry") and
-                        not cli._ws_connected.get("position") and
-                        not cli._ws_connected.get("rc"))
-            if all_down:
-                observers.setdefault(did, {"drone_id": did, "ws_all_down": True})
-                continue
-        # Position forced to ws-only: don't attempt HTTP.
-        if pos_mode == "ws":
-            observers.setdefault(did, {"drone_id": did, "ws_only": True})
-            continue
-        need_http.append((did, base))
-
-    def _fetch(did: str, base: str):
-        try:
-            resp = _http_session.get(f"{base.rstrip('/')}/api/position", timeout=0.3)
-            if resp.status_code == 200:
-                return did, resp.json()
-        except Exception:
-            pass
-        return did, None
-
-    if need_http:
-        import concurrent.futures as _cf
-        jobs = {}
-        pool = _cf.ThreadPoolExecutor(max_workers=max(1, len(need_http)))
-        try:
-            for did, base in need_http:
-                jobs[pool.submit(_fetch, did, base)] = did
-            # Loop with a per-future timeout rather than as_completed's
-            # global timeout — that one raises TimeoutError instead of
-            # returning partial results, which used to bubble up as a
-            # 500 whenever any Pi was slow/unreachable.
-            deadline = time.time() + 0.6
-            for fut in list(jobs):
-                remaining = max(0.0, deadline - time.time())
-                try:
-                    did, pj = fut.result(timeout=remaining)
-                except Exception:
-                    continue
-                if not pj:
-                    continue
-                entry = observers.setdefault(did, {"drone_id": did})
-                if entry.get("pos") is None and pj.get("pos") is not None:
-                    entry["pos"] = pj["pos"]
-                if entry.get("dir") is None and pj.get("dir") is not None:
-                    entry["dir"] = pj["dir"]
-                if entry.get("pos_vel") is None and pj.get("vel") is not None:
-                    entry["pos_vel"] = pj["vel"]
-                if entry.get("pos_stale") is None and pj.get("stale") is not None:
-                    entry["pos_stale"] = pj["stale"]
-                if entry.get("ref_markers") is None and pj.get("ref_markers") is not None:
-                    entry["ref_markers"] = pj["ref_markers"]
-                # Currently-visible markers — MUST be propagated so the 2D
-                # halo + 3D highlight light up on manual flight too. When
-                # the DroneObserver isn't started, the per-drone position
-                # service is the only source for this, and we were dropping
-                # it in both the WS-cache and HTTP-fallback paths.
-                if entry.get("seen_markers") is None and pj.get("seen_markers") is not None:
-                    entry["seen_markers"] = pj["seen_markers"]
-                if entry.get("altitude_m") is None and pj.get("pos"):
-                    try:
-                        entry["altitude_m"] = float(pj["pos"][2])
-                    except (IndexError, TypeError, ValueError):
-                        pass
-                entry["_pos_source"] = "http"
-        finally:
-            # Don't wait for slow workers — let them finish in the
-            # background. If we joined here the endpoint could block 4+
-            # seconds when a drone is unreachable.
-            pool.shutdown(wait=False)
-
-    return jsonify(active=active_drone_id,
-                   allow_live=aruco_fleet.allow_live,
-                   observers=observers)
 
 
-@bp_aruco.get("/proxy/aruco/params")
-def proxy_aruco_params_get():
-    did = request.args.get("id") or active_drone_id
-    obs, did = _aruco_resolve(did)
-    if obs is None:
-        return jsonify(asdict_hover_defaults()), 200
-    return jsonify(obs.get_params())
 
 
 def asdict_hover_defaults():
@@ -2398,26 +865,6 @@ def asdict_hover_defaults():
     return asdict(AsHoverParams())
 
 
-@bp_aruco.post("/proxy/aruco/params")
-def proxy_aruco_params_set():
-    data = request.get_json(silent=True) or {}
-    # If no id, broadcast to EVERY observer (fleet-wide knobs like
-    # axis_locked should apply to the whole swarm, not just one drone).
-    did = data.pop("id", None) or request.args.get("id")
-    if did:
-        obs, did = _aruco_resolve(str(did))
-        if obs is None:
-            return jsonify(ok=False, error="unknown drone"), 404
-        applied = obs.update_params(data)
-        return jsonify(ok=True, applied=applied, drone_id=did)
-    # Fleet-wide fan-out
-    applied_all = {}
-    for d_id, o in aruco_fleet._obs.items():
-        try:
-            applied_all[d_id] = o.update_params(data)
-        except Exception as e:
-            applied_all[d_id] = {"error": str(e)[:80]}
-    return jsonify(ok=True, applied=applied_all, fleet=True)
 
 
 # ── Camera-faces-arena-centre toggle ──────────────────────────────────
@@ -2451,143 +898,20 @@ def _apply_camera_face_to_fleet():
 _apply_camera_face_to_fleet()
 
 
-@bp_settings.get("/proxy/config/camera_face_center")
-def proxy_camera_face_center_get():
-    with _camera_face_center_lock:
-        return jsonify(
-            ok=True,
-            enabled=_camera_face_center_enabled,
-            xy=list(_camera_face_center_xy),
-        )
 
 
-@bp_settings.post("/proxy/config/camera_face_center")
-def proxy_camera_face_center_set():
-    """Enable/disable the toggle, optionally override the centre XY.
-    Body: {"enabled": true, "xy": [0, 5.4]}"""
-    global _camera_face_center_enabled, _camera_face_center_xy
-    data = request.get_json(silent=True) or {}
-    changed = {}
-    with _camera_face_center_lock:
-        if "enabled" in data:
-            _camera_face_center_enabled = bool(data["enabled"])
-            changed["enabled"] = _camera_face_center_enabled
-        if "xy" in data and isinstance(data["xy"], (list, tuple)) and len(data["xy"]) >= 2:
-            try:
-                _camera_face_center_xy = (float(data["xy"][0]), float(data["xy"][1]))
-                changed["xy"] = list(_camera_face_center_xy)
-            except (TypeError, ValueError):
-                pass
-    _apply_camera_face_to_fleet()
-    log_command("camera_face_center_set", changed)
-    print(f"[CAMERA_FACE] enabled={_camera_face_center_enabled} xy={_camera_face_center_xy}")
-    return jsonify(ok=True, changed=changed,
-                   enabled=_camera_face_center_enabled,
-                   xy=list(_camera_face_center_xy))
 
 
-@bp_aruco.get("/proxy/aruco/safety_margin")
-def proxy_aruco_safety_margin_get():
-    """Return the current autonomous-mode arena safety margin (metres).
-    Reads from the active drone's observer since the margin is
-    per-observer state; fleet-wide consistency is maintained by the
-    POST endpoint broadcasting to every observer."""
-    obs = aruco_fleet.get(str(active_drone_id))
-    if obs is None:
-        return jsonify(ok=False, safety_margin_m=None), 200
-    with obs._lock:
-        return jsonify(
-            ok=True,
-            safety_margin_m=float(obs._safety_margin_m),
-            arena_bounds=dict(obs._arena_bounds),
-        )
 
 
-@bp_aruco.post("/proxy/aruco/safety_margin")
-def proxy_aruco_safety_margin_set():
-    """Set the autonomous-mode arena safety margin. Body:
-        {"safety_margin_m": 1.5}
-    Broadcasts to every drone's observer so the fleet shares one value.
-    """
-    data = request.get_json(silent=True) or {}
-    try:
-        v = float(data.get("safety_margin_m"))
-    except (TypeError, ValueError):
-        return jsonify(ok=False, error="safety_margin_m required"), 400
-    v = max(0.1, min(5.0, v))   # clamp to a sane range
-    for d_id, o in aruco_fleet._obs.items():
-        try:
-            o.set_arena_bounds({}, safety_margin_m=v)
-        except Exception as e:
-            print(f"[SAFETY] drone {d_id} set failed: {e}")
-    log_command("safety_margin_set", {"safety_margin_m": v})
-    print(f"[SAFETY] arena margin set to {v}m (fleet-wide)")
-    return jsonify(ok=True, safety_margin_m=v)
 
 
-@bp_aruco.post("/proxy/aruco/start")
-def proxy_aruco_start():
-    data = request.get_json(silent=True) or {}
-    did = str(data.get("id") or request.args.get("id") or active_drone_id)
-    obs, did = _aruco_resolve(did)
-    if obs is None:
-        return jsonify(ok=False, error="unknown drone"), 404
-    log_command("aruco_start", {"id": did})
-    obs.start()
-    return jsonify(ok=True, drone_id=did)
 
 
-@bp_aruco.post("/proxy/aruco/stop")
-def proxy_aruco_stop():
-    data = request.get_json(silent=True) or {}
-    did = str(data.get("id") or request.args.get("id") or active_drone_id)
-    obs, did = _aruco_resolve(did)
-    if obs is None:
-        return jsonify(ok=False, error="unknown drone"), 404
-    log_command("aruco_stop", {"id": did})
-    obs.stop()
-    return jsonify(ok=True, drone_id=did)
 
 
-@bp_aruco.post("/proxy/aruco/target")
-def proxy_aruco_target():
-    data = request.get_json(silent=True) or {}
-    did = str(data.get("id") or request.args.get("id") or active_drone_id)
-    obs, did = _aruco_resolve(did)
-    if obs is None:
-        return jsonify(ok=False, error="unknown drone"), 404
-    mid = data.get("marker")
-    if mid is not None:
-        try:
-            mid = int(mid)
-        except (TypeError, ValueError):
-            mid = None
-    obs.set_target(mid)
-    log_command("aruco_target", {"id": did, "marker": mid})
-    return jsonify(ok=True, drone_id=did, marker=mid)
 
 
-@bp_aruco.post("/proxy/aruco/mode")
-def proxy_aruco_mode():
-    data = request.get_json(silent=True) or {}
-    did = str(data.get("id") or request.args.get("id") or active_drone_id)
-    obs, did = _aruco_resolve(did)
-    if obs is None:
-        return jsonify(ok=False, error="unknown drone"), 404
-    requested = (data.get("mode") or "").lower()
-    # Respect global PAUSE — switching to LIVE while paused is exactly
-    # the kind of autonomous-command surprise PAUSE exists to prevent.
-    # Going back to OBSERVE is always allowed (it's a safety downgrade).
-    if requested == "live":
-        guarded = _pause_guard_response()
-        if guarded is not None:
-            return guarded
-    if requested == "live" and not obs.allow_live:
-        return jsonify(ok=False, mode=obs.mode,
-                       error="LIVE mode disabled on this server (REMOTE_NO_LIVE=1)"), 403
-    actual = obs.set_mode(requested)
-    log_command("aruco_mode", {"id": did, "mode": actual})
-    return jsonify(ok=(actual == requested), drone_id=did, mode=actual)
 
 
 def _aruco_require_live(obs):
@@ -2599,83 +923,14 @@ def _aruco_require_live(obs):
     return None
 
 
-@bp_aruco.post("/proxy/aruco/takeoff")
-def proxy_aruco_takeoff():
-    data = request.get_json(silent=True) or {}
-    did = str(data.get("id") or request.args.get("id") or active_drone_id)
-    obs, did = _aruco_resolve(did)
-    err = _aruco_require_live(obs)
-    if err is not None:
-        return err
-    log_command("aruco_takeoff", {"id": did})
-    return jsonify(ok=True, drone_id=did, result=obs.cmd_takeoff())
 
 
-@bp_aruco.post("/proxy/aruco/land")
-def proxy_aruco_land():
-    data = request.get_json(silent=True) or {}
-    did = str(data.get("id") or request.args.get("id") or active_drone_id)
-    obs, did = _aruco_resolve(did)
-    err = _aruco_require_live(obs)
-    if err is not None:
-        return err
-    log_command("aruco_land", {"id": did})
-    return jsonify(ok=True, drone_id=did, result=obs.cmd_land())
 
 
-@bp_aruco.post("/proxy/aruco/emergency")
-def proxy_aruco_emergency():
-    # Allowed at any mode — killswitch must always be reachable
-    data = request.get_json(silent=True) or {}
-    did = str(data.get("id") or request.args.get("id") or active_drone_id)
-    obs, did = _aruco_resolve(did)
-    if obs is None:
-        return jsonify(ok=False, error="unknown drone"), 404
-    log_command("aruco_emergency", {"id": did})
-    return jsonify(ok=True, drone_id=did, result=obs.cmd_emergency())
 
 
-@bp_aruco.post("/proxy/aruco/rc_stop")
-def proxy_aruco_rc_stop():
-    data = request.get_json(silent=True) or {}
-    did = str(data.get("id") or request.args.get("id") or active_drone_id)
-    obs, did = _aruco_resolve(did)
-    if obs is None:
-        return jsonify(ok=False, error="unknown drone"), 404
-    log_command("aruco_rc_stop", {"id": did})
-    return jsonify(ok=True, drone_id=did, result=obs.cmd_rc_stop())
 
 
-@bp_aruco.get("/proxy/aruco/video.mjpg")
-def proxy_aruco_video():
-    """Pass-through MJPEG for the observer's drone (separate from /proxy/video
-    so the main UI's video stream and the ArUco Seek panel don't collide)."""
-    did = request.args.get("id") or active_drone_id
-    obs, did = _aruco_resolve(did)
-    if obs is None:
-        return Response(b"", status=404)
-    upstream_url = f"{obs.api_base}/api/position/video"
-    try:
-        upstream = requests.get(upstream_url, stream=True, timeout=10)
-    except Exception as e:
-        return Response(f"upstream error: {e}".encode(), status=502, mimetype="text/plain")
-    content_type = upstream.headers.get(
-        "Content-Type", "multipart/x-mixed-replace; boundary=frame"
-    )
-
-    def generate():
-        try:
-            for chunk in upstream.iter_content(chunk_size=8192):
-                if chunk:
-                    yield chunk
-        except (GeneratorExit, requests.exceptions.RequestException):
-            pass
-        finally:
-            try:
-                upstream.close()
-            except Exception:
-                pass
-    return Response(generate(), content_type=content_type)
 
 
 # ─── Special Missions (multi-drone coordinated flight) ────────────────────
@@ -2710,9 +965,6 @@ def _parse_marker_list(raw) -> list[int]:
     return sorted(out)
 
 
-@bp_missions.get("/proxy/missions/status")
-def proxy_missions_status():
-    return jsonify(mission_manager.status())
 
 
 # ── Position-tracker presets ──────────────────────────────────────────
@@ -2854,77 +1106,12 @@ def _save_position_presets(data: dict):
         tmp.replace(POSITION_PRESETS_PATH)
 
 
-@bp_arena.get("/proxy/position/presets")
-def proxy_position_presets_list():
-    return jsonify(ok=True, presets=_load_position_presets(),
-                   path=str(POSITION_PRESETS_PATH))
 
 
-@bp_arena.post("/proxy/position/presets")
-def proxy_position_presets_save():
-    """Save a named preset. Body: {"name": "X", "params": {...}}"""
-    data = request.get_json(silent=True) or {}
-    name = str(data.get("name", "")).strip()
-    params = data.get("params")
-    if not name or not isinstance(params, dict):
-        return jsonify(ok=False, error="name + params required"), 400
-    presets = _load_position_presets()
-    presets[name] = params
-    try:
-        _save_position_presets(presets)
-    except Exception as e:
-        return jsonify(ok=False, error=f"save failed: {e}"), 500
-    log_command("position_preset_save", {"name": name})
-    return jsonify(ok=True, name=name)
 
 
-@bp_arena.delete("/proxy/position/presets")
-def proxy_position_presets_delete():
-    name = str(request.args.get("name", "")).strip()
-    if not name:
-        return jsonify(ok=False, error="name required"), 400
-    presets = _load_position_presets()
-    if name not in presets:
-        return jsonify(ok=False, error="preset not found"), 404
-    del presets[name]
-    try:
-        _save_position_presets(presets)
-    except Exception as e:
-        return jsonify(ok=False, error=f"save failed: {e}"), 500
-    log_command("position_preset_delete", {"name": name})
-    return jsonify(ok=True)
 
 
-@bp_arena.post("/proxy/position/presets/apply")
-def proxy_position_presets_apply():
-    """Load a preset and fan it out to every drone via /proxy/position/config.
-    Body: {"name": "..."} — any unknown keys in the preset are accepted
-    by the position config endpoint (it silently ignores unknown fields)."""
-    data = request.get_json(silent=True) or {}
-    name = str(data.get("name", "")).strip()
-    if not name:
-        return jsonify(ok=False, error="name required"), 400
-    presets = _load_position_presets()
-    params = presets.get(name)
-    if not isinstance(params, dict):
-        return jsonify(ok=False, error="preset not found"), 404
-    # Fan out to every drone's /api/position/config
-    results = {}
-    for did, info in DRONES.items():
-        base = (info or {}).get("base")
-        if not base:
-            results[str(did)] = {"ok": False, "error": "no base url"}
-            continue
-        try:
-            r = _http_session.post(f"{base.rstrip('/')}/api/position/config",
-                                   json=params, timeout=2.0)
-            results[str(did)] = r.json() if r.ok else {"ok": False, "status": r.status_code}
-        except Exception as e:
-            results[str(did)] = {"ok": False, "error": str(e)[:120]}
-    log_command("position_preset_apply", {"name": name})
-    ok_count = sum(1 for v in results.values() if v.get("ok"))
-    return jsonify(ok=True, name=name, applied_to=ok_count,
-                   total=len(results), results=results)
 
 
 # ── Mission presets ───────────────────────────────────────────────────
@@ -3001,158 +1188,16 @@ def _save_mission_presets(data: dict):
         tmp.replace(MISSION_PRESETS_PATH)
 
 
-@bp_missions.get("/proxy/missions/presets")
-def proxy_mission_presets_list():
-    """Return all presets grouped by mission type."""
-    return jsonify(ok=True, presets=_load_mission_presets(),
-                   path=str(MISSION_PRESETS_PATH))
 
 
-@bp_missions.post("/proxy/missions/presets")
-def proxy_mission_presets_save():
-    """Create or overwrite a named preset.
-    Body: {"mission_type": "scan_all", "name": "tight-margin",
-           "params": {...}}"""
-    data = request.get_json(silent=True) or {}
-    mtype = str(data.get("mission_type", "")).strip()
-    name  = str(data.get("name", "")).strip()
-    params = data.get("params")
-    if not mtype or not name or not isinstance(params, dict):
-        return jsonify(ok=False, error="mission_type, name, params required"), 400
-    if mtype not in ("scan_all", "capture_targets"):
-        return jsonify(ok=False, error=f"unknown mission_type: {mtype}"), 400
-    # Minimal sanity checks per mission type — we don't want a broken
-    # preset to silently save.
-    if mtype == "scan_all":
-        if "target_markers" not in params:
-            return jsonify(ok=False, error="target_markers required for scan_all"), 400
-    if mtype == "capture_targets":
-        if not isinstance(params.get("target_boxes"), list):
-            return jsonify(ok=False, error="target_boxes (list) required for capture_targets"), 400
-    presets = _load_mission_presets()
-    presets.setdefault(mtype, {})[name] = params
-    try:
-        _save_mission_presets(presets)
-    except Exception as e:
-        return jsonify(ok=False, error=f"save failed: {e}"), 500
-    log_command("mission_preset_save", {"mission_type": mtype, "name": name})
-    return jsonify(ok=True, mission_type=mtype, name=name)
 
 
-@bp_missions.delete("/proxy/missions/presets")
-def proxy_mission_presets_delete():
-    """Delete a named preset. Query: ?mission_type=X&name=Y"""
-    mtype = str(request.args.get("mission_type", "")).strip()
-    name  = str(request.args.get("name", "")).strip()
-    if not mtype or not name:
-        return jsonify(ok=False, error="mission_type, name required"), 400
-    presets = _load_mission_presets()
-    bucket  = presets.get(mtype, {})
-    if name not in bucket:
-        return jsonify(ok=False, error="preset not found"), 404
-    del bucket[name]
-    try:
-        _save_mission_presets(presets)
-    except Exception as e:
-        return jsonify(ok=False, error=f"save failed: {e}"), 500
-    log_command("mission_preset_delete", {"mission_type": mtype, "name": name})
-    return jsonify(ok=True)
 
 
-@bp_missions.post("/proxy/missions/scan_all/start")
-def proxy_missions_scan_all_start():
-    guarded = _pause_guard_response()
-    if guarded is not None:
-        return guarded
-    data = request.get_json(silent=True) or {}
-    drone_ids = data.get("drone_ids") or []
-    if not isinstance(drone_ids, list) or not drone_ids:
-        return jsonify(ok=False, error="drone_ids (non-empty list) required"), 400
-    target_markers = _parse_marker_list(data.get("target_markers", "1-12"))
-    if not target_markers:
-        return jsonify(ok=False, error="target_markers must parse to at least one id"), 400
-    hover_seconds = float(data.get("hover_seconds", 3.0))
-    approach_tolerance_m = float(data.get("approach_tolerance_m", 0.30))
-    approach_skew_tol   = float(data.get("approach_skew_tol", 0.12))
-    approach_err_x_tol  = float(data.get("approach_err_x_tol", 0.15))
-    auto_takeoff = bool(data.get("auto_takeoff", False))
-    ok, msg = mission_manager.start_scan_all(
-        drone_ids=[str(d) for d in drone_ids],
-        target_markers=target_markers,
-        hover_seconds=hover_seconds,
-        approach_tolerance_m=approach_tolerance_m,
-        approach_skew_tol=approach_skew_tol,
-        approach_err_x_tol=approach_err_x_tol,
-        auto_takeoff=auto_takeoff,
-    )
-    log_command("mission_scan_all_start", {
-        "drone_ids": drone_ids, "target_markers": target_markers,
-        "hover_seconds": hover_seconds, "ok": ok, "msg": msg,
-    })
-    status = 200 if ok else 409
-    return jsonify(ok=ok, message=msg, status=mission_manager.status()), status
 
 
-@bp_missions.post("/proxy/missions/capture_targets/start")
-def proxy_missions_capture_targets_start():
-    """Launch the SDC26 capture-all-targets mission. Body:
-    {
-      "drone_ids":    ["1", "2", ...],
-      "target_boxes": [{"id":1,"x":-5.0,"y":2.0,"z":0.0}, ...],
-                                                  # z optional — marker
-                                                  # height above floor
-                                                  # (e.g. 0.5 for a stand)
-      "home_xy":      [x, y],                    # team home coord
-      "arena_face_xy":[x, y],                    # where the camera aims
-      "hover_above_m": 1.5,                      # HEIGHT above the target
-                                                  # marker; waypoint Z =
-                                                  # box.z + hover_above_m
-      "hover_seconds": 4.0,
-      "auto_takeoff":  false
-    }
-    """
-    guarded = _pause_guard_response()
-    if guarded is not None:
-        return guarded
-    data = request.get_json(silent=True) or {}
-    drone_ids = data.get("drone_ids") or []
-    if not isinstance(drone_ids, list) or not drone_ids:
-        return jsonify(ok=False, error="drone_ids (non-empty list) required"), 400
-    target_boxes = data.get("target_boxes") or []
-    if not isinstance(target_boxes, list) or not target_boxes:
-        return jsonify(ok=False, error="target_boxes (non-empty list) required"), 400
-    home_xy = data.get("home_xy", [0.0, 1.5])
-    arena_face_xy = data.get("arena_face_xy", [0.0, 5.4])
-    hover_above_m = float(data.get("hover_above_m", 1.5))
-    hover_seconds = float(data.get("hover_seconds", 4.0))
-    nav_tol_xy_m  = float(data.get("nav_tol_xy_m", 0.3))
-    auto_takeoff  = bool(data.get("auto_takeoff", False))
-    ok, msg = mission_manager.start_capture_all_targets(
-        drone_ids=[str(d) for d in drone_ids],
-        target_boxes=target_boxes,
-        home_xy=tuple(home_xy),
-        arena_face_xy=tuple(arena_face_xy),
-        hover_above_m=hover_above_m,
-        hover_seconds=hover_seconds,
-        nav_tol_xy_m=nav_tol_xy_m,
-        auto_takeoff=auto_takeoff,
-    )
-    log_command("mission_capture_targets_start", {
-        "drone_ids": drone_ids,
-        "target_boxes": target_boxes,
-        "ok": ok, "msg": msg,
-    })
-    status = 200 if ok else 409
-    return jsonify(ok=ok, message=msg, status=mission_manager.status()), status
 
 
-@bp_missions.post("/proxy/missions/stop")
-def proxy_missions_stop():
-    data = request.get_json(silent=True) or {}
-    land = bool(data.get("land", False))
-    ok = mission_manager.stop(land=land)
-    log_command("mission_stop", {"land": land, "ok": ok})
-    return jsonify(ok=ok, status=mission_manager.status())
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -3347,221 +1392,26 @@ def _scan_and_capture_thread(
         _scan_cap_set(active=False)
 
 
-@bp_missions.post("/proxy/missions/scan_and_capture/start")
-def proxy_scan_and_capture_start():
-    """Scan-and-capture: the first selected drone rotates to discover
-    SDC26 target boxes (IDs 31-36 Blue, 41-46 Red) via ArUco. All
-    selected drones then visit boxes concurrently at stacked altitudes
-    using the standard CaptureAllTargetsMission (target-claim prevents
-    two drones from approaching the same box; per-drone altitude offset
-    keeps 3-D paths separated). Body:
-      {
-        "drone_ids":      ["2", "1"],       # multi-drone list; first scans
-        "drone_id":       "2",              # (legacy single-drone fallback)
-        "rotation_deg":   60,               # degrees per rotate step
-        "rotation_steps": 6,                # full 360° by default
-        "dwell_s":        2.0,              # observation window per step
-        "hover_seconds":  3.0,              # dwell over each target box
-        "hover_above_m":  1.5,              # HEIGHT above the target marker
-        "home_xy":        [0.0, 1.5],       # landing / return point
-        "arena_face_xy":  [0.0, 5.4],       # where camera points during capture
-        "nav_tol_xy_m":   0.3,              # arrival tolerance
-        "altitude_stack_m": 1.0,            # per-drone Z-offset step
-        "min_separation_m": 1.2             # inter-drone 3-D proximity pause
-      }
-    """
-    with _scan_cap_lock:
-        if _scan_cap_state["active"]:
-            return jsonify(ok=False, error="scan-and-capture already active",
-                           state=dict(_scan_cap_state)), 409
-    guarded = _pause_guard_response()
-    if guarded is not None:
-        return guarded
-    data = request.get_json(silent=True) or {}
-    # Accept either `drone_ids: [list]` (preferred, multi-drone) or the
-    # legacy `drone_id: str` (single-drone). Falls back to active drone.
-    drone_ids_raw = data.get("drone_ids")
-    if isinstance(drone_ids_raw, list) and drone_ids_raw:
-        drone_ids = [str(d) for d in drone_ids_raw if str(d) in DRONES]
-    else:
-        did = str(data.get("drone_id") or active_drone_id)
-        drone_ids = [did] if did in DRONES else []
-    if not drone_ids:
-        return jsonify(ok=False, error="no valid drones selected"), 400
-    rotation_deg   = max(10, min(180, int(data.get("rotation_deg", 60))))
-    rotation_steps = max(1, min(24, int(data.get("rotation_steps", 6))))
-    dwell_s        = max(0.5, min(10.0, float(data.get("dwell_s", 2.0))))
-    hover_seconds  = max(1.0, min(20.0, float(data.get("hover_seconds", 3.0))))
-    hover_above_m  = max(0.3, min(5.0, float(data.get("hover_above_m", 1.5))))
-    home_xy        = data.get("home_xy") or [0.0, 1.5]
-    arena_face_xy  = data.get("arena_face_xy") or [0.0, 5.4]
-    nav_tol_xy_m   = max(0.1, min(2.0, float(data.get("nav_tol_xy_m", 0.3))))
-    altitude_stack_m = max(0.0, min(3.0, float(data.get("altitude_stack_m", 1.0))))
-    min_separation_m = max(0.0, min(5.0, float(data.get("min_separation_m", 1.2))))
-    with _scan_cap_lock:
-        _scan_cap_state.update({
-            "active":        True,
-            "phase":         "starting",
-            "drone_id":      drone_ids[0],    # legacy single-id field — first drone
-            "drone_ids":     drone_ids,
-            "step_name":     "starting",
-            "n_detected":    0,
-            "targets_found": {},
-            "target_boxes":  [],
-            "started_at":    time.time(),
-            "ended_at":      0.0,
-            "elapsed_s":     0.0,
-            "last_error":    None,
-            "result":        None,
-        })
-    _scan_cap_abort.clear()
-    threading.Thread(
-        target=_scan_and_capture_thread,
-        args=(drone_ids, rotation_deg, rotation_steps, dwell_s,
-              hover_seconds, hover_above_m,
-              tuple(home_xy), tuple(arena_face_xy), nav_tol_xy_m,
-              altitude_stack_m, min_separation_m),
-        daemon=True, name="scan-and-capture",
-    ).start()
-    log_command("scan_and_capture_start", {
-        "drone_ids": drone_ids, "rotation_steps": rotation_steps,
-        "hover_seconds": hover_seconds,
-        "altitude_stack_m": altitude_stack_m,
-        "min_separation_m": min_separation_m,
-    })
-    return jsonify(ok=True, message="scan-and-capture started",
-                   drone_ids=drone_ids)
 
 
-@bp_missions.get("/proxy/missions/scan_and_capture/status")
-def proxy_scan_and_capture_status():
-    with _scan_cap_lock:
-        snap = dict(_scan_cap_state)
-    return jsonify(ok=True, **snap)
 
 
-@bp_missions.post("/proxy/missions/scan_and_capture/abort")
-def proxy_scan_and_capture_abort():
-    """Abort the scan-and-capture. Sets a flag that the background thread
-    checks; the thread exits at the next dwell boundary. If the capture
-    mission has already handed off to mission_manager, also stop that."""
-    _scan_cap_abort.set()
-    # Also try to stop any running mission (best-effort — might not be ours)
-    try:
-        if _scan_cap_state.get("phase") in {"capture", "done"}:
-            mission_manager.stop(land=False)
-    except Exception:
-        pass
-    with _scan_cap_lock:
-        active = _scan_cap_state["active"]
-    return jsonify(ok=True, message="abort requested", active=active)
 
 
-@bp_missions.get("/proxy/missions/trace")
-def proxy_missions_trace():
-    """Download the trace log for the most recent mission. The mission
-    class writes a JSONL file per run; we return the current one (or the
-    most recent if no mission is active)."""
-    from pathlib import Path as _P
-    import glob as _glob
-    path = None
-    try:
-        cur = mission_manager.current
-        if cur is not None and getattr(cur, "trace_path", None):
-            path = cur.trace_path
-    except Exception:
-        pass
-    if not path:
-        # Fall back to newest file in the logs dir
-        try:
-            from aruco_seek_multi import MISSION_LOG_DIR
-            files = sorted(_glob.glob(str(MISSION_LOG_DIR / "mission_*.jsonl")))
-            if files:
-                path = files[-1]
-        except Exception:
-            pass
-    if not path or not _P(path).exists():
-        return jsonify(ok=False, error="no trace available yet"), 404
-    return send_file(path, mimetype="application/x-ndjson",
-                     as_attachment=True,
-                     download_name=_P(path).name)
 
 
-@bp_missions.get("/proxy/missions/traces")
-def proxy_missions_traces():
-    """List all mission trace files on disk with size and mtime."""
-    import glob as _glob
-    from aruco_seek_multi import MISSION_LOG_DIR
-    files = []
-    try:
-        for f in sorted(_glob.glob(str(MISSION_LOG_DIR / "mission_*.jsonl"))):
-            p = Path(f)
-            st = p.stat()
-            files.append({
-                "name": p.name,
-                "size": st.st_size,
-                "mtime": st.st_mtime,
-            })
-    except Exception as e:
-        return jsonify(ok=False, error=str(e)), 500
-    return jsonify(ok=True, files=files)
 
 
 # ─── Environment & Wi-Fi control — pass-through to active drone ─────────────
 
-@bp_settings.get("/proxy/environment")
-def proxy_environment_get():
-    try:
-        r = _http_session.get(f"{PI_BASE}/api/environment", timeout=3)
-        return (r.text, r.status_code,
-                {"Content-Type": r.headers.get("Content-Type", "application/json")})
-    except Exception as e:
-        return jsonify(ok=False, error=str(e)), 502
 
 
-@bp_settings.post("/proxy/environment")
-def proxy_environment_set():
-    data = request.get_json(silent=True) or {}
-    log_command("environment_set", data)
-    try:
-        r = _http_session.post(f"{PI_BASE}/api/environment", json=data, timeout=4)
-        return (r.text, r.status_code,
-                {"Content-Type": r.headers.get("Content-Type", "application/json")})
-    except Exception as e:
-        return jsonify(ok=False, error=str(e)), 502
 
 
-@bp_settings.get("/proxy/wifi/status")
-def proxy_wifi_status():
-    try:
-        r = _http_session.get(f"{PI_BASE}/api/wifi/status", timeout=3)
-        return (r.text, r.status_code,
-                {"Content-Type": r.headers.get("Content-Type", "application/json")})
-    except Exception as e:
-        return jsonify(ok=False, error=str(e)), 502
 
 
-@bp_settings.post("/proxy/wifi/channel")
-def proxy_wifi_channel():
-    data = request.get_json(silent=True) or {}
-    log_command("wifi_channel_set", data)
-    try:
-        r = _http_session.post(f"{PI_BASE}/api/wifi/channel", json=data, timeout=8)
-        return (r.text, r.status_code,
-                {"Content-Type": r.headers.get("Content-Type", "application/json")})
-    except Exception as e:
-        return jsonify(ok=False, error=str(e)), 502
 
 
-@bp_settings.post("/proxy/wifi/scan")
-def proxy_wifi_scan():
-    data = request.get_json(silent=True) or {}
-    try:
-        r = _http_session.post(f"{PI_BASE}/api/wifi/scan", json=data, timeout=10)
-        return (r.text, r.status_code,
-                {"Content-Type": r.headers.get("Content-Type", "application/json")})
-    except Exception as e:
-        return jsonify(ok=False, error=str(e)), 502
 
 
 # ── Magnetometer (Anafi) ────────────────────────────────────────────────────
@@ -3570,29 +1420,8 @@ def proxy_wifi_scan():
 # raw GET /api/magneto and POST /api/magneto/calibrate; here we expose a
 # higher-level /proxy/magneto/recalibrate that drives the full cycle.
 
-@bp_magneto.get("/proxy/magneto")
-def proxy_magneto_status():
-    """Current magnetometer calibration status for the active drone."""
-    try:
-        r = pi_get("/api/magneto", timeout=TIMEOUT_STATUS)
-        return (r.text, r.status_code,
-                {"Content-Type": r.headers.get("Content-Type", "application/json")})
-    except Exception as e:
-        return jsonify(ok=False, error=str(e)), 502
 
 
-@bp_magneto.post("/proxy/magneto/calibrate")
-def proxy_magneto_calibrate():
-    """One-shot: send the StartMagnetoCalibration command and return.
-    The caller is then responsible for the figure-8 dance and for polling
-    /proxy/magneto until all axes report ok."""
-    log_command("magneto_calibrate")
-    try:
-        r = pi_post("/api/magneto/calibrate", timeout=TIMEOUT_CMD)
-        return (r.text, r.status_code,
-                {"Content-Type": r.headers.get("Content-Type", "application/json")})
-    except Exception as e:
-        return jsonify(ok=False, error=str(e)), 502
 
 
 def _parse_magneto_axes(status: str | None) -> dict:
@@ -3732,58 +1561,30 @@ def _magneto_cycle(timeout_s: float, poll_s: float):
            "message": msg}
 
 
-@bp_magneto.post("/proxy/magneto/recalibrate")
-def proxy_magneto_recalibrate():
-    """Blocking orchestrator: runs the full recalibration cycle and returns a
-    single summary JSON. See /proxy/magneto/recalibrate/stream for live
-    per-step progress.
-
-    Body (optional):
-      { "timeout_s": 60, "poll_s": 1.0 }"""
-    data = request.get_json(silent=True) or {}
-    try:
-        timeout_s = max(5.0, float(data.get("timeout_s", 60)))
-        poll_s = max(0.25, float(data.get("poll_s", 1.0)))
-    except (TypeError, ValueError):
-        return jsonify(ok=False, error="timeout_s/poll_s must be numeric"), 400
-
-    log_command("magneto_recalibrate", {"timeout_s": timeout_s, "poll_s": poll_s})
-
-    final = {"ok": False, "error": "no final event"}
-    for ev in _magneto_cycle(timeout_s, poll_s):
-        if ev.get("kind") == "final":
-            final = {k: v for k, v in ev.items() if k != "kind"}
-    return jsonify(final), 200
-
-
-@bp_magneto.get("/proxy/magneto/recalibrate/stream")
-def proxy_magneto_recalibrate_stream():
-    """SSE stream of the recalibration cycle. Used by the wizard GUI to light
-    up each step + per-axis indicator as it happens.
-
-    Query params: timeout_s (default 60), poll_s (default 1.0)."""
-    try:
-        timeout_s = max(5.0, float(request.args.get("timeout_s", 60)))
-        poll_s = max(0.25, float(request.args.get("poll_s", 1.0)))
-    except (TypeError, ValueError):
-        return jsonify(ok=False, error="timeout_s/poll_s must be numeric"), 400
-
-    log_command("magneto_recalibrate_stream",
-                {"timeout_s": timeout_s, "poll_s": poll_s})
-
-    def generate():
-        for ev in _magneto_cycle(timeout_s, poll_s):
-            yield f"data: {json.dumps(ev)}\n\n".encode()
-
-    return Response(generate(), mimetype="text/event-stream",
-                    headers={"Cache-Control": "no-cache",
-                             "X-Accel-Buffering": "no"})
 
 
 
-# ── Wire blueprints (Phase 3) ─────────────────────────────────
-# Every @bp_X.<method>(...) decorator above attached its route to the
-# corresponding blueprint object. Now register them all on the Flask app.
+
+
+# ── Wire blueprints (Phase 4) ─────────────────────────────
+# Importing each api.<bp> module triggers @bp_X.<method>(...)
+# decorators inside it, which attach the routes to the blueprint
+# object. _register_blueprints(app) then mounts every blueprint
+# on the Flask app.
+from controller_modularized.api import (  # noqa: E402
+    system    as _bp_mod_system,
+    drones    as _bp_mod_drones,
+    flight    as _bp_mod_flight,
+    safety    as _bp_mod_safety,
+    camera    as _bp_mod_camera,
+    telemetry as _bp_mod_telemetry,
+    settings  as _bp_mod_settings,
+    magneto   as _bp_mod_magneto,
+    logs      as _bp_mod_logs,
+    arena     as _bp_mod_arena,
+    aruco     as _bp_mod_aruco,
+    missions  as _bp_mod_missions,
+)
 _register_blueprints(app)
 
 def main():
