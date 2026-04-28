@@ -604,14 +604,13 @@ class MissionController:
             self._marker_lost(now); return
         d, yaw_to_marker, hdg = meas
 
-        # Hard distance floor: same guard as in approach / orbit.
-        if d < cfg.distance_floor_factor * cfg.target_distance_m:
-            self._send_rc(0, 0, 0, 0)
-            with self.state.lock:
-                self.state.note = (f"distance floor ({d:.2f} m) -- "
-                                   "refusing motion in align")
-                self.state.settle_began_at = None
-            return
+        # Hard distance floor: prevent forward motion when too close, but
+        # let yaw and lateral PDs keep running. The previous "zero all
+        # channels" pattern froze the drone in place if it dipped just
+        # past the floor (flight 22-09-49: hovered at d=1.37 with hdg=22
+        # for 8 s, never recovering). The fwd PD will naturally produce
+        # a backward command when d<target, pushing the drone out.
+        floor_active = d < cfg.distance_floor_factor * cfg.target_distance_m
 
         # ALIGN target: heading=0, distance=d_align_start.
         d_set = self.state.align_distance_m or d
@@ -628,6 +627,8 @@ class MissionController:
         u_yaw = 0.0 if abs(e_yaw) < cfg.yaw_deadband_deg else self.pd_yaw.step(e_yaw, now)
         u_fwd_raw = 0.0 if abs(e_fwd) < cfg.distance_deadband_m else self.pd_fwd.step(e_fwd, now)
         u_fwd = self._velocity_damp_fwd(u_fwd_raw, tel)
+        if floor_active:
+            u_fwd = min(0.0, u_fwd)         # no forward push when too close
         if abs(e_hdg) < align_dead:
             u_lat_raw = 0.0
         else:
@@ -667,17 +668,13 @@ class MissionController:
             self._marker_lost(now); return
         d, yaw_to_marker, hdg = meas
 
-        # Hard distance floor: never command forward motion inside
-        # distance_floor_factor * target. Last-line guard against pose noise.
-        if d < cfg.distance_floor_factor * cfg.target_distance_m:
-            self._send_rc(0, 0, 0, 0)
-            with self.state.lock:
-                self.state.note = (f"distance floor ({d:.2f} m < "
-                                   f"{cfg.distance_floor_factor:.2f} * "
-                                   f"{cfg.target_distance_m:.2f} m) -- "
-                                   "refusing forward command")
-                self.state.settle_began_at = None
-            return
+        # Hard distance floor: prevent FORWARD motion inside the floor;
+        # yaw and lateral PDs keep running so the drone can recenter
+        # and correct heading. The PD's natural backward output (when
+        # d<target) pushes the drone out. Previously we zeroed all
+        # channels on floor entry, which froze the drone in place
+        # (flight 22-09-49: stuck at d=1.37, hdg=22 with rc=0,0,0,0).
+        floor_active = d < cfg.distance_floor_factor * cfg.target_distance_m
 
         # Errors
         e_yaw = yaw_to_marker                  # want yaw_to_marker -> 0
@@ -701,6 +698,8 @@ class MissionController:
         else:
             u_fwd_raw = self.pd_fwd.step(e_fwd, now)
         u_fwd = self._velocity_damp_fwd(u_fwd_raw, tel)
+        if floor_active:
+            u_fwd = min(0.0, u_fwd)
 
         # Lateral: same orbit-style law as ALIGN but pinned to heading 0
         # for the whole approach. We use approach_heading_deadband_deg
@@ -754,14 +753,10 @@ class MissionController:
             self._marker_lost(now); return
         d, yaw_to_marker, hdg = meas
 
-        # Hard distance floor: same guard as in approach.
-        if d < cfg.distance_floor_factor * cfg.target_distance_m:
-            self._send_rc(0, 0, 0, 0)
-            with self.state.lock:
-                self.state.note = (f"distance floor ({d:.2f} m) -- "
-                                   "refusing motion in orbit")
-                self.state.settle_began_at = None
-            return
+        # Hard distance floor: prevent forward push only; yaw and lateral
+        # keep running so the orbit doesn't freeze when the drone dips
+        # past the floor.
+        floor_active = d < cfg.distance_floor_factor * cfg.target_distance_m
 
         e_yaw = yaw_to_marker
         e_fwd = d - cfg.target_distance_m
@@ -772,6 +767,8 @@ class MissionController:
         u_yaw = 0.0 if abs(e_yaw) < cfg.yaw_deadband_deg else self.pd_yaw.step(e_yaw, now)
         u_fwd_raw = 0.0 if abs(e_fwd) < cfg.distance_deadband_m else self.pd_fwd.step(e_fwd, now)
         u_fwd = self._velocity_damp_fwd(u_fwd_raw, tel)
+        if floor_active:
+            u_fwd = min(0.0, u_fwd)
         # Lateral channel: slide the drone around the marker.
         # Sign reasoning (top-down view, drone facing marker):
         #
@@ -823,13 +820,9 @@ class MissionController:
             self._marker_lost(now, escalate=True); return
         d, yaw_to_marker, hdg = meas
 
-        # Hard distance floor: same guard as in approach / orbit.
-        if d < cfg.distance_floor_factor * cfg.target_distance_m:
-            self._send_rc(0, 0, 0, 0)
-            with self.state.lock:
-                self.state.note = (f"distance floor ({d:.2f} m) -- "
-                                   "refusing motion in hold")
-            return
+        # Hard distance floor: prevent forward push only; yaw and lateral
+        # keep running so HOLD can still recenter while pushed inside the floor.
+        floor_active = d < cfg.distance_floor_factor * cfg.target_distance_m
 
         # Same control law as orbit, just with the goal already met.
         e_yaw = yaw_to_marker
@@ -838,6 +831,8 @@ class MissionController:
         u_yaw = 0.0 if abs(e_yaw) < cfg.yaw_deadband_deg else self.pd_yaw.step(e_yaw, now)
         u_fwd_raw = 0.0 if abs(e_fwd) < cfg.distance_deadband_m else self.pd_fwd.step(e_fwd, now)
         u_fwd = self._velocity_damp_fwd(u_fwd_raw, tel)
+        if floor_active:
+            u_fwd = min(0.0, u_fwd)
         if abs(e_hdg) < cfg.heading_deadband_deg:
             u_lat_raw = 0.0
         else:
