@@ -22,6 +22,8 @@ from __future__ import annotations
 import csv
 import datetime as _dt
 import json
+import shutil
+import subprocess
 import threading
 import time
 from dataclasses import asdict
@@ -92,10 +94,94 @@ class FlightRecorder:
         if self._ann_writer:
             try: self._ann_writer.release()
             except Exception: pass
+        # OpenCV's mp4v output isn't accepted by WhatsApp (and several
+        # other ingest pipelines); re-encode to H.264 + silent AAC so the
+        # files are shareable.
+        self._reencode_for_sharing()
         # meta
         if meta is not None:
             (self.dir / "mission_meta.json").write_text(json.dumps(meta, indent=2,
                                                                    default=str))
+
+    # --------------------------------------------------------- post-process
+    def _reencode_for_sharing(self) -> None:
+        """Re-encode raw and annotated videos to H.264 + dummy AAC track.
+
+        OpenCV writes mp4v (MPEG-4 Part 2) which most modern apps refuse
+        to ingest. We use ffmpeg with libx264 and a generated silent
+        audio stream so the resulting file plays everywhere and can be
+        sent over WhatsApp/Telegram/etc.
+
+        Originals are replaced atomically on success and deleted if the
+        OpenCV writer fell back to .avi. On failure (ffmpeg missing or
+        encode error) the originals are left untouched so the operator
+        still has the raw artefacts.
+        """
+        if shutil.which("ffmpeg") is None:
+            print("[rec] ffmpeg not found -- keeping mp4v originals "
+                  "(install ffmpeg for shareable H.264 output)")
+            return
+        encoder = _pick_h264_encoder()
+        if encoder is None:
+            print("[rec] ffmpeg has no H.264 encoder available -- "
+                  "keeping mp4v originals")
+            return
+        for stem in ("raw", "annotated"):
+            # The OpenCV writer falls back to .avi/MJPG if mp4v is
+            # unavailable on the host -- handle either input.
+            src: Optional[Path] = None
+            for ext in (".mp4", ".avi"):
+                p = self.dir / f"{stem}{ext}"
+                if p.exists() and p.stat().st_size > 0:
+                    src = p
+                    break
+            if src is None:
+                continue
+            final = self.dir / f"{stem}.mp4"
+            tmp = self.dir / f"{stem}.h264.tmp.mp4"
+            # Different H.264 encoders take different quality knobs:
+            # libx264 has -preset/-crf, libopenh264 / nvenc / vaapi don't
+            # (or take them differently). Default to a fixed bitrate that
+            # gives ~ original-mp4v file size for 720p25, which is good
+            # enough for sharing.
+            if encoder == "libx264":
+                video_args = ["-c:v", "libx264", "-preset", "veryfast",
+                              "-crf", "23", "-pix_fmt", "yuv420p"]
+            else:
+                video_args = ["-c:v", encoder, "-b:v", "4M",
+                              "-pix_fmt", "yuv420p"]
+            cmd = [
+                "ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-nostdin",
+                "-i", str(src),
+                "-f", "lavfi",
+                "-i", "anullsrc=channel_layout=stereo:sample_rate=48000",
+                *video_args,
+                "-c:a", "aac", "-b:a", "96k",
+                "-shortest", "-movflags", "+faststart",
+                str(tmp),
+            ]
+            print(f"[rec] re-encoding {src.name} -> H.264 + silent AAC ...")
+            t0 = time.monotonic()
+            try:
+                subprocess.run(cmd, check=True, capture_output=True, text=True)
+            except subprocess.CalledProcessError as e:
+                print(f"[rec] ffmpeg failed for {src.name}: "
+                      f"{(e.stderr or '').strip()}")
+                try: tmp.unlink()
+                except FileNotFoundError: pass
+                continue
+            except FileNotFoundError as e:
+                print(f"[rec] could not run ffmpeg: {e}")
+                return
+            # Path.replace is atomic on POSIX and overwrites the target,
+            # so this works whether src == final (both .mp4) or not.
+            tmp.replace(final)
+            if src != final:
+                try: src.unlink()
+                except FileNotFoundError: pass
+            size_mb = final.stat().st_size / (1024 * 1024)
+            print(f"[rec]   -> {final.name} ({size_mb:.1f} MB in "
+                  f"{time.monotonic() - t0:.1f}s)")
 
     # ----------------------------------------------------------- public write
     def push_raw_frame(self, frame_bgr: np.ndarray) -> None:
@@ -205,6 +291,26 @@ class FlightRecorder:
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+def _pick_h264_encoder() -> Optional[str]:
+    """Return the name of an available ffmpeg H.264 encoder, or None.
+
+    Preference order: libx264 (best quality, but proprietary; not
+    bundled in stock Fedora ffmpeg), libopenh264 (Cisco's free encoder,
+    ships everywhere), then common hardware backends as a last resort.
+    """
+    try:
+        out = subprocess.run(["ffmpeg", "-hide_banner", "-encoders"],
+                             capture_output=True, text=True,
+                             check=True, timeout=5.0).stdout
+    except Exception:
+        return None
+    for name in ("libx264", "libopenh264",
+                 "h264_nvenc", "h264_vaapi", "h264_qsv"):
+        if name in out:
+            return name
+    return None
+
 
 def make_flight_dir(root: Path, serial: str) -> Path:
     stamp = _dt.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
