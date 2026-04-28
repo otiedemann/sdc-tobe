@@ -1022,7 +1022,22 @@ class MissionController:
                           tel: Optional[TelemetrySnapshot]) -> float:
         """Lateral mirror of :meth:`_velocity_damp_fwd`. ``u_raw`` and
         the body-right velocity share sign convention (positive = body-
-        right), so the same subtraction brakes correctly.
+        right), so the same subtraction brakes correctly -- but with a
+        crucial extra constraint: damping must not flip the command
+        sign.
+
+        Reason: lat_rc_max is small (4) and lat_kv is 0.4, so a body-
+        left velocity of ~15 cm/s is enough to swing u from -4 (PD
+        saturated) through zero to +4 (damping-driven body-RIGHT). The
+        controller would then actively push the drone in the opposite
+        direction of where PD wants to go -- driving heading AWAY from
+        target instead of just braking. Flight 22-25-16 approach: at
+        hdg=-15 with PD saturated commanding body-left, damping flipped
+        rc_lr to +4 for several seconds and the drone drifted from
+        hdg=-15 back to hdg=-31 while still 15+ deg from the heading-0
+        target. Forward damping does NOT need this guard because PD's
+        forward output naturally shrinks as d -> target_distance, so
+        the brake-by-backward path is desired and self-resolving.
         """
         cfg = self.cfg
         ws = self._telemetry_world_speed(tel)
@@ -1031,6 +1046,10 @@ class MissionController:
         vN, vE, yaw = ws
         _, v_right = self._world_to_body(vN, vE, yaw)
         u = u_raw - cfg.lat_kv * v_right
+        if u_raw > 0:
+            u = max(0.0, u)
+        elif u_raw < 0:
+            u = min(0.0, u)
         return max(-cfg.lat_rc_max, min(cfg.lat_rc_max, u))
 
     def _marker_lost(self, now: float, escalate: bool = True) -> None:
