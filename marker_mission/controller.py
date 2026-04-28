@@ -901,42 +901,32 @@ class MissionController:
 
     # ----------------------------------------------- velocity feedforward
     #
-    # Olympe's SpeedChanged.speedX/Y/Z are NED *world* frame
-    # (X=north, Y=east, Z=down) -- not body frame. The unified API
-    # server forwards them as vgx/vgy/vgz unchanged. Earlier versions
-    # of this controller damped on vgx/vgy as if they were body-frame,
-    # which produced direction-dependent (re)stabilization that
-    # spuriously back-up'd the drone in flight 21:09 once the
-    # calibration changed enough to alter PD's operating point.
+    # IMPORTANT: vgx/vgy/vgz from the unified API server are
+    # BODY-FRAME velocity (cm/s), NOT earth-frame NED. The Parrot/Anafi
+    # convention is "body NED" = forward / right / down (FRD-style).
+    # See unified_api_server.py:5564 -- "body-frame cm/s (Parrot NED:
+    # x=fwd, y=right, z=down)" -- confirmed empirically against flight
+    # 2026-04-29_00-00-47, where the previous "rotate by yaw to convert
+    # NED to body" path doubled the rotation, scrambled the damping
+    # sign, and drove the drone forward into a wall while PD wanted to
+    # brake.
     #
-    # The proper damping uses body-frame velocities, computed by
-    # rotating world NED through the drone's yaw.
+    # So: vgx is body-forward, vgy is body-right -- use them directly
+    # in the dampers. No yaw projection.
 
     @staticmethod
-    def _telemetry_world_speed(tel: Optional[TelemetrySnapshot]
-                                ) -> Optional[tuple[float, float, float]]:
-        """Return (vN, vE, yaw_deg) in cm/s + degrees, or None if any
-        component is missing. ``yaw_deg`` is from north, CW (Anafi /
-        Olympe AttitudeChanged convention)."""
+    def _telemetry_body_speed(tel: Optional[TelemetrySnapshot]
+                              ) -> Optional[tuple[float, float]]:
+        """Return (v_body_fwd, v_body_right) in cm/s, or None if missing.
+        vgx/vgy are body-frame already (Parrot 'NED' = FRD)."""
         if tel is None:
             return None
         try:
-            vN = float(tel.raw["vgx"])
-            vE = float(tel.raw["vgy"])
-            yaw = float(tel.raw["yaw"])
+            v_fwd = float(tel.raw["vgx"])
+            v_right = float(tel.raw["vgy"])
         except (KeyError, TypeError, ValueError):
             return None
-        return (vN, vE, yaw)
-
-    @staticmethod
-    def _world_to_body(vN: float, vE: float,
-                      yaw_deg: float) -> tuple[float, float]:
-        """Project world-NED velocity (north, east) to (body-forward,
-        body-right) using the drone's yaw (deg, CW from north)."""
-        th = math.radians(yaw_deg)
-        v_fwd   =  vN * math.cos(th) + vE * math.sin(th)
-        v_right = -vN * math.sin(th) + vE * math.cos(th)
-        return v_fwd, v_right
+        return (v_fwd, v_right)
 
     def _velocity_damp_fwd(self, u_raw: float,
                           tel: Optional[TelemetrySnapshot]) -> float:
@@ -948,11 +938,10 @@ class MissionController:
         until distance error closes -- way too late to brake.
         """
         cfg = self.cfg
-        ws = self._telemetry_world_speed(tel)
-        if ws is None:
+        bs = self._telemetry_body_speed(tel)
+        if bs is None:
             return max(-cfg.fwd_rc_max, min(cfg.fwd_rc_max, u_raw))
-        vN, vE, yaw = ws
-        v_fwd, _ = self._world_to_body(vN, vE, yaw)
+        v_fwd, _ = bs
         u = u_raw - cfg.fwd_kv * v_fwd
         return max(-cfg.fwd_rc_max, min(cfg.fwd_rc_max, u))
 
@@ -978,11 +967,10 @@ class MissionController:
         the brake-by-backward path is desired and self-resolving.
         """
         cfg = self.cfg
-        ws = self._telemetry_world_speed(tel)
-        if ws is None:
+        bs = self._telemetry_body_speed(tel)
+        if bs is None:
             return max(-cfg.lat_rc_max, min(cfg.lat_rc_max, u_raw))
-        vN, vE, yaw = ws
-        _, v_right = self._world_to_body(vN, vE, yaw)
+        _, v_right = bs
         u = u_raw - cfg.lat_kv * v_right
         if u_raw > 0:
             u = max(0.0, u)
