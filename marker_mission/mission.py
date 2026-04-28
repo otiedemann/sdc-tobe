@@ -179,10 +179,25 @@ def cmd_fly(args: argparse.Namespace) -> int:
                                    frame_pose_provider=pose_holder.get,
                                    telemetry_provider=tel_holder.get)
 
+    # The Stop button calls controller.stop() which blocks for up to ~25 s
+    # waiting for the safe-shutdown to finish. We don't want the Flask
+    # request thread hanging that long, so kick the stop off on a daemon
+    # thread and return immediately. The control thread itself does the
+    # rc_zero + land + telemetry poll synchronously.
+    def request_stop_async():
+        threading.Thread(
+            target=controller.stop,
+            args=("UI stop request",),
+            name="ui-stop-trigger",
+            daemon=True,
+        ).start()
+        return True
+
     ui = UiServer(state, latest_ann_frame,
                   host=cfg.ui_host, port=cfg.ui_port,
                   history_s=cfg.ui_telemetry_history_s,
-                  on_start=controller.trigger)
+                  on_start=controller.trigger,
+                  on_stop=request_stop_async)
     ui.start()
     print(f"[mission] UI running at {ui.url()} (camera) and {ui.url()}/charts")
 

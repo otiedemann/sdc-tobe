@@ -128,6 +128,12 @@ _VIDEO_AND_STATUS_HTML = """
                      cursor:pointer; font-size:.95rem;">
         Start mission
       </button>
+      <button id="btn-stop" type="button"
+              style="padding:.55rem 1rem; border:0; border-radius:6px;
+                     background:var(--bad); color:#240707; font-weight:600;
+                     cursor:pointer; font-size:.95rem; display:none;">
+        Stop &amp; land
+      </button>
       <span id="ctrl-msg" style="font-size:.85rem; color:#aab;">—</span>
     </div>
     <h2>Mission status</h2>
@@ -174,16 +180,34 @@ function fmt(v, unit, prec) {
 }
 
 // ---- Status panel (only runs if its DOM elements are present) -----------
-function setStartButton(phase) {
-  const btn = $('btn-start'); const msg = $('ctrl-msg');
-  if (!btn) return;
+const TERMINAL_PHASES = new Set(['done', 'abort']);
+const STOPPABLE_PHASES = new Set(['takeoff','search','approach','orbit','hold','land']);
+let stopRequested = false;
+function setMissionButtons(phase) {
+  const start = $('btn-start'); const stop = $('btn-stop'); const msg = $('ctrl-msg');
+  if (!start || !stop) return;
   if (phase === 'init') {
-    btn.disabled = false; btn.style.opacity = '1'; btn.style.cursor = 'pointer';
-    btn.textContent = 'Start mission';
+    start.style.display = ''; stop.style.display = 'none';
+    start.disabled = false; start.style.opacity = '1'; start.style.cursor = 'pointer';
+    start.textContent = 'Start mission';
     msg.textContent = 'Ready. Press to arm + take off.';
+    stopRequested = false;
+  } else if (TERMINAL_PHASES.has(phase)) {
+    start.style.display = 'none'; stop.style.display = 'none';
+    msg.textContent = 'Mission ' + phase + '.';
+  } else if (STOPPABLE_PHASES.has(phase)) {
+    start.style.display = 'none'; stop.style.display = '';
+    if (stopRequested) {
+      stop.disabled = true; stop.style.opacity = '0.5'; stop.style.cursor = 'not-allowed';
+      stop.textContent = 'Landing…';
+      msg.textContent = 'Stop requested. Phase: ' + phase;
+    } else {
+      stop.disabled = false; stop.style.opacity = '1'; stop.style.cursor = 'pointer';
+      stop.textContent = 'Stop & land';
+      msg.textContent = 'Phase: ' + phase;
+    }
   } else {
-    btn.disabled = true; btn.style.opacity = '0.5'; btn.style.cursor = 'not-allowed';
-    btn.textContent = 'Mission running';
+    start.style.display = 'none'; stop.style.display = 'none';
     msg.textContent = 'Phase: ' + phase;
   }
 }
@@ -196,6 +220,24 @@ async function startMission() {
     const j = await r.json();
     if (!j.ok) { msg.textContent = 'Could not start: ' + (j.error || 'unknown'); btn.disabled = false; }
   } catch (e) { msg.textContent = 'Request failed: ' + e; btn.disabled = false; }
+}
+async function stopMission() {
+  const btn = $('btn-stop'); const msg = $('ctrl-msg');
+  if (!confirm('Stop the mission and land now?')) return;
+  stopRequested = true;
+  btn.disabled = true; btn.style.opacity = '0.5'; btn.textContent = 'Landing…';
+  msg.textContent = 'Stop requested -- drone is landing.';
+  try {
+    const r = await fetch('/api/stop', {method:'POST'});
+    const j = await r.json();
+    if (!j.ok) {
+      msg.textContent = 'Could not stop: ' + (j.error || 'unknown');
+      stopRequested = false;
+    }
+  } catch (e) {
+    msg.textContent = 'Request failed: ' + e;
+    stopRequested = false;
+  }
 }
 function updateStatus(s) {
   if (!$('s-phase')) return;
@@ -215,9 +257,10 @@ function updateStatus(s) {
   $('s-ht').textContent  = (t.height_cm !== undefined && t.height_cm !== null) ? (t.height_cm + ' cm') : '—';
   $('s-fl').textContent  = t.flying ? 'yes' : 'no';
   $('s-note').textContent = s.note || (s.abort_reason || '—');
-  setStartButton(s.phase);
+  setMissionButtons(s.phase);
 }
 if ($('btn-start')) $('btn-start').addEventListener('click', startMission);
+if ($('btn-stop'))  $('btn-stop').addEventListener('click',  stopMission);
 
 // ---- Charts (only runs if at least one canvas is present) ---------------
 const buf = { t: [], d: [], y: [], h: [], drone_yaw: [], battery: [], height: [] };
@@ -334,13 +377,15 @@ class UiServer:
     def __init__(self, state: MissionState, latest_frame: LatestFrame,
                  host: str = "0.0.0.0", port: int = 8080,
                  history_s: float = 60.0,
-                 on_start: Optional[Callable[[], bool]] = None):
+                 on_start: Optional[Callable[[], bool]] = None,
+                 on_stop: Optional[Callable[[], bool]] = None):
         self.state = state
         self.frame = latest_frame
         self.host = host
         self.port = port
         self.history_s = history_s
         self.on_start = on_start
+        self.on_stop = on_stop
         self.app = Flask(__name__)
         self._register_routes()
         self._thread: Optional[threading.Thread] = None
@@ -374,6 +419,21 @@ class UiServer:
             if not started:
                 return jsonify({"ok": False,
                                 "error": "mission already started or not in INIT"}), 409
+            return jsonify({"ok": True})
+
+        @app.post("/api/stop")
+        def api_stop():
+            if self.on_stop is None:
+                return jsonify({"ok": False,
+                                "error": "no stop handler registered"}), 500
+            phase = self.state.snapshot().get("phase")
+            if phase in ("init", "done", "abort"):
+                return jsonify({"ok": False,
+                                "error": f"mission not running (phase={phase})"}), 409
+            try:
+                self.on_stop()
+            except Exception as e:
+                return jsonify({"ok": False, "error": str(e)}), 500
             return jsonify({"ok": True})
 
         @app.get("/video.mjpg")
