@@ -149,6 +149,18 @@ if HAS_OLYMPE_SDK:
         HAS_MAGNETO_CALIB_CMD = True
     except (ImportError, KeyError):
         HAS_MAGNETO_CALIB_CMD = False
+    # Drone serial number is reported as two halves -- "high" and "low" --
+    # via SettingsState messages that fire once during the initial
+    # state-ack flood after connect. We cache the concatenation in
+    # OlympeBackend.serial_number and surface it through /api/telemetry.
+    try:
+        from olympe.messages.common.SettingsState import (
+            ProductSerialHighChanged,
+            ProductSerialLowChanged,
+        )
+        HAS_PRODUCT_SERIAL = True
+    except (ImportError, KeyError):
+        HAS_PRODUCT_SERIAL = False
 
 
 # ─── Optional Wi-Fi control messages ────────────────────────────────────────
@@ -1867,6 +1879,12 @@ class OlympeBackend(DroneBackend):
         self._pcmd_seq = 0
         self._pcmd_seq_lock = threading.Lock()
         self._has_piloting_api: Optional[bool] = None
+        # Filled in by poll_telemetry once the drone has reported its
+        # ProductSerialHigh + ProductSerialLow state events. Stays None
+        # if the drone never reports them (older Olympe / firmware).
+        self.serial_number: Optional[str] = None
+        self._serial_high: Optional[str] = None
+        self._serial_low: Optional[str] = None
 
     def _d(self) -> Optional[olympe.Drone]:
         return self.drone
@@ -2462,6 +2480,27 @@ class OlympeBackend(DroneBackend):
         # Flying state
         fly_state = self._get_state(FlyingStateChanged)
         data["_sdk_flying"] = self._is_flying_state(fly_state)
+
+        # Serial number -- only worth polling until we've cached it.
+        if HAS_PRODUCT_SERIAL and self.serial_number is None:
+            if self._serial_high is None:
+                hi_state = self._get_state(ProductSerialHighChanged)
+                if hi_state:
+                    raw = hi_state.get("high")
+                    if raw:
+                        self._serial_high = str(raw).strip()
+            if self._serial_low is None:
+                lo_state = self._get_state(ProductSerialLowChanged)
+                if lo_state:
+                    raw = lo_state.get("low")
+                    if raw:
+                        self._serial_low = str(raw).strip()
+            if self._serial_high is not None and self._serial_low is not None:
+                self.serial_number = self._serial_high + self._serial_low
+                print(f"[ANAFI] serial_number = {self.serial_number}")
+        if self.serial_number is not None:
+            data["serial_number"] = self.serial_number
+
         data["_got_any"] = got_any
         return data
 
