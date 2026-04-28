@@ -203,13 +203,28 @@ def cmd_fly(args: argparse.Namespace) -> int:
 
     def vision_worker():
         # Pull the latest frame, run detection, push to recorder + UI.
+        # If the upstream MJPEG stream stalls (no fresh JPEG decoded for
+        # longer than pose_max_age_s), expire the held pose. Without this
+        # the controller would keep reading the LAST detection from
+        # pose_holder forever and act on it as if it were live, which is
+        # what caused the "drone hits the wall" incident in flight
+        # 2026-04-28_18-06-58_unknown (pose frozen identical for 120 s).
         last_seen_ts = 0.0
+        last_expired = False
         while not stop.is_set():
             frame, jpg, ts = reader.latest()
             if frame is None or ts == last_seen_ts:
+                if (last_seen_ts and not last_expired
+                        and time.monotonic() - last_seen_ts
+                            > cfg.pose_max_age_s):
+                    pose_holder.set(None)
+                    last_expired = True
+                    print(f"[vision] no new frame for "
+                          f">{cfg.pose_max_age_s:.1f}s -- expiring held pose")
                 time.sleep(0.01)
                 continue
             last_seen_ts = ts
+            last_expired = False
             try:
                 poses = detector.detect(frame, wanted_id=cfg.target_marker_id)
                 target = poses[0] if poses else None
