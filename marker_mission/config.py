@@ -96,17 +96,11 @@ class MissionConfig:
     # Output clamps for safety. Lower = slower & safer. -----------------------
     yaw_rc_max: int = 25                   # TUNE  (was 40; caps yaw rate ~25°/s)
     # Cap the forward speed low enough that PD's D-term can brake before
-    # the drone closes inside the distance floor. Without velocity
-    # feedforward damping (currently disabled until the vgx/vgy frame
-    # convention is verified), the only braking authority is reactive
-    # (D acts on de_fwd/dt, not on velocity), so it lags the drone's
-    # built-up momentum. Flight 2026-04-29_00-34-53 with rc_max=10:
-    # drone closed 82 cm in 1 s of full-forward command, D-term kicked
-    # in too late and the drone reached 1.91 m at floor=1.4 m before
-    # braking peaked. rc_max=5 caps forward to ~20 cm/s -- PD has plenty
-    # of room to decelerate within the deadband. Approach is slower but
-    # safe.
-    fwd_rc_max: int = 5                    # TUNE  caps fwd speed ~20 cm/s
+    # the drone closes inside the distance floor. Operator reported
+    # rc_max=5 was still approaching too fast for indoor walls; bumped
+    # down to 3 for ~12 cm/s top forward speed. Approach is slower but
+    # gives PD ample headroom to decelerate before the floor.
+    fwd_rc_max: int = 3                    # TUNE  caps fwd speed ~12 cm/s
     # Lateral motion has to be slow enough that yaw can keep tracking
     # the marker -- otherwise yaw lags, the marker drifts off-axis, and
     # the commanded "sideways" leaks into radial drift. An early try at
