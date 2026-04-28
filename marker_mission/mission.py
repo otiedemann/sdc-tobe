@@ -54,6 +54,7 @@ from .controller import MissionController, MissionState, Phase
 from .drone_api import DroneApi, MjpegStreamReader, TelemetrySnapshot
 from .recorder import FlightRecorder, make_flight_dir, write_meta
 from .ui import LatestFrame, UiServer
+from .web_calibration import CalibrationCapture
 
 
 # ---------------------------------------------------------------------------
@@ -241,13 +242,16 @@ def cmd_fly(args: argparse.Namespace) -> int:
         ).start()
         return True
 
+    cal_capture = CalibrationCapture(reader, CALIB_DIR, fps=cfg.record_fps)
+
     ui = UiServer(state, latest_ann_frame,
                   host=cfg.ui_host, port=cfg.ui_port,
                   history_s=cfg.ui_telemetry_history_s,
                   on_start=controller.trigger,
                   on_stop=request_stop_async,
                   flights_root=FLIGHTS_DIR,
-                  drone_connected=initially_connected)
+                  drone_connected=initially_connected,
+                  calibration_capture=cal_capture)
     ui.start()
     print(f"[mission] UI running at {ui.url()} (camera) and {ui.url()}/charts")
 

@@ -104,6 +104,7 @@ _PAGE_HEADER = """
     <a href="/" class="{{ 'active' if active=='video' else '' }}">Camera</a>
     <a href="/charts" class="{{ 'active' if active=='charts' else '' }}">Charts</a>
     <a href="/replay" class="{{ 'active' if active=='replay' else '' }}">Replay</a>
+    <a href="/calibrate" class="{{ 'active' if active=='calibrate' else '' }}">Calibrate</a>
   </nav>
   <span style="margin-left:auto; font-size:.85rem; color:#aab;"
         id="phase">{{ header_label or 'phase: …' }}</span>
@@ -518,6 +519,170 @@ _PAGE_FLIGHTS = _PAGE_BASE_CSS + _PAGE_HEADER + """
 </main>
 """
 
+# Camera-calibration page. Live preview on the left, capture-then-run
+# workflow on the right. The /api/calibrate/* endpoints below drive
+# this page; the operator never needs to drop to the CLI to recalibrate.
+_PAGE_CALIBRATE = _PAGE_BASE_CSS + _PAGE_HEADER + """
+<main class="grid" style="grid-template-columns: minmax(0,2fr) minmax(0,1fr);">
+  <div class="card">
+    <h2>Live camera</h2>
+    <img class="video" src="/video.mjpg" alt="camera feed">
+  </div>
+  <div class="card">
+    <h2>Camera calibration</h2>
+    <p style="font-size:.9rem; line-height:1.45;">
+      Print the OpenCV 9&times;6 inner-corner checkerboard
+      (<a target="_blank" rel="noopener"
+          href="https://github.com/opencv/opencv/raw/4.x/doc/pattern.png"
+          style="color:var(--accent);">pattern.png</a>)
+      onto A4 / Letter, glue it to flat rigid cardboard, and
+      <em>measure one square edge with a ruler</em> in millimetres
+      (printers rarely scale at exactly 100&nbsp;%).
+      Power the drone, hold it stationary (motors&nbsp;off!), and let the
+      camera see the checkerboard from many angles, distances (~0.5–2 m)
+      and tilts. Aim for 30+ distinct views over 30–60 s of capture.
+    </p>
+    <div style="display:flex; align-items:center; gap:.5rem; margin-top:.75rem;
+                font-size:.9rem;">
+      <label for="cal-square">Square edge:</label>
+      <input id="cal-square" type="number" step="0.1" value="25.0"
+             style="width:5rem; background:#0c0f12; color:var(--fg);
+                    border:1px solid #2a3038; border-radius:4px;
+                    padding:.25rem .35rem;"> mm
+      <span style="margin-left:auto; color:#aab;">
+        Drone: <code id="cal-serial">unknown</code>
+      </span>
+    </div>
+    <div style="display:flex; align-items:center; gap:.5rem; margin-top:.75rem;">
+      <button id="cal-start" type="button"
+              style="padding:.45rem .8rem; border:0; border-radius:6px;
+                     background:var(--good); color:#072413; font-weight:600;
+                     cursor:pointer; font-size:.9rem;">
+        Start capture
+      </button>
+      <button id="cal-stop" type="button"
+              style="padding:.45rem .8rem; border:0; border-radius:6px;
+                     background:var(--warn); color:#3a2e10; font-weight:600;
+                     cursor:pointer; font-size:.9rem; display:none;">
+        Stop capture
+      </button>
+      <button id="cal-run" type="button"
+              style="padding:.45rem .8rem; border:0; border-radius:6px;
+                     background:var(--accent); color:#062633; font-weight:600;
+                     cursor:pointer; font-size:.9rem;" disabled>
+        Run calibration
+      </button>
+    </div>
+    <div id="cal-msg" style="margin-top:.75rem; font-size:.85rem; color:#aab;
+                              min-height:1.2em;">Idle.</div>
+    <pre id="cal-result"
+         style="margin-top:.5rem; font-size:.8rem; color:var(--fg);
+                background:#0c0f12; border:1px solid #2a3038;
+                border-radius:6px; padding:.6rem; overflow-x:auto;
+                display:none; white-space:pre;"></pre>
+  </div>
+</main>
+<script>
+const $ = id => document.getElementById(id);
+async function refreshSerial() {
+  try {
+    const s = await (await fetch('/api/state', {cache:'no-store'})).json();
+    const sn = (s.telemetry || {}).serial_number;
+    $('cal-serial').textContent = sn || 'unknown';
+  } catch(e) {}
+}
+async function calStatus() {
+  try {
+    const r = await fetch('/api/calibrate/status', {cache:'no-store'});
+    const s = await r.json();
+    const start = $('cal-start'); const stop = $('cal-stop');
+    const run = $('cal-run'); const msg = $('cal-msg'); const result = $('cal-result');
+    let label = '';
+    switch (s.state) {
+      case 'idle':
+        start.style.display = ''; stop.style.display = 'none';
+        start.disabled = false; run.disabled = true;
+        label = 'Idle. Press Start capture and let the camera see the checkerboard.';
+        break;
+      case 'capturing':
+        start.style.display = 'none'; stop.style.display = '';
+        run.disabled = true;
+        label = `Capturing ... ${s.frames_captured} frames recorded `
+              + `(min ${s.min_frames}). Move the checkerboard around.`;
+        break;
+      case 'captured':
+        start.style.display = ''; stop.style.display = 'none';
+        start.disabled = false;
+        run.disabled = !$('cal-serial').textContent
+                     || $('cal-serial').textContent === 'unknown';
+        label = `Captured ${s.frames_captured} frames. `
+              + (run.disabled ? 'Drone serial unknown -- connect drone first.'
+                              : 'Press Run calibration when ready.');
+        break;
+      case 'running':
+        start.style.display = ''; stop.style.display = 'none';
+        start.disabled = true; run.disabled = true;
+        label = 'Running calibration ... can take 5-30 s.';
+        break;
+      case 'done':
+        start.style.display = ''; stop.style.display = 'none';
+        start.disabled = false; run.disabled = false;
+        label = `Calibration saved to ${s.saved_path}.`;
+        if (s.calibration) {
+          result.style.display = '';
+          const c = s.calibration;
+          const rms = c.rms_error == null ? 'n/a' : c.rms_error.toFixed(3);
+          result.textContent =
+            `serial:        ${c.serial}\n`
+          + `resolution:    ${c.resolution}\n`
+          + `image_size:    ${c.image_size[0]} x ${c.image_size[1]}\n`
+          + `rms_error:     ${rms} px ${c.rms_error != null && c.rms_error < 0.5 ? '(good)' : c.rms_error != null && c.rms_error < 1.0 ? '(ok)' : '(consider re-running with more views)'}\n`
+          + `fx, fy:        ${c.fx.toFixed(2)}, ${c.fy.toFixed(2)}\n`
+          + `cx, cy:        ${c.cx.toFixed(2)}, ${c.cy.toFixed(2)}\n`
+          + `calibrated_at: ${c.calibrated_at}`;
+        }
+        break;
+      case 'failed':
+        start.style.display = ''; stop.style.display = 'none';
+        start.disabled = false; run.disabled = !s.video_path;
+        label = `Failed: ${s.error || 'unknown error'}.`;
+        break;
+    }
+    msg.textContent = label;
+  } catch(e) {}
+}
+async function calStart() {
+  await fetch('/api/calibrate/start', {method:'POST'});
+  calStatus();
+}
+async function calStop() {
+  await fetch('/api/calibrate/stop', {method:'POST'});
+  calStatus();
+}
+async function calRun() {
+  const sq_mm = parseFloat($('cal-square').value);
+  const sq_m = sq_mm / 1000.0;
+  const serial = $('cal-serial').textContent;
+  const u = new URL('/api/calibrate/run', location.origin);
+  u.searchParams.set('serial', serial);
+  u.searchParams.set('square_size_m', String(sq_m));
+  const r = await fetch(u, {method:'POST'});
+  const j = await r.json();
+  if (!j.ok) $('cal-msg').textContent = `Could not start: ${j.error || 'unknown'}`;
+  calStatus();
+}
+$('cal-start').addEventListener('click', calStart);
+$('cal-stop').addEventListener('click', calStop);
+$('cal-run').addEventListener('click', calRun);
+async function tick() {
+  await refreshSerial();
+  await calStatus();
+  setTimeout(tick, 500);
+}
+tick();
+</script>
+"""
+
 
 # ---------------------------------------------------------------------------
 # UI server
@@ -530,7 +695,8 @@ class UiServer:
                  on_start: Optional[Callable[[], bool]] = None,
                  on_stop: Optional[Callable[[], bool]] = None,
                  flights_root: Optional[Path] = None,
-                 drone_connected: bool = True):
+                 drone_connected: bool = True,
+                 calibration_capture=None):
         self.state = state
         self.frame = latest_frame
         self.host = host
@@ -539,6 +705,9 @@ class UiServer:
         self.on_start = on_start
         self.on_stop = on_stop
         self.flights_root = Path(flights_root) if flights_root else None
+        # Drives the /calibrate page. May be None (e.g. view mode); the
+        # routes return 503 in that case.
+        self.calibration = calibration_capture
         # Whether a real drone is wired in. False -> Start button is
         # disabled in the camera page (replay still works fully).
         self.drone_connected = bool(drone_connected)
@@ -756,6 +925,75 @@ class UiServer:
                     time.sleep(0.05)
             return Response(gen(),
                             mimetype="multipart/x-mixed-replace; boundary=frame")
+
+        # ---- Calibration ----------------------------------------------
+        @app.get("/calibrate")
+        def calibrate_page():
+            return render_template_string(
+                _PAGE_CALIBRATE, active="calibrate",
+                history_s=self.history_s,
+                mode="live",
+                state_url="/api/state",
+                video_url="/video.mjpg",
+                replay_id=None,
+                header_label="calibration",
+                drone_connected=self.drone_connected,
+            )
+
+        @app.get("/api/calibrate/status")
+        def api_calibrate_status():
+            if self.calibration is None:
+                return jsonify({"state": "unavailable",
+                                "error": "calibration capture not configured"
+                                }), 503
+            return jsonify(self.calibration.status)
+
+        @app.post("/api/calibrate/start")
+        def api_calibrate_start():
+            if self.calibration is None:
+                return jsonify({"ok": False,
+                                "error": "not configured"}), 503
+            ok = self.calibration.start_capture()
+            if not ok:
+                return jsonify({"ok": False,
+                                "error": "already capturing or running"}), 409
+            return jsonify({"ok": True})
+
+        @app.post("/api/calibrate/stop")
+        def api_calibrate_stop():
+            if self.calibration is None:
+                return jsonify({"ok": False,
+                                "error": "not configured"}), 503
+            ok = self.calibration.stop_capture()
+            if not ok:
+                return jsonify({"ok": False,
+                                "error": "not currently capturing"}), 409
+            return jsonify({"ok": True})
+
+        @app.post("/api/calibrate/run")
+        def api_calibrate_run():
+            if self.calibration is None:
+                return jsonify({"ok": False,
+                                "error": "not configured"}), 503
+            from flask import request
+            serial = request.args.get("serial", "").strip()
+            try:
+                square_size_m = float(request.args.get("square_size_m", "0.025"))
+            except ValueError:
+                return jsonify({"ok": False,
+                                "error": "bad square_size_m"}), 400
+            try:
+                pat_str = request.args.get("pattern", "9x6")
+                cols, rows = (int(x) for x in pat_str.lower().split("x"))
+                pattern = (cols, rows)
+            except ValueError:
+                return jsonify({"ok": False,
+                                "error": "bad pattern (want COLSxROWS)"}), 400
+            ok, msg = self.calibration.run_calibration(
+                serial=serial, square_size_m=square_size_m, pattern=pattern)
+            if not ok:
+                return jsonify({"ok": False, "error": msg}), 409
+            return jsonify({"ok": True, "msg": msg})
 
         @app.post("/api/start")
         def api_start():
