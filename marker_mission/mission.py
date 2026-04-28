@@ -192,7 +192,7 @@ def cmd_fly(args: argparse.Namespace) -> int:
     # recorder is current via recorder_box[0]; recording_paused governs
     # WHEN they actually write -- it's set during pre-flight (INIT) and
     # post-flight (DONE/ABORT), and cleared while the drone is airborne
-    # (TAKEOFF / SEARCH / ALIGN / APPROACH / ORBIT / HOLD / LAND). The
+    # (TAKEOFF / SEARCH / ALIGN / APPROACH / HOLD / LAND). The
     # phase transitions below drive that flag so each saved flight only
     # contains the actual flight, not the operator dry-run period.
     state = MissionState()
@@ -206,8 +206,7 @@ def cmd_fly(args: argparse.Namespace) -> int:
     recording_paused.set()
 
     AIRBORNE_PHASES = {Phase.TAKEOFF, Phase.SEARCH, Phase.ALIGN,
-                       Phase.APPROACH, Phase.ORBIT, Phase.HOLD,
-                       Phase.LAND}
+                       Phase.APPROACH, Phase.HOLD, Phase.LAND}
 
     def on_phase_change(old_phase, new_phase, note):
         # Recording follows the airborne envelope: starts at TAKEOFF,

@@ -43,7 +43,10 @@ class MissionConfig:
 
     # --- Mission goals -------------------------------------------------------
     target_distance_m: float = 1.0         # final standoff distance from marker [m]
-    target_relative_heading_deg: float = 90.0  # final bearing around marker [deg]
+    # HOLD's heading setpoint. Default 0 means "stay where APPROACH put us"
+    # (drone facing the marker straight on). Set non-zero only if you want
+    # HOLD to actively slide the drone around the marker after approach.
+    target_relative_heading_deg: float = 0.0  # final bearing around marker [deg]
     hold_time_s: float = 60.0              # hover duration after arriving
 
     # --- Control loop --------------------------------------------------------
@@ -93,13 +96,13 @@ class MissionConfig:
     # Output clamps for safety. Lower = slower & safer. -----------------------
     yaw_rc_max: int = 25                   # TUNE  (was 40; caps yaw rate ~25°/s)
     fwd_rc_max: int = 10                   # TUNE  (was 30; caps fwd speed ~40 cm/s)
-    # Orbit needs lateral motion slow enough for yaw to keep tracking the
-    # marker -- otherwise yaw lags, the marker drifts off-axis, and the
-    # commanded "sideways" leaks into radial drift. First orbit attempt at
-    # rc=10 spiraled outward until the marker fell out of FOV. With rc=4
-    # the required yaw rate (~v/d) drops well below yaw_rc_max and v^2/r
-    # centrifugal drift is ~6x smaller.
-    lat_rc_max: int = 4                    # TUNE  (was 10; orbit-stability limited)
+    # Lateral motion has to be slow enough that yaw can keep tracking
+    # the marker -- otherwise yaw lags, the marker drifts off-axis, and
+    # the commanded "sideways" leaks into radial drift. An early try at
+    # rc=10 spiraled outward until the marker fell out of FOV. With
+    # rc=4 the required yaw rate (~v/d) drops well below yaw_rc_max
+    # and v^2/r centrifugal drift is ~6x smaller.
+    lat_rc_max: int = 4                    # TUNE  (was 10; tangential-stability limited)
     ud_rc_max: int = 25                    # TUNE  (we do not actively control altitude here)
 
     # Hard distance floor: refuse forward commands inside this multiple of the
@@ -128,11 +131,10 @@ class MissionConfig:
                                               # heading
     # ALIGN's job is just to keep the marker out of the detector's
     # oblique-angle dead zone before APPROACH closes distance -- it
-    # does NOT need to centre heading precisely (the ORBIT phase
-    # later does that with its tighter 2 deg deadband at close
-    # range). At ~3 m range the per-frame heading estimate jitters
-    # +/-15-20 deg, so a tight ALIGN threshold makes the phase spin
-    # forever without improving anything; +/-30 deg lets ALIGN
+    # does NOT need to centre heading precisely (APPROACH and HOLD
+    # tighten it later). At ~3 m range the per-frame heading estimate
+    # jitters +/-15-20 deg, so a tight ALIGN threshold makes the phase
+    # spin forever without improving anything; +/-30 deg lets ALIGN
     # settle as soon as the drone is roughly facing the marker and
     # hands off to APPROACH.
     align_heading_deadband_deg: float = 30.0  # TUNE
@@ -148,8 +150,6 @@ class MissionConfig:
     # here lets PD fight the drift early, while ALIGN keeps its
     # looser threshold for noise tolerance at long range.
     approach_heading_deadband_deg: float = 5.0  # TUNE
-    orbit_step_deg: float = 5.0            # TUNE  bearing change per control tick
-                                              # (limits how fast we orbit)
 
     # --- Pose smoothing ------------------------------------------------------
     pose_smoothing_alpha: float = 0.6      # TUNE  EMA factor for measurements

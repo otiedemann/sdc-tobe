@@ -14,24 +14,25 @@ State machine
 
 ::
 
-    INIT -> TAKEOFF -> SEARCH -> APPROACH -> ORBIT -> HOLD -> LAND -> DONE
-                          ^         |          |        |
-                          |         v          v        v
-                          \\---------+----------+--------/   (marker lost)
+    INIT -> TAKEOFF -> SEARCH -> ALIGN -> APPROACH -> HOLD -> LAND -> DONE
+                          ^         |        |          |
+                          |         v        v          v
+                          \\---------+--------+----------/   (marker lost)
 
 Phases:
 
 * TAKEOFF   -- request takeoff and wait until ``flying`` becomes True.
-* SEARCH    -- yaw in place. If the marker becomes visible, go to APPROACH.
+* SEARCH    -- yaw in place. If the marker becomes visible, go to ALIGN.
                If a full sweep completes without a sighting, LAND.
-* APPROACH  -- close yaw error to zero AND distance error to zero. The
-               orbit-bearing error is intentionally NOT controlled here;
-               we simply face the marker straight on first.
-* ORBIT     -- maintain target distance while sliding around the marker
-               until relative_heading hits the target. Yaw is also kept
-               at zero (camera faces the marker) so that the final pose
-               is yaw=0, heading=target.
-* HOLD      -- hover for ``hold_time_s`` while keeping all errors zero.
+* ALIGN     -- orbit at the start radius until heading is roughly 0
+               (drone roughly faces the marker straight on) so that the
+               subsequent APPROACH stays inside the detector's reliable
+               tilt range.
+* APPROACH  -- close yaw error to zero AND distance error to zero,
+               while gently holding heading near 0.
+* HOLD      -- hover for ``hold_time_s`` while station-keeping
+               (yaw / distance / heading all actively corrected) at the
+               post-approach position. Then transitions to LAND.
 * LAND      -- request land and wait until ``flying`` becomes False.
 * DONE      -- terminal state.
 
@@ -61,10 +62,9 @@ class Phase(enum.Enum):
     INIT      = "init"
     TAKEOFF   = "takeoff"
     SEARCH    = "search"
-    ALIGN     = "align"     # orbit at start radius until heading=0
-    APPROACH  = "approach"  # close distance to target with heading already ~0
-    ORBIT     = "orbit"     # orbit at target radius until heading=target
-    HOLD      = "hold"
+    ALIGN     = "align"     # orbit at start radius until heading ~ 0
+    APPROACH  = "approach"  # close distance to target with heading held near 0
+    HOLD      = "hold"      # station-keeping hover for hold_time_s, then LAND
     LAND      = "land"
     DONE      = "done"
     ABORT     = "abort"
@@ -475,8 +475,6 @@ class MissionController:
                     self._step_align(tel, now)
                 elif phase == Phase.APPROACH:
                     self._step_approach(tel, now)
-                elif phase == Phase.ORBIT:
-                    self._step_orbit(tel, now)
                 elif phase == Phase.HOLD:
                     self._step_hold(tel, now)
                 elif phase == Phase.LAND:
@@ -599,11 +597,12 @@ class MissionController:
         """Orbit the drone around the marker at its current radius until
         relative_heading is ~0 (marker normal pointing at the camera).
 
-        Same lateral law as _step_orbit, but with target heading 0 and
-        the forward setpoint pinned to the radius captured on phase
-        entry (state.align_distance_m). We don't close distance here --
-        that's APPROACH's job, and we want it to start with the marker
-        head-on so its tilt stays inside the detector's reliable range.
+        Lateral PD slides the drone tangentially around the marker to
+        drive heading toward 0. Forward setpoint is pinned to the radius
+        captured on phase entry (state.align_distance_m) -- we don't
+        close distance here, that's APPROACH's job. We want APPROACH to
+        start with the marker head-on so its tilt stays inside the
+        detector's reliable range.
         """
         cfg = self.cfg
         meas = self.smoother.get(now)
@@ -627,8 +626,8 @@ class MissionController:
         e_hdg = ((0.0 - hdg) + 540.0) % 360.0 - 180.0
 
         # ALIGN uses its own (more lenient) heading deadband -- the
-        # detector is noisy at long range / off-axis and the orbit
-        # phase's tight 2 deg threshold is impossible to satisfy here.
+        # detector is noisy at long range / off-axis and HOLD's tight
+        # 2 deg threshold is impossible to satisfy here.
         align_dead = cfg.align_heading_deadband_deg
 
         u_yaw = 0.0 if abs(e_yaw) < cfg.yaw_deadband_deg else self.pd_yaw.step(e_yaw, now)
@@ -708,8 +707,8 @@ class MissionController:
         if floor_active:
             u_fwd = min(0.0, u_fwd)
 
-        # Lateral: same orbit-style law as ALIGN but pinned to heading 0
-        # for the whole approach. We use approach_heading_deadband_deg
+        # Lateral: same tangential-slide PD as ALIGN but pinned to
+        # heading 0 for the whole approach. We use approach_heading_deadband_deg
         # (~5 deg) -- much tighter than ALIGN. ALIGN's +/-30 deg gave
         # APPROACH 60 deg of free space inside which lateral PD never
         # fired; heading drift integrated unchecked until it exited the
@@ -742,78 +741,7 @@ class MissionController:
             else:
                 self.state.settle_began_at = None
         if settled:
-            self._set_phase(Phase.ORBIT, "approach settled")
-
-    # ----------------------------------------------------------------- orbit
-    def _step_orbit(self, tel: Optional[TelemetrySnapshot],
-                   now: float) -> None:
-        """Slide around the marker maintaining distance, until the heading
-        target is reached.
-
-        Strategy: command lateral motion proportional to the heading error
-        AROUND the marker, plus forward/back motion to keep the distance,
-        plus yaw correction to keep the marker dead ahead.
-        """
-        cfg = self.cfg
-        meas = self.smoother.get(now)
-        if meas is None:
-            self._marker_lost(now); return
-        d, yaw_to_marker, hdg = meas
-
-        # Hard distance floor: prevent forward push only; yaw and lateral
-        # keep running so the orbit doesn't freeze when the drone dips
-        # past the floor.
-        floor_active = d < cfg.distance_floor_factor * cfg.target_distance_m
-
-        e_yaw = yaw_to_marker
-        e_fwd = d - cfg.target_distance_m
-        # Heading error: difference, shortest-arc.
-        e_hdg = ((cfg.target_relative_heading_deg - hdg) + 540.0) % 360.0 - 180.0
-
-        # Deadbands
-        u_yaw = 0.0 if abs(e_yaw) < cfg.yaw_deadband_deg else self.pd_yaw.step(e_yaw, now)
-        u_fwd_raw = 0.0 if abs(e_fwd) < cfg.distance_deadband_m else self.pd_fwd.step(e_fwd, now)
-        u_fwd = self._velocity_damp_fwd(u_fwd_raw, tel)
-        if floor_active:
-            u_fwd = min(0.0, u_fwd)
-        # Lateral channel: slide the drone around the marker.
-        # Sign reasoning (top-down view, drone facing marker):
-        #
-        #     +heading => drone is on the marker's RIGHT (looking outward
-        #     from the marker), which is the camera's LEFT side of the
-        #     scene. To move from heading=0 toward heading=+90, the drone
-        #     must walk CW around the marker as seen from above. From the
-        #     drone's own POV (facing the marker), walking CW around the
-        #     marker means stepping to its OWN LEFT, which is a NEGATIVE
-        #     `lr` command (lr>0 = right). So u_lat = -k * e_hdg.
-        if abs(e_hdg) < cfg.heading_deadband_deg:
-            u_lat_raw = 0.0
-        else:
-            # Convert heading-error degrees into a metres-equivalent arc
-            # length so the lateral PD stays sensibly tuned at any
-            # distance: arc = d * theta. Negate per the comment above.
-            arc_err_m = -d * math.radians(e_hdg)
-            u_lat_raw = self.pd_lat.step(arc_err_m, now)
-        u_lat = self._velocity_damp_lat(u_lat_raw, tel)
-
-        self._send_rc(lr=int(u_lat), fb=int(u_fwd), ud=0, yaw=int(u_yaw))
-
-        in_band = (abs(e_yaw) < cfg.yaw_deadband_deg
-                   and abs(e_fwd) < cfg.distance_deadband_m
-                   and abs(e_hdg) < cfg.heading_deadband_deg)
-        # Same lock-then-decide pattern as approach: don't call _set_phase
-        # while holding state.lock (non-reentrant -> self-deadlock).
-        settled = False
-        with self.state.lock:
-            if in_band:
-                if self.state.settle_began_at is None:
-                    self.state.settle_began_at = now
-                if now - self.state.settle_began_at >= cfg.approach_settle_time_s:
-                    settled = True
-            else:
-                self.state.settle_began_at = None
-        if settled:
-            self._set_phase(Phase.HOLD, "orbit reached target heading")
+            self._set_phase(Phase.HOLD, "approach settled -- station-keeping")
 
     # ------------------------------------------------------------------ hold
     def _step_hold(self, tel: Optional[TelemetrySnapshot],
@@ -844,7 +772,9 @@ class MissionController:
         # keep running so HOLD can still recenter while pushed inside the floor.
         floor_active = d < cfg.distance_floor_factor * cfg.target_distance_m
 
-        # Same control law as orbit, just with the goal already met.
+        # Station-keeping PD: yaw / distance / heading are all actively
+        # corrected so wind, rotor wash and sensor drift don't push the
+        # drone off station during the timed hover.
         e_yaw = yaw_to_marker
         e_fwd = d - cfg.target_distance_m
         e_hdg = ((cfg.target_relative_heading_deg - hdg) + 540.0) % 360.0 - 180.0
@@ -856,7 +786,15 @@ class MissionController:
         if abs(e_hdg) < cfg.heading_deadband_deg:
             u_lat_raw = 0.0
         else:
-            # Same sign reasoning as in _step_orbit: u_lat = -k * e_hdg.
+            # Lateral channel: slide the drone tangentially to correct any
+            # angular drift around the marker. Sign reasoning (top-down,
+            # drone facing marker): +heading => drone is on the marker's
+            # right (CW from normal). To bring heading back DOWN toward
+            # target, drone must walk CCW around the marker, which from
+            # its own POV is stepping body-RIGHT -- so u_lat has the
+            # OPPOSITE sign of e_hdg: u_lat = -k * e_hdg, expressed via
+            # arc length d * radians(e_hdg) so the gain stays sensibly
+            # tuned at any distance.
             arc_err_m = -d * math.radians(e_hdg)
             u_lat_raw = self.pd_lat.step(arc_err_m, now)
         u_lat = self._velocity_damp_lat(u_lat_raw, tel)
@@ -908,8 +846,8 @@ class MissionController:
     # ----------------------------------------------------- pre-flight dry-run
     def _step_preflight_dryrun(self, tel: Optional[TelemetrySnapshot],
                               now: float) -> None:
-        """Compute the RC commands an orbit-style controller WOULD send and
-        write them to ``state.last_rc`` without sending to the drone.
+        """Compute the RC commands a station-keeping controller WOULD send
+        and write them to ``state.last_rc`` without sending to the drone.
 
         Runs in INIT phase while the operator is walking the marker around
         with props off, so the UI displays live PD response. Distance
