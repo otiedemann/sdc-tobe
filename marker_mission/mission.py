@@ -188,21 +188,44 @@ def cmd_fly(args: argparse.Namespace) -> int:
     # The recorder is rotated per mission (see the mission loop below)
     # so each run lands in its own ~/.marker_mission/flights/<ts>_<serial>/
     # directory with its own log + videos. The workers reference whichever
-    # recorder is current via recorder_box[0]; recording_paused goes high
-    # during the brief moment we finalize one recorder and create the next.
+    # recorder is current via recorder_box[0]; recording_paused governs
+    # WHEN they actually write -- it's set during pre-flight (INIT) and
+    # post-flight (DONE/ABORT), and cleared while the drone is airborne
+    # (TAKEOFF / SEARCH / ALIGN / APPROACH / ORBIT / HOLD / LAND). The
+    # phase transitions below drive that flag so each saved flight only
+    # contains the actual flight, not the operator dry-run period.
     state = MissionState()
     flight_dir = make_flight_dir(FLIGHTS_DIR, serial)
     recorder = FlightRecorder(flight_dir, fps=cfg.record_fps)
     print(f"[mission] flight artefacts: {flight_dir}")
     recorder_box = [recorder]
     flight_dir_box = [flight_dir]
+    # Start paused -- INIT is not part of the flight.
     recording_paused = threading.Event()
+    recording_paused.set()
+
+    AIRBORNE_PHASES = {Phase.TAKEOFF, Phase.SEARCH, Phase.ALIGN,
+                       Phase.APPROACH, Phase.ORBIT, Phase.HOLD,
+                       Phase.LAND}
+
+    def on_phase_change(old_phase, new_phase, note):
+        # Recording follows the airborne envelope: starts at TAKEOFF,
+        # captures everything through LAND, stops at DONE / ABORT.
+        if new_phase in AIRBORNE_PHASES:
+            if recording_paused.is_set():
+                print(f"[rec] starting recording (phase={new_phase.value})")
+            recording_paused.clear()
+        else:
+            if not recording_paused.is_set():
+                print(f"[rec] stopping recording (phase={new_phase.value})")
+            recording_paused.set()
 
     # Build the controller before the UI so the UI's "Start mission" button
     # can call into it.
     controller = MissionController(api, cfg, state,
                                    frame_pose_provider=pose_holder.get,
-                                   telemetry_provider=tel_holder.get)
+                                   telemetry_provider=tel_holder.get,
+                                   on_phase_change=on_phase_change)
 
     # The Stop button calls controller.stop() which blocks for up to ~25 s
     # waiting for the safe-shutdown to finish. We don't want the Flask
@@ -409,21 +432,21 @@ def cmd_fly(args: argparse.Namespace) -> int:
                 "note": final["note"],
                 "serial": serial,
             }
+            # Pause recording for the swap. on_phase_change keeps it
+            # paused for the whole next INIT phase too, so the new
+            # flight_dir only fills up once the next TAKEOFF fires.
             recording_paused.set()
-            try:
-                write_meta(flight_dir_box[0], cfg, calibration, outcome)
-                recorder_box[0].stop(meta=None)
-                print(f"[mission #{mission_idx}] artefacts saved in "
-                      f"{flight_dir_box[0]}")
-                if stop.is_set():
-                    break
-                # ---- Roll a fresh flight dir + recorder for the next run.
-                new_dir = make_flight_dir(FLIGHTS_DIR, serial)
-                flight_dir_box[0] = new_dir
-                recorder_box[0] = FlightRecorder(new_dir, fps=cfg.record_fps)
-                print(f"[mission] new flight artefacts: {new_dir}")
-            finally:
-                recording_paused.clear()
+            write_meta(flight_dir_box[0], cfg, calibration, outcome)
+            recorder_box[0].stop(meta=None)
+            print(f"[mission #{mission_idx}] artefacts saved in "
+                  f"{flight_dir_box[0]}")
+            if stop.is_set():
+                break
+            # ---- Roll a fresh flight dir + recorder for the next run.
+            new_dir = make_flight_dir(FLIGHTS_DIR, serial)
+            flight_dir_box[0] = new_dir
+            recorder_box[0] = FlightRecorder(new_dir, fps=cfg.record_fps)
+            print(f"[mission] new flight artefacts: {new_dir}")
 
             # Reset the controller + shared state so the next iteration
             # arms cleanly back in INIT.
