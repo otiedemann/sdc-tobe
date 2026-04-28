@@ -959,10 +959,27 @@ class MissionController:
 
     def _velocity_damp_lat(self, u_raw: float,
                           tel: Optional[TelemetrySnapshot]) -> float:
-        """Mirror of :meth:`_velocity_damp_fwd` for the lateral channel."""
+        """Lateral mirror of :meth:`_velocity_damp_fwd`, but the SIGN
+        is inverted because vgx on this drone is body-LEFT-positive
+        (NOT body-right as the standard NED convention would say).
+
+        Empirically verified across two flights: a sustained
+        ``rc_lr = -4`` (= body-LEFT command, drone observably moving
+        body-LEFT, relative_heading drifts in the expected direction)
+        produces ``vgx`` rising from ~0 to +25-35 cm/s. So vgx > 0
+        corresponds to body-LEFT motion.
+
+        u_raw < 0 means the controller wants body-LEFT. To brake an
+        already-leftward drift (vgx > 0) we need a body-RIGHT bias --
+        i.e. ADD ``lat_kv * vgx`` rather than subtract it. With the
+        old (subtracting) sign, when ALIGN crossed heading=0 the
+        damping was REINFORCING the lateral motion, which is why the
+        drone was overshooting through the deadband instead of
+        braking inside it.
+        """
         cfg = self.cfg
         vgx = self._telemetry_speed(tel, "vgx")
-        u = u_raw if vgx is None else u_raw - cfg.lat_kv * vgx
+        u = u_raw if vgx is None else u_raw + cfg.lat_kv * vgx
         return max(-cfg.lat_rc_max, min(cfg.lat_rc_max, u))
 
     def _marker_lost(self, now: float, escalate: bool = True) -> None:
