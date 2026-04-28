@@ -112,18 +112,20 @@ class ArucoDetector:
         self._params.cornerRefinementWinSize = 5
         self._detector = cv2.aruco.ArucoDetector(self._aruco_dict, self._params)
 
-        # Per-marker cache of the last accepted outward-normal vector (in
-        # camera frame) and the timestamp it was accepted. Used to break
-        # the IPPE_SQUARE planar-pose ambiguity by temporal continuity --
-        # at low real tilt and long range, the two IPPE solutions have
-        # near-identical reprojection error and the solver flips between
-        # them on sub-pixel corner noise, producing the +/-10 deg "twin
-        # state" jitter on relative_heading_deg observed at 2 m standoff.
-        # Picking whichever solution is closer to the previous frame's
-        # normal collapses the jitter -- the drone's body rotation and
-        # marker geometry change continuously, so the correct solution
-        # also moves continuously.
-        self._prev_normal_cam: dict[int, tuple[np.ndarray, float]] = {}
+        # Per-marker cache of the last accepted relative_heading_deg and
+        # its timestamp. Used to break the IPPE_SQUARE planar-pose
+        # ambiguity by temporal continuity: pick whichever IPPE candidate
+        # has the relative_heading closest to the previous accepted
+        # value. relative_heading_deg is purely geometric (angle between
+        # marker normal and marker->drone vector in horizontal plane)
+        # and gimbal-stabilised, so it does NOT need correction for
+        # drone yaw drift. An earlier version cached the camera-frame
+        # normal vector and compared by dot product, but that comparison
+        # was insensitive enough that the planar mirror could still flip
+        # in (flight 22-38-36 orbit: hdg jumped +28 -> -4 -> -25 in two
+        # frames while distance stayed put -- an instantaneous mirror,
+        # not motion). Comparing the actual hdg quantity catches it.
+        self._prev_relhdg: dict[int, tuple[float, float]] = {}
         self._ambiguity_max_age_s = 5.0  # cache invalidates after this gap
 
         # 3D marker corners in marker frame, OpenCV ArUco order TL-TR-BR-BL,
@@ -175,25 +177,31 @@ class ArucoDetector:
 
             chosen_rvec: Optional[np.ndarray] = None
             chosen_tvec: Optional[np.ndarray] = None
-            chosen_normal: Optional[np.ndarray] = None
+            chosen_pose: Optional[MarkerPose] = None
             if candidates:
-                prev = self._prev_normal_cam.get(mid)
-                prev_n = (prev[0] if prev is not None
-                          and (ts - prev[1]) < self._ambiguity_max_age_s
-                          else None)
+                # Build the full pose for each candidate so we can
+                # compare on the actual relative_heading we care about
+                # rather than a proxy (camera-frame normal dot product
+                # was not discriminative enough at low tilt).
                 scored = []
                 for r, t, e in candidates:
-                    R, _ = cv2.Rodrigues(r.reshape(3, 1))
-                    n = (R @ np.array([0.0, 0.0, 1.0])).astype(float)
-                    if n[2] > 0:
-                        n = -n
-                    sim = float(np.dot(n, prev_n)) if prev_n is not None else 0.0
-                    scored.append((sim, e, r, t, n))
-                if prev_n is not None:
-                    scored.sort(key=lambda x: -x[0])    # closer-to-prev wins
+                    pose = self._build_pose(mid, img_pts, r, t, ts, (W, H))
+                    scored.append((pose, r, t, e))
+
+                prev = self._prev_relhdg.get(mid)
+                prev_hdg = (prev[0] if prev is not None
+                            and (ts - prev[1]) < self._ambiguity_max_age_s
+                            else None)
+                if prev_hdg is not None and len(scored) > 1:
+                    def hdg_delta(item):
+                        d = ((item[0].relative_heading_deg - prev_hdg
+                              + 540.0) % 360.0) - 180.0
+                        return abs(d)
+                    scored.sort(key=hdg_delta)
                 else:
-                    scored.sort(key=lambda x: x[1])     # else lowest reproj err
-                _, _, chosen_rvec, chosen_tvec, chosen_normal = scored[0]
+                    scored.sort(key=lambda x: x[3])     # lowest reproj err first
+
+                chosen_pose, chosen_rvec, chosen_tvec, chosen_err = scored[0]
 
                 # Reproj-err sanity gate: a winning IPPE candidate that still
                 # mis-projects badly is suspect -- fall back to ITERATIVE.
@@ -203,6 +211,7 @@ class ArucoDetector:
                     proj.reshape(-1, 2) - img_pts, axis=1).mean())
                 if reproj_err > 2.0:           # TUNE: pixel threshold
                     chosen_rvec = None
+                    chosen_pose = None
 
             if chosen_rvec is None:
                 ok2, rvec, tvec = cv2.solvePnP(self._obj_pts, img_pts, K, D,
@@ -213,15 +222,11 @@ class ArucoDetector:
                     continue
                 chosen_rvec = rvec.ravel()
                 chosen_tvec = tvec.ravel()
-                R, _ = cv2.Rodrigues(chosen_rvec.reshape(3, 1))
-                chosen_normal = (R @ np.array([0.0, 0.0, 1.0])).astype(float)
-                if chosen_normal[2] > 0:
-                    chosen_normal = -chosen_normal
+                chosen_pose = self._build_pose(mid, img_pts, chosen_rvec,
+                                               chosen_tvec, ts, (W, H))
 
-            self._prev_normal_cam[mid] = (chosen_normal, ts)
-            mp = self._build_pose(mid, img_pts, chosen_rvec, chosen_tvec,
-                                  ts, (W, H))
-            out.append(mp)
+            self._prev_relhdg[mid] = (chosen_pose.relative_heading_deg, ts)
+            out.append(chosen_pose)
         return out
 
     # ----------------------------------------------------------------- build
