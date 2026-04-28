@@ -318,16 +318,27 @@ def cmd_fly(args: argparse.Namespace) -> int:
                 target = poses[0] if poses else None
                 pose_holder.set(target)
                 # Status overlay -------------------------------------------
+                # Use the smoothed values from state.snapshot() so the
+                # baked-in overlay matches what the CSV records and what
+                # the controller actually acts on. Earlier we used the
+                # raw per-frame pose (target.*), which diverged from the
+                # smoothed CSV columns whenever the smoother absorbed an
+                # IPPE branch flip or jitter -- the operator then saw
+                # video showing -16 deg next to a CSV row at +12 deg
+                # at the same instant.
                 snap = state.snapshot()
                 lines = [
                     f"phase: {snap['phase']}",
                     f"target id={cfg.target_marker_id}  "
                     f"size={cfg.marker_size_m*100:.0f}cm",
                 ]
-                if target:
+                d_s = snap.get("distance_m")
+                y_s = snap.get("yaw_to_marker_deg")
+                h_s = snap.get("relative_heading_deg")
+                if target and d_s is not None:
                     lines.append(
-                        f"d={target.distance_m:.2f}m  yaw={target.yaw_deg:+.1f}deg  "
-                        f"hdg={target.relative_heading_deg:+.1f}deg")
+                        f"d={d_s:.2f}m  yaw={y_s:+.1f}deg  "
+                        f"hdg={h_s:+.1f}deg")
                 else:
                     lines.append("marker: NOT VISIBLE")
                 ann = annotate_frame(frame, poses,
