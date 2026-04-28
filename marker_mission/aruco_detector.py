@@ -187,19 +187,33 @@ class ArucoDetector:
                 for r, t, e in candidates:
                     pose = self._build_pose(mid, img_pts, r, t, ts, (W, H))
                     scored.append((pose, r, t, e))
+                # Always start from "lowest reprojection error first" --
+                # this is the geometric truth when one solution clearly
+                # fits better. Temporal continuity only overrides when
+                # the candidates are within sub-pixel tie-territory (the
+                # truly ambiguous case where IPPE flips on noise).
+                scored.sort(key=lambda x: x[3])
 
                 prev = self._prev_relhdg.get(mid)
                 prev_hdg = (prev[0] if prev is not None
                             and (ts - prev[1]) < self._ambiguity_max_age_s
                             else None)
                 if prev_hdg is not None and len(scored) > 1:
-                    def hdg_delta(item):
-                        d = ((item[0].relative_heading_deg - prev_hdg
-                              + 540.0) % 360.0) - 180.0
-                        return abs(d)
-                    scored.sort(key=hdg_delta)
-                else:
-                    scored.sort(key=lambda x: x[3])     # lowest reproj err first
+                    best_err = scored[0][3]
+                    second_err = scored[1][3]
+                    # "Ambiguous" = both fit reasonably AND errs are close.
+                    # Otherwise the lower-err candidate is the geometric
+                    # winner, even if it disagrees with the cached value
+                    # (this prevents cache lock-in: an early wrong branch
+                    # would otherwise self-perpetuate).
+                    ambiguous = (best_err < 1.0
+                                 and second_err < 2.0 * best_err + 0.2)
+                    if ambiguous:
+                        def hdg_delta(item):
+                            d = ((item[0].relative_heading_deg - prev_hdg
+                                  + 540.0) % 360.0) - 180.0
+                            return abs(d)
+                        scored.sort(key=hdg_delta)
 
                 chosen_pose, chosen_rvec, chosen_tvec, chosen_err = scored[0]
 
