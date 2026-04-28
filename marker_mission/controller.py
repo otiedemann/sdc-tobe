@@ -120,7 +120,20 @@ class PoseSmoother:
     different noise characteristics. We do NOT smooth across angle wrap
     boundaries -- the values come out of solvePnP in the (-180, 180]
     range and never wrap during a normal mission, so plain EMA is fine.
+
+    The heading channel additionally has an outlier-rejection guard:
+    a single-tick change beyond ``hdg_jump_max_deg`` is physically
+    impossible (would require >140 deg/s tangential motion at d=1.5m),
+    so it must be a planar-pose mirror flip from the IPPE solver. We
+    hold the previous smoothed value through such a sample. If the
+    "jump" persists for ``hdg_jump_consecutive_max`` consecutive ticks,
+    we accept it as real motion and resume normal smoothing -- this
+    way a real but fast manoeuvre still gets tracked, while a single
+    branch flip gets ignored.
     """
+
+    HDG_JUMP_MAX_DEG = 15.0           # max plausible per-tick change
+    HDG_JUMP_CONSECUTIVE_MAX = 5      # accept after this many "jump" ticks
 
     def __init__(self, alpha: float, max_age_s: float):
         self.alpha = float(alpha)
@@ -129,12 +142,14 @@ class PoseSmoother:
         self._yaw: Optional[float] = None
         self._hdg: Optional[float] = None
         self._last_seen: float = 0.0
+        self._hdg_jump_streak: int = 0
 
     def reset(self) -> None:
         self._d = None
         self._yaw = None
         self._hdg = None
         self._last_seen = 0.0
+        self._hdg_jump_streak = 0
 
     def update(self, pose: Optional[MarkerPose], now: float) -> None:
         if pose is None:
@@ -143,11 +158,27 @@ class PoseSmoother:
             self._d = pose.distance_m
             self._yaw = pose.yaw_deg
             self._hdg = pose.relative_heading_deg
+            self._hdg_jump_streak = 0
         else:
             a = self.alpha
             self._d   = a * pose.distance_m            + (1 - a) * self._d
             self._yaw = a * pose.yaw_deg               + (1 - a) * self._yaw
-            self._hdg = a * pose.relative_heading_deg  + (1 - a) * self._hdg
+            # Heading: outlier-reject single-frame jumps. shortest-arc
+            # delta in (-180, 180].
+            delta = ((pose.relative_heading_deg - self._hdg + 540.0)
+                     % 360.0) - 180.0
+            if abs(delta) > self.HDG_JUMP_MAX_DEG:
+                self._hdg_jump_streak += 1
+                if self._hdg_jump_streak < self.HDG_JUMP_CONSECUTIVE_MAX:
+                    # treat as IPPE flip; hold previous smoothed hdg
+                    pass
+                else:
+                    # persistent -> real motion, resync
+                    self._hdg = pose.relative_heading_deg
+                    self._hdg_jump_streak = 0
+            else:
+                self._hdg = a * pose.relative_heading_deg + (1 - a) * self._hdg
+                self._hdg_jump_streak = 0
         self._last_seen = now
 
     def get(self, now: float) -> Optional[tuple[float, float, float]]:
