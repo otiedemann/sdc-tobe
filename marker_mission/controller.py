@@ -620,10 +620,15 @@ class MissionController:
         # Heading error: shortest-arc to 0.
         e_hdg = ((0.0 - hdg) + 540.0) % 360.0 - 180.0
 
+        # ALIGN uses its own (more lenient) heading deadband -- the
+        # detector is noisy at long range / off-axis and the orbit
+        # phase's tight 2 deg threshold is impossible to satisfy here.
+        align_dead = cfg.align_heading_deadband_deg
+
         u_yaw = 0.0 if abs(e_yaw) < cfg.yaw_deadband_deg else self.pd_yaw.step(e_yaw, now)
         u_fwd_raw = 0.0 if abs(e_fwd) < cfg.distance_deadband_m else self.pd_fwd.step(e_fwd, now)
         u_fwd = self._velocity_damp_fwd(u_fwd_raw, tel)
-        if abs(e_hdg) < cfg.heading_deadband_deg:
+        if abs(e_hdg) < align_dead:
             u_lat_raw = 0.0
         else:
             arc_err_m = -d * math.radians(e_hdg)
@@ -632,9 +637,11 @@ class MissionController:
 
         self._send_rc(lr=int(u_lat), fb=int(u_fwd), ud=0, yaw=int(u_yaw))
 
-        # Settle when heading is centred; yaw has to be roughly centred
-        # too (it's the camera's view of the marker, drifts as we move).
-        in_band = (abs(e_hdg) < cfg.heading_deadband_deg
+        # Settle when heading is within the lenient ALIGN deadband.
+        # yaw_to_marker still uses the tight yaw deadband -- yaw is
+        # measured in pixels and is far less noisy than relative
+        # heading at oblique angles.
+        in_band = (abs(e_hdg) < align_dead
                    and abs(e_yaw) < cfg.yaw_deadband_deg)
         # Capture transition decision under the lock, fire _set_phase
         # OUTSIDE -- threading.Lock isn't reentrant.
