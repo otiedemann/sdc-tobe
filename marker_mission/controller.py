@@ -195,6 +195,29 @@ class MissionState:
 
     lock: threading.Lock = field(default_factory=threading.Lock)
 
+    def reset(self, cfg: MissionConfig) -> None:
+        """Clear per-mission fields so the same MissionState instance can
+        be re-used for a fresh run. Telemetry is intentionally left
+        untouched -- the telemetry_worker keeps it fresh across missions.
+        """
+        with self.lock:
+            self.phase = Phase.INIT
+            self.phase_started_at = 0.0
+            self.started_at = 0.0
+            self.last_pose = None
+            self.smoothed = None
+            self.last_rc = (0, 0, 0, 0)
+            self.target_distance_m = cfg.target_distance_m
+            self.target_relative_heading_deg = cfg.target_relative_heading_deg
+            self.settle_began_at = None
+            self.hold_began_at = None
+            self.search_began_at = None
+            self.search_yaw_swept_deg = 0.0
+            self.last_marker_seen_at = 0.0
+            self.align_distance_m = None
+            self.abort_reason = ""
+            self.note = ""
+
     def snapshot(self) -> dict:
         with self.lock:
             d = yaw = hdg = None
@@ -267,6 +290,29 @@ class MissionController:
         self._thread = threading.Thread(target=self._run, daemon=True,
                                         name="mission-ctrl")
         self._thread.start()
+
+    def reset(self) -> None:
+        """Prepare for another start() after the previous run has
+        terminated. Clears all per-mission internal state so a fresh
+        Phase.INIT-and-park cycle starts clean.
+
+        Caller must ensure the previous _run thread has exited (or
+        is_running() is False) before calling.
+        """
+        if self._thread and self._thread.is_alive():
+            raise RuntimeError("controller still running -- call stop() first")
+        self._stop.clear()
+        self._go.clear()
+        self.pd_yaw.reset()
+        self.pd_fwd.reset()
+        self.pd_lat.reset()
+        self.smoother.reset()
+        # Per-phase scratch state (set lazily in the relevant _step_*).
+        self._land_requested = False
+        self._search_start_yaw = None
+        self._search_swept = 0.0
+        self._search_prev_yaw = None
+        self.state.reset(self.cfg)
 
     def trigger(self) -> bool:
         """Release the run loop so it proceeds from INIT into TAKEOFF.

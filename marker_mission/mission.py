@@ -185,10 +185,18 @@ def cmd_fly(args: argparse.Namespace) -> int:
     latest_ann_frame = LatestFrame()
 
     # ---------- 3. Set up mission state, recorder, UI ---------------------
+    # The recorder is rotated per mission (see the mission loop below)
+    # so each run lands in its own ~/.marker_mission/flights/<ts>_<serial>/
+    # directory with its own log + videos. The workers reference whichever
+    # recorder is current via recorder_box[0]; recording_paused goes high
+    # during the brief moment we finalize one recorder and create the next.
     state = MissionState()
     flight_dir = make_flight_dir(FLIGHTS_DIR, serial)
     recorder = FlightRecorder(flight_dir, fps=cfg.record_fps)
     print(f"[mission] flight artefacts: {flight_dir}")
+    recorder_box = [recorder]
+    flight_dir_box = [flight_dir]
+    recording_paused = threading.Event()
 
     # Build the controller before the UI so the UI's "Start mission" button
     # can call into it.
@@ -301,8 +309,10 @@ def cmd_fly(args: argparse.Namespace) -> int:
                                      extra_lines=lines)
                 latest_ann_frame.set(ann)
                 # Record both raw and annotated ----------------------------
-                recorder.push_raw_frame(frame)
-                recorder.push_annotated_frame(ann)
+                if not recording_paused.is_set():
+                    rec = recorder_box[0]
+                    rec.push_raw_frame(frame)
+                    rec.push_annotated_frame(ann)
             except Exception as e:
                 print(f"[vision] error: {e}")
 
@@ -311,7 +321,9 @@ def cmd_fly(args: argparse.Namespace) -> int:
         # arriving (useful for diagnosing video drops).
         period = 1.0 / max(2.0, cfg.control_rate_hz / 2)
         while not stop.is_set():
-            recorder.log_row(state, pose_holder.get(), tel_holder.get())
+            if not recording_paused.is_set():
+                recorder_box[0].log_row(
+                    state, pose_holder.get(), tel_holder.get())
             time.sleep(period)
 
     threading.Thread(target=telemetry_worker, daemon=True,
@@ -347,33 +359,80 @@ def cmd_fly(args: argparse.Namespace) -> int:
     if hasattr(signal, "SIGTERM"):
         signal.signal(signal.SIGTERM, handle_signal)
 
-    # Arm the controller. It parks in INIT until the operator presses
-    # "Start mission" in the web UI (which calls controller.trigger via
-    # POST /api/start). If the drone wasn't reachable at startup the
-    # button stays disabled until telemetry_worker sees a connection.
-    controller.start()
+    # Arm the controller for the FIRST mission. It parks in INIT until
+    # the operator presses "Start mission" in the web UI (which calls
+    # controller.trigger via POST /api/start). If the drone wasn't
+    # reachable at startup the button stays disabled until
+    # telemetry_worker sees a connection.
     if initially_connected:
         print(f"[mission] armed -- open {ui.url()} and press 'Start mission' "
-              f"to take off. Ctrl-C to abort.")
+              f"to take off. Ctrl-C to quit.")
     else:
         print(f"[mission] UI ready at {ui.url()}. Browse recorded flights "
               f"at {ui.url()}/replay.")
         print(f"[mission] Start mission will unlock once the drone "
               f"connects via the API server.")
 
-    # Wait for completion. The ``stop`` check lets us exit cleanly even
-    # if the control thread is still alive in a blocking HTTP call -- it
-    # is a daemon thread and will be reaped when the process exits.
+    # ---------- 5b. Mission loop -----------------------------------------
+    # Each iteration runs one start-to-end mission cycle: arm the
+    # controller, wait for it to terminate (operator pressed Start ->
+    # full flight, or Stop -> safe shutdown, or no-op exit), finalize
+    # that flight's artefacts, roll a fresh flight directory, reset the
+    # state machine, and loop. Ctrl-C / SIGTERM sets ``stop`` and breaks
+    # us out of the loop into final cleanup.
+    last_phase = "init"
+    mission_idx = 0
     try:
-        while controller.is_running() and not stop.is_set():
-            time.sleep(0.5)
+        while not stop.is_set():
+            mission_idx += 1
+            controller.start()
+            # Block until the controller thread exits (mission finished
+            # or stop requested). Daemon thread, so even if it overruns
+            # we'll exit on stop.is_set().
+            while controller.is_running() and not stop.is_set():
+                time.sleep(0.5)
+            if stop.is_set():
+                break
+
+            final = state.snapshot()
+            last_phase = final["phase"]
+            print(f"[mission #{mission_idx}] final phase: {last_phase} "
+                  f"(reason: {final['note'] or final['abort_reason'] or '—'})")
+
+            # ---- Finalize this flight's artefacts (write meta + close
+            # video / csv + run the H.264 re-encode). Pause the workers
+            # for the moment we swap recorders so they don't race against
+            # FlightRecorder's _video_q and _csv_fp teardown.
+            outcome = {
+                "final_phase": last_phase,
+                "abort_reason": final["abort_reason"],
+                "note": final["note"],
+                "serial": serial,
+            }
+            recording_paused.set()
+            try:
+                write_meta(flight_dir_box[0], cfg, calibration, outcome)
+                recorder_box[0].stop(meta=None)
+                print(f"[mission #{mission_idx}] artefacts saved in "
+                      f"{flight_dir_box[0]}")
+                if stop.is_set():
+                    break
+                # ---- Roll a fresh flight dir + recorder for the next run.
+                new_dir = make_flight_dir(FLIGHTS_DIR, serial)
+                flight_dir_box[0] = new_dir
+                recorder_box[0] = FlightRecorder(new_dir, fps=cfg.record_fps)
+                print(f"[mission] new flight artefacts: {new_dir}")
+            finally:
+                recording_paused.clear()
+
+            # Reset the controller + shared state so the next iteration
+            # arms cleanly back in INIT.
+            controller.reset()
+            print(f"[mission] re-armed -- press 'Start mission' to fly "
+                  f"another, or Ctrl-C to quit.")
     except KeyboardInterrupt:
         stop.set()
         controller.stop("KeyboardInterrupt")
-
-    final_phase = state.snapshot()
-    print(f"[mission] final phase: {final_phase['phase']} "
-          f"(reason: {final_phase['note'] or final_phase['abort_reason'] or '—'})")
 
     # ---------- 6. Cleanup -----------------------------------------------
     stop.set()
@@ -383,16 +442,21 @@ def cmd_fly(args: argparse.Namespace) -> int:
         api.video_stop()
     except Exception:
         pass
-    outcome = {
-        "final_phase": final_phase["phase"],
-        "abort_reason": final_phase["abort_reason"],
-        "note": final_phase["note"],
-        "serial": serial,
-    }
-    write_meta(flight_dir, cfg, calibration, outcome)
-    recorder.stop(meta=None)  # meta already written separately above
-    print(f"[mission] artefacts saved in {flight_dir}")
-    return 0 if final_phase["phase"] in ("done",) else 2
+    # Finalize whatever recorder is current, if it hasn't been stopped
+    # already by the mission loop's stop() above.
+    try:
+        last_outcome = {
+            "final_phase": state.snapshot()["phase"],
+            "abort_reason": state.snapshot()["abort_reason"],
+            "note": state.snapshot()["note"],
+            "serial": serial,
+        }
+        write_meta(flight_dir_box[0], cfg, calibration, last_outcome)
+        recorder_box[0].stop(meta=None)
+        print(f"[mission] artefacts saved in {flight_dir_box[0]}")
+    except Exception as e:
+        print(f"[mission] cleanup recorder.stop failed: {e}")
+    return 0 if last_phase == "done" else 2
 
 
 # ---------------------------------------------------------------------------
