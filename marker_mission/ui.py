@@ -139,10 +139,22 @@ _VIDEO_AND_STATUS_HTML = """
         0.0 / 0.0 s
       </span>
     </div>
+    <div id="replay-step-row"
+         style="display:flex; align-items:center; gap:.3rem; margin-bottom:.5rem;
+                font-size:.85rem; color:#aab;">
+      Step:
+      <button class="rp-step" data-step="-1.0" type="button">−1s</button>
+      <button class="rp-step" data-step="-0.5" type="button">−0.5s</button>
+      <button class="rp-step" data-step="-0.1" type="button">−0.1s</button>
+      <button class="rp-step" data-step="0.1"  type="button">+0.1s</button>
+      <button class="rp-step" data-step="0.5"  type="button">+0.5s</button>
+      <button class="rp-step" data-step="1.0"  type="button">+1s</button>
+    </div>
     <div id="replay-speed-row"
          style="display:flex; align-items:center; gap:.4rem; margin-bottom:.75rem;
                 font-size:.85rem; color:#aab;">
       Speed:
+      <button class="rp-speed" data-speed="0.1"  type="button">0.1x</button>
       <button class="rp-speed" data-speed="0.25" type="button">0.25x</button>
       <button class="rp-speed" data-speed="0.5"  type="button">0.5x</button>
       <button class="rp-speed" data-speed="1"    type="button">1x</button>
@@ -369,10 +381,23 @@ if (REPLAY_ID) {
   document.querySelectorAll('.rp-speed').forEach(b => {
     b.addEventListener('click', () => rpSpeed(parseFloat(b.dataset.speed)));
   });
+  document.querySelectorAll('.rp-step').forEach(b => {
+    b.addEventListener('click', async () => {
+      const dt = parseFloat(b.dataset.step);
+      const seek = $('rp-seek');
+      const cur = seek ? parseFloat(seek.value || '0') : 0;
+      const dur = seek ? parseFloat(seek.max || '0') : 0;
+      const next = Math.max(0, Math.min(dur, cur + dt));
+      await rpSeek(next);
+    });
+  });
 }
 
 // ---- Charts (only runs if at least one canvas is present) ---------------
 const buf = { t: [], d: [], y: [], h: [], drone_yaw: [], battery: [], height: [] };
+let chartPlayheadT = null;     // replay only: marks current position on the x axis
+let chartPrefilled = false;    // replay only: timeline already loaded
+
 function pushSample(s) {
   const now = performance.now()/1000;
   buf.t.push(now);
@@ -387,6 +412,24 @@ function pushSample(s) {
     buf.t.shift(); buf.d.shift(); buf.y.shift(); buf.h.shift();
     buf.drone_yaw.shift(); buf.battery.shift(); buf.height.shift();
   }
+}
+async function prefillReplayCharts() {
+  if (!REPLAY_ID || chartPrefilled) return;
+  try {
+    const r = await fetch(
+      `/api/replay/${encodeURIComponent(REPLAY_ID)}/timeline`,
+      {cache: 'no-store'});
+    const tl = await r.json();
+    if (!tl || !Array.isArray(tl.t)) return;
+    buf.t = tl.t.slice();
+    buf.d = tl.d.slice();
+    buf.y = tl.y.slice();
+    buf.h = tl.h.slice();
+    buf.drone_yaw = tl.drone_yaw.slice();
+    buf.battery = tl.battery.slice();
+    buf.height = tl.height.slice();
+    chartPrefilled = true;
+  } catch (e) {}
 }
 function drawSeries(canvasId, series, opts) {
   const c = $(canvasId);
@@ -436,6 +479,29 @@ function drawSeries(canvasId, series, opts) {
     ctx.fillStyle = s.color; ctx.font = '11px ui-sans-serif';
     ctx.fillText(s.label, 6 + s.legendX*60, 14);
   });
+  // Replay playhead marker: vertical line at current time + dot on
+  // each series at the value sampled at that time.
+  if (chartPlayheadT !== null && chartPlayheadT >= t0 && chartPlayheadT <= t1) {
+    const px = ((chartPlayheadT - t0)/span) * W;
+    ctx.strokeStyle = '#facc15cc'; ctx.lineWidth = 1; ctx.setLineDash([2,3]);
+    ctx.beginPath(); ctx.moveTo(px, 0); ctx.lineTo(px, H); ctx.stroke();
+    ctx.setLineDash([]);
+    let lo_idx = 0, hi_idx = buf.t.length - 1;
+    while (lo_idx < hi_idx) {
+      const mid = (lo_idx + hi_idx) >> 1;
+      if (buf.t[mid] < chartPlayheadT) lo_idx = mid + 1; else hi_idx = mid;
+    }
+    series.forEach(s => {
+      const v = s.data[lo_idx];
+      if (v !== null && v !== undefined && Number.isFinite(v)) {
+        const py = H - ((v - lo)/(hi-lo)) * H;
+        ctx.fillStyle = s.color;
+        ctx.beginPath(); ctx.arc(px, py, 4, 0, Math.PI*2); ctx.fill();
+        ctx.fillStyle = '#0e1116'; ctx.font = 'bold 10px ui-sans-serif';
+        ctx.fillText(v.toFixed(1), px + 6, py - 6);
+      }
+    });
+  }
   ctx.fillStyle = '#aab'; ctx.font = '11px ui-sans-serif';
   ctx.fillText(hi.toFixed(2), W-50, 12);
   ctx.fillText(lo.toFixed(2), W-50, H-2);
@@ -443,7 +509,15 @@ function drawSeries(canvasId, series, opts) {
 const HAS_CHARTS = !!$('c-d');
 function updateCharts(s) {
   if (!HAS_CHARTS) return;
-  pushSample(s);
+  // Live mode: append new samples. Replay mode: buf is pre-filled
+  // once from /api/replay/<id>/timeline; we just track the playhead
+  // position so drawSeries can mark it.
+  if (REPLAY_ID) {
+    chartPlayheadT = (s.uptime_s !== undefined && s.uptime_s !== null)
+                     ? s.uptime_s : null;
+  } else {
+    pushSample(s);
+  }
   drawSeries('c-d', [{label:'distance', color:'#58c4ff', data:buf.d, legendX:0}], {target:s.target_distance_m});
   drawSeries('c-y', [{label:'yaw_to_marker', color:'#facc15', data:buf.y, legendX:0}], {target:0});
   drawSeries('c-h', [{label:'rel_heading', color:'#4ade80', data:buf.h, legendX:0}], {target:s.target_relative_heading_deg});
@@ -457,6 +531,9 @@ function updateCharts(s) {
 // ---- Single shared refresh loop -----------------------------------------
 async function refresh() {
   try {
+    if (REPLAY_ID && HAS_CHARTS && !chartPrefilled) {
+      await prefillReplayCharts();
+    }
     const r = await fetch(STATE_URL, {cache:'no-store'});
     const s = await r.json();
     if (typeof s.drone_connected === 'boolean') {
@@ -904,7 +981,7 @@ class UiServer:
             rp = self._get_or_create_replay(flight_id)
             if rp is None:
                 return jsonify({"error": "not found"}), 404
-            return jsonify(rp.state.snapshot())
+            return jsonify(rp.snapshot())
 
         @app.get("/api/replay/<flight_id>/status")
         def api_replay_status(flight_id):
@@ -912,6 +989,13 @@ class UiServer:
             if rp is None:
                 return jsonify({"error": "not found"}), 404
             return jsonify(rp.status)
+
+        @app.get("/api/replay/<flight_id>/timeline")
+        def api_replay_timeline(flight_id):
+            rp = self._get_or_create_replay(flight_id)
+            if rp is None:
+                return jsonify({"error": "not found"}), 404
+            return jsonify(rp.timeline_arrays())
 
         @app.post("/api/replay/<flight_id>/play")
         def api_replay_play(flight_id):

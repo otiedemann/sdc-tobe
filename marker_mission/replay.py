@@ -46,6 +46,11 @@ class FlightReplay:
         from .ui import LatestFrame  # local import: avoid circular
         self.dir = Path(flight_dir)
         self.flight_id = self.dir.name
+        # Recover the drone serial from mission_meta.json or, failing
+        # that, the flight_dir name suffix (make_flight_dir produces
+        # ``<wall_ts>_<serial>`` so the serial is everything after the
+        # second underscore separator).
+        self.serial: Optional[str] = self._lookup_serial()
 
         # Load the per-tick CSV. Anything that fails to parse is fatal --
         # the operator should pick a different flight.
@@ -60,6 +65,25 @@ class FlightReplay:
         self.timeline: List[float] = [float(r["monotonic"]) - t0
                                        for r in rows]
         self.duration_s = self.timeline[-1]
+
+        # Pre-compute, per row, the log-relative time at which the
+        # CURRENT phase started, and the log-relative time of the most
+        # recent marker sighting. These let us populate phase_age_s /
+        # marker_seen_age_s correctly in replay without using wall time.
+        self.phase_start_t: List[float] = [0.0] * len(rows)
+        self.marker_seen_t: List[Optional[float]] = [None] * len(rows)
+        last_phase = rows[0].get("phase", "")
+        cur_phase_start = self.timeline[0]
+        cur_marker_seen: Optional[float] = None
+        for i, r in enumerate(rows):
+            ph = r.get("phase", "")
+            if ph != last_phase:
+                cur_phase_start = self.timeline[i]
+                last_phase = ph
+            if r.get("marker_seen") == "1":
+                cur_marker_seen = self.timeline[i]
+            self.phase_start_t[i] = cur_phase_start
+            self.marker_seen_t[i] = cur_marker_seen
 
         # Annotated.mp4 already has the HUD baked in -- prefer it.
         # Fall back to raw.mp4 if annotated is missing for some reason.
@@ -123,6 +147,43 @@ class FlightReplay:
             self._speed = max(0.1, min(10.0, float(rate)))
         self._wakeup.set()
 
+    def timeline_arrays(self) -> dict:
+        """Return parallel arrays for the full flight timeline. Used by
+        the replay UI to pre-fill the charts in one shot. Values that
+        are missing in a row come back as None so the chart drawing
+        function can break the line cleanly."""
+        def _col(key: str) -> List[Optional[float]]:
+            return [self._fnum(r, key) for r in self.rows]
+        return {
+            "t": list(self.timeline),
+            "d": _col("distance_m"),
+            "y": _col("yaw_to_marker_deg"),
+            "h": _col("relative_heading_deg"),
+            "drone_yaw": _col("tel_yaw"),
+            "battery":   _col("tel_battery"),
+            "height":    _col("tel_height_cm"),
+            "duration_s": self.duration_s,
+        }
+
+    def snapshot(self) -> dict:
+        """Return MissionState.snapshot() with replay-correct timing.
+        phase_age_s and marker_seen_age_s are computed from log
+        timestamps relative to the playhead -- the standard snapshot
+        uses wall time, which is meaningless during replay (we set
+        ``phase_started_at = time.monotonic()`` on every row apply, so
+        the standard value is always near zero)."""
+        snap = self.state.snapshot()
+        with self._lock:
+            idx = self._playhead_idx
+        if 0 <= idx < len(self.rows):
+            playhead_t = self.timeline[idx]
+            snap["phase_age_s"] = playhead_t - self.phase_start_t[idx]
+            seen_t = self.marker_seen_t[idx]
+            snap["marker_seen_age_s"] = (
+                (playhead_t - seen_t) if seen_t is not None else None)
+            snap["uptime_s"] = playhead_t
+        return snap
+
     @property
     def status(self) -> dict:
         with self._lock:
@@ -148,6 +209,28 @@ class FlightReplay:
         # loop on _stop and releases its own cap.
 
     # ---------------------------------------------------- per-row dispatch
+    def _lookup_serial(self) -> Optional[str]:
+        # Prefer the persisted mission metadata if present.
+        meta_p = self.dir / "mission_meta.json"
+        if meta_p.exists():
+            try:
+                import json as _json
+                blob = _json.loads(meta_p.read_text())
+                outcome = blob.get("outcome") or blob
+                s = outcome.get("serial") if isinstance(outcome, dict) else None
+                if s:
+                    return str(s)
+            except Exception:
+                pass
+        # Fall back to the dir-name suffix. make_flight_dir uses
+        # YYYY-MM-DD_HH-MM-SS_<serial>; serial is whatever follows the
+        # second underscore. Avoid returning the literal "unknown"
+        # placeholder used when no serial was available at flight time.
+        parts = self.flight_id.split("_", 2)
+        if len(parts) >= 3 and parts[2] and parts[2] != "unknown":
+            return parts[2]
+        return None
+
     @staticmethod
     def _fnum(row: dict, key: str) -> Optional[float]:
         v = row.get(key, "")
@@ -165,7 +248,28 @@ class FlightReplay:
         if self.cap is None and self.video_path is not None:
             self.cap = cv2.VideoCapture(str(self.video_path))
 
+    def _row_at_video_time(self, video_t_s: float) -> int:
+        """Find the CSV row whose log time is closest to ``video_t_s``.
+        Used to align the state side-panel with the actual video frame
+        being displayed -- without this, state shows row[idx] values
+        but the video may be one or two CSV ticks ahead, causing the
+        numeric values to disagree with the on-frame annotation."""
+        i = bisect.bisect_left(self.timeline, video_t_s)
+        if i >= len(self.timeline):
+            return len(self.timeline) - 1
+        if i > 0 and (abs(self.timeline[i-1] - video_t_s)
+                       < abs(self.timeline[i] - video_t_s)):
+            return i - 1
+        return i
+
     def _apply_row(self, idx: int) -> None:
+        # Advance the video first so we know the ACTUAL displayed frame
+        # time, then sync the state to whichever CSV row best matches
+        # that time -- otherwise the side panel shows row[idx] values
+        # while the video shows a slightly different moment.
+        self._advance_video_to(self.timeline[idx])
+        if self.cap is not None and self._last_pos_ms >= 0:
+            idx = self._row_at_video_time(self._last_pos_ms / 1000.0)
         row = self.rows[idx]
         # Rebuild a TelemetrySnapshot from the recorded tel_* columns.
         tel_raw: dict = {}
@@ -176,6 +280,8 @@ class FlightReplay:
                 tel_raw[src] = v
         tel_raw["flying"] = (row.get("tel_flying") == "1")
         tel_raw["connected"] = (row.get("tel_connected") == "1")
+        if self.serial:
+            tel_raw["serial_number"] = self.serial
         tel_snap = TelemetrySnapshot(raw=tel_raw, received_at=time.time())
 
         # Pose tuple (or None if marker wasn't seen this row).
@@ -212,47 +318,50 @@ class FlightReplay:
             )
             self.state.phase_started_at = time.monotonic()
 
-        # Advance the video to the row's timestamp. The CSV is logged at
-        # ~5 Hz but the video is at ~25 fps, so a single cap.read() per
-        # row would only consume one of every five frames -- playback
-        # would crawl at 1/5 speed. We read forward in the cap until
-        # _last_pos_ms catches up to target_t_ms, then publish the last
-        # frame we got. Sequential reads are far cheaper than explicit
-        # seeks; we only seek for big jumps (initial load, backward
-        # seek, forward leap larger than ~1.5 s).
-        if self.cap is not None:
-            target_t_ms = self.timeline[idx] * 1000.0
-            big_jump = (self._last_pos_ms < 0
-                        or target_t_ms < self._last_pos_ms - 200.0
-                        or target_t_ms > self._last_pos_ms + 1500.0)
-            if big_jump:
-                try:
-                    self.cap.set(cv2.CAP_PROP_POS_MSEC, target_t_ms)
-                except Exception:
-                    return
-                try:
-                    ok, frame = self.cap.read()
-                except Exception:
-                    return
-                if ok and frame is not None:
-                    self._last_pos_ms = self.cap.get(cv2.CAP_PROP_POS_MSEC)
-                    self.frame.set(frame)
+    def _advance_video_to(self, target_t_s: float) -> None:
+        """Advance the video to ``target_t_s`` (relative to flight
+        start). The CSV is logged at ~5 Hz but the video is at ~25 fps,
+        so a single cap.read() per row would only consume one of every
+        five frames -- playback would crawl at 1/5 speed. We read
+        forward in the cap until _last_pos_ms catches up to
+        target_t_ms, then publish the last frame we got. Sequential
+        reads are far cheaper than explicit seeks; we only seek for
+        big jumps (initial load, backward seek, forward leap larger
+        than ~1.5 s)."""
+        if self.cap is None:
+            return
+        target_t_ms = target_t_s * 1000.0
+        big_jump = (self._last_pos_ms < 0
+                    or target_t_ms < self._last_pos_ms - 200.0
+                    or target_t_ms > self._last_pos_ms + 1500.0)
+        if big_jump:
+            try:
+                self.cap.set(cv2.CAP_PROP_POS_MSEC, target_t_ms)
+            except Exception:
                 return
-            # Small forward step -- chew through frames until caught up.
-            last_frame = None
-            for _ in range(64):  # safety cap; 64 frames ~ 2.5 s at 25fps
-                if self._last_pos_ms >= target_t_ms:
-                    break
-                try:
-                    ok, frame = self.cap.read()
-                except Exception:
-                    break
-                if not ok or frame is None:
-                    break
-                last_frame = frame
+            try:
+                ok, frame = self.cap.read()
+            except Exception:
+                return
+            if ok and frame is not None:
                 self._last_pos_ms = self.cap.get(cv2.CAP_PROP_POS_MSEC)
-            if last_frame is not None:
-                self.frame.set(last_frame)
+                self.frame.set(frame)
+            return
+        # Small forward step -- chew through frames until caught up.
+        last_frame = None
+        for _ in range(64):  # safety cap; 64 frames ~ 2.5 s at 25fps
+            if self._last_pos_ms >= target_t_ms:
+                break
+            try:
+                ok, frame = self.cap.read()
+            except Exception:
+                break
+            if not ok or frame is None:
+                break
+            last_frame = frame
+            self._last_pos_ms = self.cap.get(cv2.CAP_PROP_POS_MSEC)
+        if last_frame is not None:
+            self.frame.set(last_frame)
 
     # ---------------------------------------------------- playback loop
     def _wait(self, timeout: float) -> None:
