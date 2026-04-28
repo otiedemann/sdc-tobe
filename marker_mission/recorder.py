@@ -139,17 +139,22 @@ class FlightRecorder:
                 continue
             final = self.dir / f"{stem}.mp4"
             tmp = self.dir / f"{stem}.h264.tmp.mp4"
-            # Different H.264 encoders take different quality knobs:
-            # libx264 has -preset/-crf, libopenh264 / nvenc / vaapi don't
-            # (or take them differently). Default to a fixed bitrate that
-            # gives ~ original-mp4v file size for 720p25, which is good
-            # enough for sharing.
+            # Different H.264 encoders take different quality knobs.
+            # Common to all: explicit BT.709 color metadata + Main
+            # profile + yuv420p so the bitstream renders in VLC etc.
+            # (libopenh264 defaults to constrained-baseline + missing
+            # color tags; some VLC builds render that as a black frame.)
+            common = ["-pix_fmt", "yuv420p",
+                      "-color_primaries", "bt709",
+                      "-color_trc", "bt709",
+                      "-colorspace", "bt709",
+                      "-profile:v", "main"]
             if encoder == "libx264":
                 video_args = ["-c:v", "libx264", "-preset", "veryfast",
-                              "-crf", "23", "-pix_fmt", "yuv420p"]
+                              "-crf", "23", *common]
             else:
-                video_args = ["-c:v", encoder, "-b:v", "4M",
-                              "-pix_fmt", "yuv420p"]
+                # libopenh264 / nvenc / vaapi / qsv: bitrate-controlled.
+                video_args = ["-c:v", encoder, "-b:v", "4M", *common]
             cmd = [
                 "ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-nostdin",
                 "-i", str(src),
@@ -160,7 +165,8 @@ class FlightRecorder:
                 "-shortest", "-movflags", "+faststart",
                 str(tmp),
             ]
-            print(f"[rec] re-encoding {src.name} -> H.264 + silent AAC ...")
+            print(f"[rec] re-encoding {src.name} -> H.264 ({encoder}) "
+                  f"+ silent AAC ...")
             t0 = time.monotonic()
             try:
                 subprocess.run(cmd, check=True, capture_output=True, text=True)
@@ -173,6 +179,16 @@ class FlightRecorder:
             except FileNotFoundError as e:
                 print(f"[rec] could not run ffmpeg: {e}")
                 return
+            # Sanity-check the output. ffmpeg can return success while
+            # producing a file that no player will accept; a quick
+            # ffprobe + decode probe catches the worst cases before we
+            # destroy the original.
+            if not _probe_output_is_h264_playable(tmp):
+                print(f"[rec] re-encoded {src.name} failed playback "
+                      f"sanity check -- keeping original")
+                try: tmp.unlink()
+                except FileNotFoundError: pass
+                continue
             # Path.replace is atomic on POSIX and overwrites the target,
             # so this works whether src == final (both .mp4) or not.
             tmp.replace(final)
@@ -292,23 +308,97 @@ class FlightRecorder:
 # Helpers
 # ---------------------------------------------------------------------------
 
+def _probe_output_is_h264_playable(path: Path) -> bool:
+    """Quick sanity check: the file's first stream is H.264 AND ffmpeg
+    can decode at least a few frames out of it.
+
+    Catches the case where the encoder reports success but produces a
+    bitstream that decodes as a black/empty image (occasionally seen
+    with libopenh264 builds + certain players).
+    """
+    try:
+        out = subprocess.run(
+            ["ffprobe", "-v", "error", "-select_streams", "v:0",
+             "-show_entries", "stream=codec_name,nb_frames",
+             "-of", "default=noprint_wrappers=1:nokey=1", str(path)],
+            capture_output=True, text=True, check=True, timeout=5.0,
+        ).stdout.strip().splitlines()
+    except Exception:
+        return False
+    if not out or out[0].strip() != "h264":
+        return False
+    # `nb_frames` may be missing for some containers -- fall back to a
+    # short decode probe.
+    try:
+        subprocess.run(
+            ["ffmpeg", "-v", "error", "-nostdin", "-i", str(path),
+             "-frames:v", "5", "-f", "null", "-"],
+            capture_output=True, text=True, check=True, timeout=10.0,
+        )
+    except Exception:
+        return False
+    return True
+
+
+def _probe_h264_encoder(name: str) -> bool:
+    """Try to actually encode one black frame with the given encoder.
+
+    `ffmpeg -encoders` lists every encoder ffmpeg was compiled against,
+    but listed != usable -- libopenh264.so might be missing at runtime,
+    a VAAPI render node might not be accessible, an NVENC card might
+    not be present. The only reliable test is to run a tiny encode.
+    """
+    cmd = [
+        "ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-nostdin",
+        "-f", "lavfi",
+        "-i", "color=c=black:s=64x64:r=1:d=0.04",
+        "-c:v", name, "-f", "null", "-",
+    ]
+    try:
+        subprocess.run(cmd, check=True, capture_output=True, text=True,
+                       timeout=10.0)
+        return True
+    except Exception:
+        return False
+
+
 def _pick_h264_encoder() -> Optional[str]:
     """Return the name of an available ffmpeg H.264 encoder, or None.
 
-    Preference order: libx264 (best quality, but proprietary; not
-    bundled in stock Fedora ffmpeg), libopenh264 (Cisco's free encoder,
-    ships everywhere), then common hardware backends as a last resort.
+    Preference order: libx264 (best quality + universal compatibility,
+    but proprietary; not bundled in stock Fedora ffmpeg -- install
+    `ffmpeg-libs` from RPMFusion-free if you want it), libopenh264
+    (Cisco's free encoder, ships everywhere but earlier flights showed
+    its output sometimes refuses to render in VLC), then common
+    hardware backends.
+
+    Each candidate is *probed* with a tiny test encode -- a listed
+    encoder isn't necessarily a working encoder.
     """
     try:
         out = subprocess.run(["ffmpeg", "-hide_banner", "-encoders"],
                              capture_output=True, text=True,
                              check=True, timeout=5.0).stdout
-    except Exception:
+    except Exception as e:
+        print(f"[rec] ffmpeg -encoders failed: {e}")
         return None
-    for name in ("libx264", "libopenh264",
-                 "h264_nvenc", "h264_vaapi", "h264_qsv"):
-        if name in out:
+    candidates = ("libx264", "libopenh264",
+                  "h264_nvenc", "h264_vaapi", "h264_qsv")
+    listed = [n for n in candidates if n in out]
+    if not listed:
+        snippet = "\n  ".join(line for line in out.splitlines()
+                              if "h264" in line.lower())[:600]
+        print(f"[rec] ffmpeg has no recognised H.264 encoder.")
+        if snippet:
+            print(f"[rec]   h264-related encoders ffmpeg knows about:\n  "
+                  f"{snippet}")
+        return None
+    for name in listed:
+        if _probe_h264_encoder(name):
             return name
+        print(f"[rec] H.264 encoder '{name}' is listed but does not "
+              f"actually run on this host -- trying next.")
+    print(f"[rec] none of {listed} produced a working encode.")
     return None
 
 
