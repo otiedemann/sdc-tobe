@@ -103,9 +103,10 @@ _PAGE_HEADER = """
   <nav>
     <a href="/" class="{{ 'active' if active=='video' else '' }}">Camera</a>
     <a href="/charts" class="{{ 'active' if active=='charts' else '' }}">Charts</a>
+    <a href="/replay" class="{{ 'active' if active=='replay' else '' }}">Replay</a>
   </nav>
   <span style="margin-left:auto; font-size:.85rem; color:#aab;"
-        id="phase">phase: …</span>
+        id="phase">{{ header_label or 'phase: …' }}</span>
 </header>
 """
 
@@ -116,10 +117,43 @@ _PAGE_HEADER = """
 _VIDEO_AND_STATUS_HTML = """
 <section class="grid" style="grid-template-columns: minmax(0,2fr) minmax(0,1fr);">
   <div class="card">
-    <h2>Annotated camera view</h2>
-    <img class="video" src="/video.mjpg" alt="camera feed">
+    <h2>{{ camera_heading }}</h2>
+    <img class="video" src="{{ video_url }}" alt="camera feed">
   </div>
   <div class="card">
+    {% if mode == 'replay' %}
+    <h2>Replay control</h2>
+    <div id="replay-row" style="display:flex; align-items:center; gap:.5rem; margin-bottom:.5rem;">
+      <button id="btn-rp-toggle" type="button"
+              style="padding:.5rem .9rem; border:0; border-radius:6px;
+                     background:var(--accent); color:#062633; font-weight:600;
+                     cursor:pointer; font-size:.95rem; min-width:5rem;">
+        ▶ Play
+      </button>
+      <input type="range" id="rp-seek" min="0" max="100" value="0" step="0.1"
+             style="flex:1; accent-color: var(--accent);">
+      <span id="rp-time"
+            style="font-variant-numeric:tabular-nums; font-size:.85rem;
+                   color:#aab; min-width:7rem; text-align:right;">
+        0.0 / 0.0 s
+      </span>
+    </div>
+    <div id="replay-speed-row"
+         style="display:flex; align-items:center; gap:.4rem; margin-bottom:.75rem;
+                font-size:.85rem; color:#aab;">
+      Speed:
+      <button class="rp-speed" data-speed="0.25" type="button">0.25x</button>
+      <button class="rp-speed" data-speed="0.5"  type="button">0.5x</button>
+      <button class="rp-speed" data-speed="1"    type="button">1x</button>
+      <button class="rp-speed" data-speed="2"    type="button">2x</button>
+      <button class="rp-speed" data-speed="4"    type="button">4x</button>
+      <span style="margin-left:auto;">
+        <a href="/replay" style="color:var(--accent); text-decoration:none;">
+          ← all flights
+        </a>
+      </span>
+    </div>
+    {% else %}
     <h2>Mission control</h2>
     <div id="ctrl-row" style="display:flex; align-items:center; gap:.75rem; margin-bottom:.75rem;">
       <button id="btn-start" type="button"
@@ -136,7 +170,8 @@ _VIDEO_AND_STATUS_HTML = """
       </button>
       <span id="ctrl-msg" style="font-size:.85rem; color:#aab;">—</span>
     </div>
-    <h2>Mission status</h2>
+    {% endif %}
+    <h2>{{ 'Replayed flight' if mode == 'replay' else 'Mission status' }}</h2>
     <table id="status">
       <tr><th>Phase</th><td id="s-phase">—</td></tr>
       <tr><th>Phase age</th><td id="s-pa">—</td></tr>
@@ -172,6 +207,8 @@ _CHARTS_HTML = """
 _SHARED_SCRIPT = """
 <script>
 const HISTORY_S = {{ history_s }};
+const STATE_URL = {{ state_url|tojson }};
+const REPLAY_ID = {{ replay_id|tojson }};
 const $ = id => document.getElementById(id);
 function fmt(v, unit, prec) {
   if (v === null || v === undefined || v === '') return '—';
@@ -181,7 +218,7 @@ function fmt(v, unit, prec) {
 
 // ---- Status panel (only runs if its DOM elements are present) -----------
 const TERMINAL_PHASES = new Set(['done', 'abort']);
-const STOPPABLE_PHASES = new Set(['takeoff','search','approach','orbit','hold','land']);
+const STOPPABLE_PHASES = new Set(['takeoff','search','align','approach','orbit','hold','land']);
 let stopRequested = false;
 function setMissionButtons(phase) {
   const start = $('btn-start'); const stop = $('btn-stop'); const msg = $('ctrl-msg');
@@ -261,6 +298,63 @@ function updateStatus(s) {
 }
 if ($('btn-start')) $('btn-start').addEventListener('click', startMission);
 if ($('btn-stop'))  $('btn-stop').addEventListener('click',  stopMission);
+
+// ---- Replay controls (only present in replay pages) ---------------------
+let rpSeekDragging = false;
+async function rpToggle() {
+  if (!REPLAY_ID) return;
+  await fetch(`/api/replay/${encodeURIComponent(REPLAY_ID)}/toggle`,
+              {method:'POST'});
+}
+async function rpSeek(t) {
+  if (!REPLAY_ID) return;
+  const u = new URL(`/api/replay/${encodeURIComponent(REPLAY_ID)}/seek`,
+                    location.origin);
+  u.searchParams.set('t', String(t));
+  await fetch(u, {method:'POST'});
+}
+async function rpSpeed(rate) {
+  if (!REPLAY_ID) return;
+  const u = new URL(`/api/replay/${encodeURIComponent(REPLAY_ID)}/speed`,
+                    location.origin);
+  u.searchParams.set('rate', String(rate));
+  await fetch(u, {method:'POST'});
+}
+async function refreshReplayStatus() {
+  if (!REPLAY_ID) return;
+  try {
+    const r = await fetch(
+      `/api/replay/${encodeURIComponent(REPLAY_ID)}/status`,
+      {cache:'no-store'});
+    const rs = await r.json();
+    const btn = $('btn-rp-toggle');
+    if (btn) btn.textContent = rs.paused ? '▶ Play' : '⏸ Pause';
+    const seek = $('rp-seek');
+    if (seek && !rpSeekDragging) {
+      seek.max = String(rs.duration_s);
+      seek.value = String(rs.playhead_s);
+    }
+    const tlabel = $('rp-time');
+    if (tlabel) tlabel.textContent =
+      `${rs.playhead_s.toFixed(1)} / ${rs.duration_s.toFixed(1)} s  `
+      + `(${rs.speed.toFixed(2)}x)`;
+  } catch (e) {}
+}
+if (REPLAY_ID) {
+  if ($('btn-rp-toggle')) $('btn-rp-toggle').addEventListener('click', rpToggle);
+  const seek = $('rp-seek');
+  if (seek) {
+    seek.addEventListener('mousedown',  () => { rpSeekDragging = true; });
+    seek.addEventListener('touchstart', () => { rpSeekDragging = true; });
+    seek.addEventListener('change', e => {
+      rpSeekDragging = false;
+      rpSeek(parseFloat(e.target.value));
+    });
+  }
+  document.querySelectorAll('.rp-speed').forEach(b => {
+    b.addEventListener('click', () => rpSpeed(parseFloat(b.dataset.speed)));
+  });
+}
 
 // ---- Charts (only runs if at least one canvas is present) ---------------
 const buf = { t: [], d: [], y: [], h: [], drone_yaw: [], battery: [], height: [] };
@@ -348,11 +442,12 @@ function updateCharts(s) {
 // ---- Single shared refresh loop -----------------------------------------
 async function refresh() {
   try {
-    const r = await fetch('/api/state', {cache:'no-store'});
+    const r = await fetch(STATE_URL, {cache:'no-store'});
     const s = await r.json();
-    $('phase').textContent = 'phase: '+s.phase;
+    $('phase').textContent = (REPLAY_ID ? 'replay phase: ' : 'phase: ') + s.phase;
     updateStatus(s);
     updateCharts(s);
+    if (REPLAY_ID) await refreshReplayStatus();
   } catch (e) {}
   setTimeout(refresh, 250);
 }
@@ -368,6 +463,44 @@ _PAGE_CHARTS = (_PAGE_BASE_CSS + _PAGE_HEADER
                 + "<main>" + _CHARTS_HTML + "</main>"
                 + _SHARED_SCRIPT)
 
+# Flight list -- one card per recorded flight, with a "Replay" button.
+_PAGE_FLIGHTS = _PAGE_BASE_CSS + _PAGE_HEADER + """
+<main>
+  <div class="card">
+    <h2>Recorded flights</h2>
+    {% if flights %}
+    <table style="width:100%;">
+      <tr>
+        <th>Date</th><th>Serial</th><th>Duration</th>
+        <th>Final phase</th><th>&nbsp;</th>
+      </tr>
+      {% for f in flights %}
+      <tr>
+        <td>{{ f.date }}</td>
+        <td>{{ f.serial }}</td>
+        <td>{{ '%.1f s' % f.duration_s if f.duration_s else '—' }}</td>
+        <td><span class="pill">{{ f.final_phase or '—' }}</span></td>
+        <td style="text-align:right;">
+          <a href="/replay/{{ f.flight_id }}"
+             style="padding:.35rem .8rem; border-radius:6px;
+                    background:var(--accent); color:#062633;
+                    font-weight:600; text-decoration:none;">
+            Replay →
+          </a>
+        </td>
+      </tr>
+      {% endfor %}
+    </table>
+    {% else %}
+    <p style="color:#aab;">
+      No flights recorded yet. Run a mission to populate
+      <code>{{ flights_dir }}</code>.
+    </p>
+    {% endif %}
+  </div>
+</main>
+"""
+
 
 # ---------------------------------------------------------------------------
 # UI server
@@ -378,7 +511,8 @@ class UiServer:
                  host: str = "0.0.0.0", port: int = 8080,
                  history_s: float = 60.0,
                  on_start: Optional[Callable[[], bool]] = None,
-                 on_stop: Optional[Callable[[], bool]] = None):
+                 on_stop: Optional[Callable[[], bool]] = None,
+                 flights_root: Optional[Path] = None):
         self.state = state
         self.frame = latest_frame
         self.host = host
@@ -386,26 +520,214 @@ class UiServer:
         self.history_s = history_s
         self.on_start = on_start
         self.on_stop = on_stop
+        self.flights_root = Path(flights_root) if flights_root else None
+        # Lazy-created replay sessions, keyed by flight_id (= dir name).
+        # We hold one shared session per flight: pause/seek/speed are
+        # shared across browser tabs, but that's fine for our scale.
+        self._replays: dict = {}
+        self._replays_lock = threading.Lock()
         self.app = Flask(__name__)
         self._register_routes()
         self._thread: Optional[threading.Thread] = None
 
+    # --------------------------------------------------------- replay glue
+    def _get_or_create_replay(self, flight_id: str):
+        from .replay import FlightReplay  # local: avoid import cycle
+        if self.flights_root is None:
+            return None
+        # Reject any flight_id that tries to escape flights_root.
+        target = (self.flights_root / flight_id).resolve()
+        try:
+            target.relative_to(self.flights_root.resolve())
+        except ValueError:
+            return None
+        if not target.is_dir():
+            return None
+        with self._replays_lock:
+            existing = self._replays.get(flight_id)
+            if existing is not None:
+                return existing
+            try:
+                rp = FlightReplay(target)
+            except Exception as e:
+                print(f"[ui] failed to load replay {flight_id}: {e}")
+                return None
+            self._replays[flight_id] = rp
+            return rp
+
+    def _list_flights(self) -> list:
+        if self.flights_root is None or not self.flights_root.is_dir():
+            return []
+        out = []
+        for d in sorted(self.flights_root.iterdir(), reverse=True):
+            if not d.is_dir():
+                continue
+            entry = {"flight_id": d.name, "date": d.name,
+                     "serial": "?", "duration_s": None,
+                     "final_phase": None}
+            meta_path = d / "mission_meta.json"
+            if meta_path.exists():
+                try:
+                    meta = json.loads(meta_path.read_text())
+                    entry["serial"] = (meta.get("calibration") or {}
+                                       ).get("serial") or "?"
+                    entry["final_phase"] = (meta.get("outcome") or {}
+                                             ).get("final_phase")
+                except Exception:
+                    pass
+            csv_path = d / "flight_log.csv"
+            if csv_path.exists():
+                try:
+                    # Just read the first and last lines for duration.
+                    with csv_path.open() as f:
+                        lines = f.readlines()
+                    if len(lines) >= 3:
+                        first = lines[1].split(",")
+                        last = lines[-1].split(",")
+                        entry["duration_s"] = (
+                            float(last[1]) - float(first[1]))
+                except Exception:
+                    pass
+            out.append(entry)
+        return out
+
     def _register_routes(self) -> None:
         app = self.app
 
+        live_ctx = dict(
+            active="video",
+            history_s=self.history_s,
+            mode="live",
+            state_url="/api/state",
+            video_url="/video.mjpg",
+            replay_id=None,
+            camera_heading="Annotated camera view",
+            header_label="phase: …",
+        )
+
         @app.get("/")
         def index():
-            return render_template_string(_PAGE_VIDEO, active="video",
-                                           history_s=self.history_s)
+            return render_template_string(_PAGE_VIDEO, **live_ctx)
 
         @app.get("/charts")
         def charts():
-            return render_template_string(_PAGE_CHARTS, active="charts",
-                                           history_s=self.history_s)
+            return render_template_string(_PAGE_CHARTS,
+                                           **{**live_ctx, "active": "charts"})
 
         @app.get("/api/state")
         def api_state():
             return jsonify(self.state.snapshot())
+
+        # ---- Replay --------------------------------------------------
+        @app.get("/replay")
+        def replay_index():
+            flights = self._list_flights()
+            return render_template_string(
+                _PAGE_FLIGHTS, active="replay",
+                history_s=self.history_s,
+                mode="live",
+                state_url="/api/state",
+                video_url="/video.mjpg",
+                replay_id=None,
+                header_label="replay browser",
+                flights=flights,
+                flights_dir=str(self.flights_root) if self.flights_root else "",
+            )
+
+        @app.get("/replay/<flight_id>")
+        def replay_view(flight_id):
+            rp = self._get_or_create_replay(flight_id)
+            if rp is None:
+                return ("Flight not found or could not be loaded", 404)
+            return render_template_string(
+                _PAGE_VIDEO,
+                active="replay",
+                history_s=self.history_s,
+                mode="replay",
+                state_url=f"/api/replay/{flight_id}/state",
+                video_url=f"/replay/{flight_id}/video.mjpg",
+                replay_id=flight_id,
+                camera_heading=f"Replay: {flight_id}",
+                header_label=f"replay: {flight_id}",
+            )
+
+        @app.get("/api/flights")
+        def api_flights():
+            return jsonify(self._list_flights())
+
+        @app.get("/api/replay/<flight_id>/state")
+        def api_replay_state(flight_id):
+            rp = self._get_or_create_replay(flight_id)
+            if rp is None:
+                return jsonify({"error": "not found"}), 404
+            return jsonify(rp.state.snapshot())
+
+        @app.get("/api/replay/<flight_id>/status")
+        def api_replay_status(flight_id):
+            rp = self._get_or_create_replay(flight_id)
+            if rp is None:
+                return jsonify({"error": "not found"}), 404
+            return jsonify(rp.status)
+
+        @app.post("/api/replay/<flight_id>/play")
+        def api_replay_play(flight_id):
+            rp = self._get_or_create_replay(flight_id)
+            if rp is None:
+                return jsonify({"ok": False}), 404
+            rp.play(); return jsonify({"ok": True})
+
+        @app.post("/api/replay/<flight_id>/pause")
+        def api_replay_pause(flight_id):
+            rp = self._get_or_create_replay(flight_id)
+            if rp is None:
+                return jsonify({"ok": False}), 404
+            rp.pause(); return jsonify({"ok": True})
+
+        @app.post("/api/replay/<flight_id>/toggle")
+        def api_replay_toggle(flight_id):
+            rp = self._get_or_create_replay(flight_id)
+            if rp is None:
+                return jsonify({"ok": False}), 404
+            rp.toggle_play(); return jsonify({"ok": True})
+
+        @app.post("/api/replay/<flight_id>/seek")
+        def api_replay_seek(flight_id):
+            rp = self._get_or_create_replay(flight_id)
+            if rp is None:
+                return jsonify({"ok": False}), 404
+            from flask import request
+            try:
+                t = float(request.args.get("t", "0"))
+            except ValueError:
+                return jsonify({"ok": False, "error": "bad t"}), 400
+            rp.seek(t); return jsonify({"ok": True})
+
+        @app.post("/api/replay/<flight_id>/speed")
+        def api_replay_speed(flight_id):
+            rp = self._get_or_create_replay(flight_id)
+            if rp is None:
+                return jsonify({"ok": False}), 404
+            from flask import request
+            try:
+                rate = float(request.args.get("rate", "1"))
+            except ValueError:
+                return jsonify({"ok": False, "error": "bad rate"}), 400
+            rp.set_speed(rate); return jsonify({"ok": True})
+
+        @app.get("/replay/<flight_id>/video.mjpg")
+        def replay_video(flight_id):
+            rp = self._get_or_create_replay(flight_id)
+            if rp is None:
+                return ("flight not found", 404)
+            def gen():
+                while True:
+                    jpg, ts = rp.frame.get()
+                    if jpg:
+                        yield (b"--frame\r\nContent-Type: image/jpeg\r\n\r\n"
+                               + jpg + b"\r\n")
+                    time.sleep(0.05)
+            return Response(gen(),
+                            mimetype="multipart/x-mixed-replace; boundary=frame")
 
         @app.post("/api/start")
         def api_start():

@@ -197,7 +197,8 @@ def cmd_fly(args: argparse.Namespace) -> int:
                   host=cfg.ui_host, port=cfg.ui_port,
                   history_s=cfg.ui_telemetry_history_s,
                   on_start=controller.trigger,
-                  on_stop=request_stop_async)
+                  on_stop=request_stop_async,
+                  flights_root=FLIGHTS_DIR)
     ui.start()
     print(f"[mission] UI running at {ui.url()} (camera) and {ui.url()}/charts")
 
