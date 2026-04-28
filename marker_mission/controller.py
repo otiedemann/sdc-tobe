@@ -340,6 +340,7 @@ class MissionController:
         self.smoother.reset()
         # Per-phase scratch state (set lazily in the relevant _step_*).
         self._land_requested = False
+        self._descent_started_at = None
         self._search_start_yaw = None
         self._search_swept = 0.0
         self._search_prev_yaw = None
@@ -845,9 +846,23 @@ class MissionController:
             except DroneApiError as e:
                 print(f"[ctrl] land() failed: {e} (will retry)")
                 return
+        # The Anafi flips tel.flying to False the moment it enters the
+        # 'landing' SDK state -- i.e., when descent starts, not when
+        # the drone is on the ground. If we transitioned to DONE here
+        # the recording would stop mid-air. Stay in LAND (recording
+        # active) until either ground contact (height ~ 0) or a
+        # reasonable descent window elapses.
         if tel and not tel.flying:
-            self._set_phase(Phase.DONE, "landed")
-            return
+            try:
+                height_cm = float(tel.raw.get("height_cm") or 0.0)
+            except (TypeError, ValueError):
+                height_cm = 0.0
+            if getattr(self, "_descent_started_at", None) is None:
+                self._descent_started_at = now
+            descent_elapsed = now - self._descent_started_at
+            if height_cm < 10.0 or descent_elapsed > 5.0:
+                self._set_phase(Phase.DONE, "landed")
+                return
         # Hard timeout
         if now - self.state.phase_started_at > 30.0:
             self._abort("timed out waiting for flying=False after land")
