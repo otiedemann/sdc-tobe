@@ -94,14 +94,19 @@ class FlightRecorder:
         if self._ann_writer:
             try: self._ann_writer.release()
             except Exception: pass
-        # OpenCV's mp4v output isn't accepted by WhatsApp (and several
-        # other ingest pipelines); re-encode to H.264 + silent AAC so the
-        # files are shareable.
-        self._reencode_for_sharing()
         # meta
         if meta is not None:
             (self.dir / "mission_meta.json").write_text(json.dumps(meta, indent=2,
                                                                    default=str))
+        # OpenCV's mp4v output isn't accepted by WhatsApp (and several
+        # other ingest pipelines); re-encode to H.264 + silent AAC so the
+        # files are shareable. Run this in the background -- the next
+        # mission can roll a fresh flight dir and start while the old
+        # one is still re-encoding. The daemon thread is fire-and-forget;
+        # the encoded file just appears when it's done.
+        threading.Thread(target=self._reencode_for_sharing,
+                         name=f"reencode-{self.dir.name}",
+                         daemon=True).start()
 
     # --------------------------------------------------------- post-process
     def _reencode_for_sharing(self) -> None:
