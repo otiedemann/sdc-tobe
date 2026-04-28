@@ -531,27 +531,46 @@ _PAGE_CALIBRATE = _PAGE_BASE_CSS + _PAGE_HEADER + """
   <div class="card">
     <h2>Camera calibration</h2>
     <p style="font-size:.9rem; line-height:1.45;">
-      Print the OpenCV 9&times;6 inner-corner checkerboard
-      (<a target="_blank" rel="noopener"
-          href="https://github.com/opencv/opencv/raw/4.x/doc/pattern.png"
-          style="color:var(--accent);">pattern.png</a>)
-      onto A4 / Letter, glue it to flat rigid cardboard, and
-      <em>measure one square edge with a ruler</em> in millimetres
-      (printers rarely scale at exactly 100&nbsp;%).
+      Print a checkerboard onto A4 / Letter, glue it to flat rigid
+      cardboard, count the <em>inner corners</em> (one fewer than the
+      square count along each edge), and <em>measure one square edge
+      with a ruler</em> in millimetres -- printers rarely scale at
+      exactly 100&nbsp;%. Common patterns: a 9&times;6 inner-corner board
+      ships with OpenCV (<a target="_blank" rel="noopener"
+        href="https://github.com/opencv/opencv/raw/4.x/doc/pattern.png"
+        style="color:var(--accent);">pattern.png</a>); 10&times;7 fills A4
+      slightly better and is the default below.
       Power the drone, hold it stationary (motors&nbsp;off!), and let the
-      camera see the checkerboard from many angles, distances (~0.5–2 m)
-      and tilts. Aim for 30+ distinct views over 30–60 s of capture.
+      camera see the board from many angles, distances (~0.5-2 m) and
+      tilts. Aim for 30+ distinct views over 30-60 s of capture.
     </p>
-    <div style="display:flex; align-items:center; gap:.5rem; margin-top:.75rem;
+    <div style="display:grid; grid-template-columns: auto auto 1fr;
+                gap:.45rem .8rem; align-items:center; margin-top:.75rem;
                 font-size:.9rem;">
       <label for="cal-square">Square edge:</label>
-      <input id="cal-square" type="number" step="0.1" value="25.0"
-             style="width:5rem; background:#0c0f12; color:var(--fg);
-                    border:1px solid #2a3038; border-radius:4px;
-                    padding:.25rem .35rem;"> mm
-      <span style="margin-left:auto; color:#aab;">
+      <div>
+        <input id="cal-square" type="number" step="0.1" value="25.0"
+               style="width:5rem; background:#0c0f12; color:var(--fg);
+                      border:1px solid #2a3038; border-radius:4px;
+                      padding:.25rem .35rem;"> mm
+      </div>
+      <span style="color:#aab; text-align:right;">
         Drone: <code id="cal-serial">unknown</code>
       </span>
+
+      <label for="cal-cols">Inner corners:</label>
+      <div style="display:flex; align-items:center; gap:.3rem;">
+        <input id="cal-cols" type="number" min="3" max="20" step="1" value="10"
+               style="width:4rem; background:#0c0f12; color:var(--fg);
+                      border:1px solid #2a3038; border-radius:4px;
+                      padding:.25rem .35rem;">
+        &times;
+        <input id="cal-rows" type="number" min="3" max="20" step="1" value="7"
+               style="width:4rem; background:#0c0f12; color:var(--fg);
+                      border:1px solid #2a3038; border-radius:4px;
+                      padding:.25rem .35rem;">
+      </div>
+      <span style="color:#aab; text-align:right;">cols &times; rows</span>
     </div>
     <div style="display:flex; align-items:center; gap:.5rem; margin-top:.75rem;">
       <button id="cal-start" type="button"
@@ -661,11 +680,23 @@ async function calStop() {
 }
 async function calRun() {
   const sq_mm = parseFloat($('cal-square').value);
+  const cols = parseInt($('cal-cols').value, 10);
+  const rows = parseInt($('cal-rows').value, 10);
+  if (!Number.isFinite(sq_mm) || sq_mm <= 0) {
+    $('cal-msg').textContent = 'Square edge must be a positive number (mm).';
+    return;
+  }
+  if (!Number.isInteger(cols) || !Number.isInteger(rows)
+      || cols < 3 || rows < 3) {
+    $('cal-msg').textContent = 'Inner-corner counts must be integers >= 3.';
+    return;
+  }
   const sq_m = sq_mm / 1000.0;
   const serial = $('cal-serial').textContent;
   const u = new URL('/api/calibrate/run', location.origin);
   u.searchParams.set('serial', serial);
   u.searchParams.set('square_size_m', String(sq_m));
+  u.searchParams.set('pattern', `${cols}x${rows}`);
   const r = await fetch(u, {method:'POST'});
   const j = await r.json();
   if (!j.ok) $('cal-msg').textContent = `Could not start: ${j.error || 'unknown'}`;
@@ -983,12 +1014,15 @@ class UiServer:
                 return jsonify({"ok": False,
                                 "error": "bad square_size_m"}), 400
             try:
-                pat_str = request.args.get("pattern", "9x6")
+                pat_str = request.args.get("pattern", "10x7")
                 cols, rows = (int(x) for x in pat_str.lower().split("x"))
+                if cols < 3 or rows < 3:
+                    raise ValueError("dims < 3")
                 pattern = (cols, rows)
             except ValueError:
                 return jsonify({"ok": False,
-                                "error": "bad pattern (want COLSxROWS)"}), 400
+                                "error": "bad pattern (want COLSxROWS, "
+                                         "each >= 3)"}), 400
             ok, msg = self.calibration.run_calibration(
                 serial=serial, square_size_m=square_size_m, pattern=pattern)
             if not ok:
