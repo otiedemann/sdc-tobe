@@ -61,8 +61,9 @@ class Phase(enum.Enum):
     INIT      = "init"
     TAKEOFF   = "takeoff"
     SEARCH    = "search"
-    APPROACH  = "approach"
-    ORBIT     = "orbit"
+    ALIGN     = "align"     # orbit at start radius until heading=0
+    APPROACH  = "approach"  # close distance to target with heading already ~0
+    ORBIT     = "orbit"     # orbit at target radius until heading=target
     HOLD      = "hold"
     LAND      = "land"
     DONE      = "done"
@@ -184,6 +185,10 @@ class MissionState:
     search_began_at: Optional[float] = None
     search_yaw_swept_deg: float = 0.0
     last_marker_seen_at: float = 0.0
+    # Captured on entry to Phase.ALIGN so the forward channel can hold the
+    # current radius (we don't want to close distance until heading is
+    # centred). Cleared when leaving ALIGN.
+    align_distance_m: Optional[float] = None
 
     abort_reason: str = ""
     note: str = ""                                            # informational
@@ -320,6 +325,15 @@ class MissionController:
             self._search_start_yaw = None
             self._search_swept = 0.0
             self._search_prev_yaw = None
+        # Capture / release ALIGN's hold-radius setpoint at the phase
+        # boundary so _step_align doesn't have to discover it itself.
+        if phase == Phase.ALIGN:
+            with self.state.lock:
+                meas = self.state.smoothed
+            self.state.align_distance_m = (meas[0] if meas is not None
+                                           else self.cfg.target_distance_m)
+        elif old == Phase.ALIGN:
+            self.state.align_distance_m = None
         # Reset PD integrators on phase change
         self.pd_yaw.reset(); self.pd_fwd.reset(); self.pd_lat.reset()
         if self.on_phase_change:
@@ -404,6 +418,8 @@ class MissionController:
                     self._step_takeoff(tel, now)
                 elif phase == Phase.SEARCH:
                     self._step_search(now)
+                elif phase == Phase.ALIGN:
+                    self._step_align(tel, now)
                 elif phase == Phase.APPROACH:
                     self._step_approach(tel, now)
                 elif phase == Phase.ORBIT:
@@ -486,9 +502,14 @@ class MissionController:
     # ---------------------------------------------------------------- search
     def _step_search(self, now: float) -> None:
         cfg = self.cfg
-        # If we already see the marker, switch immediately.
+        # If we already see the marker, switch immediately. ALIGN orbits
+        # at the current radius until the relative heading is roughly
+        # zero (marker faces the camera) before APPROACH closes distance
+        # -- this keeps the marker out of the oblique-angle range where
+        # the ArUco detector starts to fail.
         if self.smoother.get(now) is not None:
-            self._set_phase(Phase.APPROACH, "marker acquired -- approaching")
+            self._set_phase(Phase.ALIGN,
+                            "marker acquired -- aligning to face it")
             return
         # Otherwise, yaw in place. Direction is arbitrary; we pick CW (+ yaw).
         self._send_rc(0, 0, 0, cfg.search_yaw_rc)
@@ -518,6 +539,71 @@ class MissionController:
         elif now - self.state.phase_started_at > 30.0:
             self._set_phase(Phase.LAND, "search timed out (no telemetry yaw)")
             return
+
+    # ----------------------------------------------------------------- align
+    def _step_align(self, tel: Optional[TelemetrySnapshot],
+                   now: float) -> None:
+        """Orbit the drone around the marker at its current radius until
+        relative_heading is ~0 (marker normal pointing at the camera).
+
+        Same lateral law as _step_orbit, but with target heading 0 and
+        the forward setpoint pinned to the radius captured on phase
+        entry (state.align_distance_m). We don't close distance here --
+        that's APPROACH's job, and we want it to start with the marker
+        head-on so its tilt stays inside the detector's reliable range.
+        """
+        cfg = self.cfg
+        meas = self.smoother.get(now)
+        if meas is None:
+            self._marker_lost(now); return
+        d, yaw_to_marker, hdg = meas
+
+        # Hard distance floor: same guard as in approach / orbit.
+        if d < cfg.distance_floor_factor * cfg.target_distance_m:
+            self._send_rc(0, 0, 0, 0)
+            with self.state.lock:
+                self.state.note = (f"distance floor ({d:.2f} m) -- "
+                                   "refusing motion in align")
+                self.state.settle_began_at = None
+            return
+
+        # ALIGN target: heading=0, distance=d_align_start.
+        d_set = self.state.align_distance_m or d
+        e_yaw = yaw_to_marker
+        e_fwd = d - d_set
+        # Heading error: shortest-arc to 0.
+        e_hdg = ((0.0 - hdg) + 540.0) % 360.0 - 180.0
+
+        u_yaw = 0.0 if abs(e_yaw) < cfg.yaw_deadband_deg else self.pd_yaw.step(e_yaw, now)
+        u_fwd_raw = 0.0 if abs(e_fwd) < cfg.distance_deadband_m else self.pd_fwd.step(e_fwd, now)
+        u_fwd = self._velocity_damp_fwd(u_fwd_raw, tel)
+        if abs(e_hdg) < cfg.heading_deadband_deg:
+            u_lat_raw = 0.0
+        else:
+            arc_err_m = -d * math.radians(e_hdg)
+            u_lat_raw = self.pd_lat.step(arc_err_m, now)
+        u_lat = self._velocity_damp_lat(u_lat_raw, tel)
+
+        self._send_rc(lr=int(u_lat), fb=int(u_fwd), ud=0, yaw=int(u_yaw))
+
+        # Settle when heading is centred; yaw has to be roughly centred
+        # too (it's the camera's view of the marker, drifts as we move).
+        in_band = (abs(e_hdg) < cfg.heading_deadband_deg
+                   and abs(e_yaw) < cfg.yaw_deadband_deg)
+        # Capture transition decision under the lock, fire _set_phase
+        # OUTSIDE -- threading.Lock isn't reentrant.
+        settled = False
+        with self.state.lock:
+            if in_band:
+                if self.state.settle_began_at is None:
+                    self.state.settle_began_at = now
+                if now - self.state.settle_began_at >= cfg.align_settle_time_s:
+                    settled = True
+            else:
+                self.state.settle_began_at = None
+        if settled:
+            self._set_phase(Phase.APPROACH,
+                            "aligned (heading ~ 0) -- closing distance")
 
     # -------------------------------------------------------------- approach
     def _step_approach(self, tel: Optional[TelemetrySnapshot],

@@ -111,6 +111,12 @@ class MissionConfig:
     approach_settle_time_s: float = 1.0    # how long all errors must be inside
                                               # dead-bands before we consider
                                               # the phase complete
+    align_settle_time_s: float = 1.0       # TUNE same idea, for the ALIGN phase
+                                              # (orbit-to-heading-0 before
+                                              # closing distance) -- the marker
+                                              # tilts past the detector's limit
+                                              # if approach starts at high
+                                              # heading
     orbit_step_deg: float = 5.0            # TUNE  bearing change per control tick
                                               # (limits how fast we orbit)
 
