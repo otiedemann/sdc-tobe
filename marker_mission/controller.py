@@ -665,7 +665,7 @@ class MissionController:
         meas = self.smoother.get(now)
         if meas is None:
             self._marker_lost(now); return
-        d, yaw_to_marker, _ = meas
+        d, yaw_to_marker, hdg = meas
 
         # Hard distance floor: never command forward motion inside
         # distance_floor_factor * target. Last-line guard against pose noise.
@@ -682,6 +682,14 @@ class MissionController:
         # Errors
         e_yaw = yaw_to_marker                  # want yaw_to_marker -> 0
         e_fwd = d - cfg.target_distance_m      # positive: too far -> move forward
+        # Hold relative_heading at 0 during approach. ALIGN may exit while
+        # the drone still has residual lateral velocity (the deadband is
+        # met but the drone hasn't fully stopped). Without an active
+        # lateral correction here, that residual integrates into a heading
+        # drift over the long approach -- on flight 21-28-02 the drone
+        # drifted from hdg=+15 to hdg=-46 across 9 s of approach, even
+        # though approach itself never commanded any lateral motion.
+        e_hdg = ((0.0 - hdg) + 540.0) % 360.0 - 180.0
 
         # Apply dead-bands
         if abs(e_yaw) < cfg.yaw_deadband_deg:
@@ -694,9 +702,20 @@ class MissionController:
             u_fwd_raw = self.pd_fwd.step(e_fwd, now)
         u_fwd = self._velocity_damp_fwd(u_fwd_raw, tel)
 
-        # Lateral / vertical zero in approach -- we want to face the marker
-        # head-on first, not orbit.
-        self._send_rc(lr=0, fb=int(u_fwd), ud=0, yaw=int(u_yaw))
+        # Lateral: same orbit-style law as ALIGN but pinned to heading 0
+        # for the whole approach. We use the looser align_heading_deadband
+        # (~30 deg) -- the goal is to *cap* drift, not enforce a precise
+        # final heading; ORBIT does that with its tight 2 deg deadband at
+        # close range later. With lat_rc_max=4 the lateral correction is
+        # bounded to ~16 cm/s so it doesn't fight the forward channel.
+        if abs(e_hdg) < cfg.align_heading_deadband_deg:
+            u_lat_raw = 0.0
+        else:
+            arc_err_m = -d * math.radians(e_hdg)
+            u_lat_raw = self.pd_lat.step(arc_err_m, now)
+        u_lat = self._velocity_damp_lat(u_lat_raw, tel)
+
+        self._send_rc(lr=int(u_lat), fb=int(u_fwd), ud=0, yaw=int(u_yaw))
 
         # Settle detection. We capture the "settled long enough" decision
         # under the lock, then release before calling _set_phase -- which
