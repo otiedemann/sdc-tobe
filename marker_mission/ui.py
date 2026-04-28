@@ -209,6 +209,10 @@ _SHARED_SCRIPT = """
 const HISTORY_S = {{ history_s }};
 const STATE_URL = {{ state_url|tojson }};
 const REPLAY_ID = {{ replay_id|tojson }};
+// Drone connection state. Initial value comes from the server's flag
+// at page-load time; refresh() updates it each tick from /api/state's
+// drone_connected field, so the Start button enables / disables live.
+let droneConnected = {{ 'true' if drone_connected else 'false' }};
 const $ = id => document.getElementById(id);
 function fmt(v, unit, prec) {
   if (v === null || v === undefined || v === '') return '—';
@@ -223,6 +227,16 @@ let stopRequested = false;
 function setMissionButtons(phase) {
   const start = $('btn-start'); const stop = $('btn-stop'); const msg = $('ctrl-msg');
   if (!start || !stop) return;
+  if (!droneConnected) {
+    // No drone wired in -- the camera page is essentially a stub for
+    // navigation to the Replay tab. Surface that clearly instead of
+    // letting the user click Start and get an opaque server error.
+    start.style.display = ''; stop.style.display = 'none';
+    start.disabled = true; start.style.opacity = '0.5'; start.style.cursor = 'not-allowed';
+    start.textContent = 'Start mission';
+    msg.textContent = 'No drone connected — open the Replay tab to view flights.';
+    return;
+  }
   if (phase === 'init') {
     start.style.display = ''; stop.style.display = 'none';
     start.disabled = false; start.style.opacity = '1'; start.style.cursor = 'pointer';
@@ -444,6 +458,9 @@ async function refresh() {
   try {
     const r = await fetch(STATE_URL, {cache:'no-store'});
     const s = await r.json();
+    if (typeof s.drone_connected === 'boolean') {
+      droneConnected = s.drone_connected;
+    }
     $('phase').textContent = (REPLAY_ID ? 'replay phase: ' : 'phase: ') + s.phase;
     updateStatus(s);
     updateCharts(s);
@@ -512,7 +529,8 @@ class UiServer:
                  history_s: float = 60.0,
                  on_start: Optional[Callable[[], bool]] = None,
                  on_stop: Optional[Callable[[], bool]] = None,
-                 flights_root: Optional[Path] = None):
+                 flights_root: Optional[Path] = None,
+                 drone_connected: bool = True):
         self.state = state
         self.frame = latest_frame
         self.host = host
@@ -521,6 +539,9 @@ class UiServer:
         self.on_start = on_start
         self.on_stop = on_stop
         self.flights_root = Path(flights_root) if flights_root else None
+        # Whether a real drone is wired in. False -> Start button is
+        # disabled in the camera page (replay still works fully).
+        self.drone_connected = bool(drone_connected)
         # Lazy-created replay sessions, keyed by flight_id (= dir name).
         # We hold one shared session per flight: pause/seek/speed are
         # shared across browser tabs, but that's fine for our scale.
@@ -603,6 +624,7 @@ class UiServer:
             replay_id=None,
             camera_heading="Annotated camera view",
             header_label="phase: …",
+            drone_connected=self.drone_connected,
         )
 
         @app.get("/")
@@ -616,7 +638,11 @@ class UiServer:
 
         @app.get("/api/state")
         def api_state():
-            return jsonify(self.state.snapshot())
+            snap = self.state.snapshot()
+            # Surface the live drone-connection flag so the JS can
+            # enable / disable the Start button without a page reload.
+            snap["drone_connected"] = self.drone_connected
+            return jsonify(snap)
 
         # ---- Replay --------------------------------------------------
         @app.get("/replay")
@@ -632,6 +658,7 @@ class UiServer:
                 header_label="replay browser",
                 flights=flights,
                 flights_dir=str(self.flights_root) if self.flights_root else "",
+                drone_connected=self.drone_connected,
             )
 
         @app.get("/replay/<flight_id>")
@@ -649,6 +676,7 @@ class UiServer:
                 replay_id=flight_id,
                 camera_heading=f"Replay: {flight_id}",
                 header_label=f"replay: {flight_id}",
+                drone_connected=self.drone_connected,
             )
 
         @app.get("/api/flights")

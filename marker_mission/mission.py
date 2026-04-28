@@ -131,23 +131,33 @@ def cmd_fly(args: argparse.Namespace) -> int:
           f"hold={cfg.hold_time_s}s api={cfg.api_base_url}")
 
     # ---------- 1. Connect to API server, fetch serial, load calibration ---
+    # The drone doesn't have to be reachable at startup -- the UI comes
+    # up either way so the operator can browse recorded flights via the
+    # Replay tab. We try briefly here so a drone that IS connected gets
+    # its proper per-serial calibration; if not, we fall back to the
+    # default Anafi intrinsics and the telemetry_worker re-checks
+    # connectivity in the background so the Start button unlocks as
+    # soon as the drone shows up.
     api = DroneApi(cfg.api_base_url, cfg.request_timeout_s)
     print(f"[mission] contacting API server at {cfg.api_base_url} ...")
-    deadline = time.monotonic() + 15.0
     serial = "unknown"
+    initially_connected = False
+    deadline = time.monotonic() + 5.0
     while time.monotonic() < deadline:
         try:
             tel = api.telemetry()
             if tel.connected:
                 serial = tel.serial_number or "unknown"
+                initially_connected = True
                 break
-        except Exception as e:
-            print(f"[mission]   waiting: {e}")
-        time.sleep(1.0)
+        except Exception:
+            pass
+        time.sleep(0.5)
+    if initially_connected:
+        print(f"[mission] connected. drone serial = {serial}")
     else:
-        print("[mission] API server unreachable or drone not connected -- abort.")
-        return 1
-    print(f"[mission] connected. drone serial = {serial}")
+        print(f"[mission] no drone yet -- starting UI anyway. "
+              f"telemetry_worker will keep retrying.")
 
     store = CalibrationStore(CALIB_DIR)
     calibration = store.load(serial, args.resolution, allow_default=True)
@@ -157,8 +167,15 @@ def cmd_fly(args: argparse.Namespace) -> int:
               "Anafi default intrinsics. Pose accuracy will be reduced.")
 
     # ---------- 2. Open video stream, start detector ----------------------
+    # Both calls are best-effort -- video_start_mjpeg fails if the drone
+    # isn't reachable yet, and the MjpegStreamReader auto-reconnects on
+    # its own loop, so we just let it retry in the background.
     print("[mission] starting video stream ...")
-    api.video_start_mjpeg()
+    if initially_connected:
+        try:
+            api.video_start_mjpeg()
+        except Exception as e:
+            print(f"[mission] video_start_mjpeg failed: {e} (will retry)")
     reader = MjpegStreamReader(api.video_url())
     reader.start()
     detector = ArucoDetector(calibration, cfg.marker_size_m, cfg.aruco_dict)
@@ -198,7 +215,8 @@ def cmd_fly(args: argparse.Namespace) -> int:
                   history_s=cfg.ui_telemetry_history_s,
                   on_start=controller.trigger,
                   on_stop=request_stop_async,
-                  flights_root=FLIGHTS_DIR)
+                  flights_root=FLIGHTS_DIR,
+                  drone_connected=initially_connected)
     ui.start()
     print(f"[mission] UI running at {ui.url()} (camera) and {ui.url()}/charts")
 
@@ -207,14 +225,34 @@ def cmd_fly(args: argparse.Namespace) -> int:
 
     def telemetry_worker():
         # Poll telemetry independently of the control loop so the UI stays
-        # responsive even when the controller is busy.
+        # responsive even when the controller is busy. Also keeps
+        # ui.drone_connected in sync, and (re-)issues video_start_mjpeg
+        # the first time the drone appears -- so the operator can plug
+        # the drone in AFTER starting mission and the video feed kicks
+        # in automatically.
         period = 0.25
+        was_connected = initially_connected
+        video_started = initially_connected
         while not stop.is_set():
             try:
                 tel = api.telemetry()
                 tel_holder.set(tel)
+                connected_now = bool(tel.connected)
             except Exception:
-                pass
+                connected_now = False
+            ui.drone_connected = connected_now
+            if connected_now and not was_connected:
+                print("[mission] drone connected (was offline at startup) "
+                      "-- starting video stream")
+            if connected_now and not video_started:
+                try:
+                    api.video_start_mjpeg()
+                    video_started = True
+                except Exception as e:
+                    print(f"[mission] video_start_mjpeg failed: {e}")
+            elif not connected_now and was_connected:
+                print("[mission] drone went offline -- waiting to reconnect")
+            was_connected = connected_now
             time.sleep(period)
 
     def vision_worker():
@@ -311,10 +349,17 @@ def cmd_fly(args: argparse.Namespace) -> int:
 
     # Arm the controller. It parks in INIT until the operator presses
     # "Start mission" in the web UI (which calls controller.trigger via
-    # POST /api/start).
+    # POST /api/start). If the drone wasn't reachable at startup the
+    # button stays disabled until telemetry_worker sees a connection.
     controller.start()
-    print(f"[mission] armed -- open {ui.url()} and press 'Start mission' "
-          f"to take off. Ctrl-C to abort.")
+    if initially_connected:
+        print(f"[mission] armed -- open {ui.url()} and press 'Start mission' "
+              f"to take off. Ctrl-C to abort.")
+    else:
+        print(f"[mission] UI ready at {ui.url()}. Browse recorded flights "
+              f"at {ui.url()}/replay.")
+        print(f"[mission] Start mission will unlock once the drone "
+              f"connects via the API server.")
 
     # Wait for completion. The ``stop`` check lets us exit cleanly even
     # if the control thread is still alive in a blocking HTTP call -- it
