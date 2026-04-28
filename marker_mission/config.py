@@ -136,6 +136,18 @@ class MissionConfig:
     # settle as soon as the drone is roughly facing the marker and
     # hands off to APPROACH.
     align_heading_deadband_deg: float = 30.0  # TUNE
+    # APPROACH uses its own, *much* tighter heading deadband. Reusing
+    # ALIGN's +/-30 deg here turned out to give the drone 60 deg of
+    # "free space" inside which the lateral PD never fires; the
+    # relative-heading then drifts CCW (driven by an arcing
+    # yaw-plus-forward coupling) until it exits the band already
+    # carrying tangential momentum, and overshoots. Flight 21-42-17:
+    # heading went +15 -> -30 over 6 s with rc_lr=0 the whole time,
+    # and only when |e_hdg|>30 did PD wake up -- by then the drone
+    # was at -30 with momentum and ended at -45. A small deadband
+    # here lets PD fight the drift early, while ALIGN keeps its
+    # looser threshold for noise tolerance at long range.
+    approach_heading_deadband_deg: float = 5.0  # TUNE
     orbit_step_deg: float = 5.0            # TUNE  bearing change per control tick
                                               # (limits how fast we orbit)
 

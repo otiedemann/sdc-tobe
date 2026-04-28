@@ -703,12 +703,15 @@ class MissionController:
         u_fwd = self._velocity_damp_fwd(u_fwd_raw, tel)
 
         # Lateral: same orbit-style law as ALIGN but pinned to heading 0
-        # for the whole approach. We use the looser align_heading_deadband
-        # (~30 deg) -- the goal is to *cap* drift, not enforce a precise
-        # final heading; ORBIT does that with its tight 2 deg deadband at
-        # close range later. With lat_rc_max=4 the lateral correction is
-        # bounded to ~16 cm/s so it doesn't fight the forward channel.
-        if abs(e_hdg) < cfg.align_heading_deadband_deg:
+        # for the whole approach. We use approach_heading_deadband_deg
+        # (~5 deg) -- much tighter than ALIGN. ALIGN's +/-30 deg gave
+        # APPROACH 60 deg of free space inside which lateral PD never
+        # fired; heading drift integrated unchecked until it exited the
+        # band already carrying tangential momentum (flight 21-42-17:
+        # +15 -> -45 with rc_lr=0 for 6 s of the drift). With lat_rc_max=4
+        # the lateral correction is still bounded to ~16 cm/s so it
+        # doesn't fight the forward channel.
+        if abs(e_hdg) < cfg.approach_heading_deadband_deg:
             u_lat_raw = 0.0
         else:
             arc_err_m = -d * math.radians(e_hdg)
