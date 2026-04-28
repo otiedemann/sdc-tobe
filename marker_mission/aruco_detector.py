@@ -217,6 +217,24 @@ class ArucoDetector:
 
                 chosen_pose, chosen_rvec, chosen_tvec, chosen_err = scored[0]
 
+                # Mirror-collapse for the irrecoverable near-frontal zone:
+                # when two IPPE candidates fit equally and their hdgs are
+                # exact mirrors (sum ~ 0), the image carries no information
+                # about the sign. Reporting either value produces +/-15
+                # flicker that oscillates the lateral PD. Reporting the
+                # midpoint (~0) tells the controller "we're centered, no
+                # strong heading signal" -- which is the truthful
+                # interpretation and falls cleanly inside the deadband.
+                if len(scored) > 1:
+                    hdg0 = scored[0][0].relative_heading_deg
+                    hdg1 = scored[1][0].relative_heading_deg
+                    err0, err1 = scored[0][3], scored[1][3]
+                    mirrored = abs(hdg0 + hdg1) < 5.0
+                    similar_err = (err0 < 1.0
+                                   and err1 < 2.0 * err0 + 0.2)
+                    if mirrored and similar_err:
+                        chosen_pose.relative_heading_deg = (hdg0 + hdg1) / 2.0
+
                 # Reproj-err sanity gate: a winning IPPE candidate that still
                 # mis-projects badly is suspect -- fall back to ITERATIVE.
                 proj, _ = cv2.projectPoints(self._obj_pts,
