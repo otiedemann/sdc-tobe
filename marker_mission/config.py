@@ -84,7 +84,13 @@ class MissionConfig:
     # Output clamps for safety. Lower = slower & safer. -----------------------
     yaw_rc_max: int = 25                   # TUNE  (was 40; caps yaw rate ~25°/s)
     fwd_rc_max: int = 10                   # TUNE  (was 30; caps fwd speed ~40 cm/s)
-    lat_rc_max: int = 10                   # TUNE  (was 30; matches fwd cap)
+    # Orbit needs lateral motion slow enough for yaw to keep tracking the
+    # marker -- otherwise yaw lags, the marker drifts off-axis, and the
+    # commanded "sideways" leaks into radial drift. First orbit attempt at
+    # rc=10 spiraled outward until the marker fell out of FOV. With rc=4
+    # the required yaw rate (~v/d) drops well below yaw_rc_max and v^2/r
+    # centrifugal drift is ~6x smaller.
+    lat_rc_max: int = 4                    # TUNE  (was 10; orbit-stability limited)
     ud_rc_max: int = 25                    # TUNE  (we do not actively control altitude here)
 
     # Hard distance floor: refuse forward commands inside this multiple of the
