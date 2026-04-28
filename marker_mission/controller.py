@@ -897,43 +897,78 @@ class MissionController:
 
     # ----------------------------------------------- velocity feedforward
     #
-    # DISABLED. The drone's vgx/vgy convention from the unified API
-    # server has not been characterized reliably enough to use as a
-    # damping signal. We tried two interpretations on real flights:
+    # vgx/vgy are interpreted as earth-frame NED (vN, vE) and rotated
+    # through the drone's yaw to get body-frame (forward, right) -- this
+    # is the only interpretation that matches the per-frame closing
+    # rate observed in the recent approach flights (e.g., 00-43-35
+    # closing at ~24 cm/s body-fwd; body-frame interpretation gave 0).
     #
-    #   - "earth NED, rotate by yaw to body" (the original path)
-    #     produced a wall crash on 2026-04-29_00-00-47 -- damping
-    #     output flipped sign and the drone accelerated forward while
-    #     PD demanded max backward.
-    #   - "body-frame already, use directly" produced an almost-crash
-    #     on 2026-04-29_00-14-17 -- approach commanded rc_fb=10 to
-    #     close distance, the drone accelerated to ~35 cm/s closing,
-    #     and the damper believed body-forward was ~0 so it never
-    #     braked.
-    #
-    # The two flights gave geometrically inconsistent answers about
-    # which convention the data is in (sign / frame). Until we can
-    # characterize that on the real drone (props off, push the
-    # airframe by hand in known directions, log vgx/vgy/yaw), the
-    # safer path is to disable damping entirely and rely on the PD's
-    # natural output: it shrinks toward zero as the distance error
-    # closes, so the drone decelerates without active braking. Drone
-    # may overshoot the target distance by a small amount; the floor
-    # guard catches anything dangerous.
-    #
-    # The dampers below are no-ops -- they just clamp u_raw to the
-    # configured RC range. If we re-enable damping later, restore the
-    # body-speed extraction here.
+    # Both dampers are now guarded with a "no-sign-flip" rule: if
+    # damping would invert the PD command's sign (i.e., the brake
+    # correction is larger and opposite to PD's intent), discard the
+    # damping for that tick and fall back to PD-only. This protects
+    # against the failure mode that crashed flight 00-00-47 -- if the
+    # frame convention ever happens to be wrong (e.g., yaw briefly
+    # bogus during a fast yaw rate), the worst-case is a single tick
+    # of PD-only output, never a damping-driven reverse command.
+
+    @staticmethod
+    def _telemetry_world_speed(tel: Optional[TelemetrySnapshot]
+                                ) -> Optional[tuple[float, float, float]]:
+        """Return (vN, vE, yaw_deg) in cm/s + degrees, or None if any
+        component is missing."""
+        if tel is None:
+            return None
+        try:
+            vN = float(tel.raw["vgx"])
+            vE = float(tel.raw["vgy"])
+            yaw = float(tel.raw["yaw"])
+        except (KeyError, TypeError, ValueError):
+            return None
+        return (vN, vE, yaw)
+
+    @staticmethod
+    def _world_to_body(vN: float, vE: float,
+                      yaw_deg: float) -> tuple[float, float]:
+        """Project world-NED velocity to (body-forward, body-right)
+        using yaw (deg, CW from north)."""
+        th = math.radians(yaw_deg)
+        v_fwd   =  vN * math.cos(th) + vE * math.sin(th)
+        v_right = -vN * math.sin(th) + vE * math.cos(th)
+        return v_fwd, v_right
+
+    @staticmethod
+    def _no_flip(u_raw: float, u_damped: float) -> float:
+        """If damping flipped the sign of u_raw, reject it (return
+        u_raw). Otherwise return u_damped. Protects against bad-frame
+        damping driving the drone opposite to PD intent."""
+        if u_raw > 0 and u_damped < 0:
+            return u_raw
+        if u_raw < 0 and u_damped > 0:
+            return u_raw
+        return u_damped
 
     def _velocity_damp_fwd(self, u_raw: float,
                           tel: Optional[TelemetrySnapshot]) -> float:
         cfg = self.cfg
-        return max(-cfg.fwd_rc_max, min(cfg.fwd_rc_max, u_raw))
+        ws = self._telemetry_world_speed(tel)
+        if ws is None:
+            return max(-cfg.fwd_rc_max, min(cfg.fwd_rc_max, u_raw))
+        vN, vE, yaw = ws
+        v_fwd, _ = self._world_to_body(vN, vE, yaw)
+        u = self._no_flip(u_raw, u_raw - cfg.fwd_kv * v_fwd)
+        return max(-cfg.fwd_rc_max, min(cfg.fwd_rc_max, u))
 
     def _velocity_damp_lat(self, u_raw: float,
                           tel: Optional[TelemetrySnapshot]) -> float:
         cfg = self.cfg
-        return max(-cfg.lat_rc_max, min(cfg.lat_rc_max, u_raw))
+        ws = self._telemetry_world_speed(tel)
+        if ws is None:
+            return max(-cfg.lat_rc_max, min(cfg.lat_rc_max, u_raw))
+        vN, vE, yaw = ws
+        _, v_right = self._world_to_body(vN, vE, yaw)
+        u = self._no_flip(u_raw, u_raw - cfg.lat_kv * v_right)
+        return max(-cfg.lat_rc_max, min(cfg.lat_rc_max, u))
 
     def _marker_lost(self, now: float, escalate: bool = True) -> None:
         """Handle missing pose with a grace window before falling back to SEARCH.
