@@ -311,6 +311,15 @@ class MissionController:
             self.state.hold_began_at = None
             self.state.search_began_at = None if phase != Phase.SEARCH else time.monotonic()
             self.state.search_yaw_swept_deg = 0.0 if phase == Phase.SEARCH else self.state.search_yaw_swept_deg
+        # Reset the controller's internal sweep tracker on every entry to
+        # SEARCH. Otherwise the second SEARCH after a successful APPROACH
+        # would re-use the previous sweep counter and hit search_total_deg
+        # almost immediately -- the drone would land instead of actually
+        # looking around again.
+        if phase == Phase.SEARCH:
+            self._search_start_yaw = None
+            self._search_swept = 0.0
+            self._search_prev_yaw = None
         # Reset PD integrators on phase change
         self.pd_yaw.reset(); self.pd_fwd.reset(); self.pd_lat.reset()
         if self.on_phase_change:
