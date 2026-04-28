@@ -212,28 +212,47 @@ class FlightReplay:
             )
             self.state.phase_started_at = time.monotonic()
 
-        # Seek + read the matching video frame. Only issue an explicit
-        # seek when the target is far from the last read position;
-        # otherwise let the decoder advance sequentially. The cap was
-        # opened lazily by _ensure_cap() inside the worker thread (see
-        # __init__'s note).
+        # Advance the video to the row's timestamp. The CSV is logged at
+        # ~5 Hz but the video is at ~25 fps, so a single cap.read() per
+        # row would only consume one of every five frames -- playback
+        # would crawl at 1/5 speed. We read forward in the cap until
+        # _last_pos_ms catches up to target_t_ms, then publish the last
+        # frame we got. Sequential reads are far cheaper than explicit
+        # seeks; we only seek for big jumps (initial load, backward
+        # seek, forward leap larger than ~1.5 s).
         if self.cap is not None:
-            t_ms = self.timeline[idx] * 1000.0
-            drift_threshold_ms = 600.0
-            if (self._last_pos_ms < 0
-                    or abs(t_ms - self._last_pos_ms) > drift_threshold_ms
-                    or t_ms < self._last_pos_ms):
+            target_t_ms = self.timeline[idx] * 1000.0
+            big_jump = (self._last_pos_ms < 0
+                        or target_t_ms < self._last_pos_ms - 200.0
+                        or target_t_ms > self._last_pos_ms + 1500.0)
+            if big_jump:
                 try:
-                    self.cap.set(cv2.CAP_PROP_POS_MSEC, t_ms)
+                    self.cap.set(cv2.CAP_PROP_POS_MSEC, target_t_ms)
                 except Exception:
                     return
-            try:
-                ok, frame = self.cap.read()
-            except Exception:
+                try:
+                    ok, frame = self.cap.read()
+                except Exception:
+                    return
+                if ok and frame is not None:
+                    self._last_pos_ms = self.cap.get(cv2.CAP_PROP_POS_MSEC)
+                    self.frame.set(frame)
                 return
-            if ok and frame is not None:
+            # Small forward step -- chew through frames until caught up.
+            last_frame = None
+            for _ in range(64):  # safety cap; 64 frames ~ 2.5 s at 25fps
+                if self._last_pos_ms >= target_t_ms:
+                    break
+                try:
+                    ok, frame = self.cap.read()
+                except Exception:
+                    break
+                if not ok or frame is None:
+                    break
+                last_frame = frame
                 self._last_pos_ms = self.cap.get(cv2.CAP_PROP_POS_MSEC)
-                self.frame.set(frame)
+            if last_frame is not None:
+                self.frame.set(last_frame)
 
     # ---------------------------------------------------- playback loop
     def _wait(self, timeout: float) -> None:
