@@ -112,6 +112,20 @@ class ArucoDetector:
         self._params.cornerRefinementWinSize = 5
         self._detector = cv2.aruco.ArucoDetector(self._aruco_dict, self._params)
 
+        # Per-marker cache of the last accepted outward-normal vector (in
+        # camera frame) and the timestamp it was accepted. Used to break
+        # the IPPE_SQUARE planar-pose ambiguity by temporal continuity --
+        # at low real tilt and long range, the two IPPE solutions have
+        # near-identical reprojection error and the solver flips between
+        # them on sub-pixel corner noise, producing the +/-10 deg "twin
+        # state" jitter on relative_heading_deg observed at 2 m standoff.
+        # Picking whichever solution is closer to the previous frame's
+        # normal collapses the jitter -- the drone's body rotation and
+        # marker geometry change continuously, so the correct solution
+        # also moves continuously.
+        self._prev_normal_cam: dict[int, tuple[np.ndarray, float]] = {}
+        self._ambiguity_max_age_s = 5.0  # cache invalidates after this gap
+
         # 3D marker corners in marker frame, OpenCV ArUco order TL-TR-BR-BL,
         # marker plane is z=0. With z pointing AWAY from the marker face,
         # the camera sits at z>0 when looking at the marker face-on.
@@ -143,29 +157,69 @@ class ArucoDetector:
             if wanted_id is not None and mid != wanted_id:
                 continue
             img_pts = c[0].astype(np.float64)
-            ok, rvec, tvec = cv2.solvePnP(self._obj_pts, img_pts, K, D,
-                                          flags=cv2.SOLVEPNP_IPPE_SQUARE)
-            # IPPE_SQUARE is fast but can return NaN for nearly-degenerate
-            # fronto-parallel views, or a non-NaN-but-poor solution for
-            # square markers whose 4-fold corner ambiguity is broken only
-            # by sub-pixel refinement.  In both cases the iterative solver
-            # gives a clean answer.  Detect both failure modes:
-            need_fallback = (not ok
-                             or not np.all(np.isfinite(rvec))
-                             or not np.all(np.isfinite(tvec)))
-            if not need_fallback:
-                # Compute mean reprojection error in pixels.
-                proj, _ = cv2.projectPoints(self._obj_pts, rvec, tvec, K, D)
+
+            # SOLVEPNP_IPPE_SQUARE returns BOTH planar-ambiguity solutions
+            # (sorted by reprojection error). We pick between them using
+            # temporal continuity instead of just trusting the lowest-error
+            # one -- at low tilt the two are within numerical noise of each
+            # other and which one wins flips between frames.
+            ok, rvecs, tvecs, errs = cv2.solvePnPGeneric(
+                self._obj_pts, img_pts, K, D,
+                flags=cv2.SOLVEPNP_IPPE_SQUARE)
+            candidates: list[tuple[np.ndarray, np.ndarray, float]] = []
+            if ok:
+                for r, t, e in zip(rvecs, tvecs, errs):
+                    r = r.ravel(); t = t.ravel()
+                    if np.all(np.isfinite(r)) and np.all(np.isfinite(t)):
+                        candidates.append((r, t, float(np.asarray(e).ravel()[0])))
+
+            chosen_rvec: Optional[np.ndarray] = None
+            chosen_tvec: Optional[np.ndarray] = None
+            chosen_normal: Optional[np.ndarray] = None
+            if candidates:
+                prev = self._prev_normal_cam.get(mid)
+                prev_n = (prev[0] if prev is not None
+                          and (ts - prev[1]) < self._ambiguity_max_age_s
+                          else None)
+                scored = []
+                for r, t, e in candidates:
+                    R, _ = cv2.Rodrigues(r.reshape(3, 1))
+                    n = (R @ np.array([0.0, 0.0, 1.0])).astype(float)
+                    if n[2] > 0:
+                        n = -n
+                    sim = float(np.dot(n, prev_n)) if prev_n is not None else 0.0
+                    scored.append((sim, e, r, t, n))
+                if prev_n is not None:
+                    scored.sort(key=lambda x: -x[0])    # closer-to-prev wins
+                else:
+                    scored.sort(key=lambda x: x[1])     # else lowest reproj err
+                _, _, chosen_rvec, chosen_tvec, chosen_normal = scored[0]
+
+                # Reproj-err sanity gate: a winning IPPE candidate that still
+                # mis-projects badly is suspect -- fall back to ITERATIVE.
+                proj, _ = cv2.projectPoints(self._obj_pts,
+                                            chosen_rvec, chosen_tvec, K, D)
                 reproj_err = float(np.linalg.norm(
                     proj.reshape(-1, 2) - img_pts, axis=1).mean())
                 if reproj_err > 2.0:           # TUNE: pixel threshold
-                    need_fallback = True
-            if need_fallback:
-                ok, rvec, tvec = cv2.solvePnP(self._obj_pts, img_pts, K, D,
-                                              flags=cv2.SOLVEPNP_ITERATIVE)
-            if not ok or not np.all(np.isfinite(rvec)) or not np.all(np.isfinite(tvec)):
-                continue
-            mp = self._build_pose(mid, img_pts, rvec.ravel(), tvec.ravel(),
+                    chosen_rvec = None
+
+            if chosen_rvec is None:
+                ok2, rvec, tvec = cv2.solvePnP(self._obj_pts, img_pts, K, D,
+                                               flags=cv2.SOLVEPNP_ITERATIVE)
+                if (not ok2
+                        or not np.all(np.isfinite(rvec))
+                        or not np.all(np.isfinite(tvec))):
+                    continue
+                chosen_rvec = rvec.ravel()
+                chosen_tvec = tvec.ravel()
+                R, _ = cv2.Rodrigues(chosen_rvec.reshape(3, 1))
+                chosen_normal = (R @ np.array([0.0, 0.0, 1.0])).astype(float)
+                if chosen_normal[2] > 0:
+                    chosen_normal = -chosen_normal
+
+            self._prev_normal_cam[mid] = (chosen_normal, ts)
+            mp = self._build_pose(mid, img_pts, chosen_rvec, chosen_tvec,
                                   ts, (W, H))
             out.append(mp)
         return out
