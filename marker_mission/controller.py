@@ -371,6 +371,13 @@ class MissionController:
             self._search_start_yaw = None
             self._search_swept = 0.0
             self._search_prev_yaw = None
+        # Latch the HOLD timer on entry, not on the first marker-visible
+        # tick. Otherwise a marker loss right at the start of HOLD never
+        # starts the timer, and the phase can run forever (eventually
+        # escalating to SEARCH). _step_hold always reads from this.
+        if phase == Phase.HOLD:
+            with self.state.lock:
+                self.state.hold_began_at = time.monotonic()
         # Capture / release ALIGN's hold-radius setpoint at the phase
         # boundary so _step_align doesn't have to discover it itself.
         if phase == Phase.ALIGN:
@@ -812,6 +819,19 @@ class MissionController:
     def _step_hold(self, tel: Optional[TelemetrySnapshot],
                   now: float) -> None:
         cfg = self.cfg
+        # Check the HOLD timer FIRST. Once hold_time_s has elapsed we
+        # commit to LAND regardless of marker visibility -- otherwise a
+        # brief marker loss at the end of HOLD pre-empts the LAND
+        # transition via _marker_lost and escalates to SEARCH instead
+        # (the user sees "drone hovered then started spinning around
+        # again" instead of "drone landed").
+        with self.state.lock:
+            began = self.state.hold_began_at
+        if began is not None and (now - began) >= cfg.hold_time_s:
+            self._send_rc(0, 0, 0, 0)
+            self._set_phase(Phase.LAND, f"hold of {cfg.hold_time_s:.0f}s complete")
+            return
+
         meas = self.smoother.get(now)
         if meas is None:
             # During hold, brief marker loss is tolerable -- just zero out.
@@ -841,13 +861,8 @@ class MissionController:
             u_lat_raw = self.pd_lat.step(arc_err_m, now)
         u_lat = self._velocity_damp_lat(u_lat_raw, tel)
         self._send_rc(lr=int(u_lat), fb=int(u_fwd), ud=0, yaw=int(u_yaw))
-
-        with self.state.lock:
-            if self.state.hold_began_at is None:
-                self.state.hold_began_at = now
-            elapsed = now - self.state.hold_began_at
-        if elapsed >= cfg.hold_time_s:
-            self._set_phase(Phase.LAND, f"hold of {cfg.hold_time_s:.0f}s complete")
+        # Timer transition is handled at the top of this method so it
+        # wins over a marker-lost escalation on the same tick.
 
     # ------------------------------------------------------------------ land
     def _step_land(self, tel: Optional[TelemetrySnapshot], now: float) -> None:
