@@ -117,13 +117,16 @@ class MissionConfig:
                                               # tilts past the detector's limit
                                               # if approach starts at high
                                               # heading
-    # ALIGN runs at long range (e.g. 3 m) with the marker still
-    # significantly off-axis, so the per-frame relative_heading
-    # estimate is noisy (+/-15 deg jitter is common). The orbit
-    # phase's tighter heading_deadband_deg (2 deg) is impossible to
-    # satisfy here and makes ALIGN spin forever; ALIGN gets its own,
-    # more lenient threshold. Only used in _step_align.
-    align_heading_deadband_deg: float = 10.0  # TUNE
+    # ALIGN's job is just to keep the marker out of the detector's
+    # oblique-angle dead zone before APPROACH closes distance -- it
+    # does NOT need to centre heading precisely (the ORBIT phase
+    # later does that with its tighter 2 deg deadband at close
+    # range). At ~3 m range the per-frame heading estimate jitters
+    # +/-15-20 deg, so a tight ALIGN threshold makes the phase spin
+    # forever without improving anything; +/-30 deg lets ALIGN
+    # settle as soon as the drone is roughly facing the marker and
+    # hands off to APPROACH.
+    align_heading_deadband_deg: float = 30.0  # TUNE
     orbit_step_deg: float = 5.0            # TUNE  bearing change per control tick
                                               # (limits how fast we orbit)
 
