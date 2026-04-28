@@ -930,29 +930,47 @@ class MissionController:
                                f"(motors NOT commanded)")
 
     # ----------------------------------------------- velocity feedforward
-    @staticmethod
-    def _telemetry_speed(tel: Optional[TelemetrySnapshot],
-                        key: str) -> Optional[float]:
-        """Return body-frame speed in cm/s from telemetry, or None.
+    #
+    # Olympe's SpeedChanged.speedX/Y/Z are NED *world* frame
+    # (X=north, Y=east, Z=down) -- not body frame. The unified API
+    # server forwards them as vgx/vgy/vgz unchanged. Earlier versions
+    # of this controller damped on vgx/vgy as if they were body-frame,
+    # which produced direction-dependent (re)stabilization that
+    # spuriously back-up'd the drone in flight 21:09 once the
+    # calibration changed enough to alter PD's operating point.
+    #
+    # The proper damping uses body-frame velocities, computed by
+    # rotating world NED through the drone's yaw.
 
-        The Anafi server publishes ``vgx`` (body-right) and ``vgy``
-        (body-forward) in cm/s under ``telemetry.raw``. Older firmwares /
-        the simulator may omit them; in that case skip the damping rather
-        than guessing.
-        """
+    @staticmethod
+    def _telemetry_world_speed(tel: Optional[TelemetrySnapshot]
+                                ) -> Optional[tuple[float, float, float]]:
+        """Return (vN, vE, yaw_deg) in cm/s + degrees, or None if any
+        component is missing. ``yaw_deg`` is from north, CW (Anafi /
+        Olympe AttitudeChanged convention)."""
         if tel is None:
             return None
-        v = tel.raw.get(key)
-        if v is None:
-            return None
         try:
-            return float(v)
-        except (TypeError, ValueError):
+            vN = float(tel.raw["vgx"])
+            vE = float(tel.raw["vgy"])
+            yaw = float(tel.raw["yaw"])
+        except (KeyError, TypeError, ValueError):
             return None
+        return (vN, vE, yaw)
+
+    @staticmethod
+    def _world_to_body(vN: float, vE: float,
+                      yaw_deg: float) -> tuple[float, float]:
+        """Project world-NED velocity (north, east) to (body-forward,
+        body-right) using the drone's yaw (deg, CW from north)."""
+        th = math.radians(yaw_deg)
+        v_fwd   =  vN * math.cos(th) + vE * math.sin(th)
+        v_right = -vN * math.sin(th) + vE * math.cos(th)
+        return v_fwd, v_right
 
     def _velocity_damp_fwd(self, u_raw: float,
                           tel: Optional[TelemetrySnapshot]) -> float:
-        """Subtract fwd_kv * vgy from the forward command, then clamp.
+        """Subtract fwd_kv * v_body_forward from the forward command.
 
         Without this, the PD term saturates rc_fb at fwd_rc_max for the
         entire long-range approach (because at e_fwd > ~0.3 m the P term
@@ -960,33 +978,27 @@ class MissionController:
         until distance error closes -- way too late to brake.
         """
         cfg = self.cfg
-        vgy = self._telemetry_speed(tel, "vgy")
-        u = u_raw if vgy is None else u_raw - cfg.fwd_kv * vgy
+        ws = self._telemetry_world_speed(tel)
+        if ws is None:
+            return max(-cfg.fwd_rc_max, min(cfg.fwd_rc_max, u_raw))
+        vN, vE, yaw = ws
+        v_fwd, _ = self._world_to_body(vN, vE, yaw)
+        u = u_raw - cfg.fwd_kv * v_fwd
         return max(-cfg.fwd_rc_max, min(cfg.fwd_rc_max, u))
 
     def _velocity_damp_lat(self, u_raw: float,
                           tel: Optional[TelemetrySnapshot]) -> float:
-        """Lateral mirror of :meth:`_velocity_damp_fwd`, but the SIGN
-        is inverted because vgx on this drone is body-LEFT-positive
-        (NOT body-right as the standard NED convention would say).
-
-        Empirically verified across two flights: a sustained
-        ``rc_lr = -4`` (= body-LEFT command, drone observably moving
-        body-LEFT, relative_heading drifts in the expected direction)
-        produces ``vgx`` rising from ~0 to +25-35 cm/s. So vgx > 0
-        corresponds to body-LEFT motion.
-
-        u_raw < 0 means the controller wants body-LEFT. To brake an
-        already-leftward drift (vgx > 0) we need a body-RIGHT bias --
-        i.e. ADD ``lat_kv * vgx`` rather than subtract it. With the
-        old (subtracting) sign, when ALIGN crossed heading=0 the
-        damping was REINFORCING the lateral motion, which is why the
-        drone was overshooting through the deadband instead of
-        braking inside it.
+        """Lateral mirror of :meth:`_velocity_damp_fwd`. ``u_raw`` and
+        the body-right velocity share sign convention (positive = body-
+        right), so the same subtraction brakes correctly.
         """
         cfg = self.cfg
-        vgx = self._telemetry_speed(tel, "vgx")
-        u = u_raw if vgx is None else u_raw + cfg.lat_kv * vgx
+        ws = self._telemetry_world_speed(tel)
+        if ws is None:
+            return max(-cfg.lat_rc_max, min(cfg.lat_rc_max, u_raw))
+        vN, vE, yaw = ws
+        _, v_right = self._world_to_body(vN, vE, yaw)
+        u = u_raw - cfg.lat_kv * v_right
         return max(-cfg.lat_rc_max, min(cfg.lat_rc_max, u))
 
     def _marker_lost(self, now: float, escalate: bool = True) -> None:

@@ -76,10 +76,21 @@ class MissionConfig:
     # brakes before distance error closes.
     fwd_kp: float = 30.0                   # TUNE  RC counts per m   (was 60)
     fwd_kd: float = 30.0                   # TUNE  RC counts per (m/s)
-    fwd_kv: float = 0.4                    # TUNE  RC counts per (cm/s); damps vgy
+    # NOTE: velocity-damping gains (fwd_kv / lat_kv) default to 0
+    # because the upstream API publishes vgx/vgy in world-NED frame
+    # (per Olympe's SpeedChanged) but earlier code damped on them as
+    # if they were body-frame. A world-to-body projection requires
+    # the drone yaw -- and on flight 21-09 the projected-body
+    # velocities did not match the drone's observed motion (d clearly
+    # decreasing while v_body_fwd computed negative), so damping was
+    # sometimes pushing the drone the wrong way. The conservative
+    # fwd_rc_max=10 / lat_rc_max=4 caps already bound speed; re-
+    # enable damping only after the frame convention is verified on
+    # the bench.
+    fwd_kv: float = 0.0                    # TUNE  RC counts per (cm/s)
     lat_kp: float = 30.0                   # TUNE  RC counts per m   (was 60)
     lat_kd: float = 30.0                   # TUNE  RC counts per (m/s)
-    lat_kv: float = 0.4                    # TUNE  RC counts per (cm/s); damps vgx
+    lat_kv: float = 0.0                    # TUNE  RC counts per (cm/s)
 
     # Output clamps for safety. Lower = slower & safer. -----------------------
     yaw_rc_max: int = 25                   # TUNE  (was 40; caps yaw rate ~25°/s)
