@@ -550,18 +550,23 @@ class MissionController:
         # head-on first, not orbit.
         self._send_rc(lr=0, fb=int(u_fwd), ud=0, yaw=int(u_yaw))
 
-        # Settle detection
+        # Settle detection. We capture the "settled long enough" decision
+        # under the lock, then release before calling _set_phase -- which
+        # itself takes the lock and would self-deadlock since
+        # threading.Lock is non-reentrant.
         in_band = (abs(e_yaw) < cfg.yaw_deadband_deg
                    and abs(e_fwd) < cfg.distance_deadband_m)
+        settled = False
         with self.state.lock:
             if in_band:
                 if self.state.settle_began_at is None:
                     self.state.settle_began_at = now
                 if now - self.state.settle_began_at >= cfg.approach_settle_time_s:
-                    self._set_phase(Phase.ORBIT, "approach settled")
-                    return
+                    settled = True
             else:
                 self.state.settle_began_at = None
+        if settled:
+            self._set_phase(Phase.ORBIT, "approach settled")
 
     # ----------------------------------------------------------------- orbit
     def _step_orbit(self, tel: Optional[TelemetrySnapshot],
@@ -622,15 +627,19 @@ class MissionController:
         in_band = (abs(e_yaw) < cfg.yaw_deadband_deg
                    and abs(e_fwd) < cfg.distance_deadband_m
                    and abs(e_hdg) < cfg.heading_deadband_deg)
+        # Same lock-then-decide pattern as approach: don't call _set_phase
+        # while holding state.lock (non-reentrant -> self-deadlock).
+        settled = False
         with self.state.lock:
             if in_band:
                 if self.state.settle_began_at is None:
                     self.state.settle_began_at = now
                 if now - self.state.settle_began_at >= cfg.approach_settle_time_s:
-                    self._set_phase(Phase.HOLD, "orbit reached target heading")
-                    return
+                    settled = True
             else:
                 self.state.settle_began_at = None
+        if settled:
+            self._set_phase(Phase.HOLD, "orbit reached target heading")
 
     # ------------------------------------------------------------------ hold
     def _step_hold(self, tel: Optional[TelemetrySnapshot],
