@@ -132,7 +132,7 @@ class PoseSmoother:
     branch flip gets ignored.
     """
 
-    HDG_JUMP_MAX_DEG = 15.0           # max plausible per-tick change
+    HDG_JUMP_MAX_DEG = 5.0            # max plausible per-tick change
     HDG_JUMP_CONSECUTIVE_MAX = 5      # accept after this many "jump" ticks
 
     def __init__(self, alpha: float, max_age_s: float):
@@ -982,6 +982,14 @@ class MissionController:
     def _velocity_damp_fwd(self, u_raw: float,
                           tel: Optional[TelemetrySnapshot]) -> float:
         cfg = self.cfg
+        # Damping only fires when PD has a non-zero intent. In deadband,
+        # active braking commands would drive the drone away from rest
+        # for as long as the residual velocity persists -- exactly the
+        # 1.5s "rc_lr=+4 while hdg=0" misbehaviour observed in flight
+        # 2026-04-29_00-57-20. Inside the deadband, drone is permitted
+        # to coast and slow from natural drag.
+        if u_raw == 0.0:
+            return 0.0
         ws = self._telemetry_world_speed(tel)
         if ws is None:
             return max(-cfg.fwd_rc_max, min(cfg.fwd_rc_max, u_raw))
@@ -993,6 +1001,8 @@ class MissionController:
     def _velocity_damp_lat(self, u_raw: float,
                           tel: Optional[TelemetrySnapshot]) -> float:
         cfg = self.cfg
+        if u_raw == 0.0:
+            return 0.0
         ws = self._telemetry_world_speed(tel)
         if ws is None:
             return max(-cfg.lat_rc_max, min(cfg.lat_rc_max, u_raw))
