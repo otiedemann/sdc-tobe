@@ -867,16 +867,10 @@ class MissionController:
 
         d, yaw_to_marker, hdg = meas
 
-        # Hard distance floor: same guard as in flight phases.
-        if d < cfg.distance_floor_factor * cfg.target_distance_m:
-            self._send_rc(0, 0, 0, 0, dry_run=True)
-            with self.state.lock:
-                self.state.note = (f"pre-flight dry-run: distance floor "
-                                   f"({d:.2f} m < "
-                                   f"{cfg.distance_floor_factor:.2f} * "
-                                   f"{cfg.target_distance_m:.2f} m) "
-                                   "-- would refuse motion")
-            return
+        # Hard distance floor: same as in flight phases -- only clamp the
+        # forward channel to <=0; yaw / lateral PDs keep running so the
+        # operator can verify them with the marker held inside the floor.
+        floor_active = d < cfg.distance_floor_factor * cfg.target_distance_m
 
         e_yaw = yaw_to_marker
         e_fwd = d - cfg.target_distance_m
@@ -885,6 +879,8 @@ class MissionController:
         u_yaw = 0.0 if abs(e_yaw) < cfg.yaw_deadband_deg else self.pd_yaw.step(e_yaw, now)
         u_fwd_raw = 0.0 if abs(e_fwd) < cfg.distance_deadband_m else self.pd_fwd.step(e_fwd, now)
         u_fwd = self._velocity_damp_fwd(u_fwd_raw, tel)
+        if floor_active:
+            u_fwd = min(0.0, u_fwd)
         if abs(e_hdg) < cfg.heading_deadband_deg:
             u_lat_raw = 0.0
         else:
