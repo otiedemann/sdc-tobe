@@ -253,11 +253,26 @@ def cmd_fly(args: argparse.Namespace) -> int:
                      name="log").start()
 
     # ---------- 5. Mission ------------------------------------------------
-    # Graceful shutdown on Ctrl-C / SIGTERM
+    # Graceful shutdown on Ctrl-C / SIGTERM. We set ``stop`` BEFORE asking
+    # the controller to stop (vs. after) so the main wait loop below can
+    # exit promptly even if the control thread is stuck in a blocking
+    # HTTP call (api.takeoff/land have a 20 s timeout, api.rc has 2 s) --
+    # otherwise we'd block on its .join until the HTTP call returns.
+    #
+    # The control thread runs _safe_shutdown on its way out (rc_zero +
+    # land + ~15 s telemetry poll), which is why this signal handler
+    # blocks for up to ~25 s. Repeated Ctrl-C during shutdown is harmless
+    # but slow, so we early-return if we're already in shutdown.
     def handle_signal(signum, _frame):
-        print(f"\n[mission] signal {signum} -- requesting safe stop")
-        controller.stop("operator interrupt")
+        if stop.is_set():
+            print(f"\n[mission] signal {signum} -- already shutting down; "
+                  f"please wait for the drone to land "
+                  f"(or kill -9 if it hangs)")
+            return
+        print(f"\n[mission] signal {signum} -- requesting safe stop "
+              f"(drone will land if airborne)")
         stop.set()
+        controller.stop("operator interrupt")
 
     signal.signal(signal.SIGINT, handle_signal)
     if hasattr(signal, "SIGTERM"):
@@ -270,11 +285,14 @@ def cmd_fly(args: argparse.Namespace) -> int:
     print(f"[mission] armed -- open {ui.url()} and press 'Start mission' "
           f"to take off. Ctrl-C to abort.")
 
-    # Wait for completion
+    # Wait for completion. The ``stop`` check lets us exit cleanly even
+    # if the control thread is still alive in a blocking HTTP call -- it
+    # is a daemon thread and will be reaped when the process exits.
     try:
-        while controller.is_running():
+        while controller.is_running() and not stop.is_set():
             time.sleep(0.5)
     except KeyboardInterrupt:
+        stop.set()
         controller.stop("KeyboardInterrupt")
 
     final_phase = state.snapshot()

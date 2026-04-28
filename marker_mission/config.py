@@ -60,7 +60,13 @@ class MissionConfig:
     # Output is the RC channel value in [-100, +100]. Inputs are in
     # SI / degrees. Start small; raise until the drone tracks crisply
     # without overshoot.
-    yaw_kp: float = 2.0                    # TUNE  RC counts per deg
+    # Yaw gains lowered after first tethered test showed a saturation-driven
+    # limit cycle: with kp=2.0 and rc_max=40, P-saturated at |error|>20°
+    # while the drone was repeatedly seeing 20-26° errors, pinning the
+    # command at +/-40 and bang-banging at ~1.7 Hz (loop delay ~300 ms).
+    # New values move the saturation threshold to 40° (past observed peak)
+    # and slow the maximum yaw rate, giving the D-term room to act.
+    yaw_kp: float = 1.0                    # TUNE  RC counts per deg   (was 2.0)
     yaw_kd: float = 0.5                    # TUNE  RC counts per (deg/s)
     # NOTE: fwd / lat gains were lowered after the first-flight wall crash.
     # The drone saturated rc_fb=+30 for the entire long-range approach,
@@ -76,7 +82,7 @@ class MissionConfig:
     lat_kv: float = 0.4                    # TUNE  RC counts per (cm/s); damps vgx
 
     # Output clamps for safety. Lower = slower & safer. -----------------------
-    yaw_rc_max: int = 40                   # TUNE
+    yaw_rc_max: int = 25                   # TUNE  (was 40; caps yaw rate ~25°/s)
     fwd_rc_max: int = 10                   # TUNE  (was 30; caps fwd speed ~40 cm/s)
     lat_rc_max: int = 10                   # TUNE  (was 30; matches fwd cap)
     ud_rc_max: int = 25                    # TUNE  (we do not actively control altitude here)

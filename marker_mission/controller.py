@@ -290,7 +290,12 @@ class MissionController:
         # Make sure a thread parked in INIT can wake up and exit cleanly.
         self._go.set()
         if self._thread:
-            self._thread.join(timeout=5.0)
+            # The control thread runs _safe_shutdown on its way out if the
+            # drone is potentially airborne -- that's an HTTP rc_zero +
+            # land + ~15 s telemetry poll, so allow generous time before
+            # giving up. Mission's main wait loop also watches the stop
+            # event so we don't block the user forever if this overruns.
+            self._thread.join(timeout=25.0)
 
     def is_running(self) -> bool:
         return self._thread is not None and self._thread.is_alive()
@@ -406,6 +411,57 @@ class MissionController:
                 print(f"[ctrl] api error: {e}")
             except Exception as e:
                 print(f"[ctrl] unexpected error: {e}")
+
+        # Main loop exited because of _stop. If we never made it past
+        # takeoff, or already reached DONE / ABORT, there's nothing to do.
+        # Otherwise the drone is potentially airborne and we MUST land it
+        # before this thread dies (operator pressed Ctrl-C; the Anafi
+        # would otherwise just hover indefinitely waiting for commands).
+        with self.state.lock:
+            phase = self.state.phase
+        if phase not in (Phase.DONE, Phase.ABORT, Phase.INIT):
+            self._safe_shutdown(self.state.abort_reason or "operator stop")
+
+    # ------------------------------------------------------- safe shutdown
+    def _safe_shutdown(self, reason: str) -> None:
+        """Best-effort: zero RC, request land, wait briefly for the drone
+        to be on the ground. Called from ``_run`` when the main loop
+        exits while the drone is (or might be) airborne -- typically an
+        operator Ctrl-C mid-flight.
+
+        Synchronous and blocking; ``stop()``'s join timeout is sized to
+        accommodate the rc_zero (2 s) + land (20 s) + telemetry poll (up
+        to 15 s) worst case. Each HTTP call has its own timeout, so we
+        never block forever.
+        """
+        print(f"[ctrl] safe shutdown ({reason}): zeroing RC and requesting land")
+        with self.state.lock:
+            self.state.note = f"safe shutdown: {reason}"
+        try:
+            self.api.rc_zero()
+        except DroneApiError as e:
+            print(f"[ctrl] safe shutdown: rc_zero failed: {e}")
+        try:
+            self.api.land()
+        except DroneApiError as e:
+            print(f"[ctrl] safe shutdown: land() failed: {e}")
+            self._set_phase(Phase.ABORT, f"safe shutdown failed: {e}")
+            return
+        # Wait for the drone to report flying=False.
+        deadline = time.monotonic() + 15.0
+        while time.monotonic() < deadline:
+            try:
+                tel = self.api.telemetry()
+                if not tel.flying:
+                    print("[ctrl] safe shutdown: drone landed")
+                    self._set_phase(Phase.DONE,
+                                    f"landed via safe shutdown ({reason})")
+                    return
+            except DroneApiError:
+                pass
+            time.sleep(0.5)
+        print("[ctrl] safe shutdown: timed out waiting for flying=False")
+        self._set_phase(Phase.ABORT, f"safe shutdown timed out: {reason}")
 
     # --------------------------------------------------------------- takeoff
     def _step_takeoff(self, tel: Optional[TelemetrySnapshot], now: float) -> None:
