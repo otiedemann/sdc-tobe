@@ -901,82 +901,43 @@ class MissionController:
 
     # ----------------------------------------------- velocity feedforward
     #
-    # IMPORTANT: vgx/vgy/vgz from the unified API server are
-    # BODY-FRAME velocity (cm/s), NOT earth-frame NED. The Parrot/Anafi
-    # convention is "body NED" = forward / right / down (FRD-style).
-    # See unified_api_server.py:5564 -- "body-frame cm/s (Parrot NED:
-    # x=fwd, y=right, z=down)" -- confirmed empirically against flight
-    # 2026-04-29_00-00-47, where the previous "rotate by yaw to convert
-    # NED to body" path doubled the rotation, scrambled the damping
-    # sign, and drove the drone forward into a wall while PD wanted to
-    # brake.
+    # DISABLED. The drone's vgx/vgy convention from the unified API
+    # server has not been characterized reliably enough to use as a
+    # damping signal. We tried two interpretations on real flights:
     #
-    # So: vgx is body-forward, vgy is body-right -- use them directly
-    # in the dampers. No yaw projection.
-
-    @staticmethod
-    def _telemetry_body_speed(tel: Optional[TelemetrySnapshot]
-                              ) -> Optional[tuple[float, float]]:
-        """Return (v_body_fwd, v_body_right) in cm/s, or None if missing.
-        vgx/vgy are body-frame already (Parrot 'NED' = FRD)."""
-        if tel is None:
-            return None
-        try:
-            v_fwd = float(tel.raw["vgx"])
-            v_right = float(tel.raw["vgy"])
-        except (KeyError, TypeError, ValueError):
-            return None
-        return (v_fwd, v_right)
+    #   - "earth NED, rotate by yaw to body" (the original path)
+    #     produced a wall crash on 2026-04-29_00-00-47 -- damping
+    #     output flipped sign and the drone accelerated forward while
+    #     PD demanded max backward.
+    #   - "body-frame already, use directly" produced an almost-crash
+    #     on 2026-04-29_00-14-17 -- approach commanded rc_fb=10 to
+    #     close distance, the drone accelerated to ~35 cm/s closing,
+    #     and the damper believed body-forward was ~0 so it never
+    #     braked.
+    #
+    # The two flights gave geometrically inconsistent answers about
+    # which convention the data is in (sign / frame). Until we can
+    # characterize that on the real drone (props off, push the
+    # airframe by hand in known directions, log vgx/vgy/yaw), the
+    # safer path is to disable damping entirely and rely on the PD's
+    # natural output: it shrinks toward zero as the distance error
+    # closes, so the drone decelerates without active braking. Drone
+    # may overshoot the target distance by a small amount; the floor
+    # guard catches anything dangerous.
+    #
+    # The dampers below are no-ops -- they just clamp u_raw to the
+    # configured RC range. If we re-enable damping later, restore the
+    # body-speed extraction here.
 
     def _velocity_damp_fwd(self, u_raw: float,
                           tel: Optional[TelemetrySnapshot]) -> float:
-        """Subtract fwd_kv * v_body_forward from the forward command.
-
-        Without this, the PD term saturates rc_fb at fwd_rc_max for the
-        entire long-range approach (because at e_fwd > ~0.3 m the P term
-        already exceeds the cap), so the drone accelerates uncontested
-        until distance error closes -- way too late to brake.
-        """
         cfg = self.cfg
-        bs = self._telemetry_body_speed(tel)
-        if bs is None:
-            return max(-cfg.fwd_rc_max, min(cfg.fwd_rc_max, u_raw))
-        v_fwd, _ = bs
-        u = u_raw - cfg.fwd_kv * v_fwd
-        return max(-cfg.fwd_rc_max, min(cfg.fwd_rc_max, u))
+        return max(-cfg.fwd_rc_max, min(cfg.fwd_rc_max, u_raw))
 
     def _velocity_damp_lat(self, u_raw: float,
                           tel: Optional[TelemetrySnapshot]) -> float:
-        """Lateral mirror of :meth:`_velocity_damp_fwd`. ``u_raw`` and
-        the body-right velocity share sign convention (positive = body-
-        right), so the same subtraction brakes correctly -- but with a
-        crucial extra constraint: damping must not flip the command
-        sign.
-
-        Reason: lat_rc_max is small (4) and lat_kv is 0.4, so a body-
-        left velocity of ~15 cm/s is enough to swing u from -4 (PD
-        saturated) through zero to +4 (damping-driven body-RIGHT). The
-        controller would then actively push the drone in the opposite
-        direction of where PD wants to go -- driving heading AWAY from
-        target instead of just braking. Flight 22-25-16 approach: at
-        hdg=-15 with PD saturated commanding body-left, damping flipped
-        rc_lr to +4 for several seconds and the drone drifted from
-        hdg=-15 back to hdg=-31 while still 15+ deg from the heading-0
-        target. Forward damping does NOT need this guard because PD's
-        forward output naturally shrinks as d -> target_distance, so
-        the brake-by-backward path is desired and self-resolving.
-        """
         cfg = self.cfg
-        bs = self._telemetry_body_speed(tel)
-        if bs is None:
-            return max(-cfg.lat_rc_max, min(cfg.lat_rc_max, u_raw))
-        _, v_right = bs
-        u = u_raw - cfg.lat_kv * v_right
-        if u_raw > 0:
-            u = max(0.0, u)
-        elif u_raw < 0:
-            u = min(0.0, u)
-        return max(-cfg.lat_rc_max, min(cfg.lat_rc_max, u))
+        return max(-cfg.lat_rc_max, min(cfg.lat_rc_max, u_raw))
 
     def _marker_lost(self, now: float, escalate: bool = True) -> None:
         """Handle missing pose with a grace window before falling back to SEARCH.
