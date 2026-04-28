@@ -554,9 +554,14 @@ _PAGE_CALIBRATE = _PAGE_BASE_CSS + _PAGE_HEADER + """
                       border:1px solid #2a3038; border-radius:4px;
                       padding:.25rem .35rem;"> mm
       </div>
-      <span style="color:#aab; text-align:right;">
-        Drone: <code id="cal-serial">unknown</code>
-      </span>
+      <div style="display:flex; align-items:center; gap:.4rem;
+                  justify-content:flex-end; color:#aab;">
+        Drone:
+        <input id="cal-serial" type="text" placeholder="serial / label"
+               style="width:11rem; background:#0c0f12; color:var(--fg);
+                      border:1px solid #2a3038; border-radius:4px;
+                      padding:.25rem .35rem; font-family:inherit;">
+      </div>
 
       <label for="cal-cols">Inner corners:</label>
       <div style="display:flex; align-items:center; gap:.3rem;">
@@ -603,11 +608,18 @@ _PAGE_CALIBRATE = _PAGE_BASE_CSS + _PAGE_HEADER + """
 </main>
 <script>
 const $ = id => document.getElementById(id);
+// Seed the serial input from live telemetry IF the operator hasn't
+// typed anything yet. The unified API server doesn't currently expose
+// a serial number, so most of the time the operator types in their
+// own label here -- it becomes the suffix in the saved .npz filename.
+let serialSeeded = false;
 async function refreshSerial() {
   try {
+    const inp = $('cal-serial');
+    if (!inp || serialSeeded || inp.value) { serialSeeded = true; return; }
     const s = await (await fetch('/api/state', {cache:'no-store'})).json();
     const sn = (s.telemetry || {}).serial_number;
-    $('cal-serial').textContent = sn || 'unknown';
+    if (sn) { inp.value = sn; serialSeeded = true; }
   } catch(e) {}
 }
 async function calStatus() {
@@ -632,11 +644,11 @@ async function calStatus() {
       case 'captured':
         start.style.display = ''; stop.style.display = 'none';
         start.disabled = false;
-        run.disabled = !$('cal-serial').textContent
-                     || $('cal-serial').textContent === 'unknown';
+        run.disabled = !$('cal-serial').value.trim();
         label = `Captured ${s.frames_captured} frames. `
-              + (run.disabled ? 'Drone serial unknown -- connect drone first.'
-                              : 'Press Run calibration when ready.');
+              + (run.disabled
+                 ? 'Type a drone serial / label, then press Run.'
+                 : 'Press Run calibration when ready.');
         break;
       case 'running':
         start.style.display = ''; stop.style.display = 'none';
@@ -692,7 +704,11 @@ async function calRun() {
     return;
   }
   const sq_m = sq_mm / 1000.0;
-  const serial = $('cal-serial').textContent;
+  const serial = $('cal-serial').value.trim();
+  if (!serial) {
+    $('cal-msg').textContent = 'Type a drone serial / label first.';
+    return;
+  }
   const u = new URL('/api/calibrate/run', location.origin);
   u.searchParams.set('serial', serial);
   u.searchParams.set('square_size_m', String(sq_m));
