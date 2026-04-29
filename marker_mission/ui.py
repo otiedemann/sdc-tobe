@@ -875,11 +875,13 @@ _PAGE_TUNE = _PAGE_BASE_CSS + _PAGE_HEADER + """
   <div class="card">
     <h2>Live PD / mission tuning</h2>
     <p style="font-size:.85rem; color:#aab; margin:.2rem 0 1rem;">
-      Edit the values below and press <b>Apply</b> to push them into the
-      running controller (no restart needed). <b>Save</b> persists the
-      current values to <code>~/.marker_mission/config.json</code>.
-      <b>Reload</b> re-reads that file (discards any unsaved Apply).
-      <b>Reset</b> reverts every field to the dataclass default.
+      Edits below are pushed to the running controller automatically
+      (~250 ms after you stop typing, or immediately on blur / Enter).
+      <b>Apply all</b> force-syncs every field at once. <b>Save</b>
+      persists the current values to
+      <code>~/.marker_mission/config.json</code>. <b>Reload</b>
+      re-reads that file. <b>Reset</b> reverts every field to the
+      dataclass default.
     </p>
     <div id="tune-status" style="font-size:.85rem; color:#aab; margin-bottom:.6rem;"></div>
     <form id="tune-form">
@@ -888,7 +890,8 @@ _PAGE_TUNE = _PAGE_BASE_CSS + _PAGE_HEADER + """
         <button type="button" id="btn-apply"
                 style="padding:.5rem .9rem; border:0; border-radius:6px;
                        background:var(--accent); color:#062633; font-weight:600;
-                       cursor:pointer;">Apply</button>
+                       cursor:pointer;" title="Force-sync every field at
+                       once (each field is also auto-applied as you edit it).">Apply all</button>
         <button type="button" id="btn-save"
                 style="padding:.5rem .9rem; border:0; border-radius:6px;
                        background:var(--good); color:#072413; font-weight:600;
@@ -981,7 +984,7 @@ function renderGroups(view) {
     }
     root.appendChild(div);
   }
-  // Wire input change-tracking and per-field reset
+  // Wire input change-tracking, per-field reset, and auto-apply
   document.querySelectorAll('.tune-input').forEach(inp => {
     inp.addEventListener('input', () => {
       const name = inp.dataset.name;
@@ -989,7 +992,11 @@ function renderGroups(view) {
       if (String(inp.value) !== def) inp.classList.add('dirty');
       else inp.classList.remove('dirty');
       TUNE_DIRTY.add(name);
+      scheduleAutoApply(name);
     });
+    // Also commit immediately on blur / Enter (cancels any pending
+    // debounce so the user gets fast feedback when leaving the field).
+    inp.addEventListener('change', () => applyFieldNow(inp.dataset.name));
   });
   document.querySelectorAll('.tune-resetbtn').forEach(btn => {
     btn.addEventListener('click', () => {
@@ -999,8 +1006,46 @@ function renderGroups(view) {
       inp.value = TUNE_FIELDS[name].default;
       inp.classList.remove('dirty');
       TUNE_DIRTY.add(name);
+      applyFieldNow(name);
     });
   });
+}
+
+// ---- Live auto-apply (debounced per-field) -------------------------------
+const APPLY_DEBOUNCE_MS = 250;
+const applyTimers = new Map();   // field name -> setTimeout id
+
+function scheduleAutoApply(name) {
+  if (applyTimers.has(name)) clearTimeout(applyTimers.get(name));
+  applyTimers.set(name, setTimeout(() => {
+    applyTimers.delete(name);
+    applyFieldNow(name);
+  }, APPLY_DEBOUNCE_MS));
+}
+async function applyFieldNow(name) {
+  if (applyTimers.has(name)) {
+    clearTimeout(applyTimers.get(name));
+    applyTimers.delete(name);
+  }
+  const inp = document.querySelector(`.tune-input[data-name="${name}"]`);
+  if (!inp) return;
+  const body = {}; body[name] = inp.value;
+  try {
+    const r = await fetch('/api/tune/apply', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify(body),
+    });
+    const j = await r.json();
+    if (!j.ok) {
+      setStatus('Apply ' + name + ' failed: '
+                + JSON.stringify(j.errors || j.error), false);
+      return;
+    }
+    setStatus(name + ' = ' + inp.value + ' applied to running controller.', true);
+  } catch (e) {
+    setStatus('Apply ' + name + ' failed: ' + e, false);
+  }
 }
 
 function collectValues() {
