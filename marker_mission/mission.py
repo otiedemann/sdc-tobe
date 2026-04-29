@@ -186,21 +186,15 @@ def cmd_fly(args: argparse.Namespace) -> int:
     latest_ann_frame = LatestFrame()
 
     # ---------- 3. Set up mission state, recorder, UI ---------------------
-    # The recorder is rotated per mission (see the mission loop below)
-    # so each run lands in its own ~/.marker_mission/flights/<ts>_<serial>/
-    # directory with its own log + videos. The workers reference whichever
-    # recorder is current via recorder_box[0]; recording_paused governs
-    # WHEN they actually write -- it's set during pre-flight (INIT) and
-    # post-flight (DONE/ABORT), and cleared while the drone is airborne
-    # (TAKEOFF / SEARCH / ALIGN / APPROACH / HOLD / LAND). The
-    # phase transitions below drive that flag so each saved flight only
-    # contains the actual flight, not the operator dry-run period.
+    # The recorder + flight directory are created LAZILY at TAKEOFF so a
+    # script run that never flies (e.g., the operator only browsing
+    # replays) doesn't litter ~/.marker_mission/flights/ with empty
+    # directories. recorder_box[0] / flight_dir_box[0] are None when
+    # there is no active recording; vision_worker / log_worker /
+    # _log_param_changes all None-check before writing.
     state = MissionState()
-    flight_dir = make_flight_dir(FLIGHTS_DIR, serial)
-    recorder = FlightRecorder(flight_dir, fps=cfg.record_fps)
-    print(f"[mission] flight artefacts: {flight_dir}")
-    recorder_box = [recorder]
-    flight_dir_box = [flight_dir]
+    recorder_box: list = [None]
+    flight_dir_box: list = [None]
     # Start paused -- INIT is not part of the flight.
     recording_paused = threading.Event()
     recording_paused.set()
@@ -209,8 +203,21 @@ def cmd_fly(args: argparse.Namespace) -> int:
                        Phase.APPROACH, Phase.HOLD, Phase.LAND}
 
     def on_phase_change(old_phase, new_phase, note):
-        # Recording follows the airborne envelope: starts at TAKEOFF,
-        # captures everything through LAND, stops at DONE / ABORT.
+        # First-tick of TAKEOFF in this mission: create the flight dir
+        # and recorder. We do this BEFORE clearing recording_paused so
+        # vision_worker / log_worker never see a "recording active but
+        # recorder is None" race.
+        if new_phase == Phase.TAKEOFF and recorder_box[0] is None:
+            new_dir = make_flight_dir(FLIGHTS_DIR, serial)
+            recorder_box[0] = FlightRecorder(new_dir, fps=cfg.record_fps)
+            flight_dir_box[0] = new_dir
+            print(f"[mission] flight artefacts: {new_dir}")
+            try:
+                cfg.save(new_dir / "cfg_start.json")
+            except Exception as e:
+                print(f"[mission] cfg_start.json save failed: {e}")
+
+        # Recording envelope.
         if new_phase in AIRBORNE_PHASES:
             if recording_paused.is_set():
                 print(f"[rec] starting recording (phase={new_phase.value})")
@@ -219,21 +226,14 @@ def cmd_fly(args: argparse.Namespace) -> int:
             if not recording_paused.is_set():
                 print(f"[rec] stopping recording (phase={new_phase.value})")
             recording_paused.set()
-        # Snapshot the active config at flight boundaries so the recorded
-        # flight directory is self-describing later (which gains, deadbands,
-        # caps were active during this run).
-        if new_phase == Phase.TAKEOFF:
-            try:
-                cfg.save(flight_dir_box[0] / "cfg_start.json")
-            except Exception as e:
-                print(f"[mission] cfg_start.json save failed: {e}")
-        elif new_phase in (Phase.DONE, Phase.ABORT):
-            # Only write end if a flight actually happened (cfg_start.json
-            # exists). Otherwise the operator just bounced INIT and we have
-            # nothing to bookend.
-            if (flight_dir_box[0] / "cfg_start.json").exists():
+
+        # End-of-flight snapshot. Only if a flight actually happened
+        # (cfg_start.json was written above).
+        if new_phase in (Phase.DONE, Phase.ABORT):
+            fdir = flight_dir_box[0]
+            if fdir is not None and (fdir / "cfg_start.json").exists():
                 try:
-                    cfg.save(flight_dir_box[0] / "cfg_end.json")
+                    cfg.save(fdir / "cfg_end.json")
                 except Exception as e:
                     print(f"[mission] cfg_end.json save failed: {e}")
 
@@ -368,8 +368,9 @@ def cmd_fly(args: argparse.Namespace) -> int:
                 # Record both raw and annotated ----------------------------
                 if not recording_paused.is_set():
                     rec = recorder_box[0]
-                    rec.push_raw_frame(frame)
-                    rec.push_annotated_frame(ann)
+                    if rec is not None:
+                        rec.push_raw_frame(frame)
+                        rec.push_annotated_frame(ann)
             except Exception as e:
                 print(f"[vision] error: {e}")
 
@@ -379,8 +380,9 @@ def cmd_fly(args: argparse.Namespace) -> int:
         period = 1.0 / max(2.0, cfg.control_rate_hz / 2)
         while not stop.is_set():
             if not recording_paused.is_set():
-                recorder_box[0].log_row(
-                    state, pose_holder.get(), tel_holder.get())
+                rec = recorder_box[0]
+                if rec is not None:
+                    rec.log_row(state, pose_holder.get(), tel_holder.get())
             time.sleep(period)
 
     threading.Thread(target=telemetry_worker, daemon=True,
@@ -457,30 +459,32 @@ def cmd_fly(args: argparse.Namespace) -> int:
                   f"(reason: {final['note'] or final['abort_reason'] or '—'})")
 
             # ---- Finalize this flight's artefacts (write meta + close
-            # video / csv + run the H.264 re-encode). Pause the workers
-            # for the moment we swap recorders so they don't race against
-            # FlightRecorder's _video_q and _csv_fp teardown.
-            outcome = {
-                "final_phase": last_phase,
-                "abort_reason": final["abort_reason"],
-                "note": final["note"],
-                "serial": serial,
-            }
-            # Pause recording for the swap. on_phase_change keeps it
-            # paused for the whole next INIT phase too, so the new
-            # flight_dir only fills up once the next TAKEOFF fires.
+            # video / csv + run the H.264 re-encode). Only fires if a
+            # flight actually happened -- a controller exit without ever
+            # entering TAKEOFF (operator pressed Stop in INIT, etc.)
+            # leaves recorder_box[0] / flight_dir_box[0] both None and we
+            # have nothing to finalize.
             recording_paused.set()
-            write_meta(flight_dir_box[0], cfg, calibration, outcome)
-            recorder_box[0].stop(meta=None)
-            print(f"[mission #{mission_idx}] artefacts saved in "
-                  f"{flight_dir_box[0]}")
+            if recorder_box[0] is not None and flight_dir_box[0] is not None:
+                outcome = {
+                    "final_phase": last_phase,
+                    "abort_reason": final["abort_reason"],
+                    "note": final["note"],
+                    "serial": serial,
+                }
+                write_meta(flight_dir_box[0], cfg, calibration, outcome)
+                recorder_box[0].stop(meta=None)
+                print(f"[mission #{mission_idx}] artefacts saved in "
+                      f"{flight_dir_box[0]}")
+            else:
+                print(f"[mission #{mission_idx}] no flight performed -- "
+                      f"nothing to save")
+            # Drop the box references. The next mission's TAKEOFF will
+            # create a fresh flight_dir + recorder via on_phase_change.
+            recorder_box[0] = None
+            flight_dir_box[0] = None
             if stop.is_set():
                 break
-            # ---- Roll a fresh flight dir + recorder for the next run.
-            new_dir = make_flight_dir(FLIGHTS_DIR, serial)
-            flight_dir_box[0] = new_dir
-            recorder_box[0] = FlightRecorder(new_dir, fps=cfg.record_fps)
-            print(f"[mission] new flight artefacts: {new_dir}")
 
             # Reset the controller + shared state so the next iteration
             # arms cleanly back in INIT.
@@ -500,17 +504,19 @@ def cmd_fly(args: argparse.Namespace) -> int:
     except Exception:
         pass
     # Finalize whatever recorder is current, if it hasn't been stopped
-    # already by the mission loop's stop() above.
+    # already by the mission loop above. Skip silently if there was no
+    # active recording (lazy creation never fired -- replay-only run).
     try:
-        last_outcome = {
-            "final_phase": state.snapshot()["phase"],
-            "abort_reason": state.snapshot()["abort_reason"],
-            "note": state.snapshot()["note"],
-            "serial": serial,
-        }
-        write_meta(flight_dir_box[0], cfg, calibration, last_outcome)
-        recorder_box[0].stop(meta=None)
-        print(f"[mission] artefacts saved in {flight_dir_box[0]}")
+        if recorder_box[0] is not None and flight_dir_box[0] is not None:
+            last_outcome = {
+                "final_phase": state.snapshot()["phase"],
+                "abort_reason": state.snapshot()["abort_reason"],
+                "note": state.snapshot()["note"],
+                "serial": serial,
+            }
+            write_meta(flight_dir_box[0], cfg, calibration, last_outcome)
+            recorder_box[0].stop(meta=None)
+            print(f"[mission] artefacts saved in {flight_dir_box[0]}")
     except Exception as e:
         print(f"[mission] cleanup recorder.stop failed: {e}")
     return 0 if last_phase == "done" else 2
