@@ -162,6 +162,10 @@ class FlightReplay:
             "drone_yaw": _col("tel_yaw"),
             "battery":   _col("tel_battery"),
             "height":    _col("tel_height_cm"),
+            "rc_lr":  _col("rc_lr"),
+            "rc_fb":  _col("rc_fb"),
+            "rc_ud":  _col("rc_ud"),
+            "rc_yaw": _col("rc_yaw"),
             "duration_s": self.duration_s,
         }
 

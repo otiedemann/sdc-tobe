@@ -213,6 +213,7 @@ _CHARTS_HTML = """
   <div class="card"><h2>Yaw to marker (°)</h2><canvas id="c-y" width="700" height="200"></canvas></div>
   <div class="card"><h2>Relative heading (°)</h2><canvas id="c-h" width="700" height="200"></canvas></div>
   <div class="card"><h2>Drone telemetry (yaw / battery / height)</h2><canvas id="c-t" width="700" height="200"></canvas></div>
+  <div class="card"><h2>RC commands (lr / fb / ud / yaw)</h2><canvas id="c-rc" width="700" height="200"></canvas></div>
 </section>
 """
 
@@ -396,7 +397,8 @@ if (REPLAY_ID) {
 }
 
 // ---- Charts (only runs if at least one canvas is present) ---------------
-const buf = { t: [], d: [], y: [], h: [], drone_yaw: [], battery: [], height: [] };
+const buf = { t: [], d: [], y: [], h: [], drone_yaw: [], battery: [], height: [],
+              rc_lr: [], rc_fb: [], rc_ud: [], rc_yaw: [] };
 let chartPlayheadT = null;     // replay only: marks current position on the x axis
 let chartPrefilled = false;    // replay only: timeline already loaded
 
@@ -410,9 +412,15 @@ function pushSample(s) {
   buf.drone_yaw.push(t.yaw);
   buf.battery.push(t.battery);
   buf.height.push(t.height_cm);
+  const rc = s.rc || {};
+  buf.rc_lr.push(rc.lr);
+  buf.rc_fb.push(rc.fb);
+  buf.rc_ud.push(rc.ud);
+  buf.rc_yaw.push(rc.yaw);
   while (buf.t.length && (now - buf.t[0]) > HISTORY_S) {
     buf.t.shift(); buf.d.shift(); buf.y.shift(); buf.h.shift();
     buf.drone_yaw.shift(); buf.battery.shift(); buf.height.shift();
+    buf.rc_lr.shift(); buf.rc_fb.shift(); buf.rc_ud.shift(); buf.rc_yaw.shift();
   }
 }
 async function prefillReplayCharts() {
@@ -430,6 +438,10 @@ async function prefillReplayCharts() {
     buf.drone_yaw = tl.drone_yaw.slice();
     buf.battery = tl.battery.slice();
     buf.height = tl.height.slice();
+    buf.rc_lr  = (tl.rc_lr  || new Array(tl.t.length).fill(null)).slice();
+    buf.rc_fb  = (tl.rc_fb  || new Array(tl.t.length).fill(null)).slice();
+    buf.rc_ud  = (tl.rc_ud  || new Array(tl.t.length).fill(null)).slice();
+    buf.rc_yaw = (tl.rc_yaw || new Array(tl.t.length).fill(null)).slice();
     chartPrefilled = true;
   } catch (e) {}
 }
@@ -528,6 +540,12 @@ function updateCharts(s) {
     {label:'battery%',  color:'#a78bfa', data:buf.battery,   legendX:2},
     {label:'h(cm)',     color:'#22d3ee', data:buf.height,    legendX:4},
   ]);
+  drawSeries('c-rc', [
+    {label:'rc_lr',  color:'#fb7185', data:buf.rc_lr,  legendX:0},
+    {label:'rc_fb',  color:'#34d399', data:buf.rc_fb,  legendX:1},
+    {label:'rc_ud',  color:'#60a5fa', data:buf.rc_ud,  legendX:2},
+    {label:'rc_yaw', color:'#fbbf24', data:buf.rc_yaw, legendX:3},
+  ], {target:0});
 }
 
 // ---- Single shared refresh loop -----------------------------------------
