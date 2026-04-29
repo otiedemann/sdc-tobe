@@ -1162,6 +1162,14 @@ async function refreshSnapshots() {
         + 'background:var(--accent); color:#062633; font-weight:600; cursor:pointer; '
         + 'margin-right:.4rem; font-size:.8rem;';
       loadBtn.addEventListener('click', () => loadSnap(s.name));
+      const overBtn = document.createElement('button');
+      overBtn.textContent = 'Overwrite';
+      overBtn.type = 'button';
+      overBtn.title = 'Save the current form values into this snapshot, replacing it.';
+      overBtn.style.cssText = 'padding:.2rem .55rem; border:1px solid #2a3038; '
+        + 'border-radius:4px; background:#1f2937; color:#e6edf3; cursor:pointer; '
+        + 'margin-right:.4rem; font-size:.8rem;';
+      overBtn.addEventListener('click', () => overwriteSnap(s.name));
       const delBtn = document.createElement('button');
       delBtn.textContent = 'Delete';
       delBtn.type = 'button';
@@ -1170,6 +1178,7 @@ async function refreshSnapshots() {
         + 'font-size:.8rem;';
       delBtn.addEventListener('click', () => deleteSnap(s.name));
       actTd.appendChild(loadBtn);
+      actTd.appendChild(overBtn);
       actTd.appendChild(delBtn);
       tr.appendChild(nameTd);
       tr.appendChild(timeTd);
@@ -1197,6 +1206,23 @@ async function saveSnap() {
     await refreshSnapshots();
   } catch (e) {
     setStatus('Snapshot save failed: ' + e, false);
+  }
+}
+async function overwriteSnap(name) {
+  if (!confirm('Overwrite snapshot "' + name + '" with the current form values?')) return;
+  try {
+    const r = await fetch('/api/tune/snapshots/' + encodeURIComponent(name), {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify(collectValues()),
+    });
+    const j = await r.json();
+    if (!j.ok) { setStatus('Overwrite failed: ' + (j.error || 'unknown'), false); return; }
+    setStatus('Snapshot "' + name + '" overwritten with current values.', true);
+    document.querySelectorAll('.tune-input.dirty').forEach(i => i.classList.remove('dirty'));
+    await refreshSnapshots();
+  } catch (e) {
+    setStatus('Overwrite failed: ' + e, false);
   }
 }
 async function loadSnap(name) {
