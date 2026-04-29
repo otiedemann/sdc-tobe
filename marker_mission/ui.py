@@ -20,6 +20,7 @@ offline).
 
 from __future__ import annotations
 
+import datetime as _dt
 import json
 import threading
 import time
@@ -1248,7 +1249,8 @@ class UiServer:
                  drone_connected: bool = True,
                  calibration_capture=None,
                  cfg: Optional[MissionConfig] = None,
-                 controller: Optional[MissionController] = None):
+                 controller: Optional[MissionController] = None,
+                 flight_dir_provider: Optional[Callable[[], Optional[Path]]] = None):
         self.state = state
         self.frame = latest_frame
         self.host = host
@@ -1261,6 +1263,10 @@ class UiServer:
         # state machine to pick up the new values.
         self.cfg = cfg
         self.controller = controller
+        # Used to write parameter_changes.csv next to flight_log.csv.
+        # mission.py rolls flight_dir between missions, so we receive
+        # a callable rather than a fixed Path.
+        self.flight_dir_provider = flight_dir_provider
         self.flights_root = Path(flights_root) if flights_root else None
         # Drives the /calibrate page. May be None (e.g. view mode); the
         # routes return 503 in that case.
@@ -1276,6 +1282,43 @@ class UiServer:
         self.app = Flask(__name__)
         self._register_routes()
         self._thread: Optional[threading.Thread] = None
+
+    # --------------------------------------------------- parameter-change log
+    def _log_param_changes(self, before: dict, source: str) -> None:
+        """Append one row per actually-changed field to
+        ``<flight_dir>/parameter_changes.csv``. ``before`` is a
+        ``{field: pre-change-value}`` snapshot; the post-change value
+        is read from ``self.cfg`` at call time. Silently no-ops if
+        there is no current flight_dir, no cfg, or nothing changed."""
+        if self.cfg is None or self.flight_dir_provider is None:
+            return
+        try:
+            fdir = self.flight_dir_provider()
+        except Exception:
+            return
+        if not fdir:
+            return
+        fdir = Path(fdir)
+        if not fdir.exists():
+            return
+        rows = []
+        wt = _dt.datetime.now().isoformat(timespec="milliseconds")
+        mt = f"{time.monotonic():.4f}"
+        for k, old in before.items():
+            new = getattr(self.cfg, k, None)
+            if old != new:
+                rows.append((wt, mt, source, k,
+                             "" if old is None else old,
+                             "" if new is None else new))
+        if not rows:
+            return
+        p = fdir / "parameter_changes.csv"
+        new_file = not p.exists()
+        with p.open("a") as fp:
+            if new_file:
+                fp.write("wall_time,monotonic,source,field,old_value,new_value\n")
+            for r in rows:
+                fp.write(",".join(str(x) for x in r) + "\n")
 
     # --------------------------------------------------------- replay glue
     def _get_or_create_replay(self, flight_id: str):
@@ -1526,6 +1569,9 @@ class UiServer:
             if self.cfg is None:
                 return jsonify({"ok": False, "error": "tuning not wired"}), 503
             data = request.get_json(silent=True) or {}
+            before = {k: getattr(self.cfg, k, None)
+                      for k in data.keys()
+                      if k in self.cfg.__dataclass_fields__}
             errors = self.cfg.update_from_dict(data)
             if self.controller is not None:
                 try:
@@ -1533,6 +1579,7 @@ class UiServer:
                 except Exception as e:
                     return jsonify({"ok": False,
                                     "error": f"controller resync failed: {e}"})
+            self._log_param_changes(before, source="ui-apply")
             if errors:
                 return jsonify({"ok": False, "errors": errors})
             return jsonify({"ok": True})
@@ -1553,6 +1600,8 @@ class UiServer:
                 return jsonify({"ok": False, "error": "tuning not wired"}), 503
             try:
                 fresh = MissionConfig.load()
+                before = {k: getattr(self.cfg, k, None)
+                          for k in self.cfg.__dataclass_fields__}
                 # Mutate the existing cfg in place so anything holding a
                 # reference to it (the controller) sees the new values.
                 self.cfg.update_from_dict({
@@ -1561,6 +1610,7 @@ class UiServer:
                 })
                 if self.controller is not None:
                     self.controller.apply_config_changes()
+                self._log_param_changes(before, source="ui-reload")
                 return jsonify({"ok": True})
             except Exception as e:
                 return jsonify({"ok": False, "error": str(e)}), 500
@@ -1571,12 +1621,15 @@ class UiServer:
                 return jsonify({"ok": False, "error": "tuning not wired"}), 503
             try:
                 defaults = MissionConfig()
+                before = {k: getattr(self.cfg, k, None)
+                          for k in self.cfg.__dataclass_fields__}
                 self.cfg.update_from_dict({
                     k: getattr(defaults, k)
                     for k in self.cfg.__dataclass_fields__
                 })
                 if self.controller is not None:
                     self.controller.apply_config_changes()
+                self._log_param_changes(before, source="ui-reset")
                 return jsonify({"ok": True})
             except Exception as e:
                 return jsonify({"ok": False, "error": str(e)}), 500
@@ -1621,10 +1674,14 @@ class UiServer:
             # state, not whatever was last applied.
             data = request.get_json(silent=True)
             if isinstance(data, dict) and data:
+                before = {k: getattr(self.cfg, k, None)
+                          for k in data.keys()
+                          if k in self.cfg.__dataclass_fields__}
                 self.cfg.update_from_dict(data)
                 if self.controller is not None:
                     try: self.controller.apply_config_changes()
                     except Exception: pass
+                self._log_param_changes(before, source=f"ui-snapshot-save:{name}")
             p = _snap_path(name)
             if p is None:
                 return jsonify({"ok": False,
@@ -1645,12 +1702,15 @@ class UiServer:
                 return jsonify({"ok": False, "error": "snapshot not found"}), 404
             try:
                 fresh = MissionConfig.load(p)
+                before = {k: getattr(self.cfg, k, None)
+                          for k in self.cfg.__dataclass_fields__}
                 self.cfg.update_from_dict({
                     k: getattr(fresh, k)
                     for k in self.cfg.__dataclass_fields__
                 })
                 if self.controller is not None:
                     self.controller.apply_config_changes()
+                self._log_param_changes(before, source=f"ui-snapshot-load:{name}")
                 return jsonify({"ok": True, "name": name})
             except Exception as e:
                 return jsonify({"ok": False, "error": str(e)}), 500

@@ -219,6 +219,23 @@ def cmd_fly(args: argparse.Namespace) -> int:
             if not recording_paused.is_set():
                 print(f"[rec] stopping recording (phase={new_phase.value})")
             recording_paused.set()
+        # Snapshot the active config at flight boundaries so the recorded
+        # flight directory is self-describing later (which gains, deadbands,
+        # caps were active during this run).
+        if new_phase == Phase.TAKEOFF:
+            try:
+                cfg.save(flight_dir_box[0] / "cfg_start.json")
+            except Exception as e:
+                print(f"[mission] cfg_start.json save failed: {e}")
+        elif new_phase in (Phase.DONE, Phase.ABORT):
+            # Only write end if a flight actually happened (cfg_start.json
+            # exists). Otherwise the operator just bounced INIT and we have
+            # nothing to bookend.
+            if (flight_dir_box[0] / "cfg_start.json").exists():
+                try:
+                    cfg.save(flight_dir_box[0] / "cfg_end.json")
+                except Exception as e:
+                    print(f"[mission] cfg_end.json save failed: {e}")
 
     # Build the controller before the UI so the UI's "Start mission" button
     # can call into it.
@@ -252,7 +269,8 @@ def cmd_fly(args: argparse.Namespace) -> int:
                   drone_connected=initially_connected,
                   calibration_capture=cal_capture,
                   cfg=cfg,
-                  controller=controller)
+                  controller=controller,
+                  flight_dir_provider=lambda: flight_dir_box[0])
     ui.start()
     print(f"[mission] UI running at {ui.url()} (camera) and {ui.url()}/charts")
 
