@@ -253,40 +253,121 @@ class MissionConfig:
 # ---------------------------------------------------------------------------
 
 TUNING_FIELDS = {
-    "target_distance_m":            {"label": "Target distance",          "kind": "float", "unit": "m",   "step": 0.1},
-    "target_relative_heading_deg":  {"label": "Target rel. heading",      "kind": "float", "unit": "deg", "step": 5.0},
-    "hold_time_s":                  {"label": "HOLD duration",            "kind": "float", "unit": "s",   "step": 1.0},
+    "target_distance_m": {
+        "label": "Target distance", "kind": "float", "unit": "m", "step": 0.1,
+        "desc": "Final standoff from the marker. APPROACH closes to this distance; HOLD station-keeps here.",
+    },
+    "target_relative_heading_deg": {
+        "label": "Target rel. heading", "kind": "float", "unit": "deg", "step": 5.0,
+        "desc": "Bearing around the marker that HOLD maintains (CW from the marker normal). 0 = drone directly in front of the marker. Default 0 means HOLD just stays where APPROACH put it; non-zero makes HOLD slide laterally to the chosen bearing.",
+    },
+    "hold_time_s": {
+        "label": "HOLD duration", "kind": "float", "unit": "s", "step": 1.0,
+        "desc": "How long HOLD hovers (station-keeping) before transitioning to LAND.",
+    },
 
-    "fwd_kp":      {"label": "fwd kp",     "kind": "float", "step": 1.0},
-    "fwd_kd":      {"label": "fwd kd",     "kind": "float", "step": 1.0},
-    "fwd_kv":      {"label": "fwd kv",     "kind": "float", "step": 0.05},
-    "fwd_rc_max":  {"label": "fwd RC max", "kind": "int",   "step": 1},
+    "fwd_kp": {
+        "label": "fwd kp", "kind": "float", "step": 1.0,
+        "desc": "Proportional gain on distance error, in RC counts per metre. e.g. kp=30 means a 1 m distance error tries to command rc_fb=30 (clamped at fwd_rc_max). Higher = more aggressive distance correction; too high = overshoot.",
+    },
+    "fwd_kd": {
+        "label": "fwd kd", "kind": "float", "step": 1.0,
+        "desc": "Derivative gain on distance, in RC counts per (m/s) of d/dt(distance). Brakes when the drone is closing fast, even if still far from target. Helps prevent overshoot, but amplifies distance noise.",
+    },
+    "fwd_kv": {
+        "label": "fwd kv", "kind": "float", "step": 0.05,
+        "desc": "Velocity feedforward on body-forward velocity, in RC counts per (cm/s). Subtracts an active brake proportional to current speed (independent of position error). 0 = disabled. Wrapped in a no-sign-flip guard so a wrong-frame velocity reading can't push the drone the wrong way.",
+    },
+    "fwd_rc_max": {
+        "label": "fwd RC max", "kind": "int", "step": 1,
+        "desc": "Hard cap on the rc_fb command magnitude (Anafi PCMD range -100..+100). Roughly each unit ≈ 4 cm/s body-forward at level flight, so rc_max=3 caps approach to ~12 cm/s. Lower = slower + safer.",
+    },
 
-    "lat_kp":      {"label": "lat kp",     "kind": "float", "step": 1.0},
-    "lat_kd":      {"label": "lat kd",     "kind": "float", "step": 1.0},
-    "lat_kv":      {"label": "lat kv",     "kind": "float", "step": 0.05},
-    "lat_rc_max":  {"label": "lat RC max", "kind": "int",   "step": 1},
+    "lat_kp": {
+        "label": "lat kp", "kind": "float", "step": 1.0,
+        "desc": "Proportional gain on heading-arc error (RC per metre of tangential offset). PD computes arc_err = -d * radians(e_hdg) so the gain is dimensionally consistent across distances. Higher = more aggressive heading correction.",
+    },
+    "lat_kd": {
+        "label": "lat kd", "kind": "float", "step": 1.0,
+        "desc": "Derivative gain on heading-arc rate. Damps lateral correction motion to prevent oscillation around the heading target.",
+    },
+    "lat_kv": {
+        "label": "lat kv", "kind": "float", "step": 0.05,
+        "desc": "Velocity feedforward on body-right velocity. Same idea as fwd_kv: brakes lateral momentum so the drone doesn't sail past the heading target. No-sign-flip-guarded.",
+    },
+    "lat_rc_max": {
+        "label": "lat RC max", "kind": "int", "step": 1,
+        "desc": "Cap on rc_lr. Lower = slower lateral motion + better yaw tracking (yaw can keep up with the apparent-marker drift). 4 ≈ 16 cm/s. Going much higher tends to spiral the drone outward because yaw lags.",
+    },
 
-    "yaw_kp":      {"label": "yaw kp",     "kind": "float", "step": 0.1},
-    "yaw_kd":      {"label": "yaw kd",     "kind": "float", "step": 0.05},
-    "yaw_rc_max":  {"label": "yaw RC max", "kind": "int",   "step": 1},
+    "yaw_kp": {
+        "label": "yaw kp", "kind": "float", "step": 0.1,
+        "desc": "Proportional gain on yaw_to_marker, in RC counts per degree. Saturates at yaw_rc_max for |error| > yaw_rc_max / yaw_kp. Too high → bang-bang at the controller's loop period.",
+    },
+    "yaw_kd": {
+        "label": "yaw kd", "kind": "float", "step": 0.05,
+        "desc": "Derivative gain on yaw_to_marker (RC per °/s). Damps the yaw oscillation that pure-P tends to produce at high gains.",
+    },
+    "yaw_rc_max": {
+        "label": "yaw RC max", "kind": "int", "step": 1,
+        "desc": "Cap on rc_yaw. Roughly 1 unit ≈ 1°/s of yaw rate, so 25 ≈ 25°/s.",
+    },
 
-    "yaw_deadband_deg":              {"label": "yaw deadband",                 "kind": "float", "unit": "deg", "step": 0.1},
-    "distance_deadband_m":           {"label": "distance deadband",            "kind": "float", "unit": "m",   "step": 0.01},
-    "heading_deadband_deg":          {"label": "heading deadband (HOLD)",      "kind": "float", "unit": "deg", "step": 0.5},
-    "approach_heading_deadband_deg": {"label": "heading deadband (APPROACH)",  "kind": "float", "unit": "deg", "step": 1.0},
-    "align_heading_deadband_deg":    {"label": "heading deadband (ALIGN)",     "kind": "float", "unit": "deg", "step": 1.0},
+    "yaw_deadband_deg": {
+        "label": "yaw deadband", "kind": "float", "unit": "deg", "step": 0.1,
+        "desc": "|yaw_to_marker| below this → rc_yaw=0. Prevents twitchy yaw command when the marker is essentially centred.",
+    },
+    "distance_deadband_m": {
+        "label": "distance deadband", "kind": "float", "unit": "m", "step": 0.01,
+        "desc": "|distance - target| below this → rc_fb=0. Defines what 'at target distance' means for phase-settle and PD.",
+    },
+    "heading_deadband_deg": {
+        "label": "heading deadband (HOLD)", "kind": "float", "unit": "deg", "step": 0.5,
+        "desc": "HOLD's deadband on heading error. PD produces no lateral output when |hdg - target| < this. Tighter than ALIGN/APPROACH because at HOLD distance the marker is large and pose is reliable.",
+    },
+    "approach_heading_deadband_deg": {
+        "label": "heading deadband (APPROACH)", "kind": "float", "unit": "deg", "step": 1.0,
+        "desc": "APPROACH's deadband. Tighter than ALIGN's so the drone fights the yaw+forward arc-coupling drift while closing distance. Too loose → drift accumulates inside the band; too tight → chatter on pose noise.",
+    },
+    "align_heading_deadband_deg": {
+        "label": "heading deadband (ALIGN)", "kind": "float", "unit": "deg", "step": 1.0,
+        "desc": "ALIGN's deadband. Looser than APPROACH because long-range pose is noisier and ALIGN only needs to roughly face the marker before APPROACH closes distance.",
+    },
 
-    "approach_settle_time_s":     {"label": "APPROACH settle time",     "kind": "float", "unit": "s", "step": 0.1},
-    "align_settle_time_s":        {"label": "ALIGN settle time",        "kind": "float", "unit": "s", "step": 0.1},
-    "search_marker_lost_grace_s": {"label": "marker-lost grace",        "kind": "float", "unit": "s", "step": 0.1},
+    "approach_settle_time_s": {
+        "label": "APPROACH settle time", "kind": "float", "unit": "s", "step": 0.1,
+        "desc": "How long all errors must stay inside their deadbands before APPROACH transitions to HOLD. Longer = stricter.",
+    },
+    "align_settle_time_s": {
+        "label": "ALIGN settle time", "kind": "float", "unit": "s", "step": 0.1,
+        "desc": "Same as above but for ALIGN → APPROACH.",
+    },
+    "search_marker_lost_grace_s": {
+        "label": "marker-lost grace", "kind": "float", "unit": "s", "step": 0.1,
+        "desc": "After the marker disappears, hold zero RC for this long before escalating to SEARCH. Tolerates brief occlusions without bouncing the state machine.",
+    },
 
-    "distance_floor_factor": {"label": "distance floor (× target)", "kind": "float", "step": 0.05},
-    "search_yaw_rc":         {"label": "search yaw RC",             "kind": "int",   "step": 1},
-    "ud_rc_max":             {"label": "ud RC max",                 "kind": "int",   "step": 1},
+    "distance_floor_factor": {
+        "label": "distance floor (× target)", "kind": "float", "step": 0.05,
+        "desc": "Minimum allowed distance, expressed as a multiple of target_distance_m. Inside the floor the forward command is clamped to ≤0 (drone can back out, never fly closer). Yaw and lateral PDs keep running so the drone can still recenter while inside.",
+    },
+    "search_yaw_rc": {
+        "label": "search yaw RC", "kind": "int", "step": 1,
+        "desc": "rc_yaw value used during SEARCH while sweeping for the marker. ≈ degrees-per-second yaw rate.",
+    },
+    "ud_rc_max": {
+        "label": "ud RC max", "kind": "int", "step": 1,
+        "desc": "Cap on rc_ud (altitude). The mission doesn't actively command altitude (Anafi self-stabilises), but the cap protects the channel from accidental large values.",
+    },
 
-    "pose_smoothing_alpha": {"label": "pose EMA alpha",  "kind": "float", "step": 0.05},
-    "pose_max_age_s":       {"label": "pose max age",    "kind": "float", "unit": "s", "step": 0.1},
+    "pose_smoothing_alpha": {
+        "label": "pose EMA alpha", "kind": "float", "step": 0.05,
+        "desc": "EMA factor on (distance, yaw_to_marker, relative_heading). 1.0 = no smoothing (raw values); 0.0 = frozen at first sample. Higher = more responsive but noisier control.",
+    },
+    "pose_max_age_s": {
+        "label": "pose max age", "kind": "float", "unit": "s", "step": 0.1,
+        "desc": "If no marker detection in this window, the smoother reports None to the controller (= 'marker lost'). Pairs with search_marker_lost_grace_s.",
+    },
 }
 
 TUNING_GROUPS = [
@@ -328,6 +409,7 @@ def tuning_view(cfg: MissionConfig) -> dict:
                 "kind":    meta.get("kind", "float"),
                 "unit":    meta.get("unit", ""),
                 "step":    meta.get("step", 0.1),
+                "desc":    meta.get("desc", ""),
                 "value":   getattr(cfg, f),
                 "default": getattr(defaults, f),
             })

@@ -930,6 +930,9 @@ _PAGE_TUNE = _PAGE_BASE_CSS + _PAGE_HEADER + """
                    font-size: .75rem; padding: .15rem .4rem;
                    cursor: pointer; }
   .tune-resetbtn:hover { color: #e6edf3; border-color: #4b5563; }
+  .tune-info { color: #6b7280; cursor: help; margin-left: .25rem;
+               font-size: .85rem; user-select: none; }
+  .tune-info:hover, .tune-info:focus { color: var(--accent); outline: none; }
 </style>
 
 <script>
@@ -958,10 +961,18 @@ function renderGroups(view) {
       TUNE_FIELDS[it.name] = {kind: it.kind, default: it.default};
       const row = document.createElement('div');
       row.className = 'tune-row';
+      const desc = it.desc || '';
+      const descAttr = desc.replace(/&/g, '&amp;').replace(/"/g, '&quot;');
+      const infoHtml = desc
+        ? `<span class="tune-info" title="${descAttr}" tabindex="0">ⓘ</span>`
+        : '';
+      row.title = desc;
       row.innerHTML = `
-        <span class="tune-label">${it.label} <span style="color:#6b7280; font-size:.75rem;">(${it.name})</span></span>
+        <span class="tune-label">${it.label} ${infoHtml}
+          <span style="color:#6b7280; font-size:.75rem;">(${it.name})</span></span>
         <input class="tune-input" type="number" data-name="${it.name}"
-               step="${it.step}" value="${it.value}">
+               step="${it.step}" value="${it.value}"
+               title="${descAttr}">
         <span class="tune-unit">${it.unit || ''}</span>
         <span class="tune-default">default: ${it.default}</span>
         <button type="button" class="tune-resetbtn" data-name="${it.name}">reset</button>
