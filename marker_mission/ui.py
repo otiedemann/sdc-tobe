@@ -281,7 +281,6 @@ function setMissionButtons(phase) {
 }
 async function startMission() {
   const btn = $('btn-start'); const msg = $('ctrl-msg');
-  if (!confirm('Start the mission now? The drone will take off.')) return;
   btn.disabled = true; msg.textContent = 'Starting…';
   try {
     const r = await fetch('/api/start', {method:'POST'});
@@ -291,7 +290,6 @@ async function startMission() {
 }
 async function stopMission() {
   const btn = $('btn-stop'); const msg = $('ctrl-msg');
-  if (!confirm('Stop the mission and land now?')) return;
   stopRequested = true;
   btn.disabled = true; btn.style.opacity = '0.5'; btn.textContent = 'Landing…';
   msg.textContent = 'Stop requested -- drone is landing.';
@@ -1209,7 +1207,6 @@ async function saveSnap() {
   }
 }
 async function overwriteSnap(name) {
-  if (!confirm('Overwrite snapshot "' + name + '" with the current form values?')) return;
   try {
     const r = await fetch('/api/tune/snapshots/' + encodeURIComponent(name), {
       method: 'POST',
