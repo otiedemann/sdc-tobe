@@ -177,6 +177,32 @@ class MissionConfig:
     record_jpeg_quality: int = 90          # for any direct JPEG saves
 
     # ------------------------------------------------------------------------
+    def update_from_dict(self, values: dict) -> dict:
+        """Apply a {field: value} dict to this cfg in-place. Returns a
+        {field: error_message} dict for any fields that failed to parse
+        or aren't valid configuration keys. Values are coerced to the
+        existing field's type so the JSON-from-the-browser road-trip
+        (which delivers everything as strings) just works."""
+        errors: dict = {}
+        for k, v in values.items():
+            if k not in self.__dataclass_fields__:
+                errors[k] = "unknown field"
+                continue
+            try:
+                cur = getattr(self, k)
+                if isinstance(cur, bool):
+                    new = str(v).lower() in ("1", "true", "yes", "on")
+                elif isinstance(cur, int):
+                    new = int(float(v))
+                elif isinstance(cur, float):
+                    new = float(v)
+                else:
+                    new = v
+                setattr(self, k, new)
+            except (ValueError, TypeError) as e:
+                errors[k] = str(e)
+        return errors
+
     @classmethod
     def load(cls, path: Optional[Path] = None) -> "MissionConfig":
         cfg = cls()
@@ -216,3 +242,93 @@ class MissionConfig:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(asdict(self), indent=2))
         return path
+
+
+# ---------------------------------------------------------------------------
+# UI tuning schema: drives the /tune page. Each entry maps a config field
+# to a label + numeric step + optional unit. Grouped for layout. Anything
+# NOT listed here is intentionally hidden from the live-tuning UI (e.g.,
+# the network/UI/recording fields whose changes need a restart anyway).
+# ---------------------------------------------------------------------------
+
+TUNING_FIELDS = {
+    "target_distance_m":            {"label": "Target distance",          "kind": "float", "unit": "m",   "step": 0.1},
+    "target_relative_heading_deg":  {"label": "Target rel. heading",      "kind": "float", "unit": "deg", "step": 5.0},
+    "hold_time_s":                  {"label": "HOLD duration",            "kind": "float", "unit": "s",   "step": 1.0},
+
+    "fwd_kp":      {"label": "fwd kp",     "kind": "float", "step": 1.0},
+    "fwd_kd":      {"label": "fwd kd",     "kind": "float", "step": 1.0},
+    "fwd_kv":      {"label": "fwd kv",     "kind": "float", "step": 0.05},
+    "fwd_rc_max":  {"label": "fwd RC max", "kind": "int",   "step": 1},
+
+    "lat_kp":      {"label": "lat kp",     "kind": "float", "step": 1.0},
+    "lat_kd":      {"label": "lat kd",     "kind": "float", "step": 1.0},
+    "lat_kv":      {"label": "lat kv",     "kind": "float", "step": 0.05},
+    "lat_rc_max":  {"label": "lat RC max", "kind": "int",   "step": 1},
+
+    "yaw_kp":      {"label": "yaw kp",     "kind": "float", "step": 0.1},
+    "yaw_kd":      {"label": "yaw kd",     "kind": "float", "step": 0.05},
+    "yaw_rc_max":  {"label": "yaw RC max", "kind": "int",   "step": 1},
+
+    "yaw_deadband_deg":              {"label": "yaw deadband",                 "kind": "float", "unit": "deg", "step": 0.1},
+    "distance_deadband_m":           {"label": "distance deadband",            "kind": "float", "unit": "m",   "step": 0.01},
+    "heading_deadband_deg":          {"label": "heading deadband (HOLD)",      "kind": "float", "unit": "deg", "step": 0.5},
+    "approach_heading_deadband_deg": {"label": "heading deadband (APPROACH)",  "kind": "float", "unit": "deg", "step": 1.0},
+    "align_heading_deadband_deg":    {"label": "heading deadband (ALIGN)",     "kind": "float", "unit": "deg", "step": 1.0},
+
+    "approach_settle_time_s":     {"label": "APPROACH settle time",     "kind": "float", "unit": "s", "step": 0.1},
+    "align_settle_time_s":        {"label": "ALIGN settle time",        "kind": "float", "unit": "s", "step": 0.1},
+    "search_marker_lost_grace_s": {"label": "marker-lost grace",        "kind": "float", "unit": "s", "step": 0.1},
+
+    "distance_floor_factor": {"label": "distance floor (× target)", "kind": "float", "step": 0.05},
+    "search_yaw_rc":         {"label": "search yaw RC",             "kind": "int",   "step": 1},
+    "ud_rc_max":             {"label": "ud RC max",                 "kind": "int",   "step": 1},
+
+    "pose_smoothing_alpha": {"label": "pose EMA alpha",  "kind": "float", "step": 0.05},
+    "pose_max_age_s":       {"label": "pose max age",    "kind": "float", "unit": "s", "step": 0.1},
+}
+
+TUNING_GROUPS = [
+    ("Mission goals", ["target_distance_m", "target_relative_heading_deg", "hold_time_s"]),
+    ("Forward PD (closing distance)",
+        ["fwd_kp", "fwd_kd", "fwd_kv", "fwd_rc_max"]),
+    ("Lateral PD (orbiting / heading correction)",
+        ["lat_kp", "lat_kd", "lat_kv", "lat_rc_max"]),
+    ("Yaw PD (centring marker)",
+        ["yaw_kp", "yaw_kd", "yaw_rc_max"]),
+    ("Deadbands",
+        ["yaw_deadband_deg", "distance_deadband_m",
+         "heading_deadband_deg", "approach_heading_deadband_deg",
+         "align_heading_deadband_deg"]),
+    ("Phase timing",
+        ["approach_settle_time_s", "align_settle_time_s",
+         "search_marker_lost_grace_s"]),
+    ("Safety / search",
+        ["distance_floor_factor", "search_yaw_rc", "ud_rc_max"]),
+    ("Pose smoothing",
+        ["pose_smoothing_alpha", "pose_max_age_s"]),
+]
+
+
+def tuning_view(cfg: MissionConfig) -> dict:
+    """Build the JSON payload the /tune page renders against. Includes
+    each field's current value, the dataclass default, and the field
+    metadata (label/kind/unit/step). Returned in the order that
+    TUNING_GROUPS dictates so the UI layout is stable."""
+    defaults = MissionConfig()
+    groups = []
+    for group_name, fields in TUNING_GROUPS:
+        items = []
+        for f in fields:
+            meta = TUNING_FIELDS.get(f, {})
+            items.append({
+                "name":    f,
+                "label":   meta.get("label", f),
+                "kind":    meta.get("kind", "float"),
+                "unit":    meta.get("unit", ""),
+                "step":    meta.get("step", 0.1),
+                "value":   getattr(cfg, f),
+                "default": getattr(defaults, f),
+            })
+        groups.append({"name": group_name, "items": items})
+    return {"groups": groups}

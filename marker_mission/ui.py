@@ -28,9 +28,10 @@ from typing import Callable, Optional
 
 import cv2
 import numpy as np
-from flask import Flask, Response, jsonify, render_template_string
+from flask import Flask, Response, jsonify, render_template_string, request
 
-from .controller import MissionState
+from .config import MissionConfig, tuning_view
+from .controller import MissionController, MissionState
 
 
 # ---------------------------------------------------------------------------
@@ -104,6 +105,7 @@ _PAGE_HEADER = """
     <a href="/" class="{{ 'active' if active=='video' else '' }}">Camera</a>
     <a href="/charts" class="{{ 'active' if active=='charts' else '' }}">Charts</a>
     <a href="/replay" class="{{ 'active' if active=='replay' else '' }}">Replay</a>
+    <a href="/tune" class="{{ 'active' if active=='tune' else '' }}">Tune</a>
     <a href="/calibrate" class="{{ 'active' if active=='calibrate' else '' }}">Calibrate</a>
   </nav>
   <span style="margin-left:auto; font-size:.85rem; color:#aab;"
@@ -809,6 +811,217 @@ tick();
 
 
 # ---------------------------------------------------------------------------
+# Tuning page. Lists every UI-exposed config field grouped by purpose;
+# numeric inputs are pre-filled with the current value and show the
+# dataclass default next to each row. Apply pushes the new values to
+# the running controller (PD gains, output clamps, smoother) without a
+# restart. Save / Reload / Reset operate on the persisted JSON file.
+# ---------------------------------------------------------------------------
+
+_PAGE_TUNE = _PAGE_BASE_CSS + _PAGE_HEADER + """
+<main class="grid" style="grid-template-columns: minmax(0, 1fr);">
+  <div class="card">
+    <h2>Live PD / mission tuning</h2>
+    <p style="font-size:.85rem; color:#aab; margin:.2rem 0 1rem;">
+      Edit the values below and press <b>Apply</b> to push them into the
+      running controller (no restart needed). <b>Save</b> persists the
+      current values to <code>~/.marker_mission/config.json</code>.
+      <b>Reload</b> re-reads that file (discards any unsaved Apply).
+      <b>Reset</b> reverts every field to the dataclass default.
+    </p>
+    <div id="tune-status" style="font-size:.85rem; color:#aab; margin-bottom:.6rem;"></div>
+    <form id="tune-form">
+      <div id="tune-groups"></div>
+      <div style="display:flex; gap:.5rem; margin-top:1rem; flex-wrap:wrap;">
+        <button type="button" id="btn-apply"
+                style="padding:.5rem .9rem; border:0; border-radius:6px;
+                       background:var(--accent); color:#062633; font-weight:600;
+                       cursor:pointer;">Apply</button>
+        <button type="button" id="btn-save"
+                style="padding:.5rem .9rem; border:0; border-radius:6px;
+                       background:var(--good); color:#072413; font-weight:600;
+                       cursor:pointer;">Save to disk</button>
+        <button type="button" id="btn-reload"
+                style="padding:.5rem .9rem; border:0; border-radius:6px;
+                       background:#334155; color:#e6edf3; cursor:pointer;">
+          Reload from disk</button>
+        <button type="button" id="btn-reset"
+                style="padding:.5rem .9rem; border:0; border-radius:6px;
+                       background:#7f1d1d; color:#fee2e2; cursor:pointer;">
+          Reset all to defaults</button>
+      </div>
+    </form>
+  </div>
+</main>
+
+<style>
+  .tune-group { margin-top: 1.2rem; }
+  .tune-group h3 { margin: 0 0 .35rem; font-size: 1rem;
+                   color: var(--accent); }
+  .tune-row { display: grid; grid-template-columns: 18rem 8rem 6rem 9rem 1fr;
+              gap: .5rem; align-items: center;
+              padding: .25rem 0;
+              border-bottom: 1px dashed #2a3038;
+              font-size: .9rem; }
+  .tune-label { color: #e6edf3; }
+  .tune-input { background: #0e1116; color: #e6edf3;
+                border: 1px solid #2a3038; border-radius: 4px;
+                padding: .25rem .4rem;
+                font-variant-numeric: tabular-nums;
+                font-family: inherit; }
+  .tune-input.dirty { border-color: var(--accent); }
+  .tune-default { color: #6b7280; font-size: .8rem;
+                  font-variant-numeric: tabular-nums; }
+  .tune-unit { color: #9ca3af; font-size: .8rem; }
+  .tune-resetbtn { background: transparent; color: #6b7280;
+                   border: 1px solid #2a3038; border-radius: 4px;
+                   font-size: .75rem; padding: .15rem .4rem;
+                   cursor: pointer; }
+  .tune-resetbtn:hover { color: #e6edf3; border-color: #4b5563; }
+</style>
+
+<script>
+const $ = id => document.getElementById(id);
+function setStatus(msg, ok) {
+  const el = $('tune-status');
+  if (!el) return;
+  el.textContent = msg;
+  el.style.color = ok ? '#4ade80' : '#f87171';
+}
+let TUNE_FIELDS = {};   // name -> {kind, default}
+let TUNE_DIRTY = new Set();
+
+function renderGroups(view) {
+  TUNE_FIELDS = {};
+  TUNE_DIRTY = new Set();
+  const root = $('tune-groups');
+  root.innerHTML = '';
+  for (const g of view.groups) {
+    const div = document.createElement('div');
+    div.className = 'tune-group';
+    const h = document.createElement('h3');
+    h.textContent = g.name;
+    div.appendChild(h);
+    for (const it of g.items) {
+      TUNE_FIELDS[it.name] = {kind: it.kind, default: it.default};
+      const row = document.createElement('div');
+      row.className = 'tune-row';
+      row.innerHTML = `
+        <span class="tune-label">${it.label} <span style="color:#6b7280; font-size:.75rem;">(${it.name})</span></span>
+        <input class="tune-input" type="number" data-name="${it.name}"
+               step="${it.step}" value="${it.value}">
+        <span class="tune-unit">${it.unit || ''}</span>
+        <span class="tune-default">default: ${it.default}</span>
+        <button type="button" class="tune-resetbtn" data-name="${it.name}">reset</button>
+      `;
+      div.appendChild(row);
+    }
+    root.appendChild(div);
+  }
+  // Wire input change-tracking and per-field reset
+  document.querySelectorAll('.tune-input').forEach(inp => {
+    inp.addEventListener('input', () => {
+      const name = inp.dataset.name;
+      const def = String(TUNE_FIELDS[name].default);
+      if (String(inp.value) !== def) inp.classList.add('dirty');
+      else inp.classList.remove('dirty');
+      TUNE_DIRTY.add(name);
+    });
+  });
+  document.querySelectorAll('.tune-resetbtn').forEach(btn => {
+    btn.addEventListener('click', () => {
+      const name = btn.dataset.name;
+      const inp = document.querySelector(`.tune-input[data-name="${name}"]`);
+      if (!inp) return;
+      inp.value = TUNE_FIELDS[name].default;
+      inp.classList.remove('dirty');
+      TUNE_DIRTY.add(name);
+    });
+  });
+}
+
+function collectValues() {
+  const out = {};
+  document.querySelectorAll('.tune-input').forEach(inp => {
+    const name = inp.dataset.name;
+    out[name] = inp.value;
+  });
+  return out;
+}
+
+async function loadView() {
+  try {
+    const r = await fetch('/api/tune', {cache: 'no-store'});
+    const view = await r.json();
+    renderGroups(view);
+    setStatus('Loaded current values.', true);
+  } catch (e) {
+    setStatus('Could not load tuning data: ' + e, false);
+  }
+}
+async function applyValues() {
+  try {
+    const r = await fetch('/api/tune/apply', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify(collectValues()),
+    });
+    const j = await r.json();
+    if (!j.ok) {
+      setStatus('Apply failed: ' + JSON.stringify(j.errors || j.error), false);
+      return;
+    }
+    document.querySelectorAll('.tune-input.dirty')
+            .forEach(i => i.classList.remove('dirty'));
+    TUNE_DIRTY.clear();
+    setStatus('Applied to running controller.', true);
+  } catch (e) {
+    setStatus('Apply failed: ' + e, false);
+  }
+}
+async function saveValues() {
+  try {
+    await applyValues();
+    const r = await fetch('/api/tune/save', {method: 'POST'});
+    const j = await r.json();
+    if (j.ok) setStatus('Saved to ' + (j.path || 'config.json') + '.', true);
+    else setStatus('Save failed: ' + (j.error || 'unknown'), false);
+  } catch (e) {
+    setStatus('Save failed: ' + e, false);
+  }
+}
+async function reloadValues() {
+  try {
+    const r = await fetch('/api/tune/reload', {method: 'POST'});
+    if (!r.ok) { setStatus('Reload failed', false); return; }
+    await loadView();
+    setStatus('Reloaded from disk.', true);
+  } catch (e) {
+    setStatus('Reload failed: ' + e, false);
+  }
+}
+async function resetAll() {
+  if (!confirm('Reset every tunable parameter to its default?')) return;
+  try {
+    const r = await fetch('/api/tune/reset', {method: 'POST'});
+    if (!r.ok) { setStatus('Reset failed', false); return; }
+    await loadView();
+    setStatus('All values reset to defaults (still un-saved).', true);
+  } catch (e) {
+    setStatus('Reset failed: ' + e, false);
+  }
+}
+
+$('btn-apply').addEventListener('click', applyValues);
+$('btn-save').addEventListener('click', saveValues);
+$('btn-reload').addEventListener('click', reloadValues);
+$('btn-reset').addEventListener('click', resetAll);
+loadView();
+</script>
+"""
+
+
+# ---------------------------------------------------------------------------
 # UI server
 # ---------------------------------------------------------------------------
 
@@ -820,7 +1033,9 @@ class UiServer:
                  on_stop: Optional[Callable[[], bool]] = None,
                  flights_root: Optional[Path] = None,
                  drone_connected: bool = True,
-                 calibration_capture=None):
+                 calibration_capture=None,
+                 cfg: Optional[MissionConfig] = None,
+                 controller: Optional[MissionController] = None):
         self.state = state
         self.frame = latest_frame
         self.host = host
@@ -828,6 +1043,11 @@ class UiServer:
         self.history_s = history_s
         self.on_start = on_start
         self.on_stop = on_stop
+        # Live-tuning page references. cfg is mutated in-place; calling
+        # controller.apply_config_changes() resyncs the running PD
+        # state machine to pick up the new values.
+        self.cfg = cfg
+        self.controller = controller
         self.flights_root = Path(flights_root) if flights_root else None
         # Drives the /calibrate page. May be None (e.g. view mode); the
         # routes return 503 in that case.
@@ -1070,6 +1290,83 @@ class UiServer:
                 header_label="calibration",
                 drone_connected=self.drone_connected,
             )
+
+        # ---- Tuning page + API -----------------------------------------
+        @app.get("/tune")
+        def tune_page():
+            return render_template_string(
+                _PAGE_TUNE, active="tune",
+                history_s=self.history_s,
+                header_label="live tuning",
+                replay_id=None,
+                mode="live",
+            )
+
+        @app.get("/api/tune")
+        def api_tune_get():
+            if self.cfg is None:
+                return jsonify({"error": "tuning not wired"}), 503
+            return jsonify(tuning_view(self.cfg))
+
+        @app.post("/api/tune/apply")
+        def api_tune_apply():
+            if self.cfg is None:
+                return jsonify({"ok": False, "error": "tuning not wired"}), 503
+            data = request.get_json(silent=True) or {}
+            errors = self.cfg.update_from_dict(data)
+            if self.controller is not None:
+                try:
+                    self.controller.apply_config_changes()
+                except Exception as e:
+                    return jsonify({"ok": False,
+                                    "error": f"controller resync failed: {e}"})
+            if errors:
+                return jsonify({"ok": False, "errors": errors})
+            return jsonify({"ok": True})
+
+        @app.post("/api/tune/save")
+        def api_tune_save():
+            if self.cfg is None:
+                return jsonify({"ok": False, "error": "tuning not wired"}), 503
+            try:
+                p = self.cfg.save()
+                return jsonify({"ok": True, "path": str(p)})
+            except Exception as e:
+                return jsonify({"ok": False, "error": str(e)}), 500
+
+        @app.post("/api/tune/reload")
+        def api_tune_reload():
+            if self.cfg is None:
+                return jsonify({"ok": False, "error": "tuning not wired"}), 503
+            try:
+                fresh = MissionConfig.load()
+                # Mutate the existing cfg in place so anything holding a
+                # reference to it (the controller) sees the new values.
+                self.cfg.update_from_dict({
+                    k: getattr(fresh, k)
+                    for k in self.cfg.__dataclass_fields__
+                })
+                if self.controller is not None:
+                    self.controller.apply_config_changes()
+                return jsonify({"ok": True})
+            except Exception as e:
+                return jsonify({"ok": False, "error": str(e)}), 500
+
+        @app.post("/api/tune/reset")
+        def api_tune_reset():
+            if self.cfg is None:
+                return jsonify({"ok": False, "error": "tuning not wired"}), 503
+            try:
+                defaults = MissionConfig()
+                self.cfg.update_from_dict({
+                    k: getattr(defaults, k)
+                    for k in self.cfg.__dataclass_fields__
+                })
+                if self.controller is not None:
+                    self.controller.apply_config_changes()
+                return jsonify({"ok": True})
+            except Exception as e:
+                return jsonify({"ok": False, "error": str(e)}), 500
 
         @app.get("/api/calibrate/status")
         def api_calibrate_status():

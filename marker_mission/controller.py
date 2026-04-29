@@ -304,6 +304,24 @@ class MissionController:
         self._go = threading.Event()
         self._thread: Optional[threading.Thread] = None
 
+    def apply_config_changes(self) -> None:
+        """Re-sync per-instance state that was copied out of cfg at
+        construction. Call after the cfg dataclass has been mutated
+        externally (e.g., from the live-tuning UI) so the running
+        controller picks up the new gains / clips immediately."""
+        cfg = self.cfg
+        self.pd_yaw.kp = float(cfg.yaw_kp)
+        self.pd_yaw.kd = float(cfg.yaw_kd)
+        self.pd_yaw.out_clip = float(cfg.yaw_rc_max)
+        self.pd_fwd.kp = float(cfg.fwd_kp)
+        self.pd_fwd.kd = float(cfg.fwd_kd)
+        self.pd_fwd.out_clip = float(cfg.fwd_rc_max)
+        self.pd_lat.kp = float(cfg.lat_kp)
+        self.pd_lat.kd = float(cfg.lat_kd)
+        self.pd_lat.out_clip = float(cfg.lat_rc_max)
+        self.smoother.alpha = float(cfg.pose_smoothing_alpha)
+        self.smoother.max_age_s = float(cfg.pose_max_age_s)
+
     # ------------------------------------------------------------------ life
     def start(self) -> None:
         """Spin up the control thread. The thread parks in INIT until

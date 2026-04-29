@@ -250,7 +250,9 @@ def cmd_fly(args: argparse.Namespace) -> int:
                   on_stop=request_stop_async,
                   flights_root=FLIGHTS_DIR,
                   drone_connected=initially_connected,
-                  calibration_capture=cal_capture)
+                  calibration_capture=cal_capture,
+                  cfg=cfg,
+                  controller=controller)
     ui.start()
     print(f"[mission] UI running at {ui.url()} (camera) and {ui.url()}/charts")
 
