@@ -821,6 +821,40 @@ tick();
 _PAGE_TUNE = _PAGE_BASE_CSS + _PAGE_HEADER + """
 <main class="grid" style="grid-template-columns: minmax(0, 1fr);">
   <div class="card">
+    <h2>Snapshots</h2>
+    <p style="font-size:.85rem; color:#aab; margin:.2rem 0 .8rem;">
+      Save the entire current parameter set under a name and load it
+      back later. Useful for switching between tuning presets ("indoor
+      slow", "outdoor fast", etc.). Save also captures any unsaved
+      edits in the form below.
+    </p>
+    <div style="display:flex; gap:.4rem; align-items:center; margin-bottom:.7rem;">
+      <input id="snap-name" type="text" placeholder="snapshot name"
+             style="flex:1; min-width:10rem; max-width:24rem;
+                    background:#0e1116; color:#e6edf3;
+                    border:1px solid #2a3038; border-radius:4px;
+                    padding:.3rem .5rem; font-family:inherit;">
+      <button type="button" id="btn-snap-save"
+              style="padding:.4rem .8rem; border:0; border-radius:6px;
+                     background:var(--good); color:#072413; font-weight:600;
+                     cursor:pointer;">Save snapshot</button>
+    </div>
+    <table id="snap-table" style="width:100%; border-collapse:collapse;
+                                  font-size:.85rem;">
+      <thead>
+        <tr style="text-align:left; color:#9ca3af;">
+          <th style="padding:.3rem .4rem;">Name</th>
+          <th style="padding:.3rem .4rem;">Saved</th>
+          <th style="padding:.3rem .4rem; width:14rem;">Actions</th>
+        </tr>
+      </thead>
+      <tbody id="snap-body">
+        <tr><td colspan="3" style="color:#6b7280; padding:.4rem;">loading…</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="card">
     <h2>Live PD / mission tuning</h2>
     <p style="font-size:.85rem; color:#aab; margin:.2rem 0 1rem;">
       Edit the values below and press <b>Apply</b> to push them into the
@@ -1016,7 +1050,112 @@ $('btn-apply').addEventListener('click', applyValues);
 $('btn-save').addEventListener('click', saveValues);
 $('btn-reload').addEventListener('click', reloadValues);
 $('btn-reset').addEventListener('click', resetAll);
+
+// ---- Snapshots ---------------------------------------------------------
+function fmtMtime(t) {
+  if (!t) return '';
+  const d = new Date(t * 1000);
+  return d.toLocaleString();
+}
+async function refreshSnapshots() {
+  try {
+    const r = await fetch('/api/tune/snapshots', {cache: 'no-store'});
+    const j = await r.json();
+    const tb = $('snap-body');
+    tb.innerHTML = '';
+    if (!j.snapshots || j.snapshots.length === 0) {
+      tb.innerHTML = '<tr><td colspan="3" style="color:#6b7280; padding:.4rem;">No snapshots yet.</td></tr>';
+      return;
+    }
+    for (const s of j.snapshots) {
+      const tr = document.createElement('tr');
+      tr.style.borderTop = '1px dashed #2a3038';
+      const nameTd = document.createElement('td');
+      nameTd.style.padding = '.3rem .4rem';
+      nameTd.style.color = '#e6edf3';
+      nameTd.textContent = s.name;
+      const timeTd = document.createElement('td');
+      timeTd.style.padding = '.3rem .4rem';
+      timeTd.style.color = '#9ca3af';
+      timeTd.textContent = fmtMtime(s.mtime);
+      const actTd = document.createElement('td');
+      actTd.style.padding = '.3rem .4rem';
+      const loadBtn = document.createElement('button');
+      loadBtn.textContent = 'Load';
+      loadBtn.type = 'button';
+      loadBtn.style.cssText = 'padding:.2rem .55rem; border:0; border-radius:4px; '
+        + 'background:var(--accent); color:#062633; font-weight:600; cursor:pointer; '
+        + 'margin-right:.4rem; font-size:.8rem;';
+      loadBtn.addEventListener('click', () => loadSnap(s.name));
+      const delBtn = document.createElement('button');
+      delBtn.textContent = 'Delete';
+      delBtn.type = 'button';
+      delBtn.style.cssText = 'padding:.2rem .55rem; border:1px solid #7f1d1d; '
+        + 'border-radius:4px; background:transparent; color:#fca5a5; cursor:pointer; '
+        + 'font-size:.8rem;';
+      delBtn.addEventListener('click', () => deleteSnap(s.name));
+      actTd.appendChild(loadBtn);
+      actTd.appendChild(delBtn);
+      tr.appendChild(nameTd);
+      tr.appendChild(timeTd);
+      tr.appendChild(actTd);
+      tb.appendChild(tr);
+    }
+  } catch (e) {
+    setStatus('Could not list snapshots: ' + e, false);
+  }
+}
+async function saveSnap() {
+  const name = $('snap-name').value.trim();
+  if (!name) { setStatus('Type a snapshot name first.', false); return; }
+  try {
+    const r = await fetch('/api/tune/snapshots/' + encodeURIComponent(name), {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify(collectValues()),
+    });
+    const j = await r.json();
+    if (!j.ok) { setStatus('Snapshot save failed: ' + (j.error || 'unknown'), false); return; }
+    setStatus('Snapshot "' + name + '" saved.', true);
+    $('snap-name').value = '';
+    document.querySelectorAll('.tune-input.dirty').forEach(i => i.classList.remove('dirty'));
+    await refreshSnapshots();
+  } catch (e) {
+    setStatus('Snapshot save failed: ' + e, false);
+  }
+}
+async function loadSnap(name) {
+  try {
+    const r = await fetch('/api/tune/snapshots/' + encodeURIComponent(name) + '/load',
+                          {method: 'POST'});
+    const j = await r.json();
+    if (!j.ok) { setStatus('Load failed: ' + (j.error || 'unknown'), false); return; }
+    await loadView();
+    setStatus('Snapshot "' + name + '" loaded into running controller.', true);
+  } catch (e) {
+    setStatus('Load failed: ' + e, false);
+  }
+}
+async function deleteSnap(name) {
+  if (!confirm('Delete snapshot "' + name + '"?')) return;
+  try {
+    const r = await fetch('/api/tune/snapshots/' + encodeURIComponent(name),
+                          {method: 'DELETE'});
+    const j = await r.json();
+    if (!j.ok) { setStatus('Delete failed: ' + (j.error || 'unknown'), false); return; }
+    setStatus('Snapshot "' + name + '" deleted.', true);
+    await refreshSnapshots();
+  } catch (e) {
+    setStatus('Delete failed: ' + e, false);
+  }
+}
+$('btn-snap-save').addEventListener('click', saveSnap);
+$('snap-name').addEventListener('keydown', e => {
+  if (e.key === 'Enter') { e.preventDefault(); saveSnap(); }
+});
+
 loadView();
+refreshSnapshots();
 </script>
 """
 
@@ -1365,6 +1504,91 @@ class UiServer:
                 if self.controller is not None:
                     self.controller.apply_config_changes()
                 return jsonify({"ok": True})
+            except Exception as e:
+                return jsonify({"ok": False, "error": str(e)}), 500
+
+        # ---- Snapshot storage. JSON files in SNAPSHOTS_DIR; the file
+        # stem is the snapshot name. Same format as the persisted
+        # config (cfg.save writes asdict(cfg) JSON), so a snapshot is
+        # just a named copy of the live cfg at one moment.
+        import re as _re
+        _NAME_RE = _re.compile(r"^[A-Za-z0-9][A-Za-z0-9_\-\. ]{0,63}$")
+
+        def _snap_path(name: str) -> Optional[Path]:
+            if not _NAME_RE.match(name):
+                return None
+            from .config import SNAPSHOTS_DIR
+            SNAPSHOTS_DIR.mkdir(parents=True, exist_ok=True)
+            return SNAPSHOTS_DIR / f"{name}.json"
+
+        @app.get("/api/tune/snapshots")
+        def api_snap_list():
+            from .config import SNAPSHOTS_DIR
+            SNAPSHOTS_DIR.mkdir(parents=True, exist_ok=True)
+            items = []
+            for p in SNAPSHOTS_DIR.glob("*.json"):
+                try:
+                    items.append({
+                        "name":  p.stem,
+                        "mtime": p.stat().st_mtime,
+                        "size":  p.stat().st_size,
+                    })
+                except OSError:
+                    continue
+            items.sort(key=lambda x: -x["mtime"])
+            return jsonify({"snapshots": items})
+
+        @app.post("/api/tune/snapshots/<name>")
+        def api_snap_save(name):
+            if self.cfg is None:
+                return jsonify({"ok": False, "error": "tuning not wired"}), 503
+            # Apply any pending edits in the request body first so
+            # "Save snapshot" implicitly captures the current form
+            # state, not whatever was last applied.
+            data = request.get_json(silent=True)
+            if isinstance(data, dict) and data:
+                self.cfg.update_from_dict(data)
+                if self.controller is not None:
+                    try: self.controller.apply_config_changes()
+                    except Exception: pass
+            p = _snap_path(name)
+            if p is None:
+                return jsonify({"ok": False,
+                                "error": "invalid name (alphanum, _ - . space, "
+                                         "max 64 chars, can't start with separator)"}), 400
+            try:
+                self.cfg.save(p)
+                return jsonify({"ok": True, "name": name, "path": str(p)})
+            except Exception as e:
+                return jsonify({"ok": False, "error": str(e)}), 500
+
+        @app.post("/api/tune/snapshots/<name>/load")
+        def api_snap_load(name):
+            if self.cfg is None:
+                return jsonify({"ok": False, "error": "tuning not wired"}), 503
+            p = _snap_path(name)
+            if p is None or not p.exists():
+                return jsonify({"ok": False, "error": "snapshot not found"}), 404
+            try:
+                fresh = MissionConfig.load(p)
+                self.cfg.update_from_dict({
+                    k: getattr(fresh, k)
+                    for k in self.cfg.__dataclass_fields__
+                })
+                if self.controller is not None:
+                    self.controller.apply_config_changes()
+                return jsonify({"ok": True, "name": name})
+            except Exception as e:
+                return jsonify({"ok": False, "error": str(e)}), 500
+
+        @app.delete("/api/tune/snapshots/<name>")
+        def api_snap_delete(name):
+            p = _snap_path(name)
+            if p is None or not p.exists():
+                return jsonify({"ok": False, "error": "snapshot not found"}), 404
+            try:
+                p.unlink()
+                return jsonify({"ok": True, "name": name})
             except Exception as e:
                 return jsonify({"ok": False, "error": str(e)}), 500
 

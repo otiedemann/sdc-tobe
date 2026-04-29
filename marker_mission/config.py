@@ -28,6 +28,7 @@ DEFAULT_DATA_DIR = Path(os.environ.get("MM_DATA_DIR",
                                        Path.home() / ".marker_mission"))
 CALIB_DIR = DEFAULT_DATA_DIR / "calibrations"
 FLIGHTS_DIR = DEFAULT_DATA_DIR / "flights"
+SNAPSHOTS_DIR = DEFAULT_DATA_DIR / "snapshots"
 
 
 # ---------------------------------------------------------------------------
