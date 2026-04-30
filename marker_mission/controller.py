@@ -1011,7 +1011,36 @@ class MissionController:
             u_lat_raw = self.pd_lat.step(arc_err_m, now)
         u_lat = self._velocity_damp_lat(u_lat_raw, tel)
 
-        self._send_rc(lr=int(u_lat), fb=int(u_fwd), ud=0, yaw=int(u_yaw))
+        # Continuous height alignment to the marker's altitude. Same
+        # geometry as HEIGHT_ALIGN: marker_height = drone_height -
+        # tvec[1] (camera y points world-down thanks to the gimbal).
+        # HEIGHT_ALIGN's one-shot settle isn't enough -- approach can
+        # take many seconds and small altitude drift (Anafi self-stabilise
+        # bias, wind, residual ud from prior phases) lets the marker
+        # walk out of frame. Soft no-op if telemetry / pose isn't
+        # available so approach itself keeps working.
+        u_ud = 0.0
+        pose = self.state.last_pose
+        try:
+            h_cm = (float(tel.raw.get("height_cm"))
+                    if tel and tel.raw.get("height_cm") is not None
+                    else None)
+        except (TypeError, ValueError):
+            h_cm = None
+        if h_cm is not None and pose is not None:
+            drone_h = h_cm / 100.0
+            try:
+                marker_y = float(pose.tvec[1])
+            except Exception:
+                marker_y = 0.0
+            target_h = max(cfg.min_height_m,
+                           min(cfg.max_height_m, drone_h - marker_y))
+            e_h = target_h - drone_h
+            if abs(e_h) >= cfg.height_deadband_m:
+                u_ud = self.pd_height.step(e_h, now)
+
+        self._send_rc(lr=int(u_lat), fb=int(u_fwd), ud=int(u_ud),
+                      yaw=int(u_yaw))
 
         # Settle detection. We capture the "settled long enough" decision
         # under the lock, then release before calling _set_phase -- which
@@ -1086,7 +1115,33 @@ class MissionController:
             arc_err_m = -d * math.radians(e_hdg)
             u_lat_raw = self.pd_lat.step(arc_err_m, now)
         u_lat = self._velocity_damp_lat(u_lat_raw, tel)
-        self._send_rc(lr=int(u_lat), fb=int(u_fwd), ud=0, yaw=int(u_yaw))
+
+        # Continuous height alignment to the marker, same as APPROACH.
+        # HOLD is only entered after APPROACH (HOOVER step rule), so
+        # the operator's intent is "stay at the marker's height". The
+        # IDLE phase (HOOVER without prior APPROACH) keeps ud=0.
+        u_ud = 0.0
+        pose = self.state.last_pose
+        try:
+            h_cm = (float(tel.raw.get("height_cm"))
+                    if tel and tel.raw.get("height_cm") is not None
+                    else None)
+        except (TypeError, ValueError):
+            h_cm = None
+        if h_cm is not None and pose is not None:
+            drone_h = h_cm / 100.0
+            try:
+                marker_y = float(pose.tvec[1])
+            except Exception:
+                marker_y = 0.0
+            target_h = max(cfg.min_height_m,
+                           min(cfg.max_height_m, drone_h - marker_y))
+            e_h = target_h - drone_h
+            if abs(e_h) >= cfg.height_deadband_m:
+                u_ud = self.pd_height.step(e_h, now)
+
+        self._send_rc(lr=int(u_lat), fb=int(u_fwd), ud=int(u_ud),
+                      yaw=int(u_yaw))
         # Timer transition is handled at the top of this method so it
         # wins over a marker-lost escalation on the same tick.
 
