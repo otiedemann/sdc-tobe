@@ -239,7 +239,7 @@ function fmt(v, unit, prec) {
 
 // ---- Status panel (only runs if its DOM elements are present) -----------
 const TERMINAL_PHASES = new Set(['done', 'abort']);
-const STOPPABLE_PHASES = new Set(['takeoff','search','align','approach','hold','land']);
+const STOPPABLE_PHASES = new Set(['takeoff','search','align','height_align','approach','hold','land']);
 let stopRequested = false;
 function setMissionButtons(phase) {
   const start = $('btn-start'); const stop = $('btn-stop'); const msg = $('ctrl-msg');

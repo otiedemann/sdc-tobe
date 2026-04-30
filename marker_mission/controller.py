@@ -63,6 +63,7 @@ class Phase(enum.Enum):
     TAKEOFF   = "takeoff"
     SEARCH    = "search"
     ALIGN     = "align"     # orbit at start radius until heading ~ 0
+    HEIGHT_ALIGN = "height_align"   # match drone height to marker height
     APPROACH  = "approach"  # close distance to target with heading held near 0
     HOLD      = "hold"      # station-keeping hover for hold_time_s, then LAND
     LAND      = "land"
@@ -297,6 +298,7 @@ class MissionController:
         self.pd_yaw = PDController(cfg.yaw_kp, cfg.yaw_kd, cfg.yaw_rc_max)
         self.pd_fwd = PDController(cfg.fwd_kp, cfg.fwd_kd, cfg.fwd_rc_max)
         self.pd_lat = PDController(cfg.lat_kp, cfg.lat_kd, cfg.lat_rc_max)
+        self.pd_height = PDController(cfg.height_kp, cfg.height_kd, cfg.ud_rc_max)
 
         self.smoother = PoseSmoother(cfg.pose_smoothing_alpha, cfg.pose_max_age_s)
 
@@ -319,6 +321,9 @@ class MissionController:
         self.pd_lat.kp = float(cfg.lat_kp)
         self.pd_lat.kd = float(cfg.lat_kd)
         self.pd_lat.out_clip = float(cfg.lat_rc_max)
+        self.pd_height.kp = float(cfg.height_kp)
+        self.pd_height.kd = float(cfg.height_kd)
+        self.pd_height.out_clip = float(cfg.ud_rc_max)
         self.smoother.alpha = float(cfg.pose_smoothing_alpha)
         self.smoother.max_age_s = float(cfg.pose_max_age_s)
 
@@ -355,6 +360,7 @@ class MissionController:
         self.pd_yaw.reset()
         self.pd_fwd.reset()
         self.pd_lat.reset()
+        self.pd_height.reset()
         self.smoother.reset()
         # Per-phase scratch state (set lazily in the relevant _step_*).
         self._land_requested = False
@@ -438,7 +444,7 @@ class MissionController:
         elif old == Phase.ALIGN:
             self.state.align_distance_m = None
         # Reset PD integrators on phase change
-        self.pd_yaw.reset(); self.pd_fwd.reset(); self.pd_lat.reset()
+        self.pd_yaw.reset(); self.pd_fwd.reset(); self.pd_lat.reset(); self.pd_height.reset()
         if self.on_phase_change:
             try:
                 self.on_phase_change(old, phase, note)
@@ -523,6 +529,8 @@ class MissionController:
                     self._step_search(now)
                 elif phase == Phase.ALIGN:
                     self._step_align(tel, now)
+                elif phase == Phase.HEIGHT_ALIGN:
+                    self._step_height_align(tel, now)
                 elif phase == Phase.APPROACH:
                     self._step_approach(tel, now)
                 elif phase == Phase.HOLD:
@@ -591,14 +599,39 @@ class MissionController:
 
     # --------------------------------------------------------------- takeoff
     def _step_takeoff(self, tel: Optional[TelemetrySnapshot], now: float) -> None:
-        # Hold zero RC while we wait for the airframe to leave the ground.
-        self._send_rc(0, 0, 0, 0)
-        if tel and tel.flying:
-            self._set_phase(Phase.SEARCH, "airborne, beginning marker search")
+        cfg = self.cfg
+        # Sub-stage 1: wait for the airframe to leave the ground.
+        if not (tel and tel.flying):
+            self._send_rc(0, 0, 0, 0)
+            if now - self.state.phase_started_at > 15.0:
+                self._abort("timed out waiting for flying=True after takeoff")
             return
-        # If takeoff hasn't completed in 15 s, abort.
-        if now - self.state.phase_started_at > 15.0:
-            self._abort("timed out waiting for flying=True after takeoff")
+        # Sub-stage 2: climb to default_height_m before searching. Anafi's
+        # takeoff command parks the drone at ~1 m; default_height_m is
+        # usually a bit higher and we want a known starting altitude
+        # for the rest of the mission.
+        try:
+            height_cm = float(tel.raw.get("height_cm")) if tel.raw.get("height_cm") is not None else None
+        except (TypeError, ValueError):
+            height_cm = None
+        if height_cm is None:
+            # Without height telemetry we can't drive a climb; just
+            # hand off to SEARCH so the rest of the flight still works.
+            self._set_phase(Phase.SEARCH,
+                            "airborne (no height telem), beginning marker search")
+            return
+        drone_h = height_cm / 100.0
+        e_h = cfg.default_height_m - drone_h
+        if abs(e_h) < cfg.height_deadband_m:
+            self._set_phase(Phase.SEARCH,
+                            f"reached default height ({drone_h:.2f}m), "
+                            f"beginning marker search")
+            return
+        u_ud = self.pd_height.step(e_h, now)
+        self._send_rc(0, 0, int(u_ud), 0)
+        # Hard timeout for the whole TAKEOFF phase (climb included).
+        if now - self.state.phase_started_at > 30.0:
+            self._abort("timed out climbing to default height")
 
     # ---------------------------------------------------------------- search
     def _step_search(self, now: float) -> None:
@@ -609,8 +642,8 @@ class MissionController:
         # -- this keeps the marker out of the oblique-angle range where
         # the ArUco detector starts to fail.
         if self.smoother.get(now) is not None:
-            self._set_phase(Phase.ALIGN,
-                            "marker acquired -- aligning to face it")
+            self._set_phase(Phase.HEIGHT_ALIGN,
+                            "marker acquired -- aligning altitude to marker")
             return
         # Otherwise, yaw in place. Direction is arbitrary; we pick CW (+ yaw).
         self._send_rc(0, 0, 0, cfg.search_yaw_rc)
@@ -714,6 +747,84 @@ class MissionController:
         if settled:
             self._set_phase(Phase.APPROACH,
                             "aligned (heading ~ 0) -- closing distance")
+
+    # ---------------------------------------------------------- height-align
+    def _step_height_align(self, tel: Optional[TelemetrySnapshot],
+                          now: float) -> None:
+        """Drive the drone's altitude to match the marker's altitude.
+
+        Marker world height = drone_height - tvec[1] (camera +y points
+        DOWN in the world thanks to the gimbal, so a positive tvec[1]
+        means the marker is below the drone). Target is clamped to
+        [min_height_m, max_height_m] -- a marker mounted lower than
+        min_height_m holds the drone at min_height_m instead of
+        descending below the safety floor.
+
+        Yaw is kept on the marker so it doesn't drift out of frame.
+        Forward / lateral channels stay zero -- altitude only.
+        """
+        cfg = self.cfg
+        meas = self.smoother.get(now)
+        pose = self.state.last_pose
+        if meas is None or pose is None:
+            self._marker_lost(now); return
+        d, yaw_to_marker, hdg = meas
+
+        try:
+            height_cm = float(tel.raw.get("height_cm")) if tel and tel.raw.get("height_cm") is not None else None
+        except (TypeError, ValueError):
+            height_cm = None
+        if height_cm is None:
+            # Without height telemetry, hand off to ALIGN. The state
+            # machine continues to function, just without height
+            # alignment for this run.
+            self._set_phase(Phase.ALIGN,
+                            "no height telemetry -- skipping HEIGHT_ALIGN")
+            return
+
+        drone_h = height_cm / 100.0
+        # tvec[1] is the marker's downward offset from the camera in
+        # the camera frame (gimbal-stabilised, so the camera y-axis
+        # aligns with world-down). Positive => marker is below drone.
+        try:
+            marker_y = float(pose.tvec[1])
+        except Exception:
+            marker_y = 0.0
+        marker_height_m = drone_h - marker_y
+        target_h = max(cfg.min_height_m,
+                       min(cfg.max_height_m, marker_height_m))
+        e_h = target_h - drone_h
+
+        e_yaw = yaw_to_marker
+        u_yaw = (0.0 if abs(e_yaw) < cfg.yaw_deadband_deg
+                 else self.pd_yaw.step(e_yaw, now))
+        u_ud = (0.0 if abs(e_h) < cfg.height_deadband_m
+                else self.pd_height.step(e_h, now))
+
+        self._send_rc(lr=0, fb=0, ud=int(u_ud), yaw=int(u_yaw))
+
+        with self.state.lock:
+            self.state.note = (f"HEIGHT_ALIGN: drone={drone_h:.2f}m  "
+                               f"marker={marker_height_m:.2f}m  "
+                               f"target={target_h:.2f}m  e={e_h:+.2f}m")
+
+        # Settle: both height and yaw inside their deadbands for the
+        # configured time -> transition to ALIGN.
+        in_band = (abs(e_h)   < cfg.height_deadband_m
+                   and abs(e_yaw) < cfg.yaw_deadband_deg)
+        settled = False
+        with self.state.lock:
+            if in_band:
+                if self.state.settle_began_at is None:
+                    self.state.settle_began_at = now
+                if now - self.state.settle_began_at >= cfg.height_settle_time_s:
+                    settled = True
+            else:
+                self.state.settle_began_at = None
+        if settled:
+            self._set_phase(Phase.ALIGN,
+                            f"height aligned ({drone_h:.2f}m) -- "
+                            f"now aligning heading")
 
     # -------------------------------------------------------------- approach
     def _step_approach(self, tel: Optional[TelemetrySnapshot],
@@ -894,6 +1005,26 @@ class MissionController:
         fb  = max(-cfg.fwd_rc_max, min(cfg.fwd_rc_max, int(round(fb))))
         ud  = max(-cfg.ud_rc_max,  min(cfg.ud_rc_max,  int(round(ud))))
         yaw = max(-cfg.yaw_rc_max, min(cfg.yaw_rc_max, int(round(yaw))))
+        # Altitude envelope: forbid further climb above max_height_m and
+        # forbid further descent below min_height_m. Applies to every
+        # phase (HEIGHT_ALIGN's PD output and the takeoff climb both
+        # respect the bounds because they're driven through the same
+        # PD instance, but this clamp also covers any residual or
+        # operator-style commands that try to push outside the
+        # envelope).
+        with self.state.lock:
+            tel = self.state.last_telemetry
+        if tel is not None:
+            try:
+                h_cm = float(tel.raw.get("height_cm"))
+            except (TypeError, ValueError):
+                h_cm = None
+            if h_cm is not None:
+                h_m = h_cm / 100.0
+                if h_m >= cfg.max_height_m:
+                    ud = min(0, ud)
+                if h_m <= cfg.min_height_m:
+                    ud = max(0, ud)
         with self.state.lock:
             self.state.last_rc = (lr, fb, ud, yaw)
         if dry_run:

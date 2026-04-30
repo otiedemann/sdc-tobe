@@ -116,6 +116,23 @@ class MissionConfig:
     # drone closer than intended.
     distance_floor_factor: float = 0.7     # TUNE  e.g. 0.7 * 1.0m = 0.7 m
 
+    # --- Altitude / height control ------------------------------------------
+    # The drone climbs to default_height_m after takeoff before searching,
+    # and re-aligns to the marker's altitude in the HEIGHT_ALIGN phase.
+    # min/max bound the height the drone is allowed to fly at -- _send_rc
+    # clamps the ud channel against these so wild PD output, residual
+    # control commands, or wind can't push the drone outside the safe
+    # envelope. min also caps the HEIGHT_ALIGN target for low markers
+    # (drone refuses to descend below min_height even if the marker is
+    # mounted on the floor).
+    default_height_m: float = 1.5          # TUNE  climb-to height after takeoff
+    min_height_m: float = 0.5              # TUNE  ud >= 0 below this
+    max_height_m: float = 2.0              # TUNE  ud <= 0 above this
+    height_kp: float = 30.0                # TUNE  RC counts per m of height error
+    height_kd: float = 10.0                # TUNE  RC counts per (m/s)
+    height_deadband_m: float = 0.10        # TUNE
+    height_settle_time_s: float = 1.0      # TUNE  before HEIGHT_ALIGN -> ALIGN
+
     # --- Search behaviour ----------------------------------------------------
     # When the marker is not visible, we yaw in place looking for it. After
     # one full rotation without a sighting, we give up and land.
@@ -300,6 +317,15 @@ TUNING_FIELDS = {
         "desc": "Cap on rc_lr. Lower = slower lateral motion + better yaw tracking (yaw can keep up with the apparent-marker drift). 4 ≈ 16 cm/s. Going much higher tends to spiral the drone outward because yaw lags.",
     },
 
+    "height_kp": {
+        "label": "height kp", "kind": "float", "step": 1.0,
+        "desc": "Proportional gain on height error (m), in RC counts per metre. Default 30 means a 1 m error tries to command rc_ud=30 (clamped at ud_rc_max).",
+    },
+    "height_kd": {
+        "label": "height kd", "kind": "float", "step": 1.0,
+        "desc": "Derivative gain on height-rate (RC per m/s). Damps oscillation around the height target.",
+    },
+
     "yaw_kp": {
         "label": "yaw kp", "kind": "float", "step": 0.1,
         "desc": "Proportional gain on yaw_to_marker, in RC counts per degree. Saturates at yaw_rc_max for |error| > yaw_rc_max / yaw_kp. Too high → bang-bang at the controller's loop period.",
@@ -311,6 +337,27 @@ TUNING_FIELDS = {
     "yaw_rc_max": {
         "label": "yaw RC max", "kind": "int", "step": 1,
         "desc": "Cap on rc_yaw. Roughly 1 unit ≈ 1°/s of yaw rate, so 25 ≈ 25°/s.",
+    },
+
+    "default_height_m": {
+        "label": "Default height (post-takeoff)", "kind": "float", "unit": "m", "step": 0.1,
+        "desc": "Height the drone climbs to immediately after takeoff before searching. PD-driven via height_kp/kd; clamped between min_height_m and max_height_m.",
+    },
+    "min_height_m": {
+        "label": "Min height", "kind": "float", "unit": "m", "step": 0.1,
+        "desc": "Floor on the drone's flight altitude. _send_rc forces rc_ud >= 0 below this height (drone can climb but not descend). HEIGHT_ALIGN also caps its target at this -- a marker mounted lower than min_height does not pull the drone down to ground level.",
+    },
+    "max_height_m": {
+        "label": "Max height", "kind": "float", "unit": "m", "step": 0.1,
+        "desc": "Ceiling on the drone's flight altitude. _send_rc forces rc_ud <= 0 above this height. HEIGHT_ALIGN also caps its target here.",
+    },
+    "height_deadband_m": {
+        "label": "height deadband", "kind": "float", "unit": "m", "step": 0.05,
+        "desc": "|drone_height - target_height| below this → rc_ud=0. Defines what 'at target altitude' means.",
+    },
+    "height_settle_time_s": {
+        "label": "HEIGHT_ALIGN settle time", "kind": "float", "unit": "s", "step": 0.1,
+        "desc": "How long height + yaw must both stay inside their deadbands before HEIGHT_ALIGN transitions to ALIGN.",
     },
 
     "yaw_deadband_deg": {
@@ -378,6 +425,10 @@ TUNING_GROUPS = [
         ["lat_kp", "lat_kd", "lat_kv", "lat_rc_max"]),
     ("Yaw PD (centring marker)",
         ["yaw_kp", "yaw_kd", "yaw_rc_max"]),
+    ("Height control",
+        ["default_height_m", "min_height_m", "max_height_m",
+         "height_kp", "height_kd", "height_deadband_m",
+         "height_settle_time_s", "ud_rc_max"]),
     ("Deadbands",
         ["yaw_deadband_deg", "distance_deadband_m",
          "heading_deadband_deg", "approach_heading_deadband_deg",
@@ -386,7 +437,7 @@ TUNING_GROUPS = [
         ["approach_settle_time_s", "align_settle_time_s",
          "search_marker_lost_grace_s"]),
     ("Safety / search",
-        ["distance_floor_factor", "search_yaw_rc", "ud_rc_max"]),
+        ["distance_floor_factor", "search_yaw_rc"]),
     ("Pose smoothing",
         ["pose_smoothing_alpha", "pose_max_age_s"]),
 ]
