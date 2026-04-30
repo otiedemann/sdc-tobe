@@ -200,7 +200,7 @@ def cmd_fly(args: argparse.Namespace) -> int:
     recording_paused.set()
 
     AIRBORNE_PHASES = {Phase.TAKEOFF, Phase.SEARCH, Phase.ALIGN,
-                       Phase.APPROACH, Phase.HOLD, Phase.LAND}
+                       Phase.APPROACH, Phase.HOLD, Phase.RTH, Phase.LAND}
 
     def on_phase_change(old_phase, new_phase, note):
         # First-tick of TAKEOFF in this mission: create the flight dir

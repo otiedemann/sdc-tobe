@@ -178,6 +178,17 @@ _VIDEO_AND_STATUS_HTML = """
                      cursor:pointer; font-size:.95rem;">
         Start mission
       </button>
+      <button id="btn-rth" type="button" disabled
+              title="Dead-reckon back to the previous mission's takeoff
+                     position. Only available after a mission has been
+                     completed in this script run -- there's no GPS or
+                     marker fix, so position drifts ~cm/s × time."
+              style="padding:.55rem 1rem; border:0; border-radius:6px;
+                     background:var(--accent); color:#062633; font-weight:600;
+                     cursor:pointer; font-size:.95rem;
+                     opacity:.5; transition:opacity .2s;">
+        Return home
+      </button>
       <button id="btn-stop" type="button"
               style="padding:.55rem 1rem; border:0; border-radius:6px;
                      background:var(--bad); color:#240707; font-weight:600;
@@ -239,10 +250,11 @@ function fmt(v, unit, prec) {
 
 // ---- Status panel (only runs if its DOM elements are present) -----------
 const TERMINAL_PHASES = new Set(['done', 'abort']);
-const STOPPABLE_PHASES = new Set(['takeoff','search','align','approach','hold','land']);
+const STOPPABLE_PHASES = new Set(['takeoff','search','align','approach','hold','rth','land']);
 let stopRequested = false;
-function setMissionButtons(phase) {
+function setMissionButtons(phase, rthAvailable) {
   const start = $('btn-start'); const stop = $('btn-stop'); const msg = $('ctrl-msg');
+  const rth = $('btn-rth');
   if (!start || !stop) return;
   if (!droneConnected) {
     // No drone wired in -- the camera page is essentially a stub for
@@ -251,6 +263,8 @@ function setMissionButtons(phase) {
     start.style.display = ''; stop.style.display = 'none';
     start.disabled = true; start.style.opacity = '0.5'; start.style.cursor = 'not-allowed';
     start.textContent = 'Start mission';
+    if (rth) { rth.style.display = ''; rth.disabled = true;
+               rth.style.opacity = '0.5'; rth.style.cursor = 'not-allowed'; }
     msg.textContent = 'No drone connected — open the Replay tab to view flights.';
     return;
   }
@@ -258,13 +272,23 @@ function setMissionButtons(phase) {
     start.style.display = ''; stop.style.display = 'none';
     start.disabled = false; start.style.opacity = '1'; start.style.cursor = 'pointer';
     start.textContent = 'Start mission';
-    msg.textContent = 'Ready. Press to arm + take off.';
+    if (rth) {
+      rth.style.display = '';
+      rth.disabled = !rthAvailable;
+      rth.style.opacity = rthAvailable ? '1' : '0.5';
+      rth.style.cursor = rthAvailable ? 'pointer' : 'not-allowed';
+    }
+    msg.textContent = rthAvailable
+      ? 'Ready. Press Start, or Return home to dead-reckon back.'
+      : 'Ready. Press to arm + take off. (Return home unlocks after the first mission.)';
     stopRequested = false;
   } else if (TERMINAL_PHASES.has(phase)) {
     start.style.display = 'none'; stop.style.display = 'none';
+    if (rth) rth.style.display = 'none';
     msg.textContent = 'Mission ' + phase + '.';
   } else if (STOPPABLE_PHASES.has(phase)) {
     start.style.display = 'none'; stop.style.display = '';
+    if (rth) rth.style.display = 'none';
     if (stopRequested) {
       stop.disabled = true; stop.style.opacity = '0.5'; stop.style.cursor = 'not-allowed';
       stop.textContent = 'Landing…';
@@ -323,9 +347,24 @@ function updateStatus(s) {
   $('s-ht').textContent  = (t.height_cm !== undefined && t.height_cm !== null) ? (t.height_cm + ' cm') : '—';
   $('s-fl').textContent  = t.flying ? 'yes' : 'no';
   $('s-note').textContent = s.note || (s.abort_reason || '—');
-  setMissionButtons(s.phase);
+  setMissionButtons(s.phase, !!s.rth_available);
+}
+async function rthMission() {
+  const btn = $('btn-rth'); const msg = $('ctrl-msg');
+  btn.disabled = true; msg.textContent = 'Arming RTH…';
+  try {
+    const r = await fetch('/api/rth', {method:'POST'});
+    const j = await r.json();
+    if (!j.ok) {
+      msg.textContent = 'Could not RTH: ' + (j.error || 'unknown');
+      btn.disabled = false;
+    } else {
+      msg.textContent = 'RTH armed -- drone taking off, then dead-reckoning home.';
+    }
+  } catch (e) { msg.textContent = 'Request failed: ' + e; btn.disabled = false; }
 }
 if ($('btn-start')) $('btn-start').addEventListener('click', startMission);
+if ($('btn-rth'))   $('btn-rth').addEventListener('click',   rthMission);
 if ($('btn-stop'))  $('btn-stop').addEventListener('click',  stopMission);
 
 // ---- Replay controls (only present in replay pages) ---------------------
@@ -1434,6 +1473,15 @@ class UiServer:
             # Surface the live drone-connection flag so the JS can
             # enable / disable the Start button without a page reload.
             snap["drone_connected"] = self.drone_connected
+            # Whether the RTH button should be clickable. False before
+            # the first mission has completed (no home recorded), or
+            # if the controller has already left INIT.
+            try:
+                snap["rth_available"] = bool(
+                    self.controller is not None
+                    and self.controller.rth_available())
+            except Exception:
+                snap["rth_available"] = False
             return jsonify(snap)
 
         # ---- Replay --------------------------------------------------
@@ -1819,6 +1867,23 @@ class UiServer:
             if not started:
                 return jsonify({"ok": False,
                                 "error": "mission already started or not in INIT"}), 409
+            return jsonify({"ok": True})
+
+        @app.post("/api/rth")
+        def api_rth():
+            if self.controller is None:
+                return jsonify({"ok": False,
+                                "error": "controller not wired"}), 500
+            try:
+                started = bool(self.controller.trigger_rth())
+            except Exception as e:
+                return jsonify({"ok": False, "error": str(e)}), 500
+            if not started:
+                return jsonify({
+                    "ok": False,
+                    "error": "RTH not available -- needs a completed mission "
+                             "(to know home) and the controller must be in INIT"
+                }), 409
             return jsonify({"ok": True})
 
         @app.post("/api/stop")
