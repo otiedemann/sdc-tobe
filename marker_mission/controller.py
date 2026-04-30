@@ -265,8 +265,15 @@ class MissionState:
     last_telemetry: Optional[TelemetrySnapshot] = None
 
     last_rc: tuple[int, int, int, int] = (0, 0, 0, 0)        # (lr, fb, ud, yaw)
+    # Active runtime targets. Populated from cfg defaults at every
+    # mission start AND overridden per-step by _apply_step_to_phase.
+    # Phases READ these (NOT cfg.target_*) so a script step that
+    # specifies an explicit value can't pollute the cfg defaults that
+    # subsequent missions parse from.
     target_distance_m: float = 1.0
     target_relative_heading_deg: float = 90.0
+    active_marker_id: Optional[int] = None
+    hold_time_s: float = 60.0
 
     settle_began_at: Optional[float] = None
     hold_began_at: Optional[float] = None
@@ -311,6 +318,8 @@ class MissionState:
             self.last_rc = (0, 0, 0, 0)
             self.target_distance_m = cfg.target_distance_m
             self.target_relative_heading_deg = cfg.target_relative_heading_deg
+            self.active_marker_id = cfg.target_marker_id
+            self.hold_time_s = cfg.hold_time_s
             self.settle_began_at = None
             self.hold_began_at = None
             self.search_began_at = None
@@ -336,6 +345,13 @@ class MissionState:
             if self.smoothed is not None:
                 d, yaw, hdg = self.smoothed
             tel = self.last_telemetry.raw if self.last_telemetry else {}
+            # Mission script for the live runtime view: one canonicalised
+            # text line per step plus the active index (-1 before the
+            # first _advance_script). The UI swaps the textarea for a
+            # highlighted list whenever this is non-empty.
+            from . import mission_script as _ms
+            script_lines = (_ms.format(self.mission_script).splitlines()
+                             if self.mission_script else [])
             return {
                 "phase": self.phase.value,
                 "phase_age_s": time.monotonic() - self.phase_started_at,
@@ -345,11 +361,17 @@ class MissionState:
                 "relative_heading_deg": hdg,
                 "target_distance_m": self.target_distance_m,
                 "target_relative_heading_deg": self.target_relative_heading_deg,
+                "active_marker_id": self.active_marker_id,
+                "hold_time_s": self.hold_time_s,
                 "rc": {"lr": self.last_rc[0], "fb": self.last_rc[1],
                        "ud": self.last_rc[2], "yaw": self.last_rc[3]},
                 "telemetry": tel,
                 "marker_seen_age_s": (time.monotonic() - self.last_marker_seen_at)
                                        if self.last_marker_seen_at else None,
+                "mission_script": script_lines,
+                "mission_step_idx": self.mission_step_idx,
+                "current_step_kind": self.current_step_kind,
+                "height_target_m": self.height_target_m,
                 "abort_reason": self.abort_reason,
                 "note": self.note,
             }
@@ -391,6 +413,16 @@ class MissionController:
         self._go = threading.Event()
         self._thread: Optional[threading.Thread] = None
 
+        # Seed the runtime targets from cfg so vision_worker (which
+        # may run before the first controller.start()) reads a
+        # sensible state.active_marker_id.
+        with self.state.lock:
+            self.state.active_marker_id = self.cfg.target_marker_id
+            self.state.hold_time_s = self.cfg.hold_time_s
+            self.state.target_distance_m = self.cfg.target_distance_m
+            self.state.target_relative_heading_deg = (
+                self.cfg.target_relative_heading_deg)
+
     def apply_config_changes(self) -> None:
         """Re-sync per-instance state that was copied out of cfg at
         construction. Call after the cfg dataclass has been mutated
@@ -423,6 +455,8 @@ class MissionController:
             self.state.started_at = time.monotonic()
             self.state.target_distance_m = self.cfg.target_distance_m
             self.state.target_relative_heading_deg = self.cfg.target_relative_heading_deg
+            self.state.active_marker_id = self.cfg.target_marker_id
+            self.state.hold_time_s = self.cfg.hold_time_s
             self.state.note = "waiting for operator to start mission"
         self._stop.clear()
         self._go.clear()
@@ -554,8 +588,9 @@ class MissionController:
         if phase == Phase.ALIGN:
             with self.state.lock:
                 meas = self.state.smoothed
+                tgt = self.state.target_distance_m
             self.state.align_distance_m = (meas[0] if meas is not None
-                                           else self.cfg.target_distance_m)
+                                           else tgt)
         elif old == Phase.ALIGN:
             self.state.align_distance_m = None
         # Reset PD integrators on phase change
@@ -826,7 +861,9 @@ class MissionController:
         # past the floor (flight 22-09-49: hovered at d=1.37 with hdg=22
         # for 8 s, never recovering). The fwd PD will naturally produce
         # a backward command when d<target, pushing the drone out.
-        floor_active = d < cfg.distance_floor_factor * cfg.target_distance_m
+        with self.state.lock:
+            tgt_d = self.state.target_distance_m
+        floor_active = d < cfg.distance_floor_factor * tgt_d
 
         # ALIGN target: heading=0, distance=d_align_start.
         d_set = self.state.align_distance_m or d
@@ -968,11 +1005,13 @@ class MissionController:
         # d<target) pushes the drone out. Previously we zeroed all
         # channels on floor entry, which froze the drone in place
         # (flight 22-09-49: stuck at d=1.37, hdg=22 with rc=0,0,0,0).
-        floor_active = d < cfg.distance_floor_factor * cfg.target_distance_m
+        with self.state.lock:
+            tgt_d = self.state.target_distance_m
+        floor_active = d < cfg.distance_floor_factor * tgt_d
 
         # Errors
         e_yaw = yaw_to_marker                  # want yaw_to_marker -> 0
-        e_fwd = d - cfg.target_distance_m      # positive: too far -> move forward
+        e_fwd = d - tgt_d                      # positive: too far -> move forward
         # Hold relative_heading at 0 during approach. ALIGN may exit while
         # the drone still has residual lateral velocity (the deadband is
         # met but the drone hasn't fully stopped). Without an active
@@ -1072,9 +1111,10 @@ class MissionController:
         # again" instead of "drone landed").
         with self.state.lock:
             began = self.state.hold_began_at
-        if began is not None and (now - began) >= cfg.hold_time_s:
+            hold_time_s = self.state.hold_time_s
+        if began is not None and (now - began) >= hold_time_s:
             self._send_rc(0, 0, 0, 0)
-            self._advance_script(f"hold of {cfg.hold_time_s:.0f}s complete")
+            self._advance_script(f"hold of {hold_time_s:.0f}s complete")
             return
 
         meas = self.smoother.get(now)
@@ -1087,14 +1127,17 @@ class MissionController:
 
         # Hard distance floor: prevent forward push only; yaw and lateral
         # keep running so HOLD can still recenter while pushed inside the floor.
-        floor_active = d < cfg.distance_floor_factor * cfg.target_distance_m
+        with self.state.lock:
+            tgt_d = self.state.target_distance_m
+            tgt_h = self.state.target_relative_heading_deg
+        floor_active = d < cfg.distance_floor_factor * tgt_d
 
         # Station-keeping PD: yaw / distance / heading are all actively
         # corrected so wind, rotor wash and sensor drift don't push the
         # drone off station during the timed hover.
         e_yaw = yaw_to_marker
-        e_fwd = d - cfg.target_distance_m
-        e_hdg = ((cfg.target_relative_heading_deg - hdg) + 540.0) % 360.0 - 180.0
+        e_fwd = d - tgt_d
+        e_hdg = ((tgt_h - hdg) + 540.0) % 360.0 - 180.0
         u_yaw = 0.0 if abs(e_yaw) < cfg.yaw_deadband_deg else self.pd_yaw.step(e_yaw, now)
         u_fwd_raw = 0.0 if abs(e_fwd) < cfg.distance_deadband_m else self.pd_fwd.step(e_fwd, now)
         u_fwd = self._velocity_damp_fwd(u_fwd_raw, tel)
@@ -1368,28 +1411,27 @@ class MissionController:
                 self._abort(f"takeoff API error: {e}")
             return
         if step.kind == "APPROACH":
-            cfg.target_marker_id = int(step.marker_id)
-            cfg.target_distance_m = float(step.distance)
-            cfg.target_relative_heading_deg = 0.0
+            # Per-step runtime targets live in MissionState. cfg.target_*
+            # stays untouched so it remains the authoritative source of
+            # parse-time defaults (defaults_from_cfg) and the user's
+            # tune-page values. Phases read from state.target_*.
             with self.state.lock:
-                self.state.target_distance_m = cfg.target_distance_m
-                self.state.target_relative_heading_deg = (
-                    cfg.target_relative_heading_deg)
-            # Resync PD gains -- not strictly necessary since the
-            # numeric targets used here are read off cfg each tick,
-            # but keep the call so any future cfg-derived state in
-            # apply_config_changes stays consistent.
-            try: self.apply_config_changes()
-            except Exception: pass
+                self.state.active_marker_id = int(step.marker_id)
+                self.state.target_distance_m = float(step.distance)
+                # APPROACH always closes head-on so the marker stays
+                # inside the detector's reliable angle range. HOLD
+                # inherits this 0 setpoint via state.target_relative_heading_deg.
+                self.state.target_relative_heading_deg = 0.0
             self._set_phase(Phase.SEARCH,
-                            note + f" id={cfg.target_marker_id}"
-                                   f" d={cfg.target_distance_m:g}m")
+                            note + f" id={int(step.marker_id)}"
+                                   f" d={float(step.distance):g}m")
             return
         if step.kind == "HOOVER":
             with self.state.lock:
                 last = self.state.last_completed_step_kind
             if last == "APPROACH":
-                cfg.hold_time_s = float(step.seconds)
+                with self.state.lock:
+                    self.state.hold_time_s = float(step.seconds)
                 self._set_phase(Phase.HOLD,
                                 note + f" station-keep {step.seconds:g}s")
             else:
@@ -1540,11 +1582,14 @@ class MissionController:
         # Hard distance floor: same as in flight phases -- only clamp the
         # forward channel to <=0; yaw / lateral PDs keep running so the
         # operator can verify them with the marker held inside the floor.
-        floor_active = d < cfg.distance_floor_factor * cfg.target_distance_m
+        with self.state.lock:
+            tgt_d = self.state.target_distance_m
+            tgt_h = self.state.target_relative_heading_deg
+        floor_active = d < cfg.distance_floor_factor * tgt_d
 
         e_yaw = yaw_to_marker
-        e_fwd = d - cfg.target_distance_m
-        e_hdg = ((cfg.target_relative_heading_deg - hdg) + 540.0) % 360.0 - 180.0
+        e_fwd = d - tgt_d
+        e_hdg = ((tgt_h - hdg) + 540.0) % 360.0 - 180.0
 
         u_yaw = 0.0 if abs(e_yaw) < cfg.yaw_deadband_deg else self.pd_yaw.step(e_yaw, now)
         u_fwd_raw = 0.0 if abs(e_fwd) < cfg.distance_deadband_m else self.pd_fwd.step(e_fwd, now)

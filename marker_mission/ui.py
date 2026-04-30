@@ -181,6 +181,11 @@ _VIDEO_AND_STATUS_HTML = """
                        Menlo, Consolas, monospace;
                        font-size:.85rem; line-height:1.35; resize:vertical;"
                 ></textarea>
+      <div id="script-runtime"
+           style="display:none; background:#0c0f12; border:1px solid #2a3038;
+                  border-radius:6px; padding:.4rem; font-family:ui-monospace,
+                  SFMono-Regular, Menlo, Consolas, monospace;
+                  font-size:.85rem; line-height:1.35;"></div>
       <div id="script-err" style="font-size:.8rem; color:var(--bad);
                                   min-height:1.1rem; margin-top:.25rem;"></div>
       <div id="script-save-status" style="font-size:.75rem; color:#778;"></div>
@@ -234,6 +239,7 @@ _VIDEO_AND_STATUS_HTML = """
       <tr><th>Battery</th><td id="s-bat">—</td></tr>
       <tr><th>Drone yaw</th><td id="s-dy">—</td></tr>
       <tr><th>Height</th><td id="s-ht">—</td></tr>
+      <tr><th>Target height</th><td id="s-ht-tgt">—</td></tr>
       <tr><th>Flying</th><td id="s-fl">—</td></tr>
       <tr><th>Note</th><td id="s-note">—</td></tr>
     </table>
@@ -516,7 +522,47 @@ async function stopMission() {
     stopRequested = false;
   }
 }
+function updateScriptRuntime(s) {
+  const ta = $('script-text');
+  const rt = $('script-runtime');
+  if (!ta || !rt) return;
+  const lines = Array.isArray(s.mission_script) ? s.mission_script : [];
+  if (!lines.length) {
+    // No script installed -- show editor (unless terminal phase).
+    rt.style.display = 'none';
+    ta.style.display = '';
+    return;
+  }
+  const idx = (typeof s.mission_step_idx === 'number') ? s.mission_step_idx : -1;
+  ta.style.display = 'none';
+  rt.style.display = '';
+  rt.innerHTML = lines.map((line, i) => {
+    let css, marker;
+    if (i < idx) {
+      css = 'color:#6b7280; padding:.2rem .55rem; '
+          + 'border-left:3px solid transparent;';
+      marker = '✓';   // check
+    } else if (i === idx) {
+      css = 'color:#e6e6e6; padding:.25rem .55rem; '
+          + 'background:rgba(74, 222, 128, 0.18); '
+          + 'border-left:3px solid var(--good); font-weight:600;';
+      marker = '▶';   // play
+    } else {
+      css = 'color:#aab; padding:.2rem .55rem; '
+          + 'border-left:3px solid transparent;';
+      marker = '·';   // dot
+    }
+    const safe = line.replace(/&/g,'&amp;').replace(/</g,'&lt;')
+                     .replace(/>/g,'&gt;');
+    const num = String(i + 1).padStart(2, ' ');
+    return `<div style="${css}">`
+         + `<span style="display:inline-block; width:1.4em;">${marker}</span>`
+         + `<span style="color:#778; margin-right:.5rem;">${num}.</span>`
+         + `${safe}</div>`;
+  }).join('');
+}
 function updateStatus(s) {
+  updateScriptRuntime(s);
   if (!$('s-phase')) return;
   $('s-phase').innerHTML = '<span class="pill">'+s.phase+'</span>';
   $('s-pa').textContent = fmt(s.phase_age_s, 's', 1);
@@ -531,7 +577,11 @@ function updateStatus(s) {
   const t = s.telemetry || {};
   $('s-bat').textContent = (t.battery !== undefined && t.battery !== null) ? (t.battery + '%') : '—';
   $('s-dy').textContent  = fmt(t.yaw, '°', 1);
-  $('s-ht').textContent  = (t.height_cm !== undefined && t.height_cm !== null) ? (t.height_cm + ' cm') : '—';
+  $('s-ht').textContent  = (t.height_cm !== undefined && t.height_cm !== null) ? ((t.height_cm/100).toFixed(2) + ' m') : '—';
+  if ($('s-ht-tgt')) {
+    $('s-ht-tgt').textContent = (s.height_target_m !== undefined && s.height_target_m !== null)
+      ? (s.height_target_m.toFixed(2) + ' m') : '—';
+  }
   $('s-fl').textContent  = t.flying ? 'yes' : 'no';
   $('s-note').textContent = s.note || (s.abort_reason || '—');
   setMissionButtons(s.phase);

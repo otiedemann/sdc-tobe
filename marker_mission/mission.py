@@ -353,10 +353,19 @@ def cmd_fly(args: argparse.Namespace) -> int:
                 # all in the video overlay -- the script can target any
                 # marker, and even non-target markers in frame are
                 # useful situational context. The controller still gets
-                # only the configured target via pose_holder.
+                # only the active target via pose_holder.
                 poses = detector.detect(frame, wanted_id=None)
+                # state.active_marker_id is the runtime target -- a
+                # script's APPROACH step can change it without
+                # polluting cfg.target_marker_id. Fall back to cfg if
+                # state hasn't been seeded yet (shouldn't happen --
+                # MissionController.__init__ seeds it).
+                with state.lock:
+                    active_mid = state.active_marker_id
+                if active_mid is None:
+                    active_mid = cfg.target_marker_id
                 target = next((p for p in poses
-                               if p.marker_id == cfg.target_marker_id), None)
+                               if p.marker_id == active_mid), None)
                 pose_holder.set(target)
                 # Status overlay -------------------------------------------
                 # Use the smoothed values from state.snapshot() so the
@@ -370,7 +379,7 @@ def cmd_fly(args: argparse.Namespace) -> int:
                 snap = state.snapshot()
                 lines = [
                     f"phase: {snap['phase']}",
-                    f"target id={cfg.target_marker_id}  "
+                    f"target id={active_mid}  "
                     f"size={cfg.marker_size_m*100:.0f}cm",
                 ]
                 d_s = snap.get("distance_m")
@@ -383,7 +392,7 @@ def cmd_fly(args: argparse.Namespace) -> int:
                 else:
                     lines.append("marker: NOT VISIBLE")
                 ann = annotate_frame(frame, poses,
-                                     target_id=cfg.target_marker_id,
+                                     target_id=active_mid,
                                      extra_lines=lines)
                 latest_ann_frame.set(ann)
                 # Record both raw and annotated ----------------------------
