@@ -1,0 +1,19 @@
+{
+  "_comment": "SDC26 target box placements for the Sphinx arena. Six boxes total: 3 blue (IDs 31-33) start in the blue home zone, 3 red (IDs 41-43) start in the red home zone. The remaining valid SDC26 IDs (34-36, 44-46) are listed but disabled by default — they're the spares used during a match if a box is moved or a fresh sticker is needed. Coordinates match the arena_config.json convention: x ∈ [-10, 10] m, y ∈ [0, 10.8] m, z = box top height in m.",
+  "marker_size_m": 0.19,
+  "box_size_m": 0.5,
+  "boxes": [
+    {"id": 31, "team": "blue", "label": "Blue home A", "x": -6.0, "y": 2.0, "z": 0.5, "yaw_deg": 0.0, "enabled": true},
+    {"id": 32, "team": "blue", "label": "Blue home B", "x": -6.0, "y": 5.4, "z": 0.5, "yaw_deg": 0.0, "enabled": true},
+    {"id": 33, "team": "blue", "label": "Blue home C", "x": -6.0, "y": 8.8, "z": 0.5, "yaw_deg": 0.0, "enabled": true},
+    {"id": 41, "team": "red",  "label": "Red home A",  "x":  6.0, "y": 2.0, "z": 0.5, "yaw_deg": 0.0, "enabled": true},
+    {"id": 42, "team": "red",  "label": "Red home B",  "x":  6.0, "y": 5.4, "z": 0.5, "yaw_deg": 0.0, "enabled": true},
+    {"id": 43, "team": "red",  "label": "Red home C",  "x":  6.0, "y": 8.8, "z": 0.5, "yaw_deg": 0.0, "enabled": true},
+    {"id": 34, "team": "blue", "label": "Blue spare 1", "x": 0.0, "y": 0.0, "z": 0.5, "yaw_deg": 0.0, "enabled": false},
+    {"id": 35, "team": "blue", "label": "Blue spare 2", "x": 0.0, "y": 0.0, "z": 0.5, "yaw_deg": 0.0, "enabled": false},
+    {"id": 36, "team": "blue", "label": "Blue spare 3", "x": 0.0, "y": 0.0, "z": 0.5, "yaw_deg": 0.0, "enabled": false},
+    {"id": 44, "team": "red",  "label": "Red spare 1",  "x": 0.0, "y": 0.0, "z": 0.5, "yaw_deg": 0.0, "enabled": false},
+    {"id": 45, "team": "red",  "label": "Red spare 2",  "x": 0.0, "y": 0.0, "z": 0.5, "yaw_deg": 0.0, "enabled": false},
+    {"id": 46, "team": "red",  "label": "Red spare 3",  "x": 0.0, "y": 0.0, "z": 0.5, "yaw_deg": 0.0, "enabled": false}
+  ]
+}

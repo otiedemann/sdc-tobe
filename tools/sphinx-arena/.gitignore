@@ -1,0 +1,4 @@
+# Generated artifacts — never commit these. Re-run `make all` to rebuild.
+out/
+*.pyc
+__pycache__/

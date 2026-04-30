@@ -1,0 +1,5 @@
+# Path A pipeline requirements (PNG + YAML emitter).
+# Blender is NOT pip-installable — install it from your distro
+# (apt install blender) or download from blender.org.
+opencv-python>=4.8
+numpy>=1.24
