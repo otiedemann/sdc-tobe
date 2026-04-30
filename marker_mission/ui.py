@@ -565,13 +565,18 @@ function updateStatus(s) {
   updateScriptRuntime(s);
   if (!$('s-phase')) return;
   $('s-phase').innerHTML = '<span class="pill">'+s.phase+'</span>';
-  $('s-pa').textContent = fmt(s.phase_age_s, 's', 1);
+  // Phase age and marker-last-seen are only meaningful while the
+  // drone is airborne. On the ground (init / done / abort) they
+  // either count up forever (phase age in INIT) or freeze on a stale
+  // value (marker last seen), so blank them out.
+  const inFlight = STOPPABLE_PHASES.has(s.phase);
+  $('s-pa').textContent = inFlight ? fmt(s.phase_age_s, 's', 1) : '—';
   $('s-d').textContent  = fmt(s.distance_m, 'm', 2);
   $('s-y').textContent  = fmt(s.yaw_to_marker_deg, '°', 1);
   $('s-h').textContent  = fmt(s.relative_heading_deg, '°', 1);
   $('s-td').textContent = fmt(s.target_distance_m, 'm', 2);
   $('s-th').textContent = fmt(s.target_relative_heading_deg, '°', 1);
-  $('s-ms').textContent = fmt(s.marker_seen_age_s, 's ago', 2);
+  $('s-ms').textContent = inFlight ? fmt(s.marker_seen_age_s, 's ago', 2) : '—';
   const rc = s.rc || {};
   $('s-rc').textContent = `${rc.lr ?? 0}, ${rc.fb ?? 0}, ${rc.ud ?? 0}, ${rc.yaw ?? 0}`;
   const t = s.telemetry || {};
