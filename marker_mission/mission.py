@@ -49,8 +49,9 @@ from .aruco_detector import ArucoDetector, MarkerPose, annotate_frame
 from .calibration_store import (Calibration, CalibrationStore,
                                 calibrate_from_video)
 from .config import (CALIB_DIR, FLIGHTS_DIR, DEFAULT_DATA_DIR,
-                     MissionConfig)
+                     PER_FLIGHT_SCRIPT_FILENAME, MissionConfig)
 from .controller import MissionController, MissionState, Phase
+from . import mission_script as ms
 from .drone_api import DroneApi, MjpegStreamReader, TelemetrySnapshot
 from .recorder import FlightRecorder, make_flight_dir, write_meta
 from .ui import LatestFrame, UiServer
@@ -201,6 +202,7 @@ def cmd_fly(args: argparse.Namespace) -> int:
 
     AIRBORNE_PHASES = {Phase.TAKEOFF, Phase.SEARCH, Phase.ALIGN,
                        Phase.HEIGHT_ALIGN, Phase.APPROACH, Phase.HOLD,
+                       Phase.IDLE, Phase.HEIGHT, Phase.DANCE,
                        Phase.LAND}
 
     def on_phase_change(old_phase, new_phase, note):
@@ -217,6 +219,18 @@ def cmd_fly(args: argparse.Namespace) -> int:
                 cfg.save(new_dir / "cfg_start.json")
             except Exception as e:
                 print(f"[mission] cfg_start.json save failed: {e}")
+            # Per-flight copy of the executing mission script. Rendered
+            # from the controller's installed step list so what we save
+            # matches what the drone actually walks (post-default-fill,
+            # post-canonicalisation), not the raw textarea contents.
+            try:
+                with state.lock:
+                    steps = list(state.mission_script)
+                if steps:
+                    (new_dir / PER_FLIGHT_SCRIPT_FILENAME).write_text(
+                        ms.format(steps) + "\n")
+            except Exception as e:
+                print(f"[mission] mission_script.txt save failed: {e}")
 
         # Recording envelope.
         if new_phase in AIRBORNE_PHASES:
@@ -335,8 +349,14 @@ def cmd_fly(args: argparse.Namespace) -> int:
             last_seen_ts = ts
             last_expired = False
             try:
-                poses = detector.detect(frame, wanted_id=cfg.target_marker_id)
-                target = poses[0] if poses else None
+                # Detect every visible marker so the operator sees them
+                # all in the video overlay -- the script can target any
+                # marker, and even non-target markers in frame are
+                # useful situational context. The controller still gets
+                # only the configured target via pose_holder.
+                poses = detector.detect(frame, wanted_id=None)
+                target = next((p for p in poses
+                               if p.marker_id == cfg.target_marker_id), None)
                 pose_holder.set(target)
                 # Status overlay -------------------------------------------
                 # Use the smoothed values from state.snapshot() so the

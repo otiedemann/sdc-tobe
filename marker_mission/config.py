@@ -29,6 +29,9 @@ DEFAULT_DATA_DIR = Path(os.environ.get("MM_DATA_DIR",
 CALIB_DIR = DEFAULT_DATA_DIR / "calibrations"
 FLIGHTS_DIR = DEFAULT_DATA_DIR / "flights"
 SNAPSHOTS_DIR = DEFAULT_DATA_DIR / "snapshots"
+MISSION_SCRIPTS_DIR = DEFAULT_DATA_DIR / "mission_scripts"
+ACTIVE_MISSION_SCRIPT_PATH = DEFAULT_DATA_DIR / "active_mission_script.txt"
+PER_FLIGHT_SCRIPT_FILENAME = "mission_script.txt"
 
 
 # ---------------------------------------------------------------------------
@@ -132,6 +135,12 @@ class MissionConfig:
     height_kd: float = 10.0                # TUNE  RC counts per (m/s)
     height_deadband_m: float = 0.10        # TUNE
     height_settle_time_s: float = 1.0      # TUNE  before HEIGHT_ALIGN -> ALIGN
+
+    # --- Mission script -----------------------------------------------------
+    # Defaults filled in when a script step omits its argument.
+    default_dance_seconds_s: float = 5.0   # TUNE  DANCE step default duration
+    dance_radius_m: float = 0.5            # TUNE  bound dance excursion within
+                                            #       this radius of dance origin
 
     # --- Search behaviour ----------------------------------------------------
     # When the marker is not visible, we yaw in place looking for it. After
@@ -359,6 +368,14 @@ TUNING_FIELDS = {
         "label": "HEIGHT_ALIGN settle time", "kind": "float", "unit": "s", "step": 0.1,
         "desc": "How long height + yaw must both stay inside their deadbands before HEIGHT_ALIGN transitions to ALIGN.",
     },
+    "default_dance_seconds_s": {
+        "label": "DANCE default duration", "kind": "float", "unit": "s", "step": 0.5,
+        "desc": "Default seconds for a DANCE step in the mission script when the operator omits the argument.",
+    },
+    "dance_radius_m": {
+        "label": "DANCE radius bound", "kind": "float", "unit": "m", "step": 0.1,
+        "desc": "DANCE position-bounded routine. If the drone drifts more than this distance from its dance-entry position, the offending RC channel is zeroed and an inward correction is applied. Same bound applies vertically.",
+    },
 
     "yaw_deadband_deg": {
         "label": "yaw deadband", "kind": "float", "unit": "deg", "step": 0.1,
@@ -429,6 +446,8 @@ TUNING_GROUPS = [
         ["default_height_m", "min_height_m", "max_height_m",
          "height_kp", "height_kd", "height_deadband_m",
          "height_settle_time_s", "ud_rc_max"]),
+    ("Mission script defaults",
+        ["default_dance_seconds_s", "dance_radius_m"]),
     ("Deadbands",
         ["yaw_deadband_deg", "distance_deadband_m",
          "heading_deadband_deg", "approach_heading_deadband_deg",

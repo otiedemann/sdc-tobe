@@ -411,14 +411,28 @@ def annotate_frame(frame_bgr: np.ndarray,
         cv2.polylines(out, [pts.reshape(-1, 1, 2)], True, col, 2)
         cx, cy = pts.mean(axis=0).astype(int)
         cv2.circle(out, (int(cx), int(cy)), 4, col, -1)
-        # Keep the per-marker label tiny: just the ID. Pose values live in the
-        # top-left HUD so we avoid drawing them twice (and avoid overlapping
-        # the marker itself when it's small in the frame).
-        cv2.putText(out, f"id={p.marker_id}", (int(cx) + 8, int(cy) - 8),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, col, 1, cv2.LINE_AA)
+        # Per-marker label: id + raw pose values (distance / yaw_to_marker /
+        # relative_heading). Drawn with a black outline + coloured fill so
+        # it stays legible against varied backgrounds. The top-left HUD
+        # shows the smoothed values for the target only; per-marker raw
+        # values let the operator spot non-target markers and judge their
+        # geometry at a glance.
+        lines = [
+            f"id={p.marker_id}",
+            f"d={p.distance_m:.2f}m  y={p.yaw_deg:+.1f}deg",
+            f"h={p.relative_heading_deg:+.1f}deg",
+        ]
+        ox = int(cx) + 8
+        oy = int(cy) - 8
+        for i, line in enumerate(lines):
+            y = oy + i * 14
+            cv2.putText(out, line, (ox, y), cv2.FONT_HERSHEY_SIMPLEX,
+                        0.42, (0, 0, 0), 2, cv2.LINE_AA)
+            cv2.putText(out, line, (ox, y), cv2.FONT_HERSHEY_SIMPLEX,
+                        0.42, col, 1, cv2.LINE_AA)
     # Optional extra status lines in the top-left corner.
+    y = 22
     if extra_lines:
-        y = 22
         for line in extra_lines:
             cv2.putText(out, line, (10, y),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 2,
@@ -427,4 +441,32 @@ def annotate_frame(frame_bgr: np.ndarray,
                         cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 0), 1,
                         cv2.LINE_AA)
             y += 22
+    # Per-marker list in the top-left, colour-coded the same way the
+    # marker outlines are (green = target, grey = other). Sorted with
+    # the target first so the operator's eye lands on it. Skipped when
+    # nothing is visible.
+    if poses:
+        # spacer line
+        y += 4
+        cv2.putText(out, "Markers seen:", (10, y),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 2,
+                    cv2.LINE_AA)
+        cv2.putText(out, "Markers seen:", (10, y),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 0, 0), 1,
+                    cv2.LINE_AA)
+        y += 18
+        ordered = sorted(poses, key=lambda p: (
+            0 if (target_id is not None and p.marker_id == target_id) else 1,
+            p.marker_id))
+        for p in ordered:
+            is_target = (target_id is not None and p.marker_id == target_id)
+            col = (0, 220, 0) if is_target else (140, 140, 140)
+            line = (f"id={p.marker_id:>3}  d={p.distance_m:.2f}m  "
+                    f"y={p.yaw_deg:+6.1f}deg  "
+                    f"h={p.relative_heading_deg:+6.1f}deg")
+            cv2.putText(out, line, (10, y), cv2.FONT_HERSHEY_SIMPLEX,
+                        0.45, (0, 0, 0), 2, cv2.LINE_AA)
+            cv2.putText(out, line, (10, y), cv2.FONT_HERSHEY_SIMPLEX,
+                        0.45, col, 1, cv2.LINE_AA)
+            y += 17
     return out

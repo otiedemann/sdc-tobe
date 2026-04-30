@@ -171,6 +171,20 @@ _VIDEO_AND_STATUS_HTML = """
     </div>
     {% else %}
     <h2>Mission control</h2>
+    <div id="script-row" style="margin-bottom:.5rem;">
+      <textarea id="script-text" rows="8" spellcheck="false"
+                placeholder="TAKEOFF&#10;APPROACH 4 1.0&#10;HOOVER 3&#10;LAND"
+                style="width:100%; box-sizing:border-box;
+                       background:#0c0f12; color:var(--fg);
+                       border:1px solid #2a3038; border-radius:6px;
+                       padding:.5rem; font-family:ui-monospace, SFMono-Regular,
+                       Menlo, Consolas, monospace;
+                       font-size:.85rem; line-height:1.35; resize:vertical;"
+                ></textarea>
+      <div id="script-err" style="font-size:.8rem; color:var(--bad);
+                                  min-height:1.1rem; margin-top:.25rem;"></div>
+      <div id="script-save-status" style="font-size:.75rem; color:#778;"></div>
+    </div>
     <div id="ctrl-row" style="display:flex; align-items:center; gap:.75rem; margin-bottom:.75rem;">
       <button id="btn-start" type="button"
               style="padding:.55rem 1rem; border:0; border-radius:6px;
@@ -186,6 +200,25 @@ _VIDEO_AND_STATUS_HTML = """
       </button>
       <span id="ctrl-msg" style="font-size:.85rem; color:#aab;">—</span>
     </div>
+    <details id="script-saves-card"
+             style="margin-top:.5rem; border-top:1px solid #2a3038; padding-top:.5rem;">
+      <summary style="cursor:pointer; font-size:.85rem; color:#aab;">
+        Saved scripts
+      </summary>
+      <div style="display:flex; gap:.4rem; align-items:center; margin:.5rem 0;">
+        <input id="script-save-name" type="text" placeholder="name"
+               style="flex:1; padding:.35rem .5rem; background:#0c0f12;
+                      color:var(--fg); border:1px solid #2a3038; border-radius:5px;
+                      font-size:.85rem;">
+        <button id="btn-script-save" type="button"
+                style="padding:.35rem .7rem; border:0; border-radius:5px;
+                       background:var(--accent); color:#062633; font-weight:600;
+                       cursor:pointer; font-size:.85rem;">
+          Save script
+        </button>
+      </div>
+      <div id="script-list" style="font-size:.85rem;"></div>
+    </details>
     {% endif %}
     <h2>{{ 'Replayed flight' if mode == 'replay' else 'Mission status' }}</h2>
     <table id="status">
@@ -239,8 +272,16 @@ function fmt(v, unit, prec) {
 
 // ---- Status panel (only runs if its DOM elements are present) -----------
 const TERMINAL_PHASES = new Set(['done', 'abort']);
-const STOPPABLE_PHASES = new Set(['takeoff','search','align','height_align','approach','hold','land']);
+const STOPPABLE_PHASES = new Set(['takeoff','search','align','height_align',
+                                   'approach','hold','idle','height','dance',
+                                   'land']);
 let stopRequested = false;
+function setScriptLocked(locked) {
+  const ta = $('script-text');
+  if (!ta) return;
+  ta.readOnly = !!locked;
+  ta.style.opacity = locked ? '0.55' : '1';
+}
 function setMissionButtons(phase) {
   const start = $('btn-start'); const stop = $('btn-stop'); const msg = $('ctrl-msg');
   if (!start || !stop) return;
@@ -252,6 +293,7 @@ function setMissionButtons(phase) {
     start.disabled = true; start.style.opacity = '0.5'; start.style.cursor = 'not-allowed';
     start.textContent = 'Start mission';
     msg.textContent = 'No drone connected — open the Replay tab to view flights.';
+    setScriptLocked(true);
     return;
   }
   if (phase === 'init') {
@@ -260,9 +302,11 @@ function setMissionButtons(phase) {
     start.textContent = 'Start mission';
     msg.textContent = 'Ready. Press to arm + take off.';
     stopRequested = false;
+    setScriptLocked(false);
   } else if (TERMINAL_PHASES.has(phase)) {
     start.style.display = 'none'; stop.style.display = 'none';
     msg.textContent = 'Mission ' + phase + '.';
+    setScriptLocked(true);
   } else if (STOPPABLE_PHASES.has(phase)) {
     start.style.display = 'none'; stop.style.display = '';
     if (stopRequested) {
@@ -274,19 +318,186 @@ function setMissionButtons(phase) {
       stop.textContent = 'Stop & land';
       msg.textContent = 'Phase: ' + phase;
     }
+    setScriptLocked(true);
   } else {
     start.style.display = 'none'; stop.style.display = 'none';
     msg.textContent = 'Phase: ' + phase;
+    setScriptLocked(true);
   }
 }
 async function startMission() {
   const btn = $('btn-start'); const msg = $('ctrl-msg');
+  const ta = $('script-text');
+  // Flush any pending autosave by sending the current text in the
+  // start request. Server parses + installs + triggers atomically;
+  // a parse error returns ok=false with a line-numbered message.
   btn.disabled = true; msg.textContent = 'Starting…';
+  setScriptError('');
   try {
-    const r = await fetch('/api/start', {method:'POST'});
+    const body = ta ? JSON.stringify({script: ta.value}) : '{}';
+    const r = await fetch('/api/start',
+                          {method:'POST',
+                           headers:{'Content-Type':'application/json'},
+                           body: body});
     const j = await r.json();
-    if (!j.ok) { msg.textContent = 'Could not start: ' + (j.error || 'unknown'); btn.disabled = false; }
+    if (!j.ok) {
+      msg.textContent = 'Could not start: ' + (j.error || 'unknown');
+      btn.disabled = false;
+      if (j.script_error) setScriptError(j.script_error);
+    }
   } catch (e) { msg.textContent = 'Request failed: ' + e; btn.disabled = false; }
+}
+
+// ---- Mission-script textarea & saved-scripts list -----------------------
+function setScriptError(s) {
+  const el = $('script-err'); if (el) el.textContent = s || '';
+}
+function setScriptSaveStatus(s) {
+  const el = $('script-save-status'); if (el) el.textContent = s || '';
+}
+let scriptSaveTimer = null;
+let scriptLastSaved = null;
+async function flushScriptDraft() {
+  const ta = $('script-text'); if (!ta) return;
+  const txt = ta.value;
+  if (txt === scriptLastSaved) return;
+  try {
+    const r = await fetch('/api/mission/script',
+                          {method:'POST',
+                           headers:{'Content-Type':'application/json'},
+                           body: JSON.stringify({text: txt})});
+    if (r.ok) {
+      scriptLastSaved = txt;
+      setScriptSaveStatus('Saved.');
+    } else {
+      setScriptSaveStatus('Save failed: HTTP ' + r.status);
+    }
+  } catch (e) { setScriptSaveStatus('Save failed: ' + e); }
+}
+function scheduleScriptSave() {
+  if (scriptSaveTimer) clearTimeout(scriptSaveTimer);
+  scriptSaveTimer = setTimeout(flushScriptDraft, 250);
+}
+async function loadInitialScript() {
+  const ta = $('script-text'); if (!ta) return;
+  try {
+    const r = await fetch('/api/mission/script', {cache:'no-store'});
+    const j = await r.json();
+    if (typeof j.text === 'string') {
+      ta.value = j.text;
+      scriptLastSaved = j.text;
+    }
+  } catch (e) {}
+}
+async function refreshScriptList() {
+  const list = $('script-list'); if (!list) return;
+  try {
+    const r = await fetch('/api/mission/scripts', {cache:'no-store'});
+    const j = await r.json();
+    if (!j.scripts || !j.scripts.length) {
+      list.innerHTML = '<div style="color:#778;">No saved scripts.</div>';
+      return;
+    }
+    const fmtTime = mt => new Date(mt*1000).toLocaleString();
+    list.innerHTML = j.scripts.map(s => {
+      const safe = s.name.replace(/"/g, '&quot;');
+      return `
+        <div style="display:flex; gap:.4rem; align-items:center;
+                    padding:.25rem 0; border-top:1px solid #2a3038;">
+          <span style="flex:1; font-family:ui-monospace, monospace;">${safe}</span>
+          <span style="color:#778; font-size:.75rem;">${fmtTime(s.mtime)}</span>
+          <button class="script-load" data-name="${safe}"
+                  style="padding:.2rem .5rem; border:0; border-radius:4px;
+                         background:var(--accent); color:#062633;
+                         font-weight:600; cursor:pointer; font-size:.75rem;">Load</button>
+          <button class="script-overwrite" data-name="${safe}"
+                  style="padding:.2rem .5rem; border:0; border-radius:4px;
+                         background:#facc15; color:#241a07;
+                         font-weight:600; cursor:pointer; font-size:.75rem;">Overwrite</button>
+          <button class="script-delete" data-name="${safe}"
+                  style="padding:.2rem .5rem; border:0; border-radius:4px;
+                         background:var(--bad); color:#240707;
+                         font-weight:600; cursor:pointer; font-size:.75rem;">Delete</button>
+        </div>`;
+    }).join('');
+    list.querySelectorAll('.script-load').forEach(b => {
+      b.addEventListener('click', () => loadScript(b.dataset.name));
+    });
+    list.querySelectorAll('.script-overwrite').forEach(b => {
+      b.addEventListener('click', () => saveScript(b.dataset.name, true));
+    });
+    list.querySelectorAll('.script-delete').forEach(b => {
+      b.addEventListener('click', () => deleteScript(b.dataset.name));
+    });
+  } catch (e) {
+    list.innerHTML = '<div style="color:var(--bad);">Failed to load list.</div>';
+  }
+}
+async function saveScript(name, overwrite) {
+  const ta = $('script-text'); if (!ta) return;
+  if (!name) {
+    setScriptSaveStatus('Enter a name first.'); return;
+  }
+  try {
+    const r = await fetch(
+      '/api/mission/scripts/' + encodeURIComponent(name),
+      {method:'POST',
+       headers:{'Content-Type':'application/json'},
+       body: JSON.stringify({text: ta.value})});
+    const j = await r.json();
+    if (j.ok) {
+      setScriptSaveStatus((overwrite ? 'Overwrote ' : 'Saved ') + name + '.');
+      refreshScriptList();
+    } else {
+      setScriptSaveStatus('Save failed: ' + (j.error || 'unknown'));
+    }
+  } catch (e) { setScriptSaveStatus('Save failed: ' + e); }
+}
+async function loadScript(name) {
+  const ta = $('script-text'); if (!ta) return;
+  try {
+    const r = await fetch(
+      '/api/mission/scripts/' + encodeURIComponent(name) + '/load',
+      {method:'POST'});
+    const j = await r.json();
+    if (j.ok && typeof j.text === 'string') {
+      ta.value = j.text;
+      setScriptError('');
+      setScriptSaveStatus('Loaded ' + name + '.');
+      // Persist as the active draft so a refresh keeps it.
+      flushScriptDraft();
+    } else {
+      setScriptSaveStatus('Load failed: ' + (j.error || 'unknown'));
+    }
+  } catch (e) { setScriptSaveStatus('Load failed: ' + e); }
+}
+async function deleteScript(name) {
+  try {
+    const r = await fetch(
+      '/api/mission/scripts/' + encodeURIComponent(name),
+      {method:'DELETE'});
+    const j = await r.json();
+    if (j.ok) {
+      setScriptSaveStatus('Deleted ' + name + '.');
+      refreshScriptList();
+    } else {
+      setScriptSaveStatus('Delete failed: ' + (j.error || 'unknown'));
+    }
+  } catch (e) { setScriptSaveStatus('Delete failed: ' + e); }
+}
+if ($('script-text')) {
+  $('script-text').addEventListener('input', () => {
+    setScriptError('');
+    scheduleScriptSave();
+  });
+  loadInitialScript();
+  refreshScriptList();
+}
+if ($('btn-script-save')) {
+  $('btn-script-save').addEventListener('click', () => {
+    const n = $('script-save-name');
+    saveScript(n ? n.value.trim() : '', false);
+  });
 }
 async function stopMission() {
   const btn = $('btn-stop'); const msg = $('ctrl-msg');
@@ -1306,6 +1517,15 @@ class UiServer:
         self._register_routes()
         self._thread: Optional[threading.Thread] = None
 
+    # ----------------------------------------------- active mission-script
+    def _write_active_script(self, text: str) -> None:
+        """Write ``text`` to the active mission-script draft path.
+        Creates the parent directory if needed; raises on IO error.
+        """
+        from .config import ACTIVE_MISSION_SCRIPT_PATH
+        ACTIVE_MISSION_SCRIPT_PATH.parent.mkdir(parents=True, exist_ok=True)
+        ACTIVE_MISSION_SCRIPT_PATH.write_text(text)
+
     # --------------------------------------------------- parameter-change log
     def _log_param_changes(self, before: dict, source: str) -> None:
         """Append one row per actually-changed field to
@@ -1812,6 +2032,27 @@ class UiServer:
             if self.on_start is None:
                 return jsonify({"ok": False,
                                 "error": "no start handler registered"}), 500
+            # Optional script in the body. If present, parse it (with
+            # cfg defaults) and install on the controller before
+            # triggering. Persist as the active draft as well so the
+            # next page-load shows what we actually flew.
+            data = request.get_json(silent=True) or {}
+            script_text = data.get("script") if isinstance(data, dict) else None
+            if script_text is not None and self.controller is not None and self.cfg is not None:
+                from .mission_script import (parse as parse_script,
+                                              defaults_from_cfg, ScriptError)
+                try:
+                    steps = parse_script(script_text,
+                                         defaults_from_cfg(self.cfg))
+                except ScriptError as e:
+                    return jsonify({"ok": False,
+                                    "error": "script parse error",
+                                    "script_error": str(e)}), 400
+                self.controller.set_script(steps)
+                try:
+                    self._write_active_script(script_text)
+                except Exception as e:
+                    print(f"[ui] active draft save failed: {e}")
             try:
                 started = bool(self.on_start())
             except Exception as e:
@@ -1820,6 +2061,94 @@ class UiServer:
                 return jsonify({"ok": False,
                                 "error": "mission already started or not in INIT"}), 409
             return jsonify({"ok": True})
+
+        @app.get("/api/mission/script")
+        def api_mission_script_get():
+            from .mission_script import load_priority_script
+            from .config import ACTIVE_MISSION_SCRIPT_PATH
+            text = load_priority_script(ACTIVE_MISSION_SCRIPT_PATH,
+                                         self.flights_root)
+            return jsonify({"text": text})
+
+        @app.post("/api/mission/script")
+        def api_mission_script_set():
+            data = request.get_json(silent=True) or {}
+            if not isinstance(data, dict) or "text" not in data:
+                return jsonify({"ok": False,
+                                "error": "missing 'text' field"}), 400
+            try:
+                self._write_active_script(str(data["text"]))
+            except Exception as e:
+                return jsonify({"ok": False, "error": str(e)}), 500
+            return jsonify({"ok": True})
+
+        _SCRIPT_NAME_RE = _re.compile(r"^[A-Za-z0-9][A-Za-z0-9_\-\. ]{0,63}$")
+
+        def _script_path(name: str) -> Optional[Path]:
+            if not _SCRIPT_NAME_RE.match(name):
+                return None
+            from .config import MISSION_SCRIPTS_DIR
+            MISSION_SCRIPTS_DIR.mkdir(parents=True, exist_ok=True)
+            return MISSION_SCRIPTS_DIR / f"{name}.txt"
+
+        @app.get("/api/mission/scripts")
+        def api_mission_scripts_list():
+            from .config import MISSION_SCRIPTS_DIR
+            MISSION_SCRIPTS_DIR.mkdir(parents=True, exist_ok=True)
+            items = []
+            for p in MISSION_SCRIPTS_DIR.glob("*.txt"):
+                try:
+                    items.append({
+                        "name":  p.stem,
+                        "mtime": p.stat().st_mtime,
+                        "size":  p.stat().st_size,
+                    })
+                except OSError:
+                    continue
+            items.sort(key=lambda x: -x["mtime"])
+            return jsonify({"scripts": items})
+
+        @app.post("/api/mission/scripts/<name>")
+        def api_mission_script_save(name):
+            data = request.get_json(silent=True) or {}
+            text = data.get("text") if isinstance(data, dict) else None
+            if not isinstance(text, str):
+                return jsonify({"ok": False,
+                                "error": "missing 'text' field"}), 400
+            p = _script_path(name)
+            if p is None:
+                return jsonify({"ok": False,
+                                "error": "invalid name (alphanum, _ - . space, "
+                                         "max 64 chars, can't start with separator)"}), 400
+            try:
+                p.write_text(text)
+                return jsonify({"ok": True, "name": name, "path": str(p)})
+            except Exception as e:
+                return jsonify({"ok": False, "error": str(e)}), 500
+
+        @app.post("/api/mission/scripts/<name>/load")
+        def api_mission_script_load(name):
+            p = _script_path(name)
+            if p is None or not p.exists():
+                return jsonify({"ok": False,
+                                "error": "script not found"}), 404
+            try:
+                return jsonify({"ok": True, "name": name,
+                                "text": p.read_text()})
+            except Exception as e:
+                return jsonify({"ok": False, "error": str(e)}), 500
+
+        @app.delete("/api/mission/scripts/<name>")
+        def api_mission_script_delete(name):
+            p = _script_path(name)
+            if p is None or not p.exists():
+                return jsonify({"ok": False,
+                                "error": "script not found"}), 404
+            try:
+                p.unlink()
+                return jsonify({"ok": True, "name": name})
+            except Exception as e:
+                return jsonify({"ok": False, "error": str(e)}), 500
 
         @app.post("/api/stop")
         def api_stop():

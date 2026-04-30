@@ -44,14 +44,17 @@ from __future__ import annotations
 
 import enum
 import math
+import random as _random
 import threading
 import time
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import List, Optional
 
 from .aruco_detector import MarkerPose
 from .config import MissionConfig
 from .drone_api import DroneApi, DroneApiError, TelemetrySnapshot
+from .mission_script import (HARDCODED_DEFAULT_SCRIPT, ScriptError, Step,
+                              defaults_from_cfg, parse as parse_script)
 
 
 # ---------------------------------------------------------------------------
@@ -66,6 +69,9 @@ class Phase(enum.Enum):
     HEIGHT_ALIGN = "height_align"   # match drone height to marker height
     APPROACH  = "approach"  # close distance to target with heading held near 0
     HOLD      = "hold"      # station-keeping hover for hold_time_s, then LAND
+    IDLE      = "idle"      # mission-script HOOVER w/o prior APPROACH
+    HEIGHT    = "height"    # mission-script HEIGHT step (climb/descend to target)
+    DANCE     = "dance"     # mission-script DANCE step (programmed RC routine)
     LAND      = "land"
     DONE      = "done"
     ABORT     = "abort"
@@ -195,6 +201,56 @@ class PoseSmoother:
 
 
 # ---------------------------------------------------------------------------
+# Dead-reckoning position estimator
+# ---------------------------------------------------------------------------
+#
+# Used by the DANCE script step to bound the routine within a small
+# radius of its entry position. The frame question (NED earth-frame vs
+# body-frame rotated through yaw) was settled empirically by
+# tools/analyze_velocity_frame.py: NED matched the marker-derived
+# ground truth 2.2x to 3.9x better than body+yaw across every flight
+# with > 1 m of motion. So vgx is treated as vN, vgy as vE.
+#
+# This is dead-reckoning only -- expect cm/s of drift per second of
+# flight. Good enough for "stay within half a metre of where the
+# dance started", not for anything tighter.
+
+class PositionEstimator:
+    MAX_DT_S = 1.0   # if we get a sample with > this gap, restart from rest
+
+    def __init__(self):
+        self.x_east_m: float = 0.0
+        self.y_north_m: float = 0.0
+        self._last_t: Optional[float] = None
+        self._has_data: bool = False
+
+    def reset(self) -> None:
+        self.x_east_m = 0.0
+        self.y_north_m = 0.0
+        self._last_t = None
+        self._has_data = False
+
+    def update(self, vgx_cms: Optional[float], vgy_cms: Optional[float],
+               now: float) -> None:
+        if vgx_cms is None or vgy_cms is None:
+            return
+        if self._last_t is None:
+            self._last_t = now
+            return
+        dt = now - self._last_t
+        self._last_t = now
+        if dt <= 0.0 or dt > self.MAX_DT_S:
+            return
+        self.x_east_m  += (vgy_cms / 100.0) * dt
+        self.y_north_m += (vgx_cms / 100.0) * dt
+        self._has_data = True
+
+    @property
+    def position_m(self) -> tuple[float, float]:
+        return (self.x_east_m, self.y_north_m)
+
+
+# ---------------------------------------------------------------------------
 # Shared mission state -- read by UI / recorder, written by controller
 # ---------------------------------------------------------------------------
 
@@ -222,6 +278,20 @@ class MissionState:
     # centred). Cleared when leaving ALIGN.
     align_distance_m: Optional[float] = None
 
+    # Mission-script execution state. Set by trigger() -- the controller
+    # walks the script one step at a time; _advance_script consumes it.
+    mission_script: List[Step] = field(default_factory=list)
+    mission_step_idx: int = -1            # -1 = before first step
+    current_step_kind: Optional[str] = None
+    last_completed_step_kind: Optional[str] = None
+    # Per-step transient state used by IDLE / HEIGHT / DANCE.
+    idle_until: Optional[float] = None
+    height_target_m: Optional[float] = None
+    dance_until: Optional[float] = None
+    dance_mode: Optional[str] = None
+    dance_origin_xy_m: Optional[tuple[float, float]] = None
+    dance_origin_height_m: Optional[float] = None
+
     abort_reason: str = ""
     note: str = ""                                            # informational
 
@@ -247,6 +317,16 @@ class MissionState:
             self.search_yaw_swept_deg = 0.0
             self.last_marker_seen_at = 0.0
             self.align_distance_m = None
+            self.mission_script = []
+            self.mission_step_idx = -1
+            self.current_step_kind = None
+            self.last_completed_step_kind = None
+            self.idle_until = None
+            self.height_target_m = None
+            self.dance_until = None
+            self.dance_mode = None
+            self.dance_origin_xy_m = None
+            self.dance_origin_height_m = None
             self.abort_reason = ""
             self.note = ""
 
@@ -301,6 +381,11 @@ class MissionController:
         self.pd_height = PDController(cfg.height_kp, cfg.height_kd, cfg.ud_rc_max)
 
         self.smoother = PoseSmoother(cfg.pose_smoothing_alpha, cfg.pose_max_age_s)
+        # Dead-reckoning position estimator. Used by the DANCE script
+        # step to bound the routine within dance_radius_m of its
+        # entry position. Runs continuously from controller
+        # construction; never reset.
+        self.position = PositionEstimator()
 
         self._stop = threading.Event()
         self._go = threading.Event()
@@ -370,15 +455,37 @@ class MissionController:
         self._search_prev_yaw = None
         self.state.reset(self.cfg)
 
+    def set_script(self, steps: List[Step]) -> None:
+        """Install the parsed mission script that the controller will
+        walk on the next trigger(). Caller must have parsed and
+        validated the steps; the controller does no further
+        validation here."""
+        with self.state.lock:
+            self.state.mission_script = list(steps)
+            self.state.mission_step_idx = -1
+            self.state.current_step_kind = None
+            self.state.last_completed_step_kind = None
+
     def trigger(self) -> bool:
-        """Release the run loop so it proceeds from INIT into TAKEOFF.
-        Returns True if this call actually started the mission, False if
-        it was already started or the controller is no longer in INIT."""
+        """Release the run loop so it proceeds into the script's first
+        step. If no script was set via set_script(), the controller
+        falls back to the hardcoded default. Returns True if this
+        call actually started the mission, False if it was already
+        started or the controller is no longer in INIT."""
         if self._go.is_set():
             return False
         with self.state.lock:
             if self.state.phase != Phase.INIT:
                 return False
+            # Fall back to the hardcoded default script if the caller
+            # didn't install one. Keeps the legacy "press Start with
+            # nothing else configured" path working.
+            if not self.state.mission_script:
+                self.state.mission_script = parse_script(
+                    HARDCODED_DEFAULT_SCRIPT, defaults_from_cfg(self.cfg))
+                self.state.mission_step_idx = -1
+                self.state.current_step_kind = None
+                self.state.last_completed_step_kind = None
         self._go.set()
         return True
 
@@ -434,6 +541,14 @@ class MissionController:
         if phase == Phase.HOLD:
             with self.state.lock:
                 self.state.hold_began_at = time.monotonic()
+        # LAND can be re-entered (script with multiple LAND steps, or
+        # LAND followed by TAKEOFF). Reset the per-LAND scratch state
+        # so the second entry actually issues api.land() instead of
+        # skipping it because _land_requested is still True from the
+        # first entry.
+        if phase == Phase.LAND:
+            self._land_requested = False
+            self._descent_started_at = None
         # Capture / release ALIGN's hold-radius setpoint at the phase
         # boundary so _step_align doesn't have to discover it itself.
         if phase == Phase.ALIGN:
@@ -465,6 +580,14 @@ class MissionController:
         if tel is not None:
             with self.state.lock:
                 self.state.last_telemetry = tel
+            # Feed the dead-reckoning position estimator (used by
+            # DANCE for radius-bounded routines).
+            try:
+                vgx = float(tel.raw.get("vgx") or 0.0)
+                vgy = float(tel.raw.get("vgy") or 0.0)
+                self.position.update(vgx, vgy, now)
+            except (TypeError, ValueError):
+                pass
         pose = self.get_pose()
         self.smoother.update(pose, now)
         if pose is not None:
@@ -503,12 +626,12 @@ class MissionController:
             print("[ctrl] stop received before takeoff -- exiting cleanly")
             return
 
-        self._set_phase(Phase.TAKEOFF, "requesting takeoff")
-        try:
-            self.api.takeoff()
-        except DroneApiError as e:
-            self._abort(f"takeoff API error: {e}")
-            return
+        # Hand off to the mission script. The first step (typically
+        # TAKEOFF) is loaded here; _apply_step_to_phase handles the
+        # api.takeoff() call so a script that opens with a non-TAKEOFF
+        # step (e.g., DANCE while already airborne, in some testing
+        # scenario) doesn't unconditionally request takeoff.
+        self._advance_script("mission start")
 
         next_tick = time.monotonic()
         while not self._stop.is_set():
@@ -535,6 +658,12 @@ class MissionController:
                     self._step_approach(tel, now)
                 elif phase == Phase.HOLD:
                     self._step_hold(tel, now)
+                elif phase == Phase.IDLE:
+                    self._step_idle(tel, now)
+                elif phase == Phase.HEIGHT:
+                    self._step_height(tel, now)
+                elif phase == Phase.DANCE:
+                    self._step_dance(tel, now)
                 elif phase == Phase.LAND:
                     self._step_land(tel, now)
                 elif phase in (Phase.DONE, Phase.ABORT):
@@ -615,17 +744,15 @@ class MissionController:
         except (TypeError, ValueError):
             height_cm = None
         if height_cm is None:
-            # Without height telemetry we can't drive a climb; just
-            # hand off to SEARCH so the rest of the flight still works.
-            self._set_phase(Phase.SEARCH,
-                            "airborne (no height telem), beginning marker search")
+            # Without height telemetry we can't drive a climb; advance
+            # to the next script step anyway so the rest of the flight
+            # still works.
+            self._advance_script("airborne (no height telemetry)")
             return
         drone_h = height_cm / 100.0
         e_h = cfg.default_height_m - drone_h
         if abs(e_h) < cfg.height_deadband_m:
-            self._set_phase(Phase.SEARCH,
-                            f"reached default height ({drone_h:.2f}m), "
-                            f"beginning marker search")
+            self._advance_script(f"takeoff complete (h={drone_h:.2f}m)")
             return
         u_ud = self.pd_height.step(e_h, now)
         self._send_rc(0, 0, int(u_ud), 0)
@@ -666,12 +793,12 @@ class MissionController:
                     self.state.search_yaw_swept_deg = self._search_swept
                 if self._search_swept >= cfg.search_total_deg:
                     self._search_start_yaw = None
-                    self._set_phase(Phase.LAND,
-                                    "no marker found in full sweep -- landing")
+                    self._terminate_script(
+                        "no marker found in full sweep -- landing")
                     return
         # Fallback timeout if no telemetry yaw is ever reported.
         elif now - self.state.phase_started_at > 30.0:
-            self._set_phase(Phase.LAND, "search timed out (no telemetry yaw)")
+            self._terminate_script("search timed out (no telemetry yaw)")
             return
 
     # ----------------------------------------------------------------- align
@@ -902,7 +1029,7 @@ class MissionController:
             else:
                 self.state.settle_began_at = None
         if settled:
-            self._set_phase(Phase.HOLD, "approach settled -- station-keeping")
+            self._advance_script("approach settled")
 
     # ------------------------------------------------------------------ hold
     def _step_hold(self, tel: Optional[TelemetrySnapshot],
@@ -918,7 +1045,7 @@ class MissionController:
             began = self.state.hold_began_at
         if began is not None and (now - began) >= cfg.hold_time_s:
             self._send_rc(0, 0, 0, 0)
-            self._set_phase(Phase.LAND, f"hold of {cfg.hold_time_s:.0f}s complete")
+            self._advance_script(f"hold of {cfg.hold_time_s:.0f}s complete")
             return
 
         meas = self.smoother.get(now)
@@ -963,6 +1090,295 @@ class MissionController:
         # Timer transition is handled at the top of this method so it
         # wins over a marker-lost escalation on the same tick.
 
+    # -------------------------------------------------------------- idle (HOOVER)
+    def _step_idle(self, tel: Optional[TelemetrySnapshot], now: float) -> None:
+        """Mission-script HOOVER step that didn't follow APPROACH:
+        zero RC and let the Anafi auto-stabilise. Advances when the
+        per-step timer set in _apply_step_to_phase expires.
+        """
+        self._send_rc(0, 0, 0, 0)
+        with self.state.lock:
+            until = self.state.idle_until
+            self.state.note = (f"IDLE: {(until - now):.1f}s remaining"
+                               if until is not None else "IDLE")
+        if until is not None and now >= until:
+            self._advance_script("idle complete")
+
+    # ------------------------------------------------------------ height (script)
+    def _step_height(self, tel: Optional[TelemetrySnapshot],
+                    now: float) -> None:
+        """Mission-script HEIGHT step: drive the drone's altitude to
+        ``state.height_target_m`` and advance once it has settled
+        within the height deadband for the configured settle time.
+        """
+        cfg = self.cfg
+        with self.state.lock:
+            target = self.state.height_target_m
+        if target is None:
+            self._advance_script("height: no target set")
+            return
+        try:
+            h_cm = (float(tel.raw.get("height_cm"))
+                    if tel and tel.raw.get("height_cm") is not None
+                    else None)
+        except (TypeError, ValueError):
+            h_cm = None
+        if h_cm is None:
+            # No height telemetry -- can't drive a controlled climb.
+            # Hold the drone briefly then move on.
+            self._send_rc(0, 0, 0, 0)
+            if now - self.state.phase_started_at > 5.0:
+                self._advance_script("height: no telemetry, advancing")
+            return
+        drone_h = h_cm / 100.0
+        e_h = target - drone_h
+        u_ud = (0.0 if abs(e_h) < cfg.height_deadband_m
+                else self.pd_height.step(e_h, now))
+        self._send_rc(0, 0, int(u_ud), 0)
+
+        in_band = abs(e_h) < cfg.height_deadband_m
+        settled = False
+        with self.state.lock:
+            self.state.note = (f"HEIGHT: drone={drone_h:.2f}m  "
+                               f"target={target:.2f}m  e={e_h:+.2f}m")
+            if in_band:
+                if self.state.settle_began_at is None:
+                    self.state.settle_began_at = now
+                if now - self.state.settle_began_at >= cfg.height_settle_time_s:
+                    settled = True
+            else:
+                self.state.settle_began_at = None
+        if settled:
+            self._advance_script(f"height reached ({drone_h:.2f}m)")
+
+    # --------------------------------------------------------- dance (script)
+    def _step_dance(self, tel: Optional[TelemetrySnapshot],
+                   now: float) -> None:
+        """Mission-script DANCE step: programmed RC routine, bounded
+        within ``cfg.dance_radius_m`` of the entry position.
+        """
+        cfg = self.cfg
+        with self.state.lock:
+            until = self.state.dance_until
+            mode = (self.state.dance_mode or "wobble")
+            origin_xy = self.state.dance_origin_xy_m
+            origin_h = self.state.dance_origin_height_m
+            started = self.state.phase_started_at
+        if until is None:
+            self._advance_script("dance: no timer set")
+            return
+        if now >= until:
+            self._send_rc(0, 0, 0, 0)
+            self._advance_script("dance complete")
+            return
+
+        elapsed = max(0.0, now - started)
+        # Mode-specific RC pattern.
+        if mode == "spin":
+            lr = 0; fb = 0; ud = 0
+            yaw = int(cfg.yaw_rc_max)
+        elif mode == "random":
+            amp_lr  = max(2, cfg.lat_rc_max // 2)
+            amp_fb  = max(2, cfg.fwd_rc_max // 2)
+            amp_ud  = max(4, cfg.ud_rc_max // 4)
+            amp_yaw = max(4, cfg.yaw_rc_max // 2)
+            lr  = int(amp_lr  * math.sin(2 * math.pi * 0.40 * elapsed))
+            fb  = int(amp_fb  * math.sin(2 * math.pi * 0.30 * elapsed + 1.0))
+            ud  = int(amp_ud  * math.sin(2 * math.pi * 0.50 * elapsed + 2.0))
+            yaw = int(amp_yaw * math.sin(2 * math.pi * 0.25 * elapsed + 0.5))
+        else:  # wobble (default)
+            amp_yaw = int(cfg.yaw_rc_max)
+            amp_ud  = max(4, cfg.ud_rc_max // 4)
+            lr = 0; fb = 0
+            yaw = int(amp_yaw * math.sin(2 * math.pi * 0.5 * elapsed))
+            ud  = int(amp_ud  * math.sin(2 * math.pi * 1.0 * elapsed))
+
+        # Horizontal radius bound. PositionEstimator is dead-reckoning
+        # NED (vgx -> vN, vgy -> vE).
+        r_xy = 0.0
+        if origin_xy is not None:
+            x, y = self.position.position_m
+            dx_e = x - origin_xy[0]
+            dy_n = y - origin_xy[1]
+            r_xy = math.hypot(dx_e, dy_n)
+            if r_xy > cfg.dance_radius_m:
+                yaw_deg = None
+                if tel is not None:
+                    try:
+                        yaw_deg = float(tel.raw.get("yaw"))
+                    except (TypeError, ValueError):
+                        yaw_deg = None
+                if yaw_deg is not None:
+                    # Inward direction in world (NED): (-dy_n, -dx_e).
+                    in_v_fwd, in_v_right = self._world_to_body(
+                        -dy_n, -dx_e, yaw_deg)
+                    # Zero any commanded channel that's pointing
+                    # outward (sign opposite to the inward vector).
+                    if fb * in_v_fwd < 0:
+                        fb = 0
+                    if lr * in_v_right < 0:
+                        lr = 0
+                    # Add an inward correction proportional to the
+                    # excess radius, capped at the per-channel max.
+                    excess = min(1.0,
+                                 (r_xy - cfg.dance_radius_m)
+                                 / max(0.1, cfg.dance_radius_m))
+                    push_fb = int(cfg.fwd_rc_max * excess
+                                  * (1 if in_v_fwd >= 0 else -1))
+                    push_lr = int(cfg.lat_rc_max * excess
+                                  * (1 if in_v_right >= 0 else -1))
+                    fb += push_fb
+                    lr += push_lr
+                else:
+                    # No yaw telemetry -- can't transform to body.
+                    # Conservatively zero horizontal channels so we
+                    # don't drift further out.
+                    lr = 0; fb = 0
+
+        # Vertical bound.
+        h_now = None
+        if tel is not None:
+            try:
+                h_cm_v = (float(tel.raw.get("height_cm"))
+                          if tel.raw.get("height_cm") is not None else None)
+                if h_cm_v is not None:
+                    h_now = h_cm_v / 100.0
+            except (TypeError, ValueError):
+                pass
+        dh = 0.0
+        if h_now is not None and origin_h is not None:
+            dh = h_now - origin_h
+            if abs(dh) > cfg.dance_radius_m:
+                # If ud is pushing further from origin (same sign as
+                # dh), invert it to drive back inward.
+                if ud * dh > 0:
+                    ud = -int(min(cfg.ud_rc_max, abs(ud)) or cfg.ud_rc_max // 4)
+
+        self._send_rc(lr, fb, ud, yaw)
+        with self.state.lock:
+            self.state.note = (f"DANCE {mode}  r={r_xy:.2f}m  dh={dh:+.2f}m  "
+                               f"t={elapsed:.1f}/{(until - started):.1f}s")
+
+    # --------------------------------------------------- mission script driver
+    def _terminate_script(self, reason: str) -> None:
+        """Cut the script short and land. Used when an APPROACH
+        sub-stage (SEARCH) gives up without finding the marker --
+        we don't want the post-LAND _advance_script to walk into
+        the next script step as if APPROACH had succeeded.
+        """
+        with self.state.lock:
+            self.state.mission_script = []
+            self.state.mission_step_idx = 0
+            # Mark the current step as if we had executed a LAND so
+            # the post-LAND _advance_script("landed") routes to DONE.
+            self.state.current_step_kind = "LAND"
+            self.state.last_completed_step_kind = None
+        self._set_phase(Phase.LAND, reason)
+
+    def _advance_script(self, reason: str) -> None:
+        """Consume the current script step and load the next one. If
+        the script is exhausted, terminate with LAND (or DONE if the
+        last step was already LAND).
+        """
+        with self.state.lock:
+            self.state.last_completed_step_kind = self.state.current_step_kind
+            self.state.mission_step_idx += 1
+            idx = self.state.mission_step_idx
+            script = list(self.state.mission_script)
+            last_done = self.state.last_completed_step_kind
+        if idx >= len(script):
+            if last_done == "LAND":
+                self._set_phase(Phase.DONE,
+                                f"script complete ({reason})")
+            else:
+                # Safety LAND for scripts that don't end with LAND.
+                self._set_phase(Phase.LAND,
+                                f"script complete -- safety land ({reason})")
+            return
+        step = script[idx]
+        with self.state.lock:
+            self.state.current_step_kind = step.kind
+        self._apply_step_to_phase(step, reason)
+
+    def _apply_step_to_phase(self, step: Step, reason: str) -> None:
+        """Configure cfg overrides + per-step state for ``step`` and
+        call _set_phase with the appropriate initial phase."""
+        cfg = self.cfg
+        note = f"script[{step.line_no}] {step.kind} ({reason})"
+        if step.kind == "TAKEOFF":
+            self._set_phase(Phase.TAKEOFF, note)
+            try:
+                self.api.takeoff()
+            except DroneApiError as e:
+                self._abort(f"takeoff API error: {e}")
+            return
+        if step.kind == "APPROACH":
+            cfg.target_marker_id = int(step.marker_id)
+            cfg.target_distance_m = float(step.distance)
+            cfg.target_relative_heading_deg = 0.0
+            with self.state.lock:
+                self.state.target_distance_m = cfg.target_distance_m
+                self.state.target_relative_heading_deg = (
+                    cfg.target_relative_heading_deg)
+            # Resync PD gains -- not strictly necessary since the
+            # numeric targets used here are read off cfg each tick,
+            # but keep the call so any future cfg-derived state in
+            # apply_config_changes stays consistent.
+            try: self.apply_config_changes()
+            except Exception: pass
+            self._set_phase(Phase.SEARCH,
+                            note + f" id={cfg.target_marker_id}"
+                                   f" d={cfg.target_distance_m:g}m")
+            return
+        if step.kind == "HOOVER":
+            with self.state.lock:
+                last = self.state.last_completed_step_kind
+            if last == "APPROACH":
+                cfg.hold_time_s = float(step.seconds)
+                self._set_phase(Phase.HOLD,
+                                note + f" station-keep {step.seconds:g}s")
+            else:
+                with self.state.lock:
+                    self.state.idle_until = (time.monotonic()
+                                              + float(step.seconds))
+                self._set_phase(Phase.IDLE,
+                                note + f" idle {step.seconds:g}s")
+            return
+        if step.kind == "LAND":
+            self._set_phase(Phase.LAND, note)
+            return
+        if step.kind == "HEIGHT":
+            target = max(cfg.min_height_m,
+                         min(cfg.max_height_m, float(step.height)))
+            with self.state.lock:
+                self.state.height_target_m = target
+            self._set_phase(Phase.HEIGHT,
+                            note + f" -> {target:.2f}m")
+            return
+        if step.kind == "DANCE":
+            now = time.monotonic()
+            origin_xy = self.position.position_m
+            with self.state.lock:
+                tel = self.state.last_telemetry
+            try:
+                h_cm = (float(tel.raw.get("height_cm"))
+                        if tel and tel.raw.get("height_cm") is not None
+                        else None)
+            except (TypeError, ValueError):
+                h_cm = None
+            origin_h = (h_cm / 100.0 if h_cm is not None
+                        else cfg.default_height_m)
+            with self.state.lock:
+                self.state.dance_until = now + float(step.seconds)
+                self.state.dance_mode = step.mode or "wobble"
+                self.state.dance_origin_xy_m = origin_xy
+                self.state.dance_origin_height_m = origin_h
+            self._set_phase(Phase.DANCE,
+                            note + f" {self.state.dance_mode}"
+                                   f" {step.seconds:g}s")
+            return
+        self._abort(f"unknown script step kind: {step.kind!r}")
+
     # ------------------------------------------------------------------ land
     def _step_land(self, tel: Optional[TelemetrySnapshot], now: float) -> None:
         # Send zero RC for one tick before requesting land so that the
@@ -990,7 +1406,11 @@ class MissionController:
                 self._descent_started_at = now
             descent_elapsed = now - self._descent_started_at
             if height_cm < 10.0 or descent_elapsed > 5.0:
-                self._set_phase(Phase.DONE, "landed")
+                # Hand off to the script. If LAND was the last step,
+                # _advance_script terminates with DONE; if more steps
+                # follow (rare -- e.g., LAND followed by TAKEOFF for
+                # a multi-flight script), the next step is loaded.
+                self._advance_script("landed")
                 return
         # Hard timeout
         if now - self.state.phase_started_at > 30.0:
