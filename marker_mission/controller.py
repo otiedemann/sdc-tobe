@@ -65,7 +65,6 @@ class Phase(enum.Enum):
     ALIGN     = "align"     # orbit at start radius until heading ~ 0
     APPROACH  = "approach"  # close distance to target with heading held near 0
     HOLD      = "hold"      # station-keeping hover for hold_time_s, then LAND
-    RTH       = "rth"       # dead-reckon back to previous mission's takeoff pos
     LAND      = "land"
     DONE      = "done"
     ABORT     = "abort"
@@ -195,70 +194,6 @@ class PoseSmoother:
 
 
 # ---------------------------------------------------------------------------
-# Dead-reckoning position estimator
-# ---------------------------------------------------------------------------
-#
-# Integrates earth-frame velocity (vgx = vN, vgy = vE in cm/s) into a
-# 2D world-frame position (x_east, y_north) in metres.
-#
-# The "are vgx/vgy body-frame or earth-frame?" question was settled
-# empirically with tools/analyze_velocity_frame.py against eight real
-# flights: NED matched the marker-derived ground truth 2.2x to 3.9x
-# better than body+yaw rotation across every flight with > 1 m of
-# motion. So no yaw rotation is needed in the integration; vgx and
-# vgy go in directly.
-#
-# This is purely dead-reckoning -- there is no marker fix, no GPS,
-# no SLAM correction. Drift accumulates as roughly cm/s of velocity
-# noise per second of flight. After ~60 s expect 1-2 m position
-# error. So this is fine for a "rough RTH" function but not for
-# anything requiring better than ~1 m accuracy.
-
-class PositionEstimator:
-    """World-frame x/y from integrating earth-frame NED velocity."""
-
-    MAX_DT_S = 1.0   # if we get a sample with > this gap, restart from rest
-
-    def __init__(self):
-        self.x_east_m: float = 0.0
-        self.y_north_m: float = 0.0
-        self._last_t: Optional[float] = None
-        self._has_data: bool = False
-
-    def reset(self) -> None:
-        self.x_east_m = 0.0
-        self.y_north_m = 0.0
-        self._last_t = None
-        self._has_data = False
-
-    def update(self, vgx_cms: Optional[float], vgy_cms: Optional[float],
-               now: float) -> None:
-        """Integrate one telemetry sample. ``vgx`` is earth-frame
-        north velocity, ``vgy`` is earth-frame east, both in cm/s."""
-        if vgx_cms is None or vgy_cms is None:
-            return
-        if self._last_t is None:
-            self._last_t = now
-            return
-        dt = now - self._last_t
-        self._last_t = now
-        if dt <= 0.0 or dt > self.MAX_DT_S:
-            return
-        self.x_east_m  += (vgy_cms / 100.0) * dt
-        self.y_north_m += (vgx_cms / 100.0) * dt
-        self._has_data = True
-
-    @property
-    def position_m(self) -> tuple[float, float]:
-        """Return (x_east, y_north) in metres."""
-        return (self.x_east_m, self.y_north_m)
-
-    @property
-    def has_data(self) -> bool:
-        return self._has_data
-
-
-# ---------------------------------------------------------------------------
 # Shared mission state -- read by UI / recorder, written by controller
 # ---------------------------------------------------------------------------
 
@@ -286,25 +221,6 @@ class MissionState:
     # centred). Cleared when leaving ALIGN.
     align_distance_m: Optional[float] = None
 
-    # Dead-reckoning bookkeeping for the RTH (return-to-home) feature.
-    # Position is in PositionEstimator's frame -- (x_east, y_north)
-    # metres relative to the estimator's origin (which is fixed for
-    # the script's lifetime; the estimator runs continuously from
-    # boot). Yaw is the compass heading recorded at takeoff; RTH
-    # rotates the airframe back to this heading before landing so
-    # the drone ends pointed the same way it started.
-    # current_mission_takeoff_{world,yaw_deg} are set when the current
-    # mission's TAKEOFF fires; on DONE both are promoted to the
-    # previous_* fields, which are what RTH navigates to.
-    current_mission_takeoff_world: Optional[tuple[float, float]] = None
-    current_mission_takeoff_yaw_deg: Optional[float] = None
-    previous_mission_takeoff_world: Optional[tuple[float, float]] = None
-    previous_mission_takeoff_yaw_deg: Optional[float] = None
-    # Set by trigger_rth() before the next TAKEOFF; consumed in
-    # _step_takeoff and cleared on DONE/ABORT. When True, takeoff
-    # leads to RTH instead of SEARCH.
-    rth_armed: bool = False
-
     abort_reason: str = ""
     note: str = ""                                            # informational
 
@@ -330,13 +246,6 @@ class MissionState:
             self.search_yaw_swept_deg = 0.0
             self.last_marker_seen_at = 0.0
             self.align_distance_m = None
-            self.current_mission_takeoff_world = None
-            self.current_mission_takeoff_yaw_deg = None
-            # NB: previous_mission_takeoff_{world,yaw_deg} are
-            # intentionally NOT reset -- they have to survive between
-            # missions for RTH to have a target. rth_armed is also NOT
-            # reset (the RTH button sets it before reset() runs at
-            # end-of-flight).
             self.abort_reason = ""
             self.note = ""
 
@@ -390,11 +299,6 @@ class MissionController:
         self.pd_lat = PDController(cfg.lat_kp, cfg.lat_kd, cfg.lat_rc_max)
 
         self.smoother = PoseSmoother(cfg.pose_smoothing_alpha, cfg.pose_max_age_s)
-
-        # Dead-reckoning position estimator. Runs continuously from
-        # construction (no reset between missions) so RTH has a stable
-        # frame to navigate in.
-        self.position = PositionEstimator()
 
         self._stop = threading.Event()
         self._go = threading.Event()
@@ -479,36 +383,6 @@ class MissionController:
         with self.state.lock:
             return self.state.phase == Phase.INIT and not self._go.is_set()
 
-    def trigger_rth(self) -> bool:
-        """Set the RTH-armed flag and trigger the mission. The next
-        TAKEOFF will route to Phase.RTH (dead-reckoning navigate to
-        previous_mission_takeoff_world, then yaw back to the recorded
-        takeoff heading) instead of Phase.SEARCH.
-
-        Returns True if RTH was successfully armed and triggered.
-        Refuses if the run loop has already left INIT, if no previous
-        mission start is recorded yet, or if the position estimator
-        has no telemetry data (so we don't even know where 'home' is
-        relative to where we are)."""
-        with self.state.lock:
-            if self.state.phase != Phase.INIT:
-                return False
-            if self.state.previous_mission_takeoff_world is None:
-                return False
-            if not self.position.has_data:
-                return False
-            self.state.rth_armed = True
-        return self.trigger()
-
-    def rth_available(self) -> bool:
-        """True if trigger_rth() would succeed right now."""
-        if not self.is_armed():
-            return False
-        with self.state.lock:
-            if self.state.previous_mission_takeoff_world is None:
-                return False
-        return self.position.has_data
-
     def stop(self, reason: str = "external stop") -> None:
         with self.state.lock:
             if self.state.phase not in (Phase.DONE, Phase.ABORT):
@@ -554,34 +428,6 @@ class MissionController:
         if phase == Phase.HOLD:
             with self.state.lock:
                 self.state.hold_began_at = time.monotonic()
-        # RTH bookkeeping. On TAKEOFF, snapshot the current world
-        # position AND compass yaw so the next mission can navigate
-        # back here pointing in the same direction. On DONE/ABORT,
-        # promote them to "previous" (the actual RTH target), and
-        # clear rth_armed so a fresh "Start mission" press doesn't
-        # trigger another RTH.
-        if phase == Phase.TAKEOFF:
-            with self.state.lock:
-                tel = self.state.last_telemetry
-                yaw_now = None
-                if tel is not None:
-                    try:
-                        yaw_now = float(tel.raw.get("yaw") or 0.0)
-                    except (TypeError, ValueError):
-                        yaw_now = None
-                self.state.current_mission_takeoff_world = self.position.position_m
-                self.state.current_mission_takeoff_yaw_deg = yaw_now
-        if phase in (Phase.DONE, Phase.ABORT):
-            with self.state.lock:
-                if self.state.current_mission_takeoff_world is not None:
-                    self.state.previous_mission_takeoff_world = (
-                        self.state.current_mission_takeoff_world)
-                if self.state.current_mission_takeoff_yaw_deg is not None:
-                    self.state.previous_mission_takeoff_yaw_deg = (
-                        self.state.current_mission_takeoff_yaw_deg)
-                self.state.current_mission_takeoff_world = None
-                self.state.current_mission_takeoff_yaw_deg = None
-                self.state.rth_armed = False
         # Capture / release ALIGN's hold-radius setpoint at the phase
         # boundary so _step_align doesn't have to discover it itself.
         if phase == Phase.ALIGN:
@@ -613,15 +459,6 @@ class MissionController:
         if tel is not None:
             with self.state.lock:
                 self.state.last_telemetry = tel
-            # Feed dead-reckoning estimator (used by RTH). vgx/vgy are
-            # earth-frame NED velocity (settled empirically; see the
-            # PositionEstimator docstring), so no yaw rotation here.
-            try:
-                vgx = float(tel.raw.get("vgx") or 0.0)
-                vgy = float(tel.raw.get("vgy") or 0.0)
-                self.position.update(vgx, vgy, now)
-            except (TypeError, ValueError):
-                pass
         pose = self.get_pose()
         self.smoother.update(pose, now)
         if pose is not None:
@@ -690,8 +527,6 @@ class MissionController:
                     self._step_approach(tel, now)
                 elif phase == Phase.HOLD:
                     self._step_hold(tel, now)
-                elif phase == Phase.RTH:
-                    self._step_rth(tel, now)
                 elif phase == Phase.LAND:
                     self._step_land(tel, now)
                 elif phase in (Phase.DONE, Phase.ABORT):
@@ -759,17 +594,7 @@ class MissionController:
         # Hold zero RC while we wait for the airframe to leave the ground.
         self._send_rc(0, 0, 0, 0)
         if tel and tel.flying:
-            # If the operator pressed Return home before this takeoff,
-            # skip the marker-search/align/approach pipeline and go
-            # straight into dead-reckoning RTH navigation.
-            with self.state.lock:
-                go_rth = self.state.rth_armed
-            if go_rth:
-                self._set_phase(Phase.RTH,
-                                "airborne, navigating to previous takeoff position")
-            else:
-                self._set_phase(Phase.SEARCH,
-                                "airborne, beginning marker search")
+            self._set_phase(Phase.SEARCH, "airborne, beginning marker search")
             return
         # If takeoff hasn't completed in 15 s, abort.
         if now - self.state.phase_started_at > 15.0:
@@ -1026,118 +851,6 @@ class MissionController:
         self._send_rc(lr=int(u_lat), fb=int(u_fwd), ud=0, yaw=int(u_yaw))
         # Timer transition is handled at the top of this method so it
         # wins over a marker-lost escalation on the same tick.
-
-    # ------------------------------------------------------------------- rth
-    # Dead-reckoning return-to-home. No marker / no GPS fix: we drive
-    # purely off the integrated PositionEstimator, which has roughly
-    # cm/s position-error drift per second of flight. This is a "rough"
-    # RTH -- expect to land within a couple of metres of the original
-    # takeoff spot, not centimetres.
-    #
-    # Strategy:
-    #   - target = state.previous_mission_takeoff_world (set when the
-    #     previous mission's TAKEOFF fired).
-    #   - error = target - estimator.position. Distance + bearing in
-    #     world frame.
-    #   - Yaw the drone to face the bearing (pd_yaw on tel_yaw).
-    #   - Once roughly facing target (|yaw_err| < gate), push forward
-    #     proportional to remaining distance (pd_fwd, capped to
-    #     fwd_rc_max).
-    #   - Land when within RTH_ARRIVE_RADIUS_M, or after RTH_TIMEOUT_S
-    #     (so a runaway dead-reckoning can't fly the drone into a wall
-    #     forever).
-    RTH_ARRIVE_RADIUS_M = 0.6
-    RTH_TIMEOUT_S = 60.0
-    RTH_YAW_GATE_DEG = 25.0   # only push forward when within this of target
-    # Once at home position, rotate the airframe back to its takeoff
-    # yaw. We tolerate this much error before committing to LAND
-    # (avoids spinning forever on noisy yaw telemetry).
-    RTH_FINAL_YAW_TOLERANCE_DEG = 8.0
-
-    def _step_rth(self, tel: Optional[TelemetrySnapshot], now: float) -> None:
-        cfg = self.cfg
-        target = self.state.previous_mission_takeoff_world
-        if target is None:
-            self._set_phase(Phase.LAND, "RTH: no target available")
-            return
-
-        # Hard timeout -- protects against runaway drift in any direction.
-        if now - self.state.phase_started_at > self.RTH_TIMEOUT_S:
-            self._set_phase(Phase.LAND,
-                            f"RTH: timeout after {self.RTH_TIMEOUT_S:.0f}s")
-            return
-
-        x_now, y_now = self.position.position_m
-        dx = target[0] - x_now      # east error
-        dy = target[1] - y_now      # north error
-        dist = math.hypot(dx, dy)
-
-        try:
-            cur_yaw = float(tel.raw.get("yaw") or 0.0) if tel is not None else 0.0
-        except (TypeError, ValueError):
-            cur_yaw = 0.0
-
-        # ----- Sub-stage 2: at home, now align yaw to takeoff heading -----
-        if dist < self.RTH_ARRIVE_RADIUS_M:
-            home_yaw = self.state.previous_mission_takeoff_yaw_deg
-            if home_yaw is None:
-                # No takeoff yaw recorded (shouldn't happen, but fall
-                # back to landing in current orientation).
-                self._set_phase(Phase.LAND, "RTH: arrived (no takeoff yaw)")
-                return
-            yaw_err_home = ((home_yaw - cur_yaw + 540.0) % 360.0) - 180.0
-            if abs(yaw_err_home) < self.RTH_FINAL_YAW_TOLERANCE_DEG:
-                self._set_phase(Phase.LAND,
-                                f"RTH: arrived (dist={dist:.2f}m, "
-                                f"yaw aligned to home {home_yaw:.0f}°)")
-                return
-            # Spin in place to reach home yaw. No fwd / lat motion --
-            # we're already at the target position.
-            if abs(yaw_err_home) < cfg.yaw_deadband_deg:
-                u_yaw = 0.0
-            else:
-                u_yaw = self.pd_yaw.step(yaw_err_home, now)
-            self._send_rc(lr=0, fb=0, ud=0, yaw=int(u_yaw))
-            with self.state.lock:
-                self.state.note = (f"RTH: at home, yawing to {home_yaw:+.0f}° "
-                                   f"(err {yaw_err_home:+.0f}°)")
-            return
-
-        # ----- Sub-stage 1: navigate to home position -----
-        # Bearing to target in compass (CW from north). atan2(east,
-        # north) gives that directly: at (E=0, N=+) -> 0, at (E=+, N=0)
-        # -> +90, at (E=0, N=-) -> +/-180.
-        target_bearing_deg = math.degrees(math.atan2(dx, dy))
-        # Shortest-arc yaw error in (-180, 180].
-        yaw_err = ((target_bearing_deg - cur_yaw + 540.0) % 360.0) - 180.0
-
-        # Yaw command: PD on yaw error, identical to other phases'
-        # yaw control law. Saturates at yaw_rc_max.
-        if abs(yaw_err) < cfg.yaw_deadband_deg:
-            u_yaw = 0.0
-        else:
-            u_yaw = self.pd_yaw.step(yaw_err, now)
-
-        # Forward command: only push forward once we're roughly facing
-        # the target. Otherwise we'd fly sideways while yawing in.
-        if abs(yaw_err) < self.RTH_YAW_GATE_DEG:
-            u_fwd_raw = self.pd_fwd.step(dist, now)
-        else:
-            u_fwd_raw = 0.0
-        u_fwd = self._velocity_damp_fwd(u_fwd_raw, tel)
-        # Don't allow the damper to flip a positive-intent command into
-        # backward during RTH -- distance is always positive so PD
-        # always wants forward; backward here would be a damping
-        # artefact, not a desired behaviour.
-        if u_fwd_raw > 0:
-            u_fwd = max(0.0, u_fwd)
-
-        self._send_rc(lr=0, fb=int(u_fwd), ud=0, yaw=int(u_yaw))
-
-        with self.state.lock:
-            self.state.note = (f"RTH: dist={dist:.2f}m  "
-                               f"bearing={target_bearing_deg:+.0f}°  "
-                               f"yaw_err={yaw_err:+.0f}°")
 
     # ------------------------------------------------------------------ land
     def _step_land(self, tel: Optional[TelemetrySnapshot], now: float) -> None:
