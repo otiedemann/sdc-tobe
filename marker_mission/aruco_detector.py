@@ -422,39 +422,39 @@ def annotate_frame(frame_bgr: np.ndarray,
             f"d={p.distance_m:.2f}m  y={p.yaw_deg:+.1f}deg",
             f"h={p.relative_heading_deg:+.1f}deg",
         ]
-        ox = int(cx) + 8
-        oy = int(cy) - 8
+        ox = int(cx) + 12
+        oy = int(cy) - 12
         for i, line in enumerate(lines):
-            y = oy + i * 14
+            y = oy + i * 21
             cv2.putText(out, line, (ox, y), cv2.FONT_HERSHEY_SIMPLEX,
-                        0.42, (0, 0, 0), 2, cv2.LINE_AA)
+                        0.63, (0, 0, 0), 3, cv2.LINE_AA)
             cv2.putText(out, line, (ox, y), cv2.FONT_HERSHEY_SIMPLEX,
-                        0.42, col, 1, cv2.LINE_AA)
+                        0.63, col, 1, cv2.LINE_AA)
     # Optional extra status lines in the top-left corner.
-    y = 22
+    y = 33
     if extra_lines:
         for line in extra_lines:
             cv2.putText(out, line, (10, y),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 2,
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.825, (255, 255, 255), 3,
                         cv2.LINE_AA)
             cv2.putText(out, line, (10, y),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 0), 1,
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.825, (0, 0, 0), 1,
                         cv2.LINE_AA)
-            y += 22
+            y += 33
     # Per-marker list in the top-left, colour-coded the same way the
     # marker outlines are (green = target, grey = other). Sorted with
     # the target first so the operator's eye lands on it. Skipped when
     # nothing is visible.
     if poses:
         # spacer line
-        y += 4
+        y += 6
         cv2.putText(out, "Markers seen:", (10, y),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 2,
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.675, (255, 255, 255), 3,
                     cv2.LINE_AA)
         cv2.putText(out, "Markers seen:", (10, y),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 0, 0), 1,
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.675, (0, 0, 0), 1,
                     cv2.LINE_AA)
-        y += 18
+        y += 27
         ordered = sorted(poses, key=lambda p: (
             0 if (target_id is not None and p.marker_id == target_id) else 1,
             p.marker_id))
@@ -465,8 +465,8 @@ def annotate_frame(frame_bgr: np.ndarray,
                     f"y={p.yaw_deg:+6.1f}deg  "
                     f"h={p.relative_heading_deg:+6.1f}deg")
             cv2.putText(out, line, (10, y), cv2.FONT_HERSHEY_SIMPLEX,
-                        0.45, (0, 0, 0), 2, cv2.LINE_AA)
+                        0.675, (0, 0, 0), 3, cv2.LINE_AA)
             cv2.putText(out, line, (10, y), cv2.FONT_HERSHEY_SIMPLEX,
-                        0.45, col, 1, cv2.LINE_AA)
-            y += 17
+                        0.675, col, 1, cv2.LINE_AA)
+            y += 26
     return out
