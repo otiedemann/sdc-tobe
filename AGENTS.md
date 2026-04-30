@@ -14,11 +14,15 @@ Use this file as the default guide for agentic coding tools.
   - `aruco-position/` (ArUco detection, calibration, streaming)
   - `sim_swarm/` and `sim_swarm_c2/` (simulation + viewers)
   - `drone-sim/` (HTTP/UDP simulator)
-  - `sphinx-control/` (FastAPI web service to manage a fleet of
-    Parrot Sphinx UE4 simulator instances on one Linux host —
-    spawn / restart / stop up to 10 drones, each with its own
-    port or netns IP, dashboard at :8090. Tailscale-aware.
-    Has dry-run mode for development on macOS without Sphinx.)
+  - `sphinx-control/` (FastAPI web service to manage Parrot Sphinx
+    UE4 simulator instances on one Linux host. Spawn / restart /
+    stop drones from a dashboard at :8090. Single-drone by default
+    (Sphinx 2.x architectural limit). Tailscale-aware. Has dry-run
+    mode for development on macOS without Sphinx.)
+  - `tools/sphinx-arena/` (Parrot Sphinx UE4 simulator: arena
+    scene generator. Emits ArUco-marker PNGs → FBX planes → Sphinx
+    YAML config. Path A = no UE editor build required; see its
+    README.md.)
 - `old/` is legacy; avoid edits unless requested.
 - No root build system (`Makefile`, `pyproject.toml`, `package.json`).
 
