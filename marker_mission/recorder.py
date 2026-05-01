@@ -47,6 +47,7 @@ _CSV_FIELDS = [
     "marker_normal_bearing_deg", "marker_tilt_deg", "marker_inplane_rot_deg",
     "marker_id", "marker_seen",
     "target_distance_m", "target_relative_heading_deg",
+    "mission_step_idx",
     "rc_lr", "rc_fb", "rc_ud", "rc_yaw",
     "tel_battery", "tel_yaw", "tel_pitch", "tel_roll",
     "tel_height_cm", "tel_flight_time_s",
@@ -232,6 +233,11 @@ class FlightRecorder:
                 row["marker_inplane_rot_deg"] = f"{pose.marker_inplane_rot_deg:.2f}"
             row["target_distance_m"] = f"{snap['target_distance_m']:.3f}"
             row["target_relative_heading_deg"] = f"{snap['target_relative_heading_deg']:.2f}"
+            # mission_step_idx (-1 means "before first step"). Replay
+            # uses this to highlight the active step in the script
+            # list without re-deriving it from phase transitions.
+            mi = snap.get("mission_step_idx")
+            row["mission_step_idx"] = "" if mi is None else str(mi)
             rc = snap["rc"]
             row["rc_lr"] = rc["lr"]; row["rc_fb"] = rc["fb"]
             row["rc_ud"] = rc["ud"]; row["rc_yaw"] = rc["yaw"]

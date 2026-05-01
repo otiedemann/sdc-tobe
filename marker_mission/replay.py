@@ -32,6 +32,7 @@ import cv2  # noqa: E402  -- after the env-var override above
 
 from .controller import MissionState, Phase
 from .drone_api import TelemetrySnapshot
+from . import mission_script as _ms
 
 
 class FlightReplay:
@@ -85,6 +86,25 @@ class FlightReplay:
             self.phase_start_t[i] = cur_phase_start
             self.marker_seen_t[i] = cur_marker_seen
 
+        # Mission script. Saved by mission.py at TAKEOFF as the
+        # canonicalised step list -- already has all defaults filled
+        # in, so parse() never touches its defaults dict. Old flights
+        # that pre-date the mission_script feature have no file, so
+        # we run replay without a script panel.
+        self.script_steps: List = []
+        sp = self.dir / "mission_script.txt"
+        if sp.is_file():
+            try:
+                self.script_steps = _ms.parse(sp.read_text(), {})
+            except Exception as e:
+                print(f"[replay] mission_script.txt parse failed: {e}")
+                self.script_steps = []
+
+        # Per-row mission_step_idx. Prefer the recorded column for
+        # exactness; fall back to a phase-walk for flights recorded
+        # before the column existed.
+        self.step_idx_per_row: List[int] = self._build_step_idx_per_row(rows)
+
         # Annotated.mp4 already has the HUD baked in -- prefer it.
         # Fall back to raw.mp4 if annotated is missing for some reason.
         # NOTE: don't open the cv2.VideoCapture here. libavcodec's
@@ -102,6 +122,11 @@ class FlightReplay:
 
         # Public state for the UI to read.
         self.state = MissionState()
+        # Install the recorded script so snapshot()'s mission_script
+        # field gets populated. mission_step_idx is set per-tick in
+        # _apply_row from the precomputed array above.
+        with self.state.lock:
+            self.state.mission_script = self.script_steps
         self.frame = LatestFrame()
         self._last_pos_ms = -1.0
 
@@ -212,6 +237,66 @@ class FlightReplay:
         # thread and should be released there. The worker exits its
         # loop on _stop and releases its own cap.
 
+    # ---------------------------------------------------- step-idx mapping
+    def _build_step_idx_per_row(self, rows: List[dict]) -> List[int]:
+        """Per CSV row, the script-step index that was active when the
+        row was logged.
+
+        Two paths:
+
+        * ``mission_step_idx`` column present (newer flights) -- read
+          it directly. The recorder writes -1 before the first step.
+        * Column absent (older flights) -- walk the phase column and
+          advance through ``self.script_steps`` whenever the phase
+          enters a kind-specific entry phase. Each step kind has
+          exactly one entry phase under the live controller's flow:
+
+          * TAKEOFF -> ``takeoff``
+          * APPROACH -> ``search`` (sub-phases never start the step)
+          * HOOVER -> ``hold`` (after APPROACH) or ``idle`` (otherwise)
+          * HEIGHT -> ``height``
+          * DANCE -> ``dance``
+          * LAND -> ``land``
+        """
+        n = len(rows)
+        out = [-1] * n
+        # Path 1: explicit column.
+        col_present = any("mission_step_idx" in r and r["mission_step_idx"]
+                          for r in rows)
+        if col_present:
+            cur = -1
+            for i, r in enumerate(rows):
+                v = r.get("mission_step_idx", "")
+                if v != "":
+                    try:
+                        cur = int(v)
+                    except ValueError:
+                        pass
+                out[i] = cur
+            return out
+        # Path 2: phase walk.
+        if not self.script_steps:
+            return out
+        ENTRY = {
+            "TAKEOFF":  {"takeoff"},
+            "APPROACH": {"search"},
+            "HOOVER":   {"hold", "idle"},
+            "HEIGHT":   {"height"},
+            "DANCE":    {"dance"},
+            "LAND":     {"land"},
+        }
+        idx = -1
+        prev_phase = None
+        for i, r in enumerate(rows):
+            phase = r.get("phase", "")
+            if phase != prev_phase and idx + 1 < len(self.script_steps):
+                next_kind = self.script_steps[idx + 1].kind
+                if phase in ENTRY.get(next_kind, set()):
+                    idx += 1
+            out[i] = idx
+            prev_phase = phase
+        return out
+
     # ---------------------------------------------------- per-row dispatch
     def _lookup_serial(self) -> Optional[str]:
         # Prefer the persisted mission metadata if present.
@@ -299,6 +384,15 @@ class FlightReplay:
         except ValueError:
             phase = Phase.INIT
 
+        # Active script step index for this row -- precomputed at
+        # __init__. Out-of-range indices (e.g., past last step) clamp
+        # to len(script_steps) so the UI shows "no step active".
+        s_idx = self.step_idx_per_row[idx] if self.step_idx_per_row else -1
+        if 0 <= s_idx < len(self.script_steps):
+            cur_kind = self.script_steps[s_idx].kind
+        else:
+            cur_kind = None
+
         with self.state.lock:
             self.state.phase = phase
             self.state.last_telemetry = tel_snap
@@ -307,6 +401,8 @@ class FlightReplay:
                 self._fnum(row, "target_distance_m") or 1.0)
             self.state.target_relative_heading_deg = (
                 self._fnum(row, "target_relative_heading_deg") or 0.0)
+            self.state.mission_step_idx = s_idx
+            self.state.current_step_kind = cur_kind
             self.state.last_rc = (
                 int(self._fnum(row, "rc_lr") or 0),
                 int(self._fnum(row, "rc_fb") or 0),

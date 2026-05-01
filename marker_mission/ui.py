@@ -173,6 +173,13 @@ _VIDEO_AND_STATUS_HTML = """
         </a>
       </span>
     </div>
+    <h2>Mission script</h2>
+    <div id="script-runtime"
+         style="background:#0c0f12; border:1px solid #2a3038;
+                border-radius:6px; padding:.4rem; font-family:ui-monospace,
+                SFMono-Regular, Menlo, Consolas, monospace;
+                font-size:.85rem; line-height:1.35; margin-bottom:.6rem;
+                color:#778;">No mission script recorded for this flight.</div>
     {% else %}
     <h2>Mission control</h2>
     <div id="script-row" style="margin-bottom:.5rem;">
@@ -527,18 +534,25 @@ async function stopMission() {
   }
 }
 function updateScriptRuntime(s) {
-  const ta = $('script-text');
+  const ta = $('script-text');           // present on the live page only
   const rt = $('script-runtime');
-  if (!ta || !rt) return;
+  if (!rt) return;
   const lines = Array.isArray(s.mission_script) ? s.mission_script : [];
   if (!lines.length) {
-    // No script installed -- show editor (unless terminal phase).
-    rt.style.display = 'none';
-    ta.style.display = '';
+    if (ta) {
+      // Live page: no script installed yet -> show the editor.
+      rt.style.display = 'none';
+      ta.style.display = '';
+    } else {
+      // Replay page: no script was recorded for this flight.
+      rt.style.display = '';
+      rt.innerHTML = '<div style="color:#778;">'
+                   + 'No mission script recorded for this flight.</div>';
+    }
     return;
   }
   const idx = (typeof s.mission_step_idx === 'number') ? s.mission_step_idx : -1;
-  ta.style.display = 'none';
+  if (ta) ta.style.display = 'none';
   rt.style.display = '';
   rt.innerHTML = lines.map((line, i) => {
     let css, marker;
