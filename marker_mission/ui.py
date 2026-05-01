@@ -29,7 +29,8 @@ from typing import Callable, Optional
 
 import cv2
 import numpy as np
-from flask import Flask, Response, jsonify, render_template_string, request
+from flask import (Flask, Response, jsonify, render_template_string,
+                    request, send_file)
 
 from .config import MissionConfig, tuning_view
 from .controller import MissionController, MissionState
@@ -101,7 +102,10 @@ _PAGE_BASE_CSS = """
 
 _PAGE_HEADER = """
 <header>
-  <h1>Marker mission</h1>
+  <img src="/team_logo.png" alt="team logo"
+       style="width:120px; height:120px; object-fit:contain;
+              display:block; margin-right:.8rem;">
+  <h1 style="line-height:1.15;">to be defined<br>mission control</h1>
   <nav>
     <a href="/" class="{{ 'active' if active=='video' else '' }}">Camera</a>
     <a href="/charts" class="{{ 'active' if active=='charts' else '' }}">Charts</a>
@@ -2231,6 +2235,19 @@ class UiServer:
                     time.sleep(0.05)
             return Response(gen(),
                             mimetype="multipart/x-mixed-replace; boundary=frame")
+
+        @app.get("/team_logo.png")
+        def team_logo():
+            # Repo asset, lives next to the package -- ../1_Doc/...
+            # Browsers cache this for an hour so the 2.8 MB transfer
+            # only happens on first load per session.
+            p = (Path(__file__).resolve().parent.parent
+                 / "1_Doc" / "team_logo_transparent.png")
+            if not p.is_file():
+                return ("logo not found", 404)
+            resp = send_file(str(p), mimetype="image/png")
+            resp.headers["Cache-Control"] = "public, max-age=3600"
+            return resp
 
     def start(self) -> None:
         if self._thread and self._thread.is_alive():
