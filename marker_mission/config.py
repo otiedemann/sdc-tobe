@@ -75,6 +75,12 @@ class MissionConfig:
     # and slow the maximum yaw rate, giving the D-term room to act.
     yaw_kp: float = 1.0                    # TUNE  RC counts per deg   (was 2.0)
     yaw_kd: float = 0.5                    # TUNE  RC counts per (deg/s)
+    # Integral term. 0 = pure PD (default; matches all flights up to
+    # 2026-04-30). Bump above zero to eliminate steady-state error
+    # during HOLD; back-calculation anti-windup + i_clip protect
+    # against runaway during saturation / marker loss.
+    yaw_ki: float = 0.0                    # TUNE  RC counts per (deg*s)
+    yaw_i_clip: float = 50.0               # TUNE  hard bound on |integral|
     # NOTE: fwd / lat gains were lowered after the first-flight wall crash.
     # The drone saturated rc_fb=+30 for the entire long-range approach,
     # accelerated to ~120 cm/s, and started braking too late. The new caps
@@ -93,9 +99,13 @@ class MissionConfig:
     # built up ~40 cm/s on the cruise and crashed into the marker
     # because PD alone only brakes inside the deadband -- too late.
     fwd_kv: float = 0.4                    # TUNE  RC counts per (cm/s)
+    fwd_ki: float = 0.0                    # TUNE  RC counts per (m*s)
+    fwd_i_clip: float = 1.0                # TUNE  hard bound on |integral|
     lat_kp: float = 30.0                   # TUNE  RC counts per m   (was 60)
     lat_kd: float = 30.0                   # TUNE  RC counts per (m/s)
     lat_kv: float = 0.4                    # TUNE  RC counts per (cm/s)
+    lat_ki: float = 0.0                    # TUNE  RC counts per (m*s)
+    lat_i_clip: float = 1.0                # TUNE  hard bound on |integral|
 
     # Output clamps for safety. Lower = slower & safer. -----------------------
     yaw_rc_max: int = 25                   # TUNE  (was 40; caps yaw rate ~25°/s)
@@ -133,6 +143,8 @@ class MissionConfig:
     max_height_m: float = 2.0              # TUNE  ud <= 0 above this
     height_kp: float = 30.0                # TUNE  RC counts per m of height error
     height_kd: float = 10.0                # TUNE  RC counts per (m/s)
+    height_ki: float = 0.0                 # TUNE  RC counts per (m*s)
+    height_i_clip: float = 1.0             # TUNE  hard bound on |integral|
     height_deadband_m: float = 0.10        # TUNE
     height_settle_time_s: float = 1.0      # TUNE  before HEIGHT_ALIGN -> ALIGN
 
@@ -304,6 +316,14 @@ TUNING_FIELDS = {
         "label": "fwd kv", "kind": "float", "step": 0.05,
         "desc": "Velocity feedforward on body-forward velocity, in RC counts per (cm/s). Subtracts an active brake proportional to current speed (independent of position error). 0 = disabled. Wrapped in a no-sign-flip guard so a wrong-frame velocity reading can't push the drone the wrong way.",
     },
+    "fwd_ki": {
+        "label": "fwd ki", "kind": "float", "step": 1.0,
+        "desc": "Integral gain on distance error (RC per m*s). 0 = pure PD (default). Bump above 0 to eliminate steady-state distance error during HOLD; back-calculation anti-windup + fwd_i_clip protect against runaway during saturation or marker loss.",
+    },
+    "fwd_i_clip": {
+        "label": "fwd i clip", "kind": "float", "unit": "m*s", "step": 0.1,
+        "desc": "Hard cap on the magnitude of the fwd integrator. With ki=30 and i_clip=1.0, the I term can contribute at most 30 RC counts. Last-line guard against integrator runaway.",
+    },
     "fwd_rc_max": {
         "label": "fwd RC max", "kind": "int", "step": 1,
         "desc": "Hard cap on the rc_fb command magnitude (Anafi PCMD range -100..+100). Roughly each unit ≈ 4 cm/s body-forward at level flight, so rc_max=3 caps approach to ~12 cm/s. Lower = slower + safer.",
@@ -321,6 +341,14 @@ TUNING_FIELDS = {
         "label": "lat kv", "kind": "float", "step": 0.05,
         "desc": "Velocity feedforward on body-right velocity. Same idea as fwd_kv: brakes lateral momentum so the drone doesn't sail past the heading target. No-sign-flip-guarded.",
     },
+    "lat_ki": {
+        "label": "lat ki", "kind": "float", "step": 1.0,
+        "desc": "Integral gain on heading-arc error (RC per m*s). 0 = pure PD. Useful for HOLD if the drone has a steady tangential bias (gimbal offset, mass imbalance). Anti-windup paired with lat_i_clip.",
+    },
+    "lat_i_clip": {
+        "label": "lat i clip", "kind": "float", "unit": "m*s", "step": 0.1,
+        "desc": "Hard cap on the magnitude of the lat integrator. Last-line guard against integrator runaway during saturation or marker loss.",
+    },
     "lat_rc_max": {
         "label": "lat RC max", "kind": "int", "step": 1,
         "desc": "Cap on rc_lr. Lower = slower lateral motion + better yaw tracking (yaw can keep up with the apparent-marker drift). 4 ≈ 16 cm/s. Going much higher tends to spiral the drone outward because yaw lags.",
@@ -334,6 +362,14 @@ TUNING_FIELDS = {
         "label": "height kd", "kind": "float", "step": 1.0,
         "desc": "Derivative gain on height-rate (RC per m/s). Damps oscillation around the height target.",
     },
+    "height_ki": {
+        "label": "height ki", "kind": "float", "step": 1.0,
+        "desc": "Integral gain on height error (RC per m*s). 0 = pure PD. Eliminates steady altitude offset (gimbal drift, residual lift bias). Anti-windup paired with height_i_clip.",
+    },
+    "height_i_clip": {
+        "label": "height i clip", "kind": "float", "unit": "m*s", "step": 0.1,
+        "desc": "Hard cap on the magnitude of the height integrator. Last-line guard against integrator runaway during saturation or marker loss.",
+    },
 
     "yaw_kp": {
         "label": "yaw kp", "kind": "float", "step": 0.1,
@@ -342,6 +378,14 @@ TUNING_FIELDS = {
     "yaw_kd": {
         "label": "yaw kd", "kind": "float", "step": 0.05,
         "desc": "Derivative gain on yaw_to_marker (RC per °/s). Damps the yaw oscillation that pure-P tends to produce at high gains.",
+    },
+    "yaw_ki": {
+        "label": "yaw ki", "kind": "float", "step": 0.05,
+        "desc": "Integral gain on yaw_to_marker (RC per deg*s). 0 = pure PD. Eliminates steady yaw bias (e.g., camera mounting offset). Anti-windup paired with yaw_i_clip.",
+    },
+    "yaw_i_clip": {
+        "label": "yaw i clip", "kind": "float", "unit": "deg*s", "step": 1.0,
+        "desc": "Hard cap on the magnitude of the yaw integrator. Last-line guard against integrator runaway during saturation or marker loss.",
     },
     "yaw_rc_max": {
         "label": "yaw RC max", "kind": "int", "step": 1,
@@ -437,15 +481,15 @@ TUNING_FIELDS = {
 TUNING_GROUPS = [
     ("Mission goals", ["target_distance_m", "target_relative_heading_deg", "hold_time_s"]),
     ("Forward PD (closing distance)",
-        ["fwd_kp", "fwd_kd", "fwd_kv", "fwd_rc_max"]),
+        ["fwd_kp", "fwd_kd", "fwd_kv", "fwd_ki", "fwd_i_clip", "fwd_rc_max"]),
     ("Lateral PD (orbiting / heading correction)",
-        ["lat_kp", "lat_kd", "lat_kv", "lat_rc_max"]),
+        ["lat_kp", "lat_kd", "lat_kv", "lat_ki", "lat_i_clip", "lat_rc_max"]),
     ("Yaw PD (centring marker)",
-        ["yaw_kp", "yaw_kd", "yaw_rc_max"]),
+        ["yaw_kp", "yaw_kd", "yaw_ki", "yaw_i_clip", "yaw_rc_max"]),
     ("Height control",
         ["default_height_m", "min_height_m", "max_height_m",
-         "height_kp", "height_kd", "height_deadband_m",
-         "height_settle_time_s", "ud_rc_max"]),
+         "height_kp", "height_kd", "height_ki", "height_i_clip",
+         "height_deadband_m", "height_settle_time_s", "ud_rc_max"]),
     ("Mission script defaults",
         ["default_dance_seconds_s", "dance_radius_m"]),
     ("Deadbands",

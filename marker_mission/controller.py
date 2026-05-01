@@ -81,39 +81,102 @@ class Phase(enum.Enum):
 # PD controller building block
 # ---------------------------------------------------------------------------
 
-class PDController:
-    """Plain proportional-derivative controller with output clamp.
+class PIDController:
+    """Proportional-integral-derivative controller with output clamp
+    and back-calculation anti-windup.
 
     The derivative is computed from filtered sample-to-sample differences
     so that quick measurement jitter does not blow up the D term.
+
+    The integral term defaults to OFF (``ki = 0.0``) so the class
+    behaves exactly like the older PD controller until an operator
+    bumps ``ki`` via /tune. Anti-windup is two-layered:
+
+    * Hard clamp: ``|integral| <= i_clip``. Last-line guard against
+      an integrator runaway during marker loss / sustained saturation.
+    * Back-calculation: when the unclamped output exceeds out_clip,
+      the integrator is wound back by ``(u_unclipped - u_clipped) / ki``
+      so it doesn't keep growing while the actuator is pinned.
+
+    The integrator is also frozen in a few obvious cases (``dt > 1 s``
+    suggests a missed tick / phase change; ``ki == 0`` skips the
+    integration math entirely).
     """
 
     def __init__(self, kp: float, kd: float, out_clip: float,
+                 ki: float = 0.0, i_clip: float = 1.0,
                  d_filter_alpha: float = 0.4):
         self.kp = float(kp)
         self.kd = float(kd)
+        self.ki = float(ki)
         self.out_clip = float(out_clip)
+        self.i_clip = float(i_clip)
         self.alpha = float(d_filter_alpha)
         self._last_err: Optional[float] = None
         self._last_t: Optional[float] = None
         self._d_filt: float = 0.0
+        self._integral: float = 0.0
 
     def reset(self) -> None:
         self._last_err = None
         self._last_t = None
         self._d_filt = 0.0
+        self._integral = 0.0
 
     def step(self, error: float, now: float) -> float:
+        # Derivative term -------------------------------------------------
         if self._last_err is None or self._last_t is None or now - self._last_t < 1e-3:
             d_err = 0.0
         else:
             d_raw = (error - self._last_err) / (now - self._last_t)
             self._d_filt = self.alpha * d_raw + (1.0 - self.alpha) * self._d_filt
             d_err = self._d_filt
+
+        # Integral term ---------------------------------------------------
+        # Skip the math when ki == 0 so the integrator state stays at
+        # zero and the controller is provably equivalent to today's PD.
+        if self.ki != 0.0 and self._last_t is not None:
+            dt = now - self._last_t
+            if 0.0 < dt < 1.0:
+                self._integral += error * dt
+                # Hard clamp.
+                if self._integral > self.i_clip:
+                    self._integral = self.i_clip
+                elif self._integral < -self.i_clip:
+                    self._integral = -self.i_clip
+
         self._last_err = error
         self._last_t = now
-        u = self.kp * error + self.kd * d_err
-        return max(-self.out_clip, min(self.out_clip, u))
+
+        u_unclipped = (self.kp * error
+                       + self.kd * d_err
+                       + self.ki * self._integral)
+        if u_unclipped > self.out_clip:
+            u = self.out_clip
+        elif u_unclipped < -self.out_clip:
+            u = -self.out_clip
+        else:
+            u = u_unclipped
+
+        # Back-calculation anti-windup. When the unclamped command
+        # was past saturation, unwind the integrator by exactly the
+        # excess so it can't keep growing while the actuator is
+        # pinned. Only meaningful with ki != 0.
+        if self.ki != 0.0 and u != u_unclipped:
+            self._integral -= (u_unclipped - u) / self.ki
+            if self._integral > self.i_clip:
+                self._integral = self.i_clip
+            elif self._integral < -self.i_clip:
+                self._integral = -self.i_clip
+
+        return u
+
+
+# Backwards-compatible alias. The old PD-only class name is widely
+# used in this module and in commit messages; keep it pointing at
+# the new PID class so the rest of the file (and any external tests)
+# don't have to change.
+PDController = PIDController
 
 
 # ---------------------------------------------------------------------------
@@ -396,11 +459,17 @@ class MissionController:
         self.get_tel = telemetry_provider
         self.on_phase_change = on_phase_change
 
-        # PD controllers
-        self.pd_yaw = PDController(cfg.yaw_kp, cfg.yaw_kd, cfg.yaw_rc_max)
-        self.pd_fwd = PDController(cfg.fwd_kp, cfg.fwd_kd, cfg.fwd_rc_max)
-        self.pd_lat = PDController(cfg.lat_kp, cfg.lat_kd, cfg.lat_rc_max)
-        self.pd_height = PDController(cfg.height_kp, cfg.height_kd, cfg.ud_rc_max)
+        # PD/PID controllers. ``ki`` defaults to 0 in cfg, so today's
+        # behaviour (pure PD) is preserved unless the operator bumps
+        # the I gains via /tune.
+        self.pd_yaw = PIDController(cfg.yaw_kp, cfg.yaw_kd, cfg.yaw_rc_max,
+                                     ki=cfg.yaw_ki, i_clip=cfg.yaw_i_clip)
+        self.pd_fwd = PIDController(cfg.fwd_kp, cfg.fwd_kd, cfg.fwd_rc_max,
+                                     ki=cfg.fwd_ki, i_clip=cfg.fwd_i_clip)
+        self.pd_lat = PIDController(cfg.lat_kp, cfg.lat_kd, cfg.lat_rc_max,
+                                     ki=cfg.lat_ki, i_clip=cfg.lat_i_clip)
+        self.pd_height = PIDController(cfg.height_kp, cfg.height_kd, cfg.ud_rc_max,
+                                        ki=cfg.height_ki, i_clip=cfg.height_i_clip)
 
         self.smoother = PoseSmoother(cfg.pose_smoothing_alpha, cfg.pose_max_age_s)
         # Dead-reckoning position estimator. Used by the DANCE script
@@ -431,15 +500,23 @@ class MissionController:
         cfg = self.cfg
         self.pd_yaw.kp = float(cfg.yaw_kp)
         self.pd_yaw.kd = float(cfg.yaw_kd)
+        self.pd_yaw.ki = float(cfg.yaw_ki)
+        self.pd_yaw.i_clip = float(cfg.yaw_i_clip)
         self.pd_yaw.out_clip = float(cfg.yaw_rc_max)
         self.pd_fwd.kp = float(cfg.fwd_kp)
         self.pd_fwd.kd = float(cfg.fwd_kd)
+        self.pd_fwd.ki = float(cfg.fwd_ki)
+        self.pd_fwd.i_clip = float(cfg.fwd_i_clip)
         self.pd_fwd.out_clip = float(cfg.fwd_rc_max)
         self.pd_lat.kp = float(cfg.lat_kp)
         self.pd_lat.kd = float(cfg.lat_kd)
+        self.pd_lat.ki = float(cfg.lat_ki)
+        self.pd_lat.i_clip = float(cfg.lat_i_clip)
         self.pd_lat.out_clip = float(cfg.lat_rc_max)
         self.pd_height.kp = float(cfg.height_kp)
         self.pd_height.kd = float(cfg.height_kd)
+        self.pd_height.ki = float(cfg.height_ki)
+        self.pd_height.i_clip = float(cfg.height_i_clip)
         self.pd_height.out_clip = float(cfg.ud_rc_max)
         self.smoother.alpha = float(cfg.pose_smoothing_alpha)
         self.smoother.max_age_s = float(cfg.pose_max_age_s)
