@@ -211,10 +211,21 @@ def cmd_fly(args: argparse.Namespace) -> int:
         # vision_worker / log_worker never see a "recording active but
         # recorder is None" race.
         if new_phase == Phase.TAKEOFF and recorder_box[0] is None:
+            # Refresh the serial from live telemetry. The startup
+            # capture (5 s window) returns "unknown" if the drone
+            # wasn't connected yet; telemetry_worker keeps the holder
+            # current after a late connect, so by TAKEOFF time the
+            # real serial is usually available. Without this refresh
+            # the flight directory ends up named "..._unknown" even
+            # though the drone is plainly connected.
+            nonlocal serial
+            tel_now = tel_holder.get()
+            if tel_now is not None and tel_now.serial_number:
+                serial = tel_now.serial_number
             new_dir = make_flight_dir(FLIGHTS_DIR, serial)
             recorder_box[0] = FlightRecorder(new_dir, fps=cfg.record_fps)
             flight_dir_box[0] = new_dir
-            print(f"[mission] flight artefacts: {new_dir}")
+            print(f"[mission] flight artefacts: {new_dir} (serial={serial})")
             try:
                 cfg.save(new_dir / "cfg_start.json")
             except Exception as e:
