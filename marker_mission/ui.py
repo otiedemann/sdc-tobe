@@ -237,6 +237,18 @@ _VIDEO_AND_STATUS_HTML = """
       <div id="script-list" style="font-size:.85rem;"></div>
     </details>
     {% endif %}
+    {% if mode != 'replay' %}
+    <h2>Position</h2>
+    <div style="display:flex; gap:.6rem; align-items:center;
+                margin-bottom:.6rem;">
+      <canvas id="c-pos" width="240" height="240"
+              style="background:#0c0f12; border-radius:6px;
+                     flex:0 0 auto;"></canvas>
+      <div id="c-pos-text" style="font-size:.8rem; color:#aab;
+                                    font-variant-numeric:tabular-nums;
+                                    line-height:1.5;">—</div>
+    </div>
+    {% endif %}
     <h2>{{ 'Replayed flight' if mode == 'replay' else 'Mission status' }}</h2>
     <table id="status">
       <tr><th>Phase</th><td id="s-phase">—</td></tr>
@@ -754,14 +766,16 @@ function updateStatus(s) {
   $('s-note').textContent = s.note || (s.abort_reason || '—');
   setMissionButtons(s.phase);
   drawRcWidgets(s);
+  drawPositionView(s);
 }
 if ($('btn-start')) $('btn-start').addEventListener('click', startMission);
 if ($('btn-stop'))  $('btn-stop').addEventListener('click',  stopMission);
 
 // ---- Live RC widget (used by /tune; harmless on pages without it) -------
 // Two 2D crosses (lr+fb on the left "throttle stick", yaw+ud on the
-// right) plus a row of four signed bars. Auto-scales axes against an
-// observed-max so it works without knowing the cfg's *_rc_max values.
+// right) plus a time-series history chart for the four channels.
+// Auto-scales axes against an observed-max so it works without
+// knowing the cfg's *_rc_max values.
 let _rcAbsMax = 25;
 function drawRc2D(canvasId, xVal, yVal, xLabel, yLabel) {
   const c = $(canvasId); if (!c) return;
@@ -785,53 +799,171 @@ function drawRc2D(canvasId, xVal, yVal, xLabel, yLabel) {
   ctx.strokeStyle = '#58c4ff66'; ctx.lineWidth = 1;
   ctx.beginPath(); ctx.moveTo(W/2, H/2); ctx.lineTo(xPx, yPx); ctx.stroke();
 }
-function drawRcBars(canvasId, channels) {
-  const c = $(canvasId); if (!c) return;
+function drawRcWidgets(s) {
+  // Skip when none of the RC canvases are present (i.e. not on /tune).
+  const has2d = $('c-rc-lr-fb') || $('c-rc-yaw-ud');
+  const hasHist = !!$('c-rc-history');
+  if (!has2d && !hasHist) return;
+  const rc = s.rc || {};
+  const vals = [rc.lr || 0, rc.fb || 0, rc.ud || 0, rc.yaw || 0];
+  const seen = Math.max(_rcAbsMax, ...vals.map(Math.abs));
+  if (seen > _rcAbsMax) _rcAbsMax = Math.ceil(seen / 5) * 5;
+  if (has2d) {
+    drawRc2D('c-rc-lr-fb',  rc.lr || 0, rc.fb || 0, 'lr', 'fb');
+    drawRc2D('c-rc-yaw-ud', rc.yaw || 0, rc.ud || 0, 'yaw', 'ud');
+  }
+  // Pages with HAS_CHARTS already pushed this tick inside updateCharts;
+  // tune-style pages haven't, so push here so the history chart fills.
+  if (hasHist && !HAS_CHARTS && !REPLAY_ID) pushSample(s);
+  if (hasHist) {
+    drawSeries('c-rc-history', [
+      {label:'rc_lr',  color:'#fb7185', data:buf.rc_lr,  legendX:0},
+      {label:'rc_fb',  color:'#34d399', data:buf.rc_fb,  legendX:1},
+      {label:'rc_ud',  color:'#60a5fa', data:buf.rc_ud,  legendX:2},
+      {label:'rc_yaw', color:'#fbbf24', data:buf.rc_yaw, legendX:3},
+    ], {target: 0});
+  }
+}
+
+// ---- Position view (used by /; harmless on pages without it) ------------
+// Top-down arena diagram: 1 m grid, wall labels (front/back/left/right),
+// origin tick, drone position dot + heading arrow.
+//
+// The arrow does NOT use tel.yaw because the Anafi's yaw=0 is its
+// takeoff-time / compass reference, not "facing the front wall". For
+// every flight the offset between tel.yaw and arena-frame yaw is
+// arbitrary, so a tel.yaw-based arrow is meaningless without a
+// per-flight calibration step.
+//
+// Instead we derive the drone's arena-frame yaw from the live marker
+// pose: drone yaw in arena = compass bearing of the active marker from
+// the drone (in arena frame) - yaw_to_marker (camera-frame angle to
+// the marker, CW positive). This needs world_position_m, the active
+// marker's world position (looked up from the cached arena), and
+// yaw_to_marker_deg from the snapshot. When any of those is missing
+// we just skip the arrow rather than draw a wrong one.
+let _arenaCache = null;
+let _arenaCacheTried = false;
+async function _ensureArenaCache() {
+  if (_arenaCacheTried) return;
+  _arenaCacheTried = true;
+  try {
+    const r = await fetch('/api/arena/active', {cache:'no-store'});
+    if (r.ok) _arenaCache = await r.json();
+  } catch (e) {}
+}
+function _droneYawArena(s) {
+  const pos = s.world_position_m;
+  if (!Array.isArray(pos) || pos.length !== 3) return null;
+  if (typeof s.yaw_to_marker_deg !== 'number') return null;
+  if (!_arenaCache || !Array.isArray(_arenaCache.markers)) return null;
+  const mid = s.active_marker_id;
+  if (mid == null) return null;
+  const marker = _arenaCache.markers.find(m => m.id === mid);
+  if (!marker) return null;
+  const dxm = marker.x - pos[0];
+  const dym = marker.y - pos[1];
+  // bearing of marker from drone (compass-style: 0 = +y arena, +CW)
+  const bearing = Math.atan2(dxm, dym) * 180 / Math.PI;
+  return bearing - s.yaw_to_marker_deg;     // arena-frame yaw, degrees
+}
+function drawPositionView(s) {
+  const c = $('c-pos'); if (!c) return;
+  _ensureArenaCache();
   const ctx = c.getContext('2d');
   const W = c.width, H = c.height;
   ctx.clearRect(0, 0, W, H);
-  const padL = 50, padR = 10, padT = 6, padB = 6;
-  const innerW = W - padL - padR;
-  const rowH = (H - padT - padB) / channels.length;
-  const colours = ['#fb7185','#34d399','#60a5fa','#fbbf24'];
-  const zeroX = padL + innerW / 2;
-  // axis
   ctx.strokeStyle = '#2a3038'; ctx.lineWidth = 1;
-  ctx.beginPath(); ctx.moveTo(zeroX, padT); ctx.lineTo(zeroX, H - padB);
+  ctx.strokeRect(0.5, 0.5, W-1, H-1);
+  const margin = 16;
+  const aw = (_arenaCache && _arenaCache.width_m) || 10;
+  const ad = (_arenaCache && _arenaCache.depth_m) || 10;
+  const pxPerM = Math.min((W - 2*margin) / aw, (H - 2*margin) / ad);
+  const cx = W/2, cy = H/2;
+  const ax = (xm) => cx + xm * pxPerM;
+  const ay = (ym) => cy - ym * pxPerM;
+  const xLeft = ax(-aw/2), xRight = ax(aw/2);
+  const yTop = ay(ad/2), yBot = ay(-ad/2);
+  // 1 m background grid clipped to the arena rect. Heavier line at
+  // the centre lines (origin axes).
+  const xMin = Math.ceil(-aw/2), xMax = Math.floor(aw/2);
+  const yMin = Math.ceil(-ad/2), yMax = Math.floor(ad/2);
+  ctx.strokeStyle = '#1d2229'; ctx.lineWidth = 1;
+  ctx.beginPath();
+  for (let xi = xMin; xi <= xMax; xi++) {
+    if (xi === 0) continue;
+    const xp = ax(xi);
+    ctx.moveTo(xp, yTop); ctx.lineTo(xp, yBot);
+  }
+  for (let yi = yMin; yi <= yMax; yi++) {
+    if (yi === 0) continue;
+    const yp = ay(yi);
+    ctx.moveTo(xLeft, yp); ctx.lineTo(xRight, yp);
+  }
   ctx.stroke();
-  ctx.fillStyle = '#aab'; ctx.font = '11px ui-sans-serif';
-  ctx.textAlign = 'right';
-  channels.forEach((ch, i) => {
-    const yMid = padT + rowH * (i + 0.5);
-    const v = ch.value || 0;
-    const px = (v / _rcAbsMax) * (innerW / 2 - 6);
-    const x0 = Math.min(zeroX, zeroX + px);
-    const w  = Math.abs(px);
-    ctx.fillStyle = colours[i % colours.length];
-    ctx.fillRect(x0, yMid - rowH * 0.30, Math.max(2, w), rowH * 0.60);
-    ctx.fillStyle = '#aab';
-    ctx.fillText(ch.label, padL - 6, yMid + 4);
-    ctx.textAlign = 'left';
-    ctx.fillText(String(v), padL + innerW + 4, yMid + 4);
-    ctx.textAlign = 'right';
-  });
-}
-function drawRcWidgets(s) {
-  // Skip when none of the RC canvases are present (i.e. not on /tune).
-  if (!$('c-rc-lr-fb') && !$('c-rc-yaw-ud') && !$('c-rc-bars')) return;
-  const rc = s.rc || {};
-  const vals = [rc.lr || 0, rc.fb || 0, rc.ud || 0, rc.yaw || 0];
-  const seen = Math.max(..._rcAbsMax ? [_rcAbsMax] : [25],
-                        ...vals.map(Math.abs));
-  if (seen > _rcAbsMax) _rcAbsMax = Math.ceil(seen / 5) * 5;
-  drawRc2D('c-rc-lr-fb',  rc.lr || 0, rc.fb || 0, 'lr', 'fb');
-  drawRc2D('c-rc-yaw-ud', rc.yaw || 0, rc.ud || 0, 'yaw', 'ud');
-  drawRcBars('c-rc-bars', [
-    {label: 'lr',  value: rc.lr  || 0},
-    {label: 'fb',  value: rc.fb  || 0},
-    {label: 'ud',  value: rc.ud  || 0},
-    {label: 'yaw', value: rc.yaw || 0},
-  ]);
+  // Origin axes (slightly brighter).
+  ctx.strokeStyle = '#2a3038';
+  ctx.beginPath();
+  ctx.moveTo(cx, yTop); ctx.lineTo(cx, yBot);
+  ctx.moveTo(xLeft, cy); ctx.lineTo(xRight, cy);
+  ctx.stroke();
+  // Arena rectangle.
+  if (_arenaCache) {
+    ctx.strokeStyle = '#aab'; ctx.lineWidth = 1.5;
+    ctx.strokeRect(xLeft, yTop, aw * pxPerM, ad * pxPerM);
+  }
+  // Wall captions.
+  ctx.fillStyle = '#778'; ctx.font = '9px ui-sans-serif';
+  ctx.textAlign = 'center';
+  ctx.fillText('front', cx, yTop - 4);
+  ctx.fillText('back',  cx, yBot + 9);
+  ctx.save(); ctx.translate(xLeft - 4, cy); ctx.rotate(-Math.PI/2);
+  ctx.fillText('left', 0, 0); ctx.restore();
+  ctx.save(); ctx.translate(xRight + 4, cy); ctx.rotate(Math.PI/2);
+  ctx.fillText('right', 0, 0); ctx.restore();
+  // Origin tick.
+  ctx.fillStyle = '#facc15';
+  ctx.beginPath(); ctx.arc(cx, cy, 2, 0, 2*Math.PI); ctx.fill();
+  // Drone position + heading arrow.
+  const pos = s.world_position_m;
+  const txt = $('c-pos-text');
+  if (Array.isArray(pos) && pos.length === 3) {
+    const dx = ax(pos[0]), dy = ay(pos[1]);
+    ctx.fillStyle = '#4ade80';
+    ctx.beginPath(); ctx.arc(dx, dy, 5, 0, 2*Math.PI); ctx.fill();
+    const yawArena = _droneYawArena(s);
+    let yawTxt = '—';
+    if (yawArena !== null) {
+      const yawRad = yawArena * Math.PI / 180;
+      const L = 18;
+      const ex = dx + L * Math.sin(yawRad);
+      const ey = dy - L * Math.cos(yawRad);     // canvas y flipped
+      ctx.strokeStyle = '#4ade80'; ctx.lineWidth = 2;
+      ctx.beginPath(); ctx.moveTo(dx, dy); ctx.lineTo(ex, ey); ctx.stroke();
+      const ang = Math.atan2(ey - dy, ex - dx);
+      const HEAD = 5;
+      ctx.fillStyle = '#4ade80';
+      ctx.beginPath();
+      ctx.moveTo(ex, ey);
+      ctx.lineTo(ex - HEAD * Math.cos(ang - Math.PI/6),
+                 ey - HEAD * Math.sin(ang - Math.PI/6));
+      ctx.lineTo(ex - HEAD * Math.cos(ang + Math.PI/6),
+                 ey - HEAD * Math.sin(ang + Math.PI/6));
+      ctx.closePath(); ctx.fill();
+      const norm = ((yawArena % 360) + 540) % 360 - 180;
+      yawTxt = norm.toFixed(1) + '°';
+    }
+    if (txt) {
+      const n = (s.world_position_used_markers || []).length;
+      txt.innerHTML = `x: <b style="color:#e6e6e6;">${pos[0].toFixed(2)}</b> m<br>`
+                    + `y: <b style="color:#e6e6e6;">${pos[1].toFixed(2)}</b> m<br>`
+                    + `z: <b style="color:#e6e6e6;">${pos[2].toFixed(2)}</b> m<br>`
+                    + `yaw: <b style="color:#e6e6e6;">${yawTxt}</b><br>`
+                    + `n markers: ${n}`;
+    }
+  } else {
+    if (txt) txt.textContent = 'World position unknown.';
+  }
 }
 
 // ---- Replay controls (only present in replay pages) ---------------------
@@ -1368,9 +1500,13 @@ _PAGE_TUNE = _PAGE_BASE_CSS + _PAGE_HEADER + _COMMON_SCRIPT + _PAGE_GRID_OPEN + 
                 style="background:#0c0f12; border-radius:6px;"></canvas>
         <div style="font-size:.75rem; color:#778; margin-top:.2rem;">yaw / ud</div>
       </div>
-      <canvas id="c-rc-bars" width="380" height="120"
-              style="background:#0c0f12; border-radius:6px;
-                     flex:1; min-width:280px;"></canvas>
+      <div style="flex:1; min-width:280px;">
+        <canvas id="c-rc-history" width="700" height="180"
+                style="background:#0c0f12; border-radius:6px;
+                       width:100%; height:auto;"></canvas>
+        <div style="font-size:.75rem; color:#778; margin-top:.2rem;
+                    text-align:center;">history</div>
+      </div>
     </div>
   </div>
   <div class="card">
