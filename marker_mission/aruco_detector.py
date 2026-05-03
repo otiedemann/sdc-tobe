@@ -73,6 +73,21 @@ class MarkerPose:
     marker_inplane_rot_deg: float    # marker's rotation within its own plane
     timestamp: float                 # monotonic seconds when the frame was decoded
     frame_size: tuple[int, int]      # (width, height) of the source frame
+    # Which solvePnP path produced this pose. One of:
+    #   "ippe_only"     -- IPPE_SQUARE returned only one front-facing
+    #                       candidate (or only one survived back-facing
+    #                       filter), used directly.
+    #   "ippe_lowerr"   -- two IPPE candidates; picked the lower
+    #                       reproj-err winner without temporal override.
+    #   "ippe_temporal" -- two IPPE candidates with similar reproj-err;
+    #                       temporal-continuity heading match overrode
+    #                       the lower-err winner.
+    #   "iterative"     -- IPPE failed entirely (no front-facing
+    #                       candidate or reproj-err > 2px), fell through
+    #                       to SOLVEPNP_ITERATIVE.
+    # Logged per tick so a flight log can be sliced by method when
+    # diagnosing position jumps.
+    pose_method: str = ""
 
 
 # ---------------------------------------------------------------------------
@@ -112,20 +127,20 @@ class ArucoDetector:
         self._params.cornerRefinementWinSize = 5
         self._detector = cv2.aruco.ArucoDetector(self._aruco_dict, self._params)
 
-        # Per-marker cache of the last accepted relative_heading_deg and
-        # its timestamp. Used to break the IPPE_SQUARE planar-pose
-        # ambiguity by temporal continuity: pick whichever IPPE candidate
-        # has the relative_heading closest to the previous accepted
-        # value. relative_heading_deg is purely geometric (angle between
-        # marker normal and marker->drone vector in horizontal plane)
-        # and gimbal-stabilised, so it does NOT need correction for
-        # drone yaw drift. An earlier version cached the camera-frame
-        # normal vector and compared by dot product, but that comparison
-        # was insensitive enough that the planar mirror could still flip
-        # in (flight 22-38-36 orbit: hdg jumped +28 -> -4 -> -25 in two
-        # frames while distance stayed put -- an instantaneous mirror,
-        # not motion). Comparing the actual hdg quantity catches it.
-        self._prev_relhdg: dict[int, tuple[float, float]] = {}
+        # Per-marker cache of the last accepted rvec + timestamp. Used to
+        # break the IPPE_SQUARE planar-pose ambiguity by temporal
+        # continuity: the two IPPE candidates for a planar marker differ
+        # by a large rotation (often ~180 deg about an axis in the
+        # marker plane), so the wrong one is far from the previous
+        # frame's rvec while the right one stays close. Earlier versions
+        # cached only relative_heading_deg, which is just the horizontal
+        # projection of the marker normal -- it doesn't distinguish the
+        # two solutions when their tilt difference is mostly vertical
+        # (flights 2026-05-02_19-10-53 etc. flipped world-X by O(2 m)
+        # frame-to-frame on off-centre markers because of this). Caching
+        # the full rvec uses the entire 3-DOF rotation as the
+        # discriminator, which is reliable.
+        self._prev_rvec: dict[int, tuple[np.ndarray, float]] = {}
         self._ambiguity_max_age_s = 5.0  # cache invalidates after this gap
 
         # 3D marker corners in marker frame, OpenCV ArUco order TL-TR-BR-BL,
@@ -172,12 +187,30 @@ class ArucoDetector:
             if ok:
                 for r, t, e in zip(rvecs, tvecs, errs):
                     r = r.ravel(); t = t.ravel()
-                    if np.all(np.isfinite(r)) and np.all(np.isfinite(t)):
-                        candidates.append((r, t, float(np.asarray(e).ravel()[0])))
+                    if not (np.all(np.isfinite(r)) and np.all(np.isfinite(t))):
+                        continue
+                    # Reject the back-facing IPPE solution. For a
+                    # near-fronto-parallel marker the planar ambiguity
+                    # can degenerate so that one of the two candidates
+                    # places the marker normal in +cam_z (i.e., facing
+                    # away from the camera) -- physically impossible
+                    # because we just decoded the marker's pixels, but
+                    # mathematically a valid second solution. R @ (0,0,1)
+                    # is the marker normal in camera frame, and its
+                    # z-component is R[2,2]; front-facing must have it
+                    # negative. Filtering here means the rvec stored on
+                    # MarkerPose is always front-facing, so downstream
+                    # consumers (arena.position_from_marker) don't have
+                    # to rediscover the issue.
+                    R, _ = cv2.Rodrigues(r.reshape(3, 1))
+                    if R[2, 2] >= 0.0:
+                        continue
+                    candidates.append((r, t, float(np.asarray(e).ravel()[0])))
 
             chosen_rvec: Optional[np.ndarray] = None
             chosen_tvec: Optional[np.ndarray] = None
             chosen_pose: Optional[MarkerPose] = None
+            chosen_method: str = ""
             if candidates:
                 # Build the full pose for each candidate so we can
                 # compare on the actual relative_heading we care about
@@ -194,11 +227,15 @@ class ArucoDetector:
                 # truly ambiguous case where IPPE flips on noise).
                 scored.sort(key=lambda x: x[3])
 
-                prev = self._prev_relhdg.get(mid)
-                prev_hdg = (prev[0] if prev is not None
-                            and (ts - prev[1]) < self._ambiguity_max_age_s
-                            else None)
-                if prev_hdg is not None and len(scored) > 1:
+                # Default tag before any temporal override fires.
+                chosen_method = ("ippe_only" if len(scored) == 1
+                                 else "ippe_lowerr")
+
+                prev = self._prev_rvec.get(mid)
+                prev_rvec = (prev[0] if prev is not None
+                             and (ts - prev[1]) < self._ambiguity_max_age_s
+                             else None)
+                if prev_rvec is not None and len(scored) > 1:
                     best_err = scored[0][3]
                     second_err = scored[1][3]
                     # "Ambiguous" = both fit reasonably AND errs are close.
@@ -209,11 +246,11 @@ class ArucoDetector:
                     ambiguous = (best_err < 1.0
                                  and second_err < 2.0 * best_err + 0.2)
                     if ambiguous:
-                        def hdg_delta(item):
-                            d = ((item[0].relative_heading_deg - prev_hdg
-                                  + 540.0) % 360.0) - 180.0
-                            return abs(d)
-                        scored.sort(key=hdg_delta)
+                        before = scored[0]
+                        scored.sort(key=lambda item:
+                                    self._rvec_angle(item[1], prev_rvec))
+                        if scored[0] is not before:
+                            chosen_method = "ippe_temporal"
 
                 chosen_pose, chosen_rvec, chosen_tvec, chosen_err = scored[0]
 
@@ -252,14 +289,31 @@ class ArucoDetector:
                         or not np.all(np.isfinite(rvec))
                         or not np.all(np.isfinite(tvec))):
                     continue
+                # Same back-facing rejection as the IPPE branch above --
+                # ITERATIVE doesn't suffer the planar ambiguity but a
+                # poorly conditioned image can still converge wrong.
+                R_iter, _ = cv2.Rodrigues(rvec.reshape(3, 1))
+                if R_iter[2, 2] >= 0.0:
+                    continue
                 chosen_rvec = rvec.ravel()
                 chosen_tvec = tvec.ravel()
                 chosen_pose = self._build_pose(mid, img_pts, chosen_rvec,
                                                chosen_tvec, ts, (W, H))
+                chosen_method = "iterative"
 
-            self._prev_relhdg[mid] = (chosen_pose.relative_heading_deg, ts)
+            chosen_pose.pose_method = chosen_method
+            self._prev_rvec[mid] = (np.asarray(chosen_rvec).copy(), ts)
             out.append(chosen_pose)
         return out
+
+    @staticmethod
+    def _rvec_angle(r1: np.ndarray, r2: np.ndarray) -> float:
+        """Angular distance (radians) between two Rodrigues rotations.
+        Used as the IPPE planar-ambiguity tie-breaker."""
+        R1, _ = cv2.Rodrigues(np.asarray(r1).reshape(3, 1))
+        R2, _ = cv2.Rodrigues(np.asarray(r2).reshape(3, 1))
+        cos_angle = (np.trace(R1 @ R2.T) - 1.0) * 0.5
+        return math.acos(max(-1.0, min(1.0, cos_angle)))
 
     # ----------------------------------------------------------------- build
     @staticmethod
@@ -288,16 +342,15 @@ class ArucoDetector:
         # by R to express it in the camera frame.
         R, _ = cv2.Rodrigues(rvec.reshape(3, 1))
         n_cam = (R @ np.array([0.0, 0.0, 1.0])).astype(float)
-        # n_cam.z should be NEGATIVE when the camera is looking at the
-        # marker's front face (the normal points back towards the camera).
-        # solvePnP with a planar square sometimes returns the front/back-
-        # ambiguous mirror solution (identity rotation) for a perfectly
-        # centred, fronto-parallel marker.  Since ArUco IDs are only
-        # readable from the front, any apparent "back-facing" pose is
-        # the spurious one -- flip the normal so all downstream geometry
-        # behaves as if the marker correctly faces the camera.
-        if n_cam[2] > 0:
-            n_cam = -n_cam
+        # n_cam.z is guaranteed negative (front-facing) here: the IPPE
+        # candidate loop in detect() already filters out any solution
+        # with R[2,2] >= 0 before this is called. If a future change
+        # ever feeds a back-facing pose in, downstream geometry
+        # (relative_heading, arena.position_from_marker) silently
+        # produces wrong values -- catch it loudly instead.
+        assert n_cam[2] < 0.0, (
+            f"_build_pose given back-facing pose for marker {marker_id}: "
+            f"n_cam={n_cam!r}; detect() should have filtered it")
 
         # --- Yaw to marker (aerospace: + = nose right, CW from above) -------
         # Project the camera->marker vector onto the camera's horizontal
