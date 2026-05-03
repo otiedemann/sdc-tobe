@@ -395,14 +395,16 @@ document.addEventListener('keydown', e => {
   if (e.ctrlKey || e.metaKey || e.altKey) return;     // browser shortcuts win
   if (String(e.key || '').toUpperCase()
       !== String(KILLSWITCH_KEY).toUpperCase()) return;
-  // Don't fire (and don't swallow the keystroke) when the operator is
-  // editing the killswitch_key tune input itself -- otherwise every
-  // attempt to overwrite the current key would trigger the killswitch
-  // instead of typing the new value into the field.
+  // Don't fire when the operator is editing the killswitch_key tune
+  // input itself -- otherwise every attempt to overwrite the current
+  // key would trigger the killswitch instead of typing a new value.
   const t = e.target;
   if (t && t.classList && t.classList.contains('tune-input')
       && t.dataset && t.dataset.name === 'killswitch_key') return;
-  e.preventDefault(); e.stopPropagation();
+  // Fire the killswitch but DON'T preventDefault: the operator may
+  // also need that character to land in an input (e.g. typing "0"
+  // into a number field while killswitch_key="0"). Letting the
+  // keystroke through means the killswitch is purely additive.
   _killswitchBanner();
   _beep(220, 350);                                    // distinct lower tone
   fetch('/api/stop', {method: 'POST'}).catch(() => {});
@@ -3205,13 +3207,30 @@ class UiServer:
             if self.on_start is None:
                 return jsonify({"ok": False,
                                 "error": "no start handler registered"}), 500
-            # Optional script in the body. If present, parse it (with
-            # cfg defaults) and install on the controller before
-            # triggering. Persist as the active draft as well so the
-            # next page-load shows what we actually flew.
+            # Resolve the script in this priority order:
+            #   1. ``script`` in the request body (Camera page sends the
+            #      live textarea content here, including any unflushed
+            #      edits within the autosave debounce).
+            #   2. Active draft on disk (~/.marker_mission/active_mission_script.txt).
+            #      The Camera-page editor autosaves to this file on every
+            #      keystroke. Sidebars on /charts /tune /arena /calibrate
+            #      have a Start button but no editor; they hit /api/start
+            #      with no script body, and we want them to launch the
+            #      operator's saved script -- NOT the hardcoded default.
+            #   3. (No load) -- controller.trigger() falls back to the
+            #      hardcoded default script.
             data = request.get_json(silent=True) or {}
             script_text = data.get("script") if isinstance(data, dict) else None
-            if script_text is not None and self.controller is not None and self.cfg is not None:
+            if not script_text:                      # None or "" -> try draft
+                from .mission_script import load_priority_script
+                from .config import ACTIVE_MISSION_SCRIPT_PATH
+                try:
+                    script_text = load_priority_script(
+                        ACTIVE_MISSION_SCRIPT_PATH, self.flights_root)
+                except Exception as e:
+                    print(f"[ui] active-draft load failed: {e}")
+                    script_text = None
+            if script_text and self.controller is not None and self.cfg is not None:
                 from .mission_script import (parse as parse_script,
                                               defaults_from_cfg, ScriptError)
                 try:
@@ -3222,10 +3241,13 @@ class UiServer:
                                     "error": "script parse error",
                                     "script_error": str(e)}), 400
                 self.controller.set_script(steps)
-                try:
-                    self._write_active_script(script_text)
-                except Exception as e:
-                    print(f"[ui] active draft save failed: {e}")
+                # Only write the active draft if the body carried it --
+                # don't overwrite the file with what we just read from it.
+                if data.get("script"):
+                    try:
+                        self._write_active_script(data["script"])
+                    except Exception as e:
+                        print(f"[ui] active draft save failed: {e}")
             try:
                 started = bool(self.on_start())
             except Exception as e:
