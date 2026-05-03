@@ -48,6 +48,8 @@ _CSV_FIELDS = [
     "marker_id", "marker_seen",
     "target_distance_m", "target_relative_heading_deg",
     "mission_step_idx",
+    "world_x", "world_y", "world_z", "world_n_used",
+    "target_pose_method", "arena_pose_methods", "arena_per_marker_world",
     "rc_lr", "rc_fb", "rc_ud", "rc_yaw",
     "tel_battery", "tel_yaw", "tel_pitch", "tel_roll",
     "tel_height_cm", "tel_flight_time_s",
@@ -238,6 +240,27 @@ class FlightRecorder:
             # list without re-deriving it from phase transitions.
             mi = snap.get("mission_step_idx")
             row["mission_step_idx"] = "" if mi is None else str(mi)
+            wp = snap.get("world_position_m")
+            if wp is not None:
+                row["world_x"] = f"{wp[0]:.3f}"
+                row["world_y"] = f"{wp[1]:.3f}"
+                row["world_z"] = f"{wp[2]:.3f}"
+            wpu = snap.get("world_position_used_markers") or []
+            row["world_n_used"] = str(len(wpu))
+            row["target_pose_method"] = snap.get("target_pose_method", "") or ""
+            wpm = snap.get("world_position_pose_methods") or []
+            # Format as "id:method|id:method" so the CSV stays one
+            # column but the per-marker breakdown is recoverable.
+            row["arena_pose_methods"] = "|".join(
+                f"{mid}:{meth}"
+                for mid, meth in zip(wpu, wpm))
+            wppm = snap.get("world_position_per_marker") or []
+            # Format: "id:x,y,z|id:x,y,z" -- per-marker camera world
+            # position vote BEFORE the weighted average, so per-marker
+            # bias can be diagnosed from the log.
+            row["arena_per_marker_world"] = "|".join(
+                f"{mid}:{p[0]:.3f},{p[1]:.3f},{p[2]:.3f}"
+                for mid, p in zip(wpu, wppm))
             rc = snap["rc"]
             row["rc_lr"] = rc["lr"]; row["rc_fb"] = rc["fb"]
             row["rc_ud"] = rc["ud"]; row["rc_yaw"] = rc["yaw"]

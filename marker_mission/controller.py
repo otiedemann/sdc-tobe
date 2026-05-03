@@ -362,6 +362,26 @@ class MissionState:
     dance_origin_xy_m: Optional[tuple[float, float]] = None
     dance_origin_height_m: Optional[float] = None
 
+    # Arena-frame world position (camera centre), populated by
+    # vision_worker once an ArenaConfig is loaded. None until either
+    # the arena config is missing or no reference marker is in view.
+    world_position_m: Optional[tuple[float, float, float]] = None
+    world_position_used_markers: List[int] = field(default_factory=list)
+    # Per-contributing-marker solvePnP method (same order as
+    # world_position_used_markers). Used by the recorder so flight
+    # logs can be sliced by method when diagnosing position jumps.
+    world_position_pose_methods: List[str] = field(default_factory=list)
+    # Per-contributing-marker world-position vote (same order as
+    # world_position_used_markers). Each entry is the (x, y, z) the
+    # estimator derived from THIS marker alone, before the weighted
+    # average. Used to debug per-marker bias.
+    world_position_per_marker: List[tuple[float, float, float]] = field(
+        default_factory=list)
+    # solvePnP method for the controller's active TARGET marker
+    # (whatever pose_holder.get() returned this tick). "" when the
+    # target marker isn't currently in view.
+    target_pose_method: str = ""
+
     abort_reason: str = ""
     note: str = ""                                            # informational
 
@@ -399,6 +419,11 @@ class MissionState:
             self.dance_mode = None
             self.dance_origin_xy_m = None
             self.dance_origin_height_m = None
+            self.world_position_m = None
+            self.world_position_used_markers = []
+            self.world_position_pose_methods = []
+            self.world_position_per_marker = []
+            self.target_pose_method = ""
             self.abort_reason = ""
             self.note = ""
 
@@ -435,6 +460,16 @@ class MissionState:
                 "mission_step_idx": self.mission_step_idx,
                 "current_step_kind": self.current_step_kind,
                 "height_target_m": self.height_target_m,
+                "world_position_m": (list(self.world_position_m)
+                                     if self.world_position_m is not None
+                                     else None),
+                "world_position_used_markers": list(
+                    self.world_position_used_markers),
+                "world_position_pose_methods": list(
+                    self.world_position_pose_methods),
+                "world_position_per_marker": [list(p) for p in
+                                              self.world_position_per_marker],
+                "target_pose_method": self.target_pose_method,
                 "abort_reason": self.abort_reason,
                 "note": self.note,
             }

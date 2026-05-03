@@ -251,6 +251,7 @@ _VIDEO_AND_STATUS_HTML = """
       <tr><th>Drone yaw</th><td id="s-dy">—</td></tr>
       <tr><th>Height</th><td id="s-ht">—</td></tr>
       <tr><th>Target height</th><td id="s-ht-tgt">—</td></tr>
+      <tr><th>World position</th><td id="s-wp">—</td></tr>
       <tr><th>Flying</th><td id="s-fl">—</td></tr>
       <tr><th>Note</th><td id="s-note">—</td></tr>
     </table>
@@ -604,6 +605,15 @@ function updateStatus(s) {
   if ($('s-ht-tgt')) {
     $('s-ht-tgt').textContent = (s.height_target_m !== undefined && s.height_target_m !== null)
       ? (s.height_target_m.toFixed(2) + ' m') : '—';
+  }
+  if ($('s-wp')) {
+    if (Array.isArray(s.world_position_m) && s.world_position_m.length === 3) {
+      const [wx, wy, wz] = s.world_position_m;
+      const n = (s.world_position_used_markers || []).length;
+      $('s-wp').textContent = `(${wx.toFixed(2)}, ${wy.toFixed(2)}, ${wz.toFixed(2)}) m  · n=${n}`;
+    } else {
+      $('s-wp').textContent = '—';
+    }
   }
   $('s-fl').textContent  = t.flying ? 'yes' : 'no';
   $('s-note').textContent = s.note || (s.abort_reason || '—');
@@ -1540,7 +1550,6 @@ loadView();
 refreshSnapshots();
 </script>
 """
-
 
 # ---------------------------------------------------------------------------
 # UI server

@@ -393,6 +393,52 @@ class FlightReplay:
         else:
             cur_kind = None
 
+        # Arena world-position estimate logged by the recorder. world_x/y/z
+        # may be empty strings when no reference marker was visible at that
+        # tick, in which case we just leave the state field None so the UI
+        # shows "—" instead of (0, 0, 0).
+        wx = self._fnum(row, "world_x")
+        wy = self._fnum(row, "world_y")
+        wz = self._fnum(row, "world_z")
+        if wx is not None and wy is not None and wz is not None:
+            world_pos = (wx, wy, wz)
+        else:
+            world_pos = None
+        wnu = self._fnum(row, "world_n_used")
+        world_n_used_int = int(wnu) if wnu is not None else 0
+
+        # Pose-method tags. CSV stores arena methods as "id:method|id:method".
+        target_pose_method = (row.get("target_pose_method") or "").strip()
+        arena_methods_blob = (row.get("arena_pose_methods") or "").strip()
+        used_marker_ids: List[int] = []
+        used_methods: List[str] = []
+        if arena_methods_blob:
+            for chunk in arena_methods_blob.split("|"):
+                if ":" not in chunk:
+                    continue
+                mid_s, meth = chunk.split(":", 1)
+                try:
+                    used_marker_ids.append(int(mid_s))
+                    used_methods.append(meth)
+                except ValueError:
+                    pass
+        # Per-marker world-position votes ("id:x,y,z|id:x,y,z").
+        per_marker_blob = (row.get("arena_per_marker_world") or "").strip()
+        per_marker_world: List[tuple] = []
+        if per_marker_blob:
+            for chunk in per_marker_blob.split("|"):
+                if ":" not in chunk:
+                    continue
+                _, xyz = chunk.split(":", 1)
+                parts = xyz.split(",")
+                if len(parts) != 3:
+                    continue
+                try:
+                    per_marker_world.append(
+                        (float(parts[0]), float(parts[1]), float(parts[2])))
+                except ValueError:
+                    pass
+
         with self.state.lock:
             self.state.phase = phase
             self.state.last_telemetry = tel_snap
@@ -403,6 +449,20 @@ class FlightReplay:
                 self._fnum(row, "target_relative_heading_deg") or 0.0)
             self.state.mission_step_idx = s_idx
             self.state.current_step_kind = cur_kind
+            self.state.world_position_m = world_pos
+            # If the new arena_pose_methods column is present we know
+            # which markers contributed; otherwise (older flights) fall
+            # back to a placeholder list of the right length so the
+            # status tile still shows the count.
+            if used_marker_ids:
+                self.state.world_position_used_markers = used_marker_ids
+                self.state.world_position_pose_methods = used_methods
+            else:
+                self.state.world_position_used_markers = (
+                    [-1] * world_n_used_int if world_n_used_int > 0 else [])
+                self.state.world_position_pose_methods = []
+            self.state.world_position_per_marker = per_marker_world
+            self.state.target_pose_method = target_pose_method
             self.state.last_rc = (
                 int(self._fnum(row, "rc_lr") or 0),
                 int(self._fnum(row, "rc_fb") or 0),

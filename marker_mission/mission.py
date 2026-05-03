@@ -48,6 +48,7 @@ import numpy as np
 from .aruco_detector import ArucoDetector, MarkerPose, annotate_frame
 from .calibration_store import (Calibration, CalibrationStore,
                                 calibrate_from_video)
+from .arena import ArenaConfig, estimate_position
 from .config import (CALIB_DIR, FLIGHTS_DIR, DEFAULT_DATA_DIR,
                      PER_FLIGHT_SCRIPT_FILENAME, MissionConfig)
 from .controller import MissionController, MissionState, Phase
@@ -181,6 +182,28 @@ def cmd_fly(args: argparse.Namespace) -> int:
     reader = MjpegStreamReader(api.video_url())
     reader.start()
     detector = ArucoDetector(calibration, cfg.marker_size_m, cfg.aruco_dict)
+
+    # ---------- 2b. Optional arena world-position estimator --------------
+    # When --arena-config is given, vision_worker computes the camera's
+    # world (arena) position each frame as a weighted average of the
+    # per-marker pose inversions. Without it the estimator is silently
+    # disabled and state.world_position_m stays None.
+    arena: Optional[ArenaConfig] = None
+    if args.arena_config:
+        try:
+            arena = ArenaConfig.load(Path(args.arena_config))
+            print(f"[mission] arena loaded from {args.arena_config}: "
+                  f"{len(arena.markers)} markers, "
+                  f"size={arena.marker_size_m:.3f}m")
+            if abs(arena.marker_size_m - cfg.marker_size_m) > 1e-3:
+                print(f"[mission] WARNING: arena marker_size_m="
+                      f"{arena.marker_size_m} differs from cfg.marker_size_m="
+                      f"{cfg.marker_size_m}; controller still uses cfg value "
+                      f"for the detector")
+        except Exception as e:
+            print(f"[mission] arena_config load failed ({e}); "
+                  f"world position estimator disabled")
+            arena = None
 
     pose_holder = _PoseHolder()
     tel_holder = _TelemetryHolder()
@@ -378,6 +401,37 @@ def cmd_fly(args: argparse.Namespace) -> int:
                 target = next((p for p in poses
                                if p.marker_id == active_mid), None)
                 pose_holder.set(target)
+                # Arena world-position estimate from every visible
+                # reference marker (weighted by inverse distance).
+                # Missing arena_config or no reference marker visible
+                # leaves state.world_position_m as None.
+                if arena is not None:
+                    est = estimate_position(arena, poses)
+                    with state.lock:
+                        if est is not None:
+                            state.world_position_m = (
+                                float(est.position_m[0]),
+                                float(est.position_m[1]),
+                                float(est.position_m[2]),
+                            )
+                            state.world_position_used_markers = list(
+                                est.used_markers)
+                            state.world_position_pose_methods = [
+                                est.per_marker_method.get(mid, "")
+                                for mid in est.used_markers]
+                            state.world_position_per_marker = [
+                                tuple(float(c) for c in
+                                      est.per_marker_position_m[mid])
+                                for mid in est.used_markers]
+                        else:
+                            state.world_position_m = None
+                            state.world_position_used_markers = []
+                            state.world_position_pose_methods = []
+                            state.world_position_per_marker = []
+                # Active target's pose method (or empty if not in view).
+                with state.lock:
+                    state.target_pose_method = (
+                        target.pose_method if target is not None else "")
                 # Status overlay -------------------------------------------
                 # Use the smoothed values from state.snapshot() so the
                 # baked-in overlay matches what the CSV records and what
@@ -590,6 +644,10 @@ def _build_parser() -> argparse.ArgumentParser:
                     help="port for the operator UI (default 8080)")
     pf.add_argument("--resolution", default="720p",
                     help="video resolution label for calibration lookup")
+    pf.add_argument("--arena-config", default=None,
+                    help="path to an arena_config*.json (marker world "
+                         "positions + walls). Without it the world-position "
+                         "estimator is disabled but everything else runs.")
 
     pc = sub.add_parser("calibrate", help="run intrinsic calibration on a video")
     pc.add_argument("--video", required=True, help="path to checkerboard video")
