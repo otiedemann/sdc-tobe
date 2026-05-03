@@ -192,6 +192,46 @@ clock drift. Marker-loss inside the HOLD timer is tolerated up to the
 grace window (`search_marker_lost_grace_s`); beyond that it escalates
 to SEARCH.
 
+### `AWAIT <marker-id> <timeout-seconds>`
+
+| Arguments | both required; no defaults |
+|---|---|
+| Starting phase | `HOLD` if `last_completed_step_kind == "APPROACH"`, otherwise `IDLE` |
+| Per-step state | `state.await_marker_id = step.marker_id` (cleared by every other step's `_apply_step_to_phase`) plus the same HOLD/IDLE per-step state as `HOOVER` |
+| Exit | awaited marker visible → `_advance_script("AWAIT marker N seen")`; otherwise timer expires → `_advance_script("hold complete" / "idle complete")` |
+
+`vision_worker` publishes the full visible-marker set to
+`state.visible_marker_ids` on every detect tick. `_step_hold` and
+`_step_idle` snapshot it under the state lock and, when
+`state.await_marker_id is not None`, advance the script as soon as
+that id appears. The early-exit check runs *before* the timer check,
+so a marker seen on the very last tick still triggers an early exit
+rather than a timeout exit.
+
+The awaited marker need not be the controller's `active_marker_id`:
+e.g. you can `APPROACH 4` then `AWAIT 7 10` to station-keep on
+marker 4 while watching for marker 7 to appear elsewhere in the
+scene. If marker 7 never appears within 10 s the step ends as a
+normal HOLD/IDLE timeout.
+
+`await_marker_id` is reset to `None` at the top of every
+`_apply_step_to_phase` call (except for the AWAIT step itself), so it
+can never leak into a subsequent step.
+
+### `PAUSE <seconds>`
+
+| Arguments | required; no default |
+|---|---|
+| Starting phase | `IDLE` (always — never HOLD) |
+| Per-step state | `state.idle_until = now + step.seconds` |
+| Exit | timer expires → `_advance_script("idle complete")` |
+
+`PAUSE` is unconditionally `IDLE` regardless of what came before. It
+sends `rc = (0,0,0,0)` for the whole duration and never station-keeps.
+Use it when you want a clean stop between two `APPROACH` steps, or as
+a fixed cooldown that mustn't carry HOLD state forward. Unlike
+`AWAIT` it has no early-exit condition.
+
 ### `HEIGHT [<height>]`
 
 | Arguments | optional; default to `cfg.default_height_m`. Clamped to `[min_height_m, max_height_m]` at apply time. |

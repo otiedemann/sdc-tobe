@@ -439,6 +439,12 @@ def cmd_fly(args: argparse.Namespace) -> int:
                 target = next((p for p in poses
                                if p.marker_id == active_mid), None)
                 pose_holder.set(target)
+                # Publish the full visible-marker set to state so AWAIT
+                # can early-exit when its target id appears, even if
+                # that id isn't the controller's active marker.
+                with state.lock:
+                    state.visible_marker_ids = [int(p.marker_id)
+                                                 for p in poses]
                 # Arena world-position estimate from every visible
                 # reference marker (weighted by inverse distance).
                 # Missing arena_config or no reference marker visible

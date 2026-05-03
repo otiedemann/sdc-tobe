@@ -6,14 +6,23 @@ that ``MissionController._advance_script`` walks one at a time. The
 language is one-command-per-line, case-insensitive, with ``#`` comments
 and blank lines ignored.
 
-Six commands:
+Eight commands:
 
     TAKEOFF
     APPROACH [<marker-id>] [<distance>]
     HOOVER   [<seconds>]
+    AWAIT    <marker-id> <timeout-seconds>
+    PAUSE    <seconds>
     LAND
     HEIGHT   [<height>]
     DANCE    [<seconds>] [<mode>]            mode in {wobble, spin, random}
+
+AWAIT behaves like HOOVER (HOLD-style station-keeping if the previous
+step was APPROACH, otherwise IDLE) but exits early as soon as the
+named marker becomes visible. The timeout is a hard upper bound.
+
+PAUSE is unconditional IDLE for the given seconds (rc = 0 throughout).
+Useful for fixed pauses regardless of what came before.
 
 Omitted arguments fall back to ``MissionConfig`` defaults at parse time
 (passed in via the ``defaults`` dict). Invalid syntax raises
@@ -125,6 +134,30 @@ def parse(text: str, defaults: dict) -> List[Step]:
                 raise ScriptError(raw_line_no,
                                   f"HOOVER seconds must be >= 0, got {sec}")
             out.append(Step(kind="HOOVER", seconds=sec, line_no=raw_line_no))
+        elif cmd == "AWAIT":
+            if len(args) != 2:
+                raise ScriptError(raw_line_no,
+                                  f"AWAIT takes exactly 2 arguments "
+                                  f"(<marker-id> <timeout-seconds>), got "
+                                  f"{len(args)}")
+            mid = _parse_int(args[0], raw_line_no, "AWAIT marker-id")
+            sec = _parse_float(args[1], raw_line_no, "AWAIT timeout-seconds")
+            if sec < 0:
+                raise ScriptError(raw_line_no,
+                                  f"AWAIT timeout must be >= 0, got {sec}")
+            out.append(Step(kind="AWAIT",
+                            marker_id=mid, seconds=sec,
+                            line_no=raw_line_no))
+        elif cmd == "PAUSE":
+            if len(args) != 1:
+                raise ScriptError(raw_line_no,
+                                  f"PAUSE takes exactly 1 argument "
+                                  f"(<seconds>), got {len(args)}")
+            sec = _parse_float(args[0], raw_line_no, "PAUSE seconds")
+            if sec < 0:
+                raise ScriptError(raw_line_no,
+                                  f"PAUSE seconds must be >= 0, got {sec}")
+            out.append(Step(kind="PAUSE", seconds=sec, line_no=raw_line_no))
         elif cmd == "LAND":
             if args:
                 raise ScriptError(raw_line_no,
@@ -172,6 +205,10 @@ def format(steps: List[Step]) -> str:
             lines.append(f"APPROACH {s.marker_id} {s.distance:g}")
         elif s.kind == "HOOVER":
             lines.append(f"HOOVER {s.seconds:g}")
+        elif s.kind == "AWAIT":
+            lines.append(f"AWAIT {s.marker_id} {s.seconds:g}")
+        elif s.kind == "PAUSE":
+            lines.append(f"PAUSE {s.seconds:g}")
         elif s.kind == "LAND":
             lines.append("LAND")
         elif s.kind == "HEIGHT":

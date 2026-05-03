@@ -97,6 +97,46 @@ Done when the timer expires.
 
 ---
 
+### `AWAIT <marker-id> <timeout-seconds>`
+
+> Hover (like `HOOVER`) but exit early as soon as a specific marker is
+> seen.
+
+Behaviour matches `HOOVER`:
+
+- **After `APPROACH`** — station-keeping HOLD on the previously
+  approached marker.
+- **Otherwise** — IDLE.
+
+The difference is the early-exit condition: as soon as `marker-id`
+appears in the detector's visible-marker set, the script advances
+immediately. If the marker is never seen, the step ends after
+`timeout-seconds`.
+
+Arguments:
+- `marker-id`: id to watch for. Required.
+- `timeout-seconds`: hard upper bound. Required.
+
+Done when the awaited marker is seen *or* the timeout expires.
+
+---
+
+### `PAUSE <seconds>`
+
+> Unconditional IDLE for the given seconds.
+
+Sends `rc = (0,0,0,0)` for the whole duration regardless of what came
+before. No HOLD station-keeping, no early exit. Useful for fixed
+pauses — e.g. between two `APPROACH` steps when you want a clean stop
+rather than carrying station-keeping state forward.
+
+Arguments:
+- `seconds`: pause duration. Required.
+
+Done when the timer expires.
+
+---
+
 ### `HEIGHT [<height>]`
 
 > Drive the drone to a specific altitude.

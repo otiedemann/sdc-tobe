@@ -361,6 +361,16 @@ class MissionState:
     dance_mode: Optional[str] = None
     dance_origin_xy_m: Optional[tuple[float, float]] = None
     dance_origin_height_m: Optional[float] = None
+    # AWAIT step: when set, _step_idle / _step_hold advance the
+    # script as soon as this marker id appears in
+    # state.visible_marker_ids (see vision_worker). Cleared on every
+    # _apply_step_to_phase call so it doesn't leak across steps.
+    await_marker_id: Optional[int] = None
+    # All marker ids the detector reports this frame. Maintained by
+    # vision_worker on every detect tick. Used by AWAIT for early
+    # exit and by anything else that wants a "what's visible right
+    # now" signal.
+    visible_marker_ids: List[int] = field(default_factory=list)
 
     # Arena-frame world position (camera centre), populated by
     # vision_worker once an ArenaConfig is loaded. None until either
@@ -416,6 +426,8 @@ class MissionState:
             self.idle_until = None
             self.height_target_m = None
             self.dance_until = None
+            self.await_marker_id = None
+            self.visible_marker_ids = []
             self.dance_mode = None
             self.dance_origin_xy_m = None
             self.dance_origin_height_m = None
@@ -1224,6 +1236,16 @@ class MissionController:
         with self.state.lock:
             began = self.state.hold_began_at
             hold_time_s = self.state.hold_time_s
+            await_id = self.state.await_marker_id
+            visible_now = (set(self.state.visible_marker_ids)
+                           if await_id is not None else None)
+        # AWAIT early-exit: an AWAIT step routed us here, and the
+        # awaited marker is now in view. Advance the script before
+        # the timer expires.
+        if await_id is not None and visible_now and await_id in visible_now:
+            self._send_rc(0, 0, 0, 0)
+            self._advance_script(f"AWAIT marker {await_id} seen")
+            return
         if began is not None and (now - began) >= hold_time_s:
             self._send_rc(0, 0, 0, 0)
             self._advance_script(f"hold of {hold_time_s:.0f}s complete")
@@ -1302,15 +1324,23 @@ class MissionController:
 
     # -------------------------------------------------------------- idle (HOOVER)
     def _step_idle(self, tel: Optional[TelemetrySnapshot], now: float) -> None:
-        """Mission-script HOOVER step that didn't follow APPROACH:
-        zero RC and let the Anafi auto-stabilise. Advances when the
-        per-step timer set in _apply_step_to_phase expires.
+        """Mission-script HOOVER step that didn't follow APPROACH (or
+        a PAUSE / AWAIT step routed here): zero RC and let the Anafi
+        auto-stabilise. Advances when the per-step timer set in
+        _apply_step_to_phase expires, OR -- if AWAIT installed an
+        await_marker_id -- as soon as that marker becomes visible.
         """
         self._send_rc(0, 0, 0, 0)
         with self.state.lock:
             until = self.state.idle_until
+            await_id = self.state.await_marker_id
+            visible_now = (set(self.state.visible_marker_ids)
+                           if await_id is not None else None)
             self.state.note = (f"IDLE: {(until - now):.1f}s remaining"
                                if until is not None else "IDLE")
+        if await_id is not None and visible_now and await_id in visible_now:
+            self._advance_script(f"AWAIT marker {await_id} seen")
+            return
         if until is not None and now >= until:
             self._advance_script("idle complete")
 
@@ -1515,6 +1545,13 @@ class MissionController:
         call _set_phase with the appropriate initial phase."""
         cfg = self.cfg
         note = f"script[{step.line_no}] {step.kind} ({reason})"
+        # AWAIT installs an early-exit marker id; every other step
+        # clears it so a previous AWAIT can't accidentally short-circuit
+        # subsequent IDLE / HOLD ticks.
+        with self.state.lock:
+            self.state.await_marker_id = (int(step.marker_id)
+                                          if step.kind == "AWAIT"
+                                          else None)
         if step.kind == "TAKEOFF":
             self._set_phase(Phase.TAKEOFF, note)
             try:
@@ -1552,6 +1589,38 @@ class MissionController:
                                               + float(step.seconds))
                 self._set_phase(Phase.IDLE,
                                 note + f" idle {step.seconds:g}s")
+            return
+        if step.kind == "AWAIT":
+            # Same shape as HOOVER (HOLD if previous was APPROACH else
+            # IDLE) plus an early-exit when state.await_marker_id (set
+            # above) appears in state.visible_marker_ids -- the per-tick
+            # check lives in _step_hold / _step_idle.
+            with self.state.lock:
+                last = self.state.last_completed_step_kind
+            if last == "APPROACH":
+                with self.state.lock:
+                    self.state.hold_time_s = float(step.seconds)
+                self._set_phase(Phase.HOLD,
+                                note + f" station-keep,"
+                                       f" await marker {step.marker_id}"
+                                       f" timeout {step.seconds:g}s")
+            else:
+                with self.state.lock:
+                    self.state.idle_until = (time.monotonic()
+                                              + float(step.seconds))
+                self._set_phase(Phase.IDLE,
+                                note + f" idle, await marker {step.marker_id}"
+                                       f" timeout {step.seconds:g}s")
+            return
+        if step.kind == "PAUSE":
+            # Unconditional IDLE for ``seconds``. No early-exit, no
+            # marker tracking, no station-keeping. Mirrors the
+            # HOOVER-without-prior-APPROACH branch above.
+            with self.state.lock:
+                self.state.idle_until = (time.monotonic()
+                                          + float(step.seconds))
+            self._set_phase(Phase.IDLE,
+                            note + f" pause {step.seconds:g}s")
             return
         if step.kind == "LAND":
             self._set_phase(Phase.LAND, note)
