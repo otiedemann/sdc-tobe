@@ -212,6 +212,10 @@ class MissionConfig:
     ui_host: str = "0.0.0.0"
     ui_port: int = 8080
     ui_telemetry_history_s: float = 60.0   # how long to keep on the chart screen
+    # Operator-facing emergency-land hotkey. Pressing this key anywhere on
+    # the web UI (including inside text fields) triggers /api/stop. Single
+    # character; comparison is case-insensitive.
+    killswitch_key: str = "Q"              # TUNE  global emergency-land hotkey
 
     # --- Recording -----------------------------------------------------------
     record_fps: int = 25                   # MJPEG frames are decoded -> we re-mux
@@ -478,6 +482,11 @@ TUNING_FIELDS = {
         "label": "pose max age", "kind": "float", "unit": "s", "step": 0.01,
         "desc": "If no marker detection in this window, the smoother reports None to the controller (= 'marker lost'). Pairs with search_marker_lost_grace_s.",
     },
+
+    "killswitch_key": {
+        "label": "killswitch key", "kind": "str",
+        "desc": "Single character. Pressing this key anywhere on the web UI (including inside textareas / number inputs) immediately triggers /api/stop and lands the drone. Default 'Q'. Comparison is case-insensitive; modifier keys (Ctrl/Cmd/Alt) are excluded so browser shortcuts still work.",
+    },
 }
 
 TUNING_GROUPS = [
@@ -505,6 +514,8 @@ TUNING_GROUPS = [
         ["distance_floor_factor", "search_yaw_rc"]),
     ("Pose smoothing",
         ["pose_smoothing_alpha", "pose_max_age_s"]),
+    ("Operator UX",
+        ["killswitch_key"]),
 ]
 
 

@@ -270,9 +270,132 @@ _CHARTS_HTML = """
 </section>
 """
 
+
+# Compact right-side sidebar included on every non-Camera page so the
+# operator never loses eyes-on telemetry / kill button when switching
+# tabs. Uses the same DOM ids as the Camera page (s-phase, s-bat, etc.)
+# so _SHARED_SCRIPT's updateStatus() / updateScriptRuntime() / button
+# handlers light it up unchanged. The Camera page omits this fragment
+# because its main right card already provides everything (plus the
+# script editor + named-saves disclosure).
+_COMPACT_SIDEBAR_HTML = """
+<aside class="card" style="position:sticky; top:.6rem; align-self:start;">
+  <h2>Live</h2>
+  <img class="mini-video" src="/video.mjpg" alt="camera"
+       style="width:100%; max-width:280px; display:block; border-radius:6px;
+              background:#000; margin-bottom:.6rem;">
+
+  <h2>Mission control</h2>
+  <div id="ctrl-row" style="display:flex; align-items:center;
+                            gap:.5rem; margin-bottom:.5rem;">
+    <button id="btn-start" type="button"
+            style="padding:.5rem .8rem; border:0; border-radius:6px;
+                   background:var(--good); color:#072413; font-weight:600;
+                   cursor:pointer; font-size:.9rem;">
+      Start
+    </button>
+    <button id="btn-stop" type="button"
+            style="padding:.5rem .8rem; border:0; border-radius:6px;
+                   background:var(--bad); color:#240707; font-weight:600;
+                   cursor:pointer; font-size:.9rem; display:none;">
+      Stop &amp; land
+    </button>
+    <span id="ctrl-msg" style="font-size:.8rem; color:#aab;">—</span>
+  </div>
+
+  <div id="script-runtime"
+       style="background:#0c0f12; border:1px solid #2a3038;
+              border-radius:6px; padding:.4rem; font-family:ui-monospace,
+              SFMono-Regular, Menlo, Consolas, monospace;
+              font-size:.8rem; line-height:1.35; margin-bottom:.6rem;
+              color:#778; max-height:180px; overflow-y:auto;
+              display:none;">No script.</div>
+
+  <h2>Mission status</h2>
+  <table id="status">
+    <tr><th>Phase</th><td id="s-phase">—</td></tr>
+    <tr><th>Phase age</th><td id="s-pa">—</td></tr>
+    <tr><th>Distance</th><td id="s-d">—</td></tr>
+    <tr><th>Yaw to marker</th><td id="s-y">—</td></tr>
+    <tr><th>Rel. heading</th><td id="s-h">—</td></tr>
+    <tr><th>Target distance</th><td id="s-td">—</td></tr>
+    <tr><th>Target heading</th><td id="s-th">—</td></tr>
+    <tr><th>Marker last seen</th><td id="s-ms">—</td></tr>
+    <tr><th>RC (lr,fb,ud,yaw)</th><td id="s-rc">—</td></tr>
+    <tr><th>Battery</th><td id="s-bat">—</td></tr>
+    <tr><th>Drone yaw</th><td id="s-dy">—</td></tr>
+    <tr><th>Height</th><td id="s-ht">—</td></tr>
+    <tr><th>Target height</th><td id="s-ht-tgt">—</td></tr>
+    <tr><th>World position</th><td id="s-wp">—</td></tr>
+    <tr><th>Flying</th><td id="s-fl">—</td></tr>
+    <tr><th>Note</th><td id="s-note">—</td></tr>
+  </table>
+</aside>
+"""
+
+# Open / close strings for non-Camera pages: 2-col grid with the
+# existing page content on the left and _COMPACT_SIDEBAR_HTML on the
+# right. Each non-Camera page template wraps its body between these.
+_PAGE_GRID_OPEN = (
+    '<main style="display:grid; gap:1rem; align-items:start;'
+    ' grid-template-columns:minmax(0,1fr) 320px;">'
+    '<div>'
+)
+_PAGE_GRID_CLOSE = '</div>' + _COMPACT_SIDEBAR_HTML + '</main>'
+
+
+# Tiny script that runs FIRST on every page. Defines the killswitch
+# keydown listener (binds the configured cfg.killswitch_key, fires
+# /api/stop, shows a banner) and a Web Audio beep helper used by the
+# phase-change notifier in _SHARED_SCRIPT below. Kept separate from
+# _SHARED_SCRIPT so it can run on pages whose other JS isn't yet ready
+# (e.g. the operator hits the killswitch the moment the page loads).
+_COMMON_SCRIPT = """
+<script>
+const KILLSWITCH_KEY = {{ killswitch_key|tojson }};
+let _audioCtx = null;
+function _beep(freqHz, durMs) {
+  try {
+    _audioCtx = _audioCtx || new (window.AudioContext || window.webkitAudioContext)();
+    if (_audioCtx.state === 'suspended') _audioCtx.resume();
+    const o = _audioCtx.createOscillator();
+    const g = _audioCtx.createGain();
+    o.frequency.value = freqHz; o.type = 'sine';
+    o.connect(g); g.connect(_audioCtx.destination);
+    const t0 = _audioCtx.currentTime;
+    g.gain.setValueAtTime(0.18, t0);
+    g.gain.exponentialRampToValueAtTime(0.001, t0 + durMs / 1000);
+    o.start(t0); o.stop(t0 + durMs / 1000 + 0.05);
+  } catch (e) {}
+}
+function _killswitchBanner() {
+  const banner = document.createElement('div');
+  banner.textContent = 'KILLSWITCH FIRED \\u2014 landing';
+  banner.style.cssText = 'position:fixed; top:0; left:0; right:0; z-index:9999;'
+                      + ' background:#f87171; color:#240707;'
+                      + ' text-align:center; padding:.6rem;'
+                      + ' font-weight:700; font-size:1rem;';
+  document.body.appendChild(banner);
+  setTimeout(() => banner.remove(), 4000);
+}
+document.addEventListener('keydown', e => {
+  if (!KILLSWITCH_KEY) return;
+  if (e.ctrlKey || e.metaKey || e.altKey) return;     // browser shortcuts win
+  if (String(e.key || '').toUpperCase()
+      !== String(KILLSWITCH_KEY).toUpperCase()) return;
+  e.preventDefault(); e.stopPropagation();
+  _killswitchBanner();
+  _beep(220, 350);                                    // distinct lower tone
+  fetch('/api/stop', {method: 'POST'}).catch(() => {});
+});
+</script>
+"""
+
 # One shared script that updates whatever DOM elements happen to exist on
 # the current page. Lets `/` and `/charts` share a single state-fetch loop
-# instead of duplicating it.
+# instead of duplicating it. Now included on every page (not just / and
+# /charts) so the universal sidebar's status table + Start/Stop + script
+# runtime work everywhere.
 _SHARED_SCRIPT = """
 <script>
 const HISTORY_S = {{ history_s }};
@@ -600,7 +723,18 @@ function updateStatus(s) {
   const rc = s.rc || {};
   $('s-rc').textContent = `${rc.lr ?? 0}, ${rc.fb ?? 0}, ${rc.ud ?? 0}, ${rc.yaw ?? 0}`;
   const t = s.telemetry || {};
-  $('s-bat').textContent = (t.battery !== undefined && t.battery !== null) ? (t.battery + '%') : '—';
+  const batEl = $('s-bat');
+  if (typeof t.battery === 'number') {
+    batEl.textContent = t.battery + '%';
+    batEl.style.color = t.battery >= 50 ? 'var(--good)'
+                       : t.battery >= 25 ? 'var(--warn)'
+                       : 'var(--bad)';
+    batEl.style.fontWeight = '600';
+  } else {
+    batEl.textContent = '—';
+    batEl.style.color = '';
+    batEl.style.fontWeight = '';
+  }
   $('s-dy').textContent  = fmt(t.yaw, '°', 1);
   $('s-ht').textContent  = (t.height_cm !== undefined && t.height_cm !== null) ? ((t.height_cm/100).toFixed(2) + ' m') : '—';
   if ($('s-ht-tgt')) {
@@ -619,9 +753,86 @@ function updateStatus(s) {
   $('s-fl').textContent  = t.flying ? 'yes' : 'no';
   $('s-note').textContent = s.note || (s.abort_reason || '—');
   setMissionButtons(s.phase);
+  drawRcWidgets(s);
 }
 if ($('btn-start')) $('btn-start').addEventListener('click', startMission);
 if ($('btn-stop'))  $('btn-stop').addEventListener('click',  stopMission);
+
+// ---- Live RC widget (used by /tune; harmless on pages without it) -------
+// Two 2D crosses (lr+fb on the left "throttle stick", yaw+ud on the
+// right) plus a row of four signed bars. Auto-scales axes against an
+// observed-max so it works without knowing the cfg's *_rc_max values.
+let _rcAbsMax = 25;
+function drawRc2D(canvasId, xVal, yVal, xLabel, yLabel) {
+  const c = $(canvasId); if (!c) return;
+  const ctx = c.getContext('2d');
+  const W = c.width, H = c.height;
+  ctx.clearRect(0, 0, W, H);
+  ctx.strokeStyle = '#2a3038'; ctx.lineWidth = 1;
+  ctx.strokeRect(0.5, 0.5, W-1, H-1);
+  ctx.beginPath();
+  ctx.moveTo(0, H/2); ctx.lineTo(W, H/2);
+  ctx.moveTo(W/2, 0); ctx.lineTo(W/2, H); ctx.stroke();
+  ctx.fillStyle = '#778'; ctx.font = '10px ui-sans-serif';
+  ctx.textAlign = 'center'; ctx.fillText(xLabel + ' →', W - 24, H/2 - 4);
+  ctx.save(); ctx.translate(W/2 + 8, 14); ctx.fillText('↑ ' + yLabel, 0, 0);
+  ctx.restore();
+  // dot
+  const xPx = W/2 + (xVal / _rcAbsMax) * (W/2 - 8);
+  const yPx = H/2 - (yVal / _rcAbsMax) * (H/2 - 8);
+  ctx.fillStyle = '#58c4ff';
+  ctx.beginPath(); ctx.arc(xPx, yPx, 6, 0, 2*Math.PI); ctx.fill();
+  ctx.strokeStyle = '#58c4ff66'; ctx.lineWidth = 1;
+  ctx.beginPath(); ctx.moveTo(W/2, H/2); ctx.lineTo(xPx, yPx); ctx.stroke();
+}
+function drawRcBars(canvasId, channels) {
+  const c = $(canvasId); if (!c) return;
+  const ctx = c.getContext('2d');
+  const W = c.width, H = c.height;
+  ctx.clearRect(0, 0, W, H);
+  const padL = 50, padR = 10, padT = 6, padB = 6;
+  const innerW = W - padL - padR;
+  const rowH = (H - padT - padB) / channels.length;
+  const colours = ['#fb7185','#34d399','#60a5fa','#fbbf24'];
+  const zeroX = padL + innerW / 2;
+  // axis
+  ctx.strokeStyle = '#2a3038'; ctx.lineWidth = 1;
+  ctx.beginPath(); ctx.moveTo(zeroX, padT); ctx.lineTo(zeroX, H - padB);
+  ctx.stroke();
+  ctx.fillStyle = '#aab'; ctx.font = '11px ui-sans-serif';
+  ctx.textAlign = 'right';
+  channels.forEach((ch, i) => {
+    const yMid = padT + rowH * (i + 0.5);
+    const v = ch.value || 0;
+    const px = (v / _rcAbsMax) * (innerW / 2 - 6);
+    const x0 = Math.min(zeroX, zeroX + px);
+    const w  = Math.abs(px);
+    ctx.fillStyle = colours[i % colours.length];
+    ctx.fillRect(x0, yMid - rowH * 0.30, Math.max(2, w), rowH * 0.60);
+    ctx.fillStyle = '#aab';
+    ctx.fillText(ch.label, padL - 6, yMid + 4);
+    ctx.textAlign = 'left';
+    ctx.fillText(String(v), padL + innerW + 4, yMid + 4);
+    ctx.textAlign = 'right';
+  });
+}
+function drawRcWidgets(s) {
+  // Skip when none of the RC canvases are present (i.e. not on /tune).
+  if (!$('c-rc-lr-fb') && !$('c-rc-yaw-ud') && !$('c-rc-bars')) return;
+  const rc = s.rc || {};
+  const vals = [rc.lr || 0, rc.fb || 0, rc.ud || 0, rc.yaw || 0];
+  const seen = Math.max(..._rcAbsMax ? [_rcAbsMax] : [25],
+                        ...vals.map(Math.abs));
+  if (seen > _rcAbsMax) _rcAbsMax = Math.ceil(seen / 5) * 5;
+  drawRc2D('c-rc-lr-fb',  rc.lr || 0, rc.fb || 0, 'lr', 'fb');
+  drawRc2D('c-rc-yaw-ud', rc.yaw || 0, rc.ud || 0, 'yaw', 'ud');
+  drawRcBars('c-rc-bars', [
+    {label: 'lr',  value: rc.lr  || 0},
+    {label: 'fb',  value: rc.fb  || 0},
+    {label: 'ud',  value: rc.ud  || 0},
+    {label: 'yaw', value: rc.yaw || 0},
+  ]);
+}
 
 // ---- Replay controls (only present in replay pages) ---------------------
 let rpSeekDragging = false;
@@ -843,6 +1054,10 @@ function updateCharts(s) {
 }
 
 // ---- Single shared refresh loop -----------------------------------------
+// Track previous phase so we can beep when it changes. lastPhase is
+// null on first iteration -- skipping the beep then avoids a chirp
+// just because the operator opened the tab mid-flight.
+let lastPhase = null;
 async function refresh() {
   try {
     if (REPLAY_ID && HAS_CHARTS && !chartPrefilled) {
@@ -857,6 +1072,14 @@ async function refresh() {
     updateStatus(s);
     updateCharts(s);
     if (REPLAY_ID) await refreshReplayStatus();
+    // Phase-change audible cue. Don't beep on the FIRST poll (lastPhase
+    // null) so a freshly-opened tab doesn't chirp at us. Don't beep
+    // during replay either -- the playback would cue every transition.
+    if (!REPLAY_ID && lastPhase !== null && s.phase !== lastPhase
+        && typeof _beep === 'function') {
+      _beep(880, 150);
+    }
+    lastPhase = s.phase;
   } catch (e) {}
   setTimeout(refresh, 250);
 }
@@ -864,17 +1087,16 @@ refresh();
 </script>
 """
 
-_PAGE_VIDEO = (_PAGE_BASE_CSS + _PAGE_HEADER
+_PAGE_VIDEO = (_PAGE_BASE_CSS + _PAGE_HEADER + _COMMON_SCRIPT
                + "<main>" + _VIDEO_AND_STATUS_HTML + _CHARTS_HTML + "</main>"
                + _SHARED_SCRIPT)
 
-_PAGE_CHARTS = (_PAGE_BASE_CSS + _PAGE_HEADER
-                + "<main>" + _CHARTS_HTML + "</main>"
+_PAGE_CHARTS = (_PAGE_BASE_CSS + _PAGE_HEADER + _COMMON_SCRIPT
+                + _PAGE_GRID_OPEN + _CHARTS_HTML + _PAGE_GRID_CLOSE
                 + _SHARED_SCRIPT)
 
 # Flight list -- one card per recorded flight, with a "Replay" button.
-_PAGE_FLIGHTS = _PAGE_BASE_CSS + _PAGE_HEADER + """
-<main>
+_PAGE_FLIGHTS = _PAGE_BASE_CSS + _PAGE_HEADER + _COMMON_SCRIPT + _PAGE_GRID_OPEN + """
   <div class="card">
     <h2>Recorded flights</h2>
     {% if flights %}
@@ -907,14 +1129,13 @@ _PAGE_FLIGHTS = _PAGE_BASE_CSS + _PAGE_HEADER + """
     </p>
     {% endif %}
   </div>
-</main>
-"""
+""" + _PAGE_GRID_CLOSE + _SHARED_SCRIPT
 
 # Camera-calibration page. Live preview on the left, capture-then-run
 # workflow on the right. The /api/calibrate/* endpoints below drive
 # this page; the operator never needs to drop to the CLI to recalibrate.
-_PAGE_CALIBRATE = _PAGE_BASE_CSS + _PAGE_HEADER + """
-<main class="grid" style="grid-template-columns: minmax(0,2fr) minmax(0,1fr);">
+_PAGE_CALIBRATE = _PAGE_BASE_CSS + _PAGE_HEADER + _COMMON_SCRIPT + _PAGE_GRID_OPEN + """
+<section class="grid" style="grid-template-columns: minmax(0,2fr) minmax(0,1fr);">
   <div class="card">
     <h2>Live camera</h2>
     <img class="video" src="/video.mjpg" alt="camera feed">
@@ -996,8 +1217,9 @@ _PAGE_CALIBRATE = _PAGE_BASE_CSS + _PAGE_HEADER + """
                 border-radius:6px; padding:.6rem; overflow-x:auto;
                 display:none; white-space:pre;"></pre>
   </div>
-</main>
+</section>
 <script>
+(() => {
 const $ = id => document.getElementById(id);
 // Seed the serial input from live telemetry IF the operator hasn't
 // typed anything yet. The unified API server doesn't currently expose
@@ -1118,8 +1340,9 @@ async function tick() {
   setTimeout(tick, 500);
 }
 tick();
+})();
 </script>
-"""
+""" + _PAGE_GRID_CLOSE + _SHARED_SCRIPT
 
 
 # ---------------------------------------------------------------------------
@@ -1130,8 +1353,26 @@ tick();
 # restart. Save / Reload / Reset operate on the persisted JSON file.
 # ---------------------------------------------------------------------------
 
-_PAGE_TUNE = _PAGE_BASE_CSS + _PAGE_HEADER + """
-<main class="grid" style="grid-template-columns: minmax(0, 1fr);">
+_PAGE_TUNE = _PAGE_BASE_CSS + _PAGE_HEADER + _COMMON_SCRIPT + _PAGE_GRID_OPEN + """
+<section class="grid" style="grid-template-columns: minmax(0, 1fr);">
+  <div class="card">
+    <h2>Live RC</h2>
+    <div style="display:flex; gap:1rem; align-items:flex-start; flex-wrap:wrap;">
+      <div style="text-align:center;">
+        <canvas id="c-rc-lr-fb" width="180" height="180"
+                style="background:#0c0f12; border-radius:6px;"></canvas>
+        <div style="font-size:.75rem; color:#778; margin-top:.2rem;">lr / fb</div>
+      </div>
+      <div style="text-align:center;">
+        <canvas id="c-rc-yaw-ud" width="180" height="180"
+                style="background:#0c0f12; border-radius:6px;"></canvas>
+        <div style="font-size:.75rem; color:#778; margin-top:.2rem;">yaw / ud</div>
+      </div>
+      <canvas id="c-rc-bars" width="380" height="120"
+              style="background:#0c0f12; border-radius:6px;
+                     flex:1; min-width:280px;"></canvas>
+    </div>
+  </div>
   <div class="card">
     <h2>Snapshots</h2>
     <p style="font-size:.85rem; color:#aab; margin:.2rem 0 .8rem;">
@@ -1151,19 +1392,22 @@ _PAGE_TUNE = _PAGE_BASE_CSS + _PAGE_HEADER + """
                      background:var(--good); color:#072413; font-weight:600;
                      cursor:pointer;">Save snapshot</button>
     </div>
-    <table id="snap-table" style="width:100%; border-collapse:collapse;
-                                  font-size:.85rem;">
-      <thead>
-        <tr style="text-align:left; color:#9ca3af;">
-          <th style="padding:.3rem .4rem;">Name</th>
-          <th style="padding:.3rem .4rem;">Saved</th>
-          <th style="padding:.3rem .4rem; width:14rem;">Actions</th>
-        </tr>
-      </thead>
-      <tbody id="snap-body">
-        <tr><td colspan="3" style="color:#6b7280; padding:.4rem;">loading…</td></tr>
-      </tbody>
-    </table>
+    <div style="max-height:240px; overflow-y:auto; border:1px solid #2a3038;
+                border-radius:6px;">
+      <table id="snap-table" style="width:100%; border-collapse:collapse;
+                                    font-size:.85rem;">
+        <thead style="position:sticky; top:0; background:var(--panel);">
+          <tr style="text-align:left; color:#9ca3af;">
+            <th style="padding:.3rem .4rem;">Name</th>
+            <th style="padding:.3rem .4rem;">Saved</th>
+            <th style="padding:.3rem .4rem; width:14rem;">Actions</th>
+          </tr>
+        </thead>
+        <tbody id="snap-body">
+          <tr><td colspan="3" style="color:#6b7280; padding:.4rem;">loading…</td></tr>
+        </tbody>
+      </table>
+    </div>
   </div>
 
   <div class="card">
@@ -1201,7 +1445,7 @@ _PAGE_TUNE = _PAGE_BASE_CSS + _PAGE_HEADER + """
       </div>
     </form>
   </div>
-</main>
+</section>
 
 <style>
   .tune-group { margin-top: 1.2rem; }
@@ -1233,6 +1477,7 @@ _PAGE_TUNE = _PAGE_BASE_CSS + _PAGE_HEADER + """
 </style>
 
 <script>
+(() => {
 const $ = id => document.getElementById(id);
 function setStatus(msg, ok) {
   const el = $('tune-status');
@@ -1264,11 +1509,13 @@ function renderGroups(view) {
         ? `<span class="tune-info" title="${descAttr}" tabindex="0">ⓘ</span>`
         : '';
       row.title = desc;
+      const inputType = (it.kind === 'str') ? 'text' : 'number';
+      const stepAttr = (it.kind === 'str') ? '' : `step="${it.step}"`;
       row.innerHTML = `
         <span class="tune-label">${it.label} ${infoHtml}
           <span style="color:#6b7280; font-size:.75rem;">(${it.name})</span></span>
-        <input class="tune-input" type="number" data-name="${it.name}"
-               step="${it.step}" value="${it.value}"
+        <input class="tune-input" type="${inputType}" data-name="${it.name}"
+               ${stepAttr} value="${it.value}"
                title="${descAttr}">
         <span class="tune-unit">${it.unit || ''}</span>
         <span class="tune-default">default: ${it.default}</span>
@@ -1549,16 +1796,16 @@ $('snap-name').addEventListener('keydown', e => {
 
 loadView();
 refreshSnapshots();
+})();
 </script>
-"""
+""" + _PAGE_GRID_CLOSE + _SHARED_SCRIPT
 
 
 # ---------------------------------------------------------------------------
 # Arena tab: define the world layout + write the active config
 # ---------------------------------------------------------------------------
 
-_PAGE_ARENA = _PAGE_BASE_CSS + _PAGE_HEADER + """
-<main>
+_PAGE_ARENA = _PAGE_BASE_CSS + _PAGE_HEADER + _COMMON_SCRIPT + _PAGE_GRID_OPEN + """
   <section class="grid" style="grid-template-columns: minmax(0,1fr) minmax(0,1.4fr); gap:1rem;">
 
     <div class="card">
@@ -1641,9 +1888,9 @@ _PAGE_ARENA = _PAGE_BASE_CSS + _PAGE_HEADER + """
       <div id="ar-list" style="font-size:.85rem;"></div>
     </details>
   </section>
-</main>
 
 <script>
+(() => {
 const $ = id => document.getElementById(id);
 const WALL_COLORS = {front:'#facc15', right:'#4ade80',
                      back:'#58c4ff',  left:'#f87171'};
@@ -2020,8 +2267,9 @@ $('btn-ar-save-as').addEventListener('click', () =>
 
 loadArena();
 refreshList();
+})();
 </script>
-"""
+""" + _PAGE_GRID_CLOSE + _SHARED_SCRIPT
 
 
 # ---------------------------------------------------------------------------
@@ -2187,26 +2435,39 @@ class UiServer:
     def _register_routes(self) -> None:
         app = self.app
 
-        live_ctx = dict(
-            active="video",
-            history_s=self.history_s,
-            mode="live",
-            state_url="/api/state",
-            video_url="/video.mjpg",
-            replay_id=None,
-            camera_heading="Annotated camera view",
-            header_label="phase: …",
-            drone_connected=self.drone_connected,
-        )
+        # Per-request context. Returning a fresh dict each call lets
+        # the live cfg.killswitch_key + self.drone_connected propagate
+        # to the rendered HTML on every page load (operators can tune
+        # the killswitch key via /tune without restarting the mission).
+        def killswitch_key():
+            return (self.cfg.killswitch_key
+                    if self.cfg and getattr(self.cfg, "killswitch_key", None)
+                    else "Q")
+
+        def live_ctx(**overrides):
+            base = dict(
+                active="video",
+                history_s=self.history_s,
+                mode="live",
+                state_url="/api/state",
+                video_url="/video.mjpg",
+                replay_id=None,
+                camera_heading="Annotated camera view",
+                header_label="phase: …",
+                drone_connected=self.drone_connected,
+                killswitch_key=killswitch_key(),
+            )
+            base.update(overrides)
+            return base
 
         @app.get("/")
         def index():
-            return render_template_string(_PAGE_VIDEO, **live_ctx)
+            return render_template_string(_PAGE_VIDEO, **live_ctx())
 
         @app.get("/charts")
         def charts():
             return render_template_string(_PAGE_CHARTS,
-                                           **{**live_ctx, "active": "charts"})
+                                           **live_ctx(active="charts"))
 
         @app.get("/api/state")
         def api_state():
@@ -2231,6 +2492,7 @@ class UiServer:
                 flights=flights,
                 flights_dir=str(self.flights_root) if self.flights_root else "",
                 drone_connected=self.drone_connected,
+                killswitch_key=killswitch_key(),
             )
 
         @app.get("/replay/<flight_id>")
@@ -2249,6 +2511,7 @@ class UiServer:
                 camera_heading=f"Replay: {flight_id}",
                 header_label=f"replay: {flight_id}",
                 drone_connected=self.drone_connected,
+                killswitch_key=killswitch_key(),
             )
 
         @app.get("/api/flights")
@@ -2348,6 +2611,7 @@ class UiServer:
                 replay_id=None,
                 header_label="calibration",
                 drone_connected=self.drone_connected,
+                killswitch_key=killswitch_key(),
             )
 
         # ---- Tuning page + API -----------------------------------------
@@ -2359,6 +2623,10 @@ class UiServer:
                 header_label="live tuning",
                 replay_id=None,
                 mode="live",
+                state_url="/api/state",
+                video_url="/video.mjpg",
+                drone_connected=self.drone_connected,
+                killswitch_key=killswitch_key(),
             )
 
         @app.get("/api/tune")
@@ -2542,7 +2810,10 @@ class UiServer:
                 header_label="arena layout",
                 replay_id=None,
                 mode="live",
+                state_url="/api/state",
+                video_url="/video.mjpg",
                 drone_connected=self.drone_connected,
+                killswitch_key=killswitch_key(),
             )
 
         def _arena_payload_to_config(data):
