@@ -395,6 +395,13 @@ document.addEventListener('keydown', e => {
   if (e.ctrlKey || e.metaKey || e.altKey) return;     // browser shortcuts win
   if (String(e.key || '').toUpperCase()
       !== String(KILLSWITCH_KEY).toUpperCase()) return;
+  // Don't fire (and don't swallow the keystroke) when the operator is
+  // editing the killswitch_key tune input itself -- otherwise every
+  // attempt to overwrite the current key would trigger the killswitch
+  // instead of typing the new value into the field.
+  const t = e.target;
+  if (t && t.classList && t.classList.contains('tune-input')
+      && t.dataset && t.dataset.name === 'killswitch_key') return;
   e.preventDefault(); e.stopPropagation();
   _killswitchBanner();
   _beep(220, 350);                                    // distinct lower tone
