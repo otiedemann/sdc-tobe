@@ -48,7 +48,7 @@ import numpy as np
 from .aruco_detector import ArucoDetector, MarkerPose, annotate_frame
 from .calibration_store import (Calibration, CalibrationStore,
                                 calibrate_from_video)
-from .arena import ArenaConfig, estimate_position
+from .arena import ArenaConfig, estimate_position, load_priority_arena
 from .config import (CALIB_DIR, FLIGHTS_DIR, DEFAULT_DATA_DIR,
                      PER_FLIGHT_SCRIPT_FILENAME, MissionConfig)
 from .controller import MissionController, MissionState, Phase
@@ -90,6 +90,26 @@ class _TelemetryHolder:
     def get(self) -> Optional[TelemetrySnapshot]:
         with self._lock:
             return self._tel
+
+
+class _ArenaHolder:
+    """Latest active ArenaConfig (or None if world positioning is off).
+
+    Wrapped in a holder so the Arena tab's POST /api/arena/active can
+    swap in a new layout without restarting the mission -- vision_worker
+    reads arena_holder.get() each tick.
+    """
+    def __init__(self, arena: Optional[ArenaConfig] = None):
+        self._lock = threading.Lock()
+        self._arena: Optional[ArenaConfig] = arena
+
+    def set(self, arena: Optional[ArenaConfig]) -> None:
+        with self._lock:
+            self._arena = arena
+
+    def get(self) -> Optional[ArenaConfig]:
+        with self._lock:
+            return self._arena
 
 
 # ---------------------------------------------------------------------------
@@ -183,11 +203,16 @@ def cmd_fly(args: argparse.Namespace) -> int:
     reader.start()
     detector = ArucoDetector(calibration, cfg.marker_size_m, cfg.aruco_dict)
 
-    # ---------- 2b. Optional arena world-position estimator --------------
-    # When --arena-config is given, vision_worker computes the camera's
-    # world (arena) position each frame as a weighted average of the
-    # per-marker pose inversions. Without it the estimator is silently
-    # disabled and state.world_position_m stays None.
+    # ---------- 2b. Arena world-position estimator -----------------------
+    # vision_worker computes the camera's arena-frame world position
+    # each frame as a weighted average of the per-marker pose
+    # inversions. Source priority for the active layout:
+    #   1. --arena-config <path> CLI override.
+    #   2. ~/.marker_mission/active_arena_config.json (saved from the
+    #      Arena tab in the UI).
+    #   3. Hard-coded default 16-marker layout (10 m x 25 m).
+    # The Arena tab's POST /api/arena/active swaps the layout via the
+    # _ArenaHolder so saves take effect without restart.
     arena: Optional[ArenaConfig] = None
     if args.arena_config:
         try:
@@ -195,15 +220,27 @@ def cmd_fly(args: argparse.Namespace) -> int:
             print(f"[mission] arena loaded from {args.arena_config}: "
                   f"{len(arena.markers)} markers, "
                   f"size={arena.marker_size_m:.3f}m")
-            if abs(arena.marker_size_m - cfg.marker_size_m) > 1e-3:
-                print(f"[mission] WARNING: arena marker_size_m="
-                      f"{arena.marker_size_m} differs from cfg.marker_size_m="
-                      f"{cfg.marker_size_m}; controller still uses cfg value "
-                      f"for the detector")
         except Exception as e:
             print(f"[mission] arena_config load failed ({e}); "
+                  f"falling back to active config / default")
+            arena = None
+    if arena is None:
+        try:
+            arena = load_priority_arena()
+            print(f"[mission] arena loaded (active or default): "
+                  f"{len(arena.markers)} markers, "
+                  f"size={arena.marker_size_m:.3f}m, "
+                  f"{arena.width_m:.1f}m x {arena.depth_m:.1f}m")
+        except Exception as e:
+            print(f"[mission] could not load any arena ({e}); "
                   f"world position estimator disabled")
             arena = None
+    if arena is not None and abs(arena.marker_size_m - cfg.marker_size_m) > 1e-3:
+        print(f"[mission] WARNING: arena marker_size_m="
+              f"{arena.marker_size_m} differs from cfg.marker_size_m="
+              f"{cfg.marker_size_m}; controller still uses cfg value "
+              f"for the detector")
+    arena_holder = _ArenaHolder(arena)
 
     pose_holder = _PoseHolder()
     tel_holder = _TelemetryHolder()
@@ -319,7 +356,8 @@ def cmd_fly(args: argparse.Namespace) -> int:
                   calibration_capture=cal_capture,
                   cfg=cfg,
                   controller=controller,
-                  flight_dir_provider=lambda: flight_dir_box[0])
+                  flight_dir_provider=lambda: flight_dir_box[0],
+                  arena_holder=arena_holder)
     ui.start()
     print(f"[mission] UI running at {ui.url()} (camera) and {ui.url()}/charts")
 
@@ -405,6 +443,7 @@ def cmd_fly(args: argparse.Namespace) -> int:
                 # reference marker (weighted by inverse distance).
                 # Missing arena_config or no reference marker visible
                 # leaves state.world_position_m as None.
+                arena = arena_holder.get()
                 if arena is not None:
                     est = estimate_position(arena, poses)
                     with state.lock:

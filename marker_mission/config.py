@@ -32,6 +32,8 @@ SNAPSHOTS_DIR = DEFAULT_DATA_DIR / "snapshots"
 MISSION_SCRIPTS_DIR = DEFAULT_DATA_DIR / "mission_scripts"
 ACTIVE_MISSION_SCRIPT_PATH = DEFAULT_DATA_DIR / "active_mission_script.txt"
 PER_FLIGHT_SCRIPT_FILENAME = "mission_script.txt"
+ARENA_CONFIGS_DIR = DEFAULT_DATA_DIR / "arenas"
+ACTIVE_ARENA_CONFIG_PATH = DEFAULT_DATA_DIR / "active_arena_config.json"
 
 
 # ---------------------------------------------------------------------------

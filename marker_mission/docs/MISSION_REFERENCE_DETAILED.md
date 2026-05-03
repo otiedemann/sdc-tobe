@@ -24,6 +24,7 @@ out_clip` values in `config.py`.
 - [Cross-cutting mechanics](#cross-cutting-mechanics)
 - [Termination and recovery](#termination-and-recovery)
 - [Cfg fields the runtime reads vs. writes](#cfg-fields-the-runtime-reads-vs-writes)
+- [Arena world positioning](#arena-world-positioning)
 
 ---
 
@@ -627,6 +628,104 @@ Script execution writes to `state.*` only. `cfg.target_*` and
 `cfg.hold_time_s` stay stable across runs, so the parser's
 `defaults_from_cfg()` always returns the user's tuned defaults — not
 the trailing values from the previous mission.
+
+---
+
+## Arena world positioning
+
+Optional layer on top of the per-marker pose: combine all visible
+reference markers into a single arena-frame camera position estimate.
+Lives in [`arena.py`](../arena.py). Disabled by default (no
+`active_arena_config.json` yet → the loader falls through to the 16-marker
+default; vision_worker still runs the estimator).
+
+### Coordinate convention (centred origin)
+
+* Origin `(0, 0, 0)` is the centre of the arena floor.
+* Looking down at the floor: `+x` to the right, `+y` toward the front
+  wall (top of the top-down view), `+z` is up.
+* Walls are at `x = ±width/2` (left / right) and `y = ±depth/2`
+  (front / back). Markers sit on the **inside face** of each wall with
+  their normal pointing toward the origin.
+
+The `WALL_ROTATIONS` matrices in [`arena.py`](../arena.py) implement
+the marker→arena rotation per wall. Each is a proper rotation
+(det = +1), verified by hand. Per-wall geometry is unit-tested by
+constructing a head-on pose for the centre marker on each wall and
+confirming the inversion lands on `(0, 0, 1.5)` for a drone at the
+arena centre.
+
+### JSON schema
+
+```json
+{
+  "marker_size_m": 0.18,
+  "width_m": 10.0,
+  "depth_m": 25.0,
+  "top_z_m": 4.0,
+  "bottom_z_m": 2.0,
+  "markers": [
+    {"id": 1, "label": "Front high #1", "wall": "front",
+     "x": 0.0, "y": 12.5, "z": 4.0},
+    ...
+  ]
+}
+```
+
+The metadata fields (`width_m`, `depth_m`, `top_z_m`, `bottom_z_m`,
+`marker_size_m`) are optional in the JSON; `ArenaConfig.from_dict` fills
+in sensible defaults when they're absent. The Arena tab uses them to
+re-render the top-down view and validate marker positions on save.
+
+### Persistence
+
+* `~/.marker_mission/active_arena_config.json` — single active draft,
+  written by the Arena tab's "Save active" button. Loaded at
+  startup by `mission.py` via `arena.load_priority_arena()`.
+* `~/.marker_mission/arenas/<name>.json` — named save/load list,
+  same UI pattern as mission scripts and tuning snapshots.
+
+Source priority at startup: `--arena-config <path>` CLI override →
+active draft → hard-coded default 16-marker layout.
+
+### Hot reload
+
+`vision_worker` reads from `_ArenaHolder` (in [`mission.py`](../mission.py))
+each frame, so a `POST /api/arena/active` from the Arena tab takes
+effect immediately without a mission restart. The endpoint's handler
+calls `arena_holder.set(new_arena)` after writing the file.
+
+### Default 16-marker layout
+
+`default_arena(width_m, depth_m, top_z_m, bottom_z_m)` produces:
+
+* 1 marker on each of the front and back walls (centred horizontally).
+* 3 evenly-spaced markers on each of the left and right walls (at
+  `y = ±depth/4` and `y = 0`).
+
+Repeated at `top_z_m` (IDs 1–8) and `bottom_z_m` (IDs 9–16). Clockwise
+from the front wall: `front (1) → right (3) → back (1) → left (3)`.
+
+### Migration from the old convention
+
+The `aruco-position/controller-modular/arena_config-tobe-1to4.json`
+config used a different convention (origin at the front wall, opposite
+X handedness) and is **incompatible** with the current code. Loading
+it will produce wrong positions. Use the Arena tab → **Reset to
+default** → tweak as needed → **Save active** to build a fresh config
+in the new convention.
+
+### Per-marker votes and bias diagnosis
+
+`estimate_position()` returns a `PositionEstimate` with
+`per_marker_position_m` exposing each marker's vote *before* the
+weighted average. The recorder logs them as
+`arena_per_marker_world` (CSV column, format `id:x,y,z|...`). Inverse-distance weighting means closer markers dominate.
+
+If per-marker votes disagree systematically, the most likely culprit is a
+mismatch between the JSON layout and the physical arena (markers placed
+on a different wall than the config says, or the wall length wrong).
+Use the Arena tab's top-down view to spot-check.
 
 ---
 

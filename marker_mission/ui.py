@@ -111,6 +111,7 @@ _PAGE_HEADER = """
     <a href="/charts" class="{{ 'active' if active=='charts' else '' }}">Charts</a>
     <a href="/replay" class="{{ 'active' if active=='replay' else '' }}">Replay</a>
     <a href="/tune" class="{{ 'active' if active=='tune' else '' }}">Tune</a>
+    <a href="/arena" class="{{ 'active' if active=='arena' else '' }}">Arena</a>
     <a href="/calibrate" class="{{ 'active' if active=='calibrate' else '' }}">Calibrate</a>
   </nav>
   <span style="margin-left:auto; font-size:.85rem; color:#aab;"
@@ -1551,6 +1552,478 @@ refreshSnapshots();
 </script>
 """
 
+
+# ---------------------------------------------------------------------------
+# Arena tab: define the world layout + write the active config
+# ---------------------------------------------------------------------------
+
+_PAGE_ARENA = _PAGE_BASE_CSS + _PAGE_HEADER + """
+<main>
+  <section class="grid" style="grid-template-columns: minmax(0,1fr) minmax(0,1.4fr); gap:1rem;">
+
+    <div class="card">
+      <h2>Arena setup</h2>
+      <table style="width:100%;">
+        <tr><th>Width (front/back wall length)</th>
+            <td><input id="ar-width"  type="number" step="0.01" style="width:8em;"> m</td></tr>
+        <tr><th>Depth (left/right wall length)</th>
+            <td><input id="ar-depth"  type="number" step="0.01" style="width:8em;"> m</td></tr>
+        <tr><th>Top marker height</th>
+            <td><input id="ar-topz"   type="number" step="0.01" style="width:8em;"> m</td></tr>
+        <tr><th>Bottom marker height</th>
+            <td><input id="ar-botz"   type="number" step="0.01" style="width:8em;"> m</td></tr>
+        <tr><th>Marker size</th>
+            <td><input id="ar-msize"  type="number" step="0.001" style="width:8em;"> m</td></tr>
+      </table>
+      <div style="display:flex; gap:.5rem; margin-top:.6rem; flex-wrap:wrap;">
+        <button id="btn-ar-reset" type="button"
+                style="padding:.45rem .8rem; border:0; border-radius:5px;
+                       background:var(--warn); color:#241a07; font-weight:600;
+                       cursor:pointer; font-size:.85rem;">Reset to default</button>
+        <button id="btn-ar-save" type="button"
+                style="padding:.45rem .8rem; border:0; border-radius:5px;
+                       background:var(--good); color:#072413; font-weight:600;
+                       cursor:pointer; font-size:.85rem;">Save active</button>
+        <span id="ar-msg" style="font-size:.85rem; color:#aab; align-self:center;"></span>
+      </div>
+      <div id="ar-err" style="color:var(--bad); font-size:.85rem;
+                              margin-top:.4rem; min-height:1.1rem;"></div>
+    </div>
+
+    <div class="card">
+      <h2>Top-down view (+y = front, +x = right)</h2>
+      <canvas id="c-arena" width="700" height="700"
+              style="background:#0c0f12; border-radius:6px;
+                     width:100%; height:auto;"></canvas>
+    </div>
+
+  </section>
+
+  <section class="card" style="margin-top:1rem;">
+    <h2>Markers</h2>
+    <table id="ar-markers" style="width:100%; font-variant-numeric: tabular-nums;">
+      <thead>
+        <tr style="color:#aab; font-weight:500;">
+          <th style="width:3em;">id</th>
+          <th style="width:5em;">wall</th>
+          <th>x [m]</th>
+          <th>y [m]</th>
+          <th>z [m]</th>
+          <th>label</th>
+          <th style="width:3em;"></th>
+        </tr>
+      </thead>
+      <tbody id="ar-rows"></tbody>
+    </table>
+    <div style="margin-top:.5rem;">
+      <button id="btn-ar-add" type="button"
+              style="padding:.35rem .7rem; border:0; border-radius:5px;
+                     background:var(--accent); color:#062633; font-weight:600;
+                     cursor:pointer; font-size:.85rem;">+ Add marker</button>
+    </div>
+  </section>
+
+  <section class="card" style="margin-top:1rem;">
+    <details>
+      <summary style="cursor:pointer; font-size:.85rem; color:#aab;">
+        Saved arenas
+      </summary>
+      <div style="display:flex; gap:.4rem; align-items:center; margin:.5rem 0;">
+        <input id="ar-save-name" type="text" placeholder="name"
+               style="flex:1; padding:.35rem .5rem; background:#0c0f12;
+                      color:var(--fg); border:1px solid #2a3038;
+                      border-radius:5px; font-size:.85rem;">
+        <button id="btn-ar-save-as" type="button"
+                style="padding:.35rem .7rem; border:0; border-radius:5px;
+                       background:var(--accent); color:#062633; font-weight:600;
+                       cursor:pointer; font-size:.85rem;">Save as ...</button>
+      </div>
+      <div id="ar-list" style="font-size:.85rem;"></div>
+    </details>
+  </section>
+</main>
+
+<script>
+const $ = id => document.getElementById(id);
+const WALL_COLORS = {front:'#facc15', right:'#4ade80',
+                     back:'#58c4ff',  left:'#f87171'};
+let arena = null;   // {marker_size_m,width_m,depth_m,top_z_m,bottom_z_m,markers:[...]}
+
+function setMsg(s, isErr) {
+  $('ar-msg').textContent = isErr ? '' : (s || '');
+  $('ar-err').textContent = isErr ? (s || '') : '';
+}
+function metaFromInputs() {
+  return {
+    marker_size_m: parseFloat($('ar-msize').value) || 0,
+    width_m:  parseFloat($('ar-width').value)  || 0,
+    depth_m:  parseFloat($('ar-depth').value)  || 0,
+    top_z_m:  parseFloat($('ar-topz').value)   || 0,
+    bottom_z_m: parseFloat($('ar-botz').value) || 0,
+  };
+}
+function inputsFromArena() {
+  $('ar-msize').value = arena.marker_size_m;
+  $('ar-width').value = arena.width_m;
+  $('ar-depth').value = arena.depth_m;
+  $('ar-topz').value  = arena.top_z_m;
+  $('ar-botz').value  = arena.bottom_z_m;
+}
+function renderRows() {
+  const tbody = $('ar-rows');
+  tbody.innerHTML = '';
+  arena.markers.forEach((m, idx) => {
+    const tr = document.createElement('tr');
+    tr.style.borderTop = '1px solid #2a3038';
+    function cell(html) { const td = document.createElement('td');
+      td.style.padding = '.2rem .3rem'; td.innerHTML = html; return td; }
+    function inputCell(value, attrs) {
+      const td = document.createElement('td');
+      td.style.padding = '.2rem .3rem';
+      const inp = document.createElement('input');
+      Object.assign(inp, attrs);
+      inp.value = value;
+      inp.style.cssText = 'width:6em; background:#0c0f12; color:var(--fg);'
+                       + ' border:1px solid #2a3038; border-radius:4px;'
+                       + ' padding:.15rem .3rem; font-size:.8rem;';
+      td.appendChild(inp);
+      return [td, inp];
+    }
+    const [tdId, inpId] = inputCell(m.id, {type:'number', step:1, min:0});
+    inpId.style.width = '4em';
+    inpId.addEventListener('input', () => {
+      arena.markers[idx].id = parseInt(inpId.value); drawArena();
+    });
+    tr.appendChild(tdId);
+
+    const tdWall = document.createElement('td');
+    tdWall.style.padding = '.2rem .3rem';
+    const sel = document.createElement('select');
+    sel.style.cssText = 'background:#0c0f12; color:var(--fg);'
+                     + ' border:1px solid #2a3038; border-radius:4px;'
+                     + ' padding:.15rem .3rem; font-size:.8rem;';
+    ['front','back','left','right'].forEach(w => {
+      const o = document.createElement('option');
+      o.value = w; o.textContent = w;
+      if (w === m.wall) o.selected = true;
+      sel.appendChild(o);
+    });
+    sel.addEventListener('change', () => {
+      arena.markers[idx].wall = sel.value;
+      // Snap fixed coordinate so the marker lands on the new wall.
+      const meta = metaFromInputs();
+      if (sel.value === 'front') arena.markers[idx].y = +meta.depth_m / 2;
+      if (sel.value === 'back')  arena.markers[idx].y = -meta.depth_m / 2;
+      if (sel.value === 'right') arena.markers[idx].x = +meta.width_m / 2;
+      if (sel.value === 'left')  arena.markers[idx].x = -meta.width_m / 2;
+      renderRows();
+      drawArena();
+    });
+    tdWall.appendChild(sel);
+    tr.appendChild(tdWall);
+
+    [['x', m.x], ['y', m.y], ['z', m.z]].forEach(([key, val]) => {
+      const [td, inp] = inputCell(val, {type:'number', step:0.01});
+      inp.addEventListener('input', () => {
+        arena.markers[idx][key] = parseFloat(inp.value); drawArena();
+      });
+      tr.appendChild(td);
+    });
+
+    const [tdLabel, inpLabel] = inputCell(m.label || '', {type:'text'});
+    inpLabel.style.width = '12em';
+    inpLabel.addEventListener('input', () => {
+      arena.markers[idx].label = inpLabel.value;
+    });
+    tr.appendChild(tdLabel);
+
+    const tdDel = cell('');
+    const btn = document.createElement('button');
+    btn.textContent = '\\u2715';
+    btn.style.cssText = 'padding:.15rem .4rem; border:0; border-radius:4px;'
+                     + ' background:var(--bad); color:#240707; cursor:pointer;'
+                     + ' font-size:.8rem;';
+    btn.addEventListener('click', () => {
+      arena.markers.splice(idx, 1); renderRows(); drawArena();
+    });
+    tdDel.appendChild(btn);
+    tr.appendChild(tdDel);
+
+    tbody.appendChild(tr);
+  });
+}
+function drawArena() {
+  const c = $('c-arena');
+  if (!c || !arena) return;
+  const ctx = c.getContext('2d');
+  const W = c.width, H = c.height;
+  ctx.clearRect(0, 0, W, H);
+  const meta = metaFromInputs();
+  const w = meta.width_m, d = meta.depth_m;
+  if (w <= 0 || d <= 0) return;
+  const margin = 40;
+  const px_per_m = Math.min((W - 2*margin) / w, (H - 2*margin) / d);
+  const cx = W / 2, cy = H / 2;
+  // arena -> canvas: +x_arena -> +x_canvas; +y_arena -> -y_canvas (top of canvas).
+  const ax = (xm) => cx + xm * px_per_m;
+  const ay = (ym) => cy - ym * px_per_m;
+  // 1 m background grid clipped to the arena rectangle. Heavier line +
+  // numeric label at every 5 m step so the operator can read the
+  // marker positions off the diagram.
+  const xMin = Math.ceil(-w/2),  xMax = Math.floor(w/2);
+  const yMin = Math.ceil(-d/2),  yMax = Math.floor(d/2);
+  const yTop = ay(d/2), yBot = ay(-d/2);
+  const xLeft = ax(-w/2), xRight = ax(w/2);
+  // 1 m grid -- very subtle.
+  ctx.strokeStyle = '#1d2229'; ctx.lineWidth = 1;
+  ctx.beginPath();
+  for (let xi = xMin; xi <= xMax; xi++) {
+    if (xi % 5 === 0) continue;          // 5 m step drawn separately
+    const xp = ax(xi);
+    ctx.moveTo(xp, yTop); ctx.lineTo(xp, yBot);
+  }
+  for (let yi = yMin; yi <= yMax; yi++) {
+    if (yi % 5 === 0) continue;
+    const yp = ay(yi);
+    ctx.moveTo(xLeft, yp); ctx.lineTo(xRight, yp);
+  }
+  ctx.stroke();
+  // 5 m grid -- more visible (matches the old centre-lines colour, so
+  // the origin lines stay subtly highlighted as part of the 5 m grid).
+  ctx.strokeStyle = '#2a3038'; ctx.lineWidth = 1;
+  ctx.beginPath();
+  for (let xi = xMin; xi <= xMax; xi++) {
+    if (xi % 5 !== 0) continue;
+    const xp = ax(xi);
+    ctx.moveTo(xp, yTop); ctx.lineTo(xp, yBot);
+  }
+  for (let yi = yMin; yi <= yMax; yi++) {
+    if (yi % 5 !== 0) continue;
+    const yp = ay(yi);
+    ctx.moveTo(xLeft, yp); ctx.lineTo(xRight, yp);
+  }
+  ctx.stroke();
+  // 5 m labels: x along the bottom (just below the back wall), y along
+  // the left edge (just left of the left wall). Skip 0 -- the origin
+  // marker (drawn later) already labels it.
+  ctx.fillStyle = '#778'; ctx.font = '10px ui-sans-serif';
+  ctx.textAlign = 'center';
+  for (let xi = xMin; xi <= xMax; xi++) {
+    if (xi % 5 !== 0 || xi === 0) continue;
+    ctx.fillText(`${xi} m`, ax(xi), yBot + 32);
+  }
+  ctx.textAlign = 'right';
+  for (let yi = yMin; yi <= yMax; yi++) {
+    if (yi % 5 !== 0 || yi === 0) continue;
+    ctx.fillText(`${yi} m`, xLeft - 22, ay(yi) + 3);
+  }
+  ctx.textAlign = 'center';
+  // arena rectangle
+  ctx.strokeStyle = '#aab'; ctx.lineWidth = 2;
+  ctx.strokeRect(ax(-w/2), ay(d/2), w * px_per_m, d * px_per_m);
+  // wall labels
+  ctx.fillStyle = '#aab'; ctx.font = '13px ui-sans-serif';
+  ctx.textAlign = 'center';
+  ctx.fillText('front (+y)', cx, ay(d/2) - 8);
+  ctx.fillText('back (-y)',  cx, ay(-d/2) + 18);
+  ctx.save();
+  ctx.translate(ax(-w/2) - 14, cy); ctx.rotate(-Math.PI/2);
+  ctx.fillText('left (-x)', 0, 0); ctx.restore();
+  ctx.save();
+  ctx.translate(ax( w/2) + 14, cy); ctx.rotate(Math.PI/2);
+  ctx.fillText('right (+x)', 0, 0); ctx.restore();
+  // coordinate system at the origin: small yellow +x and +y arrows with labels.
+  const AXIS_LEN_PX = Math.min(50, px_per_m * 1.0);   // ~1 m, capped at 50 px
+  const HEAD = 6;
+  function drawArrow(x1, y1, x2, y2, label, labelDx, labelDy) {
+    ctx.strokeStyle = '#facc15'; ctx.fillStyle = '#facc15';
+    ctx.lineWidth = 2;
+    ctx.beginPath(); ctx.moveTo(x1, y1); ctx.lineTo(x2, y2); ctx.stroke();
+    // arrow head
+    const ang = Math.atan2(y2 - y1, x2 - x1);
+    ctx.beginPath();
+    ctx.moveTo(x2, y2);
+    ctx.lineTo(x2 - HEAD * Math.cos(ang - Math.PI/6),
+               y2 - HEAD * Math.sin(ang - Math.PI/6));
+    ctx.lineTo(x2 - HEAD * Math.cos(ang + Math.PI/6),
+               y2 - HEAD * Math.sin(ang + Math.PI/6));
+    ctx.closePath(); ctx.fill();
+    ctx.font = 'bold 12px ui-sans-serif';
+    ctx.textAlign = 'center';
+    ctx.fillText(label, x2 + labelDx, y2 + labelDy);
+  }
+  drawArrow(cx, cy, cx + AXIS_LEN_PX, cy, '+x', 10,  4);
+  drawArrow(cx, cy, cx, cy - AXIS_LEN_PX, '+y',  0, -8);
+  // origin dot
+  ctx.fillStyle = '#facc15';
+  ctx.beginPath(); ctx.arc(cx, cy, 3, 0, 2*Math.PI); ctx.fill();
+  ctx.fillStyle = '#aab'; ctx.font = '11px ui-sans-serif';
+  ctx.textAlign = 'right';
+  ctx.fillText('(0, 0)', cx - 6, cy + 14);
+  ctx.textAlign = 'center';
+  // markers. Group by (x, y) so markers stacked vertically (same wall
+  // location, different z) don't draw on top of each other -- offset
+  // them along the canvas vertical with the higher-z marker drawn
+  // higher on screen (smaller canvas y).
+  const STACK_OFFSET_PX = 14;
+  const groups = new Map();
+  arena.markers.forEach((m, idx) => {
+    const key = `${m.x.toFixed(2)},${m.y.toFixed(2)}`;
+    if (!groups.has(key)) groups.set(key, []);
+    groups.get(key).push(idx);
+  });
+  const stackOffset = new Map();
+  groups.forEach(indices => {
+    indices.sort((a, b) => arena.markers[b].z - arena.markers[a].z);
+    const n = indices.length;
+    indices.forEach((idx, i) => {
+      stackOffset.set(idx, (i - (n - 1) / 2) * STACK_OFFSET_PX);
+    });
+  });
+  arena.markers.forEach((m, idx) => {
+    const x = ax(m.x);
+    const y = ay(m.y) + (stackOffset.get(idx) || 0);
+    ctx.fillStyle = WALL_COLORS[m.wall] || '#fff';
+    ctx.beginPath(); ctx.arc(x, y, 6, 0, 2*Math.PI); ctx.fill();
+    ctx.fillStyle = '#0e1116'; ctx.font = 'bold 10px ui-sans-serif';
+    const label = String(m.id);
+    ctx.fillText(label, x, y + 3.5);
+    ctx.fillStyle = '#aab'; ctx.font = '10px ui-sans-serif';
+    ctx.textAlign = 'left';
+    ctx.fillText(`(${m.x.toFixed(1)},${m.y.toFixed(1)},${m.z.toFixed(1)})`,
+                 x + 9, y + 4);
+    ctx.textAlign = 'center';
+  });
+}
+
+async function loadArena() {
+  try {
+    const r = await fetch('/api/arena/active', {cache:'no-store'});
+    arena = await r.json();
+    inputsFromArena(); renderRows(); drawArena();
+    setMsg('Loaded.');
+  } catch (e) { setMsg('Load failed: ' + e, true); }
+}
+async function resetToDefault() {
+  try {
+    const r = await fetch('/api/arena/default', {
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body: JSON.stringify(metaFromInputs())});
+    arena = await r.json();
+    inputsFromArena(); renderRows(); drawArena();
+    setMsg('Reset to default.');
+  } catch (e) { setMsg('Reset failed: ' + e, true); }
+}
+function arenaPayload() {
+  // Pull current inputs into the payload (in case the user edited
+  // the metadata but didn't yet trigger a re-render).
+  const m = metaFromInputs();
+  return {...m, markers: arena.markers};
+}
+async function saveActive() {
+  try {
+    const r = await fetch('/api/arena/active', {
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body: JSON.stringify(arenaPayload())});
+    const j = await r.json();
+    if (j.ok) { setMsg('Saved active.'); refreshList(); }
+    else setMsg('Save failed: ' + (j.error || 'unknown'), true);
+  } catch (e) { setMsg('Save failed: ' + e, true); }
+}
+async function saveAs(name) {
+  if (!name) { setMsg('Enter a name first.', true); return; }
+  try {
+    const r = await fetch('/api/arena/configs/' + encodeURIComponent(name),
+      {method:'POST', headers:{'Content-Type':'application/json'},
+       body: JSON.stringify(arenaPayload())});
+    const j = await r.json();
+    if (j.ok) { setMsg('Saved as ' + name + '.'); refreshList(); }
+    else setMsg('Save failed: ' + (j.error || 'unknown'), true);
+  } catch (e) { setMsg('Save failed: ' + e, true); }
+}
+async function loadNamed(name) {
+  try {
+    const r = await fetch('/api/arena/configs/' + encodeURIComponent(name)
+                          + '/load', {method:'POST'});
+    const j = await r.json();
+    if (j.ok && j.config) {
+      arena = j.config;
+      inputsFromArena(); renderRows(); drawArena();
+      setMsg('Loaded ' + name + '.');
+    } else setMsg('Load failed: ' + (j.error || 'unknown'), true);
+  } catch (e) { setMsg('Load failed: ' + e, true); }
+}
+async function deleteNamed(name) {
+  try {
+    const r = await fetch('/api/arena/configs/' + encodeURIComponent(name),
+                          {method:'DELETE'});
+    const j = await r.json();
+    if (j.ok) { setMsg('Deleted ' + name + '.'); refreshList(); }
+    else setMsg('Delete failed: ' + (j.error || 'unknown'), true);
+  } catch (e) { setMsg('Delete failed: ' + e, true); }
+}
+async function refreshList() {
+  try {
+    const r = await fetch('/api/arena/configs', {cache:'no-store'});
+    const j = await r.json();
+    const list = $('ar-list');
+    if (!j.configs || !j.configs.length) {
+      list.innerHTML = '<div style="color:#778;">No saved arenas.</div>'; return;
+    }
+    const fmtTime = mt => new Date(mt*1000).toLocaleString();
+    list.innerHTML = j.configs.map(c => {
+      const safe = c.name.replace(/"/g, '&quot;');
+      return `
+        <div style="display:flex; gap:.4rem; align-items:center;
+                    padding:.25rem 0; border-top:1px solid #2a3038;">
+          <span style="flex:1; font-family:ui-monospace, monospace;">${safe}</span>
+          <span style="color:#778; font-size:.75rem;">${fmtTime(c.mtime)}</span>
+          <button class="ar-load"      data-name="${safe}"
+                  style="padding:.2rem .5rem; border:0; border-radius:4px;
+                         background:var(--accent); color:#062633;
+                         font-weight:600; cursor:pointer; font-size:.75rem;">Load</button>
+          <button class="ar-overwrite" data-name="${safe}"
+                  style="padding:.2rem .5rem; border:0; border-radius:4px;
+                         background:#facc15; color:#241a07;
+                         font-weight:600; cursor:pointer; font-size:.75rem;">Overwrite</button>
+          <button class="ar-delete"    data-name="${safe}"
+                  style="padding:.2rem .5rem; border:0; border-radius:4px;
+                         background:var(--bad); color:#240707;
+                         font-weight:600; cursor:pointer; font-size:.75rem;">Delete</button>
+        </div>`;
+    }).join('');
+    list.querySelectorAll('.ar-load').forEach(b =>
+      b.addEventListener('click', () => loadNamed(b.dataset.name)));
+    list.querySelectorAll('.ar-overwrite').forEach(b =>
+      b.addEventListener('click', () => saveAs(b.dataset.name)));
+    list.querySelectorAll('.ar-delete').forEach(b =>
+      b.addEventListener('click', () => deleteNamed(b.dataset.name)));
+  } catch (e) {}
+}
+
+['ar-width','ar-depth','ar-topz','ar-botz','ar-msize'].forEach(id => {
+  const el = $(id); if (el) el.addEventListener('input', drawArena);
+});
+$('btn-ar-reset').addEventListener('click', resetToDefault);
+$('btn-ar-save').addEventListener('click', saveActive);
+$('btn-ar-add').addEventListener('click', () => {
+  const meta = metaFromInputs();
+  arena.markers.push({id: (Math.max(0, ...arena.markers.map(m=>m.id))+1),
+                      wall:'front', x:0, y:meta.depth_m/2,
+                      z:meta.top_z_m, label:''});
+  renderRows(); drawArena();
+});
+$('btn-ar-save-as').addEventListener('click', () =>
+  saveAs($('ar-save-name').value.trim()));
+
+loadArena();
+refreshList();
+</script>
+"""
+
+
 # ---------------------------------------------------------------------------
 # UI server
 # ---------------------------------------------------------------------------
@@ -1566,7 +2039,8 @@ class UiServer:
                  calibration_capture=None,
                  cfg: Optional[MissionConfig] = None,
                  controller: Optional[MissionController] = None,
-                 flight_dir_provider: Optional[Callable[[], Optional[Path]]] = None):
+                 flight_dir_provider: Optional[Callable[[], Optional[Path]]] = None,
+                 arena_holder=None):
         self.state = state
         self.frame = latest_frame
         self.host = host
@@ -1583,6 +2057,10 @@ class UiServer:
         # mission.py rolls flight_dir between missions, so we receive
         # a callable rather than a fixed Path.
         self.flight_dir_provider = flight_dir_provider
+        # Arena tab. Holder pattern so the running vision_worker picks
+        # up a Save in the Arena tab without a restart. None when the
+        # UI runs in view-only / replay-only mode.
+        self.arena_holder = arena_holder
         self.flights_root = Path(flights_root) if flights_root else None
         # Drives the /calibrate page. May be None (e.g. view mode); the
         # routes return 503 in that case.
@@ -2045,6 +2523,205 @@ class UiServer:
             p = _snap_path(name)
             if p is None or not p.exists():
                 return jsonify({"ok": False, "error": "snapshot not found"}), 404
+            try:
+                p.unlink()
+                return jsonify({"ok": True, "name": name})
+            except Exception as e:
+                return jsonify({"ok": False, "error": str(e)}), 500
+
+        # ---- Arena tab + API -------------------------------------------
+        # Page route, the active draft, the default-regenerator, and
+        # the named save/load CRUD. Mirrors the layout of the mission
+        # script + tuning snapshot routes above.
+
+        @app.get("/arena")
+        def arena_page():
+            return render_template_string(
+                _PAGE_ARENA, active="arena",
+                history_s=self.history_s,
+                header_label="arena layout",
+                replay_id=None,
+                mode="live",
+                drone_connected=self.drone_connected,
+            )
+
+        def _arena_payload_to_config(data):
+            from .arena import ArenaConfig
+            markers = []
+            for m in (data.get("markers") or []):
+                markers.append({
+                    "id": int(m["id"]),
+                    "label": str(m.get("label", "")),
+                    "wall": str(m["wall"]).lower(),
+                    "x": float(m["x"]),
+                    "y": float(m["y"]),
+                    "z": float(m["z"]),
+                })
+            return ArenaConfig.from_dict({
+                "marker_size_m": float(data.get("marker_size_m", 0.18)),
+                "width_m":       float(data.get("width_m", 10.0)),
+                "depth_m":       float(data.get("depth_m", 25.0)),
+                "top_z_m":       float(data.get("top_z_m", 4.0)),
+                "bottom_z_m":    float(data.get("bottom_z_m", 2.0)),
+                "markers":       markers,
+            }, source="<request>")
+
+        def _validate_arena_layout(arena_obj):
+            """Return error message string, or None if OK."""
+            tol = 0.01    # 1 cm tolerance for "marker on wall" check
+            if arena_obj.width_m <= 0 or arena_obj.depth_m <= 0:
+                return "width_m and depth_m must be > 0"
+            if arena_obj.marker_size_m <= 0:
+                return "marker_size_m must be > 0"
+            seen_ids = set()
+            half_w, half_d = arena_obj.width_m / 2, arena_obj.depth_m / 2
+            for mid, m in arena_obj.markers.items():
+                if mid in seen_ids:
+                    return f"duplicate marker id {mid}"
+                seen_ids.add(mid)
+                x, y, z = m.position_m
+                if z < 0:
+                    return f"marker {mid}: z={z:.3f} must be >= 0"
+                if m.wall == "front":
+                    if abs(y - half_d) > tol:
+                        return (f"marker {mid}: y={y:.3f} not on front wall"
+                                f" (expected {half_d:.3f})")
+                    if abs(x) > half_w + tol:
+                        return f"marker {mid}: x={x:.3f} outside front wall"
+                elif m.wall == "back":
+                    if abs(y - (-half_d)) > tol:
+                        return (f"marker {mid}: y={y:.3f} not on back wall"
+                                f" (expected {-half_d:.3f})")
+                    if abs(x) > half_w + tol:
+                        return f"marker {mid}: x={x:.3f} outside back wall"
+                elif m.wall == "left":
+                    if abs(x - (-half_w)) > tol:
+                        return (f"marker {mid}: x={x:.3f} not on left wall"
+                                f" (expected {-half_w:.3f})")
+                    if abs(y) > half_d + tol:
+                        return f"marker {mid}: y={y:.3f} outside left wall"
+                elif m.wall == "right":
+                    if abs(x - half_w) > tol:
+                        return (f"marker {mid}: x={x:.3f} not on right wall"
+                                f" (expected {half_w:.3f})")
+                    if abs(y) > half_d + tol:
+                        return f"marker {mid}: y={y:.3f} outside right wall"
+            return None
+
+        @app.get("/api/arena/active")
+        def api_arena_active_get():
+            from .arena import load_priority_arena
+            try:
+                arena_obj = load_priority_arena()
+            except Exception as e:
+                return jsonify({"error": str(e)}), 500
+            return jsonify(arena_obj.to_json_dict())
+
+        @app.post("/api/arena/active")
+        def api_arena_active_set():
+            data = request.get_json(silent=True) or {}
+            try:
+                arena_obj = _arena_payload_to_config(data)
+            except Exception as e:
+                return jsonify({"ok": False,
+                                "error": f"bad payload: {e}"}), 400
+            err = _validate_arena_layout(arena_obj)
+            if err:
+                return jsonify({"ok": False, "error": err}), 400
+            from .config import ACTIVE_ARENA_CONFIG_PATH
+            try:
+                ACTIVE_ARENA_CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+                ACTIVE_ARENA_CONFIG_PATH.write_text(
+                    json.dumps(arena_obj.to_json_dict(), indent=2))
+            except Exception as e:
+                return jsonify({"ok": False, "error": str(e)}), 500
+            # Hot-reload into the running vision_worker.
+            if self.arena_holder is not None:
+                try:
+                    self.arena_holder.set(arena_obj)
+                except Exception as e:
+                    print(f"[ui] arena_holder.set failed: {e}")
+            return jsonify({"ok": True})
+
+        @app.post("/api/arena/default")
+        def api_arena_default():
+            from .arena import default_arena
+            data = request.get_json(silent=True) or {}
+            try:
+                arena_obj = default_arena(
+                    width_m=float(data.get("width_m", 10.0)),
+                    depth_m=float(data.get("depth_m", 25.0)),
+                    top_z_m=float(data.get("top_z_m", 4.0)),
+                    bottom_z_m=float(data.get("bottom_z_m", 2.0)),
+                    marker_size_m=float(data.get("marker_size_m", 0.18)))
+            except Exception as e:
+                return jsonify({"error": str(e)}), 400
+            return jsonify(arena_obj.to_json_dict())
+
+        def _arena_path(name: str) -> Optional[Path]:
+            if not _NAME_RE.match(name):
+                return None
+            from .config import ARENA_CONFIGS_DIR
+            ARENA_CONFIGS_DIR.mkdir(parents=True, exist_ok=True)
+            return ARENA_CONFIGS_DIR / f"{name}.json"
+
+        @app.get("/api/arena/configs")
+        def api_arena_list():
+            from .config import ARENA_CONFIGS_DIR
+            ARENA_CONFIGS_DIR.mkdir(parents=True, exist_ok=True)
+            items = []
+            for p in ARENA_CONFIGS_DIR.glob("*.json"):
+                try:
+                    items.append({
+                        "name":  p.stem,
+                        "mtime": p.stat().st_mtime,
+                        "size":  p.stat().st_size,
+                    })
+                except OSError:
+                    continue
+            items.sort(key=lambda x: -x["mtime"])
+            return jsonify({"configs": items})
+
+        @app.post("/api/arena/configs/<name>")
+        def api_arena_save_named(name):
+            data = request.get_json(silent=True) or {}
+            try:
+                arena_obj = _arena_payload_to_config(data)
+            except Exception as e:
+                return jsonify({"ok": False,
+                                "error": f"bad payload: {e}"}), 400
+            err = _validate_arena_layout(arena_obj)
+            if err:
+                return jsonify({"ok": False, "error": err}), 400
+            p = _arena_path(name)
+            if p is None:
+                return jsonify({"ok": False,
+                                "error": "invalid name"}), 400
+            try:
+                p.write_text(json.dumps(arena_obj.to_json_dict(), indent=2))
+                return jsonify({"ok": True, "name": name})
+            except Exception as e:
+                return jsonify({"ok": False, "error": str(e)}), 500
+
+        @app.post("/api/arena/configs/<name>/load")
+        def api_arena_load_named(name):
+            from .arena import ArenaConfig
+            p = _arena_path(name)
+            if p is None or not p.exists():
+                return jsonify({"ok": False,
+                                "error": "config not found"}), 404
+            try:
+                return jsonify({"ok": True, "name": name,
+                                "config": ArenaConfig.load(p).to_json_dict()})
+            except Exception as e:
+                return jsonify({"ok": False, "error": str(e)}), 500
+
+        @app.delete("/api/arena/configs/<name>")
+        def api_arena_delete_named(name):
+            p = _arena_path(name)
+            if p is None or not p.exists():
+                return jsonify({"ok": False,
+                                "error": "config not found"}), 404
             try:
                 p.unlink()
                 return jsonify({"ok": True, "name": name})
