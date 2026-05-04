@@ -203,6 +203,13 @@ class MissionConfig:
                                               #  0.0 = freeze at first sample)
     pose_max_age_s: float = 0.8            # if no detection in this window we
                                               # consider the marker lost
+    # Camera horizontal FOV in degrees, used by the TO step's
+    # auto-yaw heuristic to decide which arena markers would be
+    # visible from a candidate yaw at the target position. The
+    # Anafi's wide-rectilinear stream is roughly 69 deg; 60 leaves
+    # a safety margin so a marker scored as "in view" stays in view
+    # under small drift. Tune up if the auto-yaw seems pessimistic.
+    camera_fov_h_deg: float = 60.0
 
     # --- Network -------------------------------------------------------------
     api_base_url: str = "http://127.0.0.1:5050"

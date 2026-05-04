@@ -156,7 +156,7 @@ settle time (~1 s).
 
 ---
 
-### `TO <x> <y> [<z>]`
+### `TO <x> <y> [<z>] [<yaw>|auto]`
 
 > Drive the drone to an arena-frame coordinate.
 
@@ -165,6 +165,14 @@ right, `+y` toward the front wall, `+z` up. With two arguments the
 drone moves in the horizontal plane and the Anafi's onboard
 stabiliser holds whatever altitude it's currently at; with three the
 third is a target altitude (clamped to `[min_height_m, max_height_m]`).
+
+The fourth (optional) argument controls the drone's arena-frame yaw
+target in degrees (CW from the front wall). Use a numeric value to
+pin a heading explicitly, or `auto` (the default when the argument
+is omitted *and* a `z` was given) to let the controller pick a yaw
+that maximises the number of well-placed reference markers visible
+from the target — the drone arrives facing wherever the camera will
+get the cleanest world-position fix.
 
 The controller drives only when both the world-position estimate
 *and* the derived arena yaw are fresh (≤ `pose_max_age_s`). If
@@ -177,10 +185,15 @@ Arguments:
 - `x`, `y`: target coordinates in metres. Required.
 - `z`: target altitude in metres. Optional; omit to keep the current
   altitude.
+- `yaw`: target arena-frame yaw in degrees, or `auto`. Default:
+  `auto` (when the controller has an arena config; otherwise the
+  drone keeps its current heading). The yaw arg requires `z` to be
+  given (positional grammar).
 
-Done when horizontal error is inside `distance_deadband_m` (and, if
-`z` was given, height error is inside `height_deadband_m`) for the
-configured settle time.
+Done when horizontal error is inside `distance_deadband_m`, height
+error is inside `height_deadband_m` (when `z` was given), *and* yaw
+error is inside `yaw_deadband_deg` (when a yaw target is in effect)
+for the configured settle time.
 
 ---
 

@@ -369,6 +369,12 @@ class MissionState:
     goto_target_x_m: Optional[float] = None
     goto_target_y_m: Optional[float] = None
     goto_target_z_m: Optional[float] = None
+    # Optional arena-frame yaw target for the TO step (degrees, CW
+    # from arena +y / front wall). None means "do not drive yaw" --
+    # _step_goto leaves rc_yaw at 0 and the drone keeps its current
+    # heading. Set either from an explicit numeric arg in the script
+    # or by the best-view auto-yaw heuristic at TO step entry.
+    goto_target_yaw_deg: Optional[float] = None
     # When set, _step_goto stays in GOTO until ``now >=
     # goto_hold_until`` and advances on the timer instead of on
     # settle. Used by HOOVER-after-TO so the drone station-keeps at
@@ -456,6 +462,7 @@ class MissionState:
             self.goto_target_x_m = None
             self.goto_target_y_m = None
             self.goto_target_z_m = None
+            self.goto_target_yaw_deg = None
             self.goto_hold_until = None
             self.await_marker_id = None
             self.visible_marker_ids = []
@@ -546,13 +553,19 @@ class MissionController:
                  state: MissionState,
                  frame_pose_provider,           # callable -> Optional[MarkerPose]
                  telemetry_provider,            # callable -> TelemetrySnapshot
-                 on_phase_change=None):
+                 on_phase_change=None,
+                 arena_provider=None,           # callable -> Optional[ArenaConfig]
+                 ):
         self.api = api
         self.cfg = cfg
         self.state = state
         self.get_pose = frame_pose_provider
         self.get_tel = telemetry_provider
         self.on_phase_change = on_phase_change
+        # Lets the TO step's auto-yaw heuristic enumerate reference
+        # markers and score candidate yaws. Optional; without an
+        # arena_provider TO falls back to "no yaw drive" for auto.
+        self.get_arena = arena_provider
 
         # PD/PID controllers. ``ki`` defaults to 0 in cfg, so today's
         # behaviour (pure PD) is preserved unless the operator bumps
@@ -1441,6 +1454,87 @@ class MissionController:
         if settled:
             self._advance_script(f"height reached ({drone_h:.2f}m)")
 
+    def _best_view_yaw_deg(self, tx: float, ty: float) -> Optional[float]:
+        """Pick the arena-frame yaw that maximises the score of
+        reference markers visible from ``(tx, ty)``.
+
+        Score per marker = ``cos(off_normal) / max(0.5, distance)``,
+        clipped to zero when:
+
+        * the drone is on the back side of the marker (can't see the face),
+        * the off-normal angle exceeds 80 deg (extreme oblique),
+        * the marker bearing falls outside the camera horizontal FOV
+          for the candidate yaw.
+
+        Sweeps yaws every 5 deg over the full circle; returns None
+        when ``arena_provider`` isn't set or the arena has no
+        markers (caller falls back to "no yaw drive").
+        """
+        if self.get_arena is None:
+            return None
+        arena = self.get_arena()
+        if arena is None or not arena.markers:
+            return None
+        cfg = self.cfg
+        half_fov_rad = math.radians(float(cfg.camera_fov_h_deg) / 2.0)
+        # Per-marker pre-computed (bearing, distance, normal_bearing)
+        # in arena frame. Bearing is CW from arena +y so it lines up
+        # with state.arena_yaw_deg without further conversion.
+        # Marker normals (outward into the arena) per wall:
+        #   front -> -y, back -> +y, left -> +x, right -> -x.
+        wall_normal_arena = {
+            "front": (0.0, -1.0),
+            "back":  (0.0, +1.0),
+            "left":  (+1.0, 0.0),
+            "right": (-1.0, 0.0),
+        }
+        marker_data = []
+        for m in arena.markers.values():
+            dx = float(m.position_m[0]) - tx
+            dy = float(m.position_m[1]) - ty
+            dist = math.hypot(dx, dy)
+            if dist < 1e-3:
+                continue
+            bearing = math.degrees(math.atan2(dx, dy))    # CW from +y
+            n = wall_normal_arena.get(m.wall)
+            if n is None:
+                continue
+            # Drone -> marker direction in arena (unit).
+            ux, uy = dx / dist, dy / dist
+            # Drone is in front of the face only when (drone-to-marker)
+            # has a NEGATIVE projection onto the outward normal -- i.e.
+            # the drone is on the side the normal points away from.
+            # Then off_normal is the angle between -(drone->marker)
+            # and the normal (both pointing roughly the same way).
+            face_proj = ux * n[0] + uy * n[1]            # cos angle
+            if face_proj >= 0.0:
+                continue                                  # behind marker
+            off_normal_rad = math.acos(max(-1.0, min(1.0, -face_proj)))
+            if off_normal_rad > math.radians(80.0):
+                continue                                  # too oblique
+            marker_data.append((bearing, dist, off_normal_rad))
+        if not marker_data:
+            return None
+        best_score = -1.0
+        best_yaw = None
+        for yaw_int in range(0, 360, 5):
+            yaw_deg = float(yaw_int)
+            score = 0.0
+            for bearing, dist, off_normal_rad in marker_data:
+                # Angular offset of marker bearing from drone heading,
+                # wrapped to [-180, 180].
+                d = bearing - yaw_deg
+                d = (d + 540.0) % 360.0 - 180.0
+                if abs(d) > math.degrees(half_fov_rad):
+                    continue
+                score += math.cos(off_normal_rad) / max(0.5, dist)
+            if score > best_score:
+                best_score = score
+                # Wrap the chosen yaw to (-180, 180] so the
+                # downstream PD error wrap-around behaves cleanly.
+                best_yaw = ((yaw_deg + 540.0) % 360.0) - 180.0
+        return best_yaw if best_score > 0.0 else None
+
     # ----------------------------------------------------------- goto (script)
     def _step_goto(self, tel: Optional[TelemetrySnapshot],
                   now: float) -> None:
@@ -1462,6 +1556,7 @@ class MissionController:
             tx = self.state.goto_target_x_m
             ty = self.state.goto_target_y_m
             tz = self.state.goto_target_z_m
+            t_yaw = self.state.goto_target_yaw_deg
             wp = self.state.world_position_m
             wp_at = self.state.world_position_updated_at
             yaw_arena = self.state.arena_yaw_deg
@@ -1528,20 +1623,36 @@ class MissionController:
             # No height telemetry -- skip the leg, treat altitude as
             # already-OK rather than blocking the step forever.
 
-        self._send_rc(int(u_lat), int(u_fwd), int(u_ud), 0)
+        # Optional yaw leg. Drives drone arena yaw to t_yaw. Uses
+        # state.arena_yaw_deg (already published by vision_worker)
+        # which is fresh by the time we got here -- the freshness
+        # gate above failed if it weren't.
+        u_yaw = 0.0
+        e_yaw = 0.0
+        yaw_ok = True
+        if t_yaw is not None and yaw_arena is not None:
+            e_yaw = ((float(t_yaw) - float(yaw_arena) + 540.0) % 360.0
+                     - 180.0)
+            u_yaw = (0.0 if abs(e_yaw) < cfg.yaw_deadband_deg
+                     else self.pd_yaw.step(e_yaw, now))
+            yaw_ok = abs(e_yaw) < cfg.yaw_deadband_deg
+
+        self._send_rc(int(u_lat), int(u_fwd), int(u_ud), int(u_yaw))
 
         e_xy = math.hypot(ex, ey)
-        in_band = e_xy < cfg.distance_deadband_m and height_ok
+        in_band = e_xy < cfg.distance_deadband_m and height_ok and yaw_ok
         settled = False
         with self.state.lock:
             z_txt = (f"  z_e={e_h:+.2f}m" if tz is not None else "")
+            yaw_txt = (f"  yaw_e={e_yaw:+.0f}deg"
+                       if t_yaw is not None else "")
             mode_txt = ("station-keep" if hold_until is not None
                         else "GOTO")
             self.state.note = (
                 f"{mode_txt}: at ({wp[0]:.2f},{wp[1]:.2f},{wp[2]:.2f})m "
                 f"-> ({tx:.2f},{ty:.2f}"
                 f"{(',' + format(tz, '.2f')) if tz is not None else ''})m"
-                f"  e_xy={e_xy:.2f}m{z_txt}")
+                f"  e_xy={e_xy:.2f}m{z_txt}{yaw_txt}")
             if in_band:
                 if self.state.settle_began_at is None:
                     self.state.settle_began_at = now
@@ -1823,17 +1934,35 @@ class MissionController:
             tz = (max(cfg.min_height_m,
                       min(cfg.max_height_m, float(step.height)))
                   if step.height is not None else None)
+            # Yaw target: explicit float wins; "auto" / None /
+            # missing -> best-view heuristic. The heuristic returns
+            # None when there's no arena_provider or no scoring
+            # marker fits, in which case we leave the yaw target
+            # unset and the drone keeps its current heading
+            # throughout the move.
+            yaw_arg = step.yaw
+            if isinstance(yaw_arg, (int, float)):
+                yaw_target = float(yaw_arg)
+                yaw_src = "explicit"
+            else:
+                yaw_target = self._best_view_yaw_deg(tx, ty)
+                yaw_src = ("auto" if yaw_target is not None
+                           else "auto-skipped")
             with self.state.lock:
                 self.state.goto_target_x_m = tx
                 self.state.goto_target_y_m = ty
                 self.state.goto_target_z_m = tz
+                self.state.goto_target_yaw_deg = yaw_target
                 # Plain TO advances on settle, not on a hold timer --
                 # clear any goto_hold_until left over from a previous
                 # HOOVER-after-TO.
                 self.state.goto_hold_until = None
             z_txt = f" z={tz:.2f}" if tz is not None else " z=keep"
+            yaw_txt = (f" yaw={yaw_target:+.0f}({yaw_src})"
+                       if yaw_target is not None else " yaw=keep")
             self._set_phase(Phase.GOTO,
-                            note + f" -> ({tx:.2f},{ty:.2f}){z_txt}m")
+                            note + f" -> ({tx:.2f},{ty:.2f}){z_txt}m"
+                                   f"{yaw_txt}")
             return
         if step.kind == "DANCE":
             now = time.monotonic()

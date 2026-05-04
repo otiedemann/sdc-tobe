@@ -329,7 +329,8 @@ def cmd_fly(args: argparse.Namespace) -> int:
     controller = MissionController(api, cfg, state,
                                    frame_pose_provider=pose_holder.get,
                                    telemetry_provider=tel_holder.get,
-                                   on_phase_change=on_phase_change)
+                                   on_phase_change=on_phase_change,
+                                   arena_provider=arena_holder.get)
 
     # The Stop button calls controller.stop() which blocks for up to ~25 s
     # waiting for the safe-shutdown to finish. We don't want the Flask

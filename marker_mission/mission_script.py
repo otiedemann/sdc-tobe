@@ -74,9 +74,14 @@ class Step:
     mode: Optional[str] = None
     # TO step: arena-frame target. world_x / world_y are required;
     # height is reused for the optional z (None means "keep current
-    # altitude").
+    # altitude"). yaw is the optional arena-frame target yaw in
+    # degrees (CW from +y / front wall). The literal "auto" picks
+    # the best-view yaw at step entry (the yaw that maximises the
+    # number of well-placed reference markers visible from the
+    # target). Default is "auto".
     world_x: Optional[float] = None
     world_y: Optional[float] = None
+    yaw: Optional[object] = None       # float or "auto" or None
     line_no: int = 0                    # 1-based source line, for diagnostics
 
 
@@ -184,16 +189,27 @@ def parse(text: str, defaults: dict) -> List[Step]:
                  else float(_required_default(defaults, "height", raw_line_no)))
             out.append(Step(kind="HEIGHT", height=h, line_no=raw_line_no))
         elif cmd == "TO":
-            if len(args) not in (2, 3):
+            if len(args) not in (2, 3, 4):
                 raise ScriptError(raw_line_no,
-                                  f"TO takes 2 or 3 arguments "
-                                  f"(<x> <y> [<z>]), got {len(args)}")
+                                  f"TO takes 2-4 arguments "
+                                  f"(<x> <y> [<z>] [<yaw>|auto]), "
+                                  f"got {len(args)}")
             wx = _parse_float(args[0], raw_line_no, "TO x")
             wy = _parse_float(args[1], raw_line_no, "TO y")
             wz = (_parse_float(args[2], raw_line_no, "TO z")
-                  if len(args) == 3 else None)
+                  if len(args) >= 3 else None)
+            # Yaw default is "auto": the controller picks the
+            # best-view yaw at step entry. A numeric 4th arg is
+            # honoured as the explicit arena-frame yaw target.
+            yaw_arg: object = "auto"
+            if len(args) == 4:
+                if args[3].lower() == "auto":
+                    yaw_arg = "auto"
+                else:
+                    yaw_arg = _parse_float(args[3], raw_line_no, "TO yaw")
             out.append(Step(kind="TO",
                             world_x=wx, world_y=wy, height=wz,
+                            yaw=yaw_arg,
                             line_no=raw_line_no))
         elif cmd == "DANCE":
             if len(args) > 2:
@@ -238,10 +254,19 @@ def format(steps: List[Step]) -> str:
         elif s.kind == "HEIGHT":
             lines.append(f"HEIGHT {s.height:g}")
         elif s.kind == "TO":
-            if s.height is None:
-                lines.append(f"TO {s.world_x:g} {s.world_y:g}")
-            else:
-                lines.append(f"TO {s.world_x:g} {s.world_y:g} {s.height:g}")
+            # Default yaw is "auto" (omitted from canonical form).
+            # A numeric yaw forces the 4-arg form; we must emit z
+            # alongside, since the grammar is positional. Steps with
+            # a numeric yaw and no z come from the parser's 4-arg
+            # branch which always sets z, so this is well-defined.
+            parts = [f"TO {s.world_x:g} {s.world_y:g}"]
+            numeric_yaw = (s.yaw is not None and s.yaw != "auto")
+            if s.height is not None or numeric_yaw:
+                parts.append(f"{s.height:g}" if s.height is not None
+                             else "0")
+            if numeric_yaw:
+                parts.append(f"{float(s.yaw):g}")
+            lines.append(" ".join(parts))
         elif s.kind == "DANCE":
             lines.append(f"DANCE {s.seconds:g} {s.mode}")
         else:

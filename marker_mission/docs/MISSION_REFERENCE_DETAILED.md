@@ -254,13 +254,13 @@ height telemetry is unavailable, the step times out after 5 s and
 advances anyway, on the assumption that something else (HOLD, LAND)
 will save the operator.
 
-### `TO <x> <y> [<z>]`
+### `TO <x> <y> [<z>] [<yaw>|auto]`
 
-| Arguments | x, y required; z optional. Clamped to `[min_height_m, max_height_m]` when given. |
+| Arguments | x, y required; z optional (clamped to `[min_height_m, max_height_m]`); yaw optional, numeric or `auto` (default: `auto`). |
 |---|---|
 | Starting phase | `GOTO` |
-| Per-step state | `state.goto_target_x_m`, `state.goto_target_y_m`, `state.goto_target_z_m` (None when z omitted) |
-| Exit | horizontal error < `distance_deadband_m` and (z absent or `\|e_h\|` < `height_deadband_m`) for `height_settle_time_s` → `_advance_script("goto reached …")` |
+| Per-step state | `state.goto_target_x_m`, `state.goto_target_y_m`, `state.goto_target_z_m` (None when z omitted), `state.goto_target_yaw_deg` (None when no arena_provider or no scoring marker fits) |
+| Exit | horizontal error < `distance_deadband_m`, (z absent or `\|e_h\|` < `height_deadband_m`), and (yaw target absent or `\|e_yaw\|` < `yaw_deadband_deg`) for `height_settle_time_s` → `_advance_script("goto reached …")` |
 
 `_step_goto` reads the arena-frame world position from
 `state.world_position_m` and the drone's arena yaw from
@@ -287,6 +287,25 @@ prior step (or `cfg.target_marker_id` at construction) put into
 `state.active_marker_id`. `TO` itself does **not** override it, so a
 `TO` after `APPROACH 7` stays locked on marker 7 for the yaw
 estimate even though the drive target is in absolute coordinates.
+
+The auto-yaw heuristic (`MissionController._best_view_yaw_deg`) runs
+once at TO step entry, given the target `(tx, ty)`. It sweeps yaw
+candidates every 5° over the full circle. Per candidate it sums
+`cos(off_normal) / max(0.5, distance)` over every reference marker
+that satisfies all of:
+
+* the drone is on the marker's outward-normal side (can't see the
+  back of a wall marker);
+* the off-normal angle is ≤ 80° (extreme oblique markers detect
+  poorly);
+* the bearing to the marker from the drone falls within
+  `cfg.camera_fov_h_deg / 2` of the candidate yaw.
+
+The argmax over candidates is what the drone is told to face. When
+no `arena_provider` is configured, or no marker scores positively
+from the target (e.g. an empty arena), `goto_target_yaw_deg` stays
+`None` and `_step_goto` leaves `rc_yaw` at zero — the drone keeps
+its current heading throughout the move.
 
 ### `DANCE [<seconds>] [<mode>]`
 
