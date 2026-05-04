@@ -53,32 +53,27 @@ DEFAULT_FBX_DIR = Path(__file__).parent / "out" / "fbx"
 DEFAULT_OUT_YAML = Path(__file__).parent / "out" / "arena.yml"
 
 
-# Marker orientation in YAML. Each marker's per-mesh ``Rotation`` is
-# emitted as (Roll, Pitch, Yaw) in degrees. We keep Roll=0 always.
+# Marker orientation in YAML. The Sphinx YAML's per-mesh ``Rotation``
+# field is parsed by UE4's FRotator parser, which uses ``(Pitch, Yaw,
+# Roll)`` order — NOT the Blender-ish ``(Roll, Pitch, Yaw)`` we tried
+# first. With the wrong order, the live render showed markers as tall
+# thin rectangles with the ArUco pattern rotated 90° (yaw was being
+# applied as a pre-tilt rotation around Z and roll was tilting the
+# plane sideways).
 #
-# Pitch lifts the FBX (which is a flat plane lying in UE's XY plane,
-# normal +Z) to upright. With Pitch=+90° around UE's Y axis the plane
-# stands up with its normal pointing UE +X (forward). Then Yaw
-# rotates around UE's Z axis to aim that normal at the inward
-# direction of the wall the marker is mounted on.
+# Correct order, applied to a flat XY plane (normal +Z) coming out
+# of Blender:
+#   - Pitch (around UE Y) tilts the plane upright. After Pitch=+90°
+#     the plane is in YZ with normal pointing +X (forward).
+#   - Yaw (around UE Z) then rotates that +X normal to face the
+#     inward direction of each wall.
+#   - Roll stays 0.
 #
-# Per the default axis_map ``y2x,x2y_neg,z2z``:
-#   - arena +Y → UE +X
-#   - arena +X → UE -Y
-#   - arena +Z → UE +Z
-#
-# Inward direction per wall (in UE coords) and the corresponding yaw
-# (with normal already at +X after pitch):
+# Inward direction per wall (in UE coords, default axis_map):
 #   front (arena y=0,    inward arena +Y → UE +X)  yaw   0°
 #   back  (arena y=10.8, inward arena -Y → UE -X)  yaw 180°
 #   left  (arena x=-10,  inward arena +X → UE -Y)  yaw -90°
 #   right (arena x=+10,  inward arena -X → UE +Y)  yaw +90°
-#
-# Earlier we tried doing the upright-tilt in Blender via
-# rotation_euler+transform_apply, but the rotation didn't survive
-# Blender 3.0.1 → FBX → UE4 cleanly (markers ended up lying flat on
-# the floor in the live render). Doing pitch + yaw in the YAML
-# bypasses Blender's coordinate-axis conversion entirely.
 MARKER_PITCH_DEG: float = 90.0
 WALL_YAW_DEG: dict[str, float] = {
     "front":   0.0,
@@ -129,6 +124,12 @@ def emit_yaml_block(
     snap_to_ground: bool = False,
 ) -> str:
     """Render one Sphinx ``Meshes:`` entry in the documented YAML form.
+
+    ``rotation_deg`` is **(Pitch, Yaw, Roll)** — UE4's FRotator order
+    when serialised as space-separated floats. Earlier code emitted
+    (Roll, Pitch, Yaw) which the live render showed Sphinx
+    misinterprets (markers came out tall-and-thin with patterns
+    rotated 90°).
 
     ``scale`` may be a uniform float OR a per-axis tuple. Per-axis is
     needed for the arena floor (large in X/Y, unit in Z) and pillars
@@ -362,8 +363,8 @@ def main() -> int:
         ux_m, uy_m, uz_m = shifted_apply((float(m["x"]), float(m["y"]), float(m["z"])))
         loc_cm = (ux_m * 100.0, uy_m * 100.0, uz_m * 100.0)
         # Pitch stands the flat-plane FBX upright; yaw aims it at the
-        # arena interior. See WALL_YAW_DEG comments above.
-        rot = (0.0, MARKER_PITCH_DEG, yaw)
+        # arena interior. UE4 Rotator order is (Pitch, Yaw, Roll).
+        rot = (MARKER_PITCH_DEG, yaw, 0.0)
         fbx_path = fbx_dir / f"aruco_{mid:03d}.fbx"
         out_lines.append(emit_yaml_block(
             name=f"wall_{wall}_id_{mid:03d}_{m.get('label','').lower().replace(' ', '_') or 'marker'}",
@@ -385,8 +386,9 @@ def main() -> int:
         loc_cm = (ux_m * 100.0, uy_m * 100.0, uz_m * 100.0)
         # Target stickers face UP (mounted on top of the box). The
         # default flat-plane FBX (normal +Z) already points up, so no
-        # pitch — only the box's yaw offset.
-        rot = (0.0, 0.0, float(b.get("yaw_deg", 0.0)))
+        # pitch — only the box's yaw offset. UE4 Rotator order is
+        # (Pitch, Yaw, Roll).
+        rot = (0.0, float(b.get("yaw_deg", 0.0)), 0.0)
         fbx_path = fbx_dir / f"aruco_{mid:03d}.fbx"
         out_lines.append(emit_yaml_block(
             name=f"target_{b.get('team','tgt')}_id_{mid:03d}",
@@ -472,9 +474,12 @@ def main() -> int:
             print(f"warning: --floor-size-m {args.floor_size_m!r} unparseable; "
                   f"using 22x12", file=sys.stderr)
             floor_w, floor_d = 22.0, 12.0
-        # Floor centre in arena frame: x=0, y=mean of y range, z=0.
+        # Floor centre in arena frame: x=0, y=mean of y range, z=0.05.
+        # The 5 cm raise is a hack to hide Sphinx's underlying default
+        # ground plane, which otherwise z-fights with our floor at z=0
+        # and the operator sees UE4's debug checker bleeding through.
         ys = [float(m["y"]) for m in arena.get("markers", [])] or [0.0, 10.8]
-        cx_arena, cy_arena, cz_arena = 0.0, (min(ys) + max(ys)) / 2.0, 0.0
+        cx_arena, cy_arena, cz_arena = 0.0, (min(ys) + max(ys)) / 2.0, 0.05
         ux_m, uy_m, uz_m = shifted_apply((cx_arena, cy_arena, cz_arena))
         loc_cm = (ux_m * 100.0, uy_m * 100.0, uz_m * 100.0)
         # When the axis_map swaps X and Y, the floor "width" along
