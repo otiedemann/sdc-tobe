@@ -27,7 +27,10 @@ from pathlib import Path
 LOGOS = [
     {
         "name": "mbda",
-        "url": "https://upload.wikimedia.org/wikipedia/commons/d/d5/MBDA-Logo.svg",
+        # Real Wikipedia commons path (verified by parsing the
+        # de.wikipedia.org/Datei: page — the path is a hash of the
+        # filename, can't be guessed).
+        "url": "https://upload.wikimedia.org/wikipedia/commons/3/35/MBDA-Logo.svg",
         "format": "svg",
     },
     {
