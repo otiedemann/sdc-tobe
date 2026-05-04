@@ -442,6 +442,19 @@ def estimate_position(arena: ArenaConfig,
                 method = "ippe_swapped"
             # else: both OOB; skip.
 
+        # Per-marker bounds revision: even when a vote passed the
+        # anchor gate, an OOB result is still physically impossible.
+        # Try the alt branch as a second-chance fix; if both branches
+        # are OOB, drop the marker. The drone can't be outside the
+        # arena, no matter how close to prev the IPPE pose looks.
+        if pos_w is not None and not _vote_in_bounds(pos_w, arena):
+            if (method != "ippe_swapped" and alt_pos is not None
+                    and _vote_in_bounds(alt_pos, arena)):
+                pos_w = alt_pos
+                method = "ippe_swapped"
+            else:
+                pos_w = None
+
         if pos_w is not None:
             contributions.append((int(p.marker_id), pos_w, weight, method))
 
@@ -453,6 +466,16 @@ def estimate_position(arena: ArenaConfig,
     for _, pos_w, w, _ in contributions:
         weighted_sum += pos_w * w
     avg = weighted_sum / total_w
+
+    # Final aggregate sanity gate: even with all per-marker votes
+    # in-bounds, the weighted average can sit just outside the
+    # arena box if the contributions hug the boundary asymmetrically.
+    # Discard the whole estimate in that case so the caller's sticky
+    # state.world_position_m is preserved -- a fix that places the
+    # drone outside the arena is by definition wrong, no matter how
+    # confident the per-marker votes look.
+    if not _vote_in_bounds(avg, arena):
+        return None
 
     return PositionEstimate(
         position_m=avg,
