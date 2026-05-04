@@ -81,11 +81,15 @@ both inside their deadbands for ~1 s).
 
 > Hover for some time. *Behaviour depends on what came before.*
 
-Two flavours:
+Three flavours:
 
 - **After `APPROACH`** — station-keeping HOLD. The drone actively holds
   its position relative to the marker (distance, heading, altitude) for
   the configured time.
+- **After `TO`** — station-keeping at the world target. The drone keeps
+  driving toward the same `(x, y[, z])` for the duration. Same
+  position-loss recovery as `TO` (yaw-search if the world fix goes
+  stale, resume on first fresh fix).
 - **Otherwise** — IDLE. The drone sends `rc = (0,0,0,0)` and lets the
   Anafi's onboard stabiliser keep it roughly in place. No marker
   tracking.

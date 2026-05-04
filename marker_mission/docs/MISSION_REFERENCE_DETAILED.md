@@ -182,15 +182,24 @@ then sees an empty script with last-kind = "LAND" and routes to DONE.
 
 | Arguments | optional; default to `cfg.hold_time_s` |
 |---|---|
-| Starting phase | `HOLD` if `last_completed_step_kind == "APPROACH"`, otherwise `IDLE` |
-| Per-step state | `state.hold_time_s = step.seconds` (HOLD branch) or `state.idle_until = now + step.seconds` (IDLE branch) |
-| Exit | timer expires → `_advance_script("hold complete" / "idle complete")` |
+| Starting phase | `HOLD` if `last == "APPROACH"`, `GOTO` if `last == "TO"` (and a TO target is loaded), otherwise `IDLE` |
+| Per-step state | `state.hold_time_s = step.seconds` (HOLD branch); `state.goto_hold_until = now + step.seconds` (GOTO branch); `state.idle_until = now + step.seconds` (IDLE branch) |
+| Exit | timer expires → `_advance_script("hold complete" / "goto-hold complete …" / "idle complete")` |
 
 The HOLD timer uses `state.hold_began_at` (set in `_set_phase(HOLD)`)
 plus `state.hold_time_s` so the timer can't be skewed by per-tick
 clock drift. Marker-loss inside the HOLD timer is tolerated up to the
 grace window (`search_marker_lost_grace_s`); beyond that it escalates
 to SEARCH.
+
+The GOTO branch (HOOVER-after-TO) re-uses `_step_goto`'s drive
+loop with `state.goto_hold_until` set: the controller keeps
+projecting (target − position) into body frame and running the same
+PD legs as `TO`, but instead of advancing on settle it advances when
+`now >= goto_hold_until`. World-position loss falls back to a
+yaw-search exactly like inside `TO`. `goto_hold_until` is cleared
+back to None when the next `TO` step fires so a plain `TO` never
+inherits a stale timer.
 
 ### `AWAIT <marker-id> <timeout-seconds>`
 

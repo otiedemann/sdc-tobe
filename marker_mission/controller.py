@@ -369,6 +369,12 @@ class MissionState:
     goto_target_x_m: Optional[float] = None
     goto_target_y_m: Optional[float] = None
     goto_target_z_m: Optional[float] = None
+    # When set, _step_goto stays in GOTO until ``now >=
+    # goto_hold_until`` and advances on the timer instead of on
+    # settle. Used by HOOVER-after-TO so the drone station-keeps at
+    # the TO target for the requested seconds, the analogue of
+    # HOOVER-after-APPROACH (HOLD on the marker).
+    goto_hold_until: Optional[float] = None
     # AWAIT step: when set, _step_idle / _step_hold advance the
     # script as soon as this marker id appears in
     # state.visible_marker_ids (see vision_worker). Cleared on every
@@ -450,6 +456,7 @@ class MissionState:
             self.goto_target_x_m = None
             self.goto_target_y_m = None
             self.goto_target_z_m = None
+            self.goto_hold_until = None
             self.await_marker_id = None
             self.visible_marker_ids = []
             self.dance_mode = None
@@ -1459,6 +1466,7 @@ class MissionController:
             wp_at = self.state.world_position_updated_at
             yaw_arena = self.state.arena_yaw_deg
             yaw_at = self.state.arena_yaw_updated_at
+            hold_until = self.state.goto_hold_until
         if tx is None or ty is None:
             self._advance_script("goto: no target set")
             return
@@ -1527,8 +1535,10 @@ class MissionController:
         settled = False
         with self.state.lock:
             z_txt = (f"  z_e={e_h:+.2f}m" if tz is not None else "")
+            mode_txt = ("station-keep" if hold_until is not None
+                        else "GOTO")
             self.state.note = (
-                f"GOTO: at ({wp[0]:.2f},{wp[1]:.2f},{wp[2]:.2f})m "
+                f"{mode_txt}: at ({wp[0]:.2f},{wp[1]:.2f},{wp[2]:.2f})m "
                 f"-> ({tx:.2f},{ty:.2f}"
                 f"{(',' + format(tz, '.2f')) if tz is not None else ''})m"
                 f"  e_xy={e_xy:.2f}m{z_txt}")
@@ -1539,7 +1549,15 @@ class MissionController:
                     settled = True
             else:
                 self.state.settle_began_at = None
-        if settled:
+        if hold_until is not None:
+            # HOOVER-after-TO branch: stay until the timer expires;
+            # ignore the settle condition so a brief excursion doesn't
+            # cut the hover short.
+            if now >= hold_until:
+                self._advance_script(
+                    f"goto-hold complete at "
+                    f"({wp[0]:.2f},{wp[1]:.2f},{wp[2]:.2f})m")
+        elif settled:
             self._advance_script(
                 f"goto reached ({wp[0]:.2f},{wp[1]:.2f},{wp[2]:.2f})m")
 
@@ -1730,11 +1748,25 @@ class MissionController:
         if step.kind == "HOOVER":
             with self.state.lock:
                 last = self.state.last_completed_step_kind
+                tx = self.state.goto_target_x_m
+                ty = self.state.goto_target_y_m
             if last == "APPROACH":
                 with self.state.lock:
                     self.state.hold_time_s = float(step.seconds)
                 self._set_phase(Phase.HOLD,
                                 note + f" station-keep {step.seconds:g}s")
+            elif last == "TO" and tx is not None and ty is not None:
+                # World-frame analogue of HOLD: stay on the TO target
+                # for ``step.seconds``. _step_goto switches its advance
+                # condition from "settled" to "timer expired" when
+                # goto_hold_until is set.
+                with self.state.lock:
+                    self.state.goto_hold_until = (time.monotonic()
+                                                   + float(step.seconds))
+                self._set_phase(Phase.GOTO,
+                                note + f" station-keep at"
+                                       f" ({tx:.2f},{ty:.2f}) "
+                                       f"{step.seconds:g}s")
             else:
                 with self.state.lock:
                     self.state.idle_until = (time.monotonic()
@@ -1795,6 +1827,10 @@ class MissionController:
                 self.state.goto_target_x_m = tx
                 self.state.goto_target_y_m = ty
                 self.state.goto_target_z_m = tz
+                # Plain TO advances on settle, not on a hold timer --
+                # clear any goto_hold_until left over from a previous
+                # HOOVER-after-TO.
+                self.state.goto_hold_until = None
             z_txt = f" z={tz:.2f}" if tz is not None else " z=keep"
             self._set_phase(Phase.GOTO,
                             note + f" -> ({tx:.2f},{ty:.2f}){z_txt}m")
