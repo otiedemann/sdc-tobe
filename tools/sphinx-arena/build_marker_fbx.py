@@ -88,7 +88,17 @@ def _make_texture_material(name: str, png_path: Path) -> "bpy.types.Material":
 
     tex_node = nodes.new("ShaderNodeTexImage")
     img = bpy.data.images.load(str(png_path))
-    img.colorspace_settings.name = "Non-Color"  # paper-flat, no gamma
+    # Blender renamed the linear-no-gamma colorspace from "Linear"
+    # (3.x and earlier) to "Non-Color" (4.x). The host might be either.
+    # Try the modern name first; fall back so the build doesn't crash
+    # on older Blender. We just need *some* non-sRGB space so the
+    # ArUco bitmap stays high-contrast through the render pipeline.
+    for cs_name in ("Non-Color", "Linear", "Raw"):
+        try:
+            img.colorspace_settings.name = cs_name
+            break
+        except TypeError:
+            continue
     tex_node.image = img
     tex_node.interpolation = "Closest"  # keep ArUco corners sharp
 
