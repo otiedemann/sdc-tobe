@@ -177,6 +177,19 @@ async function loadSystem() {
       sxBadge.textContent = `sphinx: ${(sx.version || "ok").slice(0, 32)}`;
       sxBadge.classList.add("ok");
     }
+    const sess = data.active_session;
+    const sessBadge = $("#session-badge");
+    sessBadge.classList.remove("ok", "warn", "err");
+    if (data.session_attach === "off") {
+      sessBadge.textContent = "session: off";
+    } else if (sess) {
+      const display = sess.display || "?";
+      sessBadge.textContent = `session: ${sess.user}@${sess.type}:${display}`;
+      sessBadge.classList.add("ok");
+    } else {
+      sessBadge.textContent = "session: none detected";
+      sessBadge.classList.add("warn");
+    }
   } catch (e) {
     $("#system-output").textContent = `error: ${e.message}`;
   }

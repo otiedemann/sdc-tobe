@@ -12,6 +12,7 @@
     <div id="header-meta" class="meta">
       <span class="badge mode-{{ network_mode }}" title="Network mode">net: {{ network_mode }}</span>
       {% if dry_run %}<span class="badge warn" title="Sphinx not installed; using sleep placeholders">dry-run</span>{% endif %}
+      <span class="badge" id="session-badge" title="Where UE4 renders">session: …</span>
       <span class="badge" id="tailscale-badge" title="Tailscale status">tailscale: …</span>
       <span class="badge" id="sphinx-badge" title="Sphinx version">sphinx: …</span>
     </div>
@@ -19,6 +20,9 @@
 
   {% if network_warning %}
   <div class="banner banner-warn">⚠ {{ network_warning }}</div>
+  {% endif %}
+  {% if session_warning %}
+  <div class="banner banner-warn">⚠ {{ session_warning }}</div>
   {% endif %}
 
   <main>

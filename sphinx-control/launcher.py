@@ -36,6 +36,7 @@ from network import (
     established_peers_to_port,
     listening_pids_on_port,
 )
+from session import SessionInfo, detect_active_session, parse_explicit
 from state import DroneRecord, StateStore
 from worlds import Registry
 
@@ -113,6 +114,55 @@ class Launcher:
         self.mode = mode
 
         self.max_drones = int(config.get("max_drones", 10))
+
+        # ── Active-session attachment ────────────────────────────
+        # Decide once at startup which graphical session UE4 should
+        # render into. If sphinx-control runs as a system service the
+        # parent env has no DISPLAY/WAYLAND_DISPLAY, so we have to
+        # discover the user's session via loginctl. Re-detect on every
+        # spawn instead if the operator suspects session changes between
+        # spawns (rare; not worth the loginctl latency on the hot path).
+        attach = str(config.get("gnome_session_attach", "auto")).lower()
+        self.session_attach_setting = attach
+        self.session: SessionInfo | None = None
+        self.session_warning: str | None = None
+        if attach == "off":
+            log.info("session-attach: disabled by config")
+        elif attach == "auto":
+            self.session = detect_active_session()
+            if self.session is None:
+                self.session_warning = (
+                    "no active graphical session detected — UE4 windows will "
+                    "open with the parent process's environment "
+                    "(may render headless)."
+                )
+                log.warning(self.session_warning)
+            else:
+                log.info(
+                    "session-attach: %s for %s on %s",
+                    self.session.session_type, self.session.user, self.session.display,
+                )
+        else:
+            # Explicit override like "x11::0" or "wayland:wayland-0".
+            override_env = parse_explicit(attach)
+            if override_env is None:
+                self.session_warning = (
+                    f"gnome_session_attach value {attach!r} unrecognized "
+                    f"— expected 'auto', 'off', 'x11::N', or 'wayland:wayland-N'. "
+                    f"Falling back to inherited environment."
+                )
+                log.warning(self.session_warning)
+            else:
+                # Synthesize a minimal SessionInfo so /api/system surfaces it.
+                self.session = SessionInfo(
+                    session_id="manual",
+                    user=os.environ.get("USER", "unknown"),
+                    uid=os.getuid(),
+                    session_type=override_env.get("XDG_SESSION_TYPE", "x11"),
+                    display=override_env.get("DISPLAY") or override_env.get("WAYLAND_DISPLAY", ""),
+                    seat="manual",
+                    env=override_env,
+                )
 
     # ─── public API ──────────────────────────────────────────────
 
@@ -378,11 +428,18 @@ class Launcher:
         )
         # Tiny wait so Sphinx claims its IPC sockets before UE attaches.
         time.sleep(0.5)
+        # The UE4 child needs DISPLAY/WAYLAND_DISPLAY/XAUTHORITY pointing
+        # at the active graphical session, otherwise it has nothing to
+        # render into when sphinx-control runs as a system service. The
+        # `session.env` dict overrides whatever the parent process
+        # inherited; if no session was detected, we just use the
+        # parent env unchanged (existing behavior).
+        session_env: dict[str, str] = self.session.env if self.session else {}
         ue4_proc = subprocess.Popen(
             ue4_argv,
             stdout=ue4_log,
             stderr=subprocess.STDOUT,
-            env={**os.environ, **ue4_env},
+            env={**os.environ, **session_env, **ue4_env},
             preexec_fn=os.setsid,
         )
         return sphinx_proc.pid, ue4_proc.pid
