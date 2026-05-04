@@ -90,21 +90,25 @@ WALL_YAW_DEG: dict[str, float] = {
 
 
 # Paintings: one logo per wall, mounted at mid-height between the
-# low (z=2) and high (z=4) markers so it doesn't occlude either.
-# Painting size in metres (width × height). Logos with very different
-# aspect ratios get stretched; if that becomes an issue we can move
-# to per-painting sizing.
-_PAINTING_SIZE_M: tuple[float, float] = (3.0, 2.0)
+# low (z=2) and high (z=4) markers so they don't occlude either.
+# On long walls (front/back) markers sit at x = -5, 0, +5 — so we
+# offset paintings along the wall to fit between markers without
+# overlap.
+_PAINTING_SIZE_M: tuple[float, float] = (1.5, 1.0)  # smaller, fits between markers
 _PAINTING_Z_M: float = 3.0     # mid-height between the marker rings
 
-# (logo_filename_stem, wall_id). Matches the wall positions read from
-# arena_config.json. Drop your team logo as out/logos/team.png to
-# replace the placeholder.
-PAINTINGS: list[tuple[str, str]] = [
-    ("mbda",  "front"),  # MBDA  on front wall (arena y=0,    long wall)
-    ("brigk", "back"),   # brigk on back wall  (arena y=10.8, long wall)
-    ("sdc",   "left"),   # SDC   on left wall  (arena x=-10,  short wall)
-    ("team",  "right"),  # team  on right wall (arena x=+10,  short wall)
+# (logo_filename_stem, wall_id, offset_along_wall_m).
+# offset_along_wall_m: how far from wall centre to position the
+# painting along the wall's long axis. For long walls (front/back),
+# centre marker sits at x=0, so we offset to x=±2.5 (between the
+# centre marker at 0 and side marker at ±5). For short walls
+# (left/right), there's a single marker pair at y=5.4, so the
+# painting goes off-centre along Y to clear it.
+PAINTINGS: list[tuple[str, str, float]] = [
+    ("mbda",  "front", -2.5),  # front wall, between centre and -X marker
+    ("brigk", "back",  +2.5),  # back wall, between centre and +X marker
+    ("sdc",   "left",  -2.5),  # left wall, offset from centre marker
+    ("team",  "right", +2.5),  # right wall, offset from centre marker
 ]
 
 
@@ -496,15 +500,24 @@ def main() -> int:
             y_min, y_max = min(ys), max(ys)
             cx_arena = (x_min + x_max) / 2.0
             cy_arena = (y_min + y_max) / 2.0
+            # For each wall, the painting is offset along the wall's
+            # long axis (so it doesn't overlap the centre marker on
+            # long walls or the lone marker pair on short walls).
             wall_centres = {
-                "left":  (x_min, cy_arena),
-                "right": (x_max, cy_arena),
-                "front": (cx_arena, y_min),
-                "back":  (cx_arena, y_max),
+                # name → (centre_x, centre_y, long_axis_is_x?)
+                "left":  (x_min, cy_arena, False),  # runs along Y
+                "right": (x_max, cy_arena, False),
+                "front": (cx_arena, y_min, True),   # runs along X
+                "back":  (cx_arena, y_max, True),
             }
             pw, ph = _PAINTING_SIZE_M
-            for logo_name, wall in PAINTINGS:
-                wx, wy = wall_centres[wall]
+            for logo_name, wall, offset in PAINTINGS:
+                cwx, cwy, long_is_x = wall_centres[wall]
+                # Apply offset along the wall's long axis
+                if long_is_x:
+                    wx, wy = cwx + offset, cwy
+                else:
+                    wx, wy = cwx, cwy + offset
                 ux_m, uy_m, uz_m = shifted_apply((wx, wy, _PAINTING_Z_M))
                 loc_cm = (ux_m * 100.0, uy_m * 100.0, uz_m * 100.0)
                 rot = (MARKER_PITCH_DEG, WALL_YAW_DEG[wall], 0.0)

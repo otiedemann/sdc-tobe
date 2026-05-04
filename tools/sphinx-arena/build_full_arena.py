@@ -152,12 +152,17 @@ def main() -> int:
                    help="Floor side length (square). Default 50.0 m to "
                         "hide UE4's default ground.")
     p.add_argument("--floor-thickness-m", type=float, default=1.0)
-    p.add_argument("--wall-thickness-m", type=float, default=0.05)
-    p.add_argument("--wall-height-m", type=float, default=1.0,
-                   help="Walls are low fences (default 1 m) so the "
-                        "drone camera view above them is unobstructed. "
-                        "Sphinx YAML can't honour real opacity.")
-    p.add_argument("--pillar-thickness-m", type=float, default=0.2)
+    p.add_argument("--floor-top-z-m", type=float, default=0.1,
+                   help="Z of the floor's top face. Default 0.1 m so it "
+                        "sits clearly above UE4's default ground (which "
+                        "is at z=0 and otherwise z-fights, leaving the "
+                        "checker pattern visible through ours).")
+    p.add_argument("--wall-thickness-m", type=float, default=0.10)
+    p.add_argument("--wall-height-m", type=float, default=4.0,
+                   help="Walls are tall enough to clearly enclose the "
+                        "arena (4 m default). Sphinx YAML can't honour "
+                        "real opacity, so we accept solid walls.")
+    p.add_argument("--pillar-thickness-m", type=float, default=0.40)
     p.add_argument("--pillar-height-m", type=float, default=6.0)
     p.add_argument("--floor-color-rgb", type=str, default="180,180,180")
     p.add_argument("--wall-color-rgb", type=str, default="220,225,235")
@@ -205,10 +210,11 @@ def main() -> int:
         "mat_pillar", parse_rgb(ns.pillar_color_rgb), 0.6, out_dir)
 
     # ── FLOOR ──
-    # Centered at UE origin; top face at z=0, bottom at z=-thickness.
+    # Centered at UE origin; top face at the configured z (default 0.1m
+    # to clear UE4's default ground), bottom at top - thickness.
     # Oversized (50×50 m default) so UE4's default ground plane is
     # completely hidden underneath.
-    floor_z_center = -ns.floor_thickness_m / 2.0
+    floor_z_center = ns.floor_top_z_m - ns.floor_thickness_m / 2.0
     _add_box(
         name="arena_floor",
         location_m=(0.0, 0.0, floor_z_center),
