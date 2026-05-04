@@ -130,19 +130,32 @@ def _add_box(name: str, location_m: tuple[float, float, float],
     obj.data.materials.append(material)
 
 
-def _build_unit_cube_fbx(out_fbx: Path, name: str, material) -> None:
+def _build_unit_cube_fbx(out_fbx: Path, name: str,
+                          color_rgb: tuple[int, int, int],
+                          roughness: float) -> None:
     """Build a SINGLE-MESH unit cube FBX — one mesh, one material — and
     export it. The combined arena_static.fbx with multiple meshes and
     materials kept rendering invisible/blank in Sphinx; individual
     single-mesh FBXs (the same approach that markers and paintings
     use successfully) load reliably. The YAML emitter scales these
-    unit cubes per-axis to the right size at the right position."""
+    unit cubes per-axis to the right size at the right position.
+
+    Takes color_rgb + roughness rather than a Blender material object
+    because _clear_scene() purges orphan materials, so reusing a
+    material across exports raises 'StructRNA has been removed'.
+    Recreating the material from primitives inside this function
+    guarantees a fresh, valid material per export.
+    """
     assert bpy is not None
     _clear_scene()
+    out_dir = out_fbx.parent
+    mat = _make_textured_material(
+        f"mat_{out_fbx.stem}", color_rgb, roughness, out_dir
+    )
     bpy.ops.mesh.primitive_cube_add(size=1.0, location=(0, 0, 0))
     obj = bpy.context.active_object
     obj.name = name
-    obj.data.materials.append(material)
+    obj.data.materials.append(mat)
     bpy.ops.export_scene.fbx(
         filepath=str(out_fbx),
         use_selection=False,
@@ -392,11 +405,20 @@ def main() -> int:
         # clears Blender's scene and rebuilds a single object — that's
         # why this MUST come after the combined export above (which
         # otherwise would lose its meshes).
-        _build_unit_cube_fbx(out_dir / "floor.fbx", "arena_floor", mat_floor)
+        _build_unit_cube_fbx(
+            out_dir / "floor.fbx", "arena_floor",
+            parse_rgb(ns.floor_color_rgb), 0.85,
+        )
         print(f"  ✓ {out_dir / 'floor.fbx'}")
-        _build_unit_cube_fbx(out_dir / "pillar.fbx", "arena_pillar", mat_pillar)
+        _build_unit_cube_fbx(
+            out_dir / "pillar.fbx", "arena_pillar",
+            parse_rgb(ns.pillar_color_rgb), 0.6,
+        )
         print(f"  ✓ {out_dir / 'pillar.fbx'}")
-        _build_unit_cube_fbx(out_dir / "wall.fbx", "arena_wall", mat_wall)
+        _build_unit_cube_fbx(
+            out_dir / "wall.fbx", "arena_wall",
+            parse_rgb(ns.wall_color_rgb), 0.4,
+        )
         print(f"  ✓ {out_dir / 'wall.fbx'}")
 
     print(f"  arena bbox: x=[{x_min},{x_max}], y=[{y_min},{y_max}] "
