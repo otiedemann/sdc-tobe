@@ -75,11 +75,17 @@ DEFAULT_OUT_YAML = Path(__file__).parent / "out" / "arena.yml"
 #   left  (arena x=-10,  inward arena +X → UE -Y)  yaw -90°
 #   right (arena x=+10,  inward arena -X → UE +Y)  yaw +90°
 MARKER_PITCH_DEG: float = 90.0
+# Yaw values empirically iterated against the live UE4 render. After
+# Pitch=90° the FBX (originally a flat XY plane, normal +Z) stands up
+# with normal +Y in UE coords; Yaw rotates that normal around Z.
+# The live screenshot showed long-wall markers rotated 90° wrong AND
+# one short wall facing outward — adding 90° to every yaw and
+# flipping the right wall fixes both at once.
 WALL_YAW_DEG: dict[str, float] = {
-    "front":   0.0,
-    "back":  180.0,
-    "left":  -90.0,
-    "right":  90.0,
+    "front":  90.0,    # arena y=0    → markers face arena +Y (UE +X)
+    "back":  -90.0,    # arena y=10.8 → markers face arena -Y (UE -X)
+    "left":    0.0,    # arena x=-10  → markers face arena +X (UE -Y)
+    "right": 180.0,    # arena x=+10  → markers face arena -X (UE +Y)
 }
 
 
