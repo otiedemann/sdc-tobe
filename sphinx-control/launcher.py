@@ -481,6 +481,7 @@ class Launcher:
             world_binary=world.binary,
             instance_id=instance_id,
             endpoint=endpoint,
+            config_file=world.config_file,
         )
 
         # If netns, prefix with ``ip netns exec <ns>`` so the child runs
@@ -549,10 +550,11 @@ class Launcher:
         if firmware_url:
             descriptor_arg = f"{descriptor_path}::firmware={firmware_url}"
         argv.append(descriptor_arg)
-        if config_file:
-            argv.extend(["--config-file", config_file])
-        # No env overrides for now. If you discover Sphinx env vars that
-        # control bind ports / IPC paths in your version, add them here.
+        # NOTE: -config-file is a UE4 application flag, NOT a Sphinx
+        # flag. Pass it to parrot-ue4-* in _ue4_argv. Verified live on
+        # the SDC host: when given to sphinx, it gets forwarded to
+        # Gazebo, which expects an XML file and emits "Failed to load
+        # XML file: <path>" before continuing without the meshes.
         return argv, {}
 
     def _ue4_argv(
@@ -560,8 +562,16 @@ class Launcher:
         world_binary: str,
         instance_id: int,
         endpoint: DroneEndpoint,
+        config_file: str | None = None,
     ) -> tuple[list[str], dict[str, str]]:
-        """Build the parrot-ue4-<world> argv."""
+        """Build the parrot-ue4-<world> argv.
+
+        ``-config-file`` is a UE4 application command-line option (per
+        Parrot's docs). When supplied, the UE4 binary loads the YAML
+        and instantiates ``Meshes:`` entries before the world starts —
+        this is how custom geometry like the SDC arena gets injected
+        without building a custom UE app.
+        """
         argv: list[str] = [world_binary]
         # Parrot's UE4 binaries accept -ResX/-ResY/-Windowed for size,
         # and may accept a non-default port via -Port. Verify on your
@@ -569,6 +579,8 @@ class Launcher:
         argv.extend(["-ResX=1280", "-ResY=720", "-Windowed"])
         if endpoint.port is not None:
             argv.append(f"-Port={endpoint.port}")
+        if config_file:
+            argv.append(f"-config-file={config_file}")
         return argv, {}
 
     def _terminate_pid(self, pid: int) -> None:
