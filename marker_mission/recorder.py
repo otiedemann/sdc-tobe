@@ -48,7 +48,7 @@ _CSV_FIELDS = [
     "marker_id", "marker_seen",
     "target_distance_m", "target_relative_heading_deg",
     "mission_step_idx",
-    "world_x", "world_y", "world_z", "world_n_used",
+    "world_x", "world_y", "world_z", "world_n_used", "world_position_age_s",
     "target_pose_method", "arena_pose_methods", "arena_per_marker_world",
     "rc_lr", "rc_fb", "rc_ud", "rc_yaw",
     "tel_battery", "tel_yaw", "tel_pitch", "tel_roll",
@@ -247,6 +247,9 @@ class FlightRecorder:
                 row["world_z"] = f"{wp[2]:.3f}"
             wpu = snap.get("world_position_used_markers") or []
             row["world_n_used"] = str(len(wpu))
+            wpa = snap.get("world_position_age_s")
+            row["world_position_age_s"] = (
+                f"{wpa:.3f}" if wpa is not None else "")
             row["target_pose_method"] = snap.get("target_pose_method", "") or ""
             wpm = snap.get("world_position_pose_methods") or []
             # Format as "id:method|id:method" so the CSV stays one

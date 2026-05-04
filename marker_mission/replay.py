@@ -73,9 +73,20 @@ class FlightReplay:
         # marker_seen_age_s correctly in replay without using wall time.
         self.phase_start_t: List[float] = [0.0] * len(rows)
         self.marker_seen_t: List[Optional[float]] = [None] * len(rows)
+        # Per-row index of the most recent row (<= i) that carried a
+        # full world-position estimate. -1 until the first sighting.
+        # Used by ``_apply_row`` so a row with empty world_x still
+        # shows the last-known fix, mirroring the live behaviour
+        # where state.world_position_m persists across marker loss.
+        # ``world_pos_seen_t`` is the matching log-relative time for
+        # the snapshot's world_position_age_s.
+        self.world_pos_idx: List[int] = [-1] * len(rows)
+        self.world_pos_seen_t: List[Optional[float]] = [None] * len(rows)
         last_phase = rows[0].get("phase", "")
         cur_phase_start = self.timeline[0]
         cur_marker_seen: Optional[float] = None
+        cur_world_idx = -1
+        cur_world_t: Optional[float] = None
         for i, r in enumerate(rows):
             ph = r.get("phase", "")
             if ph != last_phase:
@@ -83,8 +94,13 @@ class FlightReplay:
                 last_phase = ph
             if r.get("marker_seen") == "1":
                 cur_marker_seen = self.timeline[i]
+            if (r.get("world_x") or "").strip():
+                cur_world_idx = i
+                cur_world_t = self.timeline[i]
             self.phase_start_t[i] = cur_phase_start
             self.marker_seen_t[i] = cur_marker_seen
+            self.world_pos_idx[i] = cur_world_idx
+            self.world_pos_seen_t[i] = cur_world_t
 
         # Mission script. Saved by mission.py at TAKEOFF as the
         # canonicalised step list -- already has all defaults filled
@@ -210,6 +226,9 @@ class FlightReplay:
             seen_t = self.marker_seen_t[idx]
             snap["marker_seen_age_s"] = (
                 (playhead_t - seen_t) if seen_t is not None else None)
+            wp_seen_t = self.world_pos_seen_t[idx]
+            snap["world_position_age_s"] = (
+                (playhead_t - wp_seen_t) if wp_seen_t is not None else None)
             snap["uptime_s"] = playhead_t
         return snap
 
@@ -394,22 +413,34 @@ class FlightReplay:
             cur_kind = None
 
         # Arena world-position estimate logged by the recorder. world_x/y/z
-        # may be empty strings when no reference marker was visible at that
-        # tick, in which case we just leave the state field None so the UI
-        # shows "—" instead of (0, 0, 0).
-        wx = self._fnum(row, "world_x")
-        wy = self._fnum(row, "world_y")
-        wz = self._fnum(row, "world_z")
+        # may be empty strings when no reference marker was visible at
+        # that tick. We mirror the live behaviour and carry the most
+        # recent fix forward (precomputed in ``world_pos_idx``); the
+        # snapshot exposes the age via ``world_position_age_s`` so the
+        # UI can colour-code staleness.
+        src_idx = self.world_pos_idx[idx] if idx < len(self.world_pos_idx) else -1
+        if src_idx >= 0:
+            src_row = self.rows[src_idx]
+            wx = self._fnum(src_row, "world_x")
+            wy = self._fnum(src_row, "world_y")
+            wz = self._fnum(src_row, "world_z")
+        else:
+            src_row = row
+            wx = wy = wz = None
         if wx is not None and wy is not None and wz is not None:
             world_pos = (wx, wy, wz)
         else:
             world_pos = None
-        wnu = self._fnum(row, "world_n_used")
+        wnu = self._fnum(src_row, "world_n_used")
         world_n_used_int = int(wnu) if wnu is not None else 0
 
         # Pose-method tags. CSV stores arena methods as "id:method|id:method".
+        # target_pose_method describes the active controller marker
+        # for THIS row (current marker visibility), the arena
+        # used-markers / per-marker votes describe whichever row
+        # produced the carried-forward world_pos.
         target_pose_method = (row.get("target_pose_method") or "").strip()
-        arena_methods_blob = (row.get("arena_pose_methods") or "").strip()
+        arena_methods_blob = (src_row.get("arena_pose_methods") or "").strip()
         used_marker_ids: List[int] = []
         used_methods: List[str] = []
         if arena_methods_blob:
@@ -423,7 +454,7 @@ class FlightReplay:
                 except ValueError:
                     pass
         # Per-marker world-position votes ("id:x,y,z|id:x,y,z").
-        per_marker_blob = (row.get("arena_per_marker_world") or "").strip()
+        per_marker_blob = (src_row.get("arena_per_marker_world") or "").strip()
         per_marker_world: List[tuple] = []
         if per_marker_blob:
             for chunk in per_marker_blob.split("|"):

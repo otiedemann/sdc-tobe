@@ -725,6 +725,16 @@ function updateScriptRuntime(s) {
          + `${safe}</div>`;
   }).join('');
 }
+// World-position staleness colour. Fresh fixes (< 1s) read green,
+// 1-3s reads yellow, beyond 3s the operator is flying on a fix that
+// could be far from reality so we go red. ``null`` (never seen yet)
+// returns '' so the cell stays neutral.
+function wpAgeColor(ageS) {
+  if (typeof ageS !== 'number') return '';
+  if (ageS < 1.0) return 'var(--good)';
+  if (ageS < 3.0) return 'var(--warn)';
+  return 'var(--bad)';
+}
 function updateStatus(s) {
   updateScriptRuntime(s);
   if (!$('s-phase')) return;
@@ -763,12 +773,20 @@ function updateStatus(s) {
       ? (s.height_target_m.toFixed(2) + ' m') : '—';
   }
   if ($('s-wp')) {
+    const wpEl = $('s-wp');
     if (Array.isArray(s.world_position_m) && s.world_position_m.length === 3) {
       const [wx, wy, wz] = s.world_position_m;
       const n = (s.world_position_used_markers || []).length;
-      $('s-wp').textContent = `(${wx.toFixed(2)}, ${wy.toFixed(2)}, ${wz.toFixed(2)}) m  · n=${n}`;
+      const age = s.world_position_age_s;
+      const ageTxt = (typeof age === 'number')
+        ? ` · ${age.toFixed(1)}s ago` : '';
+      wpEl.textContent = `(${wx.toFixed(2)}, ${wy.toFixed(2)}, ${wz.toFixed(2)}) m  · n=${n}${ageTxt}`;
+      wpEl.style.color = wpAgeColor(age);
+      wpEl.style.fontWeight = '600';
     } else {
-      $('s-wp').textContent = '—';
+      wpEl.textContent = '—';
+      wpEl.style.color = '';
+      wpEl.style.fontWeight = '';
     }
   }
   $('s-fl').textContent  = t.flying ? 'yes' : 'no';
@@ -933,12 +951,18 @@ function drawPositionView(s) {
   // Origin tick.
   ctx.fillStyle = '#facc15';
   ctx.beginPath(); ctx.arc(cx, cy, 2, 0, 2*Math.PI); ctx.fill();
-  // Drone position + heading arrow.
+  // Drone position + heading arrow. Dot colour matches the
+  // sidebar's wpAgeColor: fresh = green, stale = yellow/red, so
+  // the operator can spot a frozen position even at a glance.
   const pos = s.world_position_m;
   const txt = $('c-pos-text');
   if (Array.isArray(pos) && pos.length === 3) {
     const dx = ax(pos[0]), dy = ay(pos[1]);
-    ctx.fillStyle = '#4ade80';
+    const age = s.world_position_age_s;
+    const dotCol = (typeof age !== 'number' || age < 1.0) ? '#4ade80'
+                 : (age < 3.0) ? '#facc15'
+                 : '#f87171';
+    ctx.fillStyle = dotCol;
     ctx.beginPath(); ctx.arc(dx, dy, 5, 0, 2*Math.PI); ctx.fill();
     const yawArena = _droneYawArena(s);
     let yawTxt = '—';
@@ -964,11 +988,15 @@ function drawPositionView(s) {
     }
     if (txt) {
       const n = (s.world_position_used_markers || []).length;
+      const ageCol = wpAgeColor(age) || '#e6e6e6';
+      const ageTxt = (typeof age === 'number')
+        ? `${age.toFixed(1)} s ago` : 'no fix yet';
       txt.innerHTML = `x: <b style="color:#e6e6e6;">${pos[0].toFixed(2)}</b> m<br>`
                     + `y: <b style="color:#e6e6e6;">${pos[1].toFixed(2)}</b> m<br>`
                     + `z: <b style="color:#e6e6e6;">${pos[2].toFixed(2)}</b> m<br>`
                     + `yaw: <b style="color:#e6e6e6;">${yawTxt}</b><br>`
-                    + `n markers: ${n}`;
+                    + `n markers: ${n}<br>`
+                    + `age: <b style="color:${ageCol};">${ageTxt}</b>`;
     }
   } else {
     if (txt) txt.textContent = 'World position unknown.';

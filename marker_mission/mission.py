@@ -447,18 +447,22 @@ def cmd_fly(args: argparse.Namespace) -> int:
                                                  for p in poses]
                 # Arena world-position estimate from every visible
                 # reference marker (weighted by inverse distance).
-                # Missing arena_config or no reference marker visible
-                # leaves state.world_position_m as None.
+                # When no reference marker is visible (or arena_config
+                # is missing) we leave the previous fix in place and
+                # let world_position_age_s grow -- the operator still
+                # gets a stale-but-useful position estimate during
+                # marker loss, colour-coded by age in the UI.
                 arena = arena_holder.get()
                 if arena is not None:
                     est = estimate_position(arena, poses)
-                    with state.lock:
-                        if est is not None:
+                    if est is not None:
+                        with state.lock:
                             state.world_position_m = (
                                 float(est.position_m[0]),
                                 float(est.position_m[1]),
                                 float(est.position_m[2]),
                             )
+                            state.world_position_updated_at = time.monotonic()
                             state.world_position_used_markers = list(
                                 est.used_markers)
                             state.world_position_pose_methods = [
@@ -468,11 +472,6 @@ def cmd_fly(args: argparse.Namespace) -> int:
                                 tuple(float(c) for c in
                                       est.per_marker_position_m[mid])
                                 for mid in est.used_markers]
-                        else:
-                            state.world_position_m = None
-                            state.world_position_used_markers = []
-                            state.world_position_pose_methods = []
-                            state.world_position_per_marker = []
                 # Active target's pose method (or empty if not in view).
                 with state.lock:
                     state.target_pose_method = (

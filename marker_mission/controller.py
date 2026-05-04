@@ -373,18 +373,23 @@ class MissionState:
     visible_marker_ids: List[int] = field(default_factory=list)
 
     # Arena-frame world position (camera centre), populated by
-    # vision_worker once an ArenaConfig is loaded. None until either
-    # the arena config is missing or no reference marker is in view.
+    # vision_worker once an ArenaConfig is loaded. None until the
+    # FIRST reference-marker sighting; after that we keep the last
+    # known fix even when no marker is currently visible, so the
+    # operator still sees a position estimate during marker loss.
+    # Use ``world_position_age_s`` from the snapshot to tell live
+    # from stale.
     world_position_m: Optional[tuple[float, float, float]] = None
+    # Monotonic timestamp of the last fresh fix. 0.0 means "never
+    # computed yet" -- snapshot exposes None as the age in that
+    # case. Set every time vision_worker writes a non-None estimate.
+    world_position_updated_at: float = 0.0
+    # Markers / methods / per-marker votes from the LAST fresh fix
+    # (kept in sync with ``world_position_m``). They describe how the
+    # currently-displayed position was computed, so they go stale
+    # together. Cleared only by ``reset``.
     world_position_used_markers: List[int] = field(default_factory=list)
-    # Per-contributing-marker solvePnP method (same order as
-    # world_position_used_markers). Used by the recorder so flight
-    # logs can be sliced by method when diagnosing position jumps.
     world_position_pose_methods: List[str] = field(default_factory=list)
-    # Per-contributing-marker world-position vote (same order as
-    # world_position_used_markers). Each entry is the (x, y, z) the
-    # estimator derived from THIS marker alone, before the weighted
-    # average. Used to debug per-marker bias.
     world_position_per_marker: List[tuple[float, float, float]] = field(
         default_factory=list)
     # solvePnP method for the controller's active TARGET marker
@@ -432,6 +437,7 @@ class MissionState:
             self.dance_origin_xy_m = None
             self.dance_origin_height_m = None
             self.world_position_m = None
+            self.world_position_updated_at = 0.0
             self.world_position_used_markers = []
             self.world_position_pose_methods = []
             self.world_position_per_marker = []
@@ -475,6 +481,10 @@ class MissionState:
                 "world_position_m": (list(self.world_position_m)
                                      if self.world_position_m is not None
                                      else None),
+                "world_position_age_s": (
+                    (time.monotonic() - self.world_position_updated_at)
+                    if self.world_position_updated_at > 0.0
+                    else None),
                 "world_position_used_markers": list(
                     self.world_position_used_markers),
                 "world_position_pose_methods": list(
