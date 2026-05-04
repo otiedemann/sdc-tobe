@@ -356,15 +356,36 @@ def estimate_position(arena: ArenaConfig,
     answer when something is genuinely off.
     """
     contributions: List[tuple] = []   # (mid, pos_w, weight, method)
-    discarded_oob: List[int] = []
     for p in poses:
         marker = arena.markers.get(int(p.marker_id))
         if marker is None:
             continue
         pos_w = position_from_marker(p, marker)
+        method = str(p.pose_method or "")
+        # When the chosen IPPE branch lands outside the arena AND the
+        # detector kept the loser branch on the pose, try swapping
+        # to the loser. At significant off-normal angle the two
+        # IPPE candidates' reproj-errs can sit within sub-pixel of
+        # each other and IPPE picks wrong on noise; the right
+        # branch is the loser. A successful swap recovers the
+        # marker's contribution to the average instead of just
+        # dropping it (the OOB filter below would otherwise discard
+        # it). The mirror-collapse path takes precedence: if it
+        # already overrode the camera position via
+        # collapsed_camera_position_m, we don't second-guess it.
+        if (p.alt_camera_position_m is not None
+                and p.collapsed_camera_position_m is None
+                and not _vote_in_bounds(pos_w, arena)):
+            R_m_w = WALL_ROTATIONS[marker.wall]
+            alt_pos_w = (R_m_w @ np.asarray(p.alt_camera_position_m,
+                                            dtype=float).reshape(3)
+                         + marker.position_m)
+            if _vote_in_bounds(alt_pos_w, arena):
+                pos_w = alt_pos_w
+                method = "ippe_swapped"
         weight = 1.0 / max(0.1, float(p.distance_m))
         contributions.append(
-            (int(p.marker_id), pos_w, weight, str(p.pose_method or "")))
+            (int(p.marker_id), pos_w, weight, method))
 
     if not contributions:
         return None

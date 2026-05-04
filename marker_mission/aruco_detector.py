@@ -104,6 +104,15 @@ class MarkerPose:
     # instead of flipping with the chosen IPPE branch.
     collapsed_camera_position_m: Optional[np.ndarray] = None
 
+    # Camera position in MARKER frame derived from the LOSER IPPE
+    # candidate (the branch we did NOT pick). Set whenever IPPE
+    # returned 2 front-facing candidates. ``arena.estimate_position``
+    # uses this as a swap target when the chosen branch's world
+    # position falls outside the arena -- i.e. IPPE picked the wrong
+    # branch on reprojection-error noise. None when only one
+    # candidate survived (no ambiguity to resolve).
+    alt_camera_position_m: Optional[np.ndarray] = None
+
 
 # ---------------------------------------------------------------------------
 # Detector
@@ -268,6 +277,19 @@ class ArucoDetector:
                             chosen_method = "ippe_temporal"
 
                 chosen_pose, chosen_rvec, chosen_tvec, chosen_err = scored[0]
+
+                # Always stash the loser branch's camera-in-marker
+                # position when both candidates survived. The arena
+                # estimator swaps to it when the chosen branch's
+                # world position falls outside the arena -- the
+                # off-axis case where IPPE's reproj-error winner is
+                # inside sub-pixel noise of the wrong branch.
+                if len(scored) > 1:
+                    R_alt, _ = cv2.Rodrigues(
+                        np.asarray(scored[1][1]).reshape(3, 1))
+                    t_alt = np.asarray(scored[1][2],
+                                       dtype=float).reshape(3)
+                    chosen_pose.alt_camera_position_m = -R_alt.T @ t_alt
 
                 # Mirror-collapse for the irrecoverable near-frontal zone:
                 # when two IPPE candidates fit equally and their hdgs are
