@@ -144,7 +144,14 @@ def build_one(png_path: Path, out_path: Path) -> None:
         embed_textures=False,
         apply_unit_scale=True,
         global_scale=1.0,
-        bake_space_transform=True,
+        # Use UE4's coord convention so the imported plane lands flat
+        # in UE's XY (normal +Z) rather than getting an FBX axis
+        # conversion that left it half-tilted. bake_space_transform
+        # interacts badly with this — keep it off so transforms aren't
+        # double-baked.
+        bake_space_transform=False,
+        axis_forward="X",
+        axis_up="Z",
         object_types={"MESH"},
         mesh_smooth_type="FACE",
     )

@@ -188,30 +188,43 @@ def _export_active(out_path: Path) -> None:
     bpy.ops.export_scene.fbx(
         filepath=str(out_path),
         use_selection=False,
-        path_mode="COPY",
-        embed_textures=True,
+        # path_mode=AUTO + embed_textures=False makes the FBX point
+        # at the PNG sidecar by filename — verified live: this is the
+        # only path UE4's Sphinx mesh-importer reliably honours.
+        path_mode="AUTO",
+        embed_textures=False,
         apply_unit_scale=True,
         global_scale=1.0,
-        bake_space_transform=True,
+        bake_space_transform=False,
+        axis_forward="X",
+        axis_up="Z",
         object_types={"MESH"},
         mesh_smooth_type="FACE",
     )
 
 
 def build_floor(out_path: Path) -> None:
-    """1 m × 1 m unit plane, normal +Z, neutral concrete grey.
+    """A 1 m × 1 m × 0.1 m flat slab with neutral concrete material.
 
-    Uses a 1×1 PNG sidecar texture (not a vector BaseColor) so the
-    material survives Blender → FBX → UE4 import. The YAML emitter
-    scales this to the arena footprint (default 22 × 12 m)."""
+    NOTE: built as a CUBE (not a plane). The plane approach left UE4
+    falling back to its debug-checker default material in the live
+    render — UE4's FBX import on a flat plane sometimes drops the
+    material entirely. A flat slab with thickness has unambiguously
+    3D geometry and reliably picks up the texture-driven material.
+
+    The YAML emitter scales this to the arena footprint (default
+    22 × 12 m × 0.1 m)."""
     assert bpy is not None
     _clear_scene()
-    bpy.ops.mesh.primitive_plane_add(size=1.0, location=(0, 0, 0))
+    bpy.ops.mesh.primitive_cube_add(size=1.0, location=(0, 0, 0))
     obj = bpy.context.active_object
     obj.name = "arena_floor"
+    # Make it a flat slab: 1×1 in XY, 0.1 in Z. Centred at origin.
+    obj.scale = (1.0, 1.0, 0.1)
+    bpy.ops.object.transform_apply(location=False, rotation=False, scale=True)
     mat = _make_solid_color_texture_material(
         name="mat_floor",
-        color_rgb_0_255=(140, 140, 145),  # neutral concrete
+        color_rgb_0_255=(140, 140, 145),
         roughness=0.85,
         out_dir=out_path.parent,
     )
