@@ -75,17 +75,29 @@ DEFAULT_OUT_YAML = Path(__file__).parent / "out" / "arena.yml"
 #   left  (arena x=-10,  inward arena +X → UE -Y)  yaw -90°
 #   right (arena x=+10,  inward arena -X → UE +Y)  yaw +90°
 MARKER_PITCH_DEG: float = 90.0
-# Yaw values empirically iterated against the live UE4 render. After
-# Pitch=90° the FBX (originally a flat XY plane, normal +Z) stands up
-# with normal +Y in UE coords; Yaw rotates that normal around Z.
-# The live screenshot showed long-wall markers rotated 90° wrong AND
-# one short wall facing outward — adding 90° to every yaw and
-# flipping the right wall fixes both at once.
+# UE4's FRotator pitch is "nose up": positive pitch rotates the actor's
+# +X (forward) toward +Z (up). Applied to a flat plane whose local
+# normal is +Z, that means after Pitch=+90° the normal lands at UE -X
+# (NOT +X, NOT +Y — the previous comment got this wrong, which is why
+# the live render kept showing markers facing the wrong direction).
+# Yaw then rotates that -X normal around UE +Z; UE positive yaw is
+# clockwise viewed from above, so +X → +Y → -X → -Y → +X.
+#
+# Required inward direction per wall (in UE coords, axis_map=y2x,x2y_neg):
+#   front (arena y=0,    inward arena +Y → UE +X)  : -X → +X needs yaw 180°
+#   back  (arena y=10.8, inward arena -Y → UE -X)  : -X → -X needs yaw   0°
+#   left  (arena x=-10,  inward arena +X → UE -Y)  : -X → -Y needs yaw +90°
+#   right (arena x=+10,  inward arena -X → UE +Y)  : -X → +Y needs yaw -90°
+#
+# If markers come out facing OUTWARD after this fix, every value here
+# should be flipped 180°. The white back plate added in
+# build_marker_fbx.py makes this trivial to spot: from inside the
+# arena you should see the ArUco face; from outside, plain white.
 WALL_YAW_DEG: dict[str, float] = {
-    "front":  90.0,    # arena y=0    → markers face arena +Y (UE +X)
-    "back":  -90.0,    # arena y=10.8 → markers face arena -Y (UE -X)
-    "left":    0.0,    # arena x=-10  → markers face arena +X (UE -Y)
-    "right": 180.0,    # arena x=+10  → markers face arena -X (UE +Y)
+    "front": 180.0,   # arena y=0    → faces UE +X
+    "back":    0.0,   # arena y=10.8 → faces UE -X
+    "left":   90.0,   # arena x=-10  → faces UE -Y
+    "right": -90.0,   # arena x=+10  → faces UE +Y
 }
 
 
