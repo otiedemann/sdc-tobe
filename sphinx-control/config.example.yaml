@@ -119,6 +119,31 @@ drone_profiles:
     descriptor: "anafi_ai.drone"
     description: "Anafi Ai (newest, more compute-heavy)."
 
+# ── Flight controller (unified_api_server.py) ──────────────────
+# Optional: lets the dashboard launch the controller_unified service
+# alongside the simulator. Same machine in the SDC sim setup, since
+# the simulated Anafi appears at 192.168.42.1 just like a real one.
+flight_controller:
+  # Working dir for unified_api_server.py. The script runs from here
+  # and reads its own arena_config.json / flight_config.json from CWD.
+  cwd: "/home/sdc/sdc-tobe/controller_unified"
+  # Python interpreter to use. Relative paths resolve against `cwd`,
+  # so ".venv/bin/python" picks up the module's own venv if present.
+  # Falls back to "python3" if the file doesn't exist.
+  python: ".venv/bin/python"
+  script: "unified_api_server.py"
+  # HTTP port the FC binds. Surfaced in the dashboard so operators
+  # can curl it. Set explicitly so it doesn't collide with sphinx-
+  # control's own port.
+  http_port: 8080
+  # Anafi IP override. Leave null to inherit (defaults to 192.168.42.1
+  # which works for both real Anafi and Sphinx-simulated Anafi). Set
+  # if you've reconfigured the sim drone to a different IP (e.g.
+  # 10.202.0.1 in netns mode).
+  anafi_ip: null
+  # Extra env vars to pass through to the FC process.
+  extra_env: {}
+
 # Set true to run the launcher in dry-run mode: no real Sphinx is
 # started; instead each "drone" is a `sleep` placeholder so you can
 # develop the UI on macOS or any host without parrot-sphinx installed.

@@ -37,7 +37,12 @@ from network import (
     listening_pids_on_port,
 )
 from session import SessionInfo, detect_active_session, parse_explicit
-from state import DroneRecord, EnvironmentRecord, StateStore
+from state import (
+    DroneRecord,
+    EnvironmentRecord,
+    FlightControllerRecord,
+    StateStore,
+)
 from worlds import Registry
 
 log = logging.getLogger("sphinx-control.launcher")
@@ -56,6 +61,18 @@ class EnvironmentRequest:
     """Start an environment (UE4 only) — drone-agnostic."""
 
     world_name: str
+
+
+@dataclass
+class FCRequest:
+    """Start the flight controller (controller_unified/unified_api_server.py).
+    All fields optional; defaults come from launcher config."""
+
+    cwd: str | None = None
+    python: str | None = None
+    script: str | None = None
+    http_port: int | None = None
+    anafi_ip: str | None = None
 
 
 class Launcher:
@@ -257,6 +274,168 @@ class Launcher:
             return None
         env.extras["alive"] = self._is_env_alive(env)
         return env
+
+    # ─── flight controller (unified_api_server.py) ──────────────
+
+    def start_fc(self, req: FCRequest) -> FlightControllerRecord:
+        """Start the controller_unified/unified_api_server.py process.
+
+        This is the FC ("flight controller") — the Olympe-driven HTTP
+        service that talks to a real or simulated Anafi at ANAFI_IP.
+        Singleton: it binds a fixed HTTP port (default 8080).
+
+        Doesn't require a running drone — Olympe will retry until the
+        Anafi answers, so the operator can start the FC before, after,
+        or instead of a sphinx drone. Useful for talking to a real
+        Anafi from this same management console.
+        """
+        with self._lock:
+            existing = self.state.current_fc()
+            if existing is not None and self._is_fc_alive(existing):
+                raise RuntimeError(
+                    "the flight controller is already running; "
+                    "stop it before starting a new one."
+                )
+
+            fc_cfg = self.config.get("flight_controller", {}) or {}
+            cwd = req.cwd or fc_cfg.get("cwd")
+            python = req.python or fc_cfg.get("python") or "python3"
+            script = req.script or fc_cfg.get("script") or "unified_api_server.py"
+            http_port = req.http_port or fc_cfg.get("http_port") or 8080
+            anafi_ip = req.anafi_ip or fc_cfg.get("anafi_ip")
+
+            if not cwd:
+                raise ValueError(
+                    "flight_controller.cwd is not configured; set it in "
+                    "config.yaml (e.g. /home/sdc/sdc-tobe/controller_unified)."
+                )
+            cwd_path = Path(cwd)
+            if not self.dry_run and not cwd_path.is_dir():
+                raise RuntimeError(f"FC cwd does not exist: {cwd}")
+            if not self.dry_run and not (cwd_path / script).is_file():
+                raise RuntimeError(f"FC script not found: {cwd_path / script}")
+
+            fc_id = f"fc-{uuid.uuid4().hex[:6]}"
+            rec = FlightControllerRecord(
+                fc_id=fc_id,
+                cwd=str(cwd_path),
+                script=script,
+                http_port=int(http_port),
+                anafi_ip=anafi_ip,
+                status="starting",
+            )
+            self.state.upsert_fc(rec)
+
+            try:
+                pid = self._launch_fc(
+                    fc_id=fc_id, cwd=cwd_path, python=python,
+                    script=script, http_port=int(http_port),
+                    anafi_ip=anafi_ip,
+                    extra_env=dict(fc_cfg.get("extra_env", {}) or {}),
+                )
+            except Exception as e:
+                self.state.update_fc_status(fc_id, "error", last_error=str(e))
+                raise
+
+            self.state.update_fc_status(fc_id, "running", pid=pid)
+            updated = self.state.get_fc(fc_id)
+            assert updated is not None
+            log.info(
+                "started fc %s pid=%s cwd=%s script=%s port=%d anafi_ip=%s",
+                fc_id, pid, cwd, script, http_port, anafi_ip or "(default)",
+            )
+            return updated
+
+    def stop_fc(self) -> None:
+        with self._lock:
+            fc = self.state.current_fc()
+            if fc is None:
+                return
+            if fc.pid:
+                self._terminate_pid(fc.pid)
+            self.state.update_fc_status(fc.fc_id, "stopped")
+            log.info("stopped fc %s", fc.fc_id)
+
+    def restart_fc(self) -> FlightControllerRecord:
+        with self._lock:
+            fc = self.state.current_fc()
+            if fc is None:
+                raise KeyError("no flight controller running")
+            req = FCRequest(
+                cwd=fc.cwd, script=fc.script,
+                http_port=fc.http_port, anafi_ip=fc.anafi_ip,
+            )
+            self.stop_fc()
+            self.state.delete_fc(fc.fc_id)
+            time.sleep(0.5)
+            return self.start_fc(req)
+
+    def current_flight_controller(self) -> FlightControllerRecord | None:
+        fc = self.state.current_fc()
+        if fc is None:
+            return None
+        fc.extras["alive"] = self._is_fc_alive(fc)
+        return fc
+
+    def _launch_fc(
+        self,
+        fc_id: str,
+        cwd: Path,
+        python: str,
+        script: str,
+        http_port: int,
+        anafi_ip: str | None,
+        extra_env: dict[str, str],
+    ) -> int:
+        log_dir = self.log_dir / fc_id
+        log_dir.mkdir(parents=True, exist_ok=True)
+        fc_log = open(log_dir / "fc.log", "ab")
+
+        if self.dry_run:
+            sleeper = ["sleep", "999999"]
+            proc = subprocess.Popen(
+                sleeper, stdout=fc_log, stderr=subprocess.STDOUT,
+                preexec_fn=os.setsid,
+            )
+            return proc.pid
+
+        # Resolve python path. If it's relative, treat as relative to cwd.
+        py_path = Path(python)
+        if not py_path.is_absolute():
+            candidate = cwd / python
+            if candidate.is_file():
+                py_path = candidate
+        # If still not a real file, fall back to the literal name
+        # (let PATH resolution try) — useful when python is just
+        # "python3".
+        argv = [str(py_path), script]
+
+        env = dict(os.environ)
+        env["HTTP_PORT"] = str(http_port)
+        if anafi_ip:
+            env["ANAFI_IP"] = anafi_ip
+        env.update(extra_env)
+
+        proc = subprocess.Popen(
+            argv,
+            cwd=str(cwd),
+            stdout=fc_log,
+            stderr=subprocess.STDOUT,
+            env=env,
+            preexec_fn=os.setsid,
+        )
+        return proc.pid
+
+    def _is_fc_alive(self, fc: FlightControllerRecord) -> bool:
+        if not fc.pid:
+            return False
+        try:
+            os.kill(fc.pid, 0)
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True
+        return fc.status == "running"
 
     # ─── drone (sphinx, attached to running env) ────────────────
 
@@ -501,6 +680,14 @@ class Launcher:
                         env.env_id, env.ue4_pid,
                     )
                     self.state.update_env_status(env.env_id, "stopped")
+            fc = self.state.current_fc()
+            if fc is not None and fc.status == "running":
+                if not self._is_fc_alive(fc):
+                    log.info(
+                        "reconcile: fc %s pid %s dead, marking stopped",
+                        fc.fc_id, fc.pid,
+                    )
+                    self.state.update_fc_status(fc.fc_id, "stopped")
 
     def _is_env_alive(self, env: EnvironmentRecord) -> bool:
         if not env.ue4_pid:

@@ -29,6 +29,19 @@ CREATE TABLE IF NOT EXISTS environments (
     stopped_at  REAL,
     last_error  TEXT
 );
+CREATE TABLE IF NOT EXISTS flight_controllers (
+    fc_id        TEXT PRIMARY KEY,
+    cwd          TEXT NOT NULL,
+    script       TEXT NOT NULL,
+    http_port    INTEGER,
+    anafi_ip     TEXT,
+    pid          INTEGER,
+    status       TEXT NOT NULL DEFAULT 'unknown',
+    started_at   REAL,
+    stopped_at   REAL,
+    last_error   TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_fc_status ON flight_controllers(status);
 CREATE TABLE IF NOT EXISTS drones (
     drone_id     TEXT PRIMARY KEY,
     instance_id  INTEGER NOT NULL UNIQUE,
@@ -63,6 +76,35 @@ class EnvironmentRecord:
     config_file: str | None = None
     ue4_pid: int | None = None
     status: str = "unknown"   # unknown | starting | running | stopped | error
+    started_at: float | None = None
+    stopped_at: float | None = None
+    last_error: str | None = None
+    extras: dict[str, Any] = field(default_factory=dict)
+
+    def to_dict(self) -> dict[str, Any]:
+        d = asdict(self)
+        d["uptime_s"] = (
+            time.time() - self.started_at
+            if self.status == "running" and self.started_at
+            else None
+        )
+        return d
+
+
+@dataclass
+class FlightControllerRecord:
+    """A running ``unified_api_server.py`` process. Singleton on this
+    host (the FC binds a fixed HTTP port). Started by the operator
+    after the simulator drone is up; talks to the simulated Anafi
+    over Olympe just like it would talk to a real Anafi."""
+
+    fc_id: str
+    cwd: str
+    script: str
+    http_port: int | None = None
+    anafi_ip: str | None = None
+    pid: int | None = None
+    status: str = "unknown"
     started_at: float | None = None
     stopped_at: float | None = None
     last_error: str | None = None
@@ -329,6 +371,84 @@ class StateStore:
         with self._cursor() as c:
             c.execute("DELETE FROM environments WHERE env_id = ?", (env_id,))
 
+    # ─── flight_controllers table ──────────────────────────────
+
+    def upsert_fc(self, rec: FlightControllerRecord) -> None:
+        with self._cursor() as c:
+            c.execute(
+                """
+                INSERT INTO flight_controllers(
+                    fc_id, cwd, script, http_port, anafi_ip,
+                    pid, status, started_at, stopped_at, last_error
+                ) VALUES (?,?,?,?,?,?,?,?,?,?)
+                ON CONFLICT(fc_id) DO UPDATE SET
+                    cwd        = excluded.cwd,
+                    script     = excluded.script,
+                    http_port  = excluded.http_port,
+                    anafi_ip   = excluded.anafi_ip,
+                    pid        = excluded.pid,
+                    status     = excluded.status,
+                    started_at = excluded.started_at,
+                    stopped_at = excluded.stopped_at,
+                    last_error = excluded.last_error
+                """,
+                (
+                    rec.fc_id, rec.cwd, rec.script, rec.http_port,
+                    rec.anafi_ip, rec.pid, rec.status,
+                    rec.started_at, rec.stopped_at, rec.last_error,
+                ),
+            )
+
+    def update_fc_status(
+        self,
+        fc_id: str,
+        status: str,
+        pid: int | None = None,
+        last_error: str | None = None,
+    ) -> None:
+        now = time.time()
+        with self._cursor() as c:
+            updates = ["status = ?"]
+            params: list[Any] = [status]
+            if status == "running":
+                updates.append("started_at = ?")
+                params.append(now)
+                updates.append("stopped_at = NULL")
+            elif status == "stopped":
+                updates.append("stopped_at = ?")
+                params.append(now)
+            if pid is not None:
+                updates.append("pid = ?")
+                params.append(pid)
+            if last_error is not None:
+                updates.append("last_error = ?")
+                params.append(last_error)
+            params.append(fc_id)
+            c.execute(
+                f"UPDATE flight_controllers SET {', '.join(updates)} "
+                f"WHERE fc_id = ?",
+                params,
+            )
+
+    def get_fc(self, fc_id: str) -> FlightControllerRecord | None:
+        with self._cursor() as c:
+            row = c.execute(
+                "SELECT * FROM flight_controllers WHERE fc_id = ?", (fc_id,)
+            ).fetchone()
+            return _row_to_fc(row) if row else None
+
+    def current_fc(self) -> FlightControllerRecord | None:
+        with self._cursor() as c:
+            row = c.execute(
+                "SELECT * FROM flight_controllers WHERE status = 'running' "
+                "ORDER BY started_at DESC LIMIT 1"
+            ).fetchone()
+            return _row_to_fc(row) if row else None
+
+    def delete_fc(self, fc_id: str) -> None:
+        with self._cursor() as c:
+            c.execute("DELETE FROM flight_controllers WHERE fc_id = ?", (fc_id,))
+
 
 def _row_to_record(row: sqlite3.Row) -> DroneRecord:
     d = dict(row)
@@ -338,3 +458,8 @@ def _row_to_record(row: sqlite3.Row) -> DroneRecord:
 def _row_to_env(row: sqlite3.Row) -> EnvironmentRecord:
     d = dict(row)
     return EnvironmentRecord(**d)
+
+
+def _row_to_fc(row: sqlite3.Row) -> FlightControllerRecord:
+    d = dict(row)
+    return FlightControllerRecord(**d)
