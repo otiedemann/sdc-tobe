@@ -109,6 +109,7 @@ def index():
         max_drones=launcher.max_drones,
         network_mode=launcher.mode,
         network_warning=launcher.network_warning,
+        session_warning=launcher.session_warning,
         dry_run=launcher.dry_run,
     )
 
@@ -225,6 +226,9 @@ def api_system():
         "network_mode": launcher.mode,
         "network_warning": launcher.network_warning,
         "dry_run": launcher.dry_run,
+        "session_attach": launcher.session_attach_setting,
+        "session_warning": launcher.session_warning,
+        "active_session": launcher.session.summary() if launcher.session else None,
         "tailscale": _tailscale_status(),
         "host": _host_info(),
         "sphinx": _sphinx_info(),

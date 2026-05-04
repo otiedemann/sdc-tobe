@@ -38,6 +38,27 @@ network:
   bridge_name: "sphinx-br0"
   ip_offset: 10
 
+# Where the parrot-ue4-* renderer should draw. The UE4 window must
+# render into the user's *active* graphical session for the operator
+# to see it directly, AND for desktop-streaming tools (Sunshine /
+# Moonlight, RDP, VNC, NoMachine) to capture it. When sphinx-control
+# runs as a systemd service the parent process has no DISPLAY /
+# WAYLAND_DISPLAY / XAUTHORITY of its own, so we have to discover the
+# active session via loginctl and splice its env vars into the UE4
+# subprocess.
+#
+# Values:
+#   "auto"            detect via `loginctl list-sessions` at startup
+#                     (default — works on Ubuntu 22.04+ GNOME)
+#   "off"             never inject session env (existing behavior)
+#   "x11::0"          force X11, DISPLAY=:0
+#   "wayland:wayland-0"  force Wayland, WAYLAND_DISPLAY=wayland-0
+#
+# Override per-run via env: SPHINX_CONTROL_SESSION_USER=foo
+# (forces auto-detect to pick `foo`'s session if multiple users are
+# logged in).
+gnome_session_attach: "auto"
+
 # Where to find the Sphinx CLI and stock drone descriptors. The
 # defaults here match a vanilla `apt install parrot-sphinx` on Ubuntu.
 sphinx:

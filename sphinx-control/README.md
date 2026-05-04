@@ -108,6 +108,80 @@ tailscale:
 
 Environment override: `SPHINX_CONTROL_CONFIG=/path/to/config.yaml`.
 
+## Watching the simulator (Sunshine, RDP, VNC, NoMachine, …)
+
+The `parrot-ue4-*` renderer is a regular X11/Wayland window — to be
+visible in the operator's GNOME desktop (and therefore captured by
+desktop-streaming tools like Sunshine + Moonlight), the UE4 subprocess
+needs `DISPLAY` / `WAYLAND_DISPLAY` / `XAUTHORITY` pointing at the
+active session.
+
+When `sphinx-control` runs as a systemd service it has none of those
+env vars in its parent process. To bridge that, the launcher
+discovers the active graphical session via `loginctl` at startup and
+splices the relevant env into every UE4 spawn. The dashboard's
+session badge shows what was discovered (e.g. `session: sdc@wayland:wayland-0`).
+
+```yaml
+# config.yaml
+gnome_session_attach: "auto"   # default
+# or explicit:
+gnome_session_attach: "x11::0"
+gnome_session_attach: "wayland:wayland-0"
+# or disable (UE4 inherits parent env unchanged):
+gnome_session_attach: "off"
+```
+
+If multiple users are logged in, `SPHINX_CONTROL_SESSION_USER=foo`
+forces auto-detect to pick `foo`'s session.
+
+### Sunshine setup (quick reference)
+
+For drone operators streaming the desktop to a Mac/iPad:
+
+```bash
+# On the Sphinx host:
+sudo dpkg -i sunshine.deb           # from github.com/LizardByte/Sunshine
+sunshine                            # web config at https://localhost:47990
+
+# In sunshine config: enable the desktop application; the GNOME
+# session is captured automatically. UE4 windows opened by
+# sphinx-control will appear there.
+```
+
+From the Mac/iPad, install Moonlight, point it at the Sphinx host's
+Tailscale IP, and you'll see the live UE4 view streamed at GPU-
+encode speed. This is the path the SDC team uses for "I want to
+watch the sim from the couch" — much smoother than X11 forwarding or
+VNC because it's hardware-encoded H.264/HEVC.
+
+The session-attach feature is what makes this work: without it, UE4
+would launch into systemd's empty environment, fail to find a
+display, and either crash or render to an offscreen buffer that
+Sunshine can't see.
+
+### Troubleshooting
+
+If the session badge shows "none detected":
+
+```bash
+# 1. Confirm a graphical session exists at all:
+loginctl list-sessions
+
+# 2. Check that Active=yes and Type∈{x11,wayland} for one of them:
+loginctl show-session <id>
+
+# 3. Force a specific user (multi-user host):
+sudo systemctl edit sphinx-control
+# Add to override: Environment=SPHINX_CONTROL_SESSION_USER=sdc
+sudo systemctl restart sphinx-control
+```
+
+If you're running `uvicorn` from a terminal (not systemd) and the
+session is still not detected, you're already inside it — the
+launcher's auto-detect would attach to your session. Just spawn a
+drone and confirm the UE4 window appears on screen.
+
 ## Tailscale: making the per-drone endpoints externally reachable
 
 Two paths, depending on which `network.mode` you chose:
