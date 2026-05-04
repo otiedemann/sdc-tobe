@@ -213,6 +213,18 @@ class Launcher:
                 drone_port=endpoint.port,
                 status="spawning",
             )
+            # Clean up any STOPPED row holding this instance_id from a
+            # previous run. UNIQUE(instance_id) would otherwise reject
+            # the INSERT below. Restart() already does this for the
+            # running-then-stopped case; this catches the case where
+            # the management service was restarted (reconcile marks
+            # all running rows stopped) and the user spawns again.
+            removed = self.state.delete_stopped_at_instance_id(instance_id)
+            if removed:
+                log.info(
+                    "released %d stopped slot(s) at instance_id=%d before spawn",
+                    removed, instance_id,
+                )
             self.state.upsert(rec)
 
             try:
@@ -329,6 +341,38 @@ class Launcher:
             "established_peers": established_peers_to_port(port),
         }
 
+    def _refresh_session(self) -> None:
+        """Re-run session detection. No-op on platforms without
+        loginctl. Updates ``self.session`` and clears
+        ``self.session_warning`` if a session is found this time."""
+        fresh = detect_active_session()
+        if fresh is None:
+            # Don't clobber an existing session with None — a transient
+            # loginctl hiccup shouldn't drop the operator's display
+            # mid-flight.
+            if self.session is None and not self.session_warning:
+                self.session_warning = (
+                    "no active graphical session detected — UE4 windows will "
+                    "open with the parent process's environment "
+                    "(may render headless)."
+                )
+            return
+        if self.session is None:
+            log.info(
+                "session-attach: discovered active session %s for %s on %s",
+                fresh.session_type, fresh.user, fresh.display or "(default)",
+            )
+            self.session_warning = None
+        elif (fresh.session_id != self.session.session_id
+              or fresh.user != self.session.user):
+            log.info(
+                "session-attach: switched to %s for %s on %s "
+                "(was %s for %s)",
+                fresh.session_type, fresh.user, fresh.display or "(default)",
+                self.session.session_type, self.session.user,
+            )
+        self.session = fresh
+
     def reconcile_on_startup(self) -> None:
         """Find rows whose pids are dead and mark them stopped. Called
         once when the management service boots so stale rows from a
@@ -384,6 +428,14 @@ class Launcher:
         # is actually testable via dry-run on the real host (operator
         # can `cat /proc/<pid>/environ` to verify the injection works
         # without spawning a heavy real Sphinx).
+        #
+        # Re-detect on every spawn (auto mode) so a service that booted
+        # before the user logged in to GNOME picks up their session
+        # once it appears. Cheap: ~1 ms per spawn for a couple of
+        # loginctl calls. Manual / "off" / explicit-display modes are
+        # respected — only "auto" gets the live re-detect.
+        if self.session_attach_setting == "auto":
+            self._refresh_session()
         session_env: dict[str, str] = self.session.env if self.session else {}
 
         if self.dry_run:
@@ -459,7 +511,17 @@ class Launcher:
         config_file: str | None,
         endpoint: DroneEndpoint,
     ) -> tuple[list[str], dict[str, str]]:
-        """Build the `sphinx` argv. Adjust for your Sphinx version."""
+        """Build the `sphinx` argv. Verified against Sphinx 2.15.1.
+
+        Sphinx 2.15 supports VERY few flags — really just the descriptor
+        with optional ``::param=value`` suffixes and ``--config-file``.
+        There is no ``--instance`` / ``--port`` / ``-i`` flag. Multi-
+        instance support relies on isolating Sphinx's network state
+        (typically via netns); the flag-based approach attempted here
+        in earlier revisions silently broke every spawn because Sphinx
+        rejected the unknown flag. Don't reintroduce flags without
+        verifying with ``sphinx --help`` first.
+        """
         sphinx_bin = (self.config.get("sphinx", {}) or {}).get(
             "binary", "/usr/bin/sphinx"
         )
@@ -471,18 +533,9 @@ class Launcher:
         argv.append(descriptor_arg)
         if config_file:
             argv.extend(["--config-file", config_file])
-        # NOTE: Sphinx instance/port flags vary by release. The most
-        # commonly used flag (Sphinx ≥ 2.5) is "--instance" for
-        # multi-instance bookkeeping. Double-check `sphinx --help` on
-        # your installed version and adjust if needed.
-        argv.extend(["--instance", str(instance_id)])
-        env: dict[str, str] = {}
-        # Some Sphinx releases let you bind firmwared to a specific port
-        # via env var. If yours doesn't, the netns mode below becomes
-        # mandatory for >1 drone on the same host.
-        if endpoint.port is not None:
-            env["SPHINX_PORT"] = str(endpoint.port)
-        return argv, env
+        # No env overrides for now. If you discover Sphinx env vars that
+        # control bind ports / IPC paths in your version, add them here.
+        return argv, {}
 
     def _ue4_argv(
         self,

@@ -135,6 +135,17 @@ def api_spawn_drone(req: SpawnRequest):
         raise HTTPException(status_code=400, detail=str(e))
     except RuntimeError as e:
         raise HTTPException(status_code=409, detail=str(e))
+    except Exception as e:
+        # Any other failure (sqlite IntegrityError, OSError on Popen,
+        # XAuthority not readable, etc.). Without this catch the dialog
+        # in the browser just says "500 Internal Server Error" and the
+        # operator has to grep journalctl. Surface the type+message so
+        # the alert is actually useful.
+        log.exception("spawn failed unexpectedly")
+        raise HTTPException(
+            status_code=500,
+            detail=f"{type(e).__name__}: {e}",
+        )
     return rec.to_dict()
 
 
@@ -288,13 +299,21 @@ def _sphinx_info() -> dict[str, Any]:
     binary = (config.get("sphinx", {}) or {}).get("binary", "/usr/bin/sphinx")
     if not Path(binary).is_file():
         return {"available": False, "binary": binary}
+    # Sphinx has no --version flag (verified on Sphinx 2.15: it exits
+    # non-zero with usage). Probe via its package name instead — same
+    # info, no Sphinx invocation needed.
+    version = "installed"
     try:
         out = subprocess.check_output(
-            [binary, "--version"], text=True, timeout=3,
+            ["dpkg-query", "-W", "-f=${Version}", "parrot-sphinx"],
+            text=True, timeout=3,
         )
-        version = out.strip().splitlines()[0] if out else "unknown"
-    except subprocess.SubprocessError as e:
-        version = f"error: {e}"
+        if out.strip():
+            version = out.strip()
+    except (subprocess.SubprocessError, FileNotFoundError):
+        # Not Debian/Ubuntu, or parrot-sphinx wasn't installed via apt.
+        # The binary still exists (we checked above), so just say so.
+        pass
     return {"available": True, "binary": binary, "version": version}
 
 

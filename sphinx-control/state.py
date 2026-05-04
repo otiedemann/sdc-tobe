@@ -183,6 +183,20 @@ class StateStore:
         with self._cursor() as c:
             c.execute("DELETE FROM drones WHERE drone_id = ?", (drone_id,))
 
+    def delete_stopped_at_instance_id(self, instance_id: int) -> int:
+        """Drop any stopped rows holding ``instance_id``. Used right
+        before inserting a new drone so the UNIQUE(instance_id) constraint
+        doesn't reject the insert because a previous run's stopped row
+        is still parked at that slot. Returns the number of rows
+        deleted. Never touches running rows."""
+        with self._cursor() as c:
+            c.execute(
+                "DELETE FROM drones "
+                "WHERE instance_id = ? AND status = 'stopped'",
+                (instance_id,),
+            )
+            return c.rowcount
+
     def used_instance_ids(self) -> set[int]:
         with self._cursor() as c:
             rows = c.execute(

@@ -68,7 +68,11 @@ sphinx:
   # Default firmware URL (used when a drone is spawned without an
   # explicit firmware override). The "%23latest" is URL-encoded "#latest"
   # which Sphinx accepts as "always pull the freshest build".
-  firmware_url: "https://firmware.parrot.com/Versions/anafi2/pc/%23latest/images/anafi2-pc.ext2.zip"
+  # NOTE: the URL path uses "anafi" (not "anafi2") and the image is
+  # "anafi-pc.ext2.zip" — this is what works on Sphinx 2.15.1 with
+  # the anafi4k.drone descriptor. Verified manually:
+  #   sphinx /opt/.../drones/anafi4k.drone::firmware="<this URL>"
+  firmware_url: "https://firmware.parrot.com/Versions/anafi/pc/%23latest/images/anafi-pc.ext2.zip"
 
 # Custom Unreal Engine apps available to the dashboard, in addition to
 # stock parrot-ue4-* binaries discovered in PATH.
@@ -92,10 +96,12 @@ ue4_apps:
 
 # Drone profiles available to the dashboard. The descriptor file under
 # sphinx.drone_descriptor_dir must exist for the profile to be usable.
+# Verified working with Sphinx 2.15.1 on the SDC fleet:
+#   sphinx /opt/parrot-sphinx/usr/share/sphinx/drones/anafi4k.drone::firmware=...
 drone_profiles:
   - name: "anafi"
-    descriptor: "anafi2.drone"
-    description: "Anafi 2 / 4K (default fleet drone)."
+    descriptor: "anafi4k.drone"
+    description: "Anafi 4K (default fleet drone, Sphinx-verified)."
   - name: "anafi-usa"
     descriptor: "anafi_usa.drone"
     description: "Anafi USA / Thermal."
