@@ -289,7 +289,20 @@ class ArucoDetector:
                     hdg0 = scored[0][0].relative_heading_deg
                     hdg1 = scored[1][0].relative_heading_deg
                     err0, err1 = scored[0][3], scored[1][3]
-                    mirrored = abs(hdg0 + hdg1) < 5.0
+                    # Mirror-collapse should only fire when the drone is
+                    # genuinely near the marker normal -- the truly
+                    # ambiguous "no signal about which side" case. The
+                    # sum-near-zero check alone is necessary but not
+                    # sufficient: a drone at significant lateral offset
+                    # (e.g. 1 m off-normal at 3 m, hdg = +/-18 deg) also
+                    # has IPPE candidates summing to ~0 deg, but there
+                    # the geometrically-correct candidate IS distinct
+                    # and we'd much rather report it than collapse to
+                    # the marker normal (= the wrong answer by ~1 m).
+                    # Both individual headings being small is what
+                    # restricts us to the actual blind window.
+                    mirrored = (abs(hdg0 + hdg1) < 5.0
+                                and max(abs(hdg0), abs(hdg1)) < 10.0)
                     similar_err = (err0 < 1.0
                                    and err1 < 2.0 * err0 + 0.2)
                     if mirrored and similar_err:
