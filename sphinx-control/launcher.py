@@ -379,6 +379,13 @@ class Launcher:
         sphinx_log = open(drone_log_dir / "sphinx.log", "ab")
         ue4_log = open(drone_log_dir / "ue4.log", "ab")
 
+        # Session env (DISPLAY/XAUTHORITY/etc) gets spliced into the UE4
+        # child whether we're in dry-run or not — this way the feature
+        # is actually testable via dry-run on the real host (operator
+        # can `cat /proc/<pid>/environ` to verify the injection works
+        # without spawning a heavy real Sphinx).
+        session_env: dict[str, str] = self.session.env if self.session else {}
+
         if self.dry_run:
             sleeper = ["sleep", "999999"]
             # IMPORTANT: setsid detaches the child into its own process
@@ -396,6 +403,7 @@ class Launcher:
                 sleeper,
                 stdout=ue4_log,
                 stderr=subprocess.STDOUT,
+                env={**os.environ, **session_env},
                 preexec_fn=os.setsid,
             )
             return sphinx_proc.pid, ue4_proc.pid
@@ -431,10 +439,9 @@ class Launcher:
         # The UE4 child needs DISPLAY/WAYLAND_DISPLAY/XAUTHORITY pointing
         # at the active graphical session, otherwise it has nothing to
         # render into when sphinx-control runs as a system service. The
-        # `session.env` dict overrides whatever the parent process
-        # inherited; if no session was detected, we just use the
-        # parent env unchanged (existing behavior).
-        session_env: dict[str, str] = self.session.env if self.session else {}
+        # `session_env` dict (computed above) overrides whatever the
+        # parent process inherited; if no session was detected, we just
+        # use the parent env unchanged (existing behavior).
         ue4_proc = subprocess.Popen(
             ue4_argv,
             stdout=ue4_log,
