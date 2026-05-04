@@ -63,6 +63,21 @@ def _port_in_use(port: int) -> bool:
         s.close()
 
 
+def _proc_alive_running(pid: int) -> bool:
+    """True iff pid exists AND is in a running/sleeping state.
+    Returns False for zombie ('Z') or dead processes — which
+    ``os.kill(pid, 0)`` would otherwise report as alive."""
+    try:
+        with open(f"/proc/{pid}/status", "r") as f:
+            for line in f:
+                if line.startswith("State:"):
+                    state = line.split()[1]
+                    return state not in ("Z", "X")
+    except (FileNotFoundError, ProcessLookupError, PermissionError):
+        return False
+    return False
+
+
 def _read_tail(path: "Path", n_bytes: int) -> str:
     try:
         from pathlib import Path as _P
@@ -380,14 +395,17 @@ class Launcher:
 
             # Liveness check: poll the process once after a short delay
             # to catch the common "ModuleNotFoundError on import" /
-            # "wrong python interpreter" failures. Without this the
-            # launcher reports running while the script has already
-            # exited with a traceback in the log.
+            # "wrong python interpreter" failures. We check against
+            # /proc/<pid>/status because plain `os.kill(pid, 0)` returns
+            # success for zombies — and a Python script that errored on
+            # `import flask` becomes a zombie until we wait() on it,
+            # which would have made the launcher falsely report
+            # status=running. Verified live on the SDC host: a system-
+            # python spawn that hit ModuleNotFoundError used to slip
+            # past the kill-0 check; the State='Z' read here catches it.
             if not self.dry_run:
-                time.sleep(1.0)
-                try:
-                    os.kill(pid, 0)
-                except ProcessLookupError:
+                time.sleep(1.5)
+                if not _proc_alive_running(pid):
                     log_path = self.log_dir / fc_id / "fc.log"
                     tail = _read_tail(log_path, 1500)
                     self.state.update_fc_status(
@@ -490,13 +508,10 @@ class Launcher:
     def _is_fc_alive(self, fc: FlightControllerRecord) -> bool:
         if not fc.pid:
             return False
-        try:
-            os.kill(fc.pid, 0)
-        except ProcessLookupError:
-            return False
-        except PermissionError:
-            return True
-        return fc.status == "running"
+        # Zombie-aware check (a python that crashed on import is a
+        # zombie until we wait() on it; plain os.kill(pid, 0) would
+        # call it alive). See _proc_alive_running.
+        return _proc_alive_running(fc.pid) and fc.status == "running"
 
     # ─── drone (sphinx, attached to running env) ────────────────
 
