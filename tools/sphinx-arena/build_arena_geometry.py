@@ -108,7 +108,11 @@ def _make_solid_color_texture_material(
     assert bpy is not None
     png_path = out_dir / f"{name}.png"
     out_dir.mkdir(parents=True, exist_ok=True)
-    _write_png_solid(png_path, color_rgb_0_255, side_px=64,
+    # 256×256 — small but big enough to dodge any "treat tiny textures
+    # as placeholders" heuristic the FBX importer might have. The
+    # actual content is uniform colour so compression makes the file
+    # tiny anyway (~few hundred bytes).
+    _write_png_solid(png_path, color_rgb_0_255, side_px=256,
                      alpha_0_255=alpha_0_255)
 
     mat = bpy.data.materials.new(name=name)
@@ -188,11 +192,14 @@ def _export_active(out_path: Path) -> None:
     bpy.ops.export_scene.fbx(
         filepath=str(out_path),
         use_selection=False,
-        # path_mode=AUTO + embed_textures=False makes the FBX point
-        # at the PNG sidecar by filename — verified live: this is the
-        # only path UE4's Sphinx mesh-importer reliably honours.
-        path_mode="AUTO",
-        embed_textures=False,
+        # For floor / pillar / net: bundle the texture INSIDE the FBX
+        # rather than a sidecar PNG. The marker FBXs use sidecars
+        # successfully but the floor (same pipeline) was consistently
+        # falling back to UE4's debug-checker default in the live
+        # render. Embedded textures via path_mode=COPY are less likely
+        # to be silently dropped by UE4's auto-material generator.
+        path_mode="COPY",
+        embed_textures=True,
         apply_unit_scale=True,
         global_scale=1.0,
         bake_space_transform=False,

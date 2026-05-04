@@ -188,11 +188,15 @@ def collect_pillars(markers: list[dict]) -> list[dict]:
 
 
 # Net-wall settings. Nets stretch between pillars along each arena
-# perimeter so the drone can't fly out (it tangles in the net). Use
-# the same pillar.fbx primitive — it's a unit cube; the YAML emitter
-# scales it into a thin tall wall along each arena edge.
+# perimeter so the drone can't fly out. Sphinx's mesh-injection has
+# no opacity/transparency support (only BaseColor/Roughness/Specular/
+# Metallic) — so we can't make truly see-through walls without
+# building a custom UE4 app (Path B) or sparse-grid net geometry.
+# Compromise: keep them low (1 m, like a fence) so the camera view
+# above them is unobstructed, and use a light colour so they read
+# as a barrier rather than an occlusion.
 _NET_THICKNESS_M = 0.05      # 5 cm — visually thin, physically solid
-_NET_HEIGHT_M = 6.0          # match pillar height
+_NET_HEIGHT_M = 1.0          # short fence, not a tall wall
 _NET_END_OVERLAP_M = 0.30    # extend past the corner pillars so the
                              # joint isn't a visible gap
 
