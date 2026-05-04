@@ -99,8 +99,10 @@ def _build_one(png_path: Path, out_path: Path) -> None:
         apply_unit_scale=True,
         global_scale=1.0,
         bake_space_transform=False,
-        axis_forward="X",
-        axis_up="Z",
+        # Sphinx docs require -Y forward and -Z up for blender FBX
+        # exports; see customize_the_environment in the Sphinx docs.
+        axis_forward="-Y",
+        axis_up="-Z",
         object_types={"MESH"},
         mesh_smooth_type="FACE",
     )

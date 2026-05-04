@@ -75,29 +75,31 @@ DEFAULT_OUT_YAML = Path(__file__).parent / "out" / "arena.yml"
 #   left  (arena x=-10,  inward arena +X → UE -Y)  yaw -90°
 #   right (arena x=+10,  inward arena -X → UE +Y)  yaw +90°
 MARKER_PITCH_DEG: float = 90.0
-# UE4's FRotator pitch is "nose up": positive pitch rotates the actor's
-# +X (forward) toward +Z (up). Applied to a flat plane whose local
-# normal is +Z, that means after Pitch=+90° the normal lands at UE -X
-# (NOT +X, NOT +Y — the previous comment got this wrong, which is why
-# the live render kept showing markers facing the wrong direction).
-# Yaw then rotates that -X normal around UE +Z; UE positive yaw is
-# clockwise viewed from above, so +X → +Y → -X → -Y → +X.
+# Sphinx mesh-injection requires Blender FBX export with
+# ``axis_forward="-Y", axis_up="-Z"`` (per Sphinx 2.15 docs,
+# customize_the_environment). Under that mapping, a Blender flat plane
+# with local normal +Z lands in UE with normal -Z (upside-down). UE's
+# FRotator pitch=+90° rotates that -Z normal to +X (UE forward).
+# Yaw then rotates +X around UE +Z to face each wall's inward direction.
 #
-# Required inward direction per wall (in UE coords, axis_map=y2x,x2y_neg):
-#   front (arena y=0,    inward arena +Y → UE +X)  : -X → +X needs yaw 180°
-#   back  (arena y=10.8, inward arena -Y → UE -X)  : -X → -X needs yaw   0°
-#   left  (arena x=-10,  inward arena +X → UE -Y)  : -X → -Y needs yaw +90°
-#   right (arena x=+10,  inward arena -X → UE +Y)  : -X → +Y needs yaw -90°
+# UE positive yaw is clockwise viewed from above, so it rotates
+# +X → +Y → -X → -Y → +X.
 #
-# If markers come out facing OUTWARD after this fix, every value here
-# should be flipped 180°. The white back plate added in
-# build_marker_fbx.py makes this trivial to spot: from inside the
-# arena you should see the ArUco face; from outside, plain white.
+# Required inward direction per wall (axis_map=y2x,x2y_neg):
+#   front (arena y=0,    inward arena +Y → UE +X)  : keep +X, yaw   0°
+#   back  (arena y=10.8, inward arena -Y → UE -X)  : +X → -X, yaw 180°
+#   left  (arena x=-10,  inward arena +X → UE -Y)  : +X → -Y, yaw -90°
+#   right (arena x=+10,  inward arena -X → UE +Y)  : +X → +Y, yaw +90°
+#
+# Earlier revisions used axis_forward="X", axis_up="Z" (UE-direct) and
+# arrived at +90° offsets on each wall. Switching to the
+# Sphinx-recommended axis convention shifts every yaw by 90° back to
+# the cleaner math-derived values below.
 WALL_YAW_DEG: dict[str, float] = {
-    "front": 180.0,   # arena y=0    → faces UE +X
-    "back":    0.0,   # arena y=10.8 → faces UE -X
-    "left":   90.0,   # arena x=-10  → faces UE -Y
-    "right": -90.0,   # arena x=+10  → faces UE +Y
+    "front":   0.0,   # arena y=0    → faces UE +X
+    "back":  180.0,   # arena y=10.8 → faces UE -X
+    "left":  -90.0,   # arena x=-10  → faces UE -Y
+    "right":  90.0,   # arena x=+10  → faces UE +Y
 }
 
 

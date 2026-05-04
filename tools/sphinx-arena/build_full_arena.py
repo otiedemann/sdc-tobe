@@ -222,6 +222,22 @@ def main() -> int:
         ax, ay, az = p
         return (ay - cy, cx - ax, az)
 
+    # Blender FBX export with axis_forward="-Y", axis_up="-Z" (Sphinx
+    # convention) maps Blender axes to UE as:
+    #   Blender +X → UE -Y     (because FBX right = Blender -X under -Y fwd)
+    #   Blender +Y → UE -X     (because Blender -Y → FBX +X = UE +X)
+    #   Blender +Z → UE -Z     (because Blender -Z → FBX +Z = UE +Z)
+    # Inverse — to place geometry at UE (ux, uy, uz), build it in
+    # Blender at (-uy, -ux, -uz). For dimensions, X and Y swap because
+    # the X-Y axes are exchanged by the rotation; Z magnitude stays.
+    def ue_to_blender_pos(ue: tuple[float, float, float]) -> tuple[float, float, float]:
+        ux, uy, uz = ue
+        return (-uy, -ux, -uz)
+
+    def ue_to_blender_dims(ue_dims: tuple[float, float, float]) -> tuple[float, float, float]:
+        dx, dy, dz = ue_dims
+        return (dy, dx, dz)
+
     out_dir = ns.out.parent
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -240,11 +256,13 @@ def main() -> int:
     # to clear UE4's default ground), bottom at top - thickness.
     # Oversized (50×50 m default) so UE4's default ground plane is
     # completely hidden underneath.
-    floor_z_center = ns.floor_top_z_m - ns.floor_thickness_m / 2.0
+    floor_z_center_ue = ns.floor_top_z_m - ns.floor_thickness_m / 2.0
     _add_box(
         name="arena_floor",
-        location_m=(0.0, 0.0, floor_z_center),
-        dimensions_m=(ns.floor_size_m, ns.floor_size_m, ns.floor_thickness_m),
+        location_m=ue_to_blender_pos((0.0, 0.0, floor_z_center_ue)),
+        dimensions_m=ue_to_blender_dims(
+            (ns.floor_size_m, ns.floor_size_m, ns.floor_thickness_m)
+        ),
         material=mat_floor,
     )
 
@@ -267,8 +285,8 @@ def main() -> int:
         ue_dims = (sy_arena, sx_arena, sz_arena)
         _add_box(
             name=name,
-            location_m=(ux, uy, wall_z_center),
-            dimensions_m=ue_dims,
+            location_m=ue_to_blender_pos((ux, uy, wall_z_center)),
+            dimensions_m=ue_to_blender_dims(ue_dims),
             material=mat_wall,
         )
 
@@ -292,9 +310,11 @@ def main() -> int:
         ux, uy, _ = arena_to_ue((key[0], key[1], 0.0))
         _add_box(
             name=f"pillar_{wall}_{int(m['id']):02d}",
-            location_m=(ux, uy, pillar_z_center),
-            dimensions_m=(ns.pillar_thickness_m, ns.pillar_thickness_m,
-                          ns.pillar_height_m),
+            location_m=ue_to_blender_pos((ux, uy, pillar_z_center)),
+            dimensions_m=ue_to_blender_dims(
+                (ns.pillar_thickness_m, ns.pillar_thickness_m,
+                 ns.pillar_height_m)
+            ),
             material=mat_pillar,
         )
 
@@ -318,8 +338,13 @@ def main() -> int:
             apply_unit_scale=True,
             global_scale=1.0,
             bake_space_transform=False,
-            axis_forward="X",
-            axis_up="Z",
+            # Sphinx 2.15's customize_the_environment docs: "forward
+            # vector should be set to -Y and up vector should be set
+            # to -Z to match the Unreal Engine's coordinate system."
+            # NOT the standard X/Z used by most UE4 FBX exports —
+            # Sphinx's mesh-injection has its own convention.
+            axis_forward="-Y",
+            axis_up="-Z",
             object_types={"MESH"},
             mesh_smooth_type="FACE",
         )
