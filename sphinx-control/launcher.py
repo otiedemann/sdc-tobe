@@ -479,11 +479,19 @@ class Launcher:
             sphinx_argv = ["sudo", "-n", "ip", "netns", "exec", endpoint.netns, *sphinx_argv]
             ue4_argv = ["sudo", "-n", "ip", "netns", "exec", endpoint.netns, *ue4_argv]
 
+        # Sphinx's CLI wrapper at /usr/bin/sphinx is a bash script with
+        # `set -u`, and it references $DISPLAY internally to decide
+        # whether to fork a GUI helper. When this service runs under
+        # systemd (no inherited DISPLAY) the sphinx script aborts with
+        # "DISPLAY: unbound variable" before it ever invokes the
+        # firmware sim. Splicing session_env into sphinx's env too
+        # gives it the DISPLAY (and matching XAUTHORITY) so the script
+        # passes its own sanity checks.
         sphinx_proc = subprocess.Popen(
             sphinx_argv,
             stdout=sphinx_log,
             stderr=subprocess.STDOUT,
-            env={**os.environ, **sphinx_env},
+            env={**os.environ, **session_env, **sphinx_env},
             preexec_fn=os.setsid,  # own process group → killpg works
         )
         # Tiny wait so Sphinx claims its IPC sockets before UE attaches.
