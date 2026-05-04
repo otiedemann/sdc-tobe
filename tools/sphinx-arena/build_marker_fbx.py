@@ -60,15 +60,20 @@ def _clear_scene() -> None:
 
 
 def _build_plane(name: str) -> "bpy.types.Object":
-    """Create a 1 m × 1 m plane with a clean UV map and return the object."""
+    """Create a 1 m × 1 m flat plane (XY plane, normal +Z) with a clean
+    UV map and return the object.
+
+    The plane is left FLAT here. ``arena_to_sphinx_yaml.py`` rotates it
+    upright via the Sphinx YAML's per-mesh ``Rotation`` field
+    (pitch=90° to stand it up + yaw to face the right wall). Doing the
+    rotation in YAML keeps all orientation logic in one place and
+    avoids depending on Blender's FBX-axis-conversion quirks (a
+    ``rotation_euler`` baked here didn't survive the export → import
+    round-trip cleanly on the SDC host's Blender 3.0.1)."""
     assert bpy is not None
     bpy.ops.mesh.primitive_plane_add(size=1.0, location=(0, 0, 0))
     obj = bpy.context.active_object
     obj.name = name
-    # Stand the plane up: rotate +90° around X so it faces -Y in world frame.
-    # That puts the marker face-on to a camera that looks along +Y.
-    obj.rotation_euler = (1.5707963267948966, 0.0, 0.0)
-    bpy.ops.object.transform_apply(location=False, rotation=True, scale=False)
     return obj
 
 

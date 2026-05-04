@@ -60,7 +60,14 @@ def _make_pbr_material(name: str, base_color_rgba: tuple[float, float, float, fl
                        roughness: float) -> "bpy.types.Material":
     """Build a Principled-BSDF material with a flat colour. Sphinx
     only honours BaseColor / Roughness / Specular / Metallic — the rest
-    of the Principled inputs are ignored on FBX import."""
+    of the Principled inputs are ignored on FBX import.
+
+    NOTE: vector BaseColor (default_value RGBA) does NOT survive
+    Blender → FBX → UE4 cleanly — the SDC host's render fell back to
+    UE4's default debug checker for the floor. The texture-driven
+    materials (markers) DID survive when the texture was a colocated
+    PNG. See ``_make_solid_color_texture_material`` below — used for
+    the floor + pillar instead of this vector-only material."""
     assert bpy is not None
     mat = bpy.data.materials.new(name=name)
     mat.use_nodes = True
@@ -72,6 +79,75 @@ def _make_pbr_material(name: str, base_color_rgba: tuple[float, float, float, fl
     bsdf.inputs["Metallic"].default_value = 0.0
     bsdf.inputs["Specular"].default_value = 0.2
     return mat
+
+
+def _make_solid_color_texture_material(
+    name: str,
+    color_rgb_0_255: tuple[int, int, int],
+    roughness: float,
+    out_dir: Path,
+) -> "bpy.types.Material":
+    """Build a material whose BaseColor is a 1x1 PNG of the given colour.
+
+    Why this instead of a vector BaseColor: live evidence on the SDC
+    host showed vector PBR colours were dropped during the Blender
+    3.0 → FBX → UE4 import; the floor came out with UE4's default
+    checker. Marker materials, which use a real texture, survived.
+    So we generate a 1x1 PNG with the desired colour and reference
+    it as a colocated sidecar — same pipeline the markers use."""
+    assert bpy is not None
+    # Write the 1x1 PNG next to the FBX so the FBX exporter can
+    # reference it by filename via path_mode="AUTO".
+    png_path = out_dir / f"{name}.png"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    _write_png_solid(png_path, color_rgb_0_255)
+
+    mat = bpy.data.materials.new(name=name)
+    mat.use_nodes = True
+    nodes = mat.node_tree.nodes
+    links = mat.node_tree.links
+    bsdf = nodes.get("Principled BSDF")
+    if bsdf is None:
+        bsdf = nodes.new("ShaderNodeBsdfPrincipled")
+    bsdf.inputs["Roughness"].default_value = roughness
+    bsdf.inputs["Metallic"].default_value = 0.0
+    bsdf.inputs["Specular"].default_value = 0.2
+
+    tex_node = nodes.new("ShaderNodeTexImage")
+    img = bpy.data.images.load(str(png_path))
+    for cs_name in ("Non-Color", "Linear", "Raw"):
+        try:
+            img.colorspace_settings.name = cs_name
+            break
+        except TypeError:
+            continue
+    tex_node.image = img
+    tex_node.interpolation = "Closest"
+    links.new(tex_node.outputs["Color"], bsdf.inputs["Base Color"])
+    return mat
+
+
+def _write_png_solid(path: Path, color_rgb_0_255: tuple[int, int, int]) -> None:
+    """Write a 1×1 PNG with the given RGB colour. Standalone — no
+    Pillow dependency. Tiny enough that we can hand-craft the bytes:
+    8 bytes signature + IHDR + IDAT + IEND."""
+    import struct
+    import zlib
+    r, g, b = color_rgb_0_255
+    # IHDR: 1×1, 8-bit, color type 2 (RGB), compression 0, filter 0,
+    # interlace 0
+    ihdr = struct.pack(">IIBBBBB", 1, 1, 8, 2, 0, 0, 0)
+    # IDAT: a single scanline preceded by a 0 filter byte: [0, R, G, B]
+    raw = bytes([0, r, g, b])
+    idat = zlib.compress(raw, 9)
+    def chunk(tag: bytes, data: bytes) -> bytes:
+        return (struct.pack(">I", len(data)) + tag + data
+                + struct.pack(">I", zlib.crc32(tag + data) & 0xFFFFFFFF))
+    blob = (b"\x89PNG\r\n\x1a\n"
+            + chunk(b"IHDR", ihdr)
+            + chunk(b"IDAT", idat)
+            + chunk(b"IEND", b""))
+    path.write_bytes(blob)
 
 
 def _export_active(out_path: Path) -> None:
@@ -91,39 +167,43 @@ def _export_active(out_path: Path) -> None:
 
 
 def build_floor(out_path: Path) -> None:
-    """1 m × 1 m unit plane, normal +Z, light-concrete material.
+    """1 m × 1 m unit plane, normal +Z, neutral concrete grey.
 
-    The YAML emitter scales this to the arena footprint (default
-    22 × 12 m). We bake the unit dimension here rather than baking
-    the final size, so a single FBX serves any arena layout."""
+    Uses a 1×1 PNG sidecar texture (not a vector BaseColor) so the
+    material survives Blender → FBX → UE4 import. The YAML emitter
+    scales this to the arena footprint (default 22 × 12 m)."""
     assert bpy is not None
     _clear_scene()
     bpy.ops.mesh.primitive_plane_add(size=1.0, location=(0, 0, 0))
     obj = bpy.context.active_object
     obj.name = "arena_floor"
-    mat = _make_pbr_material(
-        "mat_floor",
-        base_color_rgba=(0.55, 0.55, 0.58, 1.0),  # neutral concrete
+    mat = _make_solid_color_texture_material(
+        name="mat_floor",
+        color_rgb_0_255=(140, 140, 145),  # neutral concrete
         roughness=0.85,
+        out_dir=out_path.parent,
     )
     obj.data.materials.append(mat)
     _export_active(out_path)
 
 
 def build_pillar(out_path: Path) -> None:
-    """1 m × 1 m × 1 m unit cube centred at origin, dark-grey material.
+    """1 m × 1 m × 1 m unit cube centred at origin, dark-grey
+    1×1-PNG-textured material.
 
     Centred so the YAML emitter can place it at the desired (x, y, z)
-    without any Blender-side offset arithmetic."""
+    without any Blender-side offset arithmetic. Same FBX is reused
+    for net walls (scaled into a thin slab in YAML)."""
     assert bpy is not None
     _clear_scene()
     bpy.ops.mesh.primitive_cube_add(size=1.0, location=(0, 0, 0))
     obj = bpy.context.active_object
     obj.name = "arena_pillar"
-    mat = _make_pbr_material(
-        "mat_pillar",
-        base_color_rgba=(0.18, 0.18, 0.20, 1.0),  # near-black
+    mat = _make_solid_color_texture_material(
+        name="mat_pillar",
+        color_rgb_0_255=(46, 46, 52),  # near-black
         roughness=0.6,
+        out_dir=out_path.parent,
     )
     obj.data.materials.append(mat)
     _export_active(out_path)
