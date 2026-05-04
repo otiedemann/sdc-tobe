@@ -157,16 +157,42 @@ def main() -> int:
                         "sits clearly above UE4's default ground (which "
                         "is at z=0 and otherwise z-fights, leaving the "
                         "checker pattern visible through ours).")
-    p.add_argument("--wall-thickness-m", type=float, default=0.10)
+    p.add_argument("--wall-thickness-m", type=float, default=0.20,
+                   help="Walls are 20 cm thick by default — thick enough "
+                        "to be visible from any approach angle, thin "
+                        "enough not to dominate the scene.")
     p.add_argument("--wall-height-m", type=float, default=4.0,
                    help="Walls are tall enough to clearly enclose the "
                         "arena (4 m default). Sphinx YAML can't honour "
                         "real opacity, so we accept solid walls.")
-    p.add_argument("--pillar-thickness-m", type=float, default=0.40)
+    p.add_argument("--pillar-thickness-m", type=float, default=0.50,
+                   help="50 cm pillars — match the SDC arena spec and "
+                        "are visually obvious from across the arena.")
     p.add_argument("--pillar-height-m", type=float, default=6.0)
-    p.add_argument("--floor-color-rgb", type=str, default="180,180,180")
-    p.add_argument("--wall-color-rgb", type=str, default="220,225,235")
-    p.add_argument("--pillar-color-rgb", type=str, default="46,46,52")
+    # Default colours pick HIGH-CONTRAST values so the arena structure
+    # is unmistakable against UE4's default sky and ground:
+    #   floor:  warm warehouse grey (clearly not default-ground checker)
+    #   walls:  dark blue-grey (industrial, doesn't blend with sky)
+    #   pillars: bright cream (jumps out, easy to spot from anywhere)
+    p.add_argument("--floor-color-rgb", type=str, default="120,120,120")
+    p.add_argument("--wall-color-rgb", type=str, default="50,60,80")
+    p.add_argument("--pillar-color-rgb", type=str, default="240,220,160")
+    p.add_argument("--save-blend", type=Path, default=None,
+                   help="Also save a Blender .blend file at this path. "
+                        "Default: same dir as --out, with .blend suffix. "
+                        "Open it via 'blender path/to/arena_static.blend' "
+                        "to inspect or tweak the geometry interactively.")
+    p.add_argument("--no-blend", action="store_true",
+                   help="Skip the .blend save step entirely.")
+    p.add_argument("--gui", action="store_true",
+                   help="After building, leave Blender's GUI open with "
+                        "the scene loaded so you can inspect / edit / "
+                        "re-export interactively. Only useful when this "
+                        "script is launched WITHOUT --background.")
+    p.add_argument("--no-fbx", action="store_true",
+                   help="Skip the FBX export step. Useful with --gui "
+                        "when you just want to view the arena without "
+                        "overwriting the existing FBX on disk.")
     ns = p.parse_args(args)
 
     def parse_rgb(s: str) -> tuple[int, int, int]:
@@ -272,30 +298,56 @@ def main() -> int:
             material=mat_pillar,
         )
 
-    # ── EXPORT ── single FBX with all meshes selected.
-    bpy.ops.object.select_all(action="SELECT")
-    bpy.ops.export_scene.fbx(
-        filepath=str(ns.out),
-        use_selection=False,
-        # Sidecar PNGs (same approach as the marker FBXs, which works).
-        path_mode="AUTO",
-        embed_textures=False,
-        apply_unit_scale=True,
-        global_scale=1.0,
-        bake_space_transform=False,
-        axis_forward="X",
-        axis_up="Z",
-        object_types={"MESH"},
-        mesh_smooth_type="FACE",
-    )
+    # ── SAVE .BLEND ── always (small, lets the user inspect/tweak).
+    # Stored next to the FBX with the same stem unless overridden.
+    if not ns.no_blend:
+        blend_path = (ns.save_blend if ns.save_blend
+                      else ns.out.with_suffix(".blend"))
+        bpy.ops.wm.save_as_mainfile(filepath=str(blend_path))
+        print(f"  ✓ {blend_path}  (open in Blender to inspect/edit)")
 
-    print(f"  ✓ {ns.out}")
+    # ── EXPORT FBX ── single file with all meshes.
+    if not ns.no_fbx:
+        bpy.ops.object.select_all(action="SELECT")
+        bpy.ops.export_scene.fbx(
+            filepath=str(ns.out),
+            use_selection=False,
+            # Sidecar PNGs (same approach as the marker FBXs, which works).
+            path_mode="AUTO",
+            embed_textures=False,
+            apply_unit_scale=True,
+            global_scale=1.0,
+            bake_space_transform=False,
+            axis_forward="X",
+            axis_up="Z",
+            object_types={"MESH"},
+            mesh_smooth_type="FACE",
+        )
+        print(f"  ✓ {ns.out}")
+
     print(f"  arena bbox: x=[{x_min},{x_max}], y=[{y_min},{y_max}] "
           f"→ centre arena ({cx:.2f}, {cy:.2f})")
-    print(f"  pillars: {len(seen)}")
-    print(f"  walls: {len(walls)}")
+    print(f"  pillars: {len(seen)} ({ns.pillar_thickness_m}×"
+          f"{ns.pillar_thickness_m}×{ns.pillar_height_m} m, "
+          f"colour rgb={ns.pillar_color_rgb})")
+    print(f"  walls: {len(walls)} ({ns.wall_thickness_m} m thick, "
+          f"{ns.wall_height_m} m tall, colour rgb={ns.wall_color_rgb})")
     print(f"  floor: {ns.floor_size_m} × {ns.floor_size_m} × "
-          f"{ns.floor_thickness_m} m")
+          f"{ns.floor_thickness_m} m, colour rgb={ns.floor_color_rgb}")
+
+    # ── INTERACTIVE GUI MODE ── if --gui was passed AND Blender is
+    # running with a GUI (i.e., NOT --background), keep the window
+    # open so the user can poke at the scene. In --background mode
+    # this flag is silently a no-op (there's no UI to keep open).
+    if ns.gui:
+        # Detect headless: bpy.app.background is True under --background.
+        if getattr(bpy.app, "background", False):
+            print("  (note: --gui ignored under --background; relaunch "
+                  "Blender without --background to enter interactive mode)")
+        else:
+            print("  GUI mode: arena scene loaded, Blender will stay open.")
+            # In a non-background launch, returning from this function
+            # hands control back to Blender's main loop.
     return 0
 
 

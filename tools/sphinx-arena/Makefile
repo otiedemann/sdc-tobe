@@ -21,7 +21,7 @@ FBX_DIR := $(OUT)/fbx
 YAML    := $(OUT)/arena.yml
 REPO_ROOT := $(realpath $(CURDIR)/../..)
 
-.PHONY: all pngs fbxs arena-static logos paintings yaml rebuild clean check
+.PHONY: all pngs fbxs arena-static logos paintings yaml rebuild clean check view-arena edit-arena
 
 # `make all` rebuilds everything from sources (matches the historical
 # behaviour). For just regenerating the YAML after editing the emitter,
@@ -81,6 +81,27 @@ yaml:
 # Convenience target: rebuild EVERYTHING from sources. Run this on a
 # host that has cv2, Blender, and network access (for logo fetch).
 rebuild: pngs fbxs arena-static logos paintings yaml
+
+# Open the arena (existing or freshly-built) in Blender's GUI for
+# inspection or editing. Two modes:
+#   make view-arena   — open the .blend file directly (read-only-ish;
+#                       just inspect existing geometry).
+#   make edit-arena   — re-run the build script under Blender GUI so
+#                       you get the freshly-generated scene (lets you
+#                       tweak the python and immediately see results).
+view-arena:
+	@if [ ! -f $(FBX_DIR)/arena_static.blend ]; then \
+	  echo "no $(FBX_DIR)/arena_static.blend yet — run 'make arena-static' first."; \
+	  exit 1; \
+	fi
+	$(BLENDER) $(FBX_DIR)/arena_static.blend
+
+edit-arena:
+	mkdir -p $(FBX_DIR)
+	$(BLENDER) --python build_full_arena.py -- \
+	    --arena-config $(REPO_ROOT)/controller_unified/arena_config.json \
+	    --out $(FBX_DIR)/arena_static.fbx \
+	    --gui --no-fbx
 
 clean:
 	rm -rf $(OUT)
