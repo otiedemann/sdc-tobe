@@ -88,9 +88,10 @@ async function loadDrones() {
     return;
   }
   const tbody = $("#drones-tbody");
-  $("#drones-count").textContent = drones.length;
+  const countEl = $("#drones-count");
+  if (countEl) countEl.textContent = drones.length;
   if (drones.length === 0) {
-    tbody.innerHTML = `<tr class="empty"><td colspan="9">No drones spawned yet.</td></tr>`;
+    tbody.innerHTML = `<tr class="empty"><td colspan="9">No environment running. Use the form above to start one.</td></tr>`;
     return;
   }
   tbody.innerHTML = "";
@@ -214,14 +215,17 @@ $("#spawn-form").addEventListener("submit", async (ev) => {
   await loadDrones();
 });
 
-$("#restart-all-btn").addEventListener("click", async () => {
+// Bulk controls only exist when max_drones > 1; guard the listeners.
+const restartAllBtn = $("#restart-all-btn");
+if (restartAllBtn) restartAllBtn.addEventListener("click", async () => {
   if (!confirm("Restart all running drones?")) return;
   try { await jpost("/api/drones/restart-all"); }
   catch (e) { alert(`restart-all: ${e.message}`); }
   await loadDrones();
 });
 
-$("#stop-all-btn").addEventListener("click", async () => {
+const stopAllBtn = $("#stop-all-btn");
+if (stopAllBtn) stopAllBtn.addEventListener("click", async () => {
   if (!confirm("Stop all running drones?")) return;
   try { await jpost("/api/drones/stop-all"); }
   catch (e) { alert(`stop-all: ${e.message}`); }

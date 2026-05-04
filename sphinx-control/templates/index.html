@@ -24,10 +24,16 @@
   {% if session_warning %}
   <div class="banner banner-warn">⚠ {{ session_warning }}</div>
   {% endif %}
+  {% if max_drones == 1 %}
+  <div class="banner banner-info">
+    Sphinx 2 runs one drone per host (firmwared and the Gz↔UE4 bridge claim
+    fixed system paths). Stop the current environment before starting a new one.
+  </div>
+  {% endif %}
 
   <main>
     <section id="spawn-section">
-      <h2>Spawn a drone</h2>
+      <h2>{% if max_drones == 1 %}Start an environment{% else %}Spawn a drone{% endif %}</h2>
       <form id="spawn-form">
         <label>Drone profile
           <select name="drone_profile" id="profile-select" required></select>
@@ -35,21 +41,29 @@
         <label>World
           <select name="world_name" id="world-select" required></select>
         </label>
+        {% if max_drones > 1 %}
         <label>Instance ID
           <input type="number" name="instance_id" id="instance-input" min="1" max="{{ max_drones }}" placeholder="auto">
         </label>
-        <button type="submit">Spawn</button>
+        {% endif %}
+        <button type="submit">{% if max_drones == 1 %}Start{% else %}Spawn{% endif %}</button>
       </form>
+      {% if max_drones > 1 %}
       <p class="muted">Up to {{ max_drones }} simultaneous drones. Empty Instance ID = auto-allocate next free slot.</p>
+      {% else %}
+      <p class="muted">Single-drone host. The Sphinx process and the UE4 renderer both spawn into the active GNOME session, so the window appears on the operator's desktop and any desktop-streaming tool (Sunshine, RDP, VNC) captures it.</p>
+      {% endif %}
     </section>
 
     <section id="drones-section">
       <div class="section-header">
-        <h2>Active drones <span id="drones-count" class="count">0</span></h2>
+        <h2>{% if max_drones == 1 %}Current environment{% else %}Active drones <span id="drones-count" class="count">0</span>{% endif %}</h2>
+        {% if max_drones > 1 %}
         <div class="bulk-controls">
           <button id="restart-all-btn" class="secondary">Restart all</button>
           <button id="stop-all-btn" class="danger">Stop all</button>
         </div>
+        {% endif %}
       </div>
       <table id="drones-table">
         <thead>
