@@ -312,6 +312,27 @@ def position_from_marker(pose: MarkerPose,
     return R_m_w @ C_m + marker.position_m
 
 
+ARENA_BOUNDS_MARGIN_M = 1.0
+
+
+def _vote_in_bounds(pos_w: np.ndarray, arena: ArenaConfig) -> bool:
+    """True if ``pos_w`` lies inside the arena's bounding box plus
+    ``ARENA_BOUNDS_MARGIN_M`` slack on every axis. The margin absorbs
+    legitimate jitter and the small overshoot a drone can have just
+    outside a wall, while still rejecting the IPPE-mirror votes that
+    place the camera several metres outside the arena -- those are
+    the votes that yank the weighted average across the room when
+    they enter the visibility set.
+    """
+    half_w = float(arena.width_m) / 2.0 + ARENA_BOUNDS_MARGIN_M
+    half_d = float(arena.depth_m) / 2.0 + ARENA_BOUNDS_MARGIN_M
+    z_lo = float(arena.bottom_z_m) - ARENA_BOUNDS_MARGIN_M
+    z_hi = float(arena.top_z_m) + ARENA_BOUNDS_MARGIN_M
+    return (-half_w <= float(pos_w[0]) <= half_w
+            and -half_d <= float(pos_w[1]) <= half_d
+            and z_lo <= float(pos_w[2]) <= z_hi)
+
+
 def estimate_position(arena: ArenaConfig,
                       poses: Iterable[MarkerPose]
                       ) -> Optional[PositionEstimate]:
@@ -321,8 +342,21 @@ def estimate_position(arena: ArenaConfig,
     Weight is currently ``1 / max(0.1, distance_m)`` -- close markers
     dominate. Returns ``None`` if no visible marker is in the arena
     config.
+
+    Per-marker votes that fall outside the arena bounding box (plus
+    ``ARENA_BOUNDS_MARGIN_M``) are discarded before the average. The
+    drone is physically constrained to the arena so any vote that
+    places it metres outside is the IPPE-mirror branch -- the
+    detector picked the wrong planar-ambiguity solution for that
+    marker. Mixing it into the weighted average produces the
+    "position jumps to (-1, 0, 0.9) every time marker 3 comes back
+    into frame" behaviour observed on a stationary drone. If every
+    vote is out-of-bounds we fall back to using all of them rather
+    than returning None -- a stale wrong answer is better than no
+    answer when something is genuinely off.
     """
     contributions: List[tuple] = []   # (mid, pos_w, weight, method)
+    discarded_oob: List[int] = []
     for p in poses:
         marker = arena.markers.get(int(p.marker_id))
         if marker is None:
@@ -334,6 +368,14 @@ def estimate_position(arena: ArenaConfig,
 
     if not contributions:
         return None
+
+    in_bounds = [c for c in contributions if _vote_in_bounds(c[1], arena)]
+    if in_bounds:
+        contributions = in_bounds
+    # else: every vote is out-of-bounds -- keep them all rather than
+    # silently dropping the estimate; the operator at least sees a
+    # nonsensical value and can diagnose, instead of losing the fix
+    # entirely.
 
     total_w = sum(w for _, _, w, _ in contributions)
     weighted_sum = np.zeros(3, dtype=float)
