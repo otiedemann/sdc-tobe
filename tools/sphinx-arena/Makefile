@@ -21,17 +21,31 @@ FBX_DIR := $(OUT)/fbx
 YAML    := $(OUT)/arena.yml
 REPO_ROOT := $(realpath $(CURDIR)/../..)
 
-.PHONY: all pngs fbxs arena-static logos paintings yaml clean check
+.PHONY: all pngs fbxs arena-static logos paintings yaml rebuild clean check
 
-all: yaml
+# `make all` rebuilds everything from sources (matches the historical
+# behaviour). For just regenerating the YAML after editing the emitter,
+# use `make yaml` directly.
+all: rebuild
 
 pngs:
 	$(PY) generate_aruco_pngs.py --out-dir $(PNG_DIR)
 
-fbxs: pngs
+# fbxs depends on the marker PNG directory existing — not the (.PHONY)
+# `pngs` target. That way re-running `make fbxs` after pngs are already
+# built doesn't try to re-import cv2 (which isn't installed on every
+# host that has Blender). Run `make pngs` explicitly when ArUco PNGs
+# need to change.
+fbxs: $(PNG_DIR)
 	mkdir -p $(FBX_DIR)
 	$(BLENDER) --background --python build_marker_fbx.py -- \
 	    --in-dir $(PNG_DIR) --out-dir $(FBX_DIR)
+
+# Auto-create the PNGs only on the very first run (when the directory
+# doesn't exist yet). After that re-running `make fbxs` skips this and
+# uses whatever's in $(PNG_DIR).
+$(PNG_DIR):
+	$(PY) generate_aruco_pngs.py --out-dir $(PNG_DIR)
 
 # Combined static arena — floor + walls + pillars all baked into a
 # single FBX with positions and dimensions in Blender vertex space.
@@ -46,14 +60,27 @@ arena-static:
 logos:
 	$(PY) download_logos.py --out-dir $(LOGO_DIR)
 
-paintings: logos
+# Same pattern as `fbxs`: depend on the directory rather than the .PHONY
+# logos target so a re-run doesn't try to re-fetch over the network.
+paintings: $(LOGO_DIR)
 	mkdir -p $(FBX_DIR)
 	$(BLENDER) --background --python build_painting_fbxs.py -- \
 	    --in-dir $(LOGO_DIR) --out-dir $(FBX_DIR)
 
-yaml: fbxs arena-static paintings
+$(LOGO_DIR):
+	$(PY) download_logos.py --out-dir $(LOGO_DIR)
+
+# `yaml` is just the YAML emit — it does not force-rebuild the FBXs.
+# Use `make all` (or the individual targets) when you want to rebuild
+# meshes; `make yaml` is the fast path when you've only changed the
+# YAML emitter logic.
+yaml:
 	$(PY) arena_to_sphinx_yaml.py --fbx-dir $(FBX_DIR) --out $(YAML) \
 	    --emit-arena-static --emit-paintings
+
+# Convenience target: rebuild EVERYTHING from sources. Run this on a
+# host that has cv2, Blender, and network access (for logo fetch).
+rebuild: pngs fbxs arena-static logos paintings yaml
 
 clean:
 	rm -rf $(OUT)
