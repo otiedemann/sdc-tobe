@@ -41,7 +41,7 @@ geometry:
 
 yaml: fbxs geometry
 	$(PY) arena_to_sphinx_yaml.py --fbx-dir $(FBX_DIR) --out $(YAML) \
-	    --emit-floor --emit-pillars
+	    --emit-floor --emit-pillars --emit-nets
 
 clean:
 	rm -rf $(OUT)
@@ -52,7 +52,7 @@ clean:
 check:
 	$(PY) generate_aruco_pngs.py --out-dir $(PNG_DIR)
 	$(PY) arena_to_sphinx_yaml.py --fbx-dir $(FBX_DIR) --out $(YAML) \
-	    --emit-floor --emit-pillars
+	    --emit-floor --emit-pillars --emit-nets
 	@echo
 	@echo "self-test ok — PNGs in $(PNG_DIR), arena YAML in $(YAML)"
 	@echo "(run 'make all' on a host with Blender to produce the FBXs)"

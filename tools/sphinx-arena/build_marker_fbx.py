@@ -110,19 +110,33 @@ def build_one(png_path: Path, out_path: Path) -> None:
     assert bpy is not None
     if not png_path.is_file():
         raise FileNotFoundError(png_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    # Copy the source PNG next to the FBX so the FBX can reference it
+    # by filename (not a path that depends on the build host). UE4's
+    # FBX importer in Sphinx mesh-injection consistently picks up
+    # textures via co-located PNGs; embedded textures via
+    # ``embed_textures=True`` were silently dropped on the SDC host
+    # (Blender 3.0.1 + Sphinx 2.15.1), leaving the marker plane with
+    # the default debug material. Verified live: nets and pillars
+    # showed material differences only after switching to this
+    # external-texture approach.
+    sibling_png = out_path.with_suffix(".png")
+    sibling_png.write_bytes(png_path.read_bytes())
+
     _clear_scene()
     obj = _build_plane(name=f"aruco_{png_path.stem}")
-    mat = _make_texture_material(f"mat_{png_path.stem}", png_path)
+    mat = _make_texture_material(f"mat_{png_path.stem}", sibling_png)
     obj.data.materials.append(mat)
 
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    # Embed the PNG inside the FBX so Sphinx doesn't need a sidecar
-    # texture path (the FBX import path is finicky about external refs).
     bpy.ops.export_scene.fbx(
         filepath=str(out_path),
         use_selection=False,
-        path_mode="COPY",
-        embed_textures=True,
+        # path_mode=AUTO writes the texture path as a filename relative
+        # to the .fbx (since we co-located the PNG). UE4 reads it back
+        # by that relative path on import.
+        path_mode="AUTO",
+        embed_textures=False,
         apply_unit_scale=True,
         global_scale=1.0,
         bake_space_transform=True,
