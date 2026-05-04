@@ -37,7 +37,7 @@ from network import (
     listening_pids_on_port,
 )
 from session import SessionInfo, detect_active_session, parse_explicit
-from state import DroneRecord, StateStore
+from state import DroneRecord, EnvironmentRecord, StateStore
 from worlds import Registry
 
 log = logging.getLogger("sphinx-control.launcher")
@@ -46,9 +46,16 @@ log = logging.getLogger("sphinx-control.launcher")
 @dataclass
 class LaunchRequest:
     drone_profile: str
-    world_name: str
+    world_name: str | None = None  # ignored — kept for back-compat with old API
     instance_id: int | None = None  # auto-allocated if None
     firmware_url: str | None = None  # falls back to config default
+
+
+@dataclass
+class EnvironmentRequest:
+    """Start an environment (UE4 only) — drone-agnostic."""
+
+    world_name: str
 
 
 class Launcher:
@@ -166,17 +173,110 @@ class Launcher:
 
     # ─── public API ──────────────────────────────────────────────
 
-    def spawn(self, req: LaunchRequest) -> DroneRecord:
+    # ─── environment (UE4-only) ─────────────────────────────────
+
+    def start_environment(self, req: EnvironmentRequest) -> EnvironmentRecord:
+        """Start a UE4 environment with no drone bound to it. The
+        operator can fly the spectator camera, inspect the arena
+        geometry, and later attach a drone via ``spawn(drone)``.
+
+        Singleton: only one environment runs at a time on this host.
+        Stop the existing environment before starting a new one.
+        """
         with self._lock:
-            profile = self.registry.profile(req.drone_profile)
+            existing = self.state.current_env()
+            if existing is not None and self._is_env_alive(existing):
+                raise RuntimeError(
+                    "an environment is already running; stop it before "
+                    "starting a new one (Sphinx 2 supports one drone per host)."
+                )
+
             world = self.registry.world(req.world_name)
-            # In dry-run mode the descriptor / UE4 binary don't have to
-            # exist — we'll spawn `sleep` placeholders. Outside dry-run
-            # they're real CLI args to subprocess and must be present.
-            if not self.dry_run and not profile.available:
-                raise RuntimeError(f"profile unavailable: {profile.unavailable_reason}")
             if not self.dry_run and not world.available:
                 raise RuntimeError(f"world unavailable: {world.unavailable_reason}")
+
+            env_id = f"env-{uuid.uuid4().hex[:6]}"
+            rec = EnvironmentRecord(
+                env_id=env_id,
+                world_name=req.world_name,
+                world_app=world.name,
+                config_file=world.config_file,
+                status="starting",
+            )
+            self.state.upsert_env(rec)
+
+            try:
+                ue4_pid = self._launch_ue4(env_id=env_id, world=world)
+            except Exception as e:
+                self.state.update_env_status(env_id, "error", last_error=str(e))
+                raise
+
+            self.state.update_env_status(env_id, "running", ue4_pid=ue4_pid)
+            updated = self.state.get_env(env_id)
+            assert updated is not None
+            log.info(
+                "started env %s world=%s ue4_pid=%s",
+                env_id, req.world_name, ue4_pid,
+            )
+            return updated
+
+    def stop_environment(self) -> None:
+        """Stop the current environment AND any drones attached to it.
+        UE4 stays the source of truth; without it sphinx has nothing
+        to render into, so a stop-environment cascades."""
+        with self._lock:
+            # First stop any running drones so they don't leak.
+            for d in self.state.list_all(status="running"):
+                try:
+                    self._stop_drone_locked(d.drone_id)
+                except Exception as e:
+                    log.warning("cascade stop of drone %s failed: %s", d.drone_id, e)
+
+            env = self.state.current_env()
+            if env is None:
+                return
+            if env.ue4_pid:
+                self._terminate_pid(env.ue4_pid)
+            self.state.update_env_status(env.env_id, "stopped")
+            log.info("stopped env %s", env.env_id)
+
+    def restart_environment(self) -> EnvironmentRecord:
+        with self._lock:
+            env = self.state.current_env()
+            if env is None:
+                raise KeyError("no environment running")
+            world_name = env.world_name
+            self.stop_environment()
+            self.state.delete_env(env.env_id)
+            time.sleep(1.0)
+            return self.start_environment(EnvironmentRequest(world_name=world_name))
+
+    def current_environment(self) -> EnvironmentRecord | None:
+        env = self.state.current_env()
+        if env is None:
+            return None
+        env.extras["alive"] = self._is_env_alive(env)
+        return env
+
+    # ─── drone (sphinx, attached to running env) ────────────────
+
+    def spawn(self, req: LaunchRequest) -> DroneRecord:
+        """Start a sphinx drone process attached to the running
+        environment. Requires an environment to be running first —
+        sphinx and UE4 rendezvous via firmwared, and without UE4
+        already up the drone has nowhere to render.
+        """
+        with self._lock:
+            env = self.state.current_env()
+            if env is None or not self._is_env_alive(env):
+                raise RuntimeError(
+                    "no environment running — start one first via "
+                    "POST /api/environment, then spawn the drone."
+                )
+
+            profile = self.registry.profile(req.drone_profile)
+            if not self.dry_run and not profile.available:
+                raise RuntimeError(f"profile unavailable: {profile.unavailable_reason}")
 
             instance_id = req.instance_id or self._allocate_instance_id()
             if instance_id < 1 or instance_id > self.max_drones:
@@ -184,15 +284,10 @@ class Launcher:
                     f"instance_id {instance_id} outside 1..{self.max_drones}"
                 )
             if instance_id in self.state.used_instance_ids():
-                # Tailored message for the one-slot host (the common case
-                # for Sphinx 2 on a single PC). Helps the dashboard alert
-                # reflect reality instead of suggesting "use a different
-                # instance_id" which has no meaning here.
                 if self.max_drones == 1:
                     raise RuntimeError(
-                        "another environment is already running on this host; "
-                        "stop it before starting a new one. Sphinx 2 only "
-                        "supports one drone per host."
+                        "a drone is already running in this environment; "
+                        "stop it before starting a new one."
                     )
                 raise RuntimeError(
                     f"instance_id {instance_id} already in use; stop the existing "
@@ -216,19 +311,14 @@ class Launcher:
                 instance_id=instance_id,
                 drone_type=profile.name,
                 descriptor=profile.descriptor_path,
-                world_app=world.name,
-                config_file=world.config_file,
+                world_app=env.world_app,
+                config_file=env.config_file,
                 firmware_url=firmware,
                 drone_ip=endpoint.ip,
                 drone_port=endpoint.port,
+                ue4_pid=env.ue4_pid,  # share env's UE4
                 status="spawning",
             )
-            # Clean up any STOPPED row holding this instance_id from a
-            # previous run. UNIQUE(instance_id) would otherwise reject
-            # the INSERT below. Restart() already does this for the
-            # running-then-stopped case; this catches the case where
-            # the management service was restarted (reconcile marks
-            # all running rows stopped) and the user spawns again.
             removed = self.state.delete_stopped_at_instance_id(instance_id)
             if removed:
                 log.info(
@@ -238,11 +328,9 @@ class Launcher:
             self.state.upsert(rec)
 
             try:
-                sphinx_pid, ue4_pid = self._launch_subprocesses(
+                sphinx_pid = self._launch_sphinx_only(
                     drone_id=drone_id,
-                    instance_id=instance_id,
                     descriptor_path=profile.descriptor_path,
-                    world=world,
                     endpoint=endpoint,
                     firmware_url=firmware,
                 )
@@ -255,27 +343,35 @@ class Launcher:
                 drone_id,
                 status="running",
                 sphinx_pid=sphinx_pid,
-                ue4_pid=ue4_pid,
+                ue4_pid=env.ue4_pid,
             )
             updated = self.state.get(drone_id)
             assert updated is not None
             log.info(
-                "spawned drone %s instance=%d sphinx_pid=%s ue4_pid=%s endpoint=%s",
-                drone_id, instance_id, sphinx_pid, ue4_pid, endpoint.display(),
+                "spawned drone %s instance=%d sphinx_pid=%s endpoint=%s "
+                "(attached to env %s, ue4_pid=%s)",
+                drone_id, instance_id, sphinx_pid, endpoint.display(),
+                env.env_id, env.ue4_pid,
             )
             return updated
 
     def stop(self, drone_id: str) -> None:
+        """Stop a drone (sphinx) but keep the environment (UE4) running."""
         with self._lock:
-            rec = self.state.get(drone_id)
-            if rec is None:
-                raise KeyError(drone_id)
-            for pid in (rec.sphinx_pid, rec.ue4_pid):
-                if pid:
-                    self._terminate_pid(pid)
-            self._safe_teardown(rec.instance_id)
-            self.state.update_status(drone_id, status="stopped")
-            log.info("stopped drone %s (instance=%d)", drone_id, rec.instance_id)
+            self._stop_drone_locked(drone_id)
+
+    def _stop_drone_locked(self, drone_id: str) -> None:
+        rec = self.state.get(drone_id)
+        if rec is None:
+            raise KeyError(drone_id)
+        # Only stop the sphinx process; the ue4_pid in the row
+        # belongs to the environment and is owned by it.
+        if rec.sphinx_pid:
+            self._terminate_pid(rec.sphinx_pid)
+        self._safe_teardown(rec.instance_id)
+        self.state.update_status(drone_id, status="stopped")
+        log.info("stopped drone %s (instance=%d) — env unchanged",
+                 drone_id, rec.instance_id)
 
     def delete(self, drone_id: str) -> None:
         """Stop the drone and remove its row from state."""
@@ -396,6 +492,26 @@ class Launcher:
                         r.drone_id, r.sphinx_pid, r.ue4_pid,
                     )
                     self.state.update_status(r.drone_id, "stopped")
+            for env in self.state.list_envs():
+                if env.status != "running":
+                    continue
+                if not self._is_env_alive(env):
+                    log.info(
+                        "reconcile: env %s ue4_pid %s dead, marking stopped",
+                        env.env_id, env.ue4_pid,
+                    )
+                    self.state.update_env_status(env.env_id, "stopped")
+
+    def _is_env_alive(self, env: EnvironmentRecord) -> bool:
+        if not env.ue4_pid:
+            return False
+        try:
+            os.kill(env.ue4_pid, 0)
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True
+        return env.status == "running"
 
     # ─── internals ───────────────────────────────────────────────
 
@@ -406,121 +522,86 @@ class Launcher:
                 return i
         raise RuntimeError(f"all {self.max_drones} instance slots in use")
 
-    def _launch_subprocesses(
+    def _build_session_env(self) -> dict[str, str]:
+        """Refresh & return the session env to splice into UE4 / sphinx
+        children. Re-detects on every call when in auto mode."""
+        if self.session_attach_setting == "auto":
+            self._refresh_session()
+        return self.session.env if self.session else {}
+
+    def _launch_ue4(self, env_id: str, world) -> int:
+        """Start the UE4 application for the environment. Returns
+        ue4_pid. Drone-agnostic: no sphinx is started here."""
+        env_log_dir = self.log_dir / env_id
+        env_log_dir.mkdir(parents=True, exist_ok=True)
+        ue4_log = open(env_log_dir / "ue4.log", "ab")
+
+        session_env = self._build_session_env()
+
+        if self.dry_run:
+            sleeper = ["sleep", "999999"]
+            ue4_proc = subprocess.Popen(
+                sleeper, stdout=ue4_log, stderr=subprocess.STDOUT,
+                env={**os.environ, **session_env}, preexec_fn=os.setsid,
+            )
+            return ue4_proc.pid
+
+        ue4_argv, ue4_env = self._ue4_argv(
+            world_binary=world.binary,
+            instance_id=0,
+            endpoint=None,
+            config_file=world.config_file,
+        )
+        ue4_proc = subprocess.Popen(
+            ue4_argv, stdout=ue4_log, stderr=subprocess.STDOUT,
+            env={**os.environ, **session_env, **ue4_env},
+            preexec_fn=os.setsid,
+        )
+        return ue4_proc.pid
+
+    def _launch_sphinx_only(
         self,
         drone_id: str,
-        instance_id: int,
         descriptor_path: str,
-        world,  # WorldEntry
         endpoint: DroneEndpoint,
         firmware_url: str | None,
-    ) -> tuple[int, int]:
-        """Start the sphinx + UE pair. Returns (sphinx_pid, ue4_pid).
+    ) -> int:
+        """Start ONLY the sphinx process. Assumes UE4 is already
+        running (started via ``start_environment``). Returns sphinx_pid.
 
-        DRY-RUN MODE replaces both processes with a long-running
-        ``sleep`` so the rest of the supervisor can be exercised
-        locally.
-
-        REAL MODE: this is the part most likely to need iteration on
-        your specific Sphinx version. The exact CLI flags for "spawn
-        on a specific port" / "spawn in a specific netns" change
-        between Sphinx releases. The default below is a best-effort
-        construction; verify it against your installed Sphinx and
-        adjust ``_sphinx_argv`` if needed.
+        Dry-run: a sleep placeholder.
         """
         drone_log_dir = self.log_dir / drone_id
         drone_log_dir.mkdir(parents=True, exist_ok=True)
         sphinx_log = open(drone_log_dir / "sphinx.log", "ab")
-        ue4_log = open(drone_log_dir / "ue4.log", "ab")
 
-        # Session env (DISPLAY/XAUTHORITY/etc) gets spliced into the UE4
-        # child whether we're in dry-run or not — this way the feature
-        # is actually testable via dry-run on the real host (operator
-        # can `cat /proc/<pid>/environ` to verify the injection works
-        # without spawning a heavy real Sphinx).
-        #
-        # Re-detect on every spawn (auto mode) so a service that booted
-        # before the user logged in to GNOME picks up their session
-        # once it appears. Cheap: ~1 ms per spawn for a couple of
-        # loginctl calls. Manual / "off" / explicit-display modes are
-        # respected — only "auto" gets the live re-detect.
-        if self.session_attach_setting == "auto":
-            self._refresh_session()
-        session_env: dict[str, str] = self.session.env if self.session else {}
+        session_env = self._build_session_env()
 
         if self.dry_run:
             sleeper = ["sleep", "999999"]
-            # IMPORTANT: setsid detaches the child into its own process
-            # group. Without this, killpg(getpgid(child)) on stop kills
-            # the management service itself, since both processes share
-            # the parent's group. This applies in dry-run too — the
-            # "real" branch already does it.
             sphinx_proc = subprocess.Popen(
-                sleeper,
-                stdout=sphinx_log,
-                stderr=subprocess.STDOUT,
-                preexec_fn=os.setsid,
+                sleeper, stdout=sphinx_log, stderr=subprocess.STDOUT,
+                env={**os.environ, **session_env}, preexec_fn=os.setsid,
             )
-            ue4_proc = subprocess.Popen(
-                sleeper,
-                stdout=ue4_log,
-                stderr=subprocess.STDOUT,
-                env={**os.environ, **session_env},
-                preexec_fn=os.setsid,
-            )
-            return sphinx_proc.pid, ue4_proc.pid
+            return sphinx_proc.pid
 
         sphinx_argv, sphinx_env = self._sphinx_argv(
-            instance_id=instance_id,
+            instance_id=endpoint.instance_id,
             descriptor_path=descriptor_path,
             firmware_url=firmware_url,
-            config_file=world.config_file,
+            config_file=None,  # config_file went to UE4 at env-start time
             endpoint=endpoint,
         )
-        ue4_argv, ue4_env = self._ue4_argv(
-            world_binary=world.binary,
-            instance_id=instance_id,
-            endpoint=endpoint,
-            config_file=world.config_file,
-        )
-
-        # If netns, prefix with ``ip netns exec <ns>`` so the child runs
-        # inside the namespace.
         if endpoint.netns:
-            sphinx_argv = ["sudo", "-n", "ip", "netns", "exec", endpoint.netns, *sphinx_argv]
-            ue4_argv = ["sudo", "-n", "ip", "netns", "exec", endpoint.netns, *ue4_argv]
+            sphinx_argv = ["sudo", "-n", "ip", "netns", "exec",
+                           endpoint.netns, *sphinx_argv]
 
-        # Sphinx's CLI wrapper at /usr/bin/sphinx is a bash script with
-        # `set -u`, and it references $DISPLAY internally to decide
-        # whether to fork a GUI helper. When this service runs under
-        # systemd (no inherited DISPLAY) the sphinx script aborts with
-        # "DISPLAY: unbound variable" before it ever invokes the
-        # firmware sim. Splicing session_env into sphinx's env too
-        # gives it the DISPLAY (and matching XAUTHORITY) so the script
-        # passes its own sanity checks.
         sphinx_proc = subprocess.Popen(
-            sphinx_argv,
-            stdout=sphinx_log,
-            stderr=subprocess.STDOUT,
+            sphinx_argv, stdout=sphinx_log, stderr=subprocess.STDOUT,
             env={**os.environ, **session_env, **sphinx_env},
-            preexec_fn=os.setsid,  # own process group → killpg works
-        )
-        # Tiny wait so Sphinx claims its IPC sockets before UE attaches.
-        time.sleep(0.5)
-        # The UE4 child needs DISPLAY/WAYLAND_DISPLAY/XAUTHORITY pointing
-        # at the active graphical session, otherwise it has nothing to
-        # render into when sphinx-control runs as a system service. The
-        # `session_env` dict (computed above) overrides whatever the
-        # parent process inherited; if no session was detected, we just
-        # use the parent env unchanged (existing behavior).
-        ue4_proc = subprocess.Popen(
-            ue4_argv,
-            stdout=ue4_log,
-            stderr=subprocess.STDOUT,
-            env={**os.environ, **session_env, **ue4_env},
             preexec_fn=os.setsid,
         )
-        return sphinx_proc.pid, ue4_proc.pid
+        return sphinx_proc.pid
 
     def _sphinx_argv(
         self,
@@ -561,7 +642,7 @@ class Launcher:
         self,
         world_binary: str,
         instance_id: int,
-        endpoint: DroneEndpoint,
+        endpoint: DroneEndpoint | None,
         config_file: str | None = None,
     ) -> tuple[list[str], dict[str, str]]:
         """Build the parrot-ue4-<world> argv.
@@ -573,11 +654,15 @@ class Launcher:
         without building a custom UE app.
         """
         argv: list[str] = [world_binary]
-        # Parrot's UE4 binaries accept -ResX/-ResY/-Windowed for size,
-        # and may accept a non-default port via -Port. Verify on your
-        # version.
+        # Parrot's UE4 binaries accept -ResX/-ResY/-Windowed for size.
+        # Resolution is intentionally generous so the operator can see
+        # the arena clearly via Sunshine — UE4 defaults to a small
+        # window otherwise.
         argv.extend(["-ResX=1280", "-ResY=720", "-Windowed"])
-        if endpoint.port is not None:
+        # `-Port` only relevant in multi-instance mode. When started
+        # by `start_environment` we have no endpoint (env-only spawn),
+        # and the single-instance default port is fine.
+        if endpoint is not None and endpoint.port is not None:
             argv.append(f"-Port={endpoint.port}")
         if config_file:
             argv.append(f"-config-file={config_file}")

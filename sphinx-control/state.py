@@ -18,6 +18,17 @@ from typing import Any, Iterator
 
 
 _SCHEMA = """
+CREATE TABLE IF NOT EXISTS environments (
+    env_id      TEXT PRIMARY KEY,
+    world_name  TEXT NOT NULL,
+    world_app   TEXT NOT NULL,
+    config_file TEXT,
+    ue4_pid     INTEGER,
+    status      TEXT NOT NULL DEFAULT 'unknown',
+    started_at  REAL,
+    stopped_at  REAL,
+    last_error  TEXT
+);
 CREATE TABLE IF NOT EXISTS drones (
     drone_id     TEXT PRIMARY KEY,
     instance_id  INTEGER NOT NULL UNIQUE,
@@ -36,7 +47,35 @@ CREATE TABLE IF NOT EXISTS drones (
     last_error   TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_drones_status ON drones(status);
+CREATE INDEX IF NOT EXISTS idx_envs_status ON environments(status);
 """
+
+
+@dataclass
+class EnvironmentRecord:
+    """A running UE4 world (drone-agnostic). Singleton on Sphinx 2.x —
+    ``firmwared`` and the Gz↔UE4 bridge claim fixed system paths so
+    only one environment can exist at a time on this host."""
+
+    env_id: str
+    world_name: str
+    world_app: str
+    config_file: str | None = None
+    ue4_pid: int | None = None
+    status: str = "unknown"   # unknown | starting | running | stopped | error
+    started_at: float | None = None
+    stopped_at: float | None = None
+    last_error: str | None = None
+    extras: dict[str, Any] = field(default_factory=dict)
+
+    def to_dict(self) -> dict[str, Any]:
+        d = asdict(self)
+        d["uptime_s"] = (
+            time.time() - self.started_at
+            if self.status == "running" and self.started_at
+            else None
+        )
+        return d
 
 
 @dataclass
@@ -204,7 +243,98 @@ class StateStore:
             ).fetchall()
             return {int(r["instance_id"]) for r in rows}
 
+    # ─── environments table ─────────────────────────────────────
+
+    def upsert_env(self, rec: EnvironmentRecord) -> None:
+        with self._cursor() as c:
+            c.execute(
+                """
+                INSERT INTO environments(
+                    env_id, world_name, world_app, config_file,
+                    ue4_pid, status, started_at, stopped_at, last_error
+                ) VALUES (?,?,?,?,?,?,?,?,?)
+                ON CONFLICT(env_id) DO UPDATE SET
+                    world_name  = excluded.world_name,
+                    world_app   = excluded.world_app,
+                    config_file = excluded.config_file,
+                    ue4_pid     = excluded.ue4_pid,
+                    status      = excluded.status,
+                    started_at  = excluded.started_at,
+                    stopped_at  = excluded.stopped_at,
+                    last_error  = excluded.last_error
+                """,
+                (
+                    rec.env_id, rec.world_name, rec.world_app, rec.config_file,
+                    rec.ue4_pid, rec.status, rec.started_at, rec.stopped_at,
+                    rec.last_error,
+                ),
+            )
+
+    def update_env_status(
+        self,
+        env_id: str,
+        status: str,
+        ue4_pid: int | None = None,
+        last_error: str | None = None,
+    ) -> None:
+        now = time.time()
+        with self._cursor() as c:
+            updates = ["status = ?"]
+            params: list[Any] = [status]
+            if status == "running":
+                updates.append("started_at = ?")
+                params.append(now)
+                updates.append("stopped_at = NULL")
+            elif status == "stopped":
+                updates.append("stopped_at = ?")
+                params.append(now)
+            if ue4_pid is not None:
+                updates.append("ue4_pid = ?")
+                params.append(ue4_pid)
+            if last_error is not None:
+                updates.append("last_error = ?")
+                params.append(last_error)
+            params.append(env_id)
+            c.execute(
+                f"UPDATE environments SET {', '.join(updates)} WHERE env_id = ?",
+                params,
+            )
+
+    def get_env(self, env_id: str) -> EnvironmentRecord | None:
+        with self._cursor() as c:
+            row = c.execute(
+                "SELECT * FROM environments WHERE env_id = ?", (env_id,)
+            ).fetchone()
+            return _row_to_env(row) if row else None
+
+    def current_env(self) -> EnvironmentRecord | None:
+        """The currently-running environment, or None. Singleton on
+        Sphinx 2.x; if multiple rows are running (shouldn't happen),
+        returns the most recently started."""
+        with self._cursor() as c:
+            row = c.execute(
+                "SELECT * FROM environments WHERE status = 'running' "
+                "ORDER BY started_at DESC LIMIT 1"
+            ).fetchone()
+            return _row_to_env(row) if row else None
+
+    def list_envs(self) -> list[EnvironmentRecord]:
+        with self._cursor() as c:
+            rows = c.execute(
+                "SELECT * FROM environments ORDER BY started_at DESC"
+            ).fetchall()
+            return [_row_to_env(r) for r in rows]
+
+    def delete_env(self, env_id: str) -> None:
+        with self._cursor() as c:
+            c.execute("DELETE FROM environments WHERE env_id = ?", (env_id,))
+
 
 def _row_to_record(row: sqlite3.Row) -> DroneRecord:
     d = dict(row)
     return DroneRecord(**d)
+
+
+def _row_to_env(row: sqlite3.Row) -> EnvironmentRecord:
+    d = dict(row)
+    return EnvironmentRecord(**d)

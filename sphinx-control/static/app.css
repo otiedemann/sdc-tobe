@@ -58,6 +58,22 @@ header h1 { margin: 0; font-size: 18px; font-weight: 600; }
 .banner-warn { background: #422006; color: var(--warn); border: 1px solid var(--warn); }
 .banner-info { background: #1e293b; color: var(--accent); border: 1px solid var(--accent); }
 
+.env-pill {
+  display: inline-block;
+  padding: 6px 12px;
+  border-radius: 4px;
+  border: 1px solid var(--border);
+  background: var(--panel2);
+  font-size: 13px;
+  margin-bottom: 12px;
+}
+.env-pill-running { border-color: var(--ok); background: #052e1a; color: var(--ok); }
+.env-pill-stopped { color: var(--muted); }
+.env-pill-starting { border-color: var(--accent); color: var(--accent); }
+.env-pill-error { border-color: var(--err); background: #420c0c; color: var(--err); }
+.env-status { font-family: ui-monospace, monospace; }
+#env-state-row { margin-bottom: 8px; }
+
 main {
   max-width: 1200px;
   margin: 0 auto;
