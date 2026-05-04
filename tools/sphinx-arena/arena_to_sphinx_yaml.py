@@ -448,11 +448,17 @@ def main() -> int:
         mid = int(b["id"])
         ux_m, uy_m, uz_m = shifted_apply((float(b["x"]), float(b["y"]), float(b["z"])))
         loc_cm = (ux_m * 100.0, uy_m * 100.0, uz_m * 100.0)
-        # Target stickers face UP (mounted on top of the box). The
-        # default flat-plane FBX (normal +Z) already points up, so no
-        # pitch — only the box's yaw offset. UE4 Rotator order is
-        # (Pitch, Yaw, Roll).
-        rot = (0.0, float(b.get("yaw_deg", 0.0)), 0.0)
+        # Target markers are mounted on a 45°-tilted plate, 1 m above
+        # the floor, facing upward and toward the arena centre. The
+        # default flat-plane FBX has normal +Z; UE4 pitch=-45° rotates
+        # that to (+0.707, 0, +0.707) — facing UE +X tilted up — and
+        # yaw spins the horizontal component to whichever direction
+        # the per-target JSON requests. UE4 Rotator order is
+        # (Pitch, Yaw, Roll). pitch_deg defaults to 0 (flat) so old
+        # box-top stickers still work without modification.
+        pitch = float(b.get("pitch_deg", 0.0))
+        yaw = float(b.get("yaw_deg", 0.0))
+        rot = (pitch, yaw, 0.0)
         fbx_path = fbx_dir / f"aruco_{mid:03d}.fbx"
         out_lines.append(emit_yaml_block(
             name=f"target_{b.get('team','tgt')}_id_{mid:03d}",
