@@ -96,19 +96,70 @@ def fmt3(x: float, y: float, z: float) -> str:
     return f"{x:.3f} {y:.3f} {z:.3f}"
 
 
-def emit_yaml_block(name: str, fbx_path: Path, location_cm: tuple[float, float, float],
-                    rotation_deg: tuple[float, float, float], scale: float,
-                    snap_to_ground: bool = False) -> str:
-    """Render one Sphinx ``Meshes:`` entry in the documented YAML form."""
+def emit_yaml_block(
+    name: str,
+    fbx_path: Path,
+    location_cm: tuple[float, float, float],
+    rotation_deg: tuple[float, float, float],
+    scale: float | tuple[float, float, float],
+    snap_to_ground: bool = False,
+) -> str:
+    """Render one Sphinx ``Meshes:`` entry in the documented YAML form.
+
+    ``scale`` may be a uniform float OR a per-axis tuple. Per-axis is
+    needed for the arena floor (large in X/Y, unit in Z) and pillars
+    (thin in X/Y, tall in Z)."""
+    if isinstance(scale, (int, float)):
+        sx = sy = sz = float(scale)
+    else:
+        sx, sy, sz = (float(v) for v in scale)
     lines = [
         f"  - Name: {name}",
         f"    FbxPath: \"{fbx_path}\"",
         f"    Location: \"{fmt3(*location_cm)}\"",
         f"    Rotation: \"{fmt3(*rotation_deg)}\"",
-        f"    Scale: \"{fmt3(scale, scale, scale)}\"",
+        f"    Scale: \"{fmt3(sx, sy, sz)}\"",
         f"    SnapToGround: {'true' if snap_to_ground else 'false'}",
     ]
     return "\n".join(lines)
+
+
+# Per-wall outward offset applied to pillar centerlines. Markers in
+# arena_config.json sit at the *inward* face of the wall; the pillar
+# body extends outward (away from the arena interior) by half its
+# width so the marker plane is flush with the inner surface.
+_PILLAR_WIDTH_M = 0.20
+_HALF_PILLAR_M = _PILLAR_WIDTH_M / 2.0
+_PILLAR_HEIGHT_M = 6.0
+
+# Wall → (dx, dy) outward offset for the pillar relative to the marker (x,y).
+WALL_OUTWARD_OFFSET_M: dict[str, tuple[float, float]] = {
+    "left":  (-_HALF_PILLAR_M, 0.0),   # x = -10  → pillar pushed to -10.1
+    "right": (+_HALF_PILLAR_M, 0.0),   # x = +10  → +10.1
+    "back":  (0.0, +_HALF_PILLAR_M),   # y = 10.8 → 10.9
+    "front": (0.0, -_HALF_PILLAR_M),   # y = 0    → -0.1
+}
+
+
+def collect_pillars(markers: list[dict]) -> list[dict]:
+    """Group markers into pillars by their (x, y, wall). Each unique
+    (x, y, wall) becomes one pillar; markers on it are the high+low
+    pair (e.g. arena_config has 8 high + 8 low → 8 pillars)."""
+    seen: dict[tuple[float, float, str], list[int]] = {}
+    for m in markers:
+        key = (float(m["x"]), float(m["y"]), str(m.get("wall", "front")))
+        seen.setdefault(key, []).append(int(m["id"]))
+    pillars: list[dict] = []
+    for (x, y, wall), ids in seen.items():
+        dx, dy = WALL_OUTWARD_OFFSET_M.get(wall, (0.0, 0.0))
+        pillars.append({
+            "x": x + dx,
+            "y": y + dy,
+            "z": _PILLAR_HEIGHT_M / 2.0,  # centred at half height
+            "wall": wall,
+            "marker_ids": sorted(ids),
+        })
+    return pillars
 
 
 def main() -> int:
@@ -141,7 +192,20 @@ def main() -> int:
     )
     p.add_argument(
         "--include-floor-box", action="store_true",
-        help="Also emit a 20m × 10m floor plane at z=0 (placeholder asset).",
+        help="Deprecated alias for --emit-floor (retained for back-compat).",
+    )
+    p.add_argument(
+        "--emit-floor", action="store_true",
+        help="Emit the arena floor (uses floor.fbx from --fbx-dir).",
+    )
+    p.add_argument(
+        "--emit-pillars", action="store_true",
+        help="Emit one pillar per unique marker (x, y, wall) "
+             "(uses pillar.fbx from --fbx-dir).",
+    )
+    p.add_argument(
+        "--floor-size-m", type=str, default="22x12",
+        help="Floor footprint as <width>x<depth> in metres. Default 22x12.",
     )
     args = p.parse_args()
 
@@ -211,7 +275,80 @@ def main() -> int:
         out_lines.append("")
         n_target += 1
 
-    if args.include_floor_box:
+    n_floor = 0
+    n_pillars = 0
+    emit_floor = args.emit_floor or args.include_floor_box
+    emit_pillars = args.emit_pillars
+    if emit_pillars:
+        # Place 8 vertical pillars at the unique (x, y, wall) positions
+        # from arena_config.json, pushed outward by half the pillar
+        # width so the marker plane sits on the pillar's inward face at
+        # exactly the (x, y) recorded in arena_config.json. ctrl_position
+        # uses those coordinates as ground truth — never offset them.
+        for pillar in collect_pillars(arena.get("markers", [])):
+            ux_m, uy_m, uz_m = axis_map.apply(
+                (pillar["x"], pillar["y"], pillar["z"])
+            )
+            loc_cm = (ux_m * 100.0, uy_m * 100.0, uz_m * 100.0)
+            ids_label = "_".join(f"{i:02d}" for i in pillar["marker_ids"])
+            out_lines.append("  # Pillar carrying markers " + ", ".join(
+                str(i) for i in pillar["marker_ids"]) + f" ({pillar['wall']} wall).")
+            out_lines.append(emit_yaml_block(
+                name=f"pillar_{pillar['wall']}_{ids_label}",
+                fbx_path=fbx_dir / "pillar.fbx",
+                location_cm=loc_cm,
+                rotation_deg=(0.0, 0.0, 0.0),
+                scale=(_PILLAR_WIDTH_M, _PILLAR_WIDTH_M, _PILLAR_HEIGHT_M),
+                snap_to_ground=False,
+            ))
+            out_lines.append("")
+            n_pillars += 1
+
+    if emit_floor:
+        # Floor: a unit FBX plane scaled to the configured footprint.
+        # Centre it at the arena's marker bbox centre so it covers
+        # symmetrically (markers span x ∈ [-10, +10], y ∈ [0, 10.8]).
+        try:
+            fw_str, fd_str = args.floor_size_m.lower().split("x", 1)
+            floor_w = float(fw_str)
+            floor_d = float(fd_str)
+        except ValueError:
+            print(f"warning: --floor-size-m {args.floor_size_m!r} unparseable; "
+                  f"using 22x12", file=sys.stderr)
+            floor_w, floor_d = 22.0, 12.0
+        # Floor centre in arena frame: x=0, y=mean of y range, z=0.
+        ys = [float(m["y"]) for m in arena.get("markers", [])] or [0.0, 10.8]
+        cx_arena, cy_arena, cz_arena = 0.0, (min(ys) + max(ys)) / 2.0, 0.0
+        ux_m, uy_m, uz_m = axis_map.apply((cx_arena, cy_arena, cz_arena))
+        loc_cm = (ux_m * 100.0, uy_m * 100.0, uz_m * 100.0)
+        # When the axis_map swaps X and Y, the floor "width" along
+        # arena +X may end up along UE Y (and vice versa). For uniform
+        # rectangles the practical answer is to scale the FBX
+        # symmetrically around the swap by checking which arena axis
+        # ends up where. Simplest correct version: figure out which
+        # UE axis maps from arena X vs Y and apply the right side.
+        ax_for_ue_x = axis_map.ue_x[0]
+        ax_for_ue_y = axis_map.ue_y[0]
+        size_per_arena_axis = {0: floor_w, 1: floor_d}
+        ue_x_size = size_per_arena_axis[ax_for_ue_x]
+        ue_y_size = size_per_arena_axis[ax_for_ue_y]
+        out_lines.append(
+            f"  # Arena floor — {floor_w} × {floor_d} m at z=0."
+        )
+        out_lines.append(emit_yaml_block(
+            name="arena_floor",
+            fbx_path=fbx_dir / "floor.fbx",
+            location_cm=loc_cm,
+            rotation_deg=(0.0, 0.0, 0.0),
+            scale=(ue_x_size, ue_y_size, 1.0),
+            snap_to_ground=False,
+        ))
+        out_lines.append("")
+        n_floor = 1
+
+    # Legacy include-floor-box-only branch retained for back-compat.
+    # Skipped because emit_floor above already handled it.
+    if False:
         out_lines.append("  # Optional 20m × 10m floor placeholder. Replace with a")
         out_lines.append("  # real concrete-textured FBX once you have one.")
         out_lines.append(emit_yaml_block(
@@ -228,6 +365,8 @@ def main() -> int:
     print(f"Wrote {args.out}")
     print(f"  wall markers: {n_wall}")
     print(f"  target markers: {n_target}")
+    print(f"  pillars: {n_pillars}")
+    print(f"  floor: {n_floor}")
     print(f"  axis map: {args.axis_map}")
     print(f"  fbx dir (in YAML): {fbx_dir}")
     return 0
