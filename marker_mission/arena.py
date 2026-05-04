@@ -317,16 +317,19 @@ ARENA_BOUNDS_MARGIN_M = 1.0
 
 def _vote_in_bounds(pos_w: np.ndarray, arena: ArenaConfig) -> bool:
     """True if ``pos_w`` lies inside the arena's bounding box plus
-    ``ARENA_BOUNDS_MARGIN_M`` slack on every axis. The margin absorbs
-    legitimate jitter and the small overshoot a drone can have just
-    outside a wall, while still rejecting the IPPE-mirror votes that
-    place the camera several metres outside the arena -- those are
-    the votes that yank the weighted average across the room when
-    they enter the visibility set.
+    ``ARENA_BOUNDS_MARGIN_M`` slack on every axis.
+
+    Floor reference is the arena origin (z = 0), NOT
+    ``arena.bottom_z_m`` -- that field is the lowest reference
+    marker's z (typically ~0.94 m), so the drone can legitimately
+    fly below it. We use a symmetric margin around z=0 / top_z_m
+    instead, otherwise a stationary drone near the floor reads
+    "out of bounds" and the branch selector rejects perfectly good
+    IPPE votes.
     """
     half_w = float(arena.width_m) / 2.0 + ARENA_BOUNDS_MARGIN_M
     half_d = float(arena.depth_m) / 2.0 + ARENA_BOUNDS_MARGIN_M
-    z_lo = float(arena.bottom_z_m) - ARENA_BOUNDS_MARGIN_M
+    z_lo = -ARENA_BOUNDS_MARGIN_M
     z_hi = float(arena.top_z_m) + ARENA_BOUNDS_MARGIN_M
     return (-half_w <= float(pos_w[0]) <= half_w
             and -half_d <= float(pos_w[1]) <= half_d
@@ -385,13 +388,19 @@ def estimate_position(arena: ArenaConfig,
     display dot doesn't jump to a clearly-wrong location on a single
     bad detection frame.
     """
-    use_anchor = (prev_position_m is not None
+    # Use the previous fix as a branch-selection anchor only when it
+    # is recent AND itself in-bounds. An OOB prev is a wrong-branch
+    # IPPE result that snuck through cold-start; trusting it would
+    # lock the estimator into the wrong branch indefinitely (every
+    # frame the wrong-but-near-prev chosen wins, the right
+    # well-in-bounds alt gets rejected as "too far"). Falling back
+    # to the cold-start (in-bounds) path lets the swap recover.
+    prev_arr = (np.asarray(prev_position_m, dtype=float).reshape(3)
+                if prev_position_m is not None else None)
+    use_anchor = (prev_arr is not None
                   and prev_age_s is not None
-                  and prev_age_s < ARENA_PREV_STALE_S)
-    if use_anchor:
-        prev_arr = np.asarray(prev_position_m, dtype=float).reshape(3)
-    else:
-        prev_arr = None
+                  and prev_age_s < ARENA_PREV_STALE_S
+                  and _vote_in_bounds(prev_arr, arena))
 
     contributions: List[tuple] = []   # (mid, pos_w, weight, method)
     for p in poses:
