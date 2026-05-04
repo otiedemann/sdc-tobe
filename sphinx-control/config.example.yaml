@@ -12,10 +12,20 @@ port: 8090
 # Sphinx processes do not — they're respawned on demand).
 state_db: "./sphinx_control.db"
 
-# Maximum simultaneous Sphinx instances. Per Parrot's docs each Sphinx
-# process is one drone; running 10 of them on one box is GPU-limited.
-# Lower this if your GPU saturates.
-max_drones: 10
+# Maximum simultaneous Sphinx instances on this host.
+#
+# Default 1 — Parrot Sphinx 2.x is architecturally one-drone-per-host:
+# `firmwared` binds to fixed system paths (/tmp/fd_mount_points/...),
+# the Gz↔UE4 bridge claims a single rendezvous, and the simulated
+# drone always lives at 192.168.42.1 unless you isolate it inside a
+# Linux network namespace. We've verified live on the SDC host that a
+# second `sphinx` invocation collides with the first; the UI used to
+# pretend ports-mode would handle this, it doesn't.
+#
+# To run more than one drone you need netns mode (CAP_NET_ADMIN +
+# bridge) — the launcher supports it but it's a separate effort to
+# wire up reliably. Until then, leave this at 1.
+max_drones: 1
 
 # How drones get distinct IPs. Two modes:
 #   "ports"  — single IP (loopback by default), each drone on a unique

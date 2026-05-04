@@ -184,6 +184,16 @@ class Launcher:
                     f"instance_id {instance_id} outside 1..{self.max_drones}"
                 )
             if instance_id in self.state.used_instance_ids():
+                # Tailored message for the one-slot host (the common case
+                # for Sphinx 2 on a single PC). Helps the dashboard alert
+                # reflect reality instead of suggesting "use a different
+                # instance_id" which has no meaning here.
+                if self.max_drones == 1:
+                    raise RuntimeError(
+                        "another environment is already running on this host; "
+                        "stop it before starting a new one. Sphinx 2 only "
+                        "supports one drone per host."
+                    )
                 raise RuntimeError(
                     f"instance_id {instance_id} already in use; stop the existing "
                     f"drone first."
