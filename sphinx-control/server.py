@@ -27,7 +27,7 @@ from fastapi.staticfiles import StaticFiles
 from jinja2 import Environment, FileSystemLoader, select_autoescape
 from pydantic import BaseModel, Field
 
-from launcher import LaunchRequest, Launcher
+from launcher import EnvironmentRequest, LaunchRequest, Launcher
 from state import StateStore
 from worlds import Registry
 
@@ -89,9 +89,16 @@ def _render(name: str, **ctx: Any) -> HTMLResponse:
 
 class SpawnRequest(BaseModel):
     drone_profile: str = Field(..., examples=["anafi"])
-    world_name: str = Field(..., examples=["empty"])
+    # world_name is accepted for back-compat but ignored — the world
+    # belongs to the environment, which must be running before a
+    # drone can spawn.
+    world_name: str | None = None
     instance_id: int | None = Field(None, ge=1, le=10)
     firmware_url: str | None = None
+
+
+class EnvSpawnRequest(BaseModel):
+    world_name: str = Field(..., examples=["empty", "sdc_arena"])
 
 
 class StatusOK(BaseModel):
@@ -112,6 +119,53 @@ def index():
         session_warning=launcher.session_warning,
         dry_run=launcher.dry_run,
     )
+
+
+# ─── API: environment (UE4 only) ─────────────────────────────────
+
+
+@app.get("/api/environment")
+def api_get_environment():
+    env = launcher.current_environment()
+    return env.to_dict() if env else None
+
+
+@app.post("/api/environment", status_code=201)
+def api_start_environment(req: EnvSpawnRequest):
+    try:
+        env = launcher.start_environment(EnvironmentRequest(world_name=req.world_name))
+    except (KeyError, ValueError) as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except RuntimeError as e:
+        raise HTTPException(status_code=409, detail=str(e))
+    except Exception as e:
+        log.exception("environment start failed")
+        raise HTTPException(status_code=500, detail=f"{type(e).__name__}: {e}")
+    return env.to_dict()
+
+
+@app.delete("/api/environment")
+def api_stop_environment():
+    try:
+        launcher.stop_environment()
+    except Exception as e:
+        log.exception("environment stop failed")
+        raise HTTPException(status_code=500, detail=f"{type(e).__name__}: {e}")
+    return StatusOK()
+
+
+@app.post("/api/environment/restart")
+def api_restart_environment():
+    try:
+        env = launcher.restart_environment()
+    except KeyError:
+        raise HTTPException(status_code=404, detail="no environment running")
+    except RuntimeError as e:
+        raise HTTPException(status_code=409, detail=str(e))
+    except Exception as e:
+        log.exception("environment restart failed")
+        raise HTTPException(status_code=500, detail=f"{type(e).__name__}: {e}")
+    return env.to_dict()
 
 
 # ─── API: drones ─────────────────────────────────────────────────

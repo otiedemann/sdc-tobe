@@ -1,8 +1,11 @@
 // Sphinx Control — vanilla JS frontend.
-// Polls /api/drones every 2s; mutating actions go through fetch + reload.
+// Polls /api/drones + /api/environment every 2s; mutating actions go
+// through fetch + reload. The flow is two-stage: start an environment
+// (UE4-only) first, then spawn a drone (sphinx) into it.
 
 const REFRESH_MS = 2000;
 let selectedDroneId = null;
+let envCache = null;
 
 const $ = (sel) => document.querySelector(sel);
 const $$ = (sel) => document.querySelectorAll(sel);
@@ -196,13 +199,81 @@ async function loadSystem() {
   }
 }
 
-$("#spawn-form").addEventListener("submit", async (ev) => {
+async function loadEnvironment() {
+  let env;
+  try {
+    env = await jget("/api/environment");
+  } catch (e) {
+    console.error("loadEnvironment", e);
+    return;
+  }
+  envCache = env;
+  const pill = $("#env-state-pill");
+  const statusSpan = pill.querySelector(".env-status");
+  pill.classList.remove("env-pill-running", "env-pill-stopped",
+                        "env-pill-starting", "env-pill-error");
+  const startBtn = $("#env-start-btn");
+  const stopBtn = $("#env-stop-btn");
+  const restartBtn = $("#env-restart-btn");
+  const droneBtn = $("#drone-spawn-btn");
+  if (!env || env.status !== "running") {
+    pill.classList.add("env-pill-stopped");
+    statusSpan.textContent = env
+      ? `last: ${env.world_name} (${env.status})`
+      : "no environment running";
+    startBtn.disabled = false;
+    stopBtn.disabled = true;
+    restartBtn.disabled = true;
+    droneBtn.disabled = true;
+  } else {
+    pill.classList.add("env-pill-running");
+    const uptime = formatUptime(env.uptime_s);
+    statusSpan.textContent = `running: ${env.world_name} — ue4_pid=${env.ue4_pid} uptime ${uptime}`;
+    startBtn.disabled = true;
+    stopBtn.disabled = false;
+    restartBtn.disabled = false;
+    droneBtn.disabled = false;
+  }
+}
+
+$("#env-form").addEventListener("submit", async (ev) => {
   ev.preventDefault();
   const fd = new FormData(ev.target);
-  const body = {
-    drone_profile: fd.get("drone_profile"),
-    world_name: fd.get("world_name"),
-  };
+  const body = { world_name: fd.get("world_name") };
+  try {
+    await jpost("/api/environment", body);
+  } catch (e) {
+    alert(`environment start failed: ${e.message}`);
+    return;
+  }
+  await loadEnvironment();
+  await loadDrones();
+});
+
+$("#env-stop-btn").addEventListener("click", async () => {
+  if (!confirm("Stop the running environment? Any attached drone will also stop.")) return;
+  try { await jdelete("/api/environment"); }
+  catch (e) { alert(`stop failed: ${e.message}`); return; }
+  await loadEnvironment();
+  await loadDrones();
+});
+
+$("#env-restart-btn").addEventListener("click", async () => {
+  if (!confirm("Restart the environment? The drone will be stopped.")) return;
+  try { await jpost("/api/environment/restart"); }
+  catch (e) { alert(`restart failed: ${e.message}`); return; }
+  await loadEnvironment();
+  await loadDrones();
+});
+
+$("#spawn-form").addEventListener("submit", async (ev) => {
+  ev.preventDefault();
+  if (!envCache || envCache.status !== "running") {
+    alert("Start the environment first (Step 1 above).");
+    return;
+  }
+  const fd = new FormData(ev.target);
+  const body = { drone_profile: fd.get("drone_profile") };
   const iid = fd.get("instance_id");
   if (iid) body.instance_id = parseInt(iid, 10);
   try {
@@ -234,7 +305,9 @@ if (stopAllBtn) stopAllBtn.addEventListener("click", async () => {
 
 (async function init() {
   await Promise.all([loadProfiles(), loadWorlds(), loadSystem()]);
+  await loadEnvironment();
   await loadDrones();
+  setInterval(loadEnvironment, REFRESH_MS);
   setInterval(loadDrones, REFRESH_MS);
   setInterval(loadSystem, REFRESH_MS * 5);
 })();
