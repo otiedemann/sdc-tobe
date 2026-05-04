@@ -426,7 +426,7 @@ def main() -> int:
             )
             out_lines.append(emit_yaml_block(
                 name=net["name"],
-                fbx_path=fbx_dir / "pillar.fbx",
+                fbx_path=fbx_dir / "net.fbx",
                 location_cm=loc_cm,
                 rotation_deg=(0.0, 0.0, 0.0),
                 scale=(ue_x_scale, ue_y_scale, ue_z_scale),
