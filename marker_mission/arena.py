@@ -293,11 +293,22 @@ def position_from_marker(pose: MarkerPose,
     detector guarantees ``rvec`` describes a front-facing pose
     (back-facing IPPE candidates are filtered out during selection),
     so we don't need to re-check the planar ambiguity here.
+
+    When ``pose.collapsed_camera_position_m`` is set the detector has
+    already pre-computed the camera-in-marker-frame position as the
+    midpoint of two IPPE mirror candidates (the near-frontal blind
+    window). We use that value as ``C_m`` instead of re-deriving it
+    from the single winning rvec/tvec, which would jump across the
+    marker normal whenever IPPE picks the other branch.
     """
-    R_m_c, _ = cv2.Rodrigues(pose.rvec)
-    t_m_c = np.asarray(pose.tvec, dtype=float).reshape(3)
+    if pose.collapsed_camera_position_m is not None:
+        C_m = np.asarray(pose.collapsed_camera_position_m,
+                         dtype=float).reshape(3)
+    else:
+        R_m_c, _ = cv2.Rodrigues(pose.rvec)
+        t_m_c = np.asarray(pose.tvec, dtype=float).reshape(3)
+        C_m = -R_m_c.T @ t_m_c
     R_m_w = WALL_ROTATIONS[marker.wall]
-    C_m = -R_m_c.T @ t_m_c
     return R_m_w @ C_m + marker.position_m
 
 

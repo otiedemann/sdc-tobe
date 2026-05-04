@@ -82,12 +82,27 @@ class MarkerPose:
     #   "ippe_temporal" -- two IPPE candidates with similar reproj-err;
     #                       temporal-continuity heading match overrode
     #                       the lower-err winner.
+    #   "ippe_collapsed"-- two IPPE candidates were heading-mirrors with
+    #                       similar reproj-err (the near-frontal blind
+    #                       window); the chosen pose's relative_heading
+    #                       and per-marker world-position vote were both
+    #                       collapsed to the midpoint. Without this the
+    #                       world position would flip across the marker
+    #                       normal every time IPPE picks the other branch.
     #   "iterative"     -- IPPE failed entirely (no front-facing
     #                       candidate or reproj-err > 2px), fell through
     #                       to SOLVEPNP_ITERATIVE.
     # Logged per tick so a flight log can be sliced by method when
     # diagnosing position jumps.
     pose_method: str = ""
+
+    # Camera position in MARKER frame, populated only by the
+    # near-frontal mirror-collapse: the midpoint of the two IPPE
+    # candidates' ``-R.T @ t`` vectors. ``arena.position_from_marker``
+    # uses this when set so the per-marker world-position vote stays
+    # on the marker normal during the planar-ambiguity blind window
+    # instead of flipping with the chosen IPPE branch.
+    collapsed_camera_position_m: Optional[np.ndarray] = None
 
 
 # ---------------------------------------------------------------------------
@@ -262,6 +277,14 @@ class ArucoDetector:
                 # midpoint (~0) tells the controller "we're centered, no
                 # strong heading signal" -- which is the truthful
                 # interpretation and falls cleanly inside the deadband.
+                #
+                # The exact same ambiguity flips the per-marker world
+                # position vote: -R.T @ t for the two candidates places
+                # the camera at mirrored points across the marker
+                # normal. We compute the midpoint of those two C_m
+                # vectors here and stash it on chosen_pose so
+                # ``arena.position_from_marker`` can use it instead of
+                # re-deriving from the single winning rvec/tvec.
                 if len(scored) > 1:
                     hdg0 = scored[0][0].relative_heading_deg
                     hdg1 = scored[1][0].relative_heading_deg
@@ -271,6 +294,17 @@ class ArucoDetector:
                                    and err1 < 2.0 * err0 + 0.2)
                     if mirrored and similar_err:
                         chosen_pose.relative_heading_deg = (hdg0 + hdg1) / 2.0
+                        R0, _ = cv2.Rodrigues(
+                            np.asarray(scored[0][1]).reshape(3, 1))
+                        R1, _ = cv2.Rodrigues(
+                            np.asarray(scored[1][1]).reshape(3, 1))
+                        t0 = np.asarray(scored[0][2], dtype=float).reshape(3)
+                        t1 = np.asarray(scored[1][2], dtype=float).reshape(3)
+                        C0 = -R0.T @ t0
+                        C1 = -R1.T @ t1
+                        chosen_pose.collapsed_camera_position_m = (
+                            (C0 + C1) * 0.5)
+                        chosen_method = "ippe_collapsed"
 
                 # Reproj-err sanity gate: a winning IPPE candidate that still
                 # mis-projects badly is suspect -- fall back to ITERATIVE.
