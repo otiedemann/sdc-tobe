@@ -862,13 +862,12 @@ function drawRcWidgets(s) {
 // arbitrary, so a tel.yaw-based arrow is meaningless without a
 // per-flight calibration step.
 //
-// Instead we derive the drone's arena-frame yaw from the live marker
-// pose: drone yaw in arena = compass bearing of the active marker from
-// the drone (in arena frame) - yaw_to_marker (camera-frame angle to
-// the marker, CW positive). This needs world_position_m, the active
-// marker's world position (looked up from the cached arena), and
-// yaw_to_marker_deg from the snapshot. When any of those is missing
-// we just skip the arrow rather than draw a wrong one.
+// Instead the server publishes ``arena_yaw_deg`` (CW from arena +y /
+// front wall) whenever ANY visible reference marker can resolve it;
+// see vision_worker. We just read it here, gated by ``arena_yaw_age_s``
+// so a stale value doesn't mislead the operator after the last marker
+// leaves the frame. When the value is missing or stale we skip the
+// arrow rather than draw a wrong one.
 let _arenaCache = null;
 let _arenaCacheTried = false;
 async function _ensureArenaCache() {
@@ -879,20 +878,12 @@ async function _ensureArenaCache() {
     if (r.ok) _arenaCache = await r.json();
   } catch (e) {}
 }
+const ARENA_YAW_FRESH_S = 1.0;
 function _droneYawArena(s) {
-  const pos = s.world_position_m;
-  if (!Array.isArray(pos) || pos.length !== 3) return null;
-  if (typeof s.yaw_to_marker_deg !== 'number') return null;
-  if (!_arenaCache || !Array.isArray(_arenaCache.markers)) return null;
-  const mid = s.active_marker_id;
-  if (mid == null) return null;
-  const marker = _arenaCache.markers.find(m => m.id === mid);
-  if (!marker) return null;
-  const dxm = marker.x - pos[0];
-  const dym = marker.y - pos[1];
-  // bearing of marker from drone (compass-style: 0 = +y arena, +CW)
-  const bearing = Math.atan2(dxm, dym) * 180 / Math.PI;
-  return bearing - s.yaw_to_marker_deg;     // arena-frame yaw, degrees
+  if (typeof s.arena_yaw_deg !== 'number') return null;
+  const age = s.arena_yaw_age_s;
+  if (typeof age !== 'number' || age > ARENA_YAW_FRESH_S) return null;
+  return s.arena_yaw_deg;
 }
 function drawPositionView(s) {
   const c = $('c-pos'); if (!c) return;
