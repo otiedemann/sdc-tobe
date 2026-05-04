@@ -48,6 +48,36 @@ from worlds import Registry
 log = logging.getLogger("sphinx-control.launcher")
 
 
+def _port_in_use(port: int) -> bool:
+    """True iff anything is already listening on the given TCP port on
+    any local interface. Used as a pre-flight check before spawning a
+    subprocess that would bind that port."""
+    import socket as _socket
+    s = _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM)
+    try:
+        s.bind(("127.0.0.1", int(port)))
+        return False
+    except OSError:
+        return True
+    finally:
+        s.close()
+
+
+def _read_tail(path: "Path", n_bytes: int) -> str:
+    try:
+        from pathlib import Path as _P
+        p = _P(path)
+        if not p.is_file():
+            return "(log file not yet flushed)"
+        size = p.stat().st_size
+        with p.open("rb") as f:
+            if size > n_bytes:
+                f.seek(size - n_bytes)
+            return f.read().decode(errors="replace")
+    except Exception as e:
+        return f"(could not read log: {e})"
+
+
 @dataclass
 class LaunchRequest:
     drone_profile: str
@@ -326,6 +356,17 @@ class Launcher:
             )
             self.state.upsert_fc(rec)
 
+            # Pre-flight: refuse to start if something's already on the
+            # FC's HTTP port. Without this the subprocess would launch
+            # and silently fail to bind, leaving the launcher reporting
+            # "running" while the actual python died 100 ms later.
+            if not self.dry_run and _port_in_use(int(http_port)):
+                raise RuntimeError(
+                    f"port {http_port} already in use — another FC may be "
+                    f"running outside sphinx-control. `sudo ss -tlnp 'sport "
+                    f"= :{http_port}'` to find it."
+                )
+
             try:
                 pid = self._launch_fc(
                     fc_id=fc_id, cwd=cwd_path, python=python,
@@ -336,6 +377,26 @@ class Launcher:
             except Exception as e:
                 self.state.update_fc_status(fc_id, "error", last_error=str(e))
                 raise
+
+            # Liveness check: poll the process once after a short delay
+            # to catch the common "ModuleNotFoundError on import" /
+            # "wrong python interpreter" failures. Without this the
+            # launcher reports running while the script has already
+            # exited with a traceback in the log.
+            if not self.dry_run:
+                time.sleep(1.0)
+                try:
+                    os.kill(pid, 0)
+                except ProcessLookupError:
+                    log_path = self.log_dir / fc_id / "fc.log"
+                    tail = _read_tail(log_path, 1500)
+                    self.state.update_fc_status(
+                        fc_id, "error",
+                        last_error=f"FC died on startup. Tail of fc.log:\n{tail}",
+                    )
+                    raise RuntimeError(
+                        f"FC died on startup. See {log_path}\nTail:\n{tail}"
+                    )
 
             self.state.update_fc_status(fc_id, "running", pid=pid)
             updated = self.state.get_fc(fc_id)

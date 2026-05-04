@@ -127,10 +127,13 @@ flight_controller:
   # Working dir for unified_api_server.py. The script runs from here
   # and reads its own arena_config.json / flight_config.json from CWD.
   cwd: "/home/sdc/sdc-tobe/controller_unified"
-  # Python interpreter to use. Relative paths resolve against `cwd`,
-  # so ".venv/bin/python" picks up the module's own venv if present.
-  # Falls back to "python3" if the file doesn't exist.
-  python: ".venv/bin/python"
+  # Python interpreter to use. Either an absolute path to a venv's
+  # python, or a name on PATH (e.g. "python3"). The SDC fleet's
+  # convention is a single repo-root venv at sdc-tobe/.venv that has
+  # flask + olympe + everything else installed; point at it here so
+  # the FC has its dependencies. Plain "python3" only works if those
+  # deps are installed system-wide.
+  python: "/home/sdc/sdc-tobe/.venv/bin/python"
   script: "unified_api_server.py"
   # HTTP port the FC binds. Surfaced in the dashboard so operators
   # can curl it. Set explicitly so it doesn't collide with sphinx-
