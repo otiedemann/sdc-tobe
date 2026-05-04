@@ -18,8 +18,9 @@ OUT     := out
 PNG_DIR := $(OUT)/markers
 FBX_DIR := $(OUT)/fbx
 YAML    := $(OUT)/arena.yml
+REPO_ROOT := $(realpath $(CURDIR)/../..)
 
-.PHONY: all pngs fbxs geometry yaml clean check
+.PHONY: all pngs fbxs arena-static yaml clean check
 
 all: yaml
 
@@ -31,17 +32,20 @@ fbxs: pngs
 	$(BLENDER) --background --python build_marker_fbx.py -- \
 	    --in-dir $(PNG_DIR) --out-dir $(FBX_DIR)
 
-# Floor + pillar primitives. Independent from markers — only needs to
-# rebuild if you change the geometry script itself, not when marker
-# positions in arena_config.json change.
-geometry:
+# Combined static arena — floor + walls + pillars all baked into a
+# single FBX with positions and dimensions in Blender vertex space.
+# YAML places it at world origin with no scaling/rotation; eliminates
+# the per-mesh transform quirks that were tilting walls and dropping
+# materials.
+arena-static: $(YAML_DEP)
 	mkdir -p $(FBX_DIR)
-	$(BLENDER) --background --python build_arena_geometry.py -- \
-	    --out-dir $(FBX_DIR)
+	$(BLENDER) --background --python build_full_arena.py -- \
+	    --arena-config $(REPO_ROOT)/controller_unified/arena_config.json \
+	    --out $(FBX_DIR)/arena_static.fbx
 
-yaml: fbxs geometry
+yaml: fbxs arena-static
 	$(PY) arena_to_sphinx_yaml.py --fbx-dir $(FBX_DIR) --out $(YAML) \
-	    --emit-floor --emit-pillars --emit-nets
+	    --emit-arena-static
 
 clean:
 	rm -rf $(OUT)
@@ -52,7 +56,7 @@ clean:
 check:
 	$(PY) generate_aruco_pngs.py --out-dir $(PNG_DIR)
 	$(PY) arena_to_sphinx_yaml.py --fbx-dir $(FBX_DIR) --out $(YAML) \
-	    --emit-floor --emit-pillars --emit-nets
+	    --emit-arena-static
 	@echo
 	@echo "self-test ok — PNGs in $(PNG_DIR), arena YAML in $(YAML)"
 	@echo "(run 'make all' on a host with Blender to produce the FBXs)"

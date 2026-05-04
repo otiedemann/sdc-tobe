@@ -290,8 +290,21 @@ def main() -> int:
              "can't fly out (uses pillar.fbx scaled into thin slabs).",
     )
     p.add_argument(
-        "--floor-size-m", type=str, default="22x12",
-        help="Floor footprint as <width>x<depth> in metres. Default 22x12.",
+        "--emit-arena-static", action="store_true",
+        help="Emit a single arena_static.fbx entry instead of separate "
+             "floor/walls/pillars. The combined FBX (built by "
+             "build_full_arena.py) already has all dimensions and "
+             "positions baked, so the YAML places it at world origin "
+             "with Scale=1 and Rotation=0. This is the recommended "
+             "path — eliminates the per-mesh scale-and-rotate quirks "
+             "that were producing tilted walls and lost-material "
+             "floors.",
+    )
+    p.add_argument(
+        "--floor-size-m", type=str, default="50x50",
+        help="Floor footprint as <width>x<depth> in metres. Default 50x50, "
+             "which completely covers the arena and hides UE4's default "
+             "ground plane (which otherwise shows through as a checker).",
     )
     p.add_argument(
         "--center-arena", action="store_true", default=True,
@@ -408,9 +421,34 @@ def main() -> int:
     n_floor = 0
     n_pillars = 0
     n_nets = 0
+    n_arena_static = 0
     emit_floor = args.emit_floor or args.include_floor_box
     emit_pillars = args.emit_pillars
     emit_nets = args.emit_nets
+    emit_arena_static = args.emit_arena_static
+
+    if emit_arena_static:
+        # Combined arena: floor + 4 walls + 8 pillars in one FBX with
+        # everything baked in Blender vertex space. Place at world
+        # origin with Scale=1 and Rotation=0; the FBX already encodes
+        # the right positions.
+        out_lines.append(
+            "  # Combined static arena — floor + 4 walls + 8 pillars."
+        )
+        out_lines.append(emit_yaml_block(
+            name="arena_static",
+            fbx_path=fbx_dir / "arena_static.fbx",
+            location_cm=(0.0, 0.0, 0.0),
+            rotation_deg=(0.0, 0.0, 0.0),
+            scale=1.0,
+            snap_to_ground=False,
+        ))
+        out_lines.append("")
+        n_arena_static = 1
+        # Skip the per-mesh emits since the combined FBX has them.
+        emit_floor = False
+        emit_pillars = False
+        emit_nets = False
     if emit_nets:
         # Net walls along the perimeter. Reuses pillar.fbx (the unit
         # cube) and scales it into a thin tall slab per wall. Position
@@ -467,23 +505,30 @@ def main() -> int:
             n_pillars += 1
 
     if emit_floor:
-        # Floor: a unit FBX plane scaled to the configured footprint.
-        # Centre it at the arena's marker bbox centre so it covers
-        # symmetrically (markers span x ∈ [-10, +10], y ∈ [0, 10.8]).
+        # Floor: a unit cube scaled to a generous footprint (default
+        # 50×50 m, 1 m thick). Centre it at the arena's marker bbox
+        # centre so it covers symmetrically. Built oversized on
+        # purpose: in earlier iterations the floor exactly matched
+        # the arena footprint (22×12 m) and UE4's default ground
+        # showed through as a debug checker on the edges. A 50×50 m
+        # floor is impossible to miss and physically hides whatever
+        # is below.
         try:
             fw_str, fd_str = args.floor_size_m.lower().split("x", 1)
             floor_w = float(fw_str)
             floor_d = float(fd_str)
         except ValueError:
             print(f"warning: --floor-size-m {args.floor_size_m!r} unparseable; "
-                  f"using 22x12", file=sys.stderr)
-            floor_w, floor_d = 22.0, 12.0
-        # Floor centre in arena frame: x=0, y=mean of y range, z=0.05.
-        # The 5 cm raise is a hack to hide Sphinx's underlying default
-        # ground plane, which otherwise z-fights with our floor at z=0
-        # and the operator sees UE4's debug checker bleeding through.
+                  f"using 50x50", file=sys.stderr)
+            floor_w, floor_d = 50.0, 50.0
+        floor_thickness = 1.0
+        # Floor centre: top of slab at z=0, so centre is at z=-0.5.
+        # The drone spawns at z=0 (UE world origin). Putting the
+        # slab centre at z=-0.5 means the slab's top face is exactly
+        # at z=0 — drone lifts off cleanly without intersecting the
+        # floor mesh.
         ys = [float(m["y"]) for m in arena.get("markers", [])] or [0.0, 10.8]
-        cx_arena, cy_arena, cz_arena = 0.0, (min(ys) + max(ys)) / 2.0, 0.05
+        cx_arena, cy_arena, cz_arena = 0.0, (min(ys) + max(ys)) / 2.0, -floor_thickness / 2.0
         ux_m, uy_m, uz_m = shifted_apply((cx_arena, cy_arena, cz_arena))
         loc_cm = (ux_m * 100.0, uy_m * 100.0, uz_m * 100.0)
         # When the axis_map swaps X and Y, the floor "width" along
@@ -498,14 +543,16 @@ def main() -> int:
         ue_x_size = size_per_arena_axis[ax_for_ue_x]
         ue_y_size = size_per_arena_axis[ax_for_ue_y]
         out_lines.append(
-            f"  # Arena floor — {floor_w} × {floor_d} m at z=0."
+            f"  # Arena floor — {floor_w} × {floor_d} × {floor_thickness} m. "
+            f"Top face at z=0; oversized so UE4's default ground plane "
+            f"can't show through at the edges."
         )
         out_lines.append(emit_yaml_block(
             name="arena_floor",
             fbx_path=fbx_dir / "floor.fbx",
             location_cm=loc_cm,
             rotation_deg=(0.0, 0.0, 0.0),
-            scale=(ue_x_size, ue_y_size, 1.0),
+            scale=(ue_x_size, ue_y_size, floor_thickness),
             snap_to_ground=False,
         ))
         out_lines.append("")
@@ -533,6 +580,7 @@ def main() -> int:
     print(f"  pillars: {n_pillars}")
     print(f"  nets: {n_nets}")
     print(f"  floor: {n_floor}")
+    print(f"  arena_static: {n_arena_static}")
     print(f"  axis map: {args.axis_map}")
     print(f"  fbx dir (in YAML): {fbx_dir}")
     return 0

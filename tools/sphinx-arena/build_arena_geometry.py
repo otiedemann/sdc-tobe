@@ -211,27 +211,25 @@ def _export_active(out_path: Path) -> None:
 
 
 def build_floor(out_path: Path) -> None:
-    """A 1 m × 1 m × 0.1 m flat slab with neutral concrete material.
+    """1 m × 1 m × 1 m unit cube — neutral concrete texture.
 
-    NOTE: built as a CUBE (not a plane). The plane approach left UE4
-    falling back to its debug-checker default material in the live
-    render — UE4's FBX import on a flat plane sometimes drops the
-    material entirely. A flat slab with thickness has unambiguously
-    3D geometry and reliably picks up the texture-driven material.
-
-    The YAML emitter scales this to the arena footprint (default
-    22 × 12 m × 0.1 m)."""
+    The YAML emitter scales this to a MASSIVE 50 × 50 × 1 m slab so
+    it completely hides UE4's underlying default ground (which kept
+    showing through as a checker debug texture in earlier renders).
+    Building it as an unscaled unit cube gives the YAML full control
+    over the final dimensions and avoids the asymmetric-scale FBX
+    quirk that earlier attempts ran into."""
     assert bpy is not None
     _clear_scene()
     bpy.ops.mesh.primitive_cube_add(size=1.0, location=(0, 0, 0))
     obj = bpy.context.active_object
     obj.name = "arena_floor"
-    # Make it a flat slab: 1×1 in XY, 0.1 in Z. Centred at origin.
-    obj.scale = (1.0, 1.0, 0.1)
-    bpy.ops.object.transform_apply(location=False, rotation=False, scale=True)
     mat = _make_solid_color_texture_material(
         name="mat_floor",
-        color_rgb_0_255=(140, 140, 145),
+        color_rgb_0_255=(180, 180, 180),  # noticeably light grey — easy
+                                          # to distinguish from UE4's
+                                          # debug checker if it's still
+                                          # leaking through.
         roughness=0.85,
         out_dir=out_path.parent,
     )
