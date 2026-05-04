@@ -69,6 +69,21 @@
       {% endif %}
     </section>
 
+    <section id="fc-section">
+      <h2>Flight controller (controller_unified)</h2>
+      <p class="muted">Step 3 (optional): start the FC HTTP service that the C2 talks to. It runs <code>controller_unified/unified_api_server.py</code> and connects to the simulated Anafi via Olympe. You can start it independently of the drone — Olympe will retry until the Anafi answers.</p>
+      <div id="fc-state-row">
+        <div id="fc-state-pill" class="env-pill env-pill-stopped">
+          <span class="fc-status">no flight controller running</span>
+        </div>
+      </div>
+      <div class="row-actions">
+        <button type="button" id="fc-start-btn">Start FC</button>
+        <button type="button" id="fc-restart-btn" class="secondary" disabled>Restart</button>
+        <button type="button" id="fc-stop-btn" class="danger" disabled>Stop</button>
+      </div>
+    </section>
+
     <section id="drones-section">
       <div class="section-header">
         <h2>{% if max_drones == 1 %}Current drone{% else %}Active drones <span id="drones-count" class="count">0</span>{% endif %}</h2>

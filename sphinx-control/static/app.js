@@ -199,6 +199,39 @@ async function loadSystem() {
   }
 }
 
+async function loadFC() {
+  let fc;
+  try {
+    fc = await jget("/api/fc");
+  } catch (e) {
+    console.error("loadFC", e);
+    return;
+  }
+  const pill = $("#fc-state-pill");
+  const statusSpan = pill.querySelector(".fc-status");
+  pill.classList.remove("env-pill-running", "env-pill-stopped",
+                        "env-pill-starting", "env-pill-error");
+  const startBtn = $("#fc-start-btn");
+  const stopBtn = $("#fc-stop-btn");
+  const restartBtn = $("#fc-restart-btn");
+  if (!fc || fc.status !== "running") {
+    pill.classList.add("env-pill-stopped");
+    statusSpan.textContent = fc
+      ? `last: ${fc.script} (${fc.status})`
+      : "no flight controller running";
+    startBtn.disabled = false;
+    stopBtn.disabled = true;
+    restartBtn.disabled = true;
+  } else {
+    pill.classList.add("env-pill-running");
+    const uptime = formatUptime(fc.uptime_s);
+    statusSpan.textContent = `running: ${fc.script} on :${fc.http_port} — pid=${fc.pid} uptime ${uptime}`;
+    startBtn.disabled = true;
+    stopBtn.disabled = false;
+    restartBtn.disabled = false;
+  }
+}
+
 async function loadEnvironment() {
   let env;
   try {
@@ -235,6 +268,26 @@ async function loadEnvironment() {
     droneBtn.disabled = false;
   }
 }
+
+$("#fc-start-btn").addEventListener("click", async () => {
+  try { await jpost("/api/fc", {}); }
+  catch (e) { alert(`fc start failed: ${e.message}`); return; }
+  await loadFC();
+});
+
+$("#fc-stop-btn").addEventListener("click", async () => {
+  if (!confirm("Stop the flight controller?")) return;
+  try { await jdelete("/api/fc"); }
+  catch (e) { alert(`fc stop failed: ${e.message}`); return; }
+  await loadFC();
+});
+
+$("#fc-restart-btn").addEventListener("click", async () => {
+  if (!confirm("Restart the flight controller?")) return;
+  try { await jpost("/api/fc/restart"); }
+  catch (e) { alert(`fc restart failed: ${e.message}`); return; }
+  await loadFC();
+});
 
 $("#env-form").addEventListener("submit", async (ev) => {
   ev.preventDefault();
@@ -307,7 +360,9 @@ if (stopAllBtn) stopAllBtn.addEventListener("click", async () => {
   await Promise.all([loadProfiles(), loadWorlds(), loadSystem()]);
   await loadEnvironment();
   await loadDrones();
+  await loadFC();
   setInterval(loadEnvironment, REFRESH_MS);
   setInterval(loadDrones, REFRESH_MS);
+  setInterval(loadFC, REFRESH_MS);
   setInterval(loadSystem, REFRESH_MS * 5);
 })();

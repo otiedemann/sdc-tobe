@@ -27,7 +27,7 @@ from fastapi.staticfiles import StaticFiles
 from jinja2 import Environment, FileSystemLoader, select_autoescape
 from pydantic import BaseModel, Field
 
-from launcher import EnvironmentRequest, LaunchRequest, Launcher
+from launcher import EnvironmentRequest, FCRequest, LaunchRequest, Launcher
 from state import StateStore
 from worlds import Registry
 
@@ -101,6 +101,15 @@ class EnvSpawnRequest(BaseModel):
     world_name: str = Field(..., examples=["empty", "sdc_arena"])
 
 
+class FCSpawnRequest(BaseModel):
+    """All optional — if omitted, defaults from config.flight_controller."""
+    cwd: str | None = None
+    python: str | None = None
+    script: str | None = None
+    http_port: int | None = Field(None, ge=1, le=65535)
+    anafi_ip: str | None = None
+
+
 class StatusOK(BaseModel):
     ok: bool = True
 
@@ -166,6 +175,54 @@ def api_restart_environment():
         log.exception("environment restart failed")
         raise HTTPException(status_code=500, detail=f"{type(e).__name__}: {e}")
     return env.to_dict()
+
+
+# ─── API: flight controller (unified_api_server) ────────────────
+
+
+@app.get("/api/fc")
+def api_get_fc():
+    fc = launcher.current_flight_controller()
+    return fc.to_dict() if fc else None
+
+
+@app.post("/api/fc", status_code=201)
+def api_start_fc(req: FCSpawnRequest):
+    try:
+        fc = launcher.start_fc(FCRequest(
+            cwd=req.cwd, python=req.python, script=req.script,
+            http_port=req.http_port, anafi_ip=req.anafi_ip,
+        ))
+    except (KeyError, ValueError) as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except RuntimeError as e:
+        raise HTTPException(status_code=409, detail=str(e))
+    except Exception as e:
+        log.exception("fc start failed")
+        raise HTTPException(status_code=500, detail=f"{type(e).__name__}: {e}")
+    return fc.to_dict()
+
+
+@app.delete("/api/fc")
+def api_stop_fc():
+    try:
+        launcher.stop_fc()
+    except Exception as e:
+        log.exception("fc stop failed")
+        raise HTTPException(status_code=500, detail=f"{type(e).__name__}: {e}")
+    return StatusOK()
+
+
+@app.post("/api/fc/restart")
+def api_restart_fc():
+    try:
+        fc = launcher.restart_fc()
+    except KeyError:
+        raise HTTPException(status_code=404, detail="no flight controller running")
+    except Exception as e:
+        log.exception("fc restart failed")
+        raise HTTPException(status_code=500, detail=f"{type(e).__name__}: {e}")
+    return fc.to_dict()
 
 
 # ─── API: drones ─────────────────────────────────────────────────
