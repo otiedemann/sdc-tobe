@@ -3,17 +3,17 @@
   "marker_size_m": 0.19,
   "box_size_m": 0.5,
   "boxes": [
-    {"id": 41, "team": "red",  "label": "Red top",     "x": -5.0, "y": 8.0, "z": 1.0, "pitch_deg": -45.0, "yaw_deg": -90.0, "enabled": true},
-    {"id": 42, "team": "red",  "label": "Red middle",  "x": -8.0, "y": 5.4, "z": 1.0, "pitch_deg": -45.0, "yaw_deg": -90.0, "enabled": true},
-    {"id": 43, "team": "red",  "label": "Red bottom",  "x": -5.0, "y": 3.0, "z": 1.0, "pitch_deg": -45.0, "yaw_deg": -90.0, "enabled": true},
-    {"id": 31, "team": "blue", "label": "Blue top",    "x":  5.0, "y": 8.0, "z": 1.0, "pitch_deg": -45.0, "yaw_deg":  90.0, "enabled": true},
-    {"id": 32, "team": "blue", "label": "Blue middle", "x":  8.0, "y": 5.4, "z": 1.0, "pitch_deg": -45.0, "yaw_deg":  90.0, "enabled": true},
-    {"id": 33, "team": "blue", "label": "Blue bottom", "x":  5.0, "y": 3.0, "z": 1.0, "pitch_deg": -45.0, "yaw_deg":  90.0, "enabled": true},
-    {"id": 34, "team": "blue", "label": "Blue spare 1", "x": 0.0, "y": 0.0, "z": 1.0, "pitch_deg": -45.0, "yaw_deg":  90.0, "enabled": false},
-    {"id": 35, "team": "blue", "label": "Blue spare 2", "x": 0.0, "y": 0.0, "z": 1.0, "pitch_deg": -45.0, "yaw_deg":  90.0, "enabled": false},
-    {"id": 36, "team": "blue", "label": "Blue spare 3", "x": 0.0, "y": 0.0, "z": 1.0, "pitch_deg": -45.0, "yaw_deg":  90.0, "enabled": false},
-    {"id": 44, "team": "red",  "label": "Red spare 1",  "x": 0.0, "y": 0.0, "z": 1.0, "pitch_deg": -45.0, "yaw_deg": -90.0, "enabled": false},
-    {"id": 45, "team": "red",  "label": "Red spare 2",  "x": 0.0, "y": 0.0, "z": 1.0, "pitch_deg": -45.0, "yaw_deg": -90.0, "enabled": false},
-    {"id": 46, "team": "red",  "label": "Red spare 3",  "x": 0.0, "y": 0.0, "z": 1.0, "pitch_deg": -45.0, "yaw_deg": -90.0, "enabled": false}
+    {"id": 41, "team": "red",  "label": "Red top",     "x": -5.0, "y": 8.0, "z": 1.0, "pitch_deg": 45.0, "yaw_deg": -90.0, "enabled": true},
+    {"id": 42, "team": "red",  "label": "Red middle",  "x": -8.0, "y": 5.4, "z": 1.0, "pitch_deg": 45.0, "yaw_deg": -90.0, "enabled": true},
+    {"id": 43, "team": "red",  "label": "Red bottom",  "x": -5.0, "y": 3.0, "z": 1.0, "pitch_deg": 45.0, "yaw_deg": -90.0, "enabled": true},
+    {"id": 31, "team": "blue", "label": "Blue top",    "x":  5.0, "y": 8.0, "z": 1.0, "pitch_deg": 45.0, "yaw_deg":  90.0, "enabled": true},
+    {"id": 32, "team": "blue", "label": "Blue middle", "x":  8.0, "y": 5.4, "z": 1.0, "pitch_deg": 45.0, "yaw_deg":  90.0, "enabled": true},
+    {"id": 33, "team": "blue", "label": "Blue bottom", "x":  5.0, "y": 3.0, "z": 1.0, "pitch_deg": 45.0, "yaw_deg":  90.0, "enabled": true},
+    {"id": 34, "team": "blue", "label": "Blue spare 1", "x": 0.0, "y": 0.0, "z": 1.0, "pitch_deg": 45.0, "yaw_deg":  90.0, "enabled": false},
+    {"id": 35, "team": "blue", "label": "Blue spare 2", "x": 0.0, "y": 0.0, "z": 1.0, "pitch_deg": 45.0, "yaw_deg":  90.0, "enabled": false},
+    {"id": 36, "team": "blue", "label": "Blue spare 3", "x": 0.0, "y": 0.0, "z": 1.0, "pitch_deg": 45.0, "yaw_deg":  90.0, "enabled": false},
+    {"id": 44, "team": "red",  "label": "Red spare 1",  "x": 0.0, "y": 0.0, "z": 1.0, "pitch_deg": 45.0, "yaw_deg": -90.0, "enabled": false},
+    {"id": 45, "team": "red",  "label": "Red spare 2",  "x": 0.0, "y": 0.0, "z": 1.0, "pitch_deg": 45.0, "yaw_deg": -90.0, "enabled": false},
+    {"id": 46, "team": "red",  "label": "Red spare 3",  "x": 0.0, "y": 0.0, "z": 1.0, "pitch_deg": 45.0, "yaw_deg": -90.0, "enabled": false}
   ]
 }

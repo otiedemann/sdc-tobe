@@ -33,6 +33,7 @@ Axis convention on export — IMPORTANT:
 from __future__ import annotations
 
 import argparse
+import math
 import sys
 from pathlib import Path
 
@@ -69,11 +70,28 @@ def _clear_scene() -> None:
 
 
 def _build_plane(name: str) -> "bpy.types.Object":
-    """Create a 1 m × 1 m flat plane (XY plane, normal +Z)."""
+    """Create a 1 m × 1 m vertical plane with normal pointing +X in UE.
+
+    Built in Blender with normal at -Y direction (after rotating the
+    default XY plane 90° around X axis), so that under the Sphinx
+    axis convention (axis_forward="-Y", axis_up="-Z") it lands in UE
+    with normal +X. This means YAML only needs YAW to aim the marker
+    — pitch=0 and roll=0 — eliminating the pitch-convention ambiguity
+    that produced repeatedly-wrong marker orientations.
+
+    For target markers (which want a 45° upward tilt facing arena
+    centre), the YAML applies pitch=+45° + yaw=±90°, all from this
+    same +X-facing FBX.
+    """
     assert bpy is not None
     bpy.ops.mesh.primitive_plane_add(size=1.0, location=(0, 0, 0))
     obj = bpy.context.active_object
     obj.name = name
+    # Rotate 90° around X axis: +Z normal → -Y normal in Blender.
+    # Bake the rotation into the mesh so the exported FBX has clean
+    # vertex positions (no leftover object-level rotation).
+    obj.rotation_euler = (math.pi / 2.0, 0.0, 0.0)
+    bpy.ops.object.transform_apply(location=False, rotation=True, scale=False)
     return obj
 
 

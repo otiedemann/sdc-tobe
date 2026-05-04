@@ -74,34 +74,31 @@ DEFAULT_OUT_YAML = Path(__file__).parent / "out" / "arena.yml"
 #   back  (arena y=10.8, inward arena -Y → UE -X)  yaw 180°
 #   left  (arena x=-10,  inward arena +X → UE -Y)  yaw -90°
 #   right (arena x=+10,  inward arena -X → UE +Y)  yaw +90°
-MARKER_PITCH_DEG: float = 90.0
-# Sphinx mesh-injection requires Blender FBX export with
-# ``axis_forward="-Y", axis_up="-Z"`` (per Sphinx 2.15 docs,
-# customize_the_environment). Under that mapping, a Blender flat plane
-# with local normal +Z lands in UE with normal -Z (upside-down). UE's
-# FRotator pitch=+90° rotates that -Z normal to +X (UE forward).
-# Yaw then rotates +X around UE +Z to face each wall's inward direction.
+# Marker pitch is now ZERO — the marker FBX itself bakes a 90° X-rotation
+# in Blender so the plane is already vertical with normal +X in UE
+# (after the Sphinx -Y/-Z axis conversion). YAML only needs to apply
+# yaw to spin the +X normal around UE +Z to face the right wall.
 #
-# UE positive yaw is clockwise viewed from above, so it rotates
-# +X → +Y → -X → -Y → +X.
-#
+# Why bake orientation into the FBX: previous revisions left the plane
+# flat (normal +Z in Blender) and tried to stand it up via YAML pitch.
+# That introduced a UE-pitch-convention ambiguity that got the
+# orientation wrong on every iteration — flipping yaws by 180° helped
+# some walls but never all four at once. With the plane already
+# vertical in the FBX, yaw alone is unambiguous.
+MARKER_PITCH_DEG: float = 0.0
+
+# UE positive yaw is clockwise viewed from above, so it rotates the
+# marker's +X normal: +X → +Y → -X → -Y → +X.
 # Required inward direction per wall (axis_map=y2x,x2y_neg):
 #   front (arena y=0,    inward arena +Y → UE +X)  : keep +X, yaw   0°
 #   back  (arena y=10.8, inward arena -Y → UE -X)  : +X → -X, yaw 180°
 #   left  (arena x=-10,  inward arena +X → UE -Y)  : +X → -Y, yaw -90°
 #   right (arena x=+10,  inward arena -X → UE +Y)  : +X → +Y, yaw +90°
-#
-# Earlier revisions used axis_forward="X", axis_up="Z" (UE-direct) and
-# arrived at +90° offsets on each wall. Switching to the
-# Sphinx-recommended axis convention shifts every yaw by 90° back to
-# the cleaner math-derived values below.
 WALL_YAW_DEG: dict[str, float] = {
-    # NOTE: previous attempt was 0/180/-90/+90; user reported markers
-    # facing outward. Flipped 180° per wall — face inward now.
-    "front": 180.0,   # arena y=0    → faces UE +X
-    "back":    0.0,   # arena y=10.8 → faces UE -X
-    "left":   90.0,   # arena x=-10  → faces UE -Y
-    "right": -90.0,   # arena x=+10  → faces UE +Y
+    "front":   0.0,   # arena y=0    → faces UE +X
+    "back":  180.0,   # arena y=10.8 → faces UE -X
+    "left":  -90.0,   # arena x=-10  → faces UE -Y
+    "right":  90.0,   # arena x=+10  → faces UE +Y
 }
 
 
@@ -232,25 +229,32 @@ def collect_pillars(markers: list[dict]) -> list[dict]:
     return pillars
 
 
-# Wall settings — visible solid walls (now emitted via the
-# single-mesh wall.fbx scaled per-axis). Net-style "fences" can be
-# selected with --net-style if a thin/low look is preferred.
+# Wall settings — visible solid walls (emitted via wall.fbx scaled
+# per-axis). Walls are pushed OUTWARD of the pillars by
+# (_PILLAR_WIDTH_M + _WALL_THICKNESS_M/2) so they sit BEHIND the
+# pillars (relative to the arena interior) instead of being co-planar
+# with the markers — otherwise the wall surface obscures the markers
+# from inside the arena.
 _WALL_THICKNESS_M = 0.20
 _WALL_HEIGHT_M = 4.0
 _WALL_END_OVERLAP_M = 0.40   # extend past corners so corner joints don't gap
+_WALL_OUTWARD_OFFSET_M = _PILLAR_WIDTH_M + _WALL_THICKNESS_M / 2.0
 
 
 def collect_walls(markers: list[dict],
                   thickness_m: float = _WALL_THICKNESS_M,
                   height_m: float = _WALL_HEIGHT_M,
-                  overlap_m: float = _WALL_END_OVERLAP_M) -> list[dict]:
+                  overlap_m: float = _WALL_END_OVERLAP_M,
+                  outward_offset_m: float = _WALL_OUTWARD_OFFSET_M) -> list[dict]:
     """Return 4 wall descriptors (in arena coords) for the perimeter.
 
-    Each wall is a tall thin slab placed at the arena perimeter along
-    one wall. Coordinates are in arena metres. The YAML emitter applies
-    the ``axis_map`` to translate to UE space and emits the entry with
-    a per-axis ``Scale`` so the unit-cube wall.fbx becomes a long thin
-    wall at the right size.
+    Each wall is a tall thin slab placed OUTWARD of the corresponding
+    pillar centerline by ``outward_offset_m`` so it doesn't visually
+    overlap with the markers (which sit on the pillars' inward faces).
+    Coordinates are in arena metres. The YAML emitter applies the
+    ``axis_map`` to translate to UE space and emits the entry with
+    a per-axis ``Scale`` so the unit-cube wall.fbx becomes a long
+    thin wall at the right size.
     """
     if not markers:
         return []
@@ -263,18 +267,19 @@ def collect_walls(markers: list[dict],
     z_center = height_m / 2.0
     long_x = width + overlap_m
     long_y = depth + overlap_m
+    o = outward_offset_m
     return [
         {"name": "wall_left",
-         "x": x_min, "y": (y_min + y_max) / 2, "z": z_center,
+         "x": x_min - o, "y": (y_min + y_max) / 2, "z": z_center,
          "sx": thickness_m, "sy": long_y, "sz": height_m},
         {"name": "wall_right",
-         "x": x_max, "y": (y_min + y_max) / 2, "z": z_center,
+         "x": x_max + o, "y": (y_min + y_max) / 2, "z": z_center,
          "sx": thickness_m, "sy": long_y, "sz": height_m},
         {"name": "wall_front",
-         "x": (x_min + x_max) / 2, "y": y_min, "z": z_center,
+         "x": (x_min + x_max) / 2, "y": y_min - o, "z": z_center,
          "sx": long_x, "sy": thickness_m, "sz": height_m},
         {"name": "wall_back",
-         "x": (x_min + x_max) / 2, "y": y_max, "z": z_center,
+         "x": (x_min + x_max) / 2, "y": y_max + o, "z": z_center,
          "sx": long_x, "sy": thickness_m, "sz": height_m},
     ]
 

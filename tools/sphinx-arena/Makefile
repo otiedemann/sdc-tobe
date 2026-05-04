@@ -80,9 +80,13 @@ $(LOGO_DIR):
 # reliably). The combined arena_static.fbx path is available via
 # --emit-arena-static but Sphinx mesh-injection doesn't render its
 # multi-mesh + multi-material content, so we don't use it by default.
+# Paintings (MBDA / brigk / SDC / team logos) are intentionally NOT
+# emitted by default — drop --emit-paintings here, or pass it on the
+# command line, to add them back. The painting FBXs themselves are
+# still built by `make paintings` so re-enabling is one flag away.
 yaml:
 	$(PY) arena_to_sphinx_yaml.py --fbx-dir $(FBX_DIR) --out $(YAML) \
-	    --emit-floor --emit-pillars --emit-walls --emit-paintings
+	    --emit-floor --emit-pillars --emit-walls
 
 # Convenience target: rebuild EVERYTHING from sources. Run this on a
 # host that has cv2, Blender, and network access (for logo fetch).
