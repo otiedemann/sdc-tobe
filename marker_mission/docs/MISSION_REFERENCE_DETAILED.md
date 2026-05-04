@@ -245,6 +245,40 @@ height telemetry is unavailable, the step times out after 5 s and
 advances anyway, on the assumption that something else (HOLD, LAND)
 will save the operator.
 
+### `TO <x> <y> [<z>]`
+
+| Arguments | x, y required; z optional. Clamped to `[min_height_m, max_height_m]` when given. |
+|---|---|
+| Starting phase | `GOTO` |
+| Per-step state | `state.goto_target_x_m`, `state.goto_target_y_m`, `state.goto_target_z_m` (None when z omitted) |
+| Exit | horizontal error < `distance_deadband_m` and (z absent or `\|e_h\|` < `height_deadband_m`) for `height_settle_time_s` → `_advance_script("goto reached …")` |
+
+`_step_goto` reads the arena-frame world position from
+`state.world_position_m` and the drone's arena yaw from
+`state.arena_yaw_deg` (both maintained by `vision_worker`). It
+projects the (target − position) error into body-forward / body-right
+using the arena yaw, runs `pd_fwd` / `pd_lat` on the legs, and — if
+`z` was given — runs `pd_height` on `(z − tel.height_cm/100)`. The PD
+integrators are reset on phase entry by `_set_phase`, so the
+marker-relative gains transfer to world-frame errors without
+carrying integral state from a previous APPROACH.
+
+`vision_worker` only stamps `arena_yaw_updated_at` when the active
+marker is visible (the camera-frame yaw to that marker plus the
+marker's known arena position is what makes the inverse solvable).
+Both `world_position_age_s` and `arena_yaw_age_s` must be ≤
+`cfg.pose_max_age_s` for the controller to issue a drive command.
+When either is stale `_step_goto` issues `rc = (0, 0, 0,
+search_yaw_rc)` — yaw in place to bring a marker back into frame —
+and resets `state.settle_began_at` so a stale "I think I'm at the
+target" reading can never satisfy the settle condition.
+
+The active marker id used for arena-yaw derivation is whatever
+prior step (or `cfg.target_marker_id` at construction) put into
+`state.active_marker_id`. `TO` itself does **not** override it, so a
+`TO` after `APPROACH 7` stays locked on marker 7 for the yaw
+estimate even though the drive target is in absolute coordinates.
+
 ### `DANCE [<seconds>] [<mode>]`
 
 | Arguments | seconds defaults to `cfg.default_dance_seconds_s`; mode defaults to `wobble`, must be one of `{wobble, spin, random}` |

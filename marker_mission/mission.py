@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import signal
 import sys
 import threading
@@ -476,6 +477,35 @@ def cmd_fly(args: argparse.Namespace) -> int:
                 with state.lock:
                     state.target_pose_method = (
                         target.pose_method if target is not None else "")
+                # Arena-frame drone yaw -- published whenever ANY visible
+                # marker is also a reference marker in the arena config.
+                # The world-position estimate gives the bearing of that
+                # marker from the drone in the arena, and the per-pose
+                # camera-frame angle (yaw_deg) is what's left over once
+                # we subtract that bearing. We prefer the active marker
+                # (matches the controller's smoothed yaw_to_marker
+                # tracking) but fall back to any other ref-marker so a
+                # TO step can run even when the active marker has left
+                # the frame.
+                if arena is not None and state.world_position_m is not None and poses:
+                    candidate = None
+                    if target is not None and int(target.marker_id) in arena.markers:
+                        candidate = target
+                    else:
+                        for p in poses:
+                            if int(p.marker_id) in arena.markers:
+                                candidate = p
+                                break
+                    if candidate is not None:
+                        marker_arena = arena.markers[int(candidate.marker_id)]
+                        wp_now = state.world_position_m
+                        dxm = float(marker_arena.position_m[0]) - wp_now[0]
+                        dym = float(marker_arena.position_m[1]) - wp_now[1]
+                        bearing_deg = math.degrees(math.atan2(dxm, dym))
+                        with state.lock:
+                            state.arena_yaw_deg = (
+                                bearing_deg - float(candidate.yaw_deg))
+                            state.arena_yaw_updated_at = time.monotonic()
                 # Status overlay -------------------------------------------
                 # Use the smoothed values from state.snapshot() so the
                 # baked-in overlay matches what the CSV records and what

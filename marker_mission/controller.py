@@ -71,6 +71,7 @@ class Phase(enum.Enum):
     HOLD      = "hold"      # station-keeping hover for hold_time_s, then LAND
     IDLE      = "idle"      # mission-script HOOVER w/o prior APPROACH
     HEIGHT    = "height"    # mission-script HEIGHT step (climb/descend to target)
+    GOTO      = "goto"      # mission-script TO step (drive to arena-frame point)
     DANCE     = "dance"     # mission-script DANCE step (programmed RC routine)
     LAND      = "land"
     DONE      = "done"
@@ -354,13 +355,20 @@ class MissionState:
     mission_step_idx: int = -1            # -1 = before first step
     current_step_kind: Optional[str] = None
     last_completed_step_kind: Optional[str] = None
-    # Per-step transient state used by IDLE / HEIGHT / DANCE.
+    # Per-step transient state used by IDLE / HEIGHT / DANCE / GOTO.
     idle_until: Optional[float] = None
     height_target_m: Optional[float] = None
     dance_until: Optional[float] = None
     dance_mode: Optional[str] = None
     dance_origin_xy_m: Optional[tuple[float, float]] = None
     dance_origin_height_m: Optional[float] = None
+    # TO step: arena-frame target. ``goto_target_z_m`` is None when
+    # the operator only specified x/y -- _step_goto then leaves the
+    # ud channel at zero and the drone holds whatever altitude it's
+    # currently at via the Anafi's onboard stabiliser.
+    goto_target_x_m: Optional[float] = None
+    goto_target_y_m: Optional[float] = None
+    goto_target_z_m: Optional[float] = None
     # AWAIT step: when set, _step_idle / _step_hold advance the
     # script as soon as this marker id appears in
     # state.visible_marker_ids (see vision_worker). Cleared on every
@@ -397,6 +405,14 @@ class MissionState:
     # target marker isn't currently in view.
     target_pose_method: str = ""
 
+    # Drone yaw in arena frame (CW from +y / front wall) computed by
+    # vision_worker whenever the active marker is visible alongside a
+    # fresh world fix. ``arena_yaw_updated_at`` is the monotonic
+    # timestamp of the last fresh value (0.0 = never), used by
+    # _step_goto to gate driving on a fresh-enough yaw.
+    arena_yaw_deg: Optional[float] = None
+    arena_yaw_updated_at: float = 0.0
+
     abort_reason: str = ""
     note: str = ""                                            # informational
 
@@ -431,6 +447,9 @@ class MissionState:
             self.idle_until = None
             self.height_target_m = None
             self.dance_until = None
+            self.goto_target_x_m = None
+            self.goto_target_y_m = None
+            self.goto_target_z_m = None
             self.await_marker_id = None
             self.visible_marker_ids = []
             self.dance_mode = None
@@ -442,6 +461,8 @@ class MissionState:
             self.world_position_pose_methods = []
             self.world_position_per_marker = []
             self.target_pose_method = ""
+            self.arena_yaw_deg = None
+            self.arena_yaw_updated_at = 0.0
             self.abort_reason = ""
             self.note = ""
 
@@ -492,6 +513,16 @@ class MissionState:
                 "world_position_per_marker": [list(p) for p in
                                               self.world_position_per_marker],
                 "target_pose_method": self.target_pose_method,
+                "arena_yaw_deg": self.arena_yaw_deg,
+                "arena_yaw_age_s": (
+                    (time.monotonic() - self.arena_yaw_updated_at)
+                    if self.arena_yaw_updated_at > 0.0
+                    else None),
+                "goto_target_m": (
+                    [self.goto_target_x_m, self.goto_target_y_m,
+                     self.goto_target_z_m]
+                    if self.goto_target_x_m is not None
+                    else None),
                 "abort_reason": self.abort_reason,
                 "note": self.note,
             }
@@ -831,6 +862,8 @@ class MissionController:
                     self._step_idle(tel, now)
                 elif phase == Phase.HEIGHT:
                     self._step_height(tel, now)
+                elif phase == Phase.GOTO:
+                    self._step_goto(tel, now)
                 elif phase == Phase.DANCE:
                     self._step_dance(tel, now)
                 elif phase == Phase.LAND:
@@ -1401,6 +1434,115 @@ class MissionController:
         if settled:
             self._advance_script(f"height reached ({drone_h:.2f}m)")
 
+    # ----------------------------------------------------------- goto (script)
+    def _step_goto(self, tel: Optional[TelemetrySnapshot],
+                  now: float) -> None:
+        """Mission-script TO step: drive the drone to an arena-frame
+        target ``(goto_target_x_m, goto_target_y_m, goto_target_z_m)``.
+
+        Drives only when both the world-position estimate AND the
+        arena-yaw estimate are fresh (vision_worker stamps both with
+        ``*_updated_at`` whenever the active marker is visible). When
+        either goes stale the controller falls back to a yaw-search
+        in place -- the drone never flies open-loop on a dead fix.
+
+        ``goto_target_z_m`` is None when the operator omitted the third
+        argument: x/y are still driven, ud stays at 0 and the Anafi's
+        onboard stabiliser holds whatever altitude the drone arrived at.
+        """
+        cfg = self.cfg
+        with self.state.lock:
+            tx = self.state.goto_target_x_m
+            ty = self.state.goto_target_y_m
+            tz = self.state.goto_target_z_m
+            wp = self.state.world_position_m
+            wp_at = self.state.world_position_updated_at
+            yaw_arena = self.state.arena_yaw_deg
+            yaw_at = self.state.arena_yaw_updated_at
+        if tx is None or ty is None:
+            self._advance_script("goto: no target set")
+            return
+
+        wp_age = (now - wp_at) if wp_at > 0.0 else None
+        yaw_age = (now - yaw_at) if yaw_at > 0.0 else None
+        fresh = (wp is not None and wp_age is not None
+                 and wp_age <= cfg.pose_max_age_s
+                 and yaw_arena is not None and yaw_age is not None
+                 and yaw_age <= cfg.pose_max_age_s)
+        if not fresh:
+            # Position / yaw lost -- yaw in place to bring a marker
+            # back into view. Reset settle timer so we don't latch a
+            # spurious "arrived" while drifting unobserved.
+            self._send_rc(0, 0, 0, cfg.search_yaw_rc)
+            with self.state.lock:
+                self.state.settle_began_at = None
+                age_txt = (f"{wp_age:.1f}s" if wp_age is not None
+                           else "never")
+                self.state.note = (f"GOTO: position stale ({age_txt}) "
+                                   f"-- searching")
+            return
+
+        ex = tx - wp[0]
+        ey = ty - wp[1]
+        # Arena +y is the front wall; yaw_arena is CW from +y. Body
+        # forward unit vector in arena = (sin(yaw), cos(yaw)); body
+        # right = (cos(yaw), -sin(yaw)) (90 deg CW from forward).
+        yaw_rad = math.radians(yaw_arena)
+        err_fwd   = ex * math.sin(yaw_rad) + ey * math.cos(yaw_rad)
+        err_right = ex * math.cos(yaw_rad) - ey * math.sin(yaw_rad)
+
+        # Reuse the marker-relative PD gains. Both legs operate on
+        # metres of error and are clipped to *_rc_max, so they're a
+        # reasonable fit; the integrators were reset on entry by
+        # _set_phase.
+        u_fwd = (0.0 if abs(err_fwd) < cfg.distance_deadband_m
+                 else self.pd_fwd.step(err_fwd, now))
+        u_lat = (0.0 if abs(err_right) < cfg.distance_deadband_m
+                 else self.pd_lat.step(err_right, now))
+
+        # Optional altitude leg.
+        e_h = 0.0
+        u_ud = 0.0
+        height_ok = True
+        if tz is not None:
+            try:
+                h_cm = (float(tel.raw.get("height_cm"))
+                        if tel and tel.raw.get("height_cm") is not None
+                        else None)
+            except (TypeError, ValueError):
+                h_cm = None
+            if h_cm is not None:
+                drone_h = h_cm / 100.0
+                e_h = tz - drone_h
+                u_ud = (0.0 if abs(e_h) < cfg.height_deadband_m
+                        else self.pd_height.step(e_h, now))
+                height_ok = abs(e_h) < cfg.height_deadband_m
+            # No height telemetry -- skip the leg, treat altitude as
+            # already-OK rather than blocking the step forever.
+
+        self._send_rc(int(u_lat), int(u_fwd), int(u_ud), 0)
+
+        e_xy = math.hypot(ex, ey)
+        in_band = e_xy < cfg.distance_deadband_m and height_ok
+        settled = False
+        with self.state.lock:
+            z_txt = (f"  z_e={e_h:+.2f}m" if tz is not None else "")
+            self.state.note = (
+                f"GOTO: at ({wp[0]:.2f},{wp[1]:.2f},{wp[2]:.2f})m "
+                f"-> ({tx:.2f},{ty:.2f}"
+                f"{(',' + format(tz, '.2f')) if tz is not None else ''})m"
+                f"  e_xy={e_xy:.2f}m{z_txt}")
+            if in_band:
+                if self.state.settle_began_at is None:
+                    self.state.settle_began_at = now
+                if now - self.state.settle_began_at >= cfg.height_settle_time_s:
+                    settled = True
+            else:
+                self.state.settle_began_at = None
+        if settled:
+            self._advance_script(
+                f"goto reached ({wp[0]:.2f},{wp[1]:.2f},{wp[2]:.2f})m")
+
     # --------------------------------------------------------- dance (script)
     def _step_dance(self, tel: Optional[TelemetrySnapshot],
                    now: float) -> None:
@@ -1642,6 +1784,20 @@ class MissionController:
                 self.state.height_target_m = target
             self._set_phase(Phase.HEIGHT,
                             note + f" -> {target:.2f}m")
+            return
+        if step.kind == "TO":
+            tx = float(step.world_x)
+            ty = float(step.world_y)
+            tz = (max(cfg.min_height_m,
+                      min(cfg.max_height_m, float(step.height)))
+                  if step.height is not None else None)
+            with self.state.lock:
+                self.state.goto_target_x_m = tx
+                self.state.goto_target_y_m = ty
+                self.state.goto_target_z_m = tz
+            z_txt = f" z={tz:.2f}" if tz is not None else " z=keep"
+            self._set_phase(Phase.GOTO,
+                            note + f" -> ({tx:.2f},{ty:.2f}){z_txt}m")
             return
         if step.kind == "DANCE":
             now = time.monotonic()

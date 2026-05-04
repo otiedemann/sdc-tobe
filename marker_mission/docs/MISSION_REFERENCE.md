@@ -152,6 +152,34 @@ settle time (~1 s).
 
 ---
 
+### `TO <x> <y> [<z>]`
+
+> Drive the drone to an arena-frame coordinate.
+
+Coordinates use the arena frame: origin at the floor centre, `+x`
+right, `+y` toward the front wall, `+z` up. With two arguments the
+drone moves in the horizontal plane and the Anafi's onboard
+stabiliser holds whatever altitude it's currently at; with three the
+third is a target altitude (clamped to `[min_height_m, max_height_m]`).
+
+The controller drives only when both the world-position estimate
+*and* the derived arena yaw are fresh (≤ `pose_max_age_s`). If
+either goes stale mid-step (e.g. all reference markers leave the
+camera frame), the controller falls back to a yaw-search in place
+until a fresh fix arrives — the drone never flies open-loop on a
+dead estimate.
+
+Arguments:
+- `x`, `y`: target coordinates in metres. Required.
+- `z`: target altitude in metres. Optional; omit to keep the current
+  altitude.
+
+Done when horizontal error is inside `distance_deadband_m` (and, if
+`z` was given, height error is inside `height_deadband_m`) for the
+configured settle time.
+
+---
+
 ### `DANCE [<seconds>] [<mode>]`
 
 > Programmed RC routine for a fixed time, bounded inside a small radius.

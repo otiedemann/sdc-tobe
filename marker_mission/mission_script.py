@@ -6,7 +6,7 @@ that ``MissionController._advance_script`` walks one at a time. The
 language is one-command-per-line, case-insensitive, with ``#`` comments
 and blank lines ignored.
 
-Eight commands:
+Nine commands:
 
     TAKEOFF
     APPROACH [<marker-id>] [<distance>]
@@ -15,6 +15,7 @@ Eight commands:
     PAUSE    <seconds>
     LAND
     HEIGHT   [<height>]
+    TO       <x> <y> [<z>]
     DANCE    [<seconds>] [<mode>]            mode in {wobble, spin, random}
 
 AWAIT behaves like HOOVER (HOLD-style station-keeping if the previous
@@ -23,6 +24,12 @@ named marker becomes visible. The timeout is a hard upper bound.
 
 PAUSE is unconditional IDLE for the given seconds (rc = 0 throughout).
 Useful for fixed pauses regardless of what came before.
+
+TO drives the drone to an arena-frame coordinate. With two arguments
+the current altitude is preserved; with three the third becomes the
+target altitude. If the world-position estimate goes stale mid-step
+the controller falls back to a yaw-search until a fresh fix arrives,
+so the drone can never run open-loop on a dead estimate.
 
 Omitted arguments fall back to ``MissionConfig`` defaults at parse time
 (passed in via the ``defaults`` dict). Invalid syntax raises
@@ -65,6 +72,11 @@ class Step:
     seconds: Optional[float] = None
     height: Optional[float] = None
     mode: Optional[str] = None
+    # TO step: arena-frame target. world_x / world_y are required;
+    # height is reused for the optional z (None means "keep current
+    # altitude").
+    world_x: Optional[float] = None
+    world_y: Optional[float] = None
     line_no: int = 0                    # 1-based source line, for diagnostics
 
 
@@ -171,6 +183,18 @@ def parse(text: str, defaults: dict) -> List[Step]:
                  if len(args) >= 1
                  else float(_required_default(defaults, "height", raw_line_no)))
             out.append(Step(kind="HEIGHT", height=h, line_no=raw_line_no))
+        elif cmd == "TO":
+            if len(args) not in (2, 3):
+                raise ScriptError(raw_line_no,
+                                  f"TO takes 2 or 3 arguments "
+                                  f"(<x> <y> [<z>]), got {len(args)}")
+            wx = _parse_float(args[0], raw_line_no, "TO x")
+            wy = _parse_float(args[1], raw_line_no, "TO y")
+            wz = (_parse_float(args[2], raw_line_no, "TO z")
+                  if len(args) == 3 else None)
+            out.append(Step(kind="TO",
+                            world_x=wx, world_y=wy, height=wz,
+                            line_no=raw_line_no))
         elif cmd == "DANCE":
             if len(args) > 2:
                 raise ScriptError(raw_line_no,
@@ -213,6 +237,11 @@ def format(steps: List[Step]) -> str:
             lines.append("LAND")
         elif s.kind == "HEIGHT":
             lines.append(f"HEIGHT {s.height:g}")
+        elif s.kind == "TO":
+            if s.height is None:
+                lines.append(f"TO {s.world_x:g} {s.world_y:g}")
+            else:
+                lines.append(f"TO {s.world_x:g} {s.world_y:g} {s.height:g}")
         elif s.kind == "DANCE":
             lines.append(f"DANCE {s.seconds:g} {s.mode}")
         else:
