@@ -456,7 +456,20 @@ def cmd_fly(args: argparse.Namespace) -> int:
                 # marker loss, colour-coded by age in the UI.
                 arena = arena_holder.get()
                 if arena is not None:
-                    est = estimate_position(arena, poses)
+                    # Snapshot the previous sticky world position +
+                    # its age so estimate_position can anchor branch
+                    # selection to it: a chosen IPPE pose that's
+                    # metres from the last good fix is the wrong
+                    # branch on a noisy frame, not a real teleport.
+                    with state.lock:
+                        prev_wp = state.world_position_m
+                        prev_at = state.world_position_updated_at
+                    prev_age_s = ((time.monotonic() - prev_at)
+                                   if prev_at > 0.0 else None)
+                    est = estimate_position(
+                        arena, poses,
+                        prev_position_m=prev_wp,
+                        prev_age_s=prev_age_s)
                     if est is not None:
                         with state.lock:
                             state.world_position_m = (

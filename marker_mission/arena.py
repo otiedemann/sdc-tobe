@@ -333,70 +333,111 @@ def _vote_in_bounds(pos_w: np.ndarray, arena: ArenaConfig) -> bool:
             and z_lo <= float(pos_w[2]) <= z_hi)
 
 
+# Per-frame jump cap when anchoring to the previous fix. The Anafi
+# caps near 12 m/s; at 25 fps that's < 0.5 m / frame, so 1.0 m gives
+# us 2x slack for low-fps moments without admitting metre-scale
+# IPPE-mirror flips.
+ARENA_MAX_STEP_M = 1.0
+# Beyond this age the previous position is too stale to anchor
+# branch selection -- fall back to in-bounds filtering.
+ARENA_PREV_STALE_S = 2.0
+
+
+def _alt_world_position(pose: 'MarkerPose',
+                         marker: 'ArenaMarker') -> Optional[np.ndarray]:
+    if pose.alt_camera_position_m is None:
+        return None
+    R_m_w = WALL_ROTATIONS[marker.wall]
+    return R_m_w @ np.asarray(pose.alt_camera_position_m,
+                              dtype=float).reshape(3) + marker.position_m
+
+
 def estimate_position(arena: ArenaConfig,
-                      poses: Iterable[MarkerPose]
+                      poses: Iterable[MarkerPose],
+                      prev_position_m: Optional[np.ndarray] = None,
+                      prev_age_s: Optional[float] = None,
                       ) -> Optional[PositionEstimate]:
     """Weighted average of camera world positions derived from each visible
     reference marker.
 
     Weight is currently ``1 / max(0.1, distance_m)`` -- close markers
-    dominate. Returns ``None`` if no visible marker is in the arena
-    config.
+    dominate. Returns ``None`` if no visible marker contributes.
 
-    Per-marker votes that fall outside the arena bounding box (plus
-    ``ARENA_BOUNDS_MARGIN_M``) are discarded before the average. The
-    drone is physically constrained to the arena so any vote that
-    places it metres outside is the IPPE-mirror branch -- the
-    detector picked the wrong planar-ambiguity solution for that
-    marker. Mixing it into the weighted average produces the
-    "position jumps to (-1, 0, 0.9) every time marker 3 comes back
-    into frame" behaviour observed on a stationary drone. If every
-    vote is out-of-bounds we fall back to using all of them rather
-    than returning None -- a stale wrong answer is better than no
-    answer when something is genuinely off.
+    Branch selection per marker:
+
+    1. **Anchored** (``prev_position_m`` is fresh, age <
+       ``ARENA_PREV_STALE_S``): for each marker we score both IPPE
+       branches against the previous fix and pick whichever is closer,
+       provided it's within ``ARENA_MAX_STEP_M`` of the previous fix.
+       If neither branch lands within that window, the marker is
+       skipped entirely -- IPPE produced two unreliable poses on this
+       frame and a wrong vote that's "barely in bounds" is what
+       caused the displayed position to jump every few frames on a
+       stationary drone with marker 3 visible.
+    2. **Unanchored** (no fresh previous fix): fall back to the
+       original arena-bounds filter. Drop chosen votes that fall
+       outside the arena box (plus ``ARENA_BOUNDS_MARGIN_M`` slack);
+       try the alt branch when chosen is OOB. Drop the marker if
+       both branches are OOB.
+
+    If every marker is skipped/dropped we return ``None`` so the
+    caller's sticky ``state.world_position_m`` is preserved -- the
+    display dot doesn't jump to a clearly-wrong location on a single
+    bad detection frame.
     """
+    use_anchor = (prev_position_m is not None
+                  and prev_age_s is not None
+                  and prev_age_s < ARENA_PREV_STALE_S)
+    if use_anchor:
+        prev_arr = np.asarray(prev_position_m, dtype=float).reshape(3)
+    else:
+        prev_arr = None
+
     contributions: List[tuple] = []   # (mid, pos_w, weight, method)
     for p in poses:
         marker = arena.markers.get(int(p.marker_id))
         if marker is None:
             continue
-        pos_w = position_from_marker(p, marker)
-        method = str(p.pose_method or "")
-        # When the chosen IPPE branch lands outside the arena AND the
-        # detector kept the loser branch on the pose, try swapping
-        # to the loser. At significant off-normal angle the two
-        # IPPE candidates' reproj-errs can sit within sub-pixel of
-        # each other and IPPE picks wrong on noise; the right
-        # branch is the loser. A successful swap recovers the
-        # marker's contribution to the average instead of just
-        # dropping it (the OOB filter below would otherwise discard
-        # it). The mirror-collapse path takes precedence: if it
-        # already overrode the camera position via
-        # collapsed_camera_position_m, we don't second-guess it.
-        if (p.alt_camera_position_m is not None
-                and p.collapsed_camera_position_m is None
-                and not _vote_in_bounds(pos_w, arena)):
-            R_m_w = WALL_ROTATIONS[marker.wall]
-            alt_pos_w = (R_m_w @ np.asarray(p.alt_camera_position_m,
-                                            dtype=float).reshape(3)
-                         + marker.position_m)
-            if _vote_in_bounds(alt_pos_w, arena):
-                pos_w = alt_pos_w
-                method = "ippe_swapped"
+        chosen_pos = position_from_marker(p, marker)
+        # collapsed camera position takes precedence: the
+        # mirror-collapse path already produced a midpoint we should
+        # trust, no branch swap.
+        if p.collapsed_camera_position_m is not None:
+            alt_pos = None
+        else:
+            alt_pos = _alt_world_position(p, marker)
+        chosen_method = str(p.pose_method or "")
         weight = 1.0 / max(0.1, float(p.distance_m))
-        contributions.append(
-            (int(p.marker_id), pos_w, weight, method))
+
+        pos_w = None
+        method = chosen_method
+        if use_anchor:
+            d_chosen = float(np.linalg.norm(chosen_pos - prev_arr))
+            d_alt = (float(np.linalg.norm(alt_pos - prev_arr))
+                     if alt_pos is not None else None)
+            chosen_ok = d_chosen <= ARENA_MAX_STEP_M
+            alt_ok = (d_alt is not None and d_alt <= ARENA_MAX_STEP_M)
+            if chosen_ok and (not alt_ok or d_chosen <= d_alt):
+                pos_w = chosen_pos
+            elif alt_ok:
+                pos_w = alt_pos
+                method = "ippe_swapped"
+            # else: both branches are too far from the previous fix
+            # to be plausible; skip this marker so its bad pose
+            # doesn't pull the average.
+        else:
+            if _vote_in_bounds(chosen_pos, arena):
+                pos_w = chosen_pos
+            elif alt_pos is not None and _vote_in_bounds(alt_pos, arena):
+                pos_w = alt_pos
+                method = "ippe_swapped"
+            # else: both OOB; skip.
+
+        if pos_w is not None:
+            contributions.append((int(p.marker_id), pos_w, weight, method))
 
     if not contributions:
         return None
-
-    in_bounds = [c for c in contributions if _vote_in_bounds(c[1], arena)]
-    if in_bounds:
-        contributions = in_bounds
-    # else: every vote is out-of-bounds -- keep them all rather than
-    # silently dropping the estimate; the operator at least sees a
-    # nonsensical value and can diagnose, instead of losing the fix
-    # entirely.
 
     total_w = sum(w for _, _, w, _ in contributions)
     weighted_sum = np.zeros(3, dtype=float)
