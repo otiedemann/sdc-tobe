@@ -89,6 +89,25 @@ WALL_YAW_DEG: dict[str, float] = {
 }
 
 
+# Paintings: one logo per wall, mounted at mid-height between the
+# low (z=2) and high (z=4) markers so it doesn't occlude either.
+# Painting size in metres (width × height). Logos with very different
+# aspect ratios get stretched; if that becomes an issue we can move
+# to per-painting sizing.
+_PAINTING_SIZE_M: tuple[float, float] = (3.0, 2.0)
+_PAINTING_Z_M: float = 3.0     # mid-height between the marker rings
+
+# (logo_filename_stem, wall_id). Matches the wall positions read from
+# arena_config.json. Drop your team logo as out/logos/team.png to
+# replace the placeholder.
+PAINTINGS: list[tuple[str, str]] = [
+    ("mbda",  "front"),  # MBDA  on front wall (arena y=0,    long wall)
+    ("brigk", "back"),   # brigk on back wall  (arena y=10.8, long wall)
+    ("sdc",   "left"),   # SDC   on left wall  (arena x=-10,  short wall)
+    ("team",  "right"),  # team  on right wall (arena x=+10,  short wall)
+]
+
+
 @dataclass(frozen=True)
 class AxisMap:
     """How arena (x, y, z) maps to UE (x, y, z). Each entry is a tuple
@@ -307,6 +326,12 @@ def main() -> int:
              "floors.",
     )
     p.add_argument(
+        "--emit-paintings", action="store_true",
+        help="Emit 4 wall paintings — one per wall — referencing "
+             "painting_<name>.fbx files in --fbx-dir. Run "
+             "build_painting_fbxs.py first to produce those.",
+    )
+    p.add_argument(
         "--floor-size-m", type=str, default="50x50",
         help="Floor footprint as <width>x<depth> in metres. Default 50x50, "
              "which completely covers the arena and hides UE4's default "
@@ -428,6 +453,7 @@ def main() -> int:
     n_pillars = 0
     n_nets = 0
     n_arena_static = 0
+    n_paintings = 0
     emit_floor = args.emit_floor or args.include_floor_box
     emit_pillars = args.emit_pillars
     emit_nets = args.emit_nets
@@ -455,6 +481,46 @@ def main() -> int:
         emit_floor = False
         emit_pillars = False
         emit_nets = False
+
+    if args.emit_paintings:
+        # One painting per wall, mounted at mid-height between the low
+        # (z=2) and high (z=4) marker rings so the logos don't occlude
+        # either marker. Position is the wall's CENTRE in arena coords;
+        # rotation matches the wall's marker yaw so the painting faces
+        # arena interior.
+        markers_for_bbox = arena.get("markers", [])
+        if markers_for_bbox:
+            xs = [float(m["x"]) for m in markers_for_bbox]
+            ys = [float(m["y"]) for m in markers_for_bbox]
+            x_min, x_max = min(xs), max(xs)
+            y_min, y_max = min(ys), max(ys)
+            cx_arena = (x_min + x_max) / 2.0
+            cy_arena = (y_min + y_max) / 2.0
+            wall_centres = {
+                "left":  (x_min, cy_arena),
+                "right": (x_max, cy_arena),
+                "front": (cx_arena, y_min),
+                "back":  (cx_arena, y_max),
+            }
+            pw, ph = _PAINTING_SIZE_M
+            for logo_name, wall in PAINTINGS:
+                wx, wy = wall_centres[wall]
+                ux_m, uy_m, uz_m = shifted_apply((wx, wy, _PAINTING_Z_M))
+                loc_cm = (ux_m * 100.0, uy_m * 100.0, uz_m * 100.0)
+                rot = (MARKER_PITCH_DEG, WALL_YAW_DEG[wall], 0.0)
+                out_lines.append(
+                    f"  # Painting — {logo_name} on {wall} wall"
+                )
+                out_lines.append(emit_yaml_block(
+                    name=f"painting_{wall}_{logo_name}",
+                    fbx_path=fbx_dir / f"painting_{logo_name}.fbx",
+                    location_cm=loc_cm,
+                    rotation_deg=rot,
+                    scale=(pw, ph, 1.0),
+                    snap_to_ground=False,
+                ))
+                out_lines.append("")
+                n_paintings += 1
     if emit_nets:
         # Net walls along the perimeter. Reuses pillar.fbx (the unit
         # cube) and scales it into a thin tall slab per wall. Position
@@ -587,6 +653,7 @@ def main() -> int:
     print(f"  nets: {n_nets}")
     print(f"  floor: {n_floor}")
     print(f"  arena_static: {n_arena_static}")
+    print(f"  paintings: {n_paintings}")
     print(f"  axis map: {args.axis_map}")
     print(f"  fbx dir (in YAML): {fbx_dir}")
     return 0

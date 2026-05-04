@@ -16,11 +16,12 @@ BLENDER ?= blender
 
 OUT     := out
 PNG_DIR := $(OUT)/markers
+LOGO_DIR := $(OUT)/logos
 FBX_DIR := $(OUT)/fbx
 YAML    := $(OUT)/arena.yml
 REPO_ROOT := $(realpath $(CURDIR)/../..)
 
-.PHONY: all pngs fbxs arena-static yaml clean check
+.PHONY: all pngs fbxs arena-static logos paintings yaml clean check
 
 all: yaml
 
@@ -34,18 +35,25 @@ fbxs: pngs
 
 # Combined static arena — floor + walls + pillars all baked into a
 # single FBX with positions and dimensions in Blender vertex space.
-# YAML places it at world origin with no scaling/rotation; eliminates
-# the per-mesh transform quirks that were tilting walls and dropping
-# materials.
-arena-static: $(YAML_DEP)
+arena-static:
 	mkdir -p $(FBX_DIR)
 	$(BLENDER) --background --python build_full_arena.py -- \
 	    --arena-config $(REPO_ROOT)/controller_unified/arena_config.json \
 	    --out $(FBX_DIR)/arena_static.fbx
 
-yaml: fbxs arena-static
+# Wall-painting logos: download external PNGs/SVGs into out/logos/,
+# then build one FBX per logo for Sphinx mesh injection.
+logos:
+	$(PY) download_logos.py --out-dir $(LOGO_DIR)
+
+paintings: logos
+	mkdir -p $(FBX_DIR)
+	$(BLENDER) --background --python build_painting_fbxs.py -- \
+	    --in-dir $(LOGO_DIR) --out-dir $(FBX_DIR)
+
+yaml: fbxs arena-static paintings
 	$(PY) arena_to_sphinx_yaml.py --fbx-dir $(FBX_DIR) --out $(YAML) \
-	    --emit-arena-static
+	    --emit-arena-static --emit-paintings
 
 clean:
 	rm -rf $(OUT)
@@ -56,7 +64,7 @@ clean:
 check:
 	$(PY) generate_aruco_pngs.py --out-dir $(PNG_DIR)
 	$(PY) arena_to_sphinx_yaml.py --fbx-dir $(FBX_DIR) --out $(YAML) \
-	    --emit-arena-static
+	    --emit-arena-static --emit-paintings
 	@echo
 	@echo "self-test ok — PNGs in $(PNG_DIR), arena YAML in $(YAML)"
 	@echo "(run 'make all' on a host with Blender to produce the FBXs)"
