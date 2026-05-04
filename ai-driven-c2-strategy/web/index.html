@@ -1,0 +1,25 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>SDC26 Strategy Prototype</title>
+    <link rel="stylesheet" href="/style.css">
+  </head>
+  <body>
+    <main id="app">
+      <section id="viewport"></section>
+      <aside id="hud">
+        <h1>SDC26 Strategy</h1>
+        <div class="metric"><span>Time</span><strong id="time">-</strong></div>
+        <div class="metric"><span>Score</span><strong id="score">-</strong></div>
+        <div class="metric"><span>Planner</span><strong id="planner">-</strong></div>
+        <p id="summary">Waiting for simulation state...</p>
+        <h2>Events</h2>
+        <ul id="events"></ul>
+      </aside>
+    </main>
+    <script src="https://cdn.jsdelivr.net/npm/three@0.160.1/build/three.min.js"></script>
+    <script src="/app.js"></script>
+  </body>
+</html>

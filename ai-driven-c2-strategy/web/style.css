@@ -1,0 +1,82 @@
+html,
+body {
+  height: 100%;
+  margin: 0;
+  background: #070b12;
+  color: #e8eefb;
+  font-family: Inter, Segoe UI, Arial, sans-serif;
+}
+
+#app {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 340px;
+  height: 100%;
+}
+
+#viewport {
+  position: relative;
+  overflow: hidden;
+}
+
+#hud {
+  border-left: 1px solid rgba(255, 255, 255, 0.12);
+  background: rgba(9, 16, 28, 0.94);
+  padding: 20px;
+  overflow-y: auto;
+}
+
+h1 {
+  margin: 0 0 18px;
+  font-size: 22px;
+}
+
+h2 {
+  margin-top: 24px;
+  font-size: 15px;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: #98a8c7;
+}
+
+.metric {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 10px 0;
+  border-top: 1px solid rgba(255, 255, 255, 0.08);
+}
+
+.metric span {
+  color: #98a8c7;
+}
+
+#summary {
+  line-height: 1.45;
+  color: #d2ddf3;
+}
+
+#events {
+  padding-left: 18px;
+  line-height: 1.4;
+  color: #c6d4ef;
+}
+
+#events li {
+  margin-bottom: 8px;
+}
+
+canvas {
+  display: block;
+}
+
+@media (max-width: 900px) {
+  #app {
+    grid-template-columns: 1fr;
+    grid-template-rows: 62vh 38vh;
+  }
+
+  #hud {
+    border-left: 0;
+    border-top: 1px solid rgba(255, 255, 255, 0.12);
+  }
+}

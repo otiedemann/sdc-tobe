@@ -1,0 +1,60 @@
+{
+  "team": {
+    "color": "blue",
+    "opponent_color": "red",
+    "home_side": "left"
+  },
+  "arena": {
+    "x_min": -10.0,
+    "x_max": 10.0,
+    "y_min": 0.0,
+    "y_max": 10.0,
+    "z_min": 0.0,
+    "z_max": 6.0,
+    "left_zone_x_max": -5.0,
+    "right_zone_x_min": 5.0
+  },
+  "llm": {
+    "enabled": true,
+    "provider": "openrouter",
+    "model": "openai/gpt-4.1-mini",
+    "temperature": 0.2,
+    "timeout_seconds": 20,
+    "max_tokens": 1800,
+    "decision_interval_seconds": 3.0
+  },
+  "openrouter": {
+    "site_url": "http://localhost:8765",
+    "app_name": "SDC26 Strategy Prototype"
+  },
+  "gameplay": {
+    "match_duration_seconds": 600.0,
+    "capture_radius_m": 0.85,
+    "capture_hold_seconds": 2.0,
+    "validation_seconds": 5.0,
+    "simultaneous_window_seconds": 1.5,
+    "drone_speed_mps": 1.4,
+    "enemy_speed_mps": 1.15,
+    "capture_z": 1.4,
+    "transit_z": 2.0,
+    "min_drone_separation_m": 0.8
+  },
+  "simulation": {
+    "own_drone_count": 5,
+    "enemy_drone_count": 4,
+    "tick_seconds": 0.1,
+    "llm_on_major_events": true
+  },
+  "mock_enemy": {
+    "enabled": true,
+    "style": "balanced"
+  },
+  "targets": [
+    { "id": "left_1", "side": "left", "position": { "x": -8.5, "y": 2.0, "z": 0.0 } },
+    { "id": "left_2", "side": "left", "position": { "x": -8.0, "y": 5.0, "z": 0.0 } },
+    { "id": "left_3", "side": "left", "position": { "x": -8.5, "y": 8.0, "z": 0.0 } },
+    { "id": "right_1", "side": "right", "position": { "x": 8.5, "y": 2.0, "z": 0.0 } },
+    { "id": "right_2", "side": "right", "position": { "x": 8.0, "y": 5.0, "z": 0.0 } },
+    { "id": "right_3", "side": "right", "position": { "x": 8.5, "y": 8.0, "z": 0.0 } }
+  ]
+}
