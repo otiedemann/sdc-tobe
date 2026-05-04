@@ -1,0 +1,31 @@
+[Unit]
+Description=Sphinx Control web service (multi-drone simulator manager)
+After=network-online.target firmwared.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Override these in /etc/systemd/system/sphinx-control.service.d/override.conf
+# (or replace inline before installing) to match your host's user/paths.
+User=sdc
+Group=sdc
+WorkingDirectory=/home/sdc/sdc-tobe/sphinx-control
+Environment=SPHINX_CONTROL_CONFIG=/home/sdc/sdc-tobe/sphinx-control/config.yaml
+Environment=PATH=/home/sdc/sdc-tobe/sphinx-control/.venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+ExecStart=/home/sdc/sdc-tobe/sphinx-control/.venv/bin/uvicorn server:app --host 0.0.0.0 --port 8090
+Restart=on-failure
+RestartSec=3s
+
+# Sphinx instances spawned by the service inherit this unit's process
+# group. KillMode=process means systemd only stops the uvicorn parent
+# on `systemctl stop`; if you want every spawned drone to die with it,
+# switch to KillMode=control-group.
+KillMode=process
+
+# netns mode requires CAP_NET_ADMIN. Comment out if running in ports
+# mode only (the default).
+# AmbientCapabilities=CAP_NET_ADMIN
+# CapabilityBoundingSet=CAP_NET_ADMIN
+
+[Install]
+WantedBy=multi-user.target

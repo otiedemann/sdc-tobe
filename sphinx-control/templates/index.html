@@ -1,0 +1,84 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{{ title }}</title>
+  <link rel="stylesheet" href="/static/app.css">
+</head>
+<body>
+  <header>
+    <h1>{{ title }}</h1>
+    <div id="header-meta" class="meta">
+      <span class="badge mode-{{ network_mode }}" title="Network mode">net: {{ network_mode }}</span>
+      {% if dry_run %}<span class="badge warn" title="Sphinx not installed; using sleep placeholders">dry-run</span>{% endif %}
+      <span class="badge" id="tailscale-badge" title="Tailscale status">tailscale: …</span>
+      <span class="badge" id="sphinx-badge" title="Sphinx version">sphinx: …</span>
+    </div>
+  </header>
+
+  {% if network_warning %}
+  <div class="banner banner-warn">⚠ {{ network_warning }}</div>
+  {% endif %}
+
+  <main>
+    <section id="spawn-section">
+      <h2>Spawn a drone</h2>
+      <form id="spawn-form">
+        <label>Drone profile
+          <select name="drone_profile" id="profile-select" required></select>
+        </label>
+        <label>World
+          <select name="world_name" id="world-select" required></select>
+        </label>
+        <label>Instance ID
+          <input type="number" name="instance_id" id="instance-input" min="1" max="{{ max_drones }}" placeholder="auto">
+        </label>
+        <button type="submit">Spawn</button>
+      </form>
+      <p class="muted">Up to {{ max_drones }} simultaneous drones. Empty Instance ID = auto-allocate next free slot.</p>
+    </section>
+
+    <section id="drones-section">
+      <div class="section-header">
+        <h2>Active drones <span id="drones-count" class="count">0</span></h2>
+        <div class="bulk-controls">
+          <button id="restart-all-btn" class="secondary">Restart all</button>
+          <button id="stop-all-btn" class="danger">Stop all</button>
+        </div>
+      </div>
+      <table id="drones-table">
+        <thead>
+          <tr>
+            <th>Instance</th>
+            <th>ID</th>
+            <th>Status</th>
+            <th>Profile</th>
+            <th>World</th>
+            <th>Endpoint</th>
+            <th>PIDs</th>
+            <th>Uptime</th>
+            <th>Actions</th>
+          </tr>
+        </thead>
+        <tbody id="drones-tbody">
+          <tr class="empty"><td colspan="9">No drones spawned yet.</td></tr>
+        </tbody>
+      </table>
+    </section>
+
+    <section id="connections-section">
+      <h2>Connections</h2>
+      <p class="muted">Click a drone row above to inspect who's connected.</p>
+      <pre id="connections-output">(select a drone)</pre>
+    </section>
+
+    <section id="system-section">
+      <h2>System</h2>
+      <pre id="system-output">loading…</pre>
+    </section>
+  </main>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>

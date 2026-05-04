@@ -1,0 +1,8 @@
+# Sphinx Control runtime artifacts — never commit.
+.venv/
+config.yaml
+sphinx_control.db
+sphinx_control.db-*
+logs/
+__pycache__/
+*.pyc
