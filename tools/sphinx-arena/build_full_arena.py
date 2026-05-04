@@ -130,6 +130,35 @@ def _add_box(name: str, location_m: tuple[float, float, float],
     obj.data.materials.append(material)
 
 
+def _build_unit_cube_fbx(out_fbx: Path, name: str, material) -> None:
+    """Build a SINGLE-MESH unit cube FBX — one mesh, one material — and
+    export it. The combined arena_static.fbx with multiple meshes and
+    materials kept rendering invisible/blank in Sphinx; individual
+    single-mesh FBXs (the same approach that markers and paintings
+    use successfully) load reliably. The YAML emitter scales these
+    unit cubes per-axis to the right size at the right position."""
+    assert bpy is not None
+    _clear_scene()
+    bpy.ops.mesh.primitive_cube_add(size=1.0, location=(0, 0, 0))
+    obj = bpy.context.active_object
+    obj.name = name
+    obj.data.materials.append(material)
+    bpy.ops.export_scene.fbx(
+        filepath=str(out_fbx),
+        use_selection=False,
+        path_mode="AUTO",
+        embed_textures=False,
+        apply_unit_scale=True,
+        global_scale=1.0,
+        bake_space_transform=False,
+        # Per Sphinx 2.15 customize_the_environment docs.
+        axis_forward="-Y",
+        axis_up="-Z",
+        object_types={"MESH"},
+        mesh_smooth_type="FACE",
+    )
+
+
 # ─── main ─────────────────────────────────────────────────────────
 
 
@@ -326,7 +355,10 @@ def main() -> int:
         bpy.ops.wm.save_as_mainfile(filepath=str(blend_path))
         print(f"  ✓ {blend_path}  (open in Blender to inspect/edit)")
 
-    # ── EXPORT FBX ── single file with all meshes.
+    # ── EXPORT COMBINED FBX ── single file with all meshes (kept for
+    # the .blend inspection workflow, but the YAML actually consumes
+    # the per-element FBXs built below — Sphinx doesn't render this
+    # multi-mesh + multi-material combined file reliably).
     if not ns.no_fbx:
         bpy.ops.object.select_all(action="SELECT")
         bpy.ops.export_scene.fbx(
@@ -349,6 +381,23 @@ def main() -> int:
             mesh_smooth_type="FACE",
         )
         print(f"  ✓ {ns.out}")
+
+        # ── ALSO EXPORT INDIVIDUAL UNIT-CUBE FBXs ──
+        # Sphinx mesh-injection apparently has trouble rendering the
+        # multi-mesh + multi-material combined FBX above; markers and
+        # paintings (single mesh + single material) load fine. So we
+        # also produce simple per-element unit-cube FBXs that the YAML
+        # emitter places via --emit-floor / --emit-pillars / --emit-walls
+        # with per-axis Scale to size them at runtime. Each call below
+        # clears Blender's scene and rebuilds a single object — that's
+        # why this MUST come after the combined export above (which
+        # otherwise would lose its meshes).
+        _build_unit_cube_fbx(out_dir / "floor.fbx", "arena_floor", mat_floor)
+        print(f"  ✓ {out_dir / 'floor.fbx'}")
+        _build_unit_cube_fbx(out_dir / "pillar.fbx", "arena_pillar", mat_pillar)
+        print(f"  ✓ {out_dir / 'pillar.fbx'}")
+        _build_unit_cube_fbx(out_dir / "wall.fbx", "arena_wall", mat_wall)
+        print(f"  ✓ {out_dir / 'wall.fbx'}")
 
     print(f"  arena bbox: x=[{x_min},{x_max}], y=[{y_min},{y_max}] "
           f"→ centre arena ({cx:.2f}, {cy:.2f})")

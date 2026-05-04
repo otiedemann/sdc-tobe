@@ -96,10 +96,12 @@ MARKER_PITCH_DEG: float = 90.0
 # Sphinx-recommended axis convention shifts every yaw by 90° back to
 # the cleaner math-derived values below.
 WALL_YAW_DEG: dict[str, float] = {
-    "front":   0.0,   # arena y=0    → faces UE +X
-    "back":  180.0,   # arena y=10.8 → faces UE -X
-    "left":  -90.0,   # arena x=-10  → faces UE -Y
-    "right":  90.0,   # arena x=+10  → faces UE +Y
+    # NOTE: previous attempt was 0/180/-90/+90; user reported markers
+    # facing outward. Flipped 180° per wall — face inward now.
+    "front": 180.0,   # arena y=0    → faces UE +X
+    "back":    0.0,   # arena y=10.8 → faces UE -X
+    "left":   90.0,   # arena x=-10  → faces UE -Y
+    "right": -90.0,   # arena x=+10  → faces UE +Y
 }
 
 
@@ -230,30 +232,25 @@ def collect_pillars(markers: list[dict]) -> list[dict]:
     return pillars
 
 
-# Net-wall settings. Nets stretch between pillars along each arena
-# perimeter so the drone can't fly out. Sphinx's mesh-injection has
-# no opacity/transparency support (only BaseColor/Roughness/Specular/
-# Metallic) — so we can't make truly see-through walls without
-# building a custom UE4 app (Path B) or sparse-grid net geometry.
-# Compromise: keep them low (1 m, like a fence) so the camera view
-# above them is unobstructed, and use a light colour so they read
-# as a barrier rather than an occlusion.
-_NET_THICKNESS_M = 0.05      # 5 cm — visually thin, physically solid
-_NET_HEIGHT_M = 1.0          # short fence, not a tall wall
-_NET_END_OVERLAP_M = 0.30    # extend past the corner pillars so the
-                             # joint isn't a visible gap
+# Wall settings — visible solid walls (now emitted via the
+# single-mesh wall.fbx scaled per-axis). Net-style "fences" can be
+# selected with --net-style if a thin/low look is preferred.
+_WALL_THICKNESS_M = 0.20
+_WALL_HEIGHT_M = 4.0
+_WALL_END_OVERLAP_M = 0.40   # extend past corners so corner joints don't gap
 
 
-def collect_nets(markers: list[dict]) -> list[dict]:
-    """Return 4 net wall descriptors (in arena coords).
+def collect_walls(markers: list[dict],
+                  thickness_m: float = _WALL_THICKNESS_M,
+                  height_m: float = _WALL_HEIGHT_M,
+                  overlap_m: float = _WALL_END_OVERLAP_M) -> list[dict]:
+    """Return 4 wall descriptors (in arena coords) for the perimeter.
 
-    Each net is a thin vertical slab placed at the arena perimeter
-    along one wall. The thickness is in the wall's *outward* axis;
-    the long axis runs parallel to the wall.
-
-    Coordinates are in arena metres. The YAML emitter applies the
-    ``axis_map`` to translate to UE space and emits the entry with
-    a per-axis ``Scale`` so the unit cube becomes a long thin wall.
+    Each wall is a tall thin slab placed at the arena perimeter along
+    one wall. Coordinates are in arena metres. The YAML emitter applies
+    the ``axis_map`` to translate to UE space and emits the entry with
+    a per-axis ``Scale`` so the unit-cube wall.fbx becomes a long thin
+    wall at the right size.
     """
     if not markers:
         return []
@@ -263,27 +260,27 @@ def collect_nets(markers: list[dict]) -> list[dict]:
     y_min, y_max = ys[0], ys[-1]
     width = x_max - x_min
     depth = y_max - y_min
-    z_center = _NET_HEIGHT_M / 2.0
-    long_x = width + _NET_END_OVERLAP_M
-    long_y = depth + _NET_END_OVERLAP_M
+    z_center = height_m / 2.0
+    long_x = width + overlap_m
+    long_y = depth + overlap_m
     return [
-        # Left wall — at arena x=x_min, full depth.
-        {"name": "net_left",
+        {"name": "wall_left",
          "x": x_min, "y": (y_min + y_max) / 2, "z": z_center,
-         "sx": _NET_THICKNESS_M, "sy": long_y, "sz": _NET_HEIGHT_M},
-        # Right wall — at arena x=x_max.
-        {"name": "net_right",
+         "sx": thickness_m, "sy": long_y, "sz": height_m},
+        {"name": "wall_right",
          "x": x_max, "y": (y_min + y_max) / 2, "z": z_center,
-         "sx": _NET_THICKNESS_M, "sy": long_y, "sz": _NET_HEIGHT_M},
-        # Front wall — at arena y=y_min, full width.
-        {"name": "net_front",
+         "sx": thickness_m, "sy": long_y, "sz": height_m},
+        {"name": "wall_front",
          "x": (x_min + x_max) / 2, "y": y_min, "z": z_center,
-         "sx": long_x, "sy": _NET_THICKNESS_M, "sz": _NET_HEIGHT_M},
-        # Back wall — at arena y=y_max.
-        {"name": "net_back",
+         "sx": long_x, "sy": thickness_m, "sz": height_m},
+        {"name": "wall_back",
          "x": (x_min + x_max) / 2, "y": y_max, "z": z_center,
-         "sx": long_x, "sy": _NET_THICKNESS_M, "sz": _NET_HEIGHT_M},
+         "sx": long_x, "sy": thickness_m, "sz": height_m},
     ]
+
+
+# Backward-compat alias — older code paths used "nets" terminology.
+collect_nets = collect_walls
 
 
 def main() -> int:
@@ -328,20 +325,22 @@ def main() -> int:
              "(uses pillar.fbx from --fbx-dir).",
     )
     p.add_argument(
+        "--emit-walls", action="store_true",
+        help="Emit 4 perimeter walls along the arena edges (uses "
+             "wall.fbx scaled into long thin slabs per side).",
+    )
+    p.add_argument(
         "--emit-nets", action="store_true",
-        help="Emit 4 net walls along the arena perimeter so drones "
-             "can't fly out (uses pillar.fbx scaled into thin slabs).",
+        help="Deprecated alias for --emit-walls (kept for back-compat).",
     )
     p.add_argument(
         "--emit-arena-static", action="store_true",
-        help="Emit a single arena_static.fbx entry instead of separate "
-             "floor/walls/pillars. The combined FBX (built by "
-             "build_full_arena.py) already has all dimensions and "
-             "positions baked, so the YAML places it at world origin "
-             "with Scale=1 and Rotation=0. This is the recommended "
-             "path — eliminates the per-mesh scale-and-rotate quirks "
-             "that were producing tilted walls and lost-material "
-             "floors.",
+        help="Emit a single arena_static.fbx (combined floor+walls+"
+             "pillars baked in vertex space). Sphinx mesh-injection "
+             "doesn't render multi-mesh + multi-material FBXs "
+             "reliably — the per-element --emit-floor/--emit-walls/"
+             "--emit-pillars path is preferred and is what the "
+             "Makefile uses by default.",
     )
     p.add_argument(
         "--emit-paintings", action="store_true",
@@ -475,12 +474,12 @@ def main() -> int:
 
     n_floor = 0
     n_pillars = 0
-    n_nets = 0
+    n_walls = 0
     n_arena_static = 0
     n_paintings = 0
     emit_floor = args.emit_floor or args.include_floor_box
     emit_pillars = args.emit_pillars
-    emit_nets = args.emit_nets
+    emit_walls = args.emit_walls or args.emit_nets  # nets is the legacy alias
     emit_arena_static = args.emit_arena_static
 
     if emit_arena_static:
@@ -504,7 +503,7 @@ def main() -> int:
         # Skip the per-mesh emits since the combined FBX has them.
         emit_floor = False
         emit_pillars = False
-        emit_nets = False
+        emit_walls = False
 
     if args.emit_paintings:
         # One painting per wall, mounted at mid-height between the low
@@ -554,35 +553,33 @@ def main() -> int:
                 ))
                 out_lines.append("")
                 n_paintings += 1
-    if emit_nets:
-        # Net walls along the perimeter. Reuses pillar.fbx (the unit
-        # cube) and scales it into a thin tall slab per wall. Position
-        # is at the wall's marker plane in arena coords; the thickness
-        # is in the outward-facing axis so the slab "sits" in front of
-        # the markers from outside the arena.
+    if emit_walls:
+        # 4 perimeter walls. Reuses wall.fbx (a unit cube — the
+        # single-mesh-single-material approach Sphinx renders
+        # reliably) and scales it per-axis into a long thin tall slab.
+        # Position is at each wall's plane in arena coords.
         ax_for_ue_x = axis_map.ue_x[0]
         ax_for_ue_y = axis_map.ue_y[0]
-        for net in collect_nets(arena.get("markers", [])):
-            ux_m, uy_m, uz_m = shifted_apply((net["x"], net["y"], net["z"]))
+        for wall in collect_walls(arena.get("markers", [])):
+            ux_m, uy_m, uz_m = shifted_apply((wall["x"], wall["y"], wall["z"]))
             loc_cm = (ux_m * 100.0, uy_m * 100.0, uz_m * 100.0)
-            arena_scales = {0: net["sx"], 1: net["sy"], 2: net["sz"]}
+            arena_scales = {0: wall["sx"], 1: wall["sy"], 2: wall["sz"]}
             ue_x_scale = arena_scales[ax_for_ue_x]
             ue_y_scale = arena_scales[ax_for_ue_y]
             ue_z_scale = arena_scales[2]
             out_lines.append(
-                f"  # Perimeter net — {net['name']}, "
-                f"keeps the drone inside the arena."
+                f"  # Perimeter wall — {wall['name']}."
             )
             out_lines.append(emit_yaml_block(
-                name=net["name"],
-                fbx_path=fbx_dir / "net.fbx",
+                name=wall["name"],
+                fbx_path=fbx_dir / "wall.fbx",
                 location_cm=loc_cm,
                 rotation_deg=(0.0, 0.0, 0.0),
                 scale=(ue_x_scale, ue_y_scale, ue_z_scale),
                 snap_to_ground=False,
             ))
             out_lines.append("")
-            n_nets += 1
+            n_walls += 1
 
     if emit_pillars:
         # Place 8 vertical pillars at the unique (x, y, wall) positions
@@ -683,7 +680,7 @@ def main() -> int:
     print(f"  wall markers: {n_wall}")
     print(f"  target markers: {n_target}")
     print(f"  pillars: {n_pillars}")
-    print(f"  nets: {n_nets}")
+    print(f"  walls: {n_walls}")
     print(f"  floor: {n_floor}")
     print(f"  arena_static: {n_arena_static}")
     print(f"  paintings: {n_paintings}")

@@ -74,9 +74,15 @@ $(LOGO_DIR):
 # Use `make all` (or the individual targets) when you want to rebuild
 # meshes; `make yaml` is the fast path when you've only changed the
 # YAML emitter logic.
+#
+# Default emits: floor + pillars + walls (each a single-mesh,
+# single-material FBX scaled per-axis in YAML — Sphinx renders these
+# reliably). The combined arena_static.fbx path is available via
+# --emit-arena-static but Sphinx mesh-injection doesn't render its
+# multi-mesh + multi-material content, so we don't use it by default.
 yaml:
 	$(PY) arena_to_sphinx_yaml.py --fbx-dir $(FBX_DIR) --out $(YAML) \
-	    --emit-arena-static --emit-paintings
+	    --emit-floor --emit-pillars --emit-walls --emit-paintings
 
 # Convenience target: rebuild EVERYTHING from sources. Run this on a
 # host that has cv2, Blender, and network access (for logo fetch).
