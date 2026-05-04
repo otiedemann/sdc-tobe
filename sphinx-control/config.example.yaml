@@ -1,0 +1,97 @@
+# Sphinx Control configuration — copy to config.yaml and edit.
+# Path is picked up via SPHINX_CONTROL_CONFIG env var, or auto-detected
+# at sphinx-control/config.yaml if no env override is set.
+
+# Where to bind the management web UI. 0.0.0.0 = listen on all interfaces
+# (so Tailscale and LAN can reach it). Use 127.0.0.1 for localhost-only.
+host: "0.0.0.0"
+port: 8090
+
+# Where the SQLite state DB lives. Persists across service restarts so
+# spawned drones survive a reboot of the management service (the actual
+# Sphinx processes do not — they're respawned on demand).
+state_db: "./sphinx_control.db"
+
+# Maximum simultaneous Sphinx instances. Per Parrot's docs each Sphinx
+# process is one drone; running 10 of them on one box is GPU-limited.
+# Lower this if your GPU saturates.
+max_drones: 10
+
+# How drones get distinct IPs. Two modes:
+#   "ports"  — single IP (loopback by default), each drone on a unique
+#              TCP port. Simplest, no root needed.
+#   "netns"  — Linux network namespace per drone (each drone has its own
+#              IP in `network.subnet`). Requires CAP_NET_ADMIN / sudo.
+#              This is the "real virtual IP per drone" mode.
+network:
+  mode: "ports"
+  # In ports mode, base port for the first drone. Drone N → port + N.
+  base_port: 9080
+  # Hostname/IP the management UI should display for ports-mode drones.
+  # Defaults to the host's primary IP. Override here if you want the UI
+  # to advertise a specific Tailscale or LAN address.
+  bind_ip: null
+
+  # netns-mode settings — only used when mode == "netns".
+  # Each drone gets 10.202.0.<instance_id+10> by default.
+  subnet: "10.202.0.0/24"
+  bridge_name: "sphinx-br0"
+  ip_offset: 10
+
+# Where to find the Sphinx CLI and stock drone descriptors. The
+# defaults here match a vanilla `apt install parrot-sphinx` on Ubuntu.
+sphinx:
+  binary: "/usr/bin/sphinx"
+  drone_descriptor_dir: "/opt/parrot-sphinx/usr/share/sphinx/drones"
+  ue4_app_default: "parrot-ue4-empty"
+  # Default firmware URL (used when a drone is spawned without an
+  # explicit firmware override). The "%23latest" is URL-encoded "#latest"
+  # which Sphinx accepts as "always pull the freshest build".
+  firmware_url: "https://firmware.parrot.com/Versions/anafi2/pc/%23latest/images/anafi2-pc.ext2.zip"
+
+# Custom Unreal Engine apps available to the dashboard, in addition to
+# stock parrot-ue4-* binaries discovered in PATH.
+ue4_apps:
+  - name: "empty"
+    binary: "parrot-ue4-empty"
+    description: "Stock minimal world. Cheap on GPU."
+  - name: "factory"
+    binary: "parrot-ue4-factory"
+    description: "Stock truck-manufacturing facility."
+  - name: "office"
+    binary: "parrot-ue4-office"
+    description: "Stock office reception + meeting rooms."
+  # SDC arena scene built by tools/sphinx-arena/. Set this binary to
+  # whatever your build emits, or leave it pointing at empty + the
+  # arena.yml config_file below.
+  - name: "sdc_arena"
+    binary: "parrot-ue4-empty"
+    config_file: "../tools/sphinx-arena/out/arena.yml"
+    description: "SDC arena (markers injected via YAML config)."
+
+# Drone profiles available to the dashboard. The descriptor file under
+# sphinx.drone_descriptor_dir must exist for the profile to be usable.
+drone_profiles:
+  - name: "anafi"
+    descriptor: "anafi2.drone"
+    description: "Anafi 2 / 4K (default fleet drone)."
+  - name: "anafi-usa"
+    descriptor: "anafi_usa.drone"
+    description: "Anafi USA / Thermal."
+  - name: "anafi-ai"
+    descriptor: "anafi_ai.drone"
+    description: "Anafi Ai (newest, more compute-heavy)."
+
+# Set true to run the launcher in dry-run mode: no real Sphinx is
+# started; instead each "drone" is a `sleep` placeholder so you can
+# develop the UI on macOS or any host without parrot-sphinx installed.
+# AUTO-ENABLED if /usr/bin/sphinx is missing.
+dry_run: false
+
+# Optional Tailscale awareness. When `enabled`, sphinx-control will
+# call `tailscale status --json` to surface the host's tailnet IP and
+# advertised routes in the dashboard. Read-only — sphinx-control never
+# changes Tailscale config; it just reports it.
+tailscale:
+  enabled: true
+  binary: "/usr/bin/tailscale"

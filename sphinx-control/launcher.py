@@ -1,0 +1,474 @@
+"""Sphinx process launcher / supervisor.
+
+Each drone is a pair of subprocesses:
+  * ``sphinx <descriptor>::firmware="..."``  — drone simulation core
+  * ``parrot-ue4-<world>``                    — the UE renderer
+
+We track both PIDs and bring both down on stop. Logs go to per-drone
+files under ``logs/drone-<id>/{sphinx,ue4}.log``.
+
+This module is deliberately tolerant of missing dependencies:
+  * If ``/usr/bin/sphinx`` is absent (e.g. macOS dev box), ``dry_run``
+    is auto-enabled and each "drone" is replaced by a long ``sleep``,
+    so the management UI works locally for development.
+  * If the configured netns mode fails (no CAP_NET_ADMIN, no bridge),
+    we fall back to ports mode automatically and surface the reason in
+    the dashboard.
+"""
+from __future__ import annotations
+
+import logging
+import os
+import shutil
+import signal
+import subprocess
+import threading
+import time
+import uuid
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
+
+from network import (
+    DroneEndpoint,
+    NetnsMode,
+    PortsMode,
+    established_peers_to_port,
+    listening_pids_on_port,
+)
+from state import DroneRecord, StateStore
+from worlds import Registry
+
+log = logging.getLogger("sphinx-control.launcher")
+
+
+@dataclass
+class LaunchRequest:
+    drone_profile: str
+    world_name: str
+    instance_id: int | None = None  # auto-allocated if None
+    firmware_url: str | None = None  # falls back to config default
+
+
+class Launcher:
+    """Supervisor for Sphinx drone subprocesses. Single instance per
+    service; thread-safe via an internal lock around mutating ops."""
+
+    def __init__(
+        self,
+        config: dict[str, Any],
+        registry: Registry,
+        state: StateStore,
+        log_dir: Path,
+    ) -> None:
+        self.config = config
+        self.registry = registry
+        self.state = state
+        self.log_dir = log_dir
+        self.log_dir.mkdir(parents=True, exist_ok=True)
+        self._lock = threading.RLock()
+
+        # Auto-detect dry-run if Sphinx isn't installed. Spares
+        # developers on Mac from having to flip a config flag.
+        binary = (config.get("sphinx", {}) or {}).get("binary", "/usr/bin/sphinx")
+        self.dry_run = bool(config.get("dry_run", False)) or not Path(binary).is_file()
+        if self.dry_run and not config.get("dry_run"):
+            log.warning(
+                "Sphinx binary not found at %s — auto-enabling dry-run mode. "
+                "Spawned drones will be `sleep` placeholders.",
+                binary,
+            )
+
+        # Network mode setup. NetnsMode is only attempted if explicitly
+        # configured AND we have CAP_NET_ADMIN. Otherwise we drop to
+        # PortsMode and surface the reason via ``self.network_warning``.
+        net = config.get("network", {}) or {}
+        mode = net.get("mode", "ports")
+        self.network_warning: str | None = None
+        if mode == "netns":
+            if os.geteuid() != 0 and shutil.which("sudo") is None:
+                self.network_warning = (
+                    "netns mode requested but no root/sudo available — "
+                    "falling back to ports mode."
+                )
+                mode = "ports"
+        if mode == "netns":
+            self.network = NetnsMode(
+                subnet=net.get("subnet", "10.202.0.0/24"),
+                bridge_name=net.get("bridge_name", "sphinx-br0"),
+                ip_offset=int(net.get("ip_offset", 10)),
+            )
+            try:
+                self.network.ensure_bridge()
+            except RuntimeError as e:
+                self.network_warning = (
+                    f"netns bridge setup failed ({e}); falling back to ports mode."
+                )
+                mode = "ports"
+        if mode == "ports":
+            self.network = PortsMode(
+                base_port=int(net.get("base_port", 9080)),
+                bind_ip=net.get("bind_ip"),
+            )
+        self.mode = mode
+
+        self.max_drones = int(config.get("max_drones", 10))
+
+    # ─── public API ──────────────────────────────────────────────
+
+    def spawn(self, req: LaunchRequest) -> DroneRecord:
+        with self._lock:
+            profile = self.registry.profile(req.drone_profile)
+            world = self.registry.world(req.world_name)
+            # In dry-run mode the descriptor / UE4 binary don't have to
+            # exist — we'll spawn `sleep` placeholders. Outside dry-run
+            # they're real CLI args to subprocess and must be present.
+            if not self.dry_run and not profile.available:
+                raise RuntimeError(f"profile unavailable: {profile.unavailable_reason}")
+            if not self.dry_run and not world.available:
+                raise RuntimeError(f"world unavailable: {world.unavailable_reason}")
+
+            instance_id = req.instance_id or self._allocate_instance_id()
+            if instance_id < 1 or instance_id > self.max_drones:
+                raise ValueError(
+                    f"instance_id {instance_id} outside 1..{self.max_drones}"
+                )
+            if instance_id in self.state.used_instance_ids():
+                raise RuntimeError(
+                    f"instance_id {instance_id} already in use; stop the existing "
+                    f"drone first."
+                )
+
+            endpoint = self.network.endpoint_for(instance_id)
+            try:
+                self.network.setup(instance_id)
+            except RuntimeError as e:
+                raise RuntimeError(f"network setup failed: {e}") from e
+
+            drone_id = f"drone-{instance_id}-{uuid.uuid4().hex[:6]}"
+            firmware = (
+                req.firmware_url
+                or (self.config.get("sphinx", {}) or {}).get("firmware_url")
+            )
+
+            rec = DroneRecord(
+                drone_id=drone_id,
+                instance_id=instance_id,
+                drone_type=profile.name,
+                descriptor=profile.descriptor_path,
+                world_app=world.name,
+                config_file=world.config_file,
+                firmware_url=firmware,
+                drone_ip=endpoint.ip,
+                drone_port=endpoint.port,
+                status="spawning",
+            )
+            self.state.upsert(rec)
+
+            try:
+                sphinx_pid, ue4_pid = self._launch_subprocesses(
+                    drone_id=drone_id,
+                    instance_id=instance_id,
+                    descriptor_path=profile.descriptor_path,
+                    world=world,
+                    endpoint=endpoint,
+                    firmware_url=firmware,
+                )
+            except Exception as e:
+                self.state.update_status(drone_id, "error", last_error=str(e))
+                self._safe_teardown(instance_id)
+                raise
+
+            self.state.update_status(
+                drone_id,
+                status="running",
+                sphinx_pid=sphinx_pid,
+                ue4_pid=ue4_pid,
+            )
+            updated = self.state.get(drone_id)
+            assert updated is not None
+            log.info(
+                "spawned drone %s instance=%d sphinx_pid=%s ue4_pid=%s endpoint=%s",
+                drone_id, instance_id, sphinx_pid, ue4_pid, endpoint.display(),
+            )
+            return updated
+
+    def stop(self, drone_id: str) -> None:
+        with self._lock:
+            rec = self.state.get(drone_id)
+            if rec is None:
+                raise KeyError(drone_id)
+            for pid in (rec.sphinx_pid, rec.ue4_pid):
+                if pid:
+                    self._terminate_pid(pid)
+            self._safe_teardown(rec.instance_id)
+            self.state.update_status(drone_id, status="stopped")
+            log.info("stopped drone %s (instance=%d)", drone_id, rec.instance_id)
+
+    def delete(self, drone_id: str) -> None:
+        """Stop the drone and remove its row from state."""
+        with self._lock:
+            rec = self.state.get(drone_id)
+            if rec is None:
+                return
+            try:
+                self.stop(drone_id)
+            except KeyError:
+                pass
+            self.state.delete(drone_id)
+            log.info("deleted drone %s", drone_id)
+
+    def restart(self, drone_id: str) -> DroneRecord:
+        """Stop and respawn with the same parameters and instance_id.
+
+        The drone_id changes (a fresh UUID is minted) but the instance_id
+        stays the same, so external clients tracking ``host:port``
+        keep working seamlessly. We delete the old stopped row before
+        respawning so the unique instance_id constraint doesn't fire.
+        """
+        with self._lock:
+            rec = self.state.get(drone_id)
+            if rec is None:
+                raise KeyError(drone_id)
+            self.stop(drone_id)
+            # Drop the stopped row first; otherwise the new row's
+            # instance_id collides with it on INSERT.
+            self.state.delete(drone_id)
+            # Tiny pause to let the kernel release the port and netns
+            # before we try to bind again.
+            time.sleep(1.0)
+            return self.spawn(LaunchRequest(
+                drone_profile=rec.drone_type,
+                world_name=rec.world_app,
+                instance_id=rec.instance_id,
+                firmware_url=rec.firmware_url,
+            ))
+
+    def restart_all(self) -> list[DroneRecord]:
+        with self._lock:
+            running = [r for r in self.state.list_all() if r.status == "running"]
+            return [self.restart(r.drone_id) for r in running]
+
+    def stop_all(self) -> int:
+        with self._lock:
+            running = [r for r in self.state.list_all() if r.status == "running"]
+            for r in running:
+                try:
+                    self.stop(r.drone_id)
+                except Exception as e:
+                    log.warning("stop_all: failed to stop %s: %s", r.drone_id, e)
+            return len(running)
+
+    def list_drones(self) -> list[DroneRecord]:
+        recs = self.state.list_all()
+        for r in recs:
+            r.extras["alive"] = self._is_alive(r)
+        return recs
+
+    def connections_for(self, drone_id: str) -> dict[str, Any]:
+        rec = self.state.get(drone_id)
+        if rec is None:
+            raise KeyError(drone_id)
+        port = rec.drone_port
+        if not port:
+            return {"drone_id": drone_id, "note": "no port (netns mode); use ss/ip on host"}
+        return {
+            "drone_id": drone_id,
+            "endpoint": f"{rec.drone_ip}:{port}",
+            "listeners_pids": listening_pids_on_port(port),
+            "established_peers": established_peers_to_port(port),
+        }
+
+    def reconcile_on_startup(self) -> None:
+        """Find rows whose pids are dead and mark them stopped. Called
+        once when the management service boots so stale rows from a
+        previous run don't lie about being live."""
+        with self._lock:
+            for r in self.state.list_all(status="running"):
+                alive = self._is_alive(r)
+                if not alive:
+                    log.info(
+                        "reconcile: drone %s pids %s/%s dead, marking stopped",
+                        r.drone_id, r.sphinx_pid, r.ue4_pid,
+                    )
+                    self.state.update_status(r.drone_id, "stopped")
+
+    # ─── internals ───────────────────────────────────────────────
+
+    def _allocate_instance_id(self) -> int:
+        used = self.state.used_instance_ids()
+        for i in range(1, self.max_drones + 1):
+            if i not in used:
+                return i
+        raise RuntimeError(f"all {self.max_drones} instance slots in use")
+
+    def _launch_subprocesses(
+        self,
+        drone_id: str,
+        instance_id: int,
+        descriptor_path: str,
+        world,  # WorldEntry
+        endpoint: DroneEndpoint,
+        firmware_url: str | None,
+    ) -> tuple[int, int]:
+        """Start the sphinx + UE pair. Returns (sphinx_pid, ue4_pid).
+
+        DRY-RUN MODE replaces both processes with a long-running
+        ``sleep`` so the rest of the supervisor can be exercised
+        locally.
+
+        REAL MODE: this is the part most likely to need iteration on
+        your specific Sphinx version. The exact CLI flags for "spawn
+        on a specific port" / "spawn in a specific netns" change
+        between Sphinx releases. The default below is a best-effort
+        construction; verify it against your installed Sphinx and
+        adjust ``_sphinx_argv`` if needed.
+        """
+        drone_log_dir = self.log_dir / drone_id
+        drone_log_dir.mkdir(parents=True, exist_ok=True)
+        sphinx_log = open(drone_log_dir / "sphinx.log", "ab")
+        ue4_log = open(drone_log_dir / "ue4.log", "ab")
+
+        if self.dry_run:
+            sleeper = ["sleep", "999999"]
+            # IMPORTANT: setsid detaches the child into its own process
+            # group. Without this, killpg(getpgid(child)) on stop kills
+            # the management service itself, since both processes share
+            # the parent's group. This applies in dry-run too — the
+            # "real" branch already does it.
+            sphinx_proc = subprocess.Popen(
+                sleeper,
+                stdout=sphinx_log,
+                stderr=subprocess.STDOUT,
+                preexec_fn=os.setsid,
+            )
+            ue4_proc = subprocess.Popen(
+                sleeper,
+                stdout=ue4_log,
+                stderr=subprocess.STDOUT,
+                preexec_fn=os.setsid,
+            )
+            return sphinx_proc.pid, ue4_proc.pid
+
+        sphinx_argv, sphinx_env = self._sphinx_argv(
+            instance_id=instance_id,
+            descriptor_path=descriptor_path,
+            firmware_url=firmware_url,
+            config_file=world.config_file,
+            endpoint=endpoint,
+        )
+        ue4_argv, ue4_env = self._ue4_argv(
+            world_binary=world.binary,
+            instance_id=instance_id,
+            endpoint=endpoint,
+        )
+
+        # If netns, prefix with ``ip netns exec <ns>`` so the child runs
+        # inside the namespace.
+        if endpoint.netns:
+            sphinx_argv = ["sudo", "-n", "ip", "netns", "exec", endpoint.netns, *sphinx_argv]
+            ue4_argv = ["sudo", "-n", "ip", "netns", "exec", endpoint.netns, *ue4_argv]
+
+        sphinx_proc = subprocess.Popen(
+            sphinx_argv,
+            stdout=sphinx_log,
+            stderr=subprocess.STDOUT,
+            env={**os.environ, **sphinx_env},
+            preexec_fn=os.setsid,  # own process group → killpg works
+        )
+        # Tiny wait so Sphinx claims its IPC sockets before UE attaches.
+        time.sleep(0.5)
+        ue4_proc = subprocess.Popen(
+            ue4_argv,
+            stdout=ue4_log,
+            stderr=subprocess.STDOUT,
+            env={**os.environ, **ue4_env},
+            preexec_fn=os.setsid,
+        )
+        return sphinx_proc.pid, ue4_proc.pid
+
+    def _sphinx_argv(
+        self,
+        instance_id: int,
+        descriptor_path: str,
+        firmware_url: str | None,
+        config_file: str | None,
+        endpoint: DroneEndpoint,
+    ) -> tuple[list[str], dict[str, str]]:
+        """Build the `sphinx` argv. Adjust for your Sphinx version."""
+        sphinx_bin = (self.config.get("sphinx", {}) or {}).get(
+            "binary", "/usr/bin/sphinx"
+        )
+        argv: list[str] = [sphinx_bin]
+        # Sphinx accepts the drone descriptor with "::firmware=..." appended.
+        descriptor_arg = descriptor_path
+        if firmware_url:
+            descriptor_arg = f"{descriptor_path}::firmware={firmware_url}"
+        argv.append(descriptor_arg)
+        if config_file:
+            argv.extend(["--config-file", config_file])
+        # NOTE: Sphinx instance/port flags vary by release. The most
+        # commonly used flag (Sphinx ≥ 2.5) is "--instance" for
+        # multi-instance bookkeeping. Double-check `sphinx --help` on
+        # your installed version and adjust if needed.
+        argv.extend(["--instance", str(instance_id)])
+        env: dict[str, str] = {}
+        # Some Sphinx releases let you bind firmwared to a specific port
+        # via env var. If yours doesn't, the netns mode below becomes
+        # mandatory for >1 drone on the same host.
+        if endpoint.port is not None:
+            env["SPHINX_PORT"] = str(endpoint.port)
+        return argv, env
+
+    def _ue4_argv(
+        self,
+        world_binary: str,
+        instance_id: int,
+        endpoint: DroneEndpoint,
+    ) -> tuple[list[str], dict[str, str]]:
+        """Build the parrot-ue4-<world> argv."""
+        argv: list[str] = [world_binary]
+        # Parrot's UE4 binaries accept -ResX/-ResY/-Windowed for size,
+        # and may accept a non-default port via -Port. Verify on your
+        # version.
+        argv.extend(["-ResX=1280", "-ResY=720", "-Windowed"])
+        if endpoint.port is not None:
+            argv.append(f"-Port={endpoint.port}")
+        return argv, {}
+
+    def _terminate_pid(self, pid: int) -> None:
+        try:
+            os.killpg(os.getpgid(pid), signal.SIGTERM)
+        except (ProcessLookupError, PermissionError):
+            return
+        deadline = time.time() + 5.0
+        while time.time() < deadline:
+            try:
+                os.kill(pid, 0)
+            except ProcessLookupError:
+                return
+            time.sleep(0.1)
+        try:
+            os.killpg(os.getpgid(pid), signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            return
+
+    def _safe_teardown(self, instance_id: int) -> None:
+        try:
+            self.network.teardown(instance_id)
+        except Exception as e:
+            log.warning("teardown of instance %d failed: %s", instance_id, e)
+
+    def _is_alive(self, rec: DroneRecord) -> bool:
+        for pid in (rec.sphinx_pid, rec.ue4_pid):
+            if not pid:
+                continue
+            try:
+                os.kill(pid, 0)
+            except ProcessLookupError:
+                return False
+            except PermissionError:
+                # The pid exists, we just don't own it (rare in our
+                # context). Treat as alive.
+                return True
+        return rec.status == "running" and rec.sphinx_pid is not None
