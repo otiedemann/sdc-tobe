@@ -74,11 +74,12 @@ DEFAULT_OUT_YAML = Path(__file__).parent / "out" / "arena.yml"
 #   back  (arena y=10.8, inward arena -Y → UE -X)  yaw 180°
 #   left  (arena x=-10,  inward arena +X → UE -Y)  yaw -90°
 #   right (arena x=+10,  inward arena -X → UE +Y)  yaw +90°
-# Test mode per user request: Pitch=90 (rotation around Y-axis) and
-# Yaw=0 for ALL wall markers, regardless of direction_deg. This lets
-# us see what raw "pitch=90 + yaw=0" does to the marker FBX in the
-# simulator without any per-wall yaw variation.
-MARKER_PITCH_DEG: float = 90.0
+# Test mode per user request: Pitch=0, Yaw=0, Roll=0 — NO rotation
+# at all in the YAML. This shows what the raw marker FBX looks like
+# in the simulator after Sphinx's axis conversion alone (no extra
+# rotation on top). Useful for diagnosing which axis the FBX-baked
+# rotation actually ended up on.
+MARKER_PITCH_DEG: float = 0.0
 _DEBUG_FORCE_YAW_ZERO = True
 
 # Per-marker direction is now read directly from arena_config.json's
