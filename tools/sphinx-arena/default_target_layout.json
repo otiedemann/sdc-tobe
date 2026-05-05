@@ -1,5 +1,5 @@
 {
-  "_comment": "SDC26 target box placements for the Sphinx arena. Six boxes total: 3 blue (IDs 31-33) start in the blue home zone, 3 red (IDs 41-43) start in the red home zone. The remaining valid SDC26 IDs (34-36, 44-46) are listed but disabled by default \u2014 they're the spares used during a match if a box is moved or a fresh sticker is needed. Coordinates: arena frame, x \u2208 [-10, 10] m, y \u2208 [0, 10.8] m. z = MARKER centre height in metres (was box-top in earlier revisions). Each marker is 19\u00d719 cm, mounted 1 m above the floor on a 45\u00b0-tilted plate facing upward and toward the arena centre, so a drone overhead can see them at any approach angle.",
+  "_comment": "SDC26 target box placements for the Sphinx arena. Six boxes total: 3 blue (IDs 31-33) start in the blue home zone (arena x>0, right side); 3 red (IDs 41-43) start in the red home zone (arena x<0, left side). Markers are vertical like the wall markers, facing inward toward the arena centre, then rotated 30\u00b0 on the X axis. Concretely: red roll = 210\u00b0 (= 180\u00b0 + 30\u00b0), blue roll = 30\u00b0 (= 0\u00b0 + 30\u00b0), pitch=0, yaw=0, z = 1.0 m. The remaining valid SDC26 IDs (34-36, 44-46) are listed but disabled \u2014 they're the spares used during a match if a box is moved or a fresh sticker is needed.",
   "marker_size_m": 0.19,
   "box_size_m": 0.5,
   "boxes": [
@@ -9,10 +9,11 @@
       "label": "Red top",
       "x": -5.0,
       "y": 8.0,
-      "z": 0.5,
-      "pitch_deg": 90.0,
+      "z": 1.0,
+      "pitch_deg": 0.0,
       "yaw_deg": 0.0,
-      "enabled": true
+      "enabled": true,
+      "roll_deg": 210.0
     },
     {
       "id": 42,
@@ -20,10 +21,11 @@
       "label": "Red middle",
       "x": -8.0,
       "y": 5.4,
-      "z": 0.5,
-      "pitch_deg": 90.0,
+      "z": 1.0,
+      "pitch_deg": 0.0,
       "yaw_deg": 0.0,
-      "enabled": true
+      "enabled": true,
+      "roll_deg": 210.0
     },
     {
       "id": 43,
@@ -31,10 +33,11 @@
       "label": "Red bottom",
       "x": -5.0,
       "y": 3.0,
-      "z": 0.5,
-      "pitch_deg": 90.0,
+      "z": 1.0,
+      "pitch_deg": 0.0,
       "yaw_deg": 0.0,
-      "enabled": true
+      "enabled": true,
+      "roll_deg": 210.0
     },
     {
       "id": 31,
@@ -42,10 +45,11 @@
       "label": "Blue top",
       "x": 5.0,
       "y": 8.0,
-      "z": 0.5,
-      "pitch_deg": 90.0,
+      "z": 1.0,
+      "pitch_deg": 0.0,
       "yaw_deg": 0.0,
-      "enabled": true
+      "enabled": true,
+      "roll_deg": 30.0
     },
     {
       "id": 32,
@@ -53,10 +57,11 @@
       "label": "Blue middle",
       "x": 8.0,
       "y": 5.4,
-      "z": 0.5,
-      "pitch_deg": 90.0,
+      "z": 1.0,
+      "pitch_deg": 0.0,
       "yaw_deg": 0.0,
-      "enabled": true
+      "enabled": true,
+      "roll_deg": 30.0
     },
     {
       "id": 33,
@@ -64,10 +69,11 @@
       "label": "Blue bottom",
       "x": 5.0,
       "y": 3.0,
-      "z": 0.5,
-      "pitch_deg": 90.0,
+      "z": 1.0,
+      "pitch_deg": 0.0,
       "yaw_deg": 0.0,
-      "enabled": true
+      "enabled": true,
+      "roll_deg": 30.0
     },
     {
       "id": 34,
@@ -75,10 +81,11 @@
       "label": "Blue spare 1",
       "x": 0.0,
       "y": 0.0,
-      "z": 0.5,
-      "pitch_deg": 90.0,
+      "z": 1.0,
+      "pitch_deg": 0.0,
       "yaw_deg": 0.0,
-      "enabled": false
+      "enabled": false,
+      "roll_deg": 30.0
     },
     {
       "id": 35,
@@ -86,10 +93,11 @@
       "label": "Blue spare 2",
       "x": 0.0,
       "y": 0.0,
-      "z": 0.5,
-      "pitch_deg": 90.0,
+      "z": 1.0,
+      "pitch_deg": 0.0,
       "yaw_deg": 0.0,
-      "enabled": false
+      "enabled": false,
+      "roll_deg": 30.0
     },
     {
       "id": 36,
@@ -97,10 +105,11 @@
       "label": "Blue spare 3",
       "x": 0.0,
       "y": 0.0,
-      "z": 0.5,
-      "pitch_deg": 90.0,
+      "z": 1.0,
+      "pitch_deg": 0.0,
       "yaw_deg": 0.0,
-      "enabled": false
+      "enabled": false,
+      "roll_deg": 30.0
     },
     {
       "id": 44,
@@ -108,10 +117,11 @@
       "label": "Red spare 1",
       "x": 0.0,
       "y": 0.0,
-      "z": 0.5,
-      "pitch_deg": 90.0,
+      "z": 1.0,
+      "pitch_deg": 0.0,
       "yaw_deg": 0.0,
-      "enabled": false
+      "enabled": false,
+      "roll_deg": 210.0
     },
     {
       "id": 45,
@@ -119,10 +129,11 @@
       "label": "Red spare 2",
       "x": 0.0,
       "y": 0.0,
-      "z": 0.5,
-      "pitch_deg": 90.0,
+      "z": 1.0,
+      "pitch_deg": 0.0,
       "yaw_deg": 0.0,
-      "enabled": false
+      "enabled": false,
+      "roll_deg": 210.0
     },
     {
       "id": 46,
@@ -130,10 +141,11 @@
       "label": "Red spare 3",
       "x": 0.0,
       "y": 0.0,
-      "z": 0.5,
-      "pitch_deg": 90.0,
+      "z": 1.0,
+      "pitch_deg": 0.0,
       "yaw_deg": 0.0,
-      "enabled": false
+      "enabled": false,
+      "roll_deg": 210.0
     }
   ]
 }

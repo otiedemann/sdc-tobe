@@ -63,6 +63,85 @@ def _port_in_use(port: int) -> bool:
         s.close()
 
 
+def _wait_for_port_release(port: int | None, timeout_s: float = 8.0,
+                           poll_interval_s: float = 0.2) -> bool:
+    """Poll until ``port`` is free (i.e. nothing is bound to it on the
+    loopback interface). Returns True if released within ``timeout_s``,
+    False on timeout. Used after killing a drone process to make sure
+    the kernel has released the netns / port BEFORE we try to bind it
+    again — earlier code used a fixed 1.0 s sleep which was sometimes
+    too short on a busy host, leaving the next spawn to fail with
+    EADDRINUSE."""
+    if port is None or int(port) <= 0:
+        return True
+    deadline = time.time() + float(timeout_s)
+    while time.time() < deadline:
+        if not _port_in_use(int(port)):
+            return True
+        time.sleep(poll_interval_s)
+    return not _port_in_use(int(port))
+
+
+def _find_port_holders(port: int) -> list[int]:
+    """Return the list of PIDs that are LISTEN-bound to ``port`` on this
+    host. Uses /proc/net/tcp directly (no external commands) so it works
+    even on minimal containers without ss/lsof/fuser installed.
+
+    Used to recover from cases where a stop_fc() PID-kill missed a
+    forked child or the recorded PID was stale — the port holder is the
+    ground truth of "what's actually running"."""
+    import struct
+    pids: set[int] = set()
+    # Walk /proc/net/tcp + tcp6 and extract inodes for sockets in
+    # LISTEN state (state hex 0x0A) on the requested port.
+    target_inodes: set[str] = set()
+    for proc_file in ("/proc/net/tcp", "/proc/net/tcp6"):
+        try:
+            with open(proc_file) as f:
+                next(f)  # skip header
+                for line in f:
+                    parts = line.split()
+                    if len(parts) < 10:
+                        continue
+                    local = parts[1]   # e.g. "0100007F:1F40"
+                    state = parts[3]   # "0A" = LISTEN
+                    inode = parts[9]
+                    if state != "0A":
+                        continue
+                    try:
+                        local_port = int(local.split(":")[1], 16)
+                    except (IndexError, ValueError):
+                        continue
+                    if local_port == int(port):
+                        target_inodes.add(inode)
+        except FileNotFoundError:
+            continue
+    if not target_inodes:
+        return []
+    # Now find which PIDs own these inodes by scanning /proc/<pid>/fd/
+    # symlinks for "socket:[<inode>]". Skip processes we can't read.
+    try:
+        proc_pids = [int(p) for p in os.listdir("/proc") if p.isdigit()]
+    except OSError:
+        return []
+    for pid in proc_pids:
+        fd_dir = f"/proc/{pid}/fd"
+        try:
+            for fd in os.listdir(fd_dir):
+                try:
+                    target = os.readlink(f"{fd_dir}/{fd}")
+                except (FileNotFoundError, PermissionError, OSError):
+                    continue
+                if target.startswith("socket:["):
+                    inode = target[8:-1]
+                    if inode in target_inodes:
+                        pids.add(pid)
+                        break
+        except (FileNotFoundError, PermissionError):
+            continue
+    return sorted(pids)
+
+
 def _proc_alive_running(pid: int) -> bool:
     """True iff pid exists AND is in a running/sleeping state.
     Returns False for zombie ('Z') or dead processes — which
@@ -385,16 +464,35 @@ class Launcher:
             )
             self.state.upsert_fc(rec)
 
-            # Pre-flight: refuse to start if something's already on the
-            # FC's HTTP port. Without this the subprocess would launch
-            # and silently fail to bind, leaving the launcher reporting
-            # "running" while the actual python died 100 ms later.
+            # Pre-flight: if the FC's HTTP port is already bound, try to
+            # auto-recover before giving up. Common case: previous FC
+            # crashed (or stop_fc() raced a child fork) and left a
+            # process holding the port that we never cleaned up.
             if not self.dry_run and _port_in_use(int(http_port)):
-                raise RuntimeError(
-                    f"port {http_port} already in use — another FC may be "
-                    f"running outside sphinx-control. `sudo ss -tlnp 'sport "
-                    f"= :{http_port}'` to find it."
-                )
+                holders = _find_port_holders(int(http_port))
+                if holders:
+                    log.warning(
+                        "port %d in use by PIDs %s on FC startup — "
+                        "auto-cleaning before retry", http_port, holders,
+                    )
+                    for h_pid in holders:
+                        try:
+                            self._terminate_pid(h_pid)
+                        except Exception as e:
+                            log.warning(
+                                "auto-cleanup kill pid=%d failed: %s",
+                                h_pid, e,
+                            )
+                    _wait_for_port_release(int(http_port), timeout_s=5.0)
+                if _port_in_use(int(http_port)):
+                    # Still bound after our cleanup — give up with a
+                    # message that explains where to look.
+                    raise RuntimeError(
+                        f"port {http_port} already in use and "
+                        f"sphinx-control's auto-cleanup couldn't free it. "
+                        f"Inspect with `sudo ss -tlnp 'sport = :{http_port}'` "
+                        f"and kill the holder manually."
+                    )
 
             try:
                 pid = self._launch_fc(
@@ -440,16 +538,67 @@ class Launcher:
             return updated
 
     def stop_fc(self) -> None:
+        """Stop the flight controller and verify it's actually dead.
+
+        Hardened over the naive 'kill PID, mark stopped' approach
+        because users reported having to manually kill PIDs from the
+        terminal:
+
+          1. Kill the recorded PID (process group via SIGTERM → SIGKILL).
+          2. WAIT for the FC's HTTP port to be released — this is the
+             real signal that the FC is gone (a zombie process can
+             still exist after kill, but it can't hold a port).
+          3. If the port is STILL bound after the wait, scan
+             /proc/net/tcp to find whatever is holding it (could be a
+             forked child whose PID we never tracked, or a manually-
+             started process), and kill that too.
+          4. State-store row is marked 'stopped' regardless — so the
+             UI never gets stuck thinking the FC is running.
+        """
         with self._lock:
             fc = self.state.current_fc()
             if fc is None:
                 return
+            fc_id = fc.fc_id
+            port = fc.http_port
             if fc.pid:
                 self._terminate_pid(fc.pid)
-            self.state.update_fc_status(fc.fc_id, "stopped")
-            log.info("stopped fc %s", fc.fc_id)
+            # Always mark the state row stopped so the UI is consistent
+            # even if subsequent cleanup steps below have hiccups.
+            self.state.update_fc_status(fc_id, "stopped")
+            # Verify the port is actually freed; if not, hunt down
+            # whatever's still bound to it.
+            if port and not _wait_for_port_release(port, timeout_s=4.0):
+                holders = _find_port_holders(int(port))
+                if holders:
+                    log.warning(
+                        "fc %s port %d still bound after PID kill — "
+                        "force-killing port holder PIDs %s",
+                        fc_id, port, holders,
+                    )
+                    for pid in holders:
+                        try:
+                            self._terminate_pid(pid)
+                        except Exception as e:
+                            log.warning(
+                                "force-kill of port-holder pid=%d failed: %s",
+                                pid, e,
+                            )
+                    _wait_for_port_release(port, timeout_s=4.0)
+                else:
+                    log.warning(
+                        "fc %s port %d still bound but no holder found "
+                        "in /proc/net/tcp (kernel TIME_WAIT?)",
+                        fc_id, port,
+                    )
+            log.info("stopped fc %s", fc_id)
 
     def restart_fc(self) -> FlightControllerRecord:
+        """Stop + start the FC reliably.
+
+        Drops the stopped state row so any subsequent sweep doesn't
+        misattribute it, then waits for the port to be free before
+        re-launching."""
         with self._lock:
             fc = self.state.current_fc()
             if fc is None:
@@ -458,9 +607,14 @@ class Launcher:
                 cwd=fc.cwd, script=fc.script,
                 http_port=fc.http_port, anafi_ip=fc.anafi_ip,
             )
+            port = fc.http_port
             self.stop_fc()
             self.state.delete_fc(fc.fc_id)
-            time.sleep(0.5)
+            # Wait for full port release before starting. stop_fc() did
+            # this internally with a 4-second budget; the second wait
+            # below is a safety net for slower hosts.
+            _wait_for_port_release(port, timeout_s=4.0)
+            time.sleep(0.3)
             return self.start_fc(req)
 
     def current_flight_controller(self) -> FlightControllerRecord | None:
@@ -651,17 +805,46 @@ class Launcher:
                  drone_id, rec.instance_id)
 
     def delete(self, drone_id: str) -> None:
-        """Stop the drone and remove its row from state."""
+        """Stop the drone, tear down its network namespace, and remove
+        its row from state. After this returns the drone's port is
+        guaranteed-or-best-effort released so a subsequent ``spawn()``
+        with the same instance_id won't race the kernel's port
+        teardown.
+
+        Hardening over the previous naive version:
+          - Always run network.teardown(), even if stop() failed (the
+            previous code skipped teardown on stop errors which left
+            stale network namespaces around).
+          - Wait for the drone port to be released before returning.
+          - Return idempotently for unknown drone_ids (lookup misses
+            after a crash were silently doing nothing — same here, but
+            documented).
+        """
         with self._lock:
             rec = self.state.get(drone_id)
             if rec is None:
+                log.info("delete: drone %s not in state — nothing to do",
+                         drone_id)
                 return
+            instance_id = rec.instance_id
+            port = rec.drone_port
             try:
                 self.stop(drone_id)
             except KeyError:
                 pass
+            except Exception as e:
+                log.warning("delete: stop(%s) failed: %s — continuing "
+                            "with teardown anyway", drone_id, e)
+            # Always tear down the network namespace, even if stop()
+            # raised. Stale netns are the #1 cause of the next spawn
+            # failing.
+            self._safe_teardown(instance_id)
             self.state.delete(drone_id)
-            log.info("deleted drone %s", drone_id)
+            # Wait for port to be released so an immediately-following
+            # spawn at the same instance_id doesn't race the kernel.
+            _wait_for_port_release(port, timeout_s=5.0)
+            log.info("deleted drone %s (instance=%d, port=%s)",
+                     drone_id, instance_id, port)
 
     def restart(self, drone_id: str) -> DroneRecord:
         """Stop and respawn with the same parameters and instance_id.
@@ -670,24 +853,63 @@ class Launcher:
         stays the same, so external clients tracking ``host:port``
         keep working seamlessly. We delete the old stopped row before
         respawning so the unique instance_id constraint doesn't fire.
+
+        Reliability improvements over the naive 'stop, sleep 1s, spawn'
+        approach (added because users reported the second spawn
+        intermittently failed when the first drone had crashed):
+          1. WAIT for the drone's port to actually be released by the
+             kernel before re-binding (poll up to 8s instead of a
+             fixed 1.0 s sleep). On a loaded host the netns teardown
+             can easily take 2-3 s.
+          2. RETRY the spawn once on failure, with a fresh teardown
+             between attempts. This catches the case where the first
+             spawn raced with stale state.
         """
         with self._lock:
             rec = self.state.get(drone_id)
             if rec is None:
                 raise KeyError(drone_id)
+            old_port = rec.drone_port
+            old_instance = rec.instance_id
             self.stop(drone_id)
             # Drop the stopped row first; otherwise the new row's
             # instance_id collides with it on INSERT.
             self.state.delete(drone_id)
-            # Tiny pause to let the kernel release the port and netns
-            # before we try to bind again.
-            time.sleep(1.0)
-            return self.spawn(LaunchRequest(
+            # Wait for the kernel to actually free the port before we
+            # try to rebind it. Falls back to a fixed sleep if the
+            # port wasn't released within the timeout — better than
+            # giving up entirely.
+            released = _wait_for_port_release(old_port, timeout_s=8.0)
+            if not released:
+                log.warning(
+                    "port %s still in use after 8s; sleeping a further 2s "
+                    "and trying spawn anyway", old_port,
+                )
+                time.sleep(2.0)
+            else:
+                # Brief settling pause even after the port released.
+                time.sleep(0.2)
+
+            launch_req = LaunchRequest(
                 drone_profile=rec.drone_type,
                 world_name=rec.world_app,
-                instance_id=rec.instance_id,
+                instance_id=old_instance,
                 firmware_url=rec.firmware_url,
-            ))
+            )
+            try:
+                return self.spawn(launch_req)
+            except Exception as first_err:
+                log.warning(
+                    "first respawn of drone %s (instance=%d) failed: %s — "
+                    "tearing down and retrying once", drone_id,
+                    old_instance, first_err,
+                )
+                self._safe_teardown(old_instance)
+                # Sweep any zombies/leftover rows the failed spawn left.
+                self.state.delete_stopped_at_instance_id(old_instance)
+                _wait_for_port_release(old_port, timeout_s=5.0)
+                time.sleep(0.5)
+                return self.spawn(launch_req)
 
     def restart_all(self) -> list[DroneRecord]:
         with self._lock:

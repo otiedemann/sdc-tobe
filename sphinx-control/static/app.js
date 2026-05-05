@@ -71,15 +71,28 @@ async function loadWorlds() {
   const worlds = await jget("/api/worlds");
   const sel = $("#world-select");
   sel.innerHTML = "";
-  for (const w of worlds) {
+  // Default selection: prefer "sdc_arena" if it's available; else fall
+  // back to the first available world. (When running this control plane,
+  // we almost always want to spawn into the SDC arena, so make that
+  // the one-click choice.)
+  const DEFAULT_WORLD = "sdc_arena";
+  let defaultIdx = -1;
+  worlds.forEach((w, i) => {
+    if (w.name === DEFAULT_WORLD && w.available) defaultIdx = i;
+  });
+  if (defaultIdx === -1) {
+    defaultIdx = worlds.findIndex(w => w.available);
+  }
+  worlds.forEach((w, i) => {
     const opt = document.createElement("option");
     opt.value = w.name;
     opt.textContent = w.available
       ? `${w.name} — ${w.description || w.binary}`
       : `${w.name} (unavailable: ${w.unavailable_reason})`;
     if (!w.available) opt.disabled = true;
+    if (i === defaultIdx) opt.selected = true;
     sel.appendChild(opt);
-  }
+  });
 }
 
 async function loadDrones() {
