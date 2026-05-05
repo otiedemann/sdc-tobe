@@ -87,15 +87,11 @@ def _build_plane(name: str) -> "bpy.types.Object":
     bpy.ops.mesh.primitive_plane_add(size=1.0, location=(0, 0, 0))
     obj = bpy.context.active_object
     obj.name = name
-    # X-axis rotation +90° to stand the plane upright, plus Z-axis
-    # rotation -90° to spin its normal into the +Y Blender direction.
-    # Under axis_forward="-Y", axis_up="-Z" FBX export this lands the
-    # marker plane vertical in UE with normal +Y (UE-right).
-    #
-    # User's empirical hint: 'return to the original version (X-axis
-    # rotation) and rotate by Z-axis' — this is exactly that
-    # combination (X+90 then Z-90).
-    obj.rotation_euler = (math.pi / 2.0, 0.0, -math.pi / 2.0)
+    # X-axis rotation +90° only — the cleanest rotation that puts the
+    # plane upright in Blender (XZ-plane, normal -Y in Blender). Under
+    # the Sphinx -Y/-Z FBX export, that lands the marker plane
+    # vertical in UE with normal +X. YAML yaw alone aims it from there.
+    obj.rotation_euler = (math.pi / 2.0, 0.0, 0.0)
     bpy.ops.object.transform_apply(location=False, rotation=True, scale=False)
     return obj
 
