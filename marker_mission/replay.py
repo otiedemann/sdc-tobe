@@ -121,6 +121,26 @@ class FlightReplay:
         # before the column existed.
         self.step_idx_per_row: List[int] = self._build_step_idx_per_row(rows)
 
+        # Per-flight arena. Recent flights save the active arena layout
+        # at TAKEOFF as ``arena_config.json`` next to the CSV, pinning
+        # the geometry that was used. Older flights don't have this
+        # file -- fall back to whatever arena is currently active so
+        # the position view still draws (with whatever marker layout
+        # the operator has now). None disables the yaw arrow only;
+        # the position dot still works either way.
+        self.arena = None
+        try:
+            from .arena import ArenaConfig, load_priority_arena
+            arena_path = self.dir / "arena_config.json"
+            if arena_path.is_file():
+                self.arena = ArenaConfig.load(arena_path)
+            else:
+                self.arena = load_priority_arena()
+        except Exception as e:
+            print(f"[replay] arena load failed: {e}; "
+                  f"position view will skip the yaw arrow")
+            self.arena = None
+
         # Annotated.mp4 already has the HUD baked in -- prefer it.
         # Fall back to raw.mp4 if annotated is missing for some reason.
         # NOTE: don't open the cv2.VideoCapture here. libavcodec's
@@ -508,6 +528,39 @@ class FlightReplay:
                 f"/ {self.duration_s:.1f}s"
             )
             self.state.phase_started_at = time.monotonic()
+
+            # Recompute arena_yaw_deg from CSV data so the position
+            # view's yaw arrow renders during replay. We need:
+            #   * the drone world position (just set above)
+            #   * the active marker's id and arena position
+            #   * the camera-frame yaw to that marker (from
+            #     ``yaw_to_marker_deg`` column)
+            # When any input is missing we leave arena_yaw_deg at None
+            # (the position dot still draws; only the arrow is
+            # skipped).
+            self.state.arena_yaw_deg = None
+            self.state.arena_yaw_updated_at = 0.0
+            if (world_pos is not None
+                    and seen
+                    and self.arena is not None
+                    and smoothed is not None):
+                try:
+                    mid = int(row.get("marker_id") or "")
+                except (TypeError, ValueError):
+                    mid = None
+                marker = (self.arena.markers.get(mid)
+                          if mid is not None else None)
+                if marker is not None:
+                    import math as _math
+                    yaw_to_marker = float(smoothed[1])  # smoothed = (d, yaw, hdg)
+                    dxm = float(marker.position_m[0]) - float(world_pos[0])
+                    dym = float(marker.position_m[1]) - float(world_pos[1])
+                    if dxm != 0.0 or dym != 0.0:
+                        bearing = _math.degrees(_math.atan2(dxm, dym))
+                        self.state.arena_yaw_deg = (
+                            ((bearing - yaw_to_marker + 540.0) % 360.0)
+                            - 180.0)
+                        self.state.arena_yaw_updated_at = time.monotonic()
 
     def _advance_video_to(self, target_t_s: float) -> None:
         """Advance the video to ``target_t_s`` (relative to flight

@@ -243,7 +243,6 @@ _VIDEO_AND_STATUS_HTML = """
       <div id="script-list" style="font-size:.85rem;"></div>
     </details>
     {% endif %}
-    {% if mode != 'replay' %}
     <h2>Position</h2>
     <div style="display:flex; gap:.6rem; align-items:center;
                 margin-bottom:.6rem;">
@@ -254,7 +253,6 @@ _VIDEO_AND_STATUS_HTML = """
                                     font-variant-numeric:tabular-nums;
                                     line-height:1.5;">—</div>
     </div>
-    {% endif %}
     <h2>{{ 'Replayed flight' if mode == 'replay' else 'Mission status' }}</h2>
     <table id="status">
       <tr><th>Phase</th><td id="s-phase">—</td></tr>
