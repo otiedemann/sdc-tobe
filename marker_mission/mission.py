@@ -281,10 +281,14 @@ def cmd_fly(args: argparse.Namespace) -> int:
     recording_paused = threading.Event()
     recording_paused.set()
 
-    AIRBORNE_PHASES = {Phase.TAKEOFF, Phase.SEARCH, Phase.ALIGN,
-                       Phase.HEIGHT_ALIGN, Phase.APPROACH, Phase.HOLD,
-                       Phase.IDLE, Phase.HEIGHT, Phase.DANCE,
-                       Phase.LAND}
+    # Phases during which we record video + log CSV. Defined as a
+    # denylist (anything that's NOT pre-flight INIT or terminal
+    # DONE/ABORT) so a future Phase added to the enum is recorded by
+    # default -- the previous allowlist silently dropped Phase.GOTO
+    # and truncated flight-log.csv at TAKEOFF on every TO-using
+    # mission until 2026-05-05.
+    NON_AIRBORNE_PHASES = {Phase.INIT, Phase.DONE, Phase.ABORT}
+    AIRBORNE_PHASES = {p for p in Phase if p not in NON_AIRBORNE_PHASES}
 
     def on_phase_change(old_phase, new_phase, note):
         # First-tick of TAKEOFF in this mission: create the flight dir
