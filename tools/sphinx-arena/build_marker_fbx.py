@@ -87,10 +87,17 @@ def _build_plane(name: str) -> "bpy.types.Object":
     bpy.ops.mesh.primitive_plane_add(size=1.0, location=(0, 0, 0))
     obj = bpy.context.active_object
     obj.name = name
-    # Rotate 90° around X axis: +Z normal → -Y normal in Blender.
-    # Bake the rotation into the mesh so the exported FBX has clean
-    # vertex positions (no leftover object-level rotation).
-    obj.rotation_euler = (math.pi / 2.0, 0.0, 0.0)
+    # Rotate -90° around X axis: +Z normal → +Y normal in Blender.
+    # Under axis_forward="-Y" / axis_up="-Z" FBX export, Blender +Y
+    # lands at UE -X — i.e., the marker's outward normal is UE -X
+    # post-import. With this convention the YAML yaw conversion
+    # ``ue_yaw = direction_deg + 90°`` (in arena_to_sphinx_yaml.py)
+    # produces inward-facing markers on every wall.
+    #
+    # Earlier we tried +math.pi/2 here, which put the normal at UE +X
+    # and required the opposite ``ue_yaw = direction_deg - 90°`` —
+    # that combination produced markers facing OUTWARD on every wall.
+    obj.rotation_euler = (-math.pi / 2.0, 0.0, 0.0)
     bpy.ops.object.transform_apply(location=False, rotation=True, scale=False)
     return obj
 
