@@ -508,6 +508,8 @@ def main() -> int:
             yaw = arena_dir_to_ue_yaw(float(m["direction_deg"]))
         else:
             yaw = wall_yaws.get(wall, 0.0)
+        # Test: roll=90 only for long-wall markers (front + back)
+        roll = 90.0 if wall in ("front", "back") else 0.0
         # Push marker slightly inward from its arena_config position
         # so it sits in front of the pillar (visible from arena
         # interior). The inward direction is the marker's direction_deg
@@ -522,11 +524,9 @@ def main() -> int:
         # arena → UE conversion (metres) → centimetres
         ux_m, uy_m, uz_m = shifted_apply((marker_x, marker_y, float(m["z"])))
         loc_cm = (ux_m * 100.0, uy_m * 100.0, uz_m * 100.0)
-        # Marker FBX is already vertical (+X normal in UE) per
-        # build_marker_fbx.py; yaw spins it around UE +Z to face the
-        # direction specified by m["direction_deg"] (or the per-wall
-        # fallback). UE4 Rotator order is (Pitch, Yaw, Roll).
-        rot = (marker_pitch, yaw, 0.0)
+        # UE4 Rotator order is (Pitch, Yaw, Roll). roll set above per
+        # wall (test mode adds roll=90 to long walls).
+        rot = (marker_pitch, yaw, roll)
         fbx_path = fbx_dir / f"aruco_{mid:03d}.fbx"
         out_lines.append(emit_yaml_block(
             name=f"wall_{wall}_id_{mid:03d}_{m.get('label','').lower().replace(' ', '_') or 'marker'}",
