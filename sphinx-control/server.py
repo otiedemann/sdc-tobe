@@ -99,6 +99,12 @@ class SpawnRequest(BaseModel):
 
 class EnvSpawnRequest(BaseModel):
     world_name: str = Field(..., examples=["empty", "sdc_arena"])
+    res_x: int | None = Field(None, ge=320, le=4096,
+                              description="UE window width in pixels (default 1280)")
+    res_y: int | None = Field(None, ge=240, le=4096,
+                              description="UE window height in pixels (default 1024)")
+    hide_panels: bool | None = Field(None,
+                                     description="Send F10 to UE window so only the 3D viewport is visible")
 
 
 class FCSpawnRequest(BaseModel):
@@ -155,7 +161,12 @@ def api_get_environment():
 @app.post("/api/environment", status_code=201)
 def api_start_environment(req: EnvSpawnRequest):
     try:
-        env = launcher.start_environment(EnvironmentRequest(world_name=req.world_name))
+        env = launcher.start_environment(EnvironmentRequest(
+            world_name=req.world_name,
+            res_x=req.res_x,
+            res_y=req.res_y,
+            hide_panels=req.hide_panels,
+        ))
     except (KeyError, ValueError) as e:
         raise HTTPException(status_code=400, detail=str(e))
     except RuntimeError as e:

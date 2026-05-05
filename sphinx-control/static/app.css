@@ -136,6 +136,16 @@ input, select {
 }
 input:disabled, select:disabled { opacity: 0.5; }
 
+/* Checkbox-with-label (e.g. "Hide panels (3D only)" on the env form).
+   Override the column-flex so the label sits next to the checkbox. */
+label.checkbox-label {
+  flex-direction: row;
+  align-items: center;
+  gap: 6px;
+  cursor: pointer;
+}
+label.checkbox-label input[type="checkbox"] { margin: 0; }
+
 button {
   padding: 8px 16px;
   background: var(--accent);

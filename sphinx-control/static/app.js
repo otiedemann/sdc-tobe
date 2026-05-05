@@ -337,6 +337,14 @@ $("#env-form").addEventListener("submit", async (ev) => {
   ev.preventDefault();
   const fd = new FormData(ev.target);
   const body = { world_name: fd.get("world_name") };
+  // Optional UE window controls — only include if the user filled
+  // them in / changed defaults. Sending null is fine, the API treats
+  // missing fields as "use launcher defaults".
+  const rx = parseInt(fd.get("res_x"), 10);
+  const ry = parseInt(fd.get("res_y"), 10);
+  if (!Number.isNaN(rx)) body.res_x = rx;
+  if (!Number.isNaN(ry)) body.res_y = ry;
+  body.hide_panels = $("#env-hide-panels").checked;
   try {
     await jpost("/api/environment", body);
   } catch (e) {

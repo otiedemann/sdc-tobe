@@ -185,6 +185,11 @@ class EnvironmentRequest:
     """Start an environment (UE4 only) — drone-agnostic."""
 
     world_name: str
+    # Optional UE window settings; None falls back to launcher.config
+    # defaults (which themselves fall back to 1280x1024).
+    res_x: int | None = None
+    res_y: int | None = None
+    hide_panels: bool | None = None  # send F10 once UE window is up
 
 
 @dataclass
@@ -347,7 +352,10 @@ class Launcher:
             self.state.upsert_env(rec)
 
             try:
-                ue4_pid = self._launch_ue4(env_id=env_id, world=world)
+                ue4_pid = self._launch_ue4(
+                    env_id=env_id, world=world,
+                    res_x=req.res_x, res_y=req.res_y,
+                )
             except Exception as e:
                 self.state.update_env_status(env_id, "error", last_error=str(e))
                 raise
@@ -356,9 +364,17 @@ class Launcher:
             updated = self.state.get_env(env_id)
             assert updated is not None
             log.info(
-                "started env %s world=%s ue4_pid=%s",
+                "started env %s world=%s ue4_pid=%s res=%sx%s",
                 env_id, req.world_name, ue4_pid,
+                req.res_x or "default", req.res_y or "default",
             )
+            # If requested, send F10 to hide the HMI panels so only the
+            # 3D viewport is visible. Default is enabled for sdc_arena.
+            ue4_cfg = self.config.get("ue4", {}) or {}
+            hide = (req.hide_panels if req.hide_panels is not None
+                    else ue4_cfg.get("hide_panels_default", True))
+            if hide:
+                self._hide_ue4_panels()
             # NOTE: sphinx-cli world params (e.g. sky preset) can ONLY
             # be applied AFTER a drone (sphinx process) is spawned —
             # without sphinx, sphinx-cli reports "An instance of Sphinx
@@ -586,22 +602,20 @@ class Launcher:
             return updated
 
     def stop_fc(self) -> None:
-        """Stop the flight controller and verify it's actually dead.
+        """Stop the flight controller. Brain-dead simple now after
+        repeated user reports that the previous implementation didn't
+        work:
 
-        Hardened over the naive 'kill PID, mark stopped' approach
-        because users reported having to manually kill PIDs from the
-        terminal:
+          1. kill -9 fc.pid (SIGKILL, direct, no process-group dance,
+             no SIGTERM grace).
+          2. kill -9 any other PIDs holding the FC's HTTP port (catches
+             children that escaped the recorded PID, etc.).
+          3. Mark state stopped.
 
-          1. Kill the recorded PID (process group via SIGTERM → SIGKILL).
-          2. WAIT for the FC's HTTP port to be released — this is the
-             real signal that the FC is gone (a zombie process can
-             still exist after kill, but it can't hold a port).
-          3. If the port is STILL bound after the wait, scan
-             /proc/net/tcp to find whatever is holding it (could be a
-             forked child whose PID we never tracked, or a manually-
-             started process), and kill that too.
-          4. State-store row is marked 'stopped' regardless — so the
-             UI never gets stuck thinking the FC is running.
+        SIGKILL is unconditional — Olympe atexit hangs that previously
+        forced us into the SIGKILL fallback after a 1.5–5s SIGTERM grace
+        are now skipped entirely. The user pointed out 'all you need
+        is to send kill <pid>'. Done.
         """
         with self._lock:
             fc = self.state.current_fc()
@@ -609,40 +623,30 @@ class Launcher:
                 return
             fc_id = fc.fc_id
             port = fc.http_port
+            killed_pids = []
             if fc.pid:
-                self._terminate_pid(fc.pid)
-            # Always mark the state row stopped so the UI is consistent
-            # even if subsequent cleanup steps below have hiccups.
+                try:
+                    os.kill(fc.pid, signal.SIGKILL)
+                    killed_pids.append(fc.pid)
+                except ProcessLookupError:
+                    pass
+                except PermissionError as e:
+                    log.warning("SIGKILL fc.pid=%d denied: %s", fc.pid, e)
+            # Catch anything still on the port (forked children, orphan
+            # processes, etc.) — the port is the ground truth.
+            if port:
+                for h_pid in _find_port_holders(int(port)):
+                    if h_pid in killed_pids:
+                        continue
+                    try:
+                        os.kill(h_pid, signal.SIGKILL)
+                        killed_pids.append(h_pid)
+                        log.info("SIGKILL'd port-%d holder pid=%d",
+                                 port, h_pid)
+                    except (ProcessLookupError, PermissionError) as e:
+                        log.warning("SIGKILL pid=%d failed: %s", h_pid, e)
             self.state.update_fc_status(fc_id, "stopped")
-            # Verify the port is actually freed; if not, hunt down
-            # whatever's still bound to it. Tight timeouts here so the
-            # UI feels responsive — _terminate_pid above already waited
-            # the SIGTERM grace, so the port should be free within
-            # milliseconds of that returning.
-            if port and not _wait_for_port_release(port, timeout_s=1.5):
-                holders = _find_port_holders(int(port))
-                if holders:
-                    log.warning(
-                        "fc %s port %d still bound after PID kill — "
-                        "force-killing port holder PIDs %s",
-                        fc_id, port, holders,
-                    )
-                    for pid in holders:
-                        try:
-                            self._terminate_pid(pid)
-                        except Exception as e:
-                            log.warning(
-                                "force-kill of port-holder pid=%d failed: %s",
-                                pid, e,
-                            )
-                    _wait_for_port_release(port, timeout_s=1.5)
-                else:
-                    log.warning(
-                        "fc %s port %d still bound but no holder found "
-                        "in /proc/net/tcp (kernel TIME_WAIT?)",
-                        fc_id, port,
-                    )
-            log.info("stopped fc %s", fc_id)
+            log.info("stopped fc %s — killed pids=%s", fc_id, killed_pids)
 
     def restart_fc(self) -> FlightControllerRecord:
         """Stop + start the FC reliably.
@@ -1177,7 +1181,9 @@ class Launcher:
             self._refresh_session()
         return self.session.env if self.session else {}
 
-    def _launch_ue4(self, env_id: str, world) -> int:
+    def _launch_ue4(self, env_id: str, world,
+                     res_x: int | None = None,
+                     res_y: int | None = None) -> int:
         """Start the UE4 application for the environment. Returns
         ue4_pid. Drone-agnostic: no sphinx is started here."""
         env_log_dir = self.log_dir / env_id
@@ -1199,6 +1205,8 @@ class Launcher:
             instance_id=0,
             endpoint=None,
             config_file=world.config_file,
+            res_x=res_x,
+            res_y=res_y,
         )
         ue4_proc = subprocess.Popen(
             ue4_argv, stdout=ue4_log, stderr=subprocess.STDOUT,
@@ -1292,6 +1300,8 @@ class Launcher:
         instance_id: int,
         endpoint: DroneEndpoint | None,
         config_file: str | None = None,
+        res_x: int | None = None,
+        res_y: int | None = None,
     ) -> tuple[list[str], dict[str, str]]:
         """Build the parrot-ue4-<world> argv.
 
@@ -1303,10 +1313,13 @@ class Launcher:
         """
         argv: list[str] = [world_binary]
         # Parrot's UE4 binaries accept -ResX/-ResY/-Windowed for size.
-        # Resolution is intentionally generous so the operator can see
-        # the arena clearly via Sunshine — UE4 defaults to a small
-        # window otherwise.
-        argv.extend(["-ResX=1280", "-ResY=720", "-Windowed"])
+        # Resolution is configurable per env-start request; defaults
+        # come from launcher.config.ue4.res_x/res_y, falling back to
+        # 1280x1024 (operator's preferred default for the SDC arena).
+        ue4_cfg = self.config.get("ue4", {}) or {}
+        rx = int(res_x or ue4_cfg.get("res_x") or 1280)
+        ry = int(res_y or ue4_cfg.get("res_y") or 1024)
+        argv.extend([f"-ResX={rx}", f"-ResY={ry}", "-Windowed"])
         # `-Port` only relevant in multi-instance mode. When started
         # by `start_environment` we have no endpoint (env-only spawn),
         # and the single-instance default port is fine.
@@ -1315,6 +1328,38 @@ class Launcher:
         if config_file:
             argv.append(f"-config-file={config_file}")
         return argv, {}
+
+    def _hide_ue4_panels(self) -> None:
+        """Send F10 to the UE4 window after launch so only the 3D
+        viewport is visible (Sphinx's HMI overlay panels — cameras list,
+        details panel, sub-windows — are toggled off via F10 per the
+        UE4 app HMI docs). Best-effort: requires xdotool to be
+        installed and the X DISPLAY environment to be reachable."""
+        if self.dry_run:
+            return
+        if not shutil.which("xdotool"):
+            log.warning("xdotool not installed — can't auto-hide UE panels")
+            return
+        # The UE4 window title is something like "Empty (64-bit
+        # Development SF_VULKAN_SM5)" — match by prefix-agnostic
+        # substring "Development" which all parrot-ue4-* binaries
+        # use. Wait briefly so the window has time to appear.
+        time.sleep(2.0)
+        env = self._build_session_env()
+        try:
+            r = subprocess.run(
+                ["xdotool", "search", "--name", "Development",
+                 "key", "--clearmodifiers", "F10"],
+                capture_output=True, text=True, timeout=5,
+                env={**os.environ, **env},
+            )
+            if r.returncode == 0:
+                log.info("sent F10 to UE4 window — panels hidden")
+            else:
+                log.warning("xdotool F10 failed (rc=%d): %s",
+                            r.returncode, r.stderr)
+        except (FileNotFoundError, subprocess.TimeoutExpired) as e:
+            log.warning("xdotool F10 send failed: %s", e)
 
     def _terminate_pid(self, pid: int, sigterm_grace_s: float = 1.5) -> None:
         """Kill the process group containing ``pid``: send SIGTERM, wait
