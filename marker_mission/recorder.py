@@ -62,6 +62,14 @@ _CSV_FIELDS = [
     # always captured -- the operator can grep the CSV for the
     # row whose abort_reason transitions from "" to non-empty.
     "note", "abort_reason",
+    # Pipe-joined list of every marker id the detector reported
+    # this tick (e.g. "1|3|7"). Distinct from
+    # ``arena_pose_methods`` (which only lists markers that
+    # contributed to the position vote): a marker can be visible
+    # but excluded from the average by the magnetometer / OOB
+    # filters. Replay reads this column to ring all visible
+    # markers in the position view, not just contributors.
+    "visible_marker_ids",
 ]
 
 
@@ -343,6 +351,9 @@ class FlightRecorder:
             row["tel_connected"] = "1" if tel_raw.get("connected") else "0"
             row["note"] = (snap.get("note") or "")
             row["abort_reason"] = (snap.get("abort_reason") or "")
+            vmids = snap.get("visible_marker_ids") or []
+            row["visible_marker_ids"] = "|".join(str(int(m))
+                                                  for m in vmids)
             try:
                 self._csv_writer.writerow(row)
                 # Flush periodically so we keep data on disk if we crash.

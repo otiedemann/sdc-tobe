@@ -514,6 +514,25 @@ class FlightReplay:
                 self.state.world_position_pose_methods = []
             self.state.world_position_per_marker = per_marker_world
             self.state.target_pose_method = target_pose_method
+            # visible_marker_ids -- pipe-joined column added 2026-05-06
+            # so the position view can ring every detected marker, not
+            # just position-vote contributors. Older flights don't have
+            # this column; fall back to the contributor list which is
+            # the best subset we can recover from CSV.
+            vmids_blob = (row.get("visible_marker_ids") or "").strip()
+            if vmids_blob:
+                vmids = []
+                for tok in vmids_blob.split("|"):
+                    tok = tok.strip()
+                    if not tok: continue
+                    try:
+                        vmids.append(int(tok))
+                    except ValueError:
+                        pass
+                self.state.visible_marker_ids = vmids
+            else:
+                self.state.visible_marker_ids = list(
+                    self.state.world_position_used_markers)
             self.state.last_rc = (
                 int(self._fnum(row, "rc_lr") or 0),
                 int(self._fnum(row, "rc_fb") or 0),

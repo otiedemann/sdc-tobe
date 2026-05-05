@@ -520,6 +520,7 @@ class MissionState:
                     (time.monotonic() - self.world_position_updated_at)
                     if self.world_position_updated_at > 0.0
                     else None),
+                "visible_marker_ids": list(self.visible_marker_ids),
                 "world_position_used_markers": list(
                     self.world_position_used_markers),
                 "world_position_pose_methods": list(
