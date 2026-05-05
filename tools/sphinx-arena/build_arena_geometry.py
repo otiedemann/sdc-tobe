@@ -60,7 +60,14 @@ def _make_pbr_material(name: str, base_color_rgba: tuple[float, float, float, fl
                        roughness: float) -> "bpy.types.Material":
     """Build a Principled-BSDF material with a flat colour. Sphinx
     only honours BaseColor / Roughness / Specular / Metallic — the rest
-    of the Principled inputs are ignored on FBX import."""
+    of the Principled inputs are ignored on FBX import.
+
+    NOTE: vector BaseColor (default_value RGBA) does NOT survive
+    Blender → FBX → UE4 cleanly — the SDC host's render fell back to
+    UE4's default debug checker for the floor. The texture-driven
+    materials (markers) DID survive when the texture was a colocated
+    PNG. See ``_make_solid_color_texture_material`` below — used for
+    the floor + pillar instead of this vector-only material."""
     assert bpy is not None
     mat = bpy.data.materials.new(name=name)
     mat.use_nodes = True
@@ -74,44 +81,165 @@ def _make_pbr_material(name: str, base_color_rgba: tuple[float, float, float, fl
     return mat
 
 
+def _make_solid_color_texture_material(
+    name: str,
+    color_rgb_0_255: tuple[int, int, int],
+    roughness: float,
+    out_dir: Path,
+    alpha_0_255: int | None = None,
+) -> "bpy.types.Material":
+    """Build a material whose BaseColor is a 64×64 PNG of the given
+    colour (optionally RGBA). Texture lives next to the FBX as a
+    sidecar — UE4's FBX import reliably picks it up that way.
+
+    Why a real texture instead of a vector ``Base Color``: live
+    evidence on the SDC host showed vector PBR colours were dropped
+    during Blender 3.0 → FBX → UE4 import; the floor came out with
+    UE4's default debug checker. Marker materials, which use a real
+    texture, survived. So we generate a small PNG and reference it
+    as a colocated sidecar — same pipeline the markers use.
+
+    When ``alpha_0_255`` is given, the PNG is RGBA. UE4's auto-
+    generated material from FBX import sometimes treats this as a
+    masked/translucent BaseColor (giving a see-through look on the
+    nets); when it doesn't, the wall stays opaque but at the lighter
+    colour, which is still visibly less imposing than the pillars.
+    """
+    assert bpy is not None
+    png_path = out_dir / f"{name}.png"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    # 256×256 — small but big enough to dodge any "treat tiny textures
+    # as placeholders" heuristic the FBX importer might have. The
+    # actual content is uniform colour so compression makes the file
+    # tiny anyway (~few hundred bytes).
+    _write_png_solid(png_path, color_rgb_0_255, side_px=256,
+                     alpha_0_255=alpha_0_255)
+
+    mat = bpy.data.materials.new(name=name)
+    mat.use_nodes = True
+    nodes = mat.node_tree.nodes
+    links = mat.node_tree.links
+    bsdf = nodes.get("Principled BSDF")
+    if bsdf is None:
+        bsdf = nodes.new("ShaderNodeBsdfPrincipled")
+    bsdf.inputs["Roughness"].default_value = roughness
+    bsdf.inputs["Metallic"].default_value = 0.0
+    bsdf.inputs["Specular"].default_value = 0.2
+
+    tex_node = nodes.new("ShaderNodeTexImage")
+    img = bpy.data.images.load(str(png_path))
+    for cs_name in ("Non-Color", "Linear", "Raw"):
+        try:
+            img.colorspace_settings.name = cs_name
+            break
+        except TypeError:
+            continue
+    tex_node.image = img
+    tex_node.interpolation = "Closest"
+    links.new(tex_node.outputs["Color"], bsdf.inputs["Base Color"])
+    return mat
+
+
+def _write_png_solid(
+    path: Path,
+    color_rgb_0_255: tuple[int, int, int],
+    side_px: int = 64,
+    alpha_0_255: int | None = None,
+) -> None:
+    """Write a solid-colour PNG. RGB by default, RGBA when ``alpha`` is
+    given. Standalone — no Pillow dependency.
+
+    ``side_px`` defaults to 64 instead of 1 because some UE4 FBX
+    import paths (verified live on the SDC host with Blender 3.0.1)
+    silently fail to apply 1×1 textures, falling back to UE4's debug
+    checker. 64×64 is still tiny on disk (~few hundred bytes after
+    zlib) and works reliably.
+    """
+    import struct
+    import zlib
+    r, g, b = color_rgb_0_255
+    if alpha_0_255 is None:
+        # RGB
+        color_type = 2  # truecolor
+        bytes_per_pixel = 3
+        pixel = bytes([r, g, b])
+    else:
+        # RGBA
+        color_type = 6  # truecolor + alpha
+        bytes_per_pixel = 4
+        pixel = bytes([r, g, b, int(alpha_0_255) & 0xFF])
+    ihdr = struct.pack(">IIBBBBB", side_px, side_px, 8, color_type, 0, 0, 0)
+    # Each scanline starts with a filter byte (0 = none) followed by
+    # the pixel row. Repeat ``side_px`` times.
+    row = bytes([0]) + pixel * side_px
+    raw = row * side_px
+    idat = zlib.compress(raw, 9)
+
+    def chunk(tag: bytes, data: bytes) -> bytes:
+        return (struct.pack(">I", len(data)) + tag + data
+                + struct.pack(">I", zlib.crc32(tag + data) & 0xFFFFFFFF))
+
+    blob = (b"\x89PNG\r\n\x1a\n"
+            + chunk(b"IHDR", ihdr)
+            + chunk(b"IDAT", idat)
+            + chunk(b"IEND", b""))
+    path.write_bytes(blob)
+
+
 def _export_active(out_path: Path) -> None:
     assert bpy is not None
     out_path.parent.mkdir(parents=True, exist_ok=True)
     bpy.ops.export_scene.fbx(
         filepath=str(out_path),
         use_selection=False,
+        # For floor / pillar / net: bundle the texture INSIDE the FBX
+        # rather than a sidecar PNG. The marker FBXs use sidecars
+        # successfully but the floor (same pipeline) was consistently
+        # falling back to UE4's debug-checker default in the live
+        # render. Embedded textures via path_mode=COPY are less likely
+        # to be silently dropped by UE4's auto-material generator.
         path_mode="COPY",
         embed_textures=True,
         apply_unit_scale=True,
         global_scale=1.0,
-        bake_space_transform=True,
+        bake_space_transform=False,
+        axis_forward="X",
+        axis_up="Z",
         object_types={"MESH"},
         mesh_smooth_type="FACE",
     )
 
 
 def build_floor(out_path: Path) -> None:
-    """1 m × 1 m unit plane, normal +Z, light-concrete material.
+    """1 m × 1 m × 1 m unit cube — neutral concrete texture.
 
-    The YAML emitter scales this to the arena footprint (default
-    22 × 12 m). We bake the unit dimension here rather than baking
-    the final size, so a single FBX serves any arena layout."""
+    The YAML emitter scales this to a MASSIVE 50 × 50 × 1 m slab so
+    it completely hides UE4's underlying default ground (which kept
+    showing through as a checker debug texture in earlier renders).
+    Building it as an unscaled unit cube gives the YAML full control
+    over the final dimensions and avoids the asymmetric-scale FBX
+    quirk that earlier attempts ran into."""
     assert bpy is not None
     _clear_scene()
-    bpy.ops.mesh.primitive_plane_add(size=1.0, location=(0, 0, 0))
+    bpy.ops.mesh.primitive_cube_add(size=1.0, location=(0, 0, 0))
     obj = bpy.context.active_object
     obj.name = "arena_floor"
-    mat = _make_pbr_material(
-        "mat_floor",
-        base_color_rgba=(0.55, 0.55, 0.58, 1.0),  # neutral concrete
+    mat = _make_solid_color_texture_material(
+        name="mat_floor",
+        color_rgb_0_255=(180, 180, 180),  # noticeably light grey — easy
+                                          # to distinguish from UE4's
+                                          # debug checker if it's still
+                                          # leaking through.
         roughness=0.85,
+        out_dir=out_path.parent,
     )
     obj.data.materials.append(mat)
     _export_active(out_path)
 
 
 def build_pillar(out_path: Path) -> None:
-    """1 m × 1 m × 1 m unit cube centred at origin, dark-grey material.
+    """1 m × 1 m × 1 m unit cube centred at origin, dark-grey
+    PNG-textured material.
 
     Centred so the YAML emitter can place it at the desired (x, y, z)
     without any Blender-side offset arithmetic."""
@@ -120,10 +248,39 @@ def build_pillar(out_path: Path) -> None:
     bpy.ops.mesh.primitive_cube_add(size=1.0, location=(0, 0, 0))
     obj = bpy.context.active_object
     obj.name = "arena_pillar"
-    mat = _make_pbr_material(
-        "mat_pillar",
-        base_color_rgba=(0.18, 0.18, 0.20, 1.0),  # near-black
+    mat = _make_solid_color_texture_material(
+        name="mat_pillar",
+        color_rgb_0_255=(46, 46, 52),  # near-black
         roughness=0.6,
+        out_dir=out_path.parent,
+    )
+    obj.data.materials.append(mat)
+    _export_active(out_path)
+
+
+def build_net(out_path: Path) -> None:
+    """1 m × 1 m × 1 m unit cube centred at origin, light-grey RGBA-
+    textured material — the perimeter "net" walls.
+
+    Distinct FBX from pillar.fbx so the wall material can be lighter
+    (and use alpha) without affecting pillars. Sphinx mesh injection
+    technically only honours four PBR params, but UE4's auto-generated
+    material from an RGBA-textured FBX often picks up a masked-
+    translucent blend mode anyway. If that succeeds, the walls render
+    truly semi-transparent; if not, the lighter colour still makes
+    them visually less imposing than the dark pillars (less wall-
+    looking)."""
+    assert bpy is not None
+    _clear_scene()
+    bpy.ops.mesh.primitive_cube_add(size=1.0, location=(0, 0, 0))
+    obj = bpy.context.active_object
+    obj.name = "arena_net"
+    mat = _make_solid_color_texture_material(
+        name="mat_net",
+        color_rgb_0_255=(220, 225, 235),  # very light blue-grey
+        roughness=0.4,
+        out_dir=out_path.parent,
+        alpha_0_255=80,  # ~30 % opaque if UE4 honours the alpha channel
     )
     obj.data.materials.append(mat)
     _export_active(out_path)
@@ -146,6 +303,7 @@ def main() -> int:
 
     floor_path = ns.out_dir / "floor.fbx"
     pillar_path = ns.out_dir / "pillar.fbx"
+    net_path = ns.out_dir / "net.fbx"
 
     print(f"  building {floor_path.name}…")
     build_floor(floor_path)
@@ -153,6 +311,9 @@ def main() -> int:
     print(f"  building {pillar_path.name}…")
     build_pillar(pillar_path)
     print(f"  ✓ {pillar_path}")
+    print(f"  building {net_path.name}…")
+    build_net(net_path)
+    print(f"  ✓ {net_path}")
     return 0
 
 

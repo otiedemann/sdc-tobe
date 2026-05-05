@@ -14,16 +14,26 @@ later via the YAML config's ``Scale`` field — we keep the canonical mesh
 at 1 m so a 0.5 m wall marker becomes ``Scale: "0.5 0.5 0.5"`` and a
 0.19 m target sticker becomes ``Scale: "0.19 0.19 0.19"``.
 
-The plane is built in the XZ plane facing -Y (i.e. its normal points at
--Y). Sphinx YAML rotation then aims it at the appropriate wall (see
+The plane is built FLAT in the XY plane with normal +Z. Sphinx YAML
+rotation then aims it at the appropriate wall (see
 ``arena_to_sphinx_yaml.py``). Only Material parameters Sphinx actually
-honors are set: BaseColor (the texture), Roughness, Specular, Metallic.
-Anything fancier than that gets stripped at FBX import time anyway.
+honors are set: BaseColor (the texture), Roughness, Specular, Metallic
+— per the Sphinx ``customize_the_environment`` docs.
+
+Axis convention on export — IMPORTANT:
+    Sphinx's documentation specifies for blender users:
+      "forward vector should be set to -Y and up vector should be set
+       to -Z to match the Unreal Engine's coordinate system."
+    We use those exact values. An earlier revision used
+    axis_forward="X", axis_up="Z" — geometry imported into Sphinx with
+    a 90° rotation offset on every wall, AND walls/pillars from the
+    combined arena_static.fbx came out either invisible or in
+    unexpected positions.
 """
 from __future__ import annotations
 
 import argparse
-import os
+import math
 import sys
 from pathlib import Path
 
@@ -60,14 +70,28 @@ def _clear_scene() -> None:
 
 
 def _build_plane(name: str) -> "bpy.types.Object":
-    """Create a 1 m × 1 m plane with a clean UV map and return the object."""
+    """Create a 1 m × 1 m vertical plane with normal pointing +X in UE.
+
+    Built in Blender with normal at -Y direction (after rotating the
+    default XY plane 90° around X axis), so that under the Sphinx
+    axis convention (axis_forward="-Y", axis_up="-Z") it lands in UE
+    with normal +X. This means YAML only needs YAW to aim the marker
+    — pitch=0 and roll=0 — eliminating the pitch-convention ambiguity
+    that produced repeatedly-wrong marker orientations.
+
+    For target markers (which want a 45° upward tilt facing arena
+    centre), the YAML applies pitch=+45° + yaw=±90°, all from this
+    same +X-facing FBX.
+    """
     assert bpy is not None
     bpy.ops.mesh.primitive_plane_add(size=1.0, location=(0, 0, 0))
     obj = bpy.context.active_object
     obj.name = name
-    # Stand the plane up: rotate +90° around X so it faces -Y in world frame.
-    # That puts the marker face-on to a camera that looks along +Y.
-    obj.rotation_euler = (1.5707963267948966, 0.0, 0.0)
+    # X-axis rotation +90° only — the cleanest rotation that puts the
+    # plane upright in Blender (XZ-plane, normal -Y in Blender). Under
+    # the Sphinx -Y/-Z FBX export, that lands the marker plane
+    # vertical in UE with normal +X. YAML yaw alone aims it from there.
+    obj.rotation_euler = (math.pi / 2.0, 0.0, 0.0)
     bpy.ops.object.transform_apply(location=False, rotation=True, scale=False)
     return obj
 
@@ -118,9 +142,7 @@ def build_one(png_path: Path, out_path: Path) -> None:
     # textures via co-located PNGs; embedded textures via
     # ``embed_textures=True`` were silently dropped on the SDC host
     # (Blender 3.0.1 + Sphinx 2.15.1), leaving the marker plane with
-    # the default debug material. Verified live: nets and pillars
-    # showed material differences only after switching to this
-    # external-texture approach.
+    # the default debug material.
     sibling_png = out_path.with_suffix(".png")
     sibling_png.write_bytes(png_path.read_bytes())
 
@@ -139,7 +161,15 @@ def build_one(png_path: Path, out_path: Path) -> None:
         embed_textures=False,
         apply_unit_scale=True,
         global_scale=1.0,
-        bake_space_transform=True,
+        bake_space_transform=False,
+        # Per Sphinx 2.15 docs (customize_the_environment): "forward
+        # vector should be set to -Y and up vector should be set to -Z
+        # to match the Unreal Engine's coordinate system." This is
+        # NON-STANDARD but it's what Sphinx's mesh-injection actually
+        # consumes — using "X"/"Z" produced rotated and missing
+        # geometry on import.
+        axis_forward="-Y",
+        axis_up="-Z",
         object_types={"MESH"},
         mesh_smooth_type="FACE",
     )
@@ -184,6 +214,9 @@ def main() -> int:
         if not pngs:
             print(f"No PNGs found in {ns.in_dir}", file=sys.stderr)
             return 1
+        # Skip the white back-plate PNGs from the previous experiment;
+        # they aren't ArUco markers themselves.
+        pngs = [p for p in pngs if not p.stem.endswith("_white")]
         for png in pngs:
             out_path = ns.out_dir / f"{png.stem}.fbx"
             build_one(png, out_path)

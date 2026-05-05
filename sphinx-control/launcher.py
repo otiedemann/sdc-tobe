@@ -317,7 +317,21 @@ class Launcher:
         env = self.state.current_env()
         if env is None:
             return None
-        env.extras["alive"] = self._is_env_alive(env)
+        # Auto-reconcile: if the recorded ue4_pid is no longer alive,
+        # mark the env stopped so the dashboard reflects reality. Without
+        # this the DB row stays "running" forever after a crash, the
+        # restart endpoint tries to "stop" a dead pid (no-op) and the
+        # operator sees "Stop does nothing" because there's nothing to
+        # stop in the first place. Caught live: ue4 process 8657 had
+        # died but the dashboard was still showing running uptime 9m.
+        if not self._is_env_alive(env):
+            log.warning(
+                "env %s ue4_pid %s no longer alive — auto-marking stopped",
+                env.env_id, env.ue4_pid,
+            )
+            self.state.update_env_status(env.env_id, "stopped")
+            return None
+        env.extras["alive"] = True
         return env
 
     # ─── flight controller (unified_api_server.py) ──────────────
@@ -453,7 +467,15 @@ class Launcher:
         fc = self.state.current_fc()
         if fc is None:
             return None
-        fc.extras["alive"] = self._is_fc_alive(fc)
+        # Auto-reconcile (see current_environment for rationale).
+        if not self._is_fc_alive(fc):
+            log.warning(
+                "fc %s pid %s no longer alive — auto-marking stopped",
+                fc.fc_id, fc.pid,
+            )
+            self.state.update_fc_status(fc.fc_id, "stopped")
+            return None
+        fc.extras["alive"] = True
         return fc
 
     def _launch_fc(
@@ -685,7 +707,17 @@ class Launcher:
     def list_drones(self) -> list[DroneRecord]:
         recs = self.state.list_all()
         for r in recs:
-            r.extras["alive"] = self._is_alive(r)
+            alive = self._is_alive(r)
+            # Auto-reconcile (see current_environment for rationale).
+            if r.status == "running" and not alive:
+                log.warning(
+                    "drone %s sphinx_pid %s no longer alive — "
+                    "auto-marking stopped",
+                    r.drone_id, r.sphinx_pid,
+                )
+                self.state.update_status(r.drone_id, "stopped")
+                r.status = "stopped"
+            r.extras["alive"] = alive
         return recs
 
     def connections_for(self, drone_id: str) -> dict[str, Any]:
