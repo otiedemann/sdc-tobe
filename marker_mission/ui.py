@@ -1484,9 +1484,8 @@ _PAGE_CALIBRATE = _PAGE_BASE_CSS + _PAGE_HEADER + _COMMON_SCRIPT + _PAGE_GRID_OP
       that config auto-load at startup.
     </p>
     <div id="camcfg-form" style="display:grid;
-         grid-template-columns: 12em 1fr; gap:.35rem .8rem;
-         align-items:center; font-size:.85rem;
-         font-family:ui-monospace, monospace;">
+         grid-template-columns: 11em minmax(11em, 1fr) minmax(16em, 2fr);
+         gap:.35rem .9rem; align-items:start; font-size:.85rem;">
       <div style="grid-column: 1 / -1; color:#778;">loading…</div>
     </div>
     <div style="display:flex; gap:.4rem; align-items:center;
@@ -1656,12 +1655,132 @@ async function tick() {
 tick();
 
 // ---- Camera config form ------------------------------------------------
-// Live values come from GET /api/camera/config. The form is dynamic:
-// for each axis returned (exposure, white_balance, hdr, etc.) we render
-// one row per sub-field with a text input prefilled with the current
-// value. Apply POSTs all rows back. Saved configs are stored under
-// ~/.marker_mission/camera_configs/ and listed below the form.
-let camcfgKeys = [];   // [['exposure','mode'], ['exposure','shutter_speed'], ...]
+// Live values come from GET /api/camera/config. The form renders one
+// row per axis-subfield using ``CAMCFG_SCHEMA`` for the control type
+// (enum -> <select>, number -> numeric <input>, readonly -> static
+// text), the dropdown options where applicable, and the explanatory
+// description. Unknown keys (firmware fields the schema hasn't been
+// taught about) fall back to a text input so the form never silently
+// hides data.
+const _ISO_VALUES = ['iso_50','iso_64','iso_80','iso_100','iso_125',
+  'iso_160','iso_200','iso_250','iso_320','iso_400','iso_500','iso_640',
+  'iso_800','iso_1000','iso_1200','iso_1600','iso_2000','iso_2500','iso_3200'];
+const _SHUTTER_VALUES = ['shutter_1_over_10000','shutter_1_over_8000',
+  'shutter_1_over_4000','shutter_1_over_3000','shutter_1_over_2000',
+  'shutter_1_over_1000','shutter_1_over_500','shutter_1_over_250',
+  'shutter_1_over_125','shutter_1_over_60','shutter_1_over_30',
+  'shutter_1_over_15','shutter_1_over_8','shutter_1_over_4',
+  'shutter_1_over_2','shutter_1','shutter_2','shutter_4','shutter_15',
+  'shutter_30'];
+const _EV_VALUES = ['ev_minus_3_00','ev_minus_2_67','ev_minus_2_33',
+  'ev_minus_2_00','ev_minus_1_67','ev_minus_1_33','ev_minus_1_00',
+  'ev_minus_0_67','ev_minus_0_33','ev_0_00','ev_plus_0_33',
+  'ev_plus_0_67','ev_plus_1_00','ev_plus_1_33','ev_plus_1_67',
+  'ev_plus_2_00','ev_plus_2_33','ev_plus_2_67','ev_plus_3_00'];
+const _WB_TEMP = ['t_1500','t_1750','t_2000','t_2250','t_2500','t_2750',
+  't_3000','t_3250','t_3500','t_3750','t_4000','t_4250','t_4500',
+  't_4750','t_5000','t_5250','t_5500','t_5750','t_6000','t_6500',
+  't_7000','t_7500','t_8000','t_8500','t_9000','t_9500','t_10000',
+  't_10500','t_11000','t_11500','t_12000','t_12500','t_13000','t_13500',
+  't_14000','t_14500','t_15000'];
+const CAMCFG_SCHEMA = {
+  'exposure.mode': {label: 'Exposure mode', type: 'enum',
+    options: ['automatic','automatic_prefer_iso_sensitivity',
+              'automatic_prefer_shutter_speed','manual_iso_sensitivity',
+              'manual_shutter_speed','manual'],
+    desc: 'How exposure is balanced. <code>automatic</code> picks both shutter and ISO. '
+        + '<code>automatic_prefer_iso_sensitivity</code> keeps ISO low (cleaner image, '
+        + 'longer shutter); <code>automatic_prefer_shutter_speed</code> keeps shutter '
+        + 'fast (less motion blur, higher ISO). <code>manual_*</code> pin one param; '
+        + '<code>manual</code> pins both.'},
+  'exposure.shutter_speed': {label: 'Shutter speed', type: 'enum',
+    options: _SHUTTER_VALUES,
+    desc: 'Shutter time. Faster (e.g. <code>shutter_1_over_500</code>) freezes motion '
+        + 'but darkens; slower (e.g. <code>shutter_1_over_30</code>) admits more light. '
+        + 'Honoured only when the mode includes <code>manual_shutter_speed</code> or '
+        + '<code>manual</code>.'},
+  'exposure.iso_sensitivity': {label: 'ISO sensitivity', type: 'enum',
+    options: _ISO_VALUES,
+    desc: 'Sensor gain. Higher ISO (e.g. <code>iso_3200</code>) brightens dim scenes '
+        + 'at the cost of noise. Honoured when mode includes '
+        + '<code>manual_iso_sensitivity</code>, <code>manual</code>, or '
+        + '<code>automatic_prefer_iso_sensitivity</code>.'},
+  'exposure.max_iso_sensitivity': {label: 'Max auto ISO', type: 'enum',
+    options: _ISO_VALUES,
+    desc: 'Cap on the ISO that auto modes will use. Lower keeps images cleaner in '
+        + 'dim light at the cost of slower shutters (more motion blur).'},
+  'exposure.metering_mode': {label: 'Metering mode', type: 'enum',
+    options: ['standard','center_top'],
+    desc: 'Where the light meter samples the scene. <code>standard</code> averages the '
+        + 'whole frame; <code>center_top</code> weights the top-centre (helps when the '
+        + 'marker is high and a bright floor would otherwise pull the meter dark).'},
+  'white_balance.mode': {label: 'White balance', type: 'enum',
+    options: ['automatic','candle','sunset','incandescent','warm_white','halogen',
+              'fluorescent','cool_white','horizon','daylight','flash','blue_sky',
+              'shaded','custom'],
+    desc: 'Colour-cast correction. <code>automatic</code> adapts to scene; presets '
+        + '(<code>daylight</code>, <code>incandescent</code>, etc.) lock to known light '
+        + 'sources. <code>custom</code> uses the temperature below.'},
+  'white_balance.temperature': {label: 'WB temperature', type: 'enum',
+    options: _WB_TEMP,
+    desc: 'Custom WB colour temperature in Kelvin (<code>t_5000</code> ≈ daylight, '
+        + '<code>t_3000</code> ≈ incandescent). Honoured only when mode = '
+        + '<code>custom</code>.'},
+  'hdr.value': {label: 'HDR', type: 'enum',
+    options: ['inactive','active'],
+    desc: 'High Dynamic Range. <code>active</code> boosts shadows and tames highlights '
+        + 'but introduces motion artefacts on fast pans/flights. Leave '
+        + '<code>inactive</code> for marker tracking.'},
+  'ev_compensation.value': {label: 'EV bias', type: 'enum',
+    options: _EV_VALUES,
+    desc: 'Exposure compensation in stops on top of the chosen mode. Negative values '
+        + '(<code>ev_minus_1_00</code>) darken; positive values brighten. Useful when '
+        + 'the marker reads washed-out (-) or murky (+).'},
+  'antiflicker.mode': {label: 'Anti-flicker', type: 'enum',
+    options: ['off','auto','mode_50hz','mode_60hz'],
+    desc: 'Filter for indoor lighting flicker (LED / fluorescent). '
+        + '<code>mode_50hz</code> for EU mains, <code>mode_60hz</code> for US mains; '
+        + '<code>auto</code> lets the camera detect; <code>off</code> disables.'},
+  'video_stabilization.mode': {label: 'Stabilisation', type: 'enum',
+    options: ['roll_pitch','pitch','none'],
+    desc: 'Gimbal-software stabilisation axes. <code>roll_pitch</code> (default) is '
+        + 'the smoothest. <code>pitch</code> stabilises tilt only. <code>none</code> '
+        + 'leaves the gimbal hard-locked (useful when calibrating intrinsics).'},
+  'stream_mode.mode': {label: 'Stream mode', type: 'enum',
+    options: ['low_latency','high_reliability','high_reliability_low_framerate'],
+    desc: 'Live-stream tuning. <code>low_latency</code> (default) minimises lag for '
+        + 'marker tracking. The <code>high_reliability_*</code> options trade latency '
+        + 'for fewer dropped frames on poor Wi-Fi.'},
+  'recording.mode': {label: 'Recording mode', type: 'enum',
+    options: ['standard','hyperlapse','slow_motion','high_framerate'],
+    desc: 'On-board recording mode. <code>standard</code> is normal video. '
+        + '<code>hyperlapse</code> uses the ratio below. <code>slow_motion</code> / '
+        + '<code>high_framerate</code> require a high-FPS framerate setting.'},
+  'recording.resolution': {label: 'Recording resolution', type: 'enum',
+    options: ['res_dci_4k','res_uhd_4k','res_2_7k','res_1080p','res_720p','res_480p'],
+    desc: 'Resolution of the recorded clip. Higher resolutions limit max framerate. '
+        + 'For marker work the live stream resolution is independent of this.'},
+  'recording.framerate': {label: 'Recording framerate', type: 'enum',
+    options: ['fps_24','fps_25','fps_30','fps_48','fps_50','fps_60','fps_96',
+              'fps_100','fps_120','fps_240','fps_480'],
+    desc: 'Recorded framerate. Higher FPS supports slow-motion playback but caps '
+        + 'achievable resolution.'},
+  'recording.hyperlapse': {label: 'Hyperlapse ratio', type: 'enum',
+    options: ['ratio_15','ratio_30','ratio_60','ratio_120'],
+    desc: 'Time-lapse compression ratio when mode = <code>hyperlapse</code>. '
+        + '<code>ratio_15</code> plays back 15× faster than real time.'},
+  'recording.bitrate': {label: 'Recording bitrate', type: 'readonly',
+    desc: 'Reported bitrate (bits/s) of the active recording mode. Read-only — '
+        + 'derived from resolution + framerate + mode by the firmware.'},
+  'zoom.level': {label: 'Zoom level', type: 'number',
+    min: 1.0, max: 3.0, step: 0.1, defaultValue: 1.0,
+    desc: 'Digital zoom factor. 1.0 = no zoom (native FOV), 3.0 = maximum 3× '
+        + 'digital zoom. Increasing zoom narrows the FOV — markers near the frame '
+        + 'edge can disappear.'},
+};
+
+let camcfgKeys = [];   // [['exposure','mode'], ...]
+
 function camcfgSetMsg(s, ok) {
   const el = $('camcfg-msg'); if (!el) return;
   el.textContent = s || '';
@@ -1669,20 +1788,66 @@ function camcfgSetMsg(s, ok) {
                  : ok === true ? 'var(--good)'
                  : '#aab';
 }
+
 function _renderField(key, sub, value) {
+  const path = key + '.' + sub;
+  const schema = CAMCFG_SCHEMA[path] || null;
+  // Label cell.
   const lbl = document.createElement('div');
-  lbl.style.color = '#aab';
-  lbl.textContent = key + '.' + sub;
-  const inp = document.createElement('input');
-  inp.type = (typeof value === 'number') ? 'number' : 'text';
-  inp.dataset.key = key;
-  inp.dataset.sub = sub;
-  inp.value = (value === null || value === undefined) ? '' : String(value);
-  inp.style.cssText = 'background:#0c0f12; color:var(--fg);'
+  lbl.style.cssText = 'color:#cbd5e1; padding:.2rem 0;';
+  lbl.textContent = schema ? schema.label : path;
+  // Control cell.
+  let ctrl;
+  const cur = (value === null || value === undefined) ? '' : String(value);
+  if (schema && schema.type === 'enum') {
+    ctrl = document.createElement('select');
+    // Make sure the current firmware value appears in the dropdown
+    // even if the schema's hardcoded list doesn't include it -- some
+    // builds expose extra enum values.
+    const opts = schema.options.slice();
+    if (cur && !opts.includes(cur)) opts.unshift(cur);
+    for (const o of opts) {
+      const op = document.createElement('option');
+      op.value = o; op.textContent = o; ctrl.appendChild(op);
+    }
+    ctrl.value = cur;
+  } else if (schema && schema.type === 'number') {
+    ctrl = document.createElement('input');
+    ctrl.type = 'number';
+    if (schema.min !== undefined) ctrl.min = schema.min;
+    if (schema.max !== undefined) ctrl.max = schema.max;
+    if (schema.step !== undefined) ctrl.step = schema.step;
+    ctrl.value = cur || (schema.defaultValue ?? '');
+  } else if (schema && schema.type === 'readonly') {
+    ctrl = document.createElement('input');
+    ctrl.type = 'text';
+    ctrl.value = cur;
+    ctrl.readOnly = true;
+    ctrl.style.opacity = '.6';
+    ctrl.style.cursor = 'not-allowed';
+    ctrl.dataset.readonly = '1';
+  } else {
+    // Unknown axis -- text input fallback.
+    ctrl = document.createElement('input');
+    ctrl.type = (typeof value === 'number') ? 'number' : 'text';
+    ctrl.value = cur;
+  }
+  ctrl.dataset.key = key;
+  ctrl.dataset.sub = sub;
+  ctrl.style.cssText += 'background:#0c0f12; color:var(--fg);'
     + ' border:1px solid #2a3038; border-radius:4px;'
-    + ' padding:.25rem .4rem; font-family:inherit;';
-  return [lbl, inp];
+    + ' padding:.25rem .4rem; font-family:ui-monospace, monospace;'
+    + ' font-size:.85rem; width:100%; box-sizing:border-box;';
+  // Description cell.
+  const desc = document.createElement('div');
+  desc.style.cssText = 'color:#778; font-size:.78rem; line-height:1.4;'
+    + ' padding:.2rem 0; font-family:inherit;';
+  desc.innerHTML = schema ? schema.desc
+    : '<span style="color:#9ca3af;">(no description for '
+      + path + ' — firmware-specific field)</span>';
+  return [lbl, ctrl, desc];
 }
+
 function camcfgPopulate(cfg) {
   const f = $('camcfg-form'); if (!f) return;
   f.innerHTML = '';
@@ -1702,30 +1867,34 @@ function camcfgPopulate(cfg) {
     if (v && typeof v === 'object') {
       for (const sub of Object.keys(v)) {
         camcfgKeys.push([k, sub]);
-        const [lbl, inp] = _renderField(k, sub, v[sub]);
-        f.appendChild(lbl); f.appendChild(inp);
+        const cells = _renderField(k, sub, v[sub]);
+        for (const c of cells) f.appendChild(c);
       }
     } else {
       camcfgKeys.push([k, '_value']);
-      const [lbl, inp] = _renderField(k, '_value', v);
-      f.appendChild(lbl); f.appendChild(inp);
+      const cells = _renderField(k, '_value', v);
+      for (const c of cells) f.appendChild(c);
     }
   }
 }
 function camcfgCollect() {
   const out = {};
-  document.querySelectorAll('#camcfg-form input').forEach(inp => {
-    const k = inp.dataset.key, s = inp.dataset.sub;
-    if (!k || !s) return;
-    let val = inp.value;
-    if (inp.type === 'number') {
-      const n = parseFloat(val); if (!Number.isFinite(n)) return;
-      val = n;
-    }
-    if (s === '_value') { out[k] = val; return; }
-    out[k] = out[k] || {};
-    out[k][s] = val;
-  });
+  document.querySelectorAll('#camcfg-form input, #camcfg-form select')
+    .forEach(inp => {
+      const k = inp.dataset.key, s = inp.dataset.sub;
+      if (!k || !s) return;
+      // Skip read-only display fields (e.g. recording.bitrate) so we
+      // don't fight the firmware by sending back its own derived value.
+      if (inp.dataset.readonly === '1') return;
+      let val = inp.value;
+      if (inp.type === 'number') {
+        const n = parseFloat(val); if (!Number.isFinite(n)) return;
+        val = n;
+      }
+      if (s === '_value') { out[k] = val; return; }
+      out[k] = out[k] || {};
+      out[k][s] = val;
+    });
   return out;
 }
 async function refreshCamcfg() {
