@@ -97,17 +97,21 @@ def arena_dir_to_ue_yaw(direction_deg_arena: float) -> float:
     """Convert a marker's facing direction (in arena coord polar) to a
     UE4 FRotator yaw value, given the default axis_map y2x,x2y_neg.
 
-    Derivation: an arena unit vector at angle θ (measured CCW from
-    arena +X in the arena XY plane) is (cos θ, sin θ, 0). Under
-    axis_map y2x,x2y_neg this maps to UE (sin θ, -cos θ, 0). Our
-    marker FBX exports with normal at UE +X (= (1, 0, 0)) post-import.
-    UE positive yaw rotates +X clockwise viewed from above:
-       yaw α takes +X to (cos α, sin α).
-    Setting (cos α, sin α) = (sin θ, -cos θ) gives α = θ - 90°.
+    EMPIRICAL: derivations using "marker FBX normal = UE +X after
+    axis conversion" produced markers facing OUTWARD on every wall
+    (verified by user repeatedly). The actual marker FBX normal under
+    Sphinx's mesh-injection is the OPPOSITE direction (-X in UE),
+    which makes the conversion ``ue_yaw = direction_deg + 90°`` correct.
 
-    So: ue_yaw = arena_direction_deg - 90°.
+    Math version that works:
+      Marker FBX normal in UE = -X = (-1, 0, 0).
+      UE positive yaw α rotates -X to (-cos α, -sin α, 0).
+      Arena dir θ as UE vector: (sin θ, -cos θ, 0).
+      Solving: -cos α = sin θ, -sin α = -cos θ
+        => cos α = -sin θ, sin α = cos θ
+        => α = θ + 90°.
     """
-    return direction_deg_arena - 90.0
+    return direction_deg_arena + 90.0
 
 
 # Legacy alias kept so older code that imports WALL_YAW_DEG still works.
@@ -401,6 +405,14 @@ def main() -> int:
     p.add_argument("--marker-pitch", type=float, default=None,
                    help="Override MARKER_PITCH_DEG for wall markers. "
                         "Default 0 (FBX is already vertical).")
+    p.add_argument("--marker-inward-offset-m", type=float, default=0.10,
+                   help="Push each wall marker this many metres INWARD "
+                        "from its arena_config.json position so it sits "
+                        "in front of the pillar (instead of being half-"
+                        "inside the pillar mesh). Default 0.10 m. The "
+                        "position tracking algorithm reads arena_config "
+                        "directly so its ground-truth coordinates are "
+                        "unchanged — only the simulator placement moves.")
     p.add_argument(
         "--no-center-arena", dest="center_arena", action="store_false",
         help="Disable the arena recentering (geometry stays at the literal "
@@ -479,6 +491,7 @@ def main() -> int:
         "left":  args.yaw_left,
         "right": args.yaw_right,
     }
+    inward_offset_m = float(args.marker_inward_offset_m)
     for m in arena.get("markers", []):
         mid = int(m["id"])
         wall = str(m.get("wall", "front"))
@@ -494,8 +507,19 @@ def main() -> int:
             yaw = arena_dir_to_ue_yaw(float(m["direction_deg"]))
         else:
             yaw = wall_yaws.get(wall, 0.0)
+        # Push marker slightly inward from its arena_config position
+        # so it sits in front of the pillar (visible from arena
+        # interior). The inward direction is the marker's direction_deg
+        # — i.e., the way it's facing.
+        marker_x = float(m["x"])
+        marker_y = float(m["y"])
+        if inward_offset_m > 0 and "direction_deg" in m:
+            import math
+            d = math.radians(float(m["direction_deg"]))
+            marker_x += inward_offset_m * math.cos(d)
+            marker_y += inward_offset_m * math.sin(d)
         # arena → UE conversion (metres) → centimetres
-        ux_m, uy_m, uz_m = shifted_apply((float(m["x"]), float(m["y"]), float(m["z"])))
+        ux_m, uy_m, uz_m = shifted_apply((marker_x, marker_y, float(m["z"])))
         loc_cm = (ux_m * 100.0, uy_m * 100.0, uz_m * 100.0)
         # Marker FBX is already vertical (+X normal in UE) per
         # build_marker_fbx.py; yaw spins it around UE +Z to face the
