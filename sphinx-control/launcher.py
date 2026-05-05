@@ -374,7 +374,7 @@ class Launcher:
             hide = (req.hide_panels if req.hide_panels is not None
                     else ue4_cfg.get("hide_panels_default", True))
             if hide:
-                self._hide_ue4_panels()
+                self._hide_ue4_panels(ue4_pid=ue4_pid)
             # NOTE: sphinx-cli world params (e.g. sky preset) can ONLY
             # be applied AFTER a drone (sphinx process) is spawned —
             # without sphinx, sphinx-cli reports "An instance of Sphinx
@@ -1351,35 +1351,59 @@ class Launcher:
             argv.append(f"-config-file={config_file}")
         return argv, {}
 
-    def _hide_ue4_panels(self) -> None:
+    def _hide_ue4_panels(self, ue4_pid: int | None = None) -> None:
         """Send F10 to the UE4 window after launch so only the 3D
         viewport is visible (Sphinx's HMI overlay panels — cameras list,
         details panel, sub-windows — are toggled off via F10 per the
         UE4 app HMI docs). Best-effort: requires xdotool to be
-        installed and the X DISPLAY environment to be reachable."""
+        installed and the X DISPLAY environment to be reachable.
+
+        Reads DISPLAY + XAUTHORITY directly from the UE4 process's
+        /proc/<pid>/environ instead of relying on the launcher's own
+        session-detect — guarantees we connect to the same X server
+        the UE4 window is on, which is the only reliable way under
+        gdm/Wayland-X11 mixed sessions where session-detect produces
+        an empty DISPLAY."""
         if self.dry_run:
             return
         if not shutil.which("xdotool"):
             log.warning("xdotool not installed — can't auto-hide UE panels")
             return
-        # The UE4 window title is something like "Empty (64-bit
-        # Development SF_VULKAN_SM5)" — match by prefix-agnostic
-        # substring "Development" which all parrot-ue4-* binaries
-        # use. Wait briefly so the window has time to appear.
+        # Wait briefly so the window has time to appear.
         time.sleep(2.0)
-        env = self._build_session_env()
+        env = dict(os.environ)
+        # Override DISPLAY/XAUTHORITY from the UE4 process if available.
+        if ue4_pid:
+            try:
+                with open(f"/proc/{ue4_pid}/environ", "rb") as f:
+                    raw = f.read()
+                for kv in raw.split(b"\0"):
+                    if kv.startswith(b"DISPLAY="):
+                        env["DISPLAY"] = kv[len(b"DISPLAY="):].decode()
+                    elif kv.startswith(b"XAUTHORITY="):
+                        env["XAUTHORITY"] = kv[len(b"XAUTHORITY="):].decode()
+            except (FileNotFoundError, PermissionError) as e:
+                log.warning("can't read /proc/%d/environ for DISPLAY: %s",
+                            ue4_pid, e)
+        # The UE4 window title is "Empty (64-bit Development SF_VULKAN_SM5)"
+        # or similar — match by substring "Development" which all
+        # parrot-ue4-* binaries include.
         try:
             r = subprocess.run(
                 ["xdotool", "search", "--name", "Development",
                  "key", "--clearmodifiers", "F10"],
-                capture_output=True, text=True, timeout=5,
-                env={**os.environ, **env},
+                capture_output=True, text=True, timeout=5, env=env,
             )
             if r.returncode == 0:
-                log.info("sent F10 to UE4 window — panels hidden")
+                log.info("sent F10 to UE4 window — panels hidden "
+                         "(DISPLAY=%s)", env.get("DISPLAY", "?"))
             else:
-                log.warning("xdotool F10 failed (rc=%d): %s",
-                            r.returncode, r.stderr)
+                log.warning(
+                    "xdotool F10 failed (rc=%d) DISPLAY=%s: stdout=%r "
+                    "stderr=%r",
+                    r.returncode, env.get("DISPLAY", "?"),
+                    r.stdout, r.stderr,
+                )
         except (FileNotFoundError, subprocess.TimeoutExpired) as e:
             log.warning("xdotool F10 send failed: %s", e)
 
