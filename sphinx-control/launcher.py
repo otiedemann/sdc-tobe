@@ -1399,7 +1399,16 @@ class Launcher:
         ue4_cfg = self.config.get("ue4", {}) or {}
         rx = int(res_x or ue4_cfg.get("res_x") or 1280)
         ry = int(res_y or ue4_cfg.get("res_y") or 1024)
-        argv.extend([f"-ResX={rx}", f"-ResY={ry}", "-Windowed"])
+        # Per the Sphinx UE4 HMI docs the window opens fullscreen by
+        # default; force WINDOWED + an explicit resolution. Some UE4
+        # 4.27 builds honour only one of -ResX/-ResY vs -ResolutionSize*,
+        # so we pass BOTH variants for robustness.
+        argv.extend([
+            f"-ResX={rx}", f"-ResY={ry}",
+            f"-ResolutionSizeX={rx}", f"-ResolutionSizeY={ry}",
+            f"-WinX=100", f"-WinY=100",
+            "-WINDOWED",
+        ])
         # `-Port` only relevant in multi-instance mode. When started
         # by `start_environment` we have no endpoint (env-only spawn),
         # and the single-instance default port is fine.
@@ -1460,21 +1469,46 @@ class Launcher:
                 last_search_rc = find.returncode
                 if find.returncode == 0 and find.stdout.strip():
                     wids = find.stdout.strip().splitlines()
-                    # Now send F10 to each matched window.
-                    send_ok = False
+                    # The HMI takes a few seconds after window appears
+                    # to start listening for hotkeys; sending F10 too
+                    # early gets dropped. Wait a bit, ACTIVATE the
+                    # window (so F10 reaches the right key handler),
+                    # then send F10 three times spaced 1.2 s apart so
+                    # the first miss doesn't lose us the toggle.
+                    time.sleep(4.0)
+                    # Hard-set window size as a belt-and-braces fallback
+                    # for the case where -ResX/-WINDOWED were ignored.
+                    rx = int(self.config.get("ue4", {}).get("res_x") or 1280)
+                    ry = int(self.config.get("ue4", {}).get("res_y") or 1024)
                     for wid in wids:
-                        s = subprocess.run(
-                            ["xdotool", "key", "--window", wid,
-                             "--clearmodifiers", "F10"],
+                        subprocess.run(
+                            ["xdotool", "windowsize", wid, str(rx), str(ry)],
                             capture_output=True, text=True, timeout=3,
                             env=env,
                         )
-                        if s.returncode == 0:
-                            send_ok = True
+                        subprocess.run(
+                            ["xdotool", "windowactivate", "--sync", wid],
+                            capture_output=True, text=True, timeout=3,
+                            env=env,
+                        )
+                    send_ok = False
+                    for attempt in range(3):
+                        for wid in wids:
+                            s = subprocess.run(
+                                ["xdotool", "key", "--window", wid,
+                                 "--clearmodifiers", "F10"],
+                                capture_output=True, text=True, timeout=3,
+                                env=env,
+                            )
+                            if s.returncode == 0:
+                                send_ok = True
+                        if attempt < 2:
+                            time.sleep(1.2)
                     if send_ok:
                         log.info(
-                            "sent F10 to UE4 window(s) %s — panels hidden "
-                            "(DISPLAY=%s)", wids, env.get("DISPLAY", "?"),
+                            "sent F10 ×3 to UE4 window(s) %s — panels "
+                            "hidden (DISPLAY=%s)",
+                            wids, env.get("DISPLAY", "?"),
                         )
                         return
                 time.sleep(1.0)
