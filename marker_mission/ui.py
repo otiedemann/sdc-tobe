@@ -97,6 +97,11 @@ _PAGE_BASE_CSS = """
   canvas { background: #0c0f12; border-radius: 6px; max-width: 100%; height: auto; }
   img.video { display: block; max-width: 100%; height: auto;
               background: #000; border-radius: 6px; }
+  /* Hover-tooltip info icon, used wherever a control needs an
+     explanation (originally /tune; now also /calibrate camera config). */
+  .tune-info { color: #6b7280; cursor: help; margin-left: .25rem;
+               font-size: .85rem; user-select: none; }
+  .tune-info:hover, .tune-info:focus { color: var(--accent); outline: none; }
 </style>
 """
 
@@ -1484,8 +1489,8 @@ _PAGE_CALIBRATE = _PAGE_BASE_CSS + _PAGE_HEADER + _COMMON_SCRIPT + _PAGE_GRID_OP
       that config auto-load at startup.
     </p>
     <div id="camcfg-form" style="display:grid;
-         grid-template-columns: 11em minmax(11em, 1fr) minmax(16em, 2fr);
-         gap:.35rem .9rem; align-items:start; font-size:.85rem;">
+         grid-template-columns: minmax(11em, max-content) minmax(0, 1fr);
+         gap:.35rem .9rem; align-items:center; font-size:.85rem;">
       <div style="grid-column: 1 / -1; color:#778;">loading…</div>
     </div>
     <div style="display:flex; gap:.4rem; align-items:center;
@@ -1688,95 +1693,96 @@ const CAMCFG_SCHEMA = {
     options: ['automatic','automatic_prefer_iso_sensitivity',
               'automatic_prefer_shutter_speed','manual_iso_sensitivity',
               'manual_shutter_speed','manual'],
-    desc: 'How exposure is balanced. <code>automatic</code> picks both shutter and ISO. '
-        + '<code>automatic_prefer_iso_sensitivity</code> keeps ISO low (cleaner image, '
-        + 'longer shutter); <code>automatic_prefer_shutter_speed</code> keeps shutter '
-        + 'fast (less motion blur, higher ISO). <code>manual_*</code> pin one param; '
-        + '<code>manual</code> pins both.'},
+    default: 'automatic',
+    desc: 'How exposure is balanced. automatic picks both shutter and ISO. '
+        + 'automatic_prefer_iso_sensitivity keeps ISO low (cleaner image, longer '
+        + 'shutter); automatic_prefer_shutter_speed keeps shutter fast (less '
+        + 'motion blur, higher ISO). manual_* pin one param; manual pins both.'},
   'exposure.shutter_speed': {label: 'Shutter speed', type: 'enum',
-    options: _SHUTTER_VALUES,
-    desc: 'Shutter time. Faster (e.g. <code>shutter_1_over_500</code>) freezes motion '
-        + 'but darkens; slower (e.g. <code>shutter_1_over_30</code>) admits more light. '
-        + 'Honoured only when the mode includes <code>manual_shutter_speed</code> or '
-        + '<code>manual</code>.'},
+    options: _SHUTTER_VALUES, default: 'shutter_1_over_60',
+    desc: 'Shutter time. Faster (e.g. shutter_1_over_500) freezes motion but '
+        + 'darkens; slower (e.g. shutter_1_over_30) admits more light. '
+        + 'Honoured only when the mode includes manual_shutter_speed or manual.'},
   'exposure.iso_sensitivity': {label: 'ISO sensitivity', type: 'enum',
-    options: _ISO_VALUES,
-    desc: 'Sensor gain. Higher ISO (e.g. <code>iso_3200</code>) brightens dim scenes '
-        + 'at the cost of noise. Honoured when mode includes '
-        + '<code>manual_iso_sensitivity</code>, <code>manual</code>, or '
-        + '<code>automatic_prefer_iso_sensitivity</code>.'},
+    options: _ISO_VALUES, default: 'iso_100',
+    desc: 'Sensor gain. Higher ISO (e.g. iso_3200) brightens dim scenes at the '
+        + 'cost of noise. Honoured when mode includes manual_iso_sensitivity, '
+        + 'manual, or automatic_prefer_iso_sensitivity.'},
   'exposure.max_iso_sensitivity': {label: 'Max auto ISO', type: 'enum',
-    options: _ISO_VALUES,
-    desc: 'Cap on the ISO that auto modes will use. Lower keeps images cleaner in '
-        + 'dim light at the cost of slower shutters (more motion blur).'},
+    options: _ISO_VALUES, default: 'iso_3200',
+    desc: 'Cap on the ISO that auto modes will use. Lower keeps images cleaner '
+        + 'in dim light at the cost of slower shutters (more motion blur).'},
   'exposure.metering_mode': {label: 'Metering mode', type: 'enum',
-    options: ['standard','center_top'],
-    desc: 'Where the light meter samples the scene. <code>standard</code> averages the '
-        + 'whole frame; <code>center_top</code> weights the top-centre (helps when the '
-        + 'marker is high and a bright floor would otherwise pull the meter dark).'},
+    options: ['standard','center_top'], default: 'standard',
+    desc: 'Where the light meter samples. standard averages the whole frame; '
+        + 'center_top weights the top-centre (helps when the marker is high '
+        + 'and a bright floor would otherwise pull the meter dark).'},
   'white_balance.mode': {label: 'White balance', type: 'enum',
     options: ['automatic','candle','sunset','incandescent','warm_white','halogen',
               'fluorescent','cool_white','horizon','daylight','flash','blue_sky',
-              'shaded','custom'],
-    desc: 'Colour-cast correction. <code>automatic</code> adapts to scene; presets '
-        + '(<code>daylight</code>, <code>incandescent</code>, etc.) lock to known light '
-        + 'sources. <code>custom</code> uses the temperature below.'},
+              'shaded','custom'], default: 'automatic',
+    desc: 'Colour-cast correction. automatic adapts to scene; presets (daylight, '
+        + 'incandescent, etc.) lock to known light sources. custom uses the '
+        + 'temperature below.'},
   'white_balance.temperature': {label: 'WB temperature', type: 'enum',
-    options: _WB_TEMP,
-    desc: 'Custom WB colour temperature in Kelvin (<code>t_5000</code> ≈ daylight, '
-        + '<code>t_3000</code> ≈ incandescent). Honoured only when mode = '
-        + '<code>custom</code>.'},
+    options: _WB_TEMP, default: 't_5000',
+    desc: 'Custom WB colour temperature in Kelvin (t_5000 = daylight, '
+        + 't_3000 = incandescent). Honoured only when mode = custom.'},
   'hdr.value': {label: 'HDR', type: 'enum',
-    options: ['inactive','active'],
-    desc: 'High Dynamic Range. <code>active</code> boosts shadows and tames highlights '
-        + 'but introduces motion artefacts on fast pans/flights. Leave '
-        + '<code>inactive</code> for marker tracking.'},
+    options: ['inactive','active'], default: 'inactive',
+    desc: 'High Dynamic Range. active boosts shadows and tames highlights but '
+        + 'introduces motion artefacts on fast pans/flights. Leave inactive '
+        + 'for marker tracking.'},
   'ev_compensation.value': {label: 'EV bias', type: 'enum',
-    options: _EV_VALUES,
-    desc: 'Exposure compensation in stops on top of the chosen mode. Negative values '
-        + '(<code>ev_minus_1_00</code>) darken; positive values brighten. Useful when '
-        + 'the marker reads washed-out (-) or murky (+).'},
+    options: _EV_VALUES, default: 'ev_0_00',
+    desc: 'Exposure compensation in stops on top of the chosen mode. Negative '
+        + 'values (ev_minus_1_00) darken; positive values brighten. Useful '
+        + 'when the marker reads washed-out (-) or murky (+).'},
   'antiflicker.mode': {label: 'Anti-flicker', type: 'enum',
-    options: ['off','auto','mode_50hz','mode_60hz'],
-    desc: 'Filter for indoor lighting flicker (LED / fluorescent). '
-        + '<code>mode_50hz</code> for EU mains, <code>mode_60hz</code> for US mains; '
-        + '<code>auto</code> lets the camera detect; <code>off</code> disables.'},
+    options: ['off','auto','mode_50hz','mode_60hz'], default: 'auto',
+    desc: 'Filter for indoor lighting flicker (LED / fluorescent). mode_50hz '
+        + 'for EU mains, mode_60hz for US mains; auto lets the camera detect; '
+        + 'off disables.'},
   'video_stabilization.mode': {label: 'Stabilisation', type: 'enum',
-    options: ['roll_pitch','pitch','none'],
-    desc: 'Gimbal-software stabilisation axes. <code>roll_pitch</code> (default) is '
-        + 'the smoothest. <code>pitch</code> stabilises tilt only. <code>none</code> '
-        + 'leaves the gimbal hard-locked (useful when calibrating intrinsics).'},
+    options: ['roll_pitch','pitch','none'], default: 'roll_pitch',
+    desc: 'Gimbal-software stabilisation axes. roll_pitch (default) is the '
+        + 'smoothest. pitch stabilises tilt only. none leaves the gimbal '
+        + 'hard-locked (useful when calibrating intrinsics).'},
   'stream_mode.mode': {label: 'Stream mode', type: 'enum',
     options: ['low_latency','high_reliability','high_reliability_low_framerate'],
-    desc: 'Live-stream tuning. <code>low_latency</code> (default) minimises lag for '
-        + 'marker tracking. The <code>high_reliability_*</code> options trade latency '
-        + 'for fewer dropped frames on poor Wi-Fi.'},
+    default: 'low_latency',
+    desc: 'Live-stream tuning. low_latency (default) minimises lag for marker '
+        + 'tracking. The high_reliability_* options trade latency for fewer '
+        + 'dropped frames on poor Wi-Fi.'},
   'recording.mode': {label: 'Recording mode', type: 'enum',
     options: ['standard','hyperlapse','slow_motion','high_framerate'],
-    desc: 'On-board recording mode. <code>standard</code> is normal video. '
-        + '<code>hyperlapse</code> uses the ratio below. <code>slow_motion</code> / '
-        + '<code>high_framerate</code> require a high-FPS framerate setting.'},
+    default: 'standard',
+    desc: 'On-board recording mode. standard is normal video. hyperlapse uses '
+        + 'the ratio below. slow_motion / high_framerate require a high-FPS '
+        + 'framerate setting.'},
   'recording.resolution': {label: 'Recording resolution', type: 'enum',
     options: ['res_dci_4k','res_uhd_4k','res_2_7k','res_1080p','res_720p','res_480p'],
-    desc: 'Resolution of the recorded clip. Higher resolutions limit max framerate. '
-        + 'For marker work the live stream resolution is independent of this.'},
+    default: 'res_1080p',
+    desc: 'Resolution of the recorded clip. Higher resolutions limit max '
+        + 'framerate. For marker work the live stream resolution is '
+        + 'independent of this.'},
   'recording.framerate': {label: 'Recording framerate', type: 'enum',
     options: ['fps_24','fps_25','fps_30','fps_48','fps_50','fps_60','fps_96',
-              'fps_100','fps_120','fps_240','fps_480'],
-    desc: 'Recorded framerate. Higher FPS supports slow-motion playback but caps '
-        + 'achievable resolution.'},
+              'fps_100','fps_120','fps_240','fps_480'], default: 'fps_30',
+    desc: 'Recorded framerate. Higher FPS supports slow-motion playback but '
+        + 'caps achievable resolution.'},
   'recording.hyperlapse': {label: 'Hyperlapse ratio', type: 'enum',
-    options: ['ratio_15','ratio_30','ratio_60','ratio_120'],
-    desc: 'Time-lapse compression ratio when mode = <code>hyperlapse</code>. '
-        + '<code>ratio_15</code> plays back 15× faster than real time.'},
+    options: ['ratio_15','ratio_30','ratio_60','ratio_120'], default: 'ratio_15',
+    desc: 'Time-lapse compression ratio when mode = hyperlapse. ratio_15 '
+        + 'plays back 15x faster than real time.'},
   'recording.bitrate': {label: 'Recording bitrate', type: 'readonly',
-    desc: 'Reported bitrate (bits/s) of the active recording mode. Read-only — '
+    desc: 'Reported bitrate (bits/s) of the active recording mode. Read-only -- '
         + 'derived from resolution + framerate + mode by the firmware.'},
   'zoom.level': {label: 'Zoom level', type: 'number',
-    min: 1.0, max: 3.0, step: 0.1, defaultValue: 1.0,
-    desc: 'Digital zoom factor. 1.0 = no zoom (native FOV), 3.0 = maximum 3× '
-        + 'digital zoom. Increasing zoom narrows the FOV — markers near the frame '
-        + 'edge can disappear.'},
+    min: 1.0, max: 3.0, step: 0.1, default: 1.0,
+    desc: 'Digital zoom factor. 1.0 = no zoom (native FOV), 3.0 = maximum 3x '
+        + 'digital zoom. Increasing zoom narrows the FOV -- markers near the '
+        + 'frame edge can disappear.'},
 };
 
 let camcfgKeys = [];   // [['exposure','mode'], ...]
@@ -1792,32 +1798,50 @@ function camcfgSetMsg(s, ok) {
 function _renderField(key, sub, value) {
   const path = key + '.' + sub;
   const schema = CAMCFG_SCHEMA[path] || null;
-  // Label cell.
+  // Label cell with an info icon: hovering reveals the description
+  // (browser-native title tooltip, same pattern as /tune's tune-info).
   const lbl = document.createElement('div');
   lbl.style.cssText = 'color:#cbd5e1; padding:.2rem 0;';
-  lbl.textContent = schema ? schema.label : path;
+  const labelText = document.createElement('span');
+  labelText.textContent = schema ? schema.label : path;
+  lbl.appendChild(labelText);
+  const helpText = schema ? schema.desc
+    : '(no description for ' + path + ' -- firmware-specific field)';
+  const info = document.createElement('span');
+  info.className = 'tune-info';
+  info.textContent = 'ⓘ';      // circled-i (the same glyph /tune uses)
+  info.title = helpText;
+  info.tabIndex = 0;
+  lbl.appendChild(info);
   // Control cell.
   let ctrl;
-  const cur = (value === null || value === undefined) ? '' : String(value);
+  const fwHas = !(value === null || value === undefined || value === '');
+  const cur = fwHas ? String(value) : '';
+  // Schema default kicks in only when the firmware didn't supply a
+  // value -- a non-null firmware reading always wins (so the form
+  // reflects what the camera is actually doing).
+  const fallback = schema && schema.default !== undefined
+    ? String(schema.default) : '';
+  const initial = fwHas ? cur : fallback;
   if (schema && schema.type === 'enum') {
     ctrl = document.createElement('select');
-    // Make sure the current firmware value appears in the dropdown
-    // even if the schema's hardcoded list doesn't include it -- some
-    // builds expose extra enum values.
     const opts = schema.options.slice();
+    // Surface the firmware's actual value even if the schema's
+    // hardcoded list doesn't include it (older Olympe builds).
     if (cur && !opts.includes(cur)) opts.unshift(cur);
     for (const o of opts) {
       const op = document.createElement('option');
       op.value = o; op.textContent = o; ctrl.appendChild(op);
     }
-    ctrl.value = cur;
+    ctrl.value = initial;
+    if (!ctrl.value && opts.length) ctrl.value = opts[0];
   } else if (schema && schema.type === 'number') {
     ctrl = document.createElement('input');
     ctrl.type = 'number';
     if (schema.min !== undefined) ctrl.min = schema.min;
     if (schema.max !== undefined) ctrl.max = schema.max;
     if (schema.step !== undefined) ctrl.step = schema.step;
-    ctrl.value = cur || (schema.defaultValue ?? '');
+    ctrl.value = initial;
   } else if (schema && schema.type === 'readonly') {
     ctrl = document.createElement('input');
     ctrl.type = 'text';
@@ -1834,18 +1858,12 @@ function _renderField(key, sub, value) {
   }
   ctrl.dataset.key = key;
   ctrl.dataset.sub = sub;
+  ctrl.title = helpText;
   ctrl.style.cssText += 'background:#0c0f12; color:var(--fg);'
     + ' border:1px solid #2a3038; border-radius:4px;'
     + ' padding:.25rem .4rem; font-family:ui-monospace, monospace;'
     + ' font-size:.85rem; width:100%; box-sizing:border-box;';
-  // Description cell.
-  const desc = document.createElement('div');
-  desc.style.cssText = 'color:#778; font-size:.78rem; line-height:1.4;'
-    + ' padding:.2rem 0; font-family:inherit;';
-  desc.innerHTML = schema ? schema.desc
-    : '<span style="color:#9ca3af;">(no description for '
-      + path + ' — firmware-specific field)</span>';
-  return [lbl, ctrl, desc];
+  return [lbl, ctrl];
 }
 
 function camcfgPopulate(cfg) {
