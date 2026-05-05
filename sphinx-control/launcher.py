@@ -645,6 +645,28 @@ class Launcher:
                                  port, h_pid)
                     except (ProcessLookupError, PermissionError) as e:
                         log.warning("SIGKILL pid=%d failed: %s", h_pid, e)
+            # Final safety net — pkill anything matching the FC's
+            # script name, just in case the recorded PID + port-holder
+            # scan both missed something. This covers the case where
+            # the user manually started an FC outside sphinx-control
+            # (different session, different terminal) and our state
+            # has no clue what PID it has.
+            try:
+                script_name = fc.script or "unified_api_server.py"
+                # -9 = SIGKILL, -f = match against full command line
+                # so "unified_api_server.py" matches even though the
+                # python process's own argv[0] is just "python3".
+                r = subprocess.run(
+                    ["pkill", "-9", "-f", script_name],
+                    capture_output=True, text=True, timeout=4,
+                )
+                # rc=0 means at least one killed; rc=1 means none —
+                # both are fine, only worth logging the kill.
+                if r.returncode == 0:
+                    log.info("pkill -9 -f %s swept additional FC procs",
+                             script_name)
+            except (FileNotFoundError, subprocess.TimeoutExpired) as e:
+                log.warning("pkill sweep failed: %s", e)
             self.state.update_fc_status(fc_id, "stopped")
             log.info("stopped fc %s — killed pids=%s", fc_id, killed_pids)
 
