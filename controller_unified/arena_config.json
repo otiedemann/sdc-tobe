@@ -7,7 +7,8 @@
       "x": -10.0,
       "y": 5.4,
       "z": 4.0,
-      "wall": "left"
+      "wall": "left",
+      "direction_deg": 0.0
     },
     {
       "id": 9,
@@ -15,7 +16,8 @@
       "x": -10.0,
       "y": 5.4,
       "z": 2.0,
-      "wall": "left"
+      "wall": "left",
+      "direction_deg": 0.0
     },
     {
       "id": 2,
@@ -23,7 +25,8 @@
       "x": -5.0,
       "y": 10.8,
       "z": 4.0,
-      "wall": "back"
+      "wall": "back",
+      "direction_deg": -90.0
     },
     {
       "id": 10,
@@ -31,7 +34,8 @@
       "x": -5.0,
       "y": 10.8,
       "z": 2.0,
-      "wall": "back"
+      "wall": "back",
+      "direction_deg": -90.0
     },
     {
       "id": 3,
@@ -39,7 +43,8 @@
       "x": 0.0,
       "y": 10.8,
       "z": 4.0,
-      "wall": "back"
+      "wall": "back",
+      "direction_deg": -90.0
     },
     {
       "id": 11,
@@ -47,7 +52,8 @@
       "x": 0.0,
       "y": 10.8,
       "z": 2.0,
-      "wall": "back"
+      "wall": "back",
+      "direction_deg": -90.0
     },
     {
       "id": 4,
@@ -55,7 +61,8 @@
       "x": 5.0,
       "y": 10.8,
       "z": 4.0,
-      "wall": "back"
+      "wall": "back",
+      "direction_deg": -90.0
     },
     {
       "id": 12,
@@ -63,7 +70,8 @@
       "x": 5.0,
       "y": 10.8,
       "z": 2.0,
-      "wall": "back"
+      "wall": "back",
+      "direction_deg": -90.0
     },
     {
       "id": 5,
@@ -71,7 +79,8 @@
       "x": 10.0,
       "y": 5.4,
       "z": 4.0,
-      "wall": "right"
+      "wall": "right",
+      "direction_deg": 180.0
     },
     {
       "id": 13,
@@ -79,7 +88,8 @@
       "x": 10.0,
       "y": 5.4,
       "z": 2.0,
-      "wall": "right"
+      "wall": "right",
+      "direction_deg": 180.0
     },
     {
       "id": 6,
@@ -87,7 +97,8 @@
       "x": 5.0,
       "y": 0.0,
       "z": 4.0,
-      "wall": "front"
+      "wall": "front",
+      "direction_deg": 90.0
     },
     {
       "id": 14,
@@ -95,7 +106,8 @@
       "x": 5.0,
       "y": 0.0,
       "z": 2.0,
-      "wall": "front"
+      "wall": "front",
+      "direction_deg": 90.0
     },
     {
       "id": 7,
@@ -103,7 +115,8 @@
       "x": 0.0,
       "y": 0.0,
       "z": 4.0,
-      "wall": "front"
+      "wall": "front",
+      "direction_deg": 90.0
     },
     {
       "id": 15,
@@ -111,7 +124,8 @@
       "x": 0.0,
       "y": 0.0,
       "z": 2.0,
-      "wall": "front"
+      "wall": "front",
+      "direction_deg": 90.0
     },
     {
       "id": 8,
@@ -119,7 +133,8 @@
       "x": -5.0,
       "y": 0.0,
       "z": 4.0,
-      "wall": "front"
+      "wall": "front",
+      "direction_deg": 90.0
     },
     {
       "id": 16,
@@ -127,7 +142,9 @@
       "x": -5.0,
       "y": 0.0,
       "z": 2.0,
-      "wall": "front"
+      "wall": "front",
+      "direction_deg": 90.0
     }
-  ]
+  ],
+  "_direction_comment": "direction_deg per marker: angle in arena coords of the marker's outward-facing normal (where 0\u00b0 = arena +X, 90\u00b0 = arena +Y). The Sphinx YAML emitter converts this to UE4 yaw via ue_yaw = direction_deg - 90 (under axis_map y2x,x2y_neg). For wall markers the value is just the wall's inward direction; for non-standard placements set direction_deg explicitly per marker."
 }

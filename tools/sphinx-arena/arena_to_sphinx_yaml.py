@@ -74,31 +74,47 @@ DEFAULT_OUT_YAML = Path(__file__).parent / "out" / "arena.yml"
 #   back  (arena y=10.8, inward arena -Y → UE -X)  yaw 180°
 #   left  (arena x=-10,  inward arena +X → UE -Y)  yaw -90°
 #   right (arena x=+10,  inward arena -X → UE +Y)  yaw +90°
-# Marker pitch is now ZERO — the marker FBX itself bakes a 90° X-rotation
+# Marker pitch is ZERO — the marker FBX itself bakes a 90° X-rotation
 # in Blender so the plane is already vertical with normal +X in UE
-# (after the Sphinx -Y/-Z axis conversion). YAML only needs to apply
-# yaw to spin the +X normal around UE +Z to face the right wall.
-#
-# Why bake orientation into the FBX: previous revisions left the plane
-# flat (normal +Z in Blender) and tried to stand it up via YAML pitch.
-# That introduced a UE-pitch-convention ambiguity that got the
-# orientation wrong on every iteration — flipping yaws by 180° helped
-# some walls but never all four at once. With the plane already
-# vertical in the FBX, yaw alone is unambiguous.
+# (after the Sphinx -Y/-Z axis conversion). YAML only needs YAW to
+# spin the +X normal around UE +Z to face the desired direction.
 MARKER_PITCH_DEG: float = 0.0
 
-# UE positive yaw is clockwise viewed from above, so it rotates the
-# marker's +X normal: +X → +Y → -X → -Y → +X.
-# Required inward direction per wall (axis_map=y2x,x2y_neg):
-#   front (arena y=0,    inward arena +Y → UE +X)  : keep +X, yaw   0°
-#   back  (arena y=10.8, inward arena -Y → UE -X)  : +X → -X, yaw 180°
-#   left  (arena x=-10,  inward arena +X → UE -Y)  : +X → -Y, yaw -90°
-#   right (arena x=+10,  inward arena -X → UE +Y)  : +X → +Y, yaw +90°
+# Per-marker direction is now read directly from arena_config.json's
+# new ``direction_deg`` field (in arena coords). The mapping below is
+# only a fallback for old configs missing direction_deg, and uses the
+# wall name to derive a sensible default.  Strongly preferred: set
+# direction_deg explicitly on every marker in arena_config.json.
+WALL_FALLBACK_DIRECTION_DEG: dict[str, float] = {
+    "left":   0.0,    # x=-10, inward = arena +X (0° in arena polar)
+    "right":  180.0,  # x=+10, inward = arena -X
+    "front":  90.0,   # y=0,   inward = arena +Y
+    "back":  -90.0,   # y=max, inward = arena -Y
+}
+
+
+def arena_dir_to_ue_yaw(direction_deg_arena: float) -> float:
+    """Convert a marker's facing direction (in arena coord polar) to a
+    UE4 FRotator yaw value, given the default axis_map y2x,x2y_neg.
+
+    Derivation: an arena unit vector at angle θ (measured CCW from
+    arena +X in the arena XY plane) is (cos θ, sin θ, 0). Under
+    axis_map y2x,x2y_neg this maps to UE (sin θ, -cos θ, 0). Our
+    marker FBX exports with normal at UE +X (= (1, 0, 0)) post-import.
+    UE positive yaw rotates +X clockwise viewed from above:
+       yaw α takes +X to (cos α, sin α).
+    Setting (cos α, sin α) = (sin θ, -cos θ) gives α = θ - 90°.
+
+    So: ue_yaw = arena_direction_deg - 90°.
+    """
+    return direction_deg_arena - 90.0
+
+
+# Legacy alias kept so older code that imports WALL_YAW_DEG still works.
+# Computed from WALL_FALLBACK_DIRECTION_DEG via the same conversion.
 WALL_YAW_DEG: dict[str, float] = {
-    "front":   0.0,   # arena y=0    → faces UE +X
-    "back":  180.0,   # arena y=10.8 → faces UE -X
-    "left":  -90.0,   # arena x=-10  → faces UE -Y
-    "right":  90.0,   # arena x=+10  → faces UE +Y
+    wall: arena_dir_to_ue_yaw(d)
+    for wall, d in WALL_FALLBACK_DIRECTION_DEG.items()
 }
 
 
@@ -366,6 +382,25 @@ def main() -> int:
              "puts the drone inside the arena instead of having to fly in "
              "from outside. Default: ON.",
     )
+    # Per-wall yaw overrides for empirical iteration.  The math-derived
+    # defaults are 0/180/-90/+90 (face inward) but axis conventions
+    # between Blender, FBX, and Sphinx's mesh-injection have produced
+    # repeated off-by-90° and off-by-180° issues; these flags let the
+    # operator iterate in seconds without rebuilding any FBXs:
+    #
+    #   make yaml YAML_EXTRA="--yaw-front 180 --yaw-back 0 --yaw-left 90 --yaw-right -90"
+    #
+    p.add_argument("--yaw-front", type=float, default=None,
+                   help="Override YAML yaw for 'front'-wall markers (deg).")
+    p.add_argument("--yaw-back", type=float, default=None,
+                   help="Override YAML yaw for 'back'-wall markers (deg).")
+    p.add_argument("--yaw-left", type=float, default=None,
+                   help="Override YAML yaw for 'left'-wall markers (deg).")
+    p.add_argument("--yaw-right", type=float, default=None,
+                   help="Override YAML yaw for 'right'-wall markers (deg).")
+    p.add_argument("--marker-pitch", type=float, default=None,
+                   help="Override MARKER_PITCH_DEG for wall markers. "
+                        "Default 0 (FBX is already vertical).")
     p.add_argument(
         "--no-center-arena", dest="center_arena", action="store_false",
         help="Disable the arena recentering (geometry stays at the literal "
@@ -374,6 +409,19 @@ def main() -> int:
     args = p.parse_args()
 
     axis_map = _AXIS_MAP_PRESETS[args.axis_map]
+
+    # Apply CLI yaw overrides on top of the module-level defaults.
+    wall_yaws = dict(WALL_YAW_DEG)
+    if args.yaw_front is not None:
+        wall_yaws["front"] = args.yaw_front
+    if args.yaw_back is not None:
+        wall_yaws["back"] = args.yaw_back
+    if args.yaw_left is not None:
+        wall_yaws["left"] = args.yaw_left
+    if args.yaw_right is not None:
+        wall_yaws["right"] = args.yaw_right
+    marker_pitch = (args.marker_pitch if args.marker_pitch is not None
+                    else MARKER_PITCH_DEG)
 
     with args.arena_config.open() as f:
         arena = json.load(f)
@@ -425,16 +473,35 @@ def main() -> int:
     out_lines.append("Meshes:")
 
     n_wall = 0
+    cli_overrides = {
+        "front": args.yaw_front,
+        "back":  args.yaw_back,
+        "left":  args.yaw_left,
+        "right": args.yaw_right,
+    }
     for m in arena.get("markers", []):
         mid = int(m["id"])
         wall = str(m.get("wall", "front"))
-        yaw = WALL_YAW_DEG.get(wall, 0.0)
+        # Yaw resolution priority:
+        #   1. CLI --yaw-<wall> flag (for empirical iteration)
+        #   2. Per-marker direction_deg from arena_config.json
+        #      (the cleanest source of truth — explicitly states which
+        #       way the marker faces in arena coords)
+        #   3. WALL_FALLBACK_DIRECTION_DEG keyed by wall name
+        if cli_overrides.get(wall) is not None:
+            yaw = cli_overrides[wall]
+        elif "direction_deg" in m:
+            yaw = arena_dir_to_ue_yaw(float(m["direction_deg"]))
+        else:
+            yaw = wall_yaws.get(wall, 0.0)
         # arena → UE conversion (metres) → centimetres
         ux_m, uy_m, uz_m = shifted_apply((float(m["x"]), float(m["y"]), float(m["z"])))
         loc_cm = (ux_m * 100.0, uy_m * 100.0, uz_m * 100.0)
-        # Pitch stands the flat-plane FBX upright; yaw aims it at the
-        # arena interior. UE4 Rotator order is (Pitch, Yaw, Roll).
-        rot = (MARKER_PITCH_DEG, yaw, 0.0)
+        # Marker FBX is already vertical (+X normal in UE) per
+        # build_marker_fbx.py; yaw spins it around UE +Z to face the
+        # direction specified by m["direction_deg"] (or the per-wall
+        # fallback). UE4 Rotator order is (Pitch, Yaw, Roll).
+        rot = (marker_pitch, yaw, 0.0)
         fbx_path = fbx_dir / f"aruco_{mid:03d}.fbx"
         out_lines.append(emit_yaml_block(
             name=f"wall_{wall}_id_{mid:03d}_{m.get('label','').lower().replace(' ', '_') or 'marker'}",
@@ -544,7 +611,7 @@ def main() -> int:
                     wx, wy = cwx, cwy + offset
                 ux_m, uy_m, uz_m = shifted_apply((wx, wy, _PAINTING_Z_M))
                 loc_cm = (ux_m * 100.0, uy_m * 100.0, uz_m * 100.0)
-                rot = (MARKER_PITCH_DEG, WALL_YAW_DEG[wall], 0.0)
+                rot = (marker_pitch, wall_yaws[wall], 0.0)
                 out_lines.append(
                     f"  # Painting — {logo_name} on {wall} wall"
                 )
