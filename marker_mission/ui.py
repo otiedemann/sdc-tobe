@@ -2267,13 +2267,39 @@ function renderGroups(view) {
         ? `<span class="tune-info" title="${descAttr}" tabindex="0">ⓘ</span>`
         : '';
       row.title = desc;
-      const inputType = (it.kind === 'str') ? 'text' : 'number';
-      const stepAttr = (it.kind === 'str') ? '' : `step="${it.step}"`;
+      let inputType, stepAttr, valueAttr;
+      if (it.kind === 'bool') {
+        inputType = 'checkbox';
+        stepAttr  = '';
+        // Boolean values come through as JS true/false from the
+        // /api/tune JSON payload; render the corresponding 'checked'
+        // attribute. value="" is required because the apply path
+        // also sends inp.value for non-bools, but for bools we
+        // override with inp.checked further down.
+        valueAttr = (it.value ? 'checked' : '') + ' value=""';
+      } else if (it.kind === 'str') {
+        inputType = 'text';
+        stepAttr  = '';
+        valueAttr = `value="${it.value}"`;
+      } else {
+        inputType = 'number';
+        stepAttr  = `step="${it.step}"`;
+        valueAttr = `value="${it.value}"`;
+      }
+      // Render warning banner for bool fields whose desc starts with
+      // "WARNING:" -- highlights the dangerous prev-anchor toggle.
+      const isWarning = (it.kind === 'bool'
+                         && (it.desc || '').toUpperCase().includes('WARNING'));
+      const warnHtml = isWarning
+        ? `<span style="background:#3a1010; color:#fca5a5;
+                        padding:.1rem .4rem; border-radius:3px;
+                        font-size:.7rem; margin-left:.4rem;">⚠ DANGEROUS</span>`
+        : '';
       row.innerHTML = `
-        <span class="tune-label">${it.label} ${infoHtml}
+        <span class="tune-label">${it.label} ${infoHtml}${warnHtml}
           <span style="color:#6b7280; font-size:.75rem;">(${it.name})</span></span>
         <input class="tune-input" type="${inputType}" data-name="${it.name}"
-               ${stepAttr} value="${it.value}"
+               data-kind="${it.kind}" ${stepAttr} ${valueAttr}
                title="${descAttr}">
         <span class="tune-unit">${it.unit || ''}</span>
         <span class="tune-default">default: ${it.default}</span>
@@ -2285,24 +2311,37 @@ function renderGroups(view) {
   }
   // Wire input change-tracking, per-field reset, and auto-apply
   document.querySelectorAll('.tune-input').forEach(inp => {
-    inp.addEventListener('input', () => {
+    const isBool = inp.dataset.kind === 'bool';
+    const fieldVal = () => isBool
+      ? (inp.checked ? 'true' : 'false')
+      : String(inp.value);
+    inp.addEventListener(isBool ? 'change' : 'input', () => {
       const name = inp.dataset.name;
       const def = String(TUNE_FIELDS[name].default);
-      if (String(inp.value) !== def) inp.classList.add('dirty');
+      if (fieldVal() !== def) inp.classList.add('dirty');
       else inp.classList.remove('dirty');
       TUNE_DIRTY.add(name);
-      scheduleAutoApply(name);
+      // Bools commit on change immediately; non-bools debounce.
+      if (isBool) applyFieldNow(name);
+      else        scheduleAutoApply(name);
     });
-    // Also commit immediately on blur / Enter (cancels any pending
-    // debounce so the user gets fast feedback when leaving the field).
-    inp.addEventListener('change', () => applyFieldNow(inp.dataset.name));
+    if (!isBool) {
+      // Also commit immediately on blur / Enter (cancels any pending
+      // debounce so the user gets fast feedback when leaving the field).
+      inp.addEventListener('change', () => applyFieldNow(inp.dataset.name));
+    }
   });
   document.querySelectorAll('.tune-resetbtn').forEach(btn => {
     btn.addEventListener('click', () => {
       const name = btn.dataset.name;
       const inp = document.querySelector(`.tune-input[data-name="${name}"]`);
       if (!inp) return;
-      inp.value = TUNE_FIELDS[name].default;
+      const def = TUNE_FIELDS[name].default;
+      if (inp.dataset.kind === 'bool') {
+        inp.checked = !!def;
+      } else {
+        inp.value = def;
+      }
       inp.classList.remove('dirty');
       TUNE_DIRTY.add(name);
       applyFieldNow(name);
@@ -2321,6 +2360,15 @@ function scheduleAutoApply(name) {
     applyFieldNow(name);
   }, APPLY_DEBOUNCE_MS));
 }
+function _inputApplyValue(inp) {
+  // Booleans send "true"/"false"; everything else sends the raw input
+  // value (server's update_from_dict casts based on the dataclass
+  // field type).
+  if (inp.dataset.kind === 'bool') {
+    return inp.checked ? 'true' : 'false';
+  }
+  return inp.value;
+}
 async function applyFieldNow(name) {
   if (applyTimers.has(name)) {
     clearTimeout(applyTimers.get(name));
@@ -2328,7 +2376,8 @@ async function applyFieldNow(name) {
   }
   const inp = document.querySelector(`.tune-input[data-name="${name}"]`);
   if (!inp) return;
-  const body = {}; body[name] = inp.value;
+  const v = _inputApplyValue(inp);
+  const body = {}; body[name] = v;
   try {
     const r = await fetch('/api/tune/apply', {
       method: 'POST',
@@ -2341,7 +2390,7 @@ async function applyFieldNow(name) {
                 + JSON.stringify(j.errors || j.error), false);
       return;
     }
-    setStatus(name + ' = ' + inp.value + ' applied to running controller.', true);
+    setStatus(name + ' = ' + v + ' applied to running controller.', true);
   } catch (e) {
     setStatus('Apply ' + name + ' failed: ' + e, false);
   }
@@ -2350,8 +2399,7 @@ async function applyFieldNow(name) {
 function collectValues() {
   const out = {};
   document.querySelectorAll('.tune-input').forEach(inp => {
-    const name = inp.dataset.name;
-    out[name] = inp.value;
+    out[inp.dataset.name] = _inputApplyValue(inp);
   });
   return out;
 }

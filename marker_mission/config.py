@@ -287,6 +287,19 @@ class MissionConfig:
     record_fps: int = 25                   # MJPEG frames are decoded -> we re-mux
     record_jpeg_quality: int = 90          # for any direct JPEG saves
 
+    # --- IPPE branch picker layers ------------------------------------------
+    # Each ``enable_ippe_*`` flag toggles one of the 2026-05-04 fixes
+    # that together dampen the IPPE planar-pose mirror flip. They live
+    # in cfg so the operator can A/B them at /tune without a redeploy
+    # and so a future flight log captures which layers were active.
+    # Default order matches what worked best in the wall-incident
+    # reprocessor + magnetometer flights.
+    enable_ippe_mirror_collapse: bool = True       # b9da68f + 291a195
+    enable_ippe_arena_oob_filter: bool = True      # 53a8efb (vote-bounds drop)
+    enable_ippe_alt_branch_swap: bool = True       # 3e1dd2e (cold-start alt rescue)
+    enable_ippe_prev_anchor: bool = False          # 2d2b8b6 + a3cbd83 -- DANGEROUS
+    enable_ippe_aggregate_oob_discard: bool = True # e144c2d (post-revise + final)
+
     # ------------------------------------------------------------------------
     def update_from_dict(self, values: dict) -> dict:
         """Apply a {field: value} dict to this cfg in-place. Returns a
@@ -573,6 +586,27 @@ TUNING_FIELDS = {
         "label": "killswitch key", "kind": "str",
         "desc": "Single character. Pressing this key anywhere on the web UI (including inside textareas / number inputs) immediately triggers /api/stop and lands the drone. Default '@'. Comparison is case-insensitive; modifier keys (Ctrl/Cmd/Alt) are excluded so browser shortcuts still work.",
     },
+
+    "enable_ippe_mirror_collapse": {
+        "label": "Mirror collapse", "kind": "bool",
+        "desc": "Truly-frontal blind window only (max|hdg| < 10 deg AND heading sum ~0 AND similar reproj-err): collapse the per-marker world-position vote to the midpoint of the two IPPE candidates. Disabling reverts to whichever branch IPPE picked, which flips on noise at <3 deg tilt. Default ON.",
+    },
+    "enable_ippe_arena_oob_filter": {
+        "label": "Arena bounds filter", "kind": "bool",
+        "desc": "Drop a per-marker world-position vote when it lands outside the arena bounding box (plus 1 m slack). The drone can't physically be there, so a vote that lands metres outside is the wrong IPPE branch. Default ON.",
+    },
+    "enable_ippe_alt_branch_swap": {
+        "label": "Alt-branch swap (cold-start)", "kind": "bool",
+        "desc": "When the chosen IPPE branch is OOB, try the other (loser) branch as a rescue. Recovered ~94% of frames on the wall-incident flight. Default ON.",
+    },
+    "enable_ippe_prev_anchor": {
+        "label": "Prev-fix branch anchor [DANGEROUS]", "kind": "bool",
+        "desc": "WARNING: enables branch lock based on the previous frame's fix. Without a magnetometer offset this can silently propagate a wrong-branch selection through the entire flight (the wall-incident failure mode -- once locked, every frame stays locked). Only enable for diagnostics or when you have very low corner noise AND a confident first frame. Default OFF.",
+    },
+    "enable_ippe_aggregate_oob_discard": {
+        "label": "OOB revise + aggregate discard", "kind": "bool",
+        "desc": "Final defensive layer: after picking, re-check the per-marker vote against arena bounds and try alt or drop the marker; after weighted average, discard if the result lands OOB (sticky position holds). Default ON.",
+    },
 }
 
 TUNING_GROUPS = [
@@ -602,6 +636,12 @@ TUNING_GROUPS = [
         ["pose_smoothing_alpha", "pose_max_age_s"]),
     ("Operator UX",
         ["killswitch_key"]),
+    ("IPPE branch picker (advanced)",
+        ["enable_ippe_mirror_collapse",
+         "enable_ippe_arena_oob_filter",
+         "enable_ippe_alt_branch_swap",
+         "enable_ippe_prev_anchor",
+         "enable_ippe_aggregate_oob_discard"]),
 ]
 
 

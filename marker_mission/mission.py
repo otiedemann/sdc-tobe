@@ -226,6 +226,7 @@ def cmd_fly(args: argparse.Namespace) -> int:
     reader = MjpegStreamReader(api.video_url())
     reader.start()
     detector = ArucoDetector(calibration, cfg.marker_size_m, cfg.aruco_dict)
+    detector.enable_mirror_collapse = cfg.enable_ippe_mirror_collapse
 
     # ---------- 2b. Arena world-position estimator -----------------------
     # vision_worker computes the camera's arena-frame world position
@@ -489,6 +490,12 @@ def cmd_fly(args: argparse.Namespace) -> int:
             last_seen_ts = ts
             last_expired = False
             try:
+                # Pick up runtime cfg toggles (e.g. operator flips
+                # mirror_collapse on /tune mid-flight). Cheap attribute
+                # write; the detector reads it per-frame inside the
+                # IPPE branch picker.
+                detector.enable_mirror_collapse = (
+                    cfg.enable_ippe_mirror_collapse)
                 # Detect every visible marker so the operator sees them
                 # all in the video overlay -- the script can target any
                 # marker, and even non-target markers in frame are
@@ -580,7 +587,12 @@ def cmd_fly(args: argparse.Namespace) -> int:
                         arena, poses,
                         prev_position_m=prev_wp,
                         prev_age_s=prev_age_s,
-                        tel_yaw_deg=tel_yaw_for_swap)
+                        tel_yaw_deg=tel_yaw_for_swap,
+                        enable_arena_oob_filter=cfg.enable_ippe_arena_oob_filter,
+                        enable_alt_branch_swap=cfg.enable_ippe_alt_branch_swap,
+                        enable_prev_anchor=cfg.enable_ippe_prev_anchor,
+                        enable_aggregate_oob_discard=
+                            cfg.enable_ippe_aggregate_oob_discard)
                     if est is not None:
                         with state.lock:
                             state.world_position_m = (

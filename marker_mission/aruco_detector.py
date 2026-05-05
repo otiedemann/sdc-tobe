@@ -177,6 +177,11 @@ class ArucoDetector:
         # discriminator, which is reliable.
         self._prev_rvec: dict[int, tuple[np.ndarray, float]] = {}
         self._ambiguity_max_age_s = 5.0  # cache invalidates after this gap
+        # Toggleable via /tune. When False, the detector skips the
+        # mirror-collapse path that overrides the chosen pose's
+        # heading + position with the midpoint of the two IPPE
+        # candidates (used for the truly-frontal blind window).
+        self.enable_mirror_collapse = True
 
         # 3D marker corners in marker frame, OpenCV ArUco order TL-TR-BR-BL,
         # marker plane is z=0. With z pointing AWAY from the marker face,
@@ -347,7 +352,7 @@ class ArucoDetector:
                                 and max(abs(hdg0), abs(hdg1)) < 10.0)
                     similar_err = (err0 < 1.0
                                    and err1 < 2.0 * err0 + 0.2)
-                    if mirrored and similar_err:
+                    if mirrored and similar_err and self.enable_mirror_collapse:
                         chosen_pose.relative_heading_deg = (hdg0 + hdg1) / 2.0
                         R0, _ = cv2.Rodrigues(
                             np.asarray(scored[0][1]).reshape(3, 1))

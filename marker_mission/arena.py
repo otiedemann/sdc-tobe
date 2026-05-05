@@ -467,6 +467,10 @@ def estimate_position(arena: ArenaConfig,
                       prev_position_m: Optional[np.ndarray] = None,
                       prev_age_s: Optional[float] = None,
                       tel_yaw_deg: Optional[float] = None,
+                      enable_arena_oob_filter: bool = True,
+                      enable_alt_branch_swap: bool = True,
+                      enable_prev_anchor: bool = False,
+                      enable_aggregate_oob_discard: bool = True,
                       ) -> Optional[PositionEstimate]:
     """Weighted average of camera world positions derived from each visible
     reference marker.
@@ -505,7 +509,8 @@ def estimate_position(arena: ArenaConfig,
     # to the cold-start (in-bounds) path lets the swap recover.
     prev_arr = (np.asarray(prev_position_m, dtype=float).reshape(3)
                 if prev_position_m is not None else None)
-    use_anchor = (prev_arr is not None
+    use_anchor = (enable_prev_anchor
+                  and prev_arr is not None
                   and prev_age_s is not None
                   and prev_age_s < ARENA_PREV_STALE_S
                   and _vote_in_bounds(prev_arr, arena))
@@ -585,9 +590,16 @@ def estimate_position(arena: ArenaConfig,
             # to be plausible; skip this marker so its bad pose
             # doesn't pull the average.
         else:
-            if _vote_in_bounds(chosen_pos, arena):
+            # Cold-start path. enable_arena_oob_filter gates the
+            # in-bounds check on the chosen vote; without it, the
+            # chosen vote is taken regardless of where it lands (the
+            # pre-2026-05-04 behaviour). enable_alt_branch_swap
+            # toggles whether we rescue OOB chosen by trying alt.
+            chosen_in = _vote_in_bounds(chosen_pos, arena)
+            if chosen_in or not enable_arena_oob_filter:
                 pos_w = chosen_pos
-            elif alt_pos is not None and _vote_in_bounds(alt_pos, arena):
+            elif (enable_alt_branch_swap and alt_pos is not None
+                    and _vote_in_bounds(alt_pos, arena)):
                 pos_w = alt_pos
                 method = "ippe_swapped"
             # else: both OOB; skip.
@@ -597,7 +609,11 @@ def estimate_position(arena: ArenaConfig,
         # Try the alt branch as a second-chance fix; if both branches
         # are OOB, drop the marker. The drone can't be outside the
         # arena, no matter how close to prev the IPPE pose looks.
-        if pos_w is not None and not _vote_in_bounds(pos_w, arena):
+        # Gated by enable_aggregate_oob_discard (same toggle as the
+        # final-average discard below -- both are layer-5 sanity).
+        if (enable_aggregate_oob_discard
+                and pos_w is not None
+                and not _vote_in_bounds(pos_w, arena)):
             if (method != "ippe_swapped" and alt_pos is not None
                     and _vote_in_bounds(alt_pos, arena)):
                 pos_w = alt_pos
@@ -624,7 +640,7 @@ def estimate_position(arena: ArenaConfig,
     # state.world_position_m is preserved -- a fix that places the
     # drone outside the arena is by definition wrong, no matter how
     # confident the per-marker votes look.
-    if not _vote_in_bounds(avg, arena):
+    if enable_aggregate_oob_discard and not _vote_in_bounds(avg, arena):
         return None
 
     return PositionEstimate(
