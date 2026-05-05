@@ -63,6 +63,25 @@ def _port_in_use(port: int) -> bool:
         s.close()
 
 
+def _wait_for_port_release(port: int | None, timeout_s: float = 8.0,
+                           poll_interval_s: float = 0.2) -> bool:
+    """Poll until ``port`` is free (i.e. nothing is bound to it on the
+    loopback interface). Returns True if released within ``timeout_s``,
+    False on timeout. Used after killing a drone process to make sure
+    the kernel has released the netns / port BEFORE we try to bind it
+    again — earlier code used a fixed 1.0 s sleep which was sometimes
+    too short on a busy host, leaving the next spawn to fail with
+    EADDRINUSE."""
+    if port is None or int(port) <= 0:
+        return True
+    deadline = time.time() + float(timeout_s)
+    while time.time() < deadline:
+        if not _port_in_use(int(port)):
+            return True
+        time.sleep(poll_interval_s)
+    return not _port_in_use(int(port))
+
+
 def _proc_alive_running(pid: int) -> bool:
     """True iff pid exists AND is in a running/sleeping state.
     Returns False for zombie ('Z') or dead processes — which
@@ -651,17 +670,46 @@ class Launcher:
                  drone_id, rec.instance_id)
 
     def delete(self, drone_id: str) -> None:
-        """Stop the drone and remove its row from state."""
+        """Stop the drone, tear down its network namespace, and remove
+        its row from state. After this returns the drone's port is
+        guaranteed-or-best-effort released so a subsequent ``spawn()``
+        with the same instance_id won't race the kernel's port
+        teardown.
+
+        Hardening over the previous naive version:
+          - Always run network.teardown(), even if stop() failed (the
+            previous code skipped teardown on stop errors which left
+            stale network namespaces around).
+          - Wait for the drone port to be released before returning.
+          - Return idempotently for unknown drone_ids (lookup misses
+            after a crash were silently doing nothing — same here, but
+            documented).
+        """
         with self._lock:
             rec = self.state.get(drone_id)
             if rec is None:
+                log.info("delete: drone %s not in state — nothing to do",
+                         drone_id)
                 return
+            instance_id = rec.instance_id
+            port = rec.drone_port
             try:
                 self.stop(drone_id)
             except KeyError:
                 pass
+            except Exception as e:
+                log.warning("delete: stop(%s) failed: %s — continuing "
+                            "with teardown anyway", drone_id, e)
+            # Always tear down the network namespace, even if stop()
+            # raised. Stale netns are the #1 cause of the next spawn
+            # failing.
+            self._safe_teardown(instance_id)
             self.state.delete(drone_id)
-            log.info("deleted drone %s", drone_id)
+            # Wait for port to be released so an immediately-following
+            # spawn at the same instance_id doesn't race the kernel.
+            _wait_for_port_release(port, timeout_s=5.0)
+            log.info("deleted drone %s (instance=%d, port=%s)",
+                     drone_id, instance_id, port)
 
     def restart(self, drone_id: str) -> DroneRecord:
         """Stop and respawn with the same parameters and instance_id.
@@ -670,24 +718,63 @@ class Launcher:
         stays the same, so external clients tracking ``host:port``
         keep working seamlessly. We delete the old stopped row before
         respawning so the unique instance_id constraint doesn't fire.
+
+        Reliability improvements over the naive 'stop, sleep 1s, spawn'
+        approach (added because users reported the second spawn
+        intermittently failed when the first drone had crashed):
+          1. WAIT for the drone's port to actually be released by the
+             kernel before re-binding (poll up to 8s instead of a
+             fixed 1.0 s sleep). On a loaded host the netns teardown
+             can easily take 2-3 s.
+          2. RETRY the spawn once on failure, with a fresh teardown
+             between attempts. This catches the case where the first
+             spawn raced with stale state.
         """
         with self._lock:
             rec = self.state.get(drone_id)
             if rec is None:
                 raise KeyError(drone_id)
+            old_port = rec.drone_port
+            old_instance = rec.instance_id
             self.stop(drone_id)
             # Drop the stopped row first; otherwise the new row's
             # instance_id collides with it on INSERT.
             self.state.delete(drone_id)
-            # Tiny pause to let the kernel release the port and netns
-            # before we try to bind again.
-            time.sleep(1.0)
-            return self.spawn(LaunchRequest(
+            # Wait for the kernel to actually free the port before we
+            # try to rebind it. Falls back to a fixed sleep if the
+            # port wasn't released within the timeout — better than
+            # giving up entirely.
+            released = _wait_for_port_release(old_port, timeout_s=8.0)
+            if not released:
+                log.warning(
+                    "port %s still in use after 8s; sleeping a further 2s "
+                    "and trying spawn anyway", old_port,
+                )
+                time.sleep(2.0)
+            else:
+                # Brief settling pause even after the port released.
+                time.sleep(0.2)
+
+            launch_req = LaunchRequest(
                 drone_profile=rec.drone_type,
                 world_name=rec.world_app,
-                instance_id=rec.instance_id,
+                instance_id=old_instance,
                 firmware_url=rec.firmware_url,
-            ))
+            )
+            try:
+                return self.spawn(launch_req)
+            except Exception as first_err:
+                log.warning(
+                    "first respawn of drone %s (instance=%d) failed: %s — "
+                    "tearing down and retrying once", drone_id,
+                    old_instance, first_err,
+                )
+                self._safe_teardown(old_instance)
+                # Sweep any zombies/leftover rows the failed spawn left.
+                self.state.delete_stopped_at_instance_id(old_instance)
+                _wait_for_port_release(old_port, timeout_s=5.0)
+                time.sleep(0.5)
+                return self.spawn(launch_req)
 
     def restart_all(self) -> list[DroneRecord]:
         with self._lock:
