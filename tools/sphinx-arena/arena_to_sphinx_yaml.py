@@ -74,20 +74,21 @@ DEFAULT_OUT_YAML = Path(__file__).parent / "out" / "arena.yml"
 #   back  (arena y=10.8, inward arena -Y → UE -X)  yaw 180°
 #   left  (arena x=-10,  inward arena +X → UE -Y)  yaw -90°
 #   right (arena x=+10,  inward arena -X → UE +Y)  yaw +90°
-# EMPIRICAL: after iterating with the user, the rotation that produces
-# inward-facing markers on every wall is Pitch=0, Yaw=0, ROLL per wall:
+# ─── FINAL EMPIRICAL ROTATION VALUES ────────────────────────────────
+# After many iterations the working rotation is Pitch=0, Yaw=0, with
+# per-wall ROLL only. The marker FBX (built with X-axis +90° rotation
+# in Blender, see build_marker_fbx.py) lands in Sphinx such that its
+# orientation is set by ROLL — not yaw, as the math kept predicting.
+# This is the single source of truth for marker rotation.
 #
-#   left:  roll = 0
-#   right: roll = 180
-#   front: roll = 90
-#   back:  roll = 270
+#   left:  roll = 180°
+#   right: roll =   0°
+#   front: roll = 270°
+#   back:  roll =  90°
 #
-# The marker FBX (with X-axis +90° in Blender) lands in UE such that
-# its "inward" rotation is around the X axis (UE forward), i.e. roll —
-# not yaw as the math kept predicting. This is the single source of
-# truth; the WALL_YAW_DEG / direction_deg machinery below is now
-# unused for rotation but kept for the existing inward-offset code
-# path (which uses direction_deg to compute which way to push markers).
+# WALL_FALLBACK_DIRECTION_DEG / direction_deg fields are still used by
+# the marker-inward-offset code (to compute which way to nudge each
+# marker so it sits in front of its pillar), but no longer drive yaw.
 MARKER_PITCH_DEG: float = 0.0
 MARKER_YAW_DEG: float = 0.0
 WALL_ROLL_DEG: dict[str, float] = {
@@ -419,13 +420,14 @@ def main() -> int:
     p.add_argument("--marker-pitch", type=float, default=None,
                    help="Override MARKER_PITCH_DEG for wall markers. "
                         "Default 0 (FBX is already vertical).")
-    p.add_argument("--marker-inward-offset-m", type=float, default=0.15,
+    p.add_argument("--marker-inward-offset-m", type=float, default=0.05,
                    help="Push each wall marker this many metres INWARD "
                         "from its arena_config.json position so it sits "
-                        "clearly in front of the pillar. Default 0.15 m. "
-                        "Position-tracking still uses the unmodified "
-                        "arena_config coords as ground truth — this "
-                        "offset only affects the simulator placement.")
+                        "just in front of the pillar (5 cm clearance, "
+                        "tuned empirically). Position-tracking still "
+                        "uses the unmodified arena_config coords as "
+                        "ground truth — this offset only affects the "
+                        "simulator placement.")
     p.add_argument(
         "--no-center-arena", dest="center_arena", action="store_false",
         help="Disable the arena recentering (geometry stays at the literal "
