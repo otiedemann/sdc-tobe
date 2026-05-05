@@ -282,23 +282,54 @@ async function loadEnvironment() {
   }
 }
 
+// Helper: while an async operation is in flight, disable the relevant
+// FC buttons and show a "working..." label on the active one. Without
+// this, the FC stop/restart looks completely unresponsive for the
+// 3-5 seconds it takes the kill+port-release dance to complete, and
+// users assume the click was lost (or click twice, racing the API).
+function fcButtonsLock(activeBtn, label) {
+  const btns = ["#fc-start-btn", "#fc-stop-btn", "#fc-restart-btn"];
+  const orig = {};
+  for (const sel of btns) {
+    const b = $(sel);
+    if (!b) continue;
+    orig[sel] = b.textContent;
+    b.disabled = true;
+    if (sel === activeBtn) b.textContent = label;
+  }
+  return () => {
+    for (const sel of btns) {
+      const b = $(sel);
+      if (!b) continue;
+      b.disabled = false;
+      b.textContent = orig[sel];
+    }
+  };
+}
+
 $("#fc-start-btn").addEventListener("click", async () => {
+  const unlock = fcButtonsLock("#fc-start-btn", "starting…");
   try { await jpost("/api/fc", {}); }
-  catch (e) { alert(`fc start failed: ${e.message}`); return; }
+  catch (e) { unlock(); alert(`fc start failed: ${e.message}`); return; }
+  unlock();
   await loadFC();
 });
 
 $("#fc-stop-btn").addEventListener("click", async () => {
   if (!confirm("Stop the flight controller?")) return;
+  const unlock = fcButtonsLock("#fc-stop-btn", "stopping…");
   try { await jdelete("/api/fc"); }
-  catch (e) { alert(`fc stop failed: ${e.message}`); return; }
+  catch (e) { unlock(); alert(`fc stop failed: ${e.message}`); return; }
+  unlock();
   await loadFC();
 });
 
 $("#fc-restart-btn").addEventListener("click", async () => {
   if (!confirm("Restart the flight controller?")) return;
+  const unlock = fcButtonsLock("#fc-restart-btn", "restarting…");
   try { await jpost("/api/fc/restart"); }
-  catch (e) { alert(`fc restart failed: ${e.message}`); return; }
+  catch (e) { unlock(); alert(`fc restart failed: ${e.message}`); return; }
+  unlock();
   await loadFC();
 });
 
