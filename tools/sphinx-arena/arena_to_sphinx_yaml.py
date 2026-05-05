@@ -97,21 +97,22 @@ def arena_dir_to_ue_yaw(direction_deg_arena: float) -> float:
     """Convert a marker's facing direction (in arena coord polar) to a
     UE4 FRotator yaw value, given the default axis_map y2x,x2y_neg.
 
-    EMPIRICAL: derivations using "marker FBX normal = UE +X after
-    axis conversion" produced markers facing OUTWARD on every wall
-    (verified by user repeatedly). The actual marker FBX normal under
-    Sphinx's mesh-injection is the OPPOSITE direction (-X in UE),
-    which makes the conversion ``ue_yaw = direction_deg + 90°`` correct.
+    With the marker FBX now baked with a Y-axis rotation in Blender
+    (build_marker_fbx.py), the plane normal lands at UE -Y after the
+    Sphinx -Y/-Z axis conversion. UE positive yaw α rotates -Y to
+    (sin α, -cos α). Setting that equal to the desired UE direction
+    (sin θ, -cos θ) — derived from arena dir θ via axis_map — gives
+    α = θ. So:
 
-    Math version that works:
-      Marker FBX normal in UE = -X = (-1, 0, 0).
-      UE positive yaw α rotates -X to (-cos α, -sin α, 0).
-      Arena dir θ as UE vector: (sin θ, -cos θ, 0).
-      Solving: -cos α = sin θ, -sin α = -cos θ
-        => cos α = -sin θ, sin α = cos θ
-        => α = θ + 90°.
+       ue_yaw = arena_direction_deg
+
+    No offset, clean cardinal values per wall:
+      left  (dir=0°):    yaw=0°
+      right (dir=180°):  yaw=180°
+      front (dir=90°):   yaw=90°
+      back  (dir=-90°):  yaw=-90°
     """
-    return direction_deg_arena + 90.0
+    return direction_deg_arena
 
 
 # Legacy alias kept so older code that imports WALL_YAW_DEG still works.

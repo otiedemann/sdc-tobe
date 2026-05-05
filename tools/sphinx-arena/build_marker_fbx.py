@@ -87,17 +87,21 @@ def _build_plane(name: str) -> "bpy.types.Object":
     bpy.ops.mesh.primitive_plane_add(size=1.0, location=(0, 0, 0))
     obj = bpy.context.active_object
     obj.name = name
-    # Rotate -90° around X axis: +Z normal → +Y normal in Blender.
-    # Under axis_forward="-Y" / axis_up="-Z" FBX export, Blender +Y
-    # lands at UE -X — i.e., the marker's outward normal is UE -X
-    # post-import. With this convention the YAML yaw conversion
-    # ``ue_yaw = direction_deg + 90°`` (in arena_to_sphinx_yaml.py)
-    # produces inward-facing markers on every wall.
+    # Rotate +90° around Y axis: +Z normal → +X normal in Blender.
+    # Under axis_forward="-Y" / axis_up="-Z" FBX export, Blender +X
+    # lands at UE -Y — i.e., the marker's outward normal is UE -Y.
+    # With this convention the YAML conversion ``ue_yaw = direction_deg``
+    # (no offset) produces inward-facing markers on every wall, with
+    # clean cardinal yaw values (0/180/+90/-90) per wall.
     #
-    # Earlier we tried +math.pi/2 here, which put the normal at UE +X
-    # and required the opposite ``ue_yaw = direction_deg - 90°`` —
-    # that combination produced markers facing OUTWARD on every wall.
-    obj.rotation_euler = (-math.pi / 2.0, 0.0, 0.0)
+    # Earlier attempts rotated around the X axis instead of Y. That
+    # gave the marker plane a normal along Blender ±Y, which after
+    # axis conversion landed at UE ±X — the long-wall direction.
+    # Wall yaws then got tangled in ±90° offsets that didn't all
+    # work out. Y-axis rotation puts the normal along Blender ±X →
+    # UE ±Y (the short-wall direction), which makes the per-wall yaw
+    # math come out symmetric.
+    obj.rotation_euler = (0.0, math.pi / 2.0, 0.0)
     bpy.ops.object.transform_apply(location=False, rotation=True, scale=False)
     return obj
 
