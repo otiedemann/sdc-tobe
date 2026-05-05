@@ -74,11 +74,12 @@ DEFAULT_OUT_YAML = Path(__file__).parent / "out" / "arena.yml"
 #   back  (arena y=10.8, inward arena -Y → UE -X)  yaw 180°
 #   left  (arena x=-10,  inward arena +X → UE -Y)  yaw -90°
 #   right (arena x=+10,  inward arena -X → UE +Y)  yaw +90°
-# Marker pitch is ZERO — the marker FBX itself bakes a 90° X-rotation
-# in Blender so the plane is already vertical with normal +X in UE
-# (after the Sphinx -Y/-Z axis conversion). YAML only needs YAW to
-# spin the +X normal around UE +Z to face the desired direction.
-MARKER_PITCH_DEG: float = 0.0
+# Test mode per user request: Pitch=90 (rotation around Y-axis) and
+# Yaw=0 for ALL wall markers, regardless of direction_deg. This lets
+# us see what raw "pitch=90 + yaw=0" does to the marker FBX in the
+# simulator without any per-wall yaw variation.
+MARKER_PITCH_DEG: float = 90.0
+_DEBUG_FORCE_YAW_ZERO = True
 
 # Per-marker direction is now read directly from arena_config.json's
 # new ``direction_deg`` field (in arena coords). The mapping below is
@@ -498,7 +499,9 @@ def main() -> int:
         #      (the cleanest source of truth — explicitly states which
         #       way the marker faces in arena coords)
         #   3. WALL_FALLBACK_DIRECTION_DEG keyed by wall name
-        if cli_overrides.get(wall) is not None:
+        if _DEBUG_FORCE_YAW_ZERO:
+            yaw = 0.0  # test mode — all wall markers at yaw=0
+        elif cli_overrides.get(wall) is not None:
             yaw = cli_overrides[wall]
         elif "direction_deg" in m:
             yaw = arena_dir_to_ue_yaw(float(m["direction_deg"]))
