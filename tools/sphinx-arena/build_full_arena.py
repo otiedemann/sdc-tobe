@@ -79,7 +79,8 @@ def _write_png_solid(path: Path, color_rgb: tuple[int, int, int],
 
 
 def _make_textured_material(name: str, color_rgb: tuple[int, int, int],
-                             roughness: float, out_dir: Path):
+                             roughness: float, out_dir: Path,
+                             alpha: float = 1.0):
     """Principled BSDF with a 256×256 PNG sidecar as BaseColor.
 
     Uses the same texture-driven approach the markers use (proven to
@@ -112,6 +113,23 @@ def _make_textured_material(name: str, color_rgb: tuple[int, int, int],
     tex_node.image = img
     tex_node.interpolation = "Closest"
     links.new(tex_node.outputs["Color"], bsdf.inputs["Base Color"])
+    if alpha < 1.0:
+        # Semi-transparent material — set Principled BSDF Alpha and
+        # switch the material's blend mode so the FBX Opacity factor
+        # is exported. UE4 mesh-injection picks this up when the
+        # imported material's Blend Mode lands as Translucent.
+        try:
+            bsdf.inputs["Alpha"].default_value = float(alpha)
+        except KeyError:
+            pass
+        try:
+            mat.blend_method = "BLEND"
+        except (AttributeError, TypeError):
+            pass
+        try:
+            mat.shadow_method = "HASHED"
+        except (AttributeError, TypeError):
+            pass
     return mat
 
 
@@ -132,7 +150,8 @@ def _add_box(name: str, location_m: tuple[float, float, float],
 
 def _build_unit_cube_fbx(out_fbx: Path, name: str,
                           color_rgb: tuple[int, int, int],
-                          roughness: float) -> None:
+                          roughness: float,
+                          alpha: float = 1.0) -> None:
     """Build a SINGLE-MESH unit cube FBX — one mesh, one material — and
     export it. The combined arena_static.fbx with multiple meshes and
     materials kept rendering invisible/blank in Sphinx; individual
@@ -150,7 +169,7 @@ def _build_unit_cube_fbx(out_fbx: Path, name: str,
     _clear_scene()
     out_dir = out_fbx.parent
     mat = _make_textured_material(
-        f"mat_{out_fbx.stem}", color_rgb, roughness, out_dir
+        f"mat_{out_fbx.stem}", color_rgb, roughness, out_dir, alpha=alpha,
     )
     bpy.ops.mesh.primitive_cube_add(size=1.0, location=(0, 0, 0))
     obj = bpy.context.active_object
@@ -431,8 +450,28 @@ def main() -> int:
         _build_unit_cube_fbx(
             out_dir / "wall.fbx", "arena_wall",
             parse_rgb(ns.wall_color_rgb), 0.4,
+            alpha=0.35,  # semi-transparent so spectators are visible
         )
         print(f"  ✓ {out_dir / 'wall.fbx'}")
+        # Spectator stand-ins: simple unit cubes scaled per-axis in YAML
+        # to person- / vehicle-sized proportions. They live OUTSIDE the
+        # arena walls (see --emit-spectators in arena_to_sphinx_yaml.py)
+        # so the sdc_arena_test world (sphx-tests base) feels populated.
+        _build_unit_cube_fbx(
+            out_dir / "actor_red.fbx", "spectator_actor_red",
+            (200, 60, 60), 0.7,
+        )
+        print(f"  ✓ {out_dir / 'actor_red.fbx'}")
+        _build_unit_cube_fbx(
+            out_dir / "actor_blue.fbx", "spectator_actor_blue",
+            (60, 80, 200), 0.7,
+        )
+        print(f"  ✓ {out_dir / 'actor_blue.fbx'}")
+        _build_unit_cube_fbx(
+            out_dir / "vehicle.fbx", "spectator_vehicle",
+            (40, 60, 90), 0.3,
+        )
+        print(f"  ✓ {out_dir / 'vehicle.fbx'}")
 
     print(f"  arena bbox: x=[{x_min},{x_max}], y=[{y_min},{y_max}] "
           f"→ centre arena ({cx:.2f}, {cy:.2f})")
