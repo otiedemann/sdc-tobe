@@ -113,6 +113,17 @@ class MarkerPose:
     # candidate survived (no ambiguity to resolve).
     alt_camera_position_m: Optional[np.ndarray] = None
 
+    # The loser IPPE candidate's ``relative_heading_deg`` -- the
+    # mirror of ``relative_heading_deg`` across the marker normal.
+    # Populated alongside ``alt_camera_position_m`` whenever both
+    # branches survived. ``vision_worker`` uses this to swap the
+    # active marker's heading when the magnetometer says the chosen
+    # branch is wrong, so the controller's body-frame projection
+    # tracks the right side of the marker normal during APPROACH /
+    # ALIGN / HEIGHT_ALIGN / HOLD. None when the mirror-collapse
+    # path already overrode ``relative_heading_deg`` to the midpoint.
+    alt_relative_heading_deg: Optional[float] = None
+
 
 # ---------------------------------------------------------------------------
 # Detector
@@ -290,6 +301,15 @@ class ArucoDetector:
                     t_alt = np.asarray(scored[1][2],
                                        dtype=float).reshape(3)
                     chosen_pose.alt_camera_position_m = -R_alt.T @ t_alt
+                    # The loser candidate's full pose (built by
+                    # _build_pose during scoring above) carries the
+                    # mirrored relative_heading_deg -- vision_worker's
+                    # magnetometer-aware branch picker uses it to fix
+                    # the +/-15 deg flicker the controller sees during
+                    # APPROACH when the active marker's chosen branch
+                    # is wrong.
+                    chosen_pose.alt_relative_heading_deg = (
+                        scored[1][0].relative_heading_deg)
 
                 # Mirror-collapse for the irrecoverable near-frontal zone:
                 # when two IPPE candidates fit equally and their hdgs are

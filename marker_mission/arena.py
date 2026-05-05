@@ -49,6 +49,7 @@ Math, per visible reference marker:
 from __future__ import annotations
 
 import json
+import math
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional
@@ -135,6 +136,13 @@ class ArenaConfig:
     depth_m: float = DEFAULT_DEPTH_M
     top_z_m: float = DEFAULT_TOP_Z_M
     bottom_z_m: float = DEFAULT_BOTTOM_Z_M
+    # Arena-frame yaw (CW from front wall / +y) at which magnetic
+    # north points. Used by the IPPE branch picker to disambiguate
+    # planar-pose mirror flips: expected drone arena yaw at any tick
+    # = ``tel.yaw_deg + magnetic_north_arena_yaw_deg``. None means
+    # "uncalibrated" -- the picker silently falls back to
+    # geometry-only logic. See vision_worker / estimate_position.
+    magnetic_north_arena_yaw_deg: Optional[float] = None
 
     @classmethod
     def load(cls, path: Path) -> "ArenaConfig":
@@ -149,6 +157,25 @@ class ArenaConfig:
         depth_m = float(data.get("depth_m", DEFAULT_DEPTH_M))
         top_z_m = float(data.get("top_z_m", DEFAULT_TOP_Z_M))
         bottom_z_m = float(data.get("bottom_z_m", DEFAULT_BOTTOM_Z_M))
+        # Optional magnetic-north calibration. Old files don't have
+        # this key -- legacy load returns None, picker stays disabled.
+        mag_raw = data.get("magnetic_north_arena_yaw_deg", None)
+        if mag_raw is None:
+            magnetic_north_arena_yaw_deg = None
+        else:
+            try:
+                m = float(mag_raw)
+            except (TypeError, ValueError):
+                raise ValueError(
+                    f"arena_config {source}: "
+                    f"magnetic_north_arena_yaw_deg must be a number, "
+                    f"got {mag_raw!r}")
+            if not (-360.0 <= m <= 360.0):
+                raise ValueError(
+                    f"arena_config {source}: "
+                    f"magnetic_north_arena_yaw_deg out of range "
+                    f"[-360, 360]: {m}")
+            magnetic_north_arena_yaw_deg = m
         markers: Dict[int, ArenaMarker] = {}
         for m in data.get("markers", []):
             mid = int(m["id"])
@@ -166,12 +193,13 @@ class ArenaConfig:
             raise ValueError(f"arena_config {source}: empty marker list")
         return cls(marker_size_m=marker_size_m, markers=markers,
                    width_m=width_m, depth_m=depth_m,
-                   top_z_m=top_z_m, bottom_z_m=bottom_z_m)
+                   top_z_m=top_z_m, bottom_z_m=bottom_z_m,
+                   magnetic_north_arena_yaw_deg=magnetic_north_arena_yaw_deg)
 
     def to_json_dict(self) -> dict:
         """Round-trippable JSON representation. The Arena tab uses this
         when writing the active config or a named save."""
-        return {
+        out: dict = {
             "marker_size_m": float(self.marker_size_m),
             "width_m": float(self.width_m),
             "depth_m": float(self.depth_m),
@@ -185,6 +213,12 @@ class ArenaConfig:
                 for m in sorted(self.markers.values(), key=lambda x: x.id)
             ],
         }
+        # Only emit the magnetic offset when it's actually set, so a
+        # round-tripped legacy arena config doesn't grow a noise key.
+        if self.magnetic_north_arena_yaw_deg is not None:
+            out["magnetic_north_arena_yaw_deg"] = float(
+                self.magnetic_north_arena_yaw_deg)
+        return out
 
     def __contains__(self, marker_id: int) -> bool:
         return marker_id in self.markers
@@ -373,10 +407,66 @@ def _alt_world_position(pose: 'MarkerPose',
                               dtype=float).reshape(3) + marker.position_m
 
 
+# Magnetometer slack: how far a candidate's implied arena yaw may
+# disagree from ``tel.yaw + magnetic_north_arena_yaw_deg`` and still
+# count as a match. 12 deg covers magnetometer drift over a 60s flight
+# (~1-2 deg) plus the sub-degree yaw_to_marker approximation across
+# IPPE branches plus a few deg of corner-detector jitter. Above 12 deg
+# both branches "look wrong" and we fall back to geometry.
+ARENA_MAG_SLACK_DEG = 12.0
+
+
+def _wrap_180(deg: float) -> float:
+    """Wrap angle to (-180, 180]."""
+    return ((float(deg) + 540.0) % 360.0) - 180.0
+
+
+def _yaw_diff(a: float, b: float) -> float:
+    """Smallest absolute angular difference, in degrees."""
+    return abs(_wrap_180(a - b))
+
+
+def _arena_yaw_for_branch(pose: 'MarkerPose',
+                           marker: 'ArenaMarker',
+                           branch: str) -> Optional[float]:
+    """Drone arena yaw implied by ``pose``'s chosen-or-alt IPPE
+    branch. Used by the magnetometer-aware branch picker in both
+    ``estimate_position`` (per-marker world-position) and
+    ``vision_worker`` (active-marker relative_heading_deg).
+
+    The math: arena_yaw = bearing(marker - drone_world) - yaw_to_marker,
+    where bearing is CW from arena +y and ``yaw_to_marker`` (camera-frame
+    angle to the marker) is approximated as branch-invariant -- the
+    marker tvec is nearly the same for both IPPE candidates because
+    they differ in *rotation* of a marker whose centre projects to
+    the same image pixel. Sub-degree error vs the 12 deg
+    ARENA_MAG_SLACK_DEG; safe.
+
+    Returns None when ``branch == 'alt'`` and ``pose`` doesn't carry
+    an alt camera position (e.g. the mirror-collapse path nulled it
+    or only one IPPE candidate survived).
+    """
+    if branch == "chosen":
+        drone_world = position_from_marker(pose, marker)
+    elif branch == "alt":
+        drone_world = _alt_world_position(pose, marker)
+        if drone_world is None:
+            return None
+    else:
+        raise ValueError(f"unknown branch {branch!r}")
+    dx = float(marker.position_m[0]) - float(drone_world[0])
+    dy = float(marker.position_m[1]) - float(drone_world[1])
+    if dx == 0.0 and dy == 0.0:
+        return None
+    bearing_deg = math.degrees(math.atan2(dx, dy))
+    return _wrap_180(bearing_deg - float(pose.yaw_deg))
+
+
 def estimate_position(arena: ArenaConfig,
                       poses: Iterable[MarkerPose],
                       prev_position_m: Optional[np.ndarray] = None,
                       prev_age_s: Optional[float] = None,
+                      tel_yaw_deg: Optional[float] = None,
                       ) -> Optional[PositionEstimate]:
     """Weighted average of camera world positions derived from each visible
     reference marker.
@@ -420,6 +510,18 @@ def estimate_position(arena: ArenaConfig,
                   and prev_age_s < ARENA_PREV_STALE_S
                   and _vote_in_bounds(prev_arr, arena))
 
+    # Magnetometer-aware branch picker. Active when the operator has
+    # calibrated the arena's magnetic-north offset AND tel.yaw is
+    # available. Short-circuits the prev-anchor / OOB blocks because
+    # the magnetometer is an independent signal that doesn't share
+    # corner-noise / pixel-size failure modes.
+    use_mag = (arena.magnetic_north_arena_yaw_deg is not None
+               and tel_yaw_deg is not None)
+    expected_arena_yaw = (
+        _wrap_180(float(tel_yaw_deg)
+                  + float(arena.magnetic_north_arena_yaw_deg))
+        if use_mag else None)
+
     contributions: List[tuple] = []   # (mid, pos_w, weight, method)
     for p in poses:
         marker = arena.markers.get(int(p.marker_id))
@@ -438,6 +540,36 @@ def estimate_position(arena: ArenaConfig,
 
         pos_w = None
         method = chosen_method
+
+        # Layer 0: magnetometer pick. Only fires when both branches
+        # exist (otherwise there's nothing to disambiguate against)
+        # and at least one of them lands within ARENA_MAG_SLACK_DEG
+        # of the magnetometer-expected arena yaw.
+        if (use_mag and alt_pos is not None
+                and p.collapsed_camera_position_m is None):
+            chosen_yaw = _arena_yaw_for_branch(p, marker, "chosen")
+            alt_yaw    = _arena_yaw_for_branch(p, marker, "alt")
+            if chosen_yaw is not None and alt_yaw is not None:
+                d_chosen = _yaw_diff(chosen_yaw, expected_arena_yaw)
+                d_alt    = _yaw_diff(alt_yaw,    expected_arena_yaw)
+                if min(d_chosen, d_alt) <= ARENA_MAG_SLACK_DEG:
+                    if d_alt < d_chosen:
+                        pos_w = alt_pos
+                        method = "ippe_mag_swap"
+                    else:
+                        pos_w = chosen_pos
+                        method = chosen_method
+                # else: both > slack -- magnetic field disturbance
+                # or stale offset; fall through to the anchor / OOB
+                # blocks rather than picking a confidently-wrong
+                # branch.
+
+        if pos_w is not None:
+            # Magnetometer made the call -- skip the anchor / OOB
+            # gates. Final aggregate OOB check still applies below.
+            contributions.append((int(p.marker_id), pos_w, weight, method))
+            continue
+
         if use_anchor:
             d_chosen = float(np.linalg.norm(chosen_pos - prev_arr))
             d_alt = (float(np.linalg.norm(alt_pos - prev_arr))

@@ -2598,6 +2598,21 @@ _PAGE_ARENA = _PAGE_BASE_CSS + _PAGE_HEADER + _COMMON_SCRIPT + _PAGE_GRID_OPEN +
             <td><input id="ar-botz"   type="number" step="0.01" style="width:8em;"> m</td></tr>
         <tr><th>Marker size</th>
             <td><input id="ar-msize"  type="number" step="0.001" style="width:8em;"> m</td></tr>
+        <tr><th>Magnetic north (arena yaw) <span class="tune-info"
+                title="Arena-frame yaw (CW from front wall / +y) at which magnetic north points. Once set, the IPPE branch picker uses tel.yaw + offset to disambiguate the +/-15 deg planar-pose flip during APPROACH and across the per-marker world-position vote. Leave empty to keep the geometry-only fallback. Press &quot;Capture&quot; while the drone is reporting a fresh world position derived from at least 2 markers." tabindex="0">ⓘ</span></th>
+            <td>
+              <input id="ar-magnorth" type="number" step="0.1"
+                     placeholder="uncalibrated"
+                     style="width:8em;"> deg
+              <button id="btn-ar-magcap" type="button"
+                      title="Capture from current state. Requires fresh world position from >= 2 markers + valid tel.yaw."
+                      style="margin-left:.4rem; padding:.2rem .55rem;
+                             border:1px solid #2a3038; border-radius:4px;
+                             background:#1f2937; color:#e6edf3;
+                             cursor:pointer; font-size:.8rem;">Capture</button>
+              <span id="ar-magcap-msg" style="margin-left:.4rem;
+                    font-size:.78rem; color:#aab;"></span>
+            </td></tr>
       </table>
       <div style="display:flex; gap:.5rem; margin-top:.6rem; flex-wrap:wrap;">
         <button id="btn-ar-reset" type="button"
@@ -2679,12 +2694,19 @@ function setMsg(s, isErr) {
   $('ar-err').textContent = isErr ? (s || '') : '';
 }
 function metaFromInputs() {
+  // Magnetic-north field is optional: empty input -> null (omitted
+  // from the saved JSON via to_json_dict). A valid float is passed
+  // through and stored in arena.magnetic_north_arena_yaw_deg.
+  const mn = $('ar-magnorth').value.trim();
+  const mn_val = (mn === '') ? null : parseFloat(mn);
   return {
     marker_size_m: parseFloat($('ar-msize').value) || 0,
     width_m:  parseFloat($('ar-width').value)  || 0,
     depth_m:  parseFloat($('ar-depth').value)  || 0,
     top_z_m:  parseFloat($('ar-topz').value)   || 0,
     bottom_z_m: parseFloat($('ar-botz').value) || 0,
+    magnetic_north_arena_yaw_deg:
+      (Number.isFinite(mn_val) ? mn_val : null),
   };
 }
 function inputsFromArena() {
@@ -2693,6 +2715,49 @@ function inputsFromArena() {
   $('ar-depth').value = arena.depth_m;
   $('ar-topz').value  = arena.top_z_m;
   $('ar-botz').value  = arena.bottom_z_m;
+  $('ar-magnorth').value =
+    (typeof arena.magnetic_north_arena_yaw_deg === 'number'
+     ? arena.magnetic_north_arena_yaw_deg : '');
+}
+function _wrap180(d) {
+  return ((d + 540.0) % 360.0) - 180.0;
+}
+async function captureMagNorth() {
+  const msg = $('ar-magcap-msg');
+  msg.style.color = '#aab'; msg.textContent = 'reading state...';
+  try {
+    const r = await fetch('/api/state', {cache:'no-store'});
+    const s = await r.json();
+    const ay = s.arena_yaw_deg;
+    const tyaw = (s.telemetry || {}).yaw;
+    const used = (s.world_position_used_markers || []).length;
+    const age = s.arena_yaw_age_s;
+    if (typeof ay !== 'number' || typeof tyaw !== 'number') {
+      msg.style.color = 'var(--bad)';
+      msg.textContent = 'no fresh arena_yaw or tel.yaw available';
+      return;
+    }
+    if (typeof age === 'number' && age > 1.0) {
+      msg.style.color = 'var(--bad)';
+      msg.textContent = 'arena_yaw is stale (' + age.toFixed(1) + 's old)';
+      return;
+    }
+    if (used < 2) {
+      msg.style.color = 'var(--bad)';
+      msg.textContent = 'need >= 2 markers visible (have ' + used + ')';
+      return;
+    }
+    // offset = arena_yaw - tel.yaw, wrapped to (-180, 180].
+    const offset = _wrap180(ay - tyaw);
+    $('ar-magnorth').value = offset.toFixed(2);
+    msg.style.color = 'var(--good)';
+    msg.textContent =
+      'captured ' + offset.toFixed(2) + ' deg from '
+      + used + ' markers (press Save active to persist)';
+  } catch (e) {
+    msg.style.color = 'var(--bad)';
+    msg.textContent = 'capture failed: ' + e;
+  }
 }
 function renderRows() {
   const tbody = $('ar-rows');
@@ -3056,6 +3121,7 @@ async function refreshList() {
 });
 $('btn-ar-reset').addEventListener('click', resetToDefault);
 $('btn-ar-save').addEventListener('click', saveActive);
+$('btn-ar-magcap').addEventListener('click', captureMagNorth);
 $('btn-ar-add').addEventListener('click', () => {
   const meta = metaFromInputs();
   arena.markers.push({id: (Math.max(0, ...arena.markers.map(m=>m.id))+1),
@@ -3662,14 +3728,21 @@ class UiServer:
                     "y": float(m["y"]),
                     "z": float(m["z"]),
                 })
-            return ArenaConfig.from_dict({
+            payload = {
                 "marker_size_m": float(data.get("marker_size_m", 0.18)),
                 "width_m":       float(data.get("width_m", 10.0)),
                 "depth_m":       float(data.get("depth_m", 25.0)),
                 "top_z_m":       float(data.get("top_z_m", 4.0)),
                 "bottom_z_m":    float(data.get("bottom_z_m", 2.0)),
                 "markers":       markers,
-            }, source="<request>")
+            }
+            # Optional magnetic-north calibration. Pass through if
+            # present (validated inside ArenaConfig.from_dict). null
+            # / missing -> uncalibrated.
+            mn = data.get("magnetic_north_arena_yaw_deg")
+            if mn is not None:
+                payload["magnetic_north_arena_yaw_deg"] = mn
+            return ArenaConfig.from_dict(payload, source="<request>")
 
         def _validate_arena_layout(arena_obj):
             """Return error message string, or None if OK."""

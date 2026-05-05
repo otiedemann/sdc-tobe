@@ -39,7 +39,7 @@ import signal
 import sys
 import threading
 import time
-from dataclasses import asdict
+from dataclasses import asdict, replace as _dc_replace
 from pathlib import Path
 from typing import Optional
 
@@ -49,7 +49,9 @@ import numpy as np
 from .aruco_detector import ArucoDetector, MarkerPose, annotate_frame
 from .calibration_store import (Calibration, CalibrationStore,
                                 calibrate_from_video)
-from .arena import ArenaConfig, estimate_position, load_priority_arena
+from .arena import (ArenaConfig, ARENA_MAG_SLACK_DEG,
+                    estimate_position, load_priority_arena,
+                    _arena_yaw_for_branch, _wrap_180, _yaw_diff)
 from .config import (CALIB_DIR, FLIGHTS_DIR, DEFAULT_DATA_DIR,
                      PER_FLIGHT_SCRIPT_FILENAME, MissionConfig)
 from .controller import MissionController, MissionState, Phase
@@ -480,6 +482,50 @@ def cmd_fly(args: argparse.Namespace) -> int:
                     active_mid = cfg.target_marker_id
                 target = next((p for p in poses
                                if p.marker_id == active_mid), None)
+                # Magnetometer-aware swap of the active marker's
+                # relative_heading_deg. When the chosen IPPE branch
+                # disagrees with tel.yaw + arena_offset by more than
+                # the alt branch does, swap to alt's heading -- the
+                # controller's body-frame projection during APPROACH
+                # / ALIGN / HOLD then tracks the right side of the
+                # marker normal from the very first frame instead
+                # of flickering +/-15 deg with corner-noise jitter.
+                # All four conditions must hold; otherwise we leave
+                # the chosen-branch pose alone (geometry-only).
+                arena_for_swap = arena_holder.get()
+                tel_for_swap = tel_holder.get()
+                tel_yaw_for_swap = (float(tel_for_swap.yaw_deg)
+                                    if tel_for_swap is not None
+                                    and tel_for_swap.yaw_deg is not None
+                                    else None)
+                if (target is not None
+                        and target.alt_relative_heading_deg is not None
+                        and arena_for_swap is not None
+                        and arena_for_swap.magnetic_north_arena_yaw_deg is not None
+                        and tel_yaw_for_swap is not None):
+                    marker_for_swap = arena_for_swap.markers.get(
+                        int(target.marker_id))
+                    if marker_for_swap is not None:
+                        expected_yaw = _wrap_180(
+                            tel_yaw_for_swap
+                            + float(arena_for_swap
+                                    .magnetic_north_arena_yaw_deg))
+                        chosen_yaw = _arena_yaw_for_branch(
+                            target, marker_for_swap, "chosen")
+                        alt_yaw = _arena_yaw_for_branch(
+                            target, marker_for_swap, "alt")
+                        if (chosen_yaw is not None
+                                and alt_yaw is not None):
+                            d_chosen = _yaw_diff(chosen_yaw, expected_yaw)
+                            d_alt = _yaw_diff(alt_yaw, expected_yaw)
+                            if (min(d_chosen, d_alt)
+                                    <= ARENA_MAG_SLACK_DEG
+                                    and d_alt < d_chosen):
+                                target = _dc_replace(
+                                    target,
+                                    relative_heading_deg=
+                                        target.alt_relative_heading_deg,
+                                    pose_method="ippe_mag_swap")
                 pose_holder.set(target)
                 # Publish the full visible-marker set to state so AWAIT
                 # can early-exit when its target id appears, even if
@@ -494,7 +540,7 @@ def cmd_fly(args: argparse.Namespace) -> int:
                 # let world_position_age_s grow -- the operator still
                 # gets a stale-but-useful position estimate during
                 # marker loss, colour-coded by age in the UI.
-                arena = arena_holder.get()
+                arena = arena_for_swap   # reuse holder snapshot above
                 if arena is not None:
                     # Snapshot the previous sticky world position +
                     # its age so estimate_position can anchor branch
@@ -509,7 +555,8 @@ def cmd_fly(args: argparse.Namespace) -> int:
                     est = estimate_position(
                         arena, poses,
                         prev_position_m=prev_wp,
-                        prev_age_s=prev_age_s)
+                        prev_age_s=prev_age_s,
+                        tel_yaw_deg=tel_yaw_for_swap)
                     if est is not None:
                         with state.lock:
                             state.world_position_m = (
