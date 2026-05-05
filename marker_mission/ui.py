@@ -432,6 +432,12 @@ const REPLAY_ID = {{ replay_id|tojson }};
 let droneConnected = {{ 'true' if drone_connected else 'false' }};
 const $ = id => document.getElementById(id);
 
+// Wall colour palette, identical to the /arena tab's WALL_COLORS.
+// Used by the position view (drawPositionView) and the arena page;
+// hoisted to shared scope so both surfaces stay in sync.
+const WALL_COLORS = {front:'#facc15', right:'#4ade80',
+                      back:'#58c4ff',  left:'#f87171'};
+
 // ---- Default-pointer helpers (used by tune / arena / scripts / camera
 // save tables) -----------------------------------------------------------
 function appendDefaultBadge(td) {
@@ -1040,6 +1046,46 @@ function drawPositionView(s) {
   // Origin tick.
   ctx.fillStyle = '#facc15';
   ctx.beginPath(); ctx.arc(cx, cy, 2, 0, 2*Math.PI); ctx.fill();
+  // Markers from the cached arena, same convention as the /arena
+  // canvas + the in-video mini-map: filled wall-coloured dot per
+  // marker (front=yellow, right=green, back=blue, left=red).
+  // Co-located markers (same x/y, different z) are stacked along
+  // the canvas vertical with high-z up. Currently-visible markers
+  // get a white outline ring -- the operator can see at a glance
+  // which references the position estimate is using.
+  if (_arenaCache && Array.isArray(_arenaCache.markers)) {
+    const seen = new Set((s.world_position_used_markers || [])
+                          .concat(s.visible_marker_ids || [])
+                          .map(v => parseInt(v, 10))
+                          .filter(v => !Number.isNaN(v)));
+    const STACK = 7;
+    const groups = new Map();
+    _arenaCache.markers.forEach((m, idx) => {
+      const key = `${(+m.x).toFixed(2)},${(+m.y).toFixed(2)}`;
+      if (!groups.has(key)) groups.set(key, []);
+      groups.get(key).push(idx);
+    });
+    const stackOff = new Map();
+    groups.forEach(indices => {
+      indices.sort((a, b) =>
+        _arenaCache.markers[b].z - _arenaCache.markers[a].z);
+      const n = indices.length;
+      indices.forEach((idx, i) =>
+        stackOff.set(idx, (i - (n - 1) / 2) * STACK));
+    });
+    _arenaCache.markers.forEach((m, idx) => {
+      const px = ax(+m.x);
+      const py = ay(+m.y) + (stackOff.get(idx) || 0);
+      ctx.fillStyle = WALL_COLORS[m.wall] || '#fff';
+      ctx.beginPath(); ctx.arc(px, py, 4, 0, 2*Math.PI); ctx.fill();
+      ctx.strokeStyle = '#0e1116'; ctx.lineWidth = 1;
+      ctx.beginPath(); ctx.arc(px, py, 4, 0, 2*Math.PI); ctx.stroke();
+      if (seen.has(parseInt(m.id, 10))) {
+        ctx.strokeStyle = '#fff'; ctx.lineWidth = 1.5;
+        ctx.beginPath(); ctx.arc(px, py, 7, 0, 2*Math.PI); ctx.stroke();
+      }
+    });
+  }
   // Drone position + heading arrow. Dot colour matches the
   // sidebar's wpAgeColor: fresh = green, stale = yellow/red, so
   // the operator can spot a frozen position even at a glance.
