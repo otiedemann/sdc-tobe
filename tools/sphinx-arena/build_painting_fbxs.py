@@ -62,6 +62,14 @@ def _build_one(png_path: Path, out_path: Path) -> None:
     obj = bpy.context.active_object
     obj.name = f"painting_{png_path.stem}"
 
+    # Rotate the plane X+90° in Blender so its normal lands at UE +X
+    # after Sphinx's axis conversion — same trick as build_marker_fbx.
+    # That makes paintings respond to the per-wall ROLL/YAW rotation
+    # exactly the way Aruco markers do.
+    import math as _math
+    obj.rotation_euler = (_math.pi / 2.0, 0.0, 0.0)
+    bpy.ops.object.transform_apply(location=False, rotation=True, scale=False)
+
     # Material
     mat = bpy.data.materials.new(name=f"mat_painting_{png_path.stem}")
     mat.use_nodes = True

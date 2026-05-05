@@ -153,10 +153,14 @@ _PAINTING_Z_M: float = 3.0     # mid-height between the marker rings
 # (left/right), there's a single marker pair at y=5.4, so the
 # painting goes off-centre along Y to clear it.
 PAINTINGS: list[tuple[str, str, float]] = [
-    ("mbda",  "front", -2.5),  # front wall, between centre and -X marker
-    ("brigk", "back",  +2.5),  # back wall, between centre and +X marker
-    ("sdc",   "left",  -2.5),  # left wall, offset from centre marker
-    ("team",  "right", +2.5),  # right wall, offset from centre marker
+    # SDC26 ToBe (Swarm Drone Challenge 2026) logo on all four walls,
+    # mounted between markers so they don't occlude. Offset along the
+    # wall's long axis: 0 puts it dead-centre between the marker pair
+    # (or behind the centre marker on long walls).
+    ("tobe", "front", -2.5),
+    ("tobe", "back",  +2.5),
+    ("tobe", "left",  -2.5),
+    ("tobe", "right", +2.5),
 ]
 
 
@@ -670,7 +674,10 @@ def main() -> int:
                     wx, wy = cwx, cwy + offset
                 ux_m, uy_m, uz_m = shifted_apply_with_zlift((wx, wy, _PAINTING_Z_M))
                 loc_cm = (ux_m * 100.0, uy_m * 100.0, uz_m * 100.0)
-                rot = (marker_pitch, wall_yaws[wall], 0.0)
+                # Match Aruco marker rotation: per-wall ROLL plus
+                # marker_pitch / wall_yaws yaw, so paintings face the
+                # arena interior the same way markers do.
+                rot = (marker_pitch, wall_yaws[wall], WALL_ROLL_DEG.get(wall, 0.0))
                 out_lines.append(
                     f"  # Painting — {logo_name} on {wall} wall"
                 )
