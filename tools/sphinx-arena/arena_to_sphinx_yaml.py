@@ -74,13 +74,28 @@ DEFAULT_OUT_YAML = Path(__file__).parent / "out" / "arena.yml"
 #   back  (arena y=10.8, inward arena -Y → UE -X)  yaw 180°
 #   left  (arena x=-10,  inward arena +X → UE -Y)  yaw -90°
 #   right (arena x=+10,  inward arena -X → UE +Y)  yaw +90°
-# Test mode per user request: Pitch=0, Yaw=0, Roll=0 — NO rotation
-# at all in the YAML. This shows what the raw marker FBX looks like
-# in the simulator after Sphinx's axis conversion alone (no extra
-# rotation on top). Useful for diagnosing which axis the FBX-baked
-# rotation actually ended up on.
+# EMPIRICAL: after iterating with the user, the rotation that produces
+# inward-facing markers on every wall is Pitch=0, Yaw=0, ROLL per wall:
+#
+#   left:  roll = 0
+#   right: roll = 180
+#   front: roll = 90
+#   back:  roll = 270
+#
+# The marker FBX (with X-axis +90° in Blender) lands in UE such that
+# its "inward" rotation is around the X axis (UE forward), i.e. roll —
+# not yaw as the math kept predicting. This is the single source of
+# truth; the WALL_YAW_DEG / direction_deg machinery below is now
+# unused for rotation but kept for the existing inward-offset code
+# path (which uses direction_deg to compute which way to push markers).
 MARKER_PITCH_DEG: float = 0.0
-_DEBUG_FORCE_YAW_ZERO = True
+MARKER_YAW_DEG: float = 0.0
+WALL_ROLL_DEG: dict[str, float] = {
+    "left":   0.0,
+    "right": 180.0,
+    "front":  90.0,
+    "back":  270.0,
+}
 
 # Per-marker direction is now read directly from arena_config.json's
 # new ``direction_deg`` field (in arena coords). The mapping below is
@@ -404,14 +419,13 @@ def main() -> int:
     p.add_argument("--marker-pitch", type=float, default=None,
                    help="Override MARKER_PITCH_DEG for wall markers. "
                         "Default 0 (FBX is already vertical).")
-    p.add_argument("--marker-inward-offset-m", type=float, default=0.10,
+    p.add_argument("--marker-inward-offset-m", type=float, default=0.30,
                    help="Push each wall marker this many metres INWARD "
                         "from its arena_config.json position so it sits "
-                        "in front of the pillar (instead of being half-"
-                        "inside the pillar mesh). Default 0.10 m. The "
-                        "position tracking algorithm reads arena_config "
-                        "directly so its ground-truth coordinates are "
-                        "unchanged — only the simulator placement moves.")
+                        "clearly in front of the pillar. Default 0.30 m. "
+                        "Position-tracking still uses the unmodified "
+                        "arena_config coords as ground truth — this "
+                        "offset only affects the simulator placement.")
     p.add_argument(
         "--no-center-arena", dest="center_arena", action="store_false",
         help="Disable the arena recentering (geometry stays at the literal "
@@ -500,16 +514,13 @@ def main() -> int:
         #      (the cleanest source of truth — explicitly states which
         #       way the marker faces in arena coords)
         #   3. WALL_FALLBACK_DIRECTION_DEG keyed by wall name
-        if _DEBUG_FORCE_YAW_ZERO:
-            yaw = 0.0  # test mode — all wall markers at yaw=0
-        elif cli_overrides.get(wall) is not None:
+        # Empirical: rotation is per-wall ROLL only. Pitch/yaw stay 0.
+        # CLI --yaw-* overrides still respected for fine-tuning.
+        if cli_overrides.get(wall) is not None:
             yaw = cli_overrides[wall]
-        elif "direction_deg" in m:
-            yaw = arena_dir_to_ue_yaw(float(m["direction_deg"]))
         else:
-            yaw = wall_yaws.get(wall, 0.0)
-        # Test: roll=90 only for long-wall markers (front + back)
-        roll = 90.0 if wall in ("front", "back") else 0.0
+            yaw = MARKER_YAW_DEG
+        roll = WALL_ROLL_DEG.get(wall, 0.0)
         # Push marker slightly inward from its arena_config position
         # so it sits in front of the pillar (visible from arena
         # interior). The inward direction is the marker's direction_deg
