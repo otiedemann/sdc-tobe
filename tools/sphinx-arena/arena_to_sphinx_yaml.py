@@ -942,8 +942,8 @@ def main() -> int:
         # samples around the ellipse so the spline is visually smooth
         # and ClosedLoop stitches the last point back to the first.
         import math as _math
-        a = 8.0    # half-width along world X (short side of arena +2.6m)
-        b = 12.5   # half-length along world Y (long side +2.5m)
+        a = 15.0   # half-width along world X (~10 m beyond short wall)
+        b = 22.0   # half-length along world Y (~12 m beyond long wall)
         z = 0.40
         n_pts = 24
         out_lines.append("")
