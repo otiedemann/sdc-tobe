@@ -81,6 +81,16 @@ class FlightRecorder:
                                         name="recorder")
         self._thread.start()
         self._frames_dropped = 0
+        # Per-kind frame arrival tracking. ``self.fps`` is just the
+        # value cv2.VideoWriter is opened with -- it ends up in the
+        # mp4 header but doesn't reflect what the stream actually
+        # delivered. We measure the real arrival rate here so
+        # ``_reencode_for_sharing`` can stamp the right fps onto the
+        # re-encoded H.264 output (without it, a 15 fps stream
+        # encoded at header=25 plays back 1.67x too fast).
+        self._first_frame_t: dict[str, float] = {}
+        self._last_frame_t: dict[str, float] = {}
+        self._frame_count: dict[str, int] = {"raw": 0, "ann": 0}
 
     # ------------------------------------------------------------------ life
     def stop(self, meta: Optional[dict] = None) -> None:
@@ -101,6 +111,18 @@ class FlightRecorder:
         if meta is not None:
             (self.dir / "mission_meta.json").write_text(json.dumps(meta, indent=2,
                                                                    default=str))
+        # Effective per-stream fps: how fast frames actually arrived,
+        # not the cv2.VideoWriter header value. Used by the re-encode
+        # pass to stamp correct timing onto the H.264 output.
+        # Mapping is "stem in the on-disk file" -> measured fps.
+        effective_fps: dict[str, float] = {}
+        for kind, stem in (("raw", "raw"), ("ann", "annotated")):
+            n = self._frame_count.get(kind, 0)
+            t0 = self._first_frame_t.get(kind)
+            t1 = self._last_frame_t.get(kind)
+            if n >= 2 and t0 is not None and t1 is not None and t1 > t0:
+                # n-1 intervals between n frames -> arrival rate
+                effective_fps[stem] = (n - 1) / (t1 - t0)
         # OpenCV's mp4v output isn't accepted by WhatsApp (and several
         # other ingest pipelines); re-encode to H.264 + silent AAC so the
         # files are shareable. Run this in the background -- the next
@@ -108,11 +130,13 @@ class FlightRecorder:
         # one is still re-encoding. The daemon thread is fire-and-forget;
         # the encoded file just appears when it's done.
         threading.Thread(target=self._reencode_for_sharing,
+                         args=(effective_fps,),
                          name=f"reencode-{self.dir.name}",
                          daemon=True).start()
 
     # --------------------------------------------------------- post-process
-    def _reencode_for_sharing(self) -> None:
+    def _reencode_for_sharing(self,
+                              effective_fps: Optional[dict] = None) -> None:
         """Re-encode raw and annotated videos to H.264 + dummy AAC track.
 
         OpenCV writes mp4v (MPEG-4 Part 2) which most modern apps refuse
@@ -120,11 +144,21 @@ class FlightRecorder:
         audio stream so the resulting file plays everywhere and can be
         sent over WhatsApp/Telegram/etc.
 
+        ``effective_fps`` is an optional ``{stem: fps}`` map (e.g.
+        ``{"raw": 14.93, "annotated": 14.93}``) measuring the real
+        arrival rate of each stream. When supplied, ``-r FPS -i src``
+        overrides the input file's claimed fps so the H.264 output is
+        timed to match wall-clock reality. Without it (or when the
+        measurement is implausible) we fall back to the source file's
+        header fps -- which is correct only when the live stream
+        actually delivered at ``cfg.record_fps``.
+
         Originals are replaced atomically on success and deleted if the
         OpenCV writer fell back to .avi. On failure (ffmpeg missing or
         encode error) the originals are left untouched so the operator
         still has the raw artefacts.
         """
+        effective_fps = effective_fps or {}
         if shutil.which("ffmpeg") is None:
             print("[rec] ffmpeg not found -- keeping mp4v originals "
                   "(install ffmpeg for shareable H.264 output)")
@@ -163,8 +197,23 @@ class FlightRecorder:
             else:
                 # libopenh264 / nvenc / vaapi / qsv: bitrate-controlled.
                 video_args = ["-c:v", encoder, "-b:v", "4M", *common]
+            # Override the input's claimed fps when we measured a
+            # plausible arrival rate. ``-r N`` BEFORE ``-i`` makes
+            # ffmpeg synthesise per-frame timestamps assuming
+            # constant rate N -- the output ends up correctly
+            # timed regardless of what the source mp4 header
+            # claimed. Clamp to [1, 60] so a freak measurement
+            # (e.g. one stale frame at startup) doesn't give us
+            # garbage timing.
+            input_args: list[str] = []
+            efps = effective_fps.get(stem)
+            if efps is not None and 1.0 <= efps <= 60.0:
+                input_args = ["-r", f"{efps:.4f}"]
+                print(f"[rec] re-timing {src.name} at measured "
+                      f"{efps:.2f} fps (vs cv2 header {self.fps})")
             cmd = [
                 "ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-nostdin",
+                *input_args,
                 "-i", str(src),
                 "-f", "lavfi",
                 "-i", "anullsrc=channel_layout=stereo:sample_rate=48000",
@@ -339,6 +388,14 @@ class FlightRecorder:
                                                      size)
                 self._ann_size = size
             self._ann_writer.write(frame)
+        # Record arrival timestamps for the effective-fps computation
+        # at finalize. Done AFTER the write so a failing encoder
+        # doesn't pollute the count.
+        now = time.monotonic()
+        if kind not in self._first_frame_t:
+            self._first_frame_t[kind] = now
+        self._last_frame_t[kind] = now
+        self._frame_count[kind] = self._frame_count.get(kind, 0) + 1
 
 
 # ---------------------------------------------------------------------------
