@@ -1,5 +1,5 @@
 {
-  "_comment": "SDC26 target box placements for the Sphinx arena. Six boxes total: 3 blue (IDs 31-33) start in the blue home zone (arena x>0, right side); 3 red (IDs 41-43) start in the red home zone (arena x<0, left side). Markers are vertical like the wall markers, facing inward toward the arena centre, then rotated 30\u00b0 on the X axis. Concretely: red roll = 210\u00b0 (= 180\u00b0 + 30\u00b0), blue roll = 30\u00b0 (= 0\u00b0 + 30\u00b0), pitch=0, yaw=0, z = 1.0 m. The remaining valid SDC26 IDs (34-36, 44-46) are listed but disabled \u2014 they're the spares used during a match if a box is moved or a fresh sticker is needed.",
+  "_comment": "SDC26 target box placements for the Sphinx arena. Six boxes total: 3 blue (IDs 31-33) start in the blue home zone (arena x>0, right side); 3 red (IDs 41-43) start in the red home zone (arena x<0, left side). Markers are vertical and aligned like the wall markers (red roll=180\u00b0 matching left wall, blue roll=0\u00b0 matching right wall), then rotated -10\u00b0 on the Y axis (pitch). pitch=-10, yaw=0, z=1.0 m. Spares (IDs 34-36, 44-46) are listed but disabled.",
   "marker_size_m": 0.19,
   "box_size_m": 0.5,
   "boxes": [
@@ -10,10 +10,10 @@
       "x": -5.0,
       "y": 8.0,
       "z": 1.0,
-      "pitch_deg": 0.0,
+      "pitch_deg": -10.0,
       "yaw_deg": 0.0,
       "enabled": true,
-      "roll_deg": 210.0
+      "roll_deg": 180.0
     },
     {
       "id": 42,
@@ -22,10 +22,10 @@
       "x": -8.0,
       "y": 5.4,
       "z": 1.0,
-      "pitch_deg": 0.0,
+      "pitch_deg": -10.0,
       "yaw_deg": 0.0,
       "enabled": true,
-      "roll_deg": 210.0
+      "roll_deg": 180.0
     },
     {
       "id": 43,
@@ -34,10 +34,10 @@
       "x": -5.0,
       "y": 3.0,
       "z": 1.0,
-      "pitch_deg": 0.0,
+      "pitch_deg": -10.0,
       "yaw_deg": 0.0,
       "enabled": true,
-      "roll_deg": 210.0
+      "roll_deg": 180.0
     },
     {
       "id": 31,
@@ -46,10 +46,10 @@
       "x": 5.0,
       "y": 8.0,
       "z": 1.0,
-      "pitch_deg": 0.0,
+      "pitch_deg": -10.0,
       "yaw_deg": 0.0,
       "enabled": true,
-      "roll_deg": 30.0
+      "roll_deg": 0.0
     },
     {
       "id": 32,
@@ -58,10 +58,10 @@
       "x": 8.0,
       "y": 5.4,
       "z": 1.0,
-      "pitch_deg": 0.0,
+      "pitch_deg": -10.0,
       "yaw_deg": 0.0,
       "enabled": true,
-      "roll_deg": 30.0
+      "roll_deg": 0.0
     },
     {
       "id": 33,
@@ -70,10 +70,10 @@
       "x": 5.0,
       "y": 3.0,
       "z": 1.0,
-      "pitch_deg": 0.0,
+      "pitch_deg": -10.0,
       "yaw_deg": 0.0,
       "enabled": true,
-      "roll_deg": 30.0
+      "roll_deg": 0.0
     },
     {
       "id": 34,
@@ -82,10 +82,10 @@
       "x": 0.0,
       "y": 0.0,
       "z": 1.0,
-      "pitch_deg": 0.0,
+      "pitch_deg": -10.0,
       "yaw_deg": 0.0,
       "enabled": false,
-      "roll_deg": 30.0
+      "roll_deg": 0.0
     },
     {
       "id": 35,
@@ -94,10 +94,10 @@
       "x": 0.0,
       "y": 0.0,
       "z": 1.0,
-      "pitch_deg": 0.0,
+      "pitch_deg": -10.0,
       "yaw_deg": 0.0,
       "enabled": false,
-      "roll_deg": 30.0
+      "roll_deg": 0.0
     },
     {
       "id": 36,
@@ -106,10 +106,10 @@
       "x": 0.0,
       "y": 0.0,
       "z": 1.0,
-      "pitch_deg": 0.0,
+      "pitch_deg": -10.0,
       "yaw_deg": 0.0,
       "enabled": false,
-      "roll_deg": 30.0
+      "roll_deg": 0.0
     },
     {
       "id": 44,
@@ -118,10 +118,10 @@
       "x": 0.0,
       "y": 0.0,
       "z": 1.0,
-      "pitch_deg": 0.0,
+      "pitch_deg": -10.0,
       "yaw_deg": 0.0,
       "enabled": false,
-      "roll_deg": 210.0
+      "roll_deg": 180.0
     },
     {
       "id": 45,
@@ -130,10 +130,10 @@
       "x": 0.0,
       "y": 0.0,
       "z": 1.0,
-      "pitch_deg": 0.0,
+      "pitch_deg": -10.0,
       "yaw_deg": 0.0,
       "enabled": false,
-      "roll_deg": 210.0
+      "roll_deg": 180.0
     },
     {
       "id": 46,
@@ -142,10 +142,10 @@
       "x": 0.0,
       "y": 0.0,
       "z": 1.0,
-      "pitch_deg": 0.0,
+      "pitch_deg": -10.0,
       "yaw_deg": 0.0,
       "enabled": false,
-      "roll_deg": 210.0
+      "roll_deg": 180.0
     }
   ]
 }

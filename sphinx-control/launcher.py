@@ -567,8 +567,11 @@ class Launcher:
             # even if subsequent cleanup steps below have hiccups.
             self.state.update_fc_status(fc_id, "stopped")
             # Verify the port is actually freed; if not, hunt down
-            # whatever's still bound to it.
-            if port and not _wait_for_port_release(port, timeout_s=4.0):
+            # whatever's still bound to it. Tight timeouts here so the
+            # UI feels responsive — _terminate_pid above already waited
+            # the SIGTERM grace, so the port should be free within
+            # milliseconds of that returning.
+            if port and not _wait_for_port_release(port, timeout_s=1.5):
                 holders = _find_port_holders(int(port))
                 if holders:
                     log.warning(
@@ -584,7 +587,7 @@ class Launcher:
                                 "force-kill of port-holder pid=%d failed: %s",
                                 pid, e,
                             )
-                    _wait_for_port_release(port, timeout_s=4.0)
+                    _wait_for_port_release(port, timeout_s=1.5)
                 else:
                     log.warning(
                         "fc %s port %d still bound but no holder found "
@@ -1185,18 +1188,28 @@ class Launcher:
             argv.append(f"-config-file={config_file}")
         return argv, {}
 
-    def _terminate_pid(self, pid: int) -> None:
+    def _terminate_pid(self, pid: int, sigterm_grace_s: float = 1.5) -> None:
+        """Kill the process group containing ``pid``: send SIGTERM, wait
+        ``sigterm_grace_s`` seconds for graceful exit, then SIGKILL.
+
+        Default grace was 5 seconds — too long for UI feedback when
+        users click 'stop FC' or 'restart drone' (the unified_api_server
+        Olympe-based FC sometimes hangs in atexit handlers and always
+        needed the SIGKILL fallback). 1.5 s catches the common quick
+        exit while still letting Flask flush logs; anything stuck
+        longer than that is unlikely to clean up by waiting more.
+        """
         try:
             os.killpg(os.getpgid(pid), signal.SIGTERM)
         except (ProcessLookupError, PermissionError):
             return
-        deadline = time.time() + 5.0
+        deadline = time.time() + float(sigterm_grace_s)
         while time.time() < deadline:
             try:
                 os.kill(pid, 0)
             except ProcessLookupError:
                 return
-            time.sleep(0.1)
+            time.sleep(0.05)
         try:
             os.killpg(os.getpgid(pid), signal.SIGKILL)
         except (ProcessLookupError, PermissionError):
