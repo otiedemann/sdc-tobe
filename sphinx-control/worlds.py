@@ -21,6 +21,9 @@ class WorldEntry:
     binary: str
     description: str = ""
     config_file: str | None = None  # Sphinx --config-file YAML, optional
+    # Extra UE4 command-line args (e.g. -ams-path=PerimeterPath,Malcolm,...)
+    # appended verbatim to the parrot-ue4-* invocation.
+    extra_ue4_args: list[str] | None = None
     available: bool = True
     unavailable_reason: str | None = None
 
@@ -61,6 +64,7 @@ class Registry:
                 binary=str(raw["binary"]),
                 description=str(raw.get("description", "")),
                 config_file=raw.get("config_file"),
+                extra_ue4_args=list(raw.get("extra_ue4_args") or []),
             )
             if shutil.which(entry.binary) is None and not Path(entry.binary).is_file():
                 entry.available = False

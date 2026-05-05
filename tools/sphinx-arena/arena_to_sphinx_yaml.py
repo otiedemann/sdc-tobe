@@ -395,6 +395,13 @@ def main() -> int:
              "Makefile uses by default.",
     )
     p.add_argument(
+        "--emit-actor-paths", action="store_true",
+        help="Emit a Paths: block with a closed-loop walking path "
+             "running around the OUTSIDE of the arena (used by "
+             "Sphinx AMS — pair with -ams-path=PerimeterPath,Malcolm,..."
+             " on the UE4 command line).",
+    )
+    p.add_argument(
         "--emit-spectators", action="store_true",
         help="Emit person- and vehicle-shaped stand-ins around the "
              "OUTSIDE of the arena walls (uses actor_red.fbx, "
@@ -921,6 +928,31 @@ def main() -> int:
         ))
         out_lines.append("")
 
+    n_actor_paths = 0
+    if args.emit_actor_paths:
+        # Closed-loop walking/driving path running OUTSIDE the arena
+        # walls. Coordinates are in WORLD frame (post axis_map +
+        # center_offset) in METRES — that's what Sphinx AMS Paths
+        # consume. Arena walls (after centering) sit at world
+        # x ≈ ±5.4 (short axis) and y ≈ ±10 (long axis); the path
+        # stays ~2 m beyond that on every side.
+        # Per Sphinx docs, each SplinePoint is "x y z [Action] [Speed]"
+        # with Action ∈ {Walk, Run, Stop} (default Walk) and Speed in
+        # km/h for vehicles. We use a generous 1.5 m elevation so the
+        # actors clear the slightly raised arena floor.
+        out_lines.append("")
+        out_lines.append("Paths:")
+        out_lines.append("  - Name: 'PerimeterPath'")
+        out_lines.append("    SplinePoints:")
+        for px, py in (
+            ( 7.5, -12.0), ( 7.5,  12.0),
+            (-7.5,  12.0), (-7.5, -12.0),
+        ):
+            out_lines.append(f"      - {px:.2f} {py:.2f} 0.40 Walk 5")
+        out_lines.append("    ClosedLoop: true")
+        out_lines.append("")
+        n_actor_paths = 1
+
     args.out.write_text("\n".join(out_lines))
     print(f"Wrote {args.out}")
     print(f"  wall markers: {n_wall}")
@@ -931,6 +963,7 @@ def main() -> int:
     print(f"  arena_static: {n_arena_static}")
     print(f"  paintings: {n_paintings}")
     print(f"  spectators: {n_spectators}")
+    print(f"  actor paths: {n_actor_paths}")
     print(f"  axis map: {args.axis_map}")
     print(f"  fbx dir (in YAML): {fbx_dir}")
     return 0

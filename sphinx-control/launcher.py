@@ -1262,6 +1262,7 @@ class Launcher:
             config_file=world.config_file,
             res_x=res_x,
             res_y=res_y,
+            extra_args=getattr(world, "extra_ue4_args", None) or [],
         )
         ue4_proc = subprocess.Popen(
             ue4_argv, stdout=ue4_log, stderr=subprocess.STDOUT,
@@ -1365,6 +1366,7 @@ class Launcher:
         config_file: str | None = None,
         res_x: int | None = None,
         res_y: int | None = None,
+        extra_args: list[str] | None = None,
     ) -> tuple[list[str], dict[str, str]]:
         """Build the parrot-ue4-<world> argv.
 
@@ -1390,6 +1392,8 @@ class Launcher:
             argv.append(f"-Port={endpoint.port}")
         if config_file:
             argv.append(f"-config-file={config_file}")
+        if extra_args:
+            argv.extend(extra_args)
         return argv, {}
 
     def _hide_ue4_panels(self, ue4_pid: int | None = None) -> None:

@@ -86,7 +86,8 @@ $(LOGO_DIR):
 # still built by `make paintings` so re-enabling is one flag away.
 yaml:
 	$(PY) arena_to_sphinx_yaml.py --fbx-dir $(FBX_DIR) --out $(YAML) \
-	    --emit-floor --emit-pillars --emit-walls --emit-spectators
+	    --emit-floor --emit-pillars --emit-walls --emit-paintings \
+	    --emit-actor-paths
 
 # Convenience target: rebuild EVERYTHING from sources. Run this on a
 # host that has cv2, Blender, and network access (for logo fetch).
