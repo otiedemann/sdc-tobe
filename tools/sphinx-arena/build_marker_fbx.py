@@ -87,21 +87,15 @@ def _build_plane(name: str) -> "bpy.types.Object":
     bpy.ops.mesh.primitive_plane_add(size=1.0, location=(0, 0, 0))
     obj = bpy.context.active_object
     obj.name = name
-    # Rotate +90° around Y axis: +Z normal → +X normal in Blender.
-    # Under axis_forward="-Y" / axis_up="-Z" FBX export, Blender +X
-    # lands at UE -Y — i.e., the marker's outward normal is UE -Y.
-    # With this convention the YAML conversion ``ue_yaw = direction_deg``
-    # (no offset) produces inward-facing markers on every wall, with
-    # clean cardinal yaw values (0/180/+90/-90) per wall.
+    # X-axis rotation +90° to stand the plane upright, plus Z-axis
+    # rotation -90° to spin its normal into the +Y Blender direction.
+    # Under axis_forward="-Y", axis_up="-Z" FBX export this lands the
+    # marker plane vertical in UE with normal +Y (UE-right).
     #
-    # Earlier attempts rotated around the X axis instead of Y. That
-    # gave the marker plane a normal along Blender ±Y, which after
-    # axis conversion landed at UE ±X — the long-wall direction.
-    # Wall yaws then got tangled in ±90° offsets that didn't all
-    # work out. Y-axis rotation puts the normal along Blender ±X →
-    # UE ±Y (the short-wall direction), which makes the per-wall yaw
-    # math come out symmetric.
-    obj.rotation_euler = (0.0, math.pi / 2.0, 0.0)
+    # User's empirical hint: 'return to the original version (X-axis
+    # rotation) and rotate by Z-axis' — this is exactly that
+    # combination (X+90 then Z-90).
+    obj.rotation_euler = (math.pi / 2.0, 0.0, -math.pi / 2.0)
     bpy.ops.object.transform_apply(location=False, rotation=True, scale=False)
     return obj
 
