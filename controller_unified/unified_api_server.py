@@ -73,6 +73,19 @@ HAS_MOVE_TO = False
 HAS_MAX_HORIZ_SPEED = False
 HAS_GEOFENCE = False
 HAS_CV2 = False
+# Camera-settings probes -- gated per-feature so a partial Olympe build
+# still gets whichever knobs it does expose. See the probed import block
+# inside ``if HAS_OLYMPE_SDK:`` for the message names.
+HAS_CAMERA_EXPOSURE = False
+HAS_CAMERA_WB = False
+HAS_CAMERA_HDR = False
+HAS_CAMERA_EV = False
+HAS_CAMERA_ANTIFLICKER = False
+HAS_CAMERA_RECORDING_MODE = False
+HAS_CAMERA_ZOOM = False
+HAS_VIDEO_STABILIZATION = False
+HAS_STREAM_MODE = False
+HAS_AF_LEGACY = False
 
 if not IS_ARM:
     try:
@@ -246,26 +259,14 @@ if HAS_OLYMPE_SDK:
         for err in _WIFI_IMPORT_ERRORS:
             print(f"[WIFI]   {err}")
 
-
-def _magneto_needs_calibration(status: Optional[str]) -> bool:
-    """Return True only when the magnetometer really needs recalibration.
-
-    The status string from _read_magnetometer_state() is a comma-separated
-    list of tokens like "REQUIRED", "not-required", "all-axes-ok", "FAILED",
-    "axes=x1y1z1", "in-progress". Our earlier substring check matched
-    "REQUIRED" inside "not-required" and produced a false warning — fix
-    by splitting on commas and comparing token-by-token.
-    """
-    if not status:
-        return False
-    tokens = [t.strip().lower() for t in status.split(",")]
-    if "required" in tokens:      # exact token, not a substring
-        return True
-    for t in tokens:
-        # Accepts "failed", "calibrationfailed", "fail", etc.
-        if t.startswith("fail") or t == "failed":
-            return True
-    return False
+    # Camera / gimbal / GPS / RTH / move-to / geofence Olympe messages.
+    # These were previously buried below an unconditional ``return False``
+    # inside ``_magneto_needs_calibration`` (dead code) which silently
+    # left HAS_CAMERA / HAS_GIMBAL / HAS_RTH / HAS_MOVE_TO /
+    # HAS_MAX_HORIZ_SPEED / HAS_GEOFENCE at False and the corresponding
+    # endpoints broken with NameError. Now imported at module scope so
+    # the existing /api/camera/{photo,record/*,zoom}, /api/gimbal,
+    # /api/rth, /api/moveto endpoints actually work.
     try:
         from olympe.messages.camera import start_recording, stop_recording, take_photo
         HAS_CAMERA = True
@@ -310,6 +311,70 @@ def _magneto_needs_calibration(status: Optional[str]) -> bool:
         HAS_GEOFENCE = True
     except (ImportError, KeyError):
         pass
+
+    # Camera-settings (modern camera.* namespace). Each axis is gated
+    # independently so a partial Olympe build still works.
+    try:
+        from olympe.messages.camera import (
+            set_exposure_settings, exposure_settings,
+            set_white_balance, white_balance,
+            set_hdr_setting, hdr_setting,
+            set_ev_compensation, ev_compensation,
+            set_antiflicker_mode, antiflicker_mode,
+            set_recording_mode, recording_mode,
+            zoom_level, zoom_info,
+        )
+        HAS_CAMERA_EXPOSURE = True
+        HAS_CAMERA_WB = True
+        HAS_CAMERA_HDR = True
+        HAS_CAMERA_EV = True
+        HAS_CAMERA_ANTIFLICKER = True
+        HAS_CAMERA_RECORDING_MODE = True
+    except (ImportError, KeyError):
+        pass
+    # ardrone3.* fallbacks (image stabilisation lives only here; the
+    # legacy anti-flicker is the fallback when ``camera.set_antiflicker_mode``
+    # isn't in this Olympe build).
+    try:
+        from olympe.messages.ardrone3.PictureSettings import VideoStabilizationMode
+        from olympe.messages.ardrone3.PictureSettingsState import VideoStabilizationModeChanged
+        HAS_VIDEO_STABILIZATION = True
+    except (ImportError, KeyError):
+        pass
+    try:
+        from olympe.messages.ardrone3.MediaStreaming import VideoStreamMode
+        from olympe.messages.ardrone3.MediaStreamingState import VideoStreamModeChanged
+        HAS_STREAM_MODE = True
+    except (ImportError, KeyError):
+        pass
+    try:
+        from olympe.messages.ardrone3.Antiflickering import setMode as AntiflickerLegacy
+        from olympe.messages.ardrone3.AntiflickeringState import modeChanged as AntiflickerLegacyChanged
+        HAS_AF_LEGACY = True
+    except (ImportError, KeyError):
+        pass
+
+
+def _magneto_needs_calibration(status: Optional[str]) -> bool:
+    """Return True only when the magnetometer really needs recalibration.
+
+    The status string from _read_magnetometer_state() is a comma-separated
+    list of tokens like "REQUIRED", "not-required", "all-axes-ok", "FAILED",
+    "axes=x1y1z1", "in-progress". Our earlier substring check matched
+    "REQUIRED" inside "not-required" and produced a false warning — fix
+    by splitting on commas and comparing token-by-token.
+    """
+    if not status:
+        return False
+    tokens = [t.strip().lower() for t in status.split(",")]
+    if "required" in tokens:      # exact token, not a substring
+        return True
+    for t in tokens:
+        # Accepts "failed", "calibrationfailed", "fail", etc.
+        if t.startswith("fail") or t == "failed":
+            return True
+    return False
+
 
 try:
     import cv2
@@ -2586,6 +2651,195 @@ class OlympeBackend(DroneBackend):
             result = d(stop_recording(cam_id=0)).wait(_timeout=5)
         return (True, "ok") if result and result.success() else (False, "record_stop_failed")
 
+    def camera_config_get(self) -> dict:
+        """Snapshot of the camera's current settings, gated per-feature
+        on the corresponding ``HAS_CAMERA_*`` probe. Keys are returned
+        only for the axes the firmware actually supports."""
+        d = self._d()
+        if d is None:
+            return {"connected": False}
+        out: dict = {"connected": True, "cam_id": 0}
+        def _state(evt):
+            try:
+                s = d.get_state(evt)
+                return s if isinstance(s, dict) else {}
+            except Exception:
+                return {}
+        if HAS_CAMERA_EXPOSURE:
+            s = _state(exposure_settings)
+            out["exposure"] = {
+                "mode": s.get("mode"),
+                "shutter_speed": s.get("shutter_speed"),
+                "iso_sensitivity": s.get("iso_sensitivity"),
+                "max_iso_sensitivity": s.get("max_iso_sensitivity"),
+                "metering_mode": s.get("metering_mode"),
+            }
+        if HAS_CAMERA_WB:
+            s = _state(white_balance)
+            out["white_balance"] = {
+                "mode": s.get("mode"),
+                "temperature": s.get("temperature"),
+            }
+        if HAS_CAMERA_HDR:
+            out["hdr"] = {"value": _state(hdr_setting).get("value")}
+        if HAS_CAMERA_EV:
+            out["ev_compensation"] = {
+                "value": _state(ev_compensation).get("value"),
+            }
+        if HAS_CAMERA_ANTIFLICKER:
+            out["antiflicker"] = {"mode": _state(antiflicker_mode).get("mode")}
+        elif HAS_AF_LEGACY:
+            out["antiflicker"] = {"mode": _state(AntiflickerLegacyChanged).get("mode")}
+        if HAS_VIDEO_STABILIZATION:
+            out["video_stabilization"] = {
+                "mode": _state(VideoStabilizationModeChanged).get("mode"),
+            }
+        if HAS_STREAM_MODE:
+            out["stream_mode"] = {
+                "mode": _state(VideoStreamModeChanged).get("mode"),
+            }
+        if HAS_CAMERA_RECORDING_MODE:
+            s = _state(recording_mode)
+            out["recording"] = {
+                "mode":       s.get("mode"),
+                "resolution": s.get("resolution"),
+                "framerate":  s.get("framerate"),
+                "hyperlapse": s.get("hyperlapse"),
+                "bitrate":    s.get("bitrate"),  # reported, read-only
+            }
+        if HAS_CAMERA_ZOOM:
+            s = _state(zoom_level)
+            out["zoom"] = {"level": s.get("level")}
+        return out
+
+    def camera_config_set(self, data: dict) -> dict:
+        """Apply a partial dict of camera settings. Each top-level key
+        is independent (operator can submit just one axis). Returns
+        ``{key: bool}`` per-axis success.
+        """
+        d = self._d()
+        if d is None:
+            return {"error": "not_ready"}
+        results: dict = {}
+        if "exposure" in data and HAS_CAMERA_EXPOSURE:
+            e = data["exposure"] or {}
+            try:
+                with command_lock:
+                    r = d(set_exposure_settings(
+                        cam_id=0,
+                        mode=e.get("mode", "automatic"),
+                        shutter_speed=e.get("shutter_speed",
+                                            "shutter_1_over_30"),
+                        iso_sensitivity=e.get("iso_sensitivity", "iso_100"),
+                        max_iso_sensitivity=e.get("max_iso_sensitivity",
+                                                   "iso_3200"),
+                        metering_mode=e.get("metering_mode", "standard"),
+                    )).wait(_timeout=2)
+                results["exposure"] = bool(r and r.success())
+            except Exception as ex:
+                results["exposure"] = False
+                results["exposure_error"] = str(ex)
+        if "white_balance" in data and HAS_CAMERA_WB:
+            w = data["white_balance"] or {}
+            try:
+                with command_lock:
+                    r = d(set_white_balance(
+                        cam_id=0,
+                        mode=w.get("mode", "automatic"),
+                        temperature=w.get("temperature", "t_5000"),
+                    )).wait(_timeout=2)
+                results["white_balance"] = bool(r and r.success())
+            except Exception as ex:
+                results["white_balance"] = False
+                results["white_balance_error"] = str(ex)
+        if "hdr" in data and HAS_CAMERA_HDR:
+            try:
+                with command_lock:
+                    r = d(set_hdr_setting(
+                        cam_id=0,
+                        value=(data["hdr"] or {}).get("value", "inactive"),
+                    )).wait(_timeout=2)
+                results["hdr"] = bool(r and r.success())
+            except Exception as ex:
+                results["hdr"] = False
+                results["hdr_error"] = str(ex)
+        if "ev_compensation" in data and HAS_CAMERA_EV:
+            try:
+                with command_lock:
+                    r = d(set_ev_compensation(
+                        cam_id=0,
+                        value=(data["ev_compensation"] or {}).get("value",
+                                                                  "ev_0_00"),
+                    )).wait(_timeout=2)
+                results["ev_compensation"] = bool(r and r.success())
+            except Exception as ex:
+                results["ev_compensation"] = False
+                results["ev_compensation_error"] = str(ex)
+        if "antiflicker" in data:
+            mode = (data["antiflicker"] or {}).get("mode", "auto")
+            try:
+                with command_lock:
+                    if HAS_CAMERA_ANTIFLICKER:
+                        r = d(set_antiflicker_mode(mode=mode)).wait(_timeout=2)
+                    elif HAS_AF_LEGACY:
+                        r = d(AntiflickerLegacy(mode=mode)).wait(_timeout=2)
+                    else:
+                        r = None
+                results["antiflicker"] = bool(r and r.success())
+            except Exception as ex:
+                results["antiflicker"] = False
+                results["antiflicker_error"] = str(ex)
+        if "video_stabilization" in data and HAS_VIDEO_STABILIZATION:
+            try:
+                with command_lock:
+                    r = d(VideoStabilizationMode(
+                        mode=(data["video_stabilization"] or {}).get(
+                            "mode", "roll_pitch"),
+                    )).wait(_timeout=2)
+                results["video_stabilization"] = bool(r and r.success())
+            except Exception as ex:
+                results["video_stabilization"] = False
+                results["video_stabilization_error"] = str(ex)
+        if "stream_mode" in data and HAS_STREAM_MODE:
+            try:
+                with command_lock:
+                    r = d(VideoStreamMode(
+                        mode=(data["stream_mode"] or {}).get(
+                            "mode", "low_latency"),
+                    )).wait(_timeout=2)
+                results["stream_mode"] = bool(r and r.success())
+            except Exception as ex:
+                results["stream_mode"] = False
+                results["stream_mode_error"] = str(ex)
+        if "recording" in data and HAS_CAMERA_RECORDING_MODE:
+            rec = data["recording"] or {}
+            try:
+                with command_lock:
+                    r = d(set_recording_mode(
+                        cam_id=0,
+                        mode=rec.get("mode", "standard"),
+                        resolution=rec.get("resolution", "res_1080p"),
+                        framerate=rec.get("framerate", "fps_30"),
+                        hyperlapse=rec.get("hyperlapse", "ratio_15"),
+                    )).wait(_timeout=2)
+                results["recording"] = bool(r and r.success())
+            except Exception as ex:
+                results["recording"] = False
+                results["recording_error"] = str(ex)
+        if "zoom" in data and HAS_CAMERA_ZOOM:
+            level = (data["zoom"] or {}).get("level", 1.0)
+            try:
+                with command_lock:
+                    r = d(_CameraSetZoom(
+                        cam_id=0, control_mode="level",
+                        target=float(level),
+                    )).wait(_timeout=2)
+                results["zoom"] = bool(r and r.success())
+            except Exception as ex:
+                results["zoom"] = False
+                results["zoom_error"] = str(ex)
+        return results
+
     def gimbal_set(self, tilt: float, pan: float) -> Tuple[bool, str]:
         d = self._d()
         if d is None or not HAS_GIMBAL:
@@ -4701,6 +4955,47 @@ def api_camera_zoom():
             b.drone(_CameraSetZoom(cam_id=0, control_mode="level",
                                     target=z)).wait(_timeout=2)
         return jsonify(ok=True, zoom=z)
+    except Exception as e:
+        return jsonify(ok=False, error=str(e)), 500
+
+
+@app.get("/api/camera/config")
+def api_camera_config_get():
+    """Read the Anafi's current camera-settings snapshot.
+    Returns ``{ok, config}``; ``config`` contains keys per axis the
+    firmware exposes (exposure, white_balance, hdr, ev_compensation,
+    antiflicker, video_stabilization, stream_mode, recording, zoom).
+    Returns connected=False without keys when no drone is bound.
+    """
+    b = backend
+    if b is None or not isinstance(b, OlympeBackend):
+        return jsonify(ok=False, error="anafi backend required"), 503
+    try:
+        return jsonify(ok=True, config=b.camera_config_get())
+    except Exception as e:
+        return jsonify(ok=False, error=str(e)), 500
+
+
+@app.post("/api/camera/config")
+def api_camera_config_set():
+    """Apply a partial camera-settings dict.
+    Body shape mirrors the GET response (one or more of: exposure,
+    white_balance, hdr, ev_compensation, antiflicker,
+    video_stabilization, stream_mode, recording, zoom). Each axis is
+    applied independently; the response includes ``results`` (per-axis
+    bool) and the post-apply ``config`` so the operator sees what the
+    firmware actually accepted.
+    """
+    b = backend
+    if b is None or not isinstance(b, OlympeBackend) or b.drone is None:
+        return jsonify(ok=False, error="drone not connected"), 503
+    data = request.get_json(silent=True) or {}
+    if not isinstance(data, dict):
+        return jsonify(ok=False, error="body must be a JSON object"), 400
+    try:
+        results = b.camera_config_set(data)
+        return jsonify(ok=True, results=results,
+                       config=b.camera_config_get())
     except Exception as e:
         return jsonify(ok=False, error=str(e)), 500
 

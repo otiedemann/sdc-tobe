@@ -320,9 +320,15 @@ def newest_flight_script(flights_root: Optional[Path]) -> Optional[str]:
 def load_priority_script(active_path: Optional[Path],
                          flights_root: Optional[Path]) -> str:
     """Return the textarea contents per the priority chain:
-    1. active draft at ``active_path``
-    2. newest per-flight ``mission_script.txt`` under ``flights_root``
-    3. ``HARDCODED_DEFAULT_SCRIPT``
+    1. active draft at ``active_path`` (operator's most recent typing)
+    2. operator-pinned default-by-name (set on /, "Set as default")
+    3. newest per-flight ``mission_script.txt`` under ``flights_root``
+    4. ``HARDCODED_DEFAULT_SCRIPT``
+
+    Default-by-name sits in the middle: the active draft is the
+    operator's WIP and MUST stay first (overriding it on every
+    restart would obliterate ongoing edits). Default kicks in when
+    there's no active draft -- fresh install or operator wiped it.
     """
     if active_path is not None:
         try:
@@ -330,6 +336,16 @@ def load_priority_script(active_path: Optional[Path],
                 return active_path.read_text()
         except OSError:
             pass
+    # Operator-pinned default-by-name.
+    try:
+        from .config import get_default, MISSION_SCRIPTS_DIR
+        name = get_default("mission_script")
+        if name:
+            p = MISSION_SCRIPTS_DIR / f"{name}.txt"
+            if p.is_file():
+                return p.read_text()
+    except Exception as e:
+        print(f"[mission_script] default-by-name load failed: {e}")
     flight_text = newest_flight_script(flights_root)
     if flight_text is not None:
         return flight_text

@@ -34,6 +34,65 @@ ACTIVE_MISSION_SCRIPT_PATH = DEFAULT_DATA_DIR / "active_mission_script.txt"
 PER_FLIGHT_SCRIPT_FILENAME = "mission_script.txt"
 ARENA_CONFIGS_DIR = DEFAULT_DATA_DIR / "arenas"
 ACTIVE_ARENA_CONFIG_PATH = DEFAULT_DATA_DIR / "active_arena_config.json"
+CAMERA_CONFIGS_DIR = DEFAULT_DATA_DIR / "camera_configs"
+
+# Centralised "set as default" pointer file. One JSON document
+# storing the operator-pinned default save NAME (no copy / no
+# symlink, to avoid drift) for each save subsystem. Empty / missing
+# / corrupt = no defaults pinned (loaders fall through to existing
+# behaviour). See ``get_default`` / ``set_default`` below.
+DEFAULTS_PATH = DEFAULT_DATA_DIR / "defaults.json"
+SUBSYSTEMS = ("tune", "mission_script", "arena", "camera")
+
+
+def load_defaults() -> dict:
+    """Return ``{subsystem: name}`` for every subsystem with a
+    pinned default. Missing keys / unreadable file / malformed
+    entries silently produce ``{}`` -- the operator sees built-in
+    behaviour rather than a crash.
+    """
+    try:
+        if DEFAULTS_PATH.exists():
+            blob = json.loads(DEFAULTS_PATH.read_text())
+            if isinstance(blob, dict):
+                return {k: str(v.get("name", ""))
+                        for k, v in blob.items()
+                        if isinstance(v, dict) and v.get("name")}
+    except (OSError, ValueError) as e:
+        print(f"[config] defaults.json unreadable: {e}; ignoring")
+    return {}
+
+
+def get_default(subsystem: str) -> Optional[str]:
+    """Resolve the pinned default name for ``subsystem`` (one of
+    ``SUBSYSTEMS``), or None if no default is set."""
+    name = load_defaults().get(subsystem) or ""
+    return name if name else None
+
+
+def set_default(subsystem: str, name: Optional[str]) -> None:
+    """Atomic name-pointer write. ``name=None`` (or empty string)
+    clears the pointer. Raises ``ValueError`` for unknown subsystems
+    so a typo doesn't silently land in the JSON."""
+    if subsystem not in SUBSYSTEMS:
+        raise ValueError(f"unknown subsystem {subsystem!r}; "
+                         f"expected one of {SUBSYSTEMS}")
+    DEFAULTS_PATH.parent.mkdir(parents=True, exist_ok=True)
+    cur: dict = {}
+    try:
+        if DEFAULTS_PATH.exists():
+            blob = json.loads(DEFAULTS_PATH.read_text()) or {}
+            if isinstance(blob, dict):
+                cur = blob
+    except Exception:
+        cur = {}
+    if name:
+        cur[subsystem] = {"name": str(name)}
+    else:
+        cur.pop(subsystem, None)
+    tmp = DEFAULTS_PATH.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(cur, indent=2))
+    os.replace(tmp, DEFAULTS_PATH)
 
 
 # ---------------------------------------------------------------------------
@@ -258,6 +317,26 @@ class MissionConfig:
     @classmethod
     def load(cls, path: Optional[Path] = None) -> "MissionConfig":
         cfg = cls()
+        # Default snapshot overlay (operator-pinned via "Set as default"
+        # on /tune). Sits between the dataclass defaults and
+        # ``config.json`` so it's a *better baseline* than the dataclass
+        # defaults but the operator's most-recent live state in
+        # ``config.json`` still wins. Env always overrides everything.
+        snap_name = get_default("tune")
+        if snap_name:
+            snap_path = SNAPSHOTS_DIR / f"{snap_name}.json"
+            if snap_path.exists():
+                try:
+                    blob = json.loads(snap_path.read_text())
+                    for k, v in blob.items():
+                        if hasattr(cfg, k):
+                            setattr(cfg, k, v)
+                except Exception as e:
+                    print(f"[config] default snapshot {snap_name!r}"
+                          f" unreadable: {e}")
+            else:
+                print(f"[config] default snapshot {snap_name!r}"
+                      f" not found; skipped")
         path = path or Path(os.environ.get("MM_CONFIG_PATH",
                                            DEFAULT_DATA_DIR / "config.json"))
         if path.exists():

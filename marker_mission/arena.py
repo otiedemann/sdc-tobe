@@ -251,8 +251,13 @@ def load_priority_arena(active_path: Optional[Path] = None
     Priority:
       1. ``active_path`` (defaults to ``ACTIVE_ARENA_CONFIG_PATH`` from
          :mod:`marker_mission.config`) if it exists.
-      2. ``default_arena()`` -- a ready-to-use 10 m x 25 m, 16-marker
+      2. operator-pinned default-by-name (Arena tab, "Set as default").
+      3. ``default_arena()`` -- a ready-to-use 10 m x 25 m, 16-marker
          layout, in case the operator hasn't saved one yet.
+
+    Default-by-name sits between the active path (which the operator
+    saves explicitly via the Arena tab) and the built-in default --
+    same shape as ``mission_script.load_priority_script``.
     """
     if active_path is None:
         # Local import to avoid a circular dependency between
@@ -264,7 +269,20 @@ def load_priority_arena(active_path: Optional[Path] = None
         try:
             return ArenaConfig.load(p)
         except Exception as e:
-            print(f"[arena] failed to load {p}: {e}; using default")
+            print(f"[arena] failed to load {p}: {e}; trying default-by-name")
+    try:
+        from .config import get_default, ARENA_CONFIGS_DIR
+        name = get_default("arena")
+        if name:
+            q = ARENA_CONFIGS_DIR / f"{name}.json"
+            if q.is_file():
+                return ArenaConfig.load(q)
+            else:
+                print(f"[arena] default-by-name {name!r} not found;"
+                      f" using built-in default")
+    except Exception as e:
+        print(f"[arena] default-by-name load failed: {e};"
+              f" using built-in default")
     return default_arena()
 
 

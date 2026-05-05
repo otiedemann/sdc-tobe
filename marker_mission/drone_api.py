@@ -170,6 +170,19 @@ class DroneApi:
     def rc_zero(self) -> dict:
         return self.rc(0, 0, 0, 0, duration_ms=200)
 
+    def camera_config_get(self) -> dict:
+        """Return the current camera-settings snapshot. Keys appear
+        only for axes the firmware exposes (exposure, white_balance,
+        hdr, ev_compensation, antiflicker, video_stabilization,
+        stream_mode, recording, zoom)."""
+        return self._get("/api/camera/config")
+
+    def camera_config_set(self, **fields) -> dict:
+        """Apply a partial camera-settings dict. Each top-level key
+        is independent; the server returns per-axis success flags
+        plus the post-apply state."""
+        return self._post("/api/camera/config", fields)
+
 
 # ---------------------------------------------------------------------------
 # Video stream reader

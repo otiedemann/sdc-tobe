@@ -234,6 +234,7 @@ _VIDEO_AND_STATUS_HTML = """
           Save script
         </button>
       </div>
+      <div id="script-default-banner" style="display:none;"></div>
       <div id="script-list" style="font-size:.85rem;"></div>
     </details>
     {% endif %}
@@ -427,6 +428,76 @@ const REPLAY_ID = {{ replay_id|tojson }};
 // drone_connected field, so the Start button enables / disables live.
 let droneConnected = {{ 'true' if drone_connected else 'false' }};
 const $ = id => document.getElementById(id);
+
+// ---- Default-pointer helpers (used by tune / arena / scripts / camera
+// save tables) -----------------------------------------------------------
+function appendDefaultBadge(td) {
+  const badge = document.createElement('span');
+  badge.textContent = 'default';
+  badge.style.cssText = 'background:#16a34a; color:#062613; '
+    + 'font-size:.7rem; font-weight:600; padding:.05rem .35rem; '
+    + 'border-radius:3px; margin-left:.4rem; vertical-align:middle;';
+  td.appendChild(badge);
+}
+function makeSetDefaultButton(isCurrentlyDefault, onClick) {
+  const b = document.createElement('button');
+  b.type = 'button';
+  b.textContent = isCurrentlyDefault ? 'Clear default' : 'Set as default';
+  b.title = isCurrentlyDefault
+    ? 'Clear this row as the auto-loaded default.'
+    : 'Make this the default that auto-loads at startup.';
+  b.style.cssText = 'padding:.2rem .55rem; border:1px solid #2a3038; '
+    + 'border-radius:4px; background:#1f2937; color:#e6edf3; '
+    + 'cursor:pointer; margin-right:.4rem; font-size:.8rem;';
+  b.addEventListener('click', onClick);
+  return b;
+}
+async function clearDefault(listUrl, onDone) {
+  // POST set-default with clear=true against any existing name in the
+  // list works as a no-op when no rows match (server returns 404).
+  // Easier path: hit the bare collection URL with a DELETE-style body.
+  // Each subsystem's set-default endpoint already accepts {clear:true}
+  // even for a name that no longer exists -- it just clears the pointer.
+  // We discover the stale name from the list response.
+  try {
+    const r0 = await fetch(listUrl, {cache:'no-store'});
+    const j0 = await r0.json();
+    const stale = j0.default;
+    if (!stale) { if (onDone) await onDone(); return; }
+    // URL convention: <listUrl>/<name>/set-default
+    await fetch(listUrl + '/' + encodeURIComponent(stale) + '/set-default',
+                {method:'POST',
+                 headers:{'Content-Type':'application/json'},
+                 body: JSON.stringify({clear: true})});
+  } catch (e) {}
+  if (onDone) await onDone();
+}
+function renderDefaultMissingBanner(elementId, defaultName, exists, onClear) {
+  let el = $(elementId);
+  if (!el) return;
+  if (defaultName && !exists) {
+    el.style.cssText = 'padding:.4rem .55rem; margin-bottom:.4rem; '
+      + 'border:1px solid #7f1d1d; border-radius:4px; '
+      + 'background:rgba(127,29,29,0.18); color:#fca5a5; '
+      + 'font-size:.8rem;';
+    el.innerHTML = '';
+    const span = document.createElement('span');
+    span.textContent = 'Default points at "' + defaultName
+      + '" but that save no longer exists. ';
+    el.appendChild(span);
+    const b = document.createElement('button');
+    b.type = 'button';
+    b.textContent = 'Clear default';
+    b.style.cssText = 'padding:.15rem .5rem; border:1px solid #7f1d1d; '
+      + 'border-radius:4px; background:transparent; color:#fca5a5; '
+      + 'cursor:pointer; font-size:.75rem;';
+    b.addEventListener('click', onClear);
+    el.appendChild(b);
+  } else {
+    el.style.display = 'none';
+    el.innerHTML = '';
+  }
+}
 function fmt(v, unit, prec) {
   if (v === null || v === undefined || v === '') return '—';
   if (typeof v === 'number') return v.toFixed(prec ?? 2) + (unit ? ' '+unit : '');
@@ -557,6 +628,9 @@ async function refreshScriptList() {
   try {
     const r = await fetch('/api/mission/scripts', {cache:'no-store'});
     const j = await r.json();
+    renderDefaultMissingBanner('script-default-banner', j.default,
+      (j.scripts || []).some(x => x.name === j.default),
+      () => clearDefault('/api/mission/scripts', refreshScriptList));
     if (!j.scripts || !j.scripts.length) {
       list.innerHTML = '<div style="color:#778;">No saved scripts.</div>';
       return;
@@ -564,10 +638,16 @@ async function refreshScriptList() {
     const fmtTime = mt => new Date(mt*1000).toLocaleString();
     list.innerHTML = j.scripts.map(s => {
       const safe = s.name.replace(/"/g, '&quot;');
+      const rowBg = s.is_default ? 'background:rgba(22,163,74,0.08);' : '';
+      const badge = s.is_default
+        ? '<span style="background:#16a34a; color:#062613; '
+          + 'font-size:.7rem; font-weight:600; padding:.05rem .35rem; '
+          + 'border-radius:3px; margin-left:.4rem;">default</span>' : '';
+      const defLabel = s.is_default ? 'Clear default' : 'Set as default';
       return `
         <div style="display:flex; gap:.4rem; align-items:center;
-                    padding:.25rem 0; border-top:1px solid #2a3038;">
-          <span style="flex:1; font-family:ui-monospace, monospace;">${safe}</span>
+                    padding:.25rem 0; border-top:1px solid #2a3038;${rowBg}">
+          <span style="flex:1; font-family:ui-monospace, monospace;">${safe}${badge}</span>
           <span style="color:#778; font-size:.75rem;">${fmtTime(s.mtime)}</span>
           <button class="script-load" data-name="${safe}"
                   style="padding:.2rem .5rem; border:0; border-radius:4px;
@@ -577,6 +657,10 @@ async function refreshScriptList() {
                   style="padding:.2rem .5rem; border:0; border-radius:4px;
                          background:#facc15; color:#241a07;
                          font-weight:600; cursor:pointer; font-size:.75rem;">Overwrite</button>
+          <button class="script-default" data-name="${safe}" data-isdef="${s.is_default ? '1' : '0'}"
+                  style="padding:.2rem .5rem; border:1px solid #2a3038;
+                         border-radius:4px; background:#1f2937; color:#e6edf3;
+                         cursor:pointer; font-size:.75rem;">${defLabel}</button>
           <button class="script-delete" data-name="${safe}"
                   style="padding:.2rem .5rem; border:0; border-radius:4px;
                          background:var(--bad); color:#240707;
@@ -591,6 +675,17 @@ async function refreshScriptList() {
     });
     list.querySelectorAll('.script-delete').forEach(b => {
       b.addEventListener('click', () => deleteScript(b.dataset.name));
+    });
+    list.querySelectorAll('.script-default').forEach(b => {
+      b.addEventListener('click', async () => {
+        const isDef = b.dataset.isdef === '1';
+        await fetch('/api/mission/scripts/' + encodeURIComponent(b.dataset.name)
+                    + '/set-default',
+                    {method:'POST',
+                     headers:{'Content-Type':'application/json'},
+                     body: JSON.stringify(isDef ? {clear: true} : {})});
+        await refreshScriptList();
+      });
     });
   } catch (e) {
     list.innerHTML = '<div style="color:var(--bad);">Failed to load list.</div>';
@@ -1378,6 +1473,65 @@ _PAGE_CALIBRATE = _PAGE_BASE_CSS + _PAGE_HEADER + _COMMON_SCRIPT + _PAGE_GRID_OP
                 display:none; white-space:pre;"></pre>
   </div>
 </section>
+<section class="grid" style="grid-template-columns: 1fr; margin-top:1rem;">
+  <div class="card">
+    <h2>Camera config</h2>
+    <p style="font-size:.85rem; color:#aab; margin:.2rem 0 .6rem;">
+      Live values pulled from the Olympe camera (only the axes the
+      firmware exposes show up). Type a valid enum string per Olympe
+      docs and press <b>Apply</b>. <b>Save</b> stores the current
+      form as a named config; <b>Set as default</b> on a row makes
+      that config auto-load at startup.
+    </p>
+    <div id="camcfg-form" style="display:grid;
+         grid-template-columns: 12em 1fr; gap:.35rem .8rem;
+         align-items:center; font-size:.85rem;
+         font-family:ui-monospace, monospace;">
+      <div style="grid-column: 1 / -1; color:#778;">loading…</div>
+    </div>
+    <div style="display:flex; gap:.4rem; align-items:center;
+                margin-top:.8rem; flex-wrap:wrap;">
+      <button id="camcfg-apply" type="button"
+              style="padding:.4rem .8rem; border:0; border-radius:6px;
+                     background:var(--good); color:#072413; font-weight:600;
+                     cursor:pointer; font-size:.85rem;">Apply</button>
+      <button id="camcfg-refresh" type="button"
+              style="padding:.4rem .8rem; border:1px solid #2a3038;
+                     border-radius:6px; background:#1f2937; color:#e6edf3;
+                     cursor:pointer; font-size:.85rem;">Refresh</button>
+      <input id="camcfg-name" type="text" placeholder="name to save as"
+             style="margin-left:.6rem; padding:.4rem .55rem; flex:1;
+                    min-width:10rem; background:#0c0f12; color:var(--fg);
+                    border:1px solid #2a3038; border-radius:6px;
+                    font-size:.85rem;">
+      <button id="camcfg-save" type="button"
+              style="padding:.4rem .8rem; border:0; border-radius:6px;
+                     background:#facc15; color:#241a07; font-weight:600;
+                     cursor:pointer; font-size:.85rem;">Save</button>
+    </div>
+    <div id="camcfg-msg" style="margin-top:.5rem; font-size:.8rem;
+                                  color:#aab; min-height:1.2em;"></div>
+    <div id="camcfg-default-banner" style="margin-top:.6rem;
+                                            display:none;"></div>
+    <div style="max-height:240px; overflow-y:auto; border:1px solid #2a3038;
+                border-radius:6px; margin-top:.4rem;">
+      <table id="camcfg-table" style="width:100%; border-collapse:collapse;
+                                       font-size:.85rem;">
+        <thead style="position:sticky; top:0; background:var(--panel);">
+          <tr style="text-align:left; color:#9ca3af;">
+            <th style="padding:.3rem .4rem;">Name</th>
+            <th style="padding:.3rem .4rem;">Saved</th>
+            <th style="padding:.3rem .4rem; width:22rem;">Actions</th>
+          </tr>
+        </thead>
+        <tbody id="camcfg-body">
+          <tr><td colspan="3" style="color:#6b7280; padding:.4rem;">
+              loading…</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+</section>
 <script>
 (() => {
 const $ = id => document.getElementById(id);
@@ -1500,6 +1654,260 @@ async function tick() {
   setTimeout(tick, 500);
 }
 tick();
+
+// ---- Camera config form ------------------------------------------------
+// Live values come from GET /api/camera/config. The form is dynamic:
+// for each axis returned (exposure, white_balance, hdr, etc.) we render
+// one row per sub-field with a text input prefilled with the current
+// value. Apply POSTs all rows back. Saved configs are stored under
+// ~/.marker_mission/camera_configs/ and listed below the form.
+let camcfgKeys = [];   // [['exposure','mode'], ['exposure','shutter_speed'], ...]
+function camcfgSetMsg(s, ok) {
+  const el = $('camcfg-msg'); if (!el) return;
+  el.textContent = s || '';
+  el.style.color = ok === false ? 'var(--bad)'
+                 : ok === true ? 'var(--good)'
+                 : '#aab';
+}
+function _renderField(key, sub, value) {
+  const lbl = document.createElement('div');
+  lbl.style.color = '#aab';
+  lbl.textContent = key + '.' + sub;
+  const inp = document.createElement('input');
+  inp.type = (typeof value === 'number') ? 'number' : 'text';
+  inp.dataset.key = key;
+  inp.dataset.sub = sub;
+  inp.value = (value === null || value === undefined) ? '' : String(value);
+  inp.style.cssText = 'background:#0c0f12; color:var(--fg);'
+    + ' border:1px solid #2a3038; border-radius:4px;'
+    + ' padding:.25rem .4rem; font-family:inherit;';
+  return [lbl, inp];
+}
+function camcfgPopulate(cfg) {
+  const f = $('camcfg-form'); if (!f) return;
+  f.innerHTML = '';
+  camcfgKeys = [];
+  if (!cfg || cfg.connected === false) {
+    const div = document.createElement('div');
+    div.style.cssText = 'grid-column:1/-1; color:#aab;';
+    div.textContent = 'Drone not connected.';
+    f.appendChild(div);
+    return;
+  }
+  // Skip non-axis keys.
+  const skip = new Set(['connected', 'cam_id']);
+  const axes = Object.keys(cfg).filter(k => !skip.has(k));
+  for (const k of axes) {
+    const v = cfg[k];
+    if (v && typeof v === 'object') {
+      for (const sub of Object.keys(v)) {
+        camcfgKeys.push([k, sub]);
+        const [lbl, inp] = _renderField(k, sub, v[sub]);
+        f.appendChild(lbl); f.appendChild(inp);
+      }
+    } else {
+      camcfgKeys.push([k, '_value']);
+      const [lbl, inp] = _renderField(k, '_value', v);
+      f.appendChild(lbl); f.appendChild(inp);
+    }
+  }
+}
+function camcfgCollect() {
+  const out = {};
+  document.querySelectorAll('#camcfg-form input').forEach(inp => {
+    const k = inp.dataset.key, s = inp.dataset.sub;
+    if (!k || !s) return;
+    let val = inp.value;
+    if (inp.type === 'number') {
+      const n = parseFloat(val); if (!Number.isFinite(n)) return;
+      val = n;
+    }
+    if (s === '_value') { out[k] = val; return; }
+    out[k] = out[k] || {};
+    out[k][s] = val;
+  });
+  return out;
+}
+async function refreshCamcfg() {
+  try {
+    const r = await fetch('/api/camera/config', {cache:'no-store'});
+    const j = await r.json();
+    if (!j.ok) {
+      camcfgSetMsg('Read failed: ' + (j.error || 'unknown'), false);
+      camcfgPopulate(null);
+      return;
+    }
+    camcfgPopulate(j.config || {});
+    camcfgSetMsg('', null);
+  } catch (e) {
+    camcfgSetMsg('Read failed: ' + e, false);
+  }
+}
+async function applyCamcfg() {
+  const body = camcfgCollect();
+  try {
+    const r = await fetch('/api/camera/config',
+                          {method:'POST',
+                           headers:{'Content-Type':'application/json'},
+                           body: JSON.stringify(body)});
+    const j = await r.json();
+    if (!j.ok) {
+      camcfgSetMsg('Apply failed: ' + (j.error || 'unknown'), false);
+      return;
+    }
+    const fail = Object.entries(j.results || {})
+      .filter(([k, v]) => v === false && !k.endsWith('_error'))
+      .map(([k]) => k);
+    if (fail.length) {
+      camcfgSetMsg('Applied with ' + fail.length + ' failures: '
+                   + fail.join(', '), false);
+    } else {
+      camcfgSetMsg('Applied.', true);
+    }
+    if (j.config) camcfgPopulate(j.config);
+  } catch (e) {
+    camcfgSetMsg('Apply failed: ' + e, false);
+  }
+}
+async function saveCamcfg() {
+  const name = $('camcfg-name').value.trim();
+  if (!name) { camcfgSetMsg('Type a name first.', false); return; }
+  const body = camcfgCollect();
+  try {
+    const r = await fetch(
+      '/api/camera/configs/' + encodeURIComponent(name),
+      {method:'POST',
+       headers:{'Content-Type':'application/json'},
+       body: JSON.stringify(body)});
+    const j = await r.json();
+    if (j.ok) {
+      camcfgSetMsg('Saved as ' + name + '.', true);
+      await refreshCamSaves();
+    } else {
+      camcfgSetMsg('Save failed: ' + (j.error || 'unknown'), false);
+    }
+  } catch (e) {
+    camcfgSetMsg('Save failed: ' + e, false);
+  }
+}
+async function loadCamcfg(name) {
+  try {
+    const r = await fetch(
+      '/api/camera/configs/' + encodeURIComponent(name) + '/load',
+      {method:'POST'});
+    const j = await r.json();
+    if (!j.ok) {
+      camcfgSetMsg('Load failed: ' + (j.error || 'unknown'), false);
+      return;
+    }
+    // Populate the form from the saved JSON without pushing to drone.
+    // The operator presses Apply explicitly so a mid-flight change
+    // can't surprise them.
+    const cfg = Object.assign({connected: true}, j.config || {});
+    camcfgPopulate(cfg);
+    camcfgSetMsg('Loaded ' + name + ' into form (press Apply to push).',
+                 true);
+  } catch (e) {
+    camcfgSetMsg('Load failed: ' + e, false);
+  }
+}
+async function deleteCamcfg(name) {
+  if (!confirm('Delete saved camera config "' + name + '"?')) return;
+  try {
+    const r = await fetch(
+      '/api/camera/configs/' + encodeURIComponent(name),
+      {method:'DELETE'});
+    const j = await r.json();
+    if (j.ok) {
+      camcfgSetMsg('Deleted ' + name + '.', true);
+      await refreshCamSaves();
+    } else {
+      camcfgSetMsg('Delete failed: ' + (j.error || 'unknown'), false);
+    }
+  } catch (e) {
+    camcfgSetMsg('Delete failed: ' + e, false);
+  }
+}
+async function setCamDefault(name, isCurrentlyDefault) {
+  try {
+    await fetch(
+      '/api/camera/configs/' + encodeURIComponent(name) + '/set-default',
+      {method:'POST',
+       headers:{'Content-Type':'application/json'},
+       body: JSON.stringify(isCurrentlyDefault ? {clear: true} : {})});
+    await refreshCamSaves();
+  } catch (e) {
+    camcfgSetMsg('Set default failed: ' + e, false);
+  }
+}
+async function refreshCamSaves() {
+  const tb = $('camcfg-body');
+  if (!tb) return;
+  try {
+    const r = await fetch('/api/camera/configs', {cache:'no-store'});
+    const j = await r.json();
+    renderDefaultMissingBanner('camcfg-default-banner', j.default,
+      (j.configs || []).some(x => x.name === j.default),
+      () => clearDefault('/api/camera/configs', refreshCamSaves));
+    tb.innerHTML = '';
+    if (!j.configs || !j.configs.length) {
+      tb.innerHTML = '<tr><td colspan="3" style="color:#6b7280;'
+        + ' padding:.4rem;">No saved camera configs yet.</td></tr>';
+      return;
+    }
+    const fmtTime = mt => new Date(mt*1000).toLocaleString();
+    for (const s of j.configs) {
+      const tr = document.createElement('tr');
+      tr.style.borderTop = '1px dashed #2a3038';
+      if (s.is_default) tr.style.background = 'rgba(22,163,74,0.08)';
+      const nameTd = document.createElement('td');
+      nameTd.style.padding = '.3rem .4rem';
+      nameTd.style.color = '#e6edf3';
+      nameTd.style.fontFamily = 'ui-monospace, monospace';
+      nameTd.textContent = s.name;
+      if (s.is_default) appendDefaultBadge(nameTd);
+      const timeTd = document.createElement('td');
+      timeTd.style.padding = '.3rem .4rem';
+      timeTd.style.color = '#9ca3af';
+      timeTd.textContent = fmtTime(s.mtime);
+      const actTd = document.createElement('td');
+      actTd.style.padding = '.3rem .4rem';
+      const loadBtn = document.createElement('button');
+      loadBtn.textContent = 'Load';
+      loadBtn.type = 'button';
+      loadBtn.title = 'Populate the form from this saved config'
+        + ' (does NOT push to the drone). Press Apply to push.';
+      loadBtn.style.cssText = 'padding:.2rem .55rem; border:0;'
+        + ' border-radius:4px; background:var(--accent); color:#062633;'
+        + ' font-weight:600; cursor:pointer; margin-right:.4rem;'
+        + ' font-size:.8rem;';
+      loadBtn.addEventListener('click', () => loadCamcfg(s.name));
+      const defBtn = makeSetDefaultButton(s.is_default,
+        () => setCamDefault(s.name, s.is_default));
+      const delBtn = document.createElement('button');
+      delBtn.textContent = 'Delete';
+      delBtn.type = 'button';
+      delBtn.style.cssText = 'padding:.2rem .55rem; border:1px solid #7f1d1d;'
+        + ' border-radius:4px; background:transparent; color:#fca5a5;'
+        + ' cursor:pointer; font-size:.8rem;';
+      delBtn.addEventListener('click', () => deleteCamcfg(s.name));
+      actTd.appendChild(loadBtn);
+      actTd.appendChild(defBtn);
+      actTd.appendChild(delBtn);
+      tr.appendChild(nameTd);
+      tr.appendChild(timeTd);
+      tr.appendChild(actTd);
+      tb.appendChild(tr);
+    }
+  } catch (e) {
+    camcfgSetMsg('List failed: ' + e, false);
+  }
+}
+$('camcfg-apply').addEventListener('click', applyCamcfg);
+$('camcfg-refresh').addEventListener('click', refreshCamcfg);
+$('camcfg-save').addEventListener('click', saveCamcfg);
+refreshCamcfg();
+refreshCamSaves();
 })();
 </script>
 """ + _PAGE_GRID_CLOSE + _SHARED_SCRIPT
@@ -1556,6 +1964,7 @@ _PAGE_TUNE = _PAGE_BASE_CSS + _PAGE_HEADER + _COMMON_SCRIPT + _PAGE_GRID_OPEN + 
                      background:var(--good); color:#072413; font-weight:600;
                      cursor:pointer;">Save snapshot</button>
     </div>
+    <div id="snap-default-banner" style="display:none;"></div>
     <div style="max-height:240px; overflow-y:auto; border:1px solid #2a3038;
                 border-radius:6px;">
       <table id="snap-table" style="width:100%; border-collapse:collapse;
@@ -1844,15 +2253,20 @@ async function refreshSnapshots() {
     tb.innerHTML = '';
     if (!j.snapshots || j.snapshots.length === 0) {
       tb.innerHTML = '<tr><td colspan="3" style="color:#6b7280; padding:.4rem;">No snapshots yet.</td></tr>';
+      renderDefaultMissingBanner('snap-default-banner', j.default,
+        (j.snapshots || []).some(x => x.name === j.default),
+        () => clearDefault('/api/tune/snapshots', refreshSnapshots));
       return;
     }
     for (const s of j.snapshots) {
       const tr = document.createElement('tr');
       tr.style.borderTop = '1px dashed #2a3038';
+      if (s.is_default) tr.style.background = 'rgba(22, 163, 74, 0.08)';
       const nameTd = document.createElement('td');
       nameTd.style.padding = '.3rem .4rem';
       nameTd.style.color = '#e6edf3';
       nameTd.textContent = s.name;
+      if (s.is_default) appendDefaultBadge(nameTd);
       const timeTd = document.createElement('td');
       timeTd.style.padding = '.3rem .4rem';
       timeTd.style.color = '#9ca3af';
@@ -1874,6 +2288,14 @@ async function refreshSnapshots() {
         + 'border-radius:4px; background:#1f2937; color:#e6edf3; cursor:pointer; '
         + 'margin-right:.4rem; font-size:.8rem;';
       overBtn.addEventListener('click', () => overwriteSnap(s.name));
+      const defBtn = makeSetDefaultButton(s.is_default, async () => {
+        await fetch('/api/tune/snapshots/' + encodeURIComponent(s.name)
+          + '/set-default',
+          {method:'POST',
+           headers:{'Content-Type':'application/json'},
+           body: JSON.stringify(s.is_default ? {clear: true} : {})});
+        await refreshSnapshots();
+      });
       const delBtn = document.createElement('button');
       delBtn.textContent = 'Delete';
       delBtn.type = 'button';
@@ -1883,12 +2305,16 @@ async function refreshSnapshots() {
       delBtn.addEventListener('click', () => deleteSnap(s.name));
       actTd.appendChild(loadBtn);
       actTd.appendChild(overBtn);
+      actTd.appendChild(defBtn);
       actTd.appendChild(delBtn);
       tr.appendChild(nameTd);
       tr.appendChild(timeTd);
       tr.appendChild(actTd);
       tb.appendChild(tr);
     }
+    renderDefaultMissingBanner('snap-default-banner', j.default,
+      j.snapshots.some(x => x.name === j.default),
+      () => clearDefault('/api/tune/snapshots', refreshSnapshots));
   } catch (e) {
     setStatus('Could not list snapshots: ' + e, false);
   }
@@ -2049,6 +2475,7 @@ _PAGE_ARENA = _PAGE_BASE_CSS + _PAGE_HEADER + _COMMON_SCRIPT + _PAGE_GRID_OPEN +
                        background:var(--accent); color:#062633; font-weight:600;
                        cursor:pointer; font-size:.85rem;">Save as ...</button>
       </div>
+      <div id="ar-default-banner" style="display:none;"></div>
       <div id="ar-list" style="font-size:.85rem;"></div>
     </details>
   </section>
@@ -2380,16 +2807,25 @@ async function refreshList() {
     const r = await fetch('/api/arena/configs', {cache:'no-store'});
     const j = await r.json();
     const list = $('ar-list');
+    renderDefaultMissingBanner('ar-default-banner', j.default,
+      (j.configs || []).some(x => x.name === j.default),
+      () => clearDefault('/api/arena/configs', refreshList));
     if (!j.configs || !j.configs.length) {
       list.innerHTML = '<div style="color:#778;">No saved arenas.</div>'; return;
     }
     const fmtTime = mt => new Date(mt*1000).toLocaleString();
     list.innerHTML = j.configs.map(c => {
       const safe = c.name.replace(/"/g, '&quot;');
+      const rowBg = c.is_default ? 'background:rgba(22,163,74,0.08);' : '';
+      const badge = c.is_default
+        ? '<span style="background:#16a34a; color:#062613; '
+          + 'font-size:.7rem; font-weight:600; padding:.05rem .35rem; '
+          + 'border-radius:3px; margin-left:.4rem;">default</span>' : '';
+      const defLabel = c.is_default ? 'Clear default' : 'Set as default';
       return `
         <div style="display:flex; gap:.4rem; align-items:center;
-                    padding:.25rem 0; border-top:1px solid #2a3038;">
-          <span style="flex:1; font-family:ui-monospace, monospace;">${safe}</span>
+                    padding:.25rem 0; border-top:1px solid #2a3038;${rowBg}">
+          <span style="flex:1; font-family:ui-monospace, monospace;">${safe}${badge}</span>
           <span style="color:#778; font-size:.75rem;">${fmtTime(c.mtime)}</span>
           <button class="ar-load"      data-name="${safe}"
                   style="padding:.2rem .5rem; border:0; border-radius:4px;
@@ -2399,6 +2835,10 @@ async function refreshList() {
                   style="padding:.2rem .5rem; border:0; border-radius:4px;
                          background:#facc15; color:#241a07;
                          font-weight:600; cursor:pointer; font-size:.75rem;">Overwrite</button>
+          <button class="ar-default" data-name="${safe}" data-isdef="${c.is_default ? '1' : '0'}"
+                  style="padding:.2rem .5rem; border:1px solid #2a3038;
+                         border-radius:4px; background:#1f2937; color:#e6edf3;
+                         cursor:pointer; font-size:.75rem;">${defLabel}</button>
           <button class="ar-delete"    data-name="${safe}"
                   style="padding:.2rem .5rem; border:0; border-radius:4px;
                          background:var(--bad); color:#240707;
@@ -2411,6 +2851,16 @@ async function refreshList() {
       b.addEventListener('click', () => saveAs(b.dataset.name)));
     list.querySelectorAll('.ar-delete').forEach(b =>
       b.addEventListener('click', () => deleteNamed(b.dataset.name)));
+    list.querySelectorAll('.ar-default').forEach(b =>
+      b.addEventListener('click', async () => {
+        const isDef = b.dataset.isdef === '1';
+        await fetch('/api/arena/configs/' + encodeURIComponent(b.dataset.name)
+                    + '/set-default',
+                    {method:'POST',
+                     headers:{'Content-Type':'application/json'},
+                     body: JSON.stringify(isDef ? {clear: true} : {})});
+        await refreshList();
+      }));
   } catch (e) {}
 }
 
@@ -2452,7 +2902,8 @@ class UiServer:
                  cfg: Optional[MissionConfig] = None,
                  controller: Optional[MissionController] = None,
                  flight_dir_provider: Optional[Callable[[], Optional[Path]]] = None,
-                 arena_holder=None):
+                 arena_holder=None,
+                 api=None):
         self.state = state
         self.frame = latest_frame
         self.host = host
@@ -2465,6 +2916,10 @@ class UiServer:
         # state machine to pick up the new values.
         self.cfg = cfg
         self.controller = controller
+        # Optional DroneApi handle, used only by the /calibrate
+        # camera-config proxy endpoints. None in view-only / replay
+        # mode -- the proxy returns 503.
+        self.api = api
         # Used to write parameter_changes.csv next to flight_log.csv.
         # mission.py rolls flight_dir between missions, so we receive
         # a callable rather than a fixed Path.
@@ -2885,8 +3340,9 @@ class UiServer:
 
         @app.get("/api/tune/snapshots")
         def api_snap_list():
-            from .config import SNAPSHOTS_DIR
+            from .config import SNAPSHOTS_DIR, get_default
             SNAPSHOTS_DIR.mkdir(parents=True, exist_ok=True)
+            default_name = get_default("tune")
             items = []
             for p in SNAPSHOTS_DIR.glob("*.json"):
                 try:
@@ -2894,11 +3350,12 @@ class UiServer:
                         "name":  p.stem,
                         "mtime": p.stat().st_mtime,
                         "size":  p.stat().st_size,
+                        "is_default": (p.stem == default_name),
                     })
                 except OSError:
                     continue
             items.sort(key=lambda x: -x["mtime"])
-            return jsonify({"snapshots": items})
+            return jsonify({"snapshots": items, "default": default_name})
 
         @app.post("/api/tune/snapshots/<name>")
         def api_snap_save(name):
@@ -2957,7 +3414,33 @@ class UiServer:
                 return jsonify({"ok": False, "error": "snapshot not found"}), 404
             try:
                 p.unlink()
+                # If the deleted snapshot was the pinned default,
+                # clear the pointer so the UI doesn't surface a
+                # "default missing" banner the operator can't reach.
+                from .config import get_default, set_default
+                if get_default("tune") == name:
+                    set_default("tune", None)
                 return jsonify({"ok": True, "name": name})
+            except Exception as e:
+                return jsonify({"ok": False, "error": str(e)}), 500
+
+        @app.post("/api/tune/snapshots/<name>/set-default")
+        def api_snap_set_default(name):
+            from .config import get_default, set_default
+            data = request.get_json(silent=True) or {}
+            # Toggle: clicking on the current default clears it.
+            cur = get_default("tune")
+            clear = bool(data.get("clear")) or cur == name
+            try:
+                if clear:
+                    set_default("tune", None)
+                    return jsonify({"ok": True, "default": None})
+                p = _snap_path(name)
+                if p is None or not p.exists():
+                    return jsonify({"ok": False,
+                                    "error": "snapshot not found"}), 404
+                set_default("tune", name)
+                return jsonify({"ok": True, "default": name})
             except Exception as e:
                 return jsonify({"ok": False, "error": str(e)}), 500
 
@@ -3102,8 +3585,9 @@ class UiServer:
 
         @app.get("/api/arena/configs")
         def api_arena_list():
-            from .config import ARENA_CONFIGS_DIR
+            from .config import ARENA_CONFIGS_DIR, get_default
             ARENA_CONFIGS_DIR.mkdir(parents=True, exist_ok=True)
+            default_name = get_default("arena")
             items = []
             for p in ARENA_CONFIGS_DIR.glob("*.json"):
                 try:
@@ -3111,11 +3595,12 @@ class UiServer:
                         "name":  p.stem,
                         "mtime": p.stat().st_mtime,
                         "size":  p.stat().st_size,
+                        "is_default": (p.stem == default_name),
                     })
                 except OSError:
                     continue
             items.sort(key=lambda x: -x["mtime"])
-            return jsonify({"configs": items})
+            return jsonify({"configs": items, "default": default_name})
 
         @app.post("/api/arena/configs/<name>")
         def api_arena_save_named(name):
@@ -3159,9 +3644,156 @@ class UiServer:
                                 "error": "config not found"}), 404
             try:
                 p.unlink()
+                from .config import get_default, set_default
+                if get_default("arena") == name:
+                    set_default("arena", None)
                 return jsonify({"ok": True, "name": name})
             except Exception as e:
                 return jsonify({"ok": False, "error": str(e)}), 500
+
+        @app.post("/api/arena/configs/<name>/set-default")
+        def api_arena_set_default(name):
+            from .config import get_default, set_default
+            data = request.get_json(silent=True) or {}
+            cur = get_default("arena")
+            clear = bool(data.get("clear")) or cur == name
+            try:
+                if clear:
+                    set_default("arena", None)
+                    return jsonify({"ok": True, "default": None})
+                p = _arena_path(name)
+                if p is None or not p.exists():
+                    return jsonify({"ok": False,
+                                    "error": "config not found"}), 404
+                set_default("arena", name)
+                return jsonify({"ok": True, "default": name})
+            except Exception as e:
+                return jsonify({"ok": False, "error": str(e)}), 500
+
+        # ---- Camera config saves (named) ------------------------------
+        # Mirrors the snapshot / arena CRUD shape. Storage:
+        # ~/.marker_mission/camera_configs/{name}.json containing the
+        # dict that POST /api/camera/config accepts (partial axes OK).
+        # Load returns the JSON without pushing to the drone -- the
+        # operator presses Apply on the form to push.
+        def _camera_path(name: str) -> Optional[Path]:
+            if not _NAME_RE.match(name):
+                return None
+            from .config import CAMERA_CONFIGS_DIR
+            CAMERA_CONFIGS_DIR.mkdir(parents=True, exist_ok=True)
+            return CAMERA_CONFIGS_DIR / f"{name}.json"
+
+        @app.get("/api/camera/configs")
+        def api_camera_configs_list():
+            from .config import CAMERA_CONFIGS_DIR, get_default
+            CAMERA_CONFIGS_DIR.mkdir(parents=True, exist_ok=True)
+            default_name = get_default("camera")
+            items = []
+            for p in CAMERA_CONFIGS_DIR.glob("*.json"):
+                try:
+                    items.append({
+                        "name":  p.stem,
+                        "mtime": p.stat().st_mtime,
+                        "size":  p.stat().st_size,
+                        "is_default": (p.stem == default_name),
+                    })
+                except OSError:
+                    continue
+            items.sort(key=lambda x: -x["mtime"])
+            return jsonify({"configs": items, "default": default_name})
+
+        @app.post("/api/camera/configs/<name>")
+        def api_camera_config_save(name):
+            data = request.get_json(silent=True)
+            if not isinstance(data, dict):
+                return jsonify({"ok": False,
+                                "error": "body must be a JSON object"}), 400
+            p = _camera_path(name)
+            if p is None:
+                return jsonify({"ok": False,
+                                "error": "invalid name (alphanum, _ - . space, "
+                                         "max 64 chars, can't start with separator)"}), 400
+            try:
+                p.write_text(json.dumps(data, indent=2))
+                return jsonify({"ok": True, "name": name, "path": str(p)})
+            except Exception as e:
+                return jsonify({"ok": False, "error": str(e)}), 500
+
+        @app.post("/api/camera/configs/<name>/load")
+        def api_camera_config_load(name):
+            p = _camera_path(name)
+            if p is None or not p.exists():
+                return jsonify({"ok": False,
+                                "error": "config not found"}), 404
+            try:
+                return jsonify({"ok": True, "name": name,
+                                "config": json.loads(p.read_text())})
+            except Exception as e:
+                return jsonify({"ok": False, "error": str(e)}), 500
+
+        @app.delete("/api/camera/configs/<name>")
+        def api_camera_config_delete(name):
+            p = _camera_path(name)
+            if p is None or not p.exists():
+                return jsonify({"ok": False,
+                                "error": "config not found"}), 404
+            try:
+                p.unlink()
+                from .config import get_default, set_default
+                if get_default("camera") == name:
+                    set_default("camera", None)
+                return jsonify({"ok": True, "name": name})
+            except Exception as e:
+                return jsonify({"ok": False, "error": str(e)}), 500
+
+        @app.post("/api/camera/configs/<name>/set-default")
+        def api_camera_config_set_default(name):
+            from .config import get_default, set_default
+            data = request.get_json(silent=True) or {}
+            cur = get_default("camera")
+            clear = bool(data.get("clear")) or cur == name
+            try:
+                if clear:
+                    set_default("camera", None)
+                    return jsonify({"ok": True, "default": None})
+                p = _camera_path(name)
+                if p is None or not p.exists():
+                    return jsonify({"ok": False,
+                                    "error": "config not found"}), 404
+                set_default("camera", name)
+                return jsonify({"ok": True, "default": name})
+            except Exception as e:
+                return jsonify({"ok": False, "error": str(e)}), 500
+
+        # ---- Camera live config passthrough (proxy to upstream) -------
+        # GET hits the unified API server and returns its config JSON
+        # to the calibrate page. POST forwards the form payload back.
+        @app.get("/api/camera/config")
+        def api_camera_config_get_proxy():
+            try:
+                cfg = self.api.camera_config_get() if self.api else None
+            except Exception as e:
+                return jsonify({"ok": False, "error": str(e)}), 503
+            if cfg is None:
+                return jsonify({"ok": False,
+                                "error": "drone api not wired"}), 503
+            # Upstream returns {ok, config} -- pass through.
+            return jsonify(cfg)
+
+        @app.post("/api/camera/config")
+        def api_camera_config_set_proxy():
+            data = request.get_json(silent=True)
+            if not isinstance(data, dict):
+                return jsonify({"ok": False,
+                                "error": "body must be a JSON object"}), 400
+            try:
+                resp = self.api.camera_config_set(**data) if self.api else None
+            except Exception as e:
+                return jsonify({"ok": False, "error": str(e)}), 503
+            if resp is None:
+                return jsonify({"ok": False,
+                                "error": "drone api not wired"}), 503
+            return jsonify(resp)
 
         @app.get("/api/calibrate/status")
         def api_calibrate_status():
@@ -3307,8 +3939,9 @@ class UiServer:
 
         @app.get("/api/mission/scripts")
         def api_mission_scripts_list():
-            from .config import MISSION_SCRIPTS_DIR
+            from .config import MISSION_SCRIPTS_DIR, get_default
             MISSION_SCRIPTS_DIR.mkdir(parents=True, exist_ok=True)
+            default_name = get_default("mission_script")
             items = []
             for p in MISSION_SCRIPTS_DIR.glob("*.txt"):
                 try:
@@ -3316,11 +3949,12 @@ class UiServer:
                         "name":  p.stem,
                         "mtime": p.stat().st_mtime,
                         "size":  p.stat().st_size,
+                        "is_default": (p.stem == default_name),
                     })
                 except OSError:
                     continue
             items.sort(key=lambda x: -x["mtime"])
-            return jsonify({"scripts": items})
+            return jsonify({"scripts": items, "default": default_name})
 
         @app.post("/api/mission/scripts/<name>")
         def api_mission_script_save(name):
@@ -3360,7 +3994,29 @@ class UiServer:
                                 "error": "script not found"}), 404
             try:
                 p.unlink()
+                from .config import get_default, set_default
+                if get_default("mission_script") == name:
+                    set_default("mission_script", None)
                 return jsonify({"ok": True, "name": name})
+            except Exception as e:
+                return jsonify({"ok": False, "error": str(e)}), 500
+
+        @app.post("/api/mission/scripts/<name>/set-default")
+        def api_mission_script_set_default(name):
+            from .config import get_default, set_default
+            data = request.get_json(silent=True) or {}
+            cur = get_default("mission_script")
+            clear = bool(data.get("clear")) or cur == name
+            try:
+                if clear:
+                    set_default("mission_script", None)
+                    return jsonify({"ok": True, "default": None})
+                p = _script_path(name)
+                if p is None or not p.exists():
+                    return jsonify({"ok": False,
+                                    "error": "script not found"}), 404
+                set_default("mission_script", name)
+                return jsonify({"ok": True, "default": name})
             except Exception as e:
                 return jsonify({"ok": False, "error": str(e)}), 500
 

@@ -179,6 +179,26 @@ def cmd_fly(args: argparse.Namespace) -> int:
         time.sleep(0.5)
     if initially_connected:
         print(f"[mission] connected. drone serial = {serial}")
+        # Apply the operator-pinned default camera config (if any)
+        # before the calibration / video-start dance below. Non-fatal:
+        # a startup that fails to push the default still flies; the
+        # operator can re-apply on /calibrate.
+        try:
+            from .config import get_default, CAMERA_CONFIGS_DIR
+            cam_default = get_default("camera")
+            if cam_default:
+                p = CAMERA_CONFIGS_DIR / f"{cam_default}.json"
+                if p.exists():
+                    payload = json.loads(p.read_text())
+                    api.camera_config_set(**payload)
+                    print(f"[mission] applied default camera config:"
+                          f" {cam_default}")
+                else:
+                    print(f"[mission] default camera config"
+                          f" {cam_default!r} not found; skipped")
+        except Exception as e:
+            print(f"[mission] default camera config push failed: {e}"
+                  f" (non-fatal)")
     else:
         print(f"[mission] no drone yet -- starting UI anyway. "
               f"telemetry_worker will keep retrying.")
@@ -359,7 +379,8 @@ def cmd_fly(args: argparse.Namespace) -> int:
                   cfg=cfg,
                   controller=controller,
                   flight_dir_provider=lambda: flight_dir_box[0],
-                  arena_holder=arena_holder)
+                  arena_holder=arena_holder,
+                  api=api)
     ui.start()
     print(f"[mission] UI running at {ui.url()} (camera) and {ui.url()}/charts")
 
