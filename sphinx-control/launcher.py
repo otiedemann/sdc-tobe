@@ -359,12 +359,11 @@ class Launcher:
                 "started env %s world=%s ue4_pid=%s",
                 env_id, req.world_name, ue4_pid,
             )
-            # Apply post-start sphinx-cli params (e.g. sky preset). The
-            # SDC arena is indoors so we default to the "indoor" preset
-            # to replace UE4's default cloudy outdoor sky. Override per
-            # world via config.yaml: ue4_apps[].sky_preset, or
-            # world-level worlds.sky_preset.
-            self._apply_post_start_world_params(req.world_name, world)
+            # NOTE: sphinx-cli world params (e.g. sky preset) can ONLY
+            # be applied AFTER a drone (sphinx process) is spawned —
+            # without sphinx, sphinx-cli reports "An instance of Sphinx
+            # is not running" and bails. We defer the post-start params
+            # until the first successful drone spawn (see spawn()).
             return updated
 
     def _apply_post_start_world_params(
@@ -907,6 +906,15 @@ class Launcher:
                 drone_id, instance_id, sphinx_pid, endpoint.display(),
                 env.env_id, env.ue4_pid,
             )
+            # Now that sphinx is running, sphinx-cli can talk to it —
+            # apply the deferred world preset (sky etc.) the env asked
+            # for. Idempotent, so running it on every spawn is fine
+            # (cheap, and self-corrects if the world drifted).
+            try:
+                world = self.registry.world(env.world_name)
+                self._apply_post_start_world_params(env.world_name, world)
+            except Exception as e:
+                log.warning("post-spawn world params failed: %s", e)
             return updated
 
     def stop(self, drone_id: str) -> None:
