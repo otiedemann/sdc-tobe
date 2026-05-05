@@ -520,9 +520,64 @@ def make_flight_dir(root: Path, serial: str) -> Path:
     return out
 
 
+def _tally_pose_methods(csv_path: Path) -> dict:
+    """Count how often each IPPE branch-picker layer fired across a
+    finished flight. Reads the recorded CSV, tallies the
+    ``target_pose_method`` column (the active-marker pose path the
+    controller actually used) and the per-marker ``arena_pose_methods``
+    column (the world-position vote contributors). Result lands in
+    ``mission_meta.outcome.pose_method_counts`` so the operator can
+    answer "did the magnetometer rescue mostly do the work, or did
+    the prev-anchor / cold-start fallbacks earn their keep?".
+
+    Returns a dict like::
+
+        {
+            "target": {"ippe_temporal": 134, "ippe_mag_swap": 47, ...},
+            "per_marker": {"ippe_lowerr": 200, "ippe_swapped": 13, ...},
+            "rows": 247,
+            "frames_with_marker": 218,
+        }
+    """
+    out = {"target": {}, "per_marker": {}, "rows": 0,
+           "frames_with_marker": 0}
+    if not csv_path.is_file():
+        return out
+    try:
+        with csv_path.open() as f:
+            for row in csv.DictReader(f):
+                out["rows"] += 1
+                if row.get("marker_seen") == "1":
+                    out["frames_with_marker"] += 1
+                tgt = (row.get("target_pose_method") or "").strip()
+                if tgt:
+                    out["target"][tgt] = out["target"].get(tgt, 0) + 1
+                blob = (row.get("arena_pose_methods") or "").strip()
+                if blob:
+                    for chunk in blob.split("|"):
+                        if ":" not in chunk:
+                            continue
+                        _, meth = chunk.split(":", 1)
+                        meth = meth.strip()
+                        if not meth:
+                            continue
+                        out["per_marker"][meth] = (
+                            out["per_marker"].get(meth, 0) + 1)
+    except (OSError, ValueError) as e:
+        print(f"[meta] pose_method tally failed: {e}")
+    return out
+
+
 def write_meta(flight_dir: Path, cfg: MissionConfig,
                calibration: Calibration,
                outcome: dict) -> None:
+    # Tally the IPPE branch-picker layer firing counts so the operator
+    # can compare what actually carried the position estimate over the
+    # flight (magnetometer? prev-anchor swap? cold-start lower-err?).
+    # Lands in outcome.pose_method_counts.
+    counts = _tally_pose_methods(flight_dir / "flight_log.csv")
+    outcome = dict(outcome)
+    outcome["pose_method_counts"] = counts
     meta = {
         "config": asdict(cfg),
         "calibration": {
