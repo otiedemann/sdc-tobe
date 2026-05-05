@@ -535,6 +535,210 @@ class ArucoDetector:
 # Annotation helper
 # ---------------------------------------------------------------------------
 
+# Per-wall colour conventions matching the /arena tab's WALL_COLORS
+# in ui.py. Stored as BGR (OpenCV) -- the RGB hex is in the comment.
+_MINIMAP_WALL_COLORS_BGR = {
+    "front": (21, 204, 250),    # #facc15 (yellow)
+    "right": (128, 222, 74),    # #4ade80 (green)
+    "back":  (255, 196, 88),    # #58c4ff (light blue)
+    "left":  (113, 113, 248),   # #f87171 (red-pink)
+}
+
+
+def draw_arena_minimap(frame_bgr: np.ndarray,
+                        arena_width_m: float,
+                        arena_depth_m: float,
+                        world_pos: Optional[tuple] = None,
+                        arena_yaw_deg: Optional[float] = None,
+                        markers: Optional[object] = None,
+                        visible_marker_ids: Optional[object] = None,
+                        size_px: int = 180,
+                        margin_px: int = 10,
+                        title: str = "") -> None:
+    """Draw an arena top-down mini-map onto the upper-right corner
+    of ``frame_bgr`` (mutates in place).
+
+    Layout: 1 m grid, arena rectangle (white outline), origin tick,
+    yellow dot for the drone position, yellow line+arrow for the
+    drone's arena yaw. Coordinates are arena +x = right, +y = front
+    (top of the mini-map). When ``world_pos`` is None the dot/arrow
+    are skipped and the mini-map shows just the arena layout. When
+    ``arena_yaw_deg`` is None the dot is drawn without an arrow.
+
+    ``title`` is rendered in the top-left of the mini-map panel
+    (small, for offline-reprocess comparisons -- "OLD" / "NEW").
+    """
+    if arena_width_m <= 0 or arena_depth_m <= 0:
+        return
+    H, W = frame_bgr.shape[:2]
+    side = int(size_px)
+    x0 = W - int(margin_px) - side
+    y0 = int(margin_px)
+    if x0 < 0 or y0 + side > H:
+        return
+    # Background panel (semi-transparent dark).
+    panel = frame_bgr[y0:y0+side, x0:x0+side].copy()
+    panel[:] = (28, 28, 28)
+    cv2.addWeighted(panel, 0.85,
+                    frame_bgr[y0:y0+side, x0:x0+side], 0.15, 0,
+                    frame_bgr[y0:y0+side, x0:x0+side])
+    cv2.rectangle(frame_bgr, (x0, y0), (x0 + side - 1, y0 + side - 1),
+                  (60, 60, 60), 1)
+
+    pad = 14
+    inner_w = side - 2 * pad
+    inner_h = side - 2 * pad
+    px_per_m = float(min(inner_w / float(arena_width_m),
+                          inner_h / float(arena_depth_m)))
+    cxp = x0 + side // 2
+    cyp = y0 + side // 2
+
+    def to_px(x_m: float, y_m: float):
+        return (int(round(cxp + x_m * px_per_m)),
+                int(round(cyp - y_m * px_per_m)))
+
+    half_w = float(arena_width_m) / 2.0
+    half_d = float(arena_depth_m) / 2.0
+
+    # 1 m grid (drawn faintly).
+    grid_col = (55, 55, 55)
+    x_lo = -int(math.floor(half_w))
+    x_hi = +int(math.floor(half_w))
+    for xi in range(x_lo, x_hi + 1):
+        p1 = to_px(xi, -half_d); p2 = to_px(xi, +half_d)
+        cv2.line(frame_bgr, p1, p2, grid_col, 1)
+    y_lo = -int(math.floor(half_d))
+    y_hi = +int(math.floor(half_d))
+    for yi in range(y_lo, y_hi + 1):
+        p1 = to_px(-half_w, yi); p2 = to_px(+half_w, yi)
+        cv2.line(frame_bgr, p1, p2, grid_col, 1)
+
+    # Origin tick.
+    cv2.drawMarker(frame_bgr, to_px(0, 0), (200, 200, 200),
+                   cv2.MARKER_TILTED_CROSS, 6, 1)
+
+    # Arena rectangle.
+    cv2.rectangle(frame_bgr,
+                  to_px(-half_w, +half_d),
+                  to_px(+half_w, -half_d),
+                  (170, 170, 170), 1)
+
+    # Wall labels (F = front, top of map).
+    cv2.putText(frame_bgr, "F",
+                (cxp - 4, to_px(0, half_d)[1] - 2),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.40, (130, 130, 130), 1, cv2.LINE_AA)
+    cv2.putText(frame_bgr, "B",
+                (cxp - 4, to_px(0, -half_d)[1] + 11),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.40, (130, 130, 130), 1, cv2.LINE_AA)
+
+    # Markers. Each known marker gets a small wall-coloured dot at
+    # its arena position; markers currently visible in this frame
+    # get an additional white outline ring so the operator can tell
+    # at a glance which references the position estimate is using.
+    # Conventions match /arena's WALL_COLORS in the web UI.
+    #
+    # Vertical stacking: two markers that share (x, y) but differ in
+    # z (e.g. the default 16-marker layout has a high-z and low-z
+    # marker per slot) would otherwise overlap in the top-down view.
+    # We group by rounded (x, y), sort descending by z, and offset
+    # each dot a few pixels along screen-y so the stack is visible
+    # as separate touching dots from top (high z) to bottom (low z).
+    if markers is not None:
+        seen_ids = set()
+        if visible_marker_ids is not None:
+            for v in visible_marker_ids:
+                try: seen_ids.add(int(v))
+                except (TypeError, ValueError): pass
+        try:
+            iter_ms = (list(markers.values()) if hasattr(markers, "values")
+                       else list(markers))
+        except Exception:
+            iter_ms = []
+        # Group co-located markers, biggest-z first within each group.
+        from collections import defaultdict
+        groups = defaultdict(list)
+        for m in iter_ms:
+            try:
+                mid = int(getattr(m, "id"))
+                wall = str(getattr(m, "wall", "")).lower()
+                pos = getattr(m, "position_m")
+                mx = float(pos[0]); my = float(pos[1]); mz = float(pos[2])
+            except Exception:
+                continue
+            key = (round(mx, 2), round(my, 2))
+            groups[key].append((mz, mid, wall, mx, my))
+        for key, items in groups.items():
+            items.sort(key=lambda it: -it[0])     # high z first
+            n = len(items)
+            # Same convention as the web /arena canvas (drawArena's
+            # STACK_OFFSET_PX = 14 on a 700 px canvas, ratio ~ 2.3 x
+            # dot-radius). Mini-map dot radius is 3 px so step = 7
+            # gives the same ratio: high-z marker drawn slightly
+            # higher on screen, low-z slightly lower.
+            for idx, (mz, mid, wall, mx, my) in enumerate(items):
+                base = to_px(mx, my)
+                step = 7
+                offset = -step * (n - 1) / 2.0 + idx * step
+                mp = (base[0], int(round(base[1] + offset)))
+                col = _MINIMAP_WALL_COLORS_BGR.get(wall, (180, 180, 180))
+                cv2.circle(frame_bgr, mp, 3, col, -1, cv2.LINE_AA)
+                cv2.circle(frame_bgr, mp, 3, (0, 0, 0), 1, cv2.LINE_AA)
+                if mid in seen_ids:
+                    cv2.circle(frame_bgr, mp, 6, (255, 255, 255),
+                               1, cv2.LINE_AA)
+
+    # Drone position + yaw arrow.
+    if world_pos is not None:
+        wx = float(world_pos[0]); wy = float(world_pos[1])
+        in_arena = abs(wx) <= half_w + 0.5 and abs(wy) <= half_d + 0.5
+        dx, dy = to_px(wx, wy)
+        # Always draw the dot, even if just outside the rectangle, so the
+        # operator can see it when the position is briefly drifting OOB.
+        if (x0 + 3 <= dx <= x0 + side - 3
+                and y0 + 3 <= dy <= y0 + side - 3):
+            yellow = (0, 220, 220)         # BGR yellow
+            cv2.circle(frame_bgr, (dx, dy), 5, yellow, -1)
+            cv2.circle(frame_bgr, (dx, dy), 5, (0, 0, 0), 1)
+            if arena_yaw_deg is not None:
+                ang = math.radians(float(arena_yaw_deg))
+                L = 16
+                ax = int(round(dx + L * math.sin(ang)))
+                ay = int(round(dy - L * math.cos(ang)))
+                cv2.line(frame_bgr, (dx, dy), (ax, ay), yellow, 2)
+                base = math.atan2(ay - dy, ax - dx)
+                head_size = 5
+                hx1 = int(round(ax - head_size * math.cos(base - math.pi/6)))
+                hy1 = int(round(ay - head_size * math.sin(base - math.pi/6)))
+                hx2 = int(round(ax - head_size * math.cos(base + math.pi/6)))
+                hy2 = int(round(ay - head_size * math.sin(base + math.pi/6)))
+                cv2.line(frame_bgr, (ax, ay), (hx1, hy1), yellow, 2)
+                cv2.line(frame_bgr, (ax, ay), (hx2, hy2), yellow, 2)
+        if not in_arena:
+            cv2.putText(frame_bgr, "OOB",
+                        (x0 + 6, y0 + side - 6),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.42,
+                        (0, 220, 220), 1, cv2.LINE_AA)
+        # Numeric label.
+        label = f"({wx:+.2f}, {wy:+.2f})"
+        cv2.putText(frame_bgr, label,
+                    (x0 + 6, y0 + side - 22),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.40, (0, 0, 0), 3, cv2.LINE_AA)
+        cv2.putText(frame_bgr, label,
+                    (x0 + 6, y0 + side - 22),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.40, (200, 200, 200), 1,
+                    cv2.LINE_AA)
+
+    # Optional title (e.g., OLD / NEW for the offline reprocessor).
+    if title:
+        cv2.putText(frame_bgr, title,
+                    (x0 + 6, y0 + 14),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.42, (0, 0, 0), 3, cv2.LINE_AA)
+        cv2.putText(frame_bgr, title,
+                    (x0 + 6, y0 + 14),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.42, (220, 220, 220), 1,
+                    cv2.LINE_AA)
+
+
 def annotate_frame(frame_bgr: np.ndarray,
                    poses: list[MarkerPose],
                    target_id: Optional[int] = None,

@@ -46,7 +46,8 @@ from typing import Optional
 import cv2
 import numpy as np
 
-from .aruco_detector import ArucoDetector, MarkerPose, annotate_frame
+from .aruco_detector import (ArucoDetector, MarkerPose, annotate_frame,
+                              draw_arena_minimap)
 from .calibration_store import (Calibration, CalibrationStore,
                                 calibrate_from_video)
 from .arena import (ArenaConfig, ARENA_MAG_SLACK_DEG,
@@ -329,6 +330,29 @@ def cmd_fly(args: argparse.Namespace) -> int:
                         ms.format(steps) + "\n")
             except Exception as e:
                 print(f"[mission] mission_script.txt save failed: {e}")
+            # Per-flight snapshot of the active arena config. The
+            # active path can be re-saved between flights; pinning the
+            # exact arena layout that this flight was estimated against
+            # makes per-flight forensics independent of what the
+            # operator subsequently edits in the Arena tab.
+            try:
+                arena_now = arena_holder.get()
+                if arena_now is not None:
+                    (new_dir / "arena_config.json").write_text(
+                        json.dumps(arena_now.to_json_dict(), indent=2))
+            except Exception as e:
+                print(f"[mission] arena_config.json save failed: {e}")
+            # Code provenance: which git commit was running when this
+            # flight started? Lets us match flight-log behaviour to the
+            # exact source even after subsequent commits to the
+            # marker_mission package.
+            try:
+                from .git_provenance import describe_marker_mission_commit
+                commit_text = describe_marker_mission_commit()
+                if commit_text:
+                    (new_dir / "git_commit.txt").write_text(commit_text + "\n")
+            except Exception as e:
+                print(f"[mission] git_commit.txt save failed: {e}")
 
         # Recording envelope.
         if new_phase in AIRBORNE_PHASES:
@@ -634,6 +658,25 @@ def cmd_fly(args: argparse.Namespace) -> int:
                 ann = annotate_frame(frame, poses,
                                      target_id=active_mid,
                                      extra_lines=lines)
+                # Arena mini-map in the upper-right corner: 1 m
+                # grid, all known markers (wall-coloured dots),
+                # currently-visible markers ringed in white, yellow
+                # drone dot at state.world_position_m + yellow yaw
+                # arrow from state.arena_yaw_deg.
+                if arena_for_swap is not None:
+                    with state.lock:
+                        wp = state.world_position_m
+                        ay_deg = state.arena_yaw_deg
+                        seen_ids = list(state.visible_marker_ids)
+                    draw_arena_minimap(
+                        ann,
+                        arena_width_m=arena_for_swap.width_m,
+                        arena_depth_m=arena_for_swap.depth_m,
+                        world_pos=wp,
+                        arena_yaw_deg=ay_deg,
+                        markers=arena_for_swap.markers,
+                        visible_marker_ids=seen_ids,
+                    )
                 latest_ann_frame.set(ann)
                 # Record both raw and annotated ----------------------------
                 if not recording_paused.is_set():

@@ -175,7 +175,14 @@ class FlightRecorder:
             print("[rec] ffmpeg has no H.264 encoder available -- "
                   "keeping mp4v originals")
             return
-        for stem in ("raw", "annotated"):
+        # Only re-encode the annotated stream. raw.mp4 is the
+        # untouched detector input and stays exactly as the OpenCV
+        # writer left it: keeps the bytes lossless against a
+        # possible re-encode pass, and avoids the 5-10 s ffmpeg cost
+        # per flight on the only artefact that actually needs to be
+        # share-friendly. Operators who want H.264 raw can run the
+        # offline reprocessor or ffmpeg manually.
+        for stem in ("annotated",):
             # The OpenCV writer falls back to .avi/MJPG if mp4v is
             # unavailable on the host -- handle either input.
             src: Optional[Path] = None
