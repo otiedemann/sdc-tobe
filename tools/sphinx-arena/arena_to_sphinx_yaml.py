@@ -746,68 +746,42 @@ def main() -> int:
 
     n_spectators = 0
     if args.emit_spectators:
-        # Person- and vehicle-shaped boxes placed OUTSIDE the arena
-        # walls so the surrounding world (especially the sphx-tests
-        # base) feels populated. Coordinates are arena-frame (pre
-        # axis_map / center_offset) — shifted_apply handles the
-        # conversion. NO z-lift: spectators stand on the world ground
-        # at z=0, not on the raised arena floor.
-        ACTOR_W, ACTOR_D, ACTOR_H = 0.6, 0.4, 1.8
-        VEHICLE_L, VEHICLE_W, VEHICLE_H = 4.5, 1.8, 1.5
-        ax_for_ue_x = axis_map.ue_x[0]
-        ax_for_ue_y = axis_map.ue_y[0]
-
-        # (fbx_name, label, ax, ay, az_center, sx, sy, sz, yaw_deg)
-        # ay range outside arena: y < 0 (front) or y > 10.8 (back).
-        # ax range outside arena: |x| > 10.
-        spectators: list[tuple[str, str, float, float, float,
-                               float, float, float, float]] = [
-            # Six actors spread along all 4 sides
-            ("actor_red.fbx",  "actor_red_front_left",
-             -5.0, -2.0, ACTOR_H / 2.0,
-             ACTOR_W, ACTOR_D, ACTOR_H, 0.0),
-            ("actor_blue.fbx", "actor_blue_front_right",
-              5.0, -2.0, ACTOR_H / 2.0,
-              ACTOR_W, ACTOR_D, ACTOR_H, 0.0),
-            ("actor_blue.fbx", "actor_blue_back_left",
-             -5.0, 12.8, ACTOR_H / 2.0,
-              ACTOR_W, ACTOR_D, ACTOR_H, 0.0),
-            ("actor_red.fbx",  "actor_red_back_right",
-              5.0, 12.8, ACTOR_H / 2.0,
-              ACTOR_W, ACTOR_D, ACTOR_H, 0.0),
-            ("actor_red.fbx",  "actor_red_left_side",
-             -12.0, 5.4, ACTOR_H / 2.0,
-              ACTOR_D, ACTOR_W, ACTOR_H, 0.0),
-            ("actor_blue.fbx", "actor_blue_right_side",
-              12.0, 5.4, ACTOR_H / 2.0,
-              ACTOR_D, ACTOR_W, ACTOR_H, 0.0),
-            # Four vehicles at the corners outside the arena
-            ("vehicle.fbx", "vehicle_front_left",
-             -8.0, -3.5, VEHICLE_H / 2.0,
-              VEHICLE_L, VEHICLE_W, VEHICLE_H, 0.0),
-            ("vehicle.fbx", "vehicle_front_right",
-              8.0, -3.5, VEHICLE_H / 2.0,
-              VEHICLE_L, VEHICLE_W, VEHICLE_H, 0.0),
-            ("vehicle.fbx", "vehicle_back_left",
-             -8.0, 14.3, VEHICLE_H / 2.0,
-              VEHICLE_L, VEHICLE_W, VEHICLE_H, 0.0),
-            ("vehicle.fbx", "vehicle_back_right",
-              8.0, 14.3, VEHICLE_H / 2.0,
-              VEHICLE_L, VEHICLE_W, VEHICLE_H, 0.0),
+        # Composite humanoid + car FBXs placed OUTSIDE the arena walls
+        # so the surrounding world (especially the sphx-tests base)
+        # feels populated. The FBXs are pre-sized in Blender (~1.8 m
+        # tall actors, ~4.5 m long cars) so YAML scale stays at 1,1,1
+        # — yaw is the only per-instance rotation. NO z-lift: they
+        # stand on the world ground at z=0, not on the raised arena
+        # floor.
+        # (fbx_name, label, ax, ay, yaw_deg)
+        spectators: list[tuple[str, str, float, float, float]] = [
+            # Six actors spread along all 4 sides — yaw turns them so
+            # they face the arena interior.
+            ("actor_red.fbx",  "actor_red_front_left",   -5.0, -2.0,   0.0),
+            ("actor_blue.fbx", "actor_blue_front_right",  5.0, -2.0,   0.0),
+            ("actor_blue.fbx", "actor_blue_back_left",   -5.0, 12.8, 180.0),
+            ("actor_red.fbx",  "actor_red_back_right",    5.0, 12.8, 180.0),
+            ("actor_red.fbx",  "actor_red_left_side",   -12.0,  5.4,  90.0),
+            ("actor_blue.fbx", "actor_blue_right_side",  12.0,  5.4, -90.0),
+            # Four vehicles at the corners outside the arena.
+            # Long axis of the car (x in Blender) follows arena X by
+            # default; rotate by 90° on the side cars so their long
+            # edge runs along arena Y.
+            ("vehicle.fbx", "vehicle_front_left",  -7.0, -3.5,   0.0),
+            ("vehicle.fbx", "vehicle_front_right",  7.0, -3.5,   0.0),
+            ("vehicle.fbx", "vehicle_back_left",   -7.0, 14.3, 180.0),
+            ("vehicle.fbx", "vehicle_back_right",   7.0, 14.3, 180.0),
         ]
-        for fbx_name, label, ax, ay, az, sx_arena, sy_arena, sz, yaw in spectators:
-            ux_m, uy_m, uz_m = shifted_apply((ax, ay, az))
+        for fbx_name, label, ax, ay, yaw in spectators:
+            ux_m, uy_m, uz_m = shifted_apply((ax, ay, 0.0))
             loc_cm = (ux_m * 100.0, uy_m * 100.0, uz_m * 100.0)
-            arena_dims = {0: sx_arena, 1: sy_arena}
-            ue_x_size = arena_dims[ax_for_ue_x]
-            ue_y_size = arena_dims[ax_for_ue_y]
             out_lines.append(f"  # Spectator {label}.")
             out_lines.append(emit_yaml_block(
                 name=f"spectator_{label}",
                 fbx_path=fbx_dir / fbx_name,
                 location_cm=loc_cm,
                 rotation_deg=(0.0, yaw, 0.0),
-                scale=(ue_x_size, ue_y_size, sz),
+                scale=(1.0, 1.0, 1.0),
                 snap_to_ground=False,
             ))
             out_lines.append("")

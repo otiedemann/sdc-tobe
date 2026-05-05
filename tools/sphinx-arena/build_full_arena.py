@@ -191,6 +191,109 @@ def _build_unit_cube_fbx(out_fbx: Path, name: str,
     )
 
 
+def _join_and_export(parts, out_fbx: Path, name: str, mat) -> None:
+    """Join a list of Blender objects into one mesh, assign a single
+    material, and export as FBX with the same flags Sphinx expects."""
+    assert bpy is not None
+    bpy.ops.object.select_all(action="DESELECT")
+    for p in parts:
+        p.select_set(True)
+    bpy.context.view_layer.objects.active = parts[0]
+    bpy.ops.object.join()
+    obj = bpy.context.active_object
+    obj.name = name
+    obj.data.materials.clear()
+    obj.data.materials.append(mat)
+    bpy.ops.export_scene.fbx(
+        filepath=str(out_fbx),
+        use_selection=False,
+        path_mode="AUTO",
+        embed_textures=False,
+        apply_unit_scale=True,
+        global_scale=1.0,
+        bake_space_transform=False,
+        axis_forward="-Y",
+        axis_up="-Z",
+        object_types={"MESH"},
+        mesh_smooth_type="FACE",
+    )
+
+
+def _build_actor_fbx(out_fbx: Path, name: str,
+                     color_rgb: tuple[int, int, int]) -> None:
+    """Stylised humanoid: head sphere, torso box, arm + leg cylinders.
+    All joined into ONE mesh with ONE material so Sphinx renders it
+    reliably. Total height ~1.8 m, standing on its feet at z=0."""
+    import math as _math
+    assert bpy is not None
+    _clear_scene()
+    mat = _make_textured_material(
+        f"mat_{out_fbx.stem}", color_rgb, 0.6, out_fbx.parent,
+    )
+    parts = []
+    # Legs (cylinders, top of leg ~ 0.9 m)
+    for x in (-0.13, 0.13):
+        bpy.ops.mesh.primitive_cylinder_add(
+            radius=0.10, depth=0.9, location=(x, 0, 0.45),
+            vertices=12,
+        )
+        parts.append(bpy.context.active_object)
+    # Torso (rectangular block 0.9–1.5 m)
+    bpy.ops.mesh.primitive_cube_add(size=1.0, location=(0, 0, 1.2))
+    bpy.context.active_object.scale = (0.55, 0.30, 0.60)
+    bpy.ops.object.transform_apply(scale=True)
+    parts.append(bpy.context.active_object)
+    # Arms (cylinders hanging at the sides)
+    for x in (-0.36, 0.36):
+        bpy.ops.mesh.primitive_cylinder_add(
+            radius=0.08, depth=0.65, location=(x, 0, 1.25),
+            vertices=12,
+        )
+        parts.append(bpy.context.active_object)
+    # Head (sphere on top, top at ~1.85 m)
+    bpy.ops.mesh.primitive_uv_sphere_add(
+        radius=0.15, location=(0, 0, 1.65), segments=16, ring_count=8,
+    )
+    parts.append(bpy.context.active_object)
+    _join_and_export(parts, out_fbx, name, mat)
+
+
+def _build_vehicle_fbx(out_fbx: Path, name: str,
+                       color_rgb: tuple[int, int, int]) -> None:
+    """Stylised car: lower body box, upper cabin box, four wheels.
+    Single mesh + single material. ~4.5 × 1.8 × 1.5 m, sitting on its
+    wheels at z=0."""
+    import math as _math
+    assert bpy is not None
+    _clear_scene()
+    mat = _make_textured_material(
+        f"mat_{out_fbx.stem}", color_rgb, 0.3, out_fbx.parent,
+    )
+    parts = []
+    # Lower body (z=0.35..0.95, 4.5 m long, 1.8 m wide)
+    bpy.ops.mesh.primitive_cube_add(size=1.0, location=(0, 0, 0.65))
+    bpy.context.active_object.scale = (4.5, 1.8, 0.60)
+    bpy.ops.object.transform_apply(scale=True)
+    parts.append(bpy.context.active_object)
+    # Upper cabin (z=0.95..1.45, narrower & shorter)
+    bpy.ops.mesh.primitive_cube_add(size=1.0, location=(-0.3, 0, 1.20))
+    bpy.context.active_object.scale = (2.4, 1.55, 0.50)
+    bpy.ops.object.transform_apply(scale=True)
+    parts.append(bpy.context.active_object)
+    # Wheels — cylinders rotated to lie on their sides (axis along Y).
+    # rotation=(pi/2, 0, 0) tips the cylinder's Z axis onto -Y.
+    for x in (-1.55, 1.55):
+        for y in (-0.95, 0.95):
+            bpy.ops.mesh.primitive_cylinder_add(
+                radius=0.38, depth=0.30,
+                rotation=(_math.pi / 2.0, 0, 0),
+                location=(x, y, 0.38),
+                vertices=14,
+            )
+            parts.append(bpy.context.active_object)
+    _join_and_export(parts, out_fbx, name, mat)
+
+
 # ─── main ─────────────────────────────────────────────────────────
 
 
@@ -453,23 +556,24 @@ def main() -> int:
             alpha=0.35,  # semi-transparent so spectators are visible
         )
         print(f"  ✓ {out_dir / 'wall.fbx'}")
-        # Spectator stand-ins: simple unit cubes scaled per-axis in YAML
-        # to person- / vehicle-sized proportions. They live OUTSIDE the
-        # arena walls (see --emit-spectators in arena_to_sphinx_yaml.py)
-        # so the sdc_arena_test world (sphx-tests base) feels populated.
-        _build_unit_cube_fbx(
+        # Spectator stand-ins: composite humanoid + car meshes (head /
+        # torso / arms / legs joined into a single mesh; car body /
+        # cabin / 4 wheels likewise). They live OUTSIDE the arena walls
+        # (see --emit-spectators in arena_to_sphinx_yaml.py) so the
+        # sdc_arena_test world (sphx-tests base) feels populated.
+        _build_actor_fbx(
             out_dir / "actor_red.fbx", "spectator_actor_red",
-            (200, 60, 60), 0.7,
+            (200, 60, 60),
         )
         print(f"  ✓ {out_dir / 'actor_red.fbx'}")
-        _build_unit_cube_fbx(
+        _build_actor_fbx(
             out_dir / "actor_blue.fbx", "spectator_actor_blue",
-            (60, 80, 200), 0.7,
+            (60, 80, 200),
         )
         print(f"  ✓ {out_dir / 'actor_blue.fbx'}")
-        _build_unit_cube_fbx(
+        _build_vehicle_fbx(
             out_dir / "vehicle.fbx", "spectator_vehicle",
-            (40, 60, 90), 0.3,
+            (40, 60, 90),
         )
         print(f"  ✓ {out_dir / 'vehicle.fbx'}")
 
