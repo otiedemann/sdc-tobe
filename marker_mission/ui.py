@@ -3248,7 +3248,7 @@ class UiServer:
         def killswitch_key():
             return (self.cfg.killswitch_key
                     if self.cfg and getattr(self.cfg, "killswitch_key", None)
-                    else "Q")
+                    else "@")
 
         def live_ctx(**overrides):
             base = dict(

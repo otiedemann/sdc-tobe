@@ -281,7 +281,7 @@ class MissionConfig:
     # Operator-facing emergency-land hotkey. Pressing this key anywhere on
     # the web UI (including inside text fields) triggers /api/stop. Single
     # character; comparison is case-insensitive.
-    killswitch_key: str = "Q"              # TUNE  global emergency-land hotkey
+    killswitch_key: str = "@"              # TUNE  global emergency-land hotkey
 
     # --- Recording -----------------------------------------------------------
     record_fps: int = 25                   # MJPEG frames are decoded -> we re-mux
@@ -571,7 +571,7 @@ TUNING_FIELDS = {
 
     "killswitch_key": {
         "label": "killswitch key", "kind": "str",
-        "desc": "Single character. Pressing this key anywhere on the web UI (including inside textareas / number inputs) immediately triggers /api/stop and lands the drone. Default 'Q'. Comparison is case-insensitive; modifier keys (Ctrl/Cmd/Alt) are excluded so browser shortcuts still work.",
+        "desc": "Single character. Pressing this key anywhere on the web UI (including inside textareas / number inputs) immediately triggers /api/stop and lands the drone. Default '@'. Comparison is case-insensitive; modifier keys (Ctrl/Cmd/Alt) are excluded so browser shortcuts still work.",
     },
 }
 
