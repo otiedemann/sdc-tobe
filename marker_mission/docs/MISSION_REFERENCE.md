@@ -465,7 +465,12 @@ mission loop then resets state for the next run.
 | `TAKEOFF` | TAKEOFF |
 | `APPROACH` | SEARCH → HEIGHT_ALIGN → ALIGN → APPROACH |
 | `HOOVER` (after APPROACH) | HOLD |
+| `HOOVER` (after `TO`) | GOTO (station-keeping at the world target) |
 | `HOOVER` (otherwise) | IDLE |
+| `AWAIT` (after APPROACH) | HOLD with marker-id early-exit |
+| `AWAIT` (otherwise) | IDLE with marker-id early-exit |
+| `PAUSE` | IDLE (unconditional, no early exit) |
 | `HEIGHT` | HEIGHT |
+| `TO` | GOTO |
 | `DANCE` | DANCE |
 | `LAND` | LAND → DONE (or next command if any) |
