@@ -362,6 +362,21 @@ def cmd_fly(args: argparse.Namespace) -> int:
     # thread and return immediately. The control thread itself does the
     # rc_zero + land + telemetry poll synchronously.
     def request_stop_async():
+        # Set abort_reason synchronously BEFORE returning so the next
+        # CSV row (and the forced flush below) timestamp the
+        # emergency-land moment precisely. The shutdown thread will
+        # call controller.stop("UI stop request") which sets the same
+        # field again -- idempotent, but capturing it here means the
+        # log row recorded right now already shows the abort.
+        with state.lock:
+            if not state.abort_reason:
+                state.abort_reason = "UI stop request"
+        rec = recorder_box[0]
+        if rec is not None:
+            try:
+                rec.log_row(state, pose_holder.get(), tel_holder.get())
+            except Exception as e:
+                print(f"[mission] emergency-stop log_row failed: {e}")
         threading.Thread(
             target=controller.stop,
             args=("UI stop request",),

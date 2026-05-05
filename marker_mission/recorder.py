@@ -55,6 +55,13 @@ _CSV_FIELDS = [
     "tel_height_cm", "tel_flight_time_s",
     "tel_vgx", "tel_vgy", "tel_vgz",
     "tel_flying", "tel_connected",
+    # Note + abort reason carry whatever the controller's state
+    # machine has surfaced this tick. The killswitch / Stop button
+    # write a non-empty abort_reason synchronously into state so
+    # the precise tick where the emergency land was triggered is
+    # always captured -- the operator can grep the CSV for the
+    # row whose abort_reason transitions from "" to non-empty.
+    "note", "abort_reason",
 ]
 
 
@@ -327,6 +334,8 @@ class FlightRecorder:
                 row[dst] = v if v is not None else ""
             row["tel_flying"] = "1" if tel_raw.get("flying") else "0"
             row["tel_connected"] = "1" if tel_raw.get("connected") else "0"
+            row["note"] = (snap.get("note") or "")
+            row["abort_reason"] = (snap.get("abort_reason") or "")
             try:
                 self._csv_writer.writerow(row)
                 # Flush periodically so we keep data on disk if we crash.
