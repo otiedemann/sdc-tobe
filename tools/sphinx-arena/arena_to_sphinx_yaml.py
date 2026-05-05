@@ -91,10 +91,10 @@ DEFAULT_OUT_YAML = Path(__file__).parent / "out" / "arena.yml"
 MARKER_PITCH_DEG: float = 0.0
 MARKER_YAW_DEG: float = 0.0
 WALL_ROLL_DEG: dict[str, float] = {
-    "left":   0.0,
-    "right": 180.0,
-    "front":  90.0,
-    "back":  270.0,
+    "left":  180.0,
+    "right":   0.0,
+    "front": 270.0,
+    "back":   90.0,
 }
 
 # Per-marker direction is now read directly from arena_config.json's
@@ -419,10 +419,10 @@ def main() -> int:
     p.add_argument("--marker-pitch", type=float, default=None,
                    help="Override MARKER_PITCH_DEG for wall markers. "
                         "Default 0 (FBX is already vertical).")
-    p.add_argument("--marker-inward-offset-m", type=float, default=0.30,
+    p.add_argument("--marker-inward-offset-m", type=float, default=0.15,
                    help="Push each wall marker this many metres INWARD "
                         "from its arena_config.json position so it sits "
-                        "clearly in front of the pillar. Default 0.30 m. "
+                        "clearly in front of the pillar. Default 0.15 m. "
                         "Position-tracking still uses the unmodified "
                         "arena_config coords as ground truth — this "
                         "offset only affects the simulator placement.")
