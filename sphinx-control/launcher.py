@@ -1341,6 +1341,14 @@ class Launcher:
         descriptor_arg = descriptor_path
         if firmware_url:
             descriptor_arg = f"{descriptor_path}::firmware={firmware_url}"
+        # Initial pose so the drone spawns ABOVE the raised arena floor
+        # (top at z=+0.40 m). Default lifts to 0.5 m. Configurable via
+        # config.yaml: ue4.drone_spawn_pose ("x y z roll pitch yaw"
+        # space-separated; matches Sphinx's <pose> XML element format).
+        ue4_cfg = self.config.get("ue4", {}) or {}
+        spawn_pose = ue4_cfg.get("drone_spawn_pose", "0 0 0.5 0 0 0")
+        if spawn_pose:
+            descriptor_arg = f"{descriptor_arg}::pose={spawn_pose}"
         argv.append(descriptor_arg)
         # NOTE: -config-file is a UE4 application flag, NOT a Sphinx
         # flag. Pass it to parrot-ue4-* in _ue4_argv. Verified live on
