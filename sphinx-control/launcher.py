@@ -404,26 +404,59 @@ class Launcher:
         )
         if not sky_preset:
             return
-        # Give the UE process a moment to come fully up before sphinx-cli
-        # tries to talk to it. 2s is enough on the SDC host.
-        time.sleep(2.0)
-        try:
-            result = subprocess.run(
-                ["sphinx-cli", "param", "-m", "world",
-                 "sky/sky", "preset", sky_preset],
-                capture_output=True, text=True, timeout=8,
+        # Poll sphinx-cli up to 30 s. After spawn() returns, sphinx is
+        # still initializing and connecting to UE4 — calling sphinx-cli
+        # too early gets 'An instance of Sphinx is not running'. Retry
+        # on a 1.5s cadence until it succeeds or we give up.
+        deadline = time.time() + 30.0
+        attempt = 0
+        last_err = ""
+        sky_ok = False
+        while time.time() < deadline and not sky_ok:
+            attempt += 1
+            try:
+                result = subprocess.run(
+                    ["sphinx-cli", "param", "-m", "world",
+                     "sky/sky", "preset", sky_preset],
+                    capture_output=True, text=True, timeout=4,
+                )
+                if result.returncode == 0:
+                    log.info(
+                        "world '%s' sky preset → %s (attempt %d)",
+                        world_name, sky_preset, attempt,
+                    )
+                    sky_ok = True
+                    break
+                last_err = (result.stdout + result.stderr).strip()
+            except (FileNotFoundError, subprocess.TimeoutExpired) as e:
+                last_err = str(e)
+            time.sleep(1.5)
+        if not sky_ok:
+            log.warning(
+                "sphinx-cli sky preset never succeeded after 30s: %s",
+                last_err,
             )
-            if result.returncode == 0:
-                log.info(
-                    "world '%s' sky preset → %s", world_name, sky_preset,
-                )
+        # Also raise the drone's spawn position to clear the raised
+        # arena floor (top face at z=+0.40 m). Sphinx supports moving
+        # the drone via the omniscient component's `pose` action.
+        # Best-effort — failures are logged but not fatal.
+        spawn_z_m = float(
+            self.config.get("ue4", {}).get("drone_spawn_z_m", 0.5)
+        )
+        try:
+            r = subprocess.run(
+                ["sphinx-cli", "action", "-m", "omniscient", "pose",
+                 "0", "0", str(spawn_z_m), "0", "0", "0"],
+                capture_output=True, text=True, timeout=4,
+            )
+            if r.returncode == 0:
+                log.info("drone teleported to z=%s m via omniscient/pose",
+                         spawn_z_m)
             else:
-                log.warning(
-                    "sphinx-cli failed to set sky preset (rc=%d): %s%s",
-                    result.returncode, result.stdout, result.stderr,
-                )
+                log.warning("omniscient/pose failed (rc=%d): %s%s",
+                            r.returncode, r.stdout, r.stderr)
         except (FileNotFoundError, subprocess.TimeoutExpired) as e:
-            log.warning("sphinx-cli unavailable for sky preset: %s", e)
+            log.warning("omniscient/pose call failed: %s", e)
 
     def stop_environment(self) -> None:
         """Stop the current environment AND any drones attached to it.

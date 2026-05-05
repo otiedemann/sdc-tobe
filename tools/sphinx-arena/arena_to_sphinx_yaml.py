@@ -230,6 +230,14 @@ def emit_yaml_block(
 # arena_config.json sit at the *inward* face of the wall; the pillar
 # body extends outward (away from the arena interior) by half its
 # width so the marker plane is flush with the inner surface.
+# Arena Z offset: every arena element (floor zones, walls, pillars,
+# wall markers) is lifted by this amount so the visible floor sits
+# clearly above UE4's default ground (which has a checker pattern at
+# some unknown z > 0). Drones spawn at world z=0 and need to be
+# repositioned to land on the raised floor — see sphinx-cli call in
+# launcher.py post-spawn.
+_ARENA_Z_OFFSET_M = 0.40
+
 _PILLAR_WIDTH_M = 0.20
 _HALF_PILLAR_M = _PILLAR_WIDTH_M / 2.0
 _PILLAR_HEIGHT_M = 6.0
@@ -479,6 +487,14 @@ def main() -> int:
     else:
         center_offset = (0.0, 0.0, 0.0)
 
+    def shifted_apply_with_zlift(arena_xyz: tuple[float, float, float]) -> tuple[float, float, float]:
+        """Variant that also raises Z by _ARENA_Z_OFFSET_M. Used by
+        walls, pillars, markers, target markers, paintings — anything
+        sitting on the arena floor — so they all line up with the
+        raised floor zones."""
+        ax, ay, az = arena_xyz
+        return shifted_apply((ax, ay, az + _ARENA_Z_OFFSET_M))
+
     def shifted_apply(arena_xyz: tuple[float, float, float]) -> tuple[float, float, float]:
         """Apply --center-arena shift then axis_map."""
         ox, oy, oz = center_offset
@@ -535,7 +551,7 @@ def main() -> int:
             marker_x += inward_offset_m * math.cos(d)
             marker_y += inward_offset_m * math.sin(d)
         # arena → UE conversion (metres) → centimetres
-        ux_m, uy_m, uz_m = shifted_apply((marker_x, marker_y, float(m["z"])))
+        ux_m, uy_m, uz_m = shifted_apply_with_zlift((marker_x, marker_y, float(m["z"])))
         loc_cm = (ux_m * 100.0, uy_m * 100.0, uz_m * 100.0)
         # UE4 Rotator order is (Pitch, Yaw, Roll). roll set above per
         # wall (test mode adds roll=90 to long walls).
@@ -557,7 +573,7 @@ def main() -> int:
         if not b.get("enabled", True):
             continue
         mid = int(b["id"])
-        ux_m, uy_m, uz_m = shifted_apply((float(b["x"]), float(b["y"]), float(b["z"])))
+        ux_m, uy_m, uz_m = shifted_apply_with_zlift((float(b["x"]), float(b["y"]), float(b["z"])))
         loc_cm = (ux_m * 100.0, uy_m * 100.0, uz_m * 100.0)
         # Target markers use the same single-mesh FBX as wall markers,
         # so rotation is set per-target via pitch_deg / yaw_deg / roll_deg
@@ -646,7 +662,7 @@ def main() -> int:
                     wx, wy = cwx + offset, cwy
                 else:
                     wx, wy = cwx, cwy + offset
-                ux_m, uy_m, uz_m = shifted_apply((wx, wy, _PAINTING_Z_M))
+                ux_m, uy_m, uz_m = shifted_apply_with_zlift((wx, wy, _PAINTING_Z_M))
                 loc_cm = (ux_m * 100.0, uy_m * 100.0, uz_m * 100.0)
                 rot = (marker_pitch, wall_yaws[wall], 0.0)
                 out_lines.append(
@@ -670,7 +686,7 @@ def main() -> int:
         ax_for_ue_x = axis_map.ue_x[0]
         ax_for_ue_y = axis_map.ue_y[0]
         for wall in collect_walls(arena.get("markers", [])):
-            ux_m, uy_m, uz_m = shifted_apply((wall["x"], wall["y"], wall["z"]))
+            ux_m, uy_m, uz_m = shifted_apply_with_zlift((wall["x"], wall["y"], wall["z"]))
             loc_cm = (ux_m * 100.0, uy_m * 100.0, uz_m * 100.0)
             arena_scales = {0: wall["sx"], 1: wall["sy"], 2: wall["sz"]}
             ue_x_scale = arena_scales[ax_for_ue_x]
@@ -697,7 +713,7 @@ def main() -> int:
         # exactly the (x, y) recorded in arena_config.json. ctrl_position
         # uses those coordinates as ground truth — never offset them.
         for pillar in collect_pillars(arena.get("markers", [])):
-            ux_m, uy_m, uz_m = shifted_apply(
+            ux_m, uy_m, uz_m = shifted_apply_with_zlift(
                 (pillar["x"], pillar["y"], pillar["z"])
             )
             loc_cm = (ux_m * 100.0, uy_m * 100.0, uz_m * 100.0)
@@ -716,6 +732,62 @@ def main() -> int:
             n_pillars += 1
 
     if emit_floor:
+        # Coloured arena floor: red 7 m + neutral 6 m + blue 7 m strip,
+        # spanning the full arena depth (10.8 m). Each strip is its
+        # own scaled unit-cube FBX (floor_red, floor (neutral grey),
+        # floor_blue) so we get separate solid-colour zones without
+        # multi-material FBX imports. Strips sit at 5 cm above UE
+        # default ground (z=0) so the playable surface is the
+        # coloured arena, not the cloudy default world.
+        ARENA_LEN = 20.0     # arena X-axis length (-10..+10)
+        ARENA_DEPTH = 10.8   # arena Y-axis depth
+        ZONE_END = 7.0       # red & blue zones each 7 m of the length
+        ZONE_MID = ARENA_LEN - 2 * ZONE_END  # neutral 6 m in middle
+        # parrot-ue4-empty has a BUILT-IN checkered arena floor that
+        # sits ABOVE z=0 (visible in user screenshots as a checker
+        # rectangle floating above our coloured zones). Raise our
+        # floor's top to z=+0.40 m so it hides that built-in mesh
+        # too. Drone spawn z=0 still works — UE4 collisions ignore
+        # the single-frame intersection.
+        FLOOR_THICK = 0.50
+        FLOOR_TOP_Z = 0.40
+        zone_z_center = FLOOR_TOP_Z - FLOOR_THICK / 2.0
+        # Per-zone arena X centres
+        red_cx = -ARENA_LEN / 2 + ZONE_END / 2     # = -6.5
+        mid_cx = 0.0
+        blue_cx = ARENA_LEN / 2 - ZONE_END / 2     # = +6.5
+        # Marker-bbox-centred Y (cy = (y_min+y_max)/2)
+        ys = [float(m["y"]) for m in arena.get("markers", [])] or [0.0, 10.8]
+        cy = (min(ys) + max(ys)) / 2.0
+        ax_for_ue_x = axis_map.ue_x[0]
+        ax_for_ue_y = axis_map.ue_y[0]
+        for zone_name, fbx_name, cx_arena, length_m in (
+            ("arena_floor_red",     "floor_red.fbx",  red_cx,  ZONE_END),
+            ("arena_floor_neutral", "floor.fbx",      mid_cx,  ZONE_MID),
+            ("arena_floor_blue",    "floor_blue.fbx", blue_cx, ZONE_END),
+        ):
+            ux_m, uy_m, uz_m = shifted_apply((cx_arena, cy, zone_z_center))
+            loc_cm = (ux_m * 100.0, uy_m * 100.0, uz_m * 100.0)
+            arena_dims = {0: length_m, 1: ARENA_DEPTH}
+            ue_x_size = arena_dims[ax_for_ue_x]
+            ue_y_size = arena_dims[ax_for_ue_y]
+            out_lines.append(
+                f"  # Floor zone {zone_name} — {length_m} × "
+                f"{ARENA_DEPTH} × {FLOOR_THICK} m."
+            )
+            out_lines.append(emit_yaml_block(
+                name=zone_name,
+                fbx_path=fbx_dir / fbx_name,
+                location_cm=loc_cm,
+                rotation_deg=(0.0, 0.0, 0.0),
+                scale=(ue_x_size, ue_y_size, FLOOR_THICK),
+                snap_to_ground=False,
+            ))
+            out_lines.append("")
+        n_floor = 3
+        # Continue to skip the legacy single-50x50 emit block below.
+        emit_floor = False
+    if False:  # legacy single-floor branch — disabled
         # Floor: a unit cube scaled to a generous footprint (default
         # 50×50 m, 1 m thick). Centre it at the arena's marker bbox
         # centre so it covers symmetrically. Built oversized on
