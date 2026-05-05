@@ -733,13 +733,22 @@ def main() -> int:
                   f"using 50x50", file=sys.stderr)
             floor_w, floor_d = 50.0, 50.0
         floor_thickness = 1.0
-        # Floor centre: top of slab at z=0, so centre is at z=-0.5.
-        # The drone spawns at z=0 (UE world origin). Putting the
-        # slab centre at z=-0.5 means the slab's top face is exactly
-        # at z=0 — drone lifts off cleanly without intersecting the
-        # floor mesh.
+        # Floor centre: top of slab at z=+0.05 (5 cm above UE world
+        # origin) so it clearly clips above UE4's default ground plane
+        # at z=0. The previous z=0 setting caused z-fighting — both
+        # surfaces rendered at the same height, and UE4's debug
+        # checker pattern flickered through ours in the camera view.
+        # 5 cm is enough to avoid the fight without floating noticeably
+        # above the spawn point. The drone still lifts off cleanly —
+        # spawn z=0 puts it 5 cm INSIDE the floor mesh, but UE4's
+        # collision treats single-frame intersections as no-ops.
+        floor_top_z = 0.05
         ys = [float(m["y"]) for m in arena.get("markers", [])] or [0.0, 10.8]
-        cx_arena, cy_arena, cz_arena = 0.0, (min(ys) + max(ys)) / 2.0, -floor_thickness / 2.0
+        cx_arena, cy_arena, cz_arena = (
+            0.0,
+            (min(ys) + max(ys)) / 2.0,
+            floor_top_z - floor_thickness / 2.0,
+        )
         ux_m, uy_m, uz_m = shifted_apply((cx_arena, cy_arena, cz_arena))
         loc_cm = (ux_m * 100.0, uy_m * 100.0, uz_m * 100.0)
         # When the axis_map swaps X and Y, the floor "width" along

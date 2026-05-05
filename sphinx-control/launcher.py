@@ -359,7 +359,56 @@ class Launcher:
                 "started env %s world=%s ue4_pid=%s",
                 env_id, req.world_name, ue4_pid,
             )
+            # Apply post-start sphinx-cli params (e.g. sky preset). The
+            # SDC arena is indoors so we default to the "indoor" preset
+            # to replace UE4's default cloudy outdoor sky. Override per
+            # world via config.yaml: ue4_apps[].sky_preset, or
+            # world-level worlds.sky_preset.
+            self._apply_post_start_world_params(req.world_name, world)
             return updated
+
+    def _apply_post_start_world_params(
+        self, world_name: str, world: Any
+    ) -> None:
+        """Best-effort runtime configuration of the freshly-started world.
+        Currently sets the sky preset via sphinx-cli; failures are
+        logged but don't abort the env startup (the env still works,
+        just with the default sky)."""
+        if self.dry_run:
+            return
+        # Resolve sky preset: per-world override > global default > "indoor".
+        # The Registry's World object exposes config attributes via
+        # ``world.extras`` if present, plus we look at the launcher
+        # config under worlds.sky_preset.
+        sky_preset = None
+        worlds_cfg = self.config.get("worlds", {}) or {}
+        sky_preset = (
+            getattr(world, "sky_preset", None)
+            or worlds_cfg.get("sky_preset")
+            or "indoor"
+        )
+        if not sky_preset:
+            return
+        # Give the UE process a moment to come fully up before sphinx-cli
+        # tries to talk to it. 2s is enough on the SDC host.
+        time.sleep(2.0)
+        try:
+            result = subprocess.run(
+                ["sphinx-cli", "param", "-m", "world",
+                 "sky/sky", "preset", sky_preset],
+                capture_output=True, text=True, timeout=8,
+            )
+            if result.returncode == 0:
+                log.info(
+                    "world '%s' sky preset → %s", world_name, sky_preset,
+                )
+            else:
+                log.warning(
+                    "sphinx-cli failed to set sky preset (rc=%d): %s%s",
+                    result.returncode, result.stdout, result.stderr,
+                )
+        except (FileNotFoundError, subprocess.TimeoutExpired) as e:
+            log.warning("sphinx-cli unavailable for sky preset: %s", e)
 
     def stop_environment(self) -> None:
         """Stop the current environment AND any drones attached to it.
