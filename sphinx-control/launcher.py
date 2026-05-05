@@ -457,6 +457,21 @@ class Launcher:
                             r.returncode, r.stdout, r.stderr)
         except (FileNotFoundError, subprocess.TimeoutExpired) as e:
             log.warning("omniscient/pose call failed: %s", e)
+        # AMS actors spawn paused by default per Sphinx docs. Unpause
+        # them so spectators actually walk/drive along PerimeterPath.
+        try:
+            r = subprocess.run(
+                ["sphinx-cli", "param", "-m", "world",
+                 "actors", "pause", "false"],
+                capture_output=True, text=True, timeout=4,
+            )
+            if r.returncode == 0:
+                log.info("AMS actors unpaused (walking)")
+            else:
+                log.warning("actors/pause unpause failed (rc=%d): %s%s",
+                            r.returncode, r.stdout, r.stderr)
+        except (FileNotFoundError, subprocess.TimeoutExpired) as e:
+            log.warning("actors/pause call failed: %s", e)
 
     def stop_environment(self) -> None:
         """Stop the current environment AND any drones attached to it.
