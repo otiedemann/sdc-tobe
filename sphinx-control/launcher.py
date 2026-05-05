@@ -411,7 +411,8 @@ class Launcher:
         deadline = time.time() + 30.0
         attempt = 0
         last_err = ""
-        while time.time() < deadline:
+        sky_ok = False
+        while time.time() < deadline and not sky_ok:
             attempt += 1
             try:
                 result = subprocess.run(
@@ -424,15 +425,38 @@ class Launcher:
                         "world '%s' sky preset → %s (attempt %d)",
                         world_name, sky_preset, attempt,
                     )
-                    return
+                    sky_ok = True
+                    break
                 last_err = (result.stdout + result.stderr).strip()
             except (FileNotFoundError, subprocess.TimeoutExpired) as e:
                 last_err = str(e)
             time.sleep(1.5)
-        log.warning(
-            "sphinx-cli sky preset never succeeded after 30s: %s",
-            last_err,
+        if not sky_ok:
+            log.warning(
+                "sphinx-cli sky preset never succeeded after 30s: %s",
+                last_err,
+            )
+        # Also raise the drone's spawn position to clear the raised
+        # arena floor (top face at z=+0.40 m). Sphinx supports moving
+        # the drone via the omniscient component's `pose` action.
+        # Best-effort — failures are logged but not fatal.
+        spawn_z_m = float(
+            self.config.get("ue4", {}).get("drone_spawn_z_m", 0.5)
         )
+        try:
+            r = subprocess.run(
+                ["sphinx-cli", "action", "-m", "omniscient", "pose",
+                 "0", "0", str(spawn_z_m), "0", "0", "0"],
+                capture_output=True, text=True, timeout=4,
+            )
+            if r.returncode == 0:
+                log.info("drone teleported to z=%s m via omniscient/pose",
+                         spawn_z_m)
+            else:
+                log.warning("omniscient/pose failed (rc=%d): %s%s",
+                            r.returncode, r.stdout, r.stderr)
+        except (FileNotFoundError, subprocess.TimeoutExpired) as e:
+            log.warning("omniscient/pose call failed: %s", e)
 
     def stop_environment(self) -> None:
         """Stop the current environment AND any drones attached to it.
