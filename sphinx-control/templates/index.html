@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>{{ title }}</title>
-  <link rel="stylesheet" href="/static/app.css">
+  <link rel="stylesheet" href="/static/app.css?v={{ app_css_v }}">
 </head>
 <body>
   <header>
@@ -43,6 +43,16 @@
       <form id="env-form">
         <label>World
           <select name="world_name" id="world-select" required></select>
+        </label>
+        <label>Width
+          <input type="number" name="res_x" id="env-res-x" value="1280" min="320" max="4096" step="1">
+        </label>
+        <label>Height
+          <input type="number" name="res_y" id="env-res-y" value="1024" min="240" max="4096" step="1">
+        </label>
+        <label class="checkbox-label">
+          <input type="checkbox" name="hide_panels" id="env-hide-panels" checked>
+          Hide panels (3D only)
         </label>
         <button type="submit" id="env-start-btn">Start environment</button>
         <button type="button" id="env-restart-btn" class="secondary" disabled>Restart</button>
@@ -126,6 +136,6 @@
     </section>
   </main>
 
-  <script src="/static/app.js"></script>
+  <script src="/static/app.js?v={{ app_js_v }}"></script>
 </body>
 </html>

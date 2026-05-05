@@ -185,6 +185,11 @@ class EnvironmentRequest:
     """Start an environment (UE4 only) — drone-agnostic."""
 
     world_name: str
+    # Optional UE window settings; None falls back to launcher.config
+    # defaults (which themselves fall back to 1280x1024).
+    res_x: int | None = None
+    res_y: int | None = None
+    hide_panels: bool | None = None  # send F10 once UE window is up
 
 
 @dataclass
@@ -347,7 +352,10 @@ class Launcher:
             self.state.upsert_env(rec)
 
             try:
-                ue4_pid = self._launch_ue4(env_id=env_id, world=world)
+                ue4_pid = self._launch_ue4(
+                    env_id=env_id, world=world,
+                    res_x=req.res_x, res_y=req.res_y,
+                )
             except Exception as e:
                 self.state.update_env_status(env_id, "error", last_error=str(e))
                 raise
@@ -356,10 +364,66 @@ class Launcher:
             updated = self.state.get_env(env_id)
             assert updated is not None
             log.info(
-                "started env %s world=%s ue4_pid=%s",
+                "started env %s world=%s ue4_pid=%s res=%sx%s",
                 env_id, req.world_name, ue4_pid,
+                req.res_x or "default", req.res_y or "default",
             )
+            # If requested, send F10 to hide the HMI panels so only the
+            # 3D viewport is visible. Default is enabled for sdc_arena.
+            ue4_cfg = self.config.get("ue4", {}) or {}
+            hide = (req.hide_panels if req.hide_panels is not None
+                    else ue4_cfg.get("hide_panels_default", True))
+            if hide:
+                self._hide_ue4_panels(ue4_pid=ue4_pid)
+            # NOTE: sphinx-cli world params (e.g. sky preset) can ONLY
+            # be applied AFTER a drone (sphinx process) is spawned —
+            # without sphinx, sphinx-cli reports "An instance of Sphinx
+            # is not running" and bails. We defer the post-start params
+            # until the first successful drone spawn (see spawn()).
             return updated
+
+    def _apply_post_start_world_params(
+        self, world_name: str, world: Any
+    ) -> None:
+        """Best-effort runtime configuration of the freshly-started world.
+        Currently sets the sky preset via sphinx-cli; failures are
+        logged but don't abort the env startup (the env still works,
+        just with the default sky)."""
+        if self.dry_run:
+            return
+        # Resolve sky preset: per-world override > global default > "indoor".
+        # The Registry's World object exposes config attributes via
+        # ``world.extras`` if present, plus we look at the launcher
+        # config under worlds.sky_preset.
+        sky_preset = None
+        worlds_cfg = self.config.get("worlds", {}) or {}
+        sky_preset = (
+            getattr(world, "sky_preset", None)
+            or worlds_cfg.get("sky_preset")
+            or "indoor"
+        )
+        if not sky_preset:
+            return
+        # Give the UE process a moment to come fully up before sphinx-cli
+        # tries to talk to it. 2s is enough on the SDC host.
+        time.sleep(2.0)
+        try:
+            result = subprocess.run(
+                ["sphinx-cli", "param", "-m", "world",
+                 "sky/sky", "preset", sky_preset],
+                capture_output=True, text=True, timeout=8,
+            )
+            if result.returncode == 0:
+                log.info(
+                    "world '%s' sky preset → %s", world_name, sky_preset,
+                )
+            else:
+                log.warning(
+                    "sphinx-cli failed to set sky preset (rc=%d): %s%s",
+                    result.returncode, result.stdout, result.stderr,
+                )
+        except (FileNotFoundError, subprocess.TimeoutExpired) as e:
+            log.warning("sphinx-cli unavailable for sky preset: %s", e)
 
     def stop_environment(self) -> None:
         """Stop the current environment AND any drones attached to it.
@@ -538,22 +602,20 @@ class Launcher:
             return updated
 
     def stop_fc(self) -> None:
-        """Stop the flight controller and verify it's actually dead.
+        """Stop the flight controller. Brain-dead simple now after
+        repeated user reports that the previous implementation didn't
+        work:
 
-        Hardened over the naive 'kill PID, mark stopped' approach
-        because users reported having to manually kill PIDs from the
-        terminal:
+          1. kill -9 fc.pid (SIGKILL, direct, no process-group dance,
+             no SIGTERM grace).
+          2. kill -9 any other PIDs holding the FC's HTTP port (catches
+             children that escaped the recorded PID, etc.).
+          3. Mark state stopped.
 
-          1. Kill the recorded PID (process group via SIGTERM → SIGKILL).
-          2. WAIT for the FC's HTTP port to be released — this is the
-             real signal that the FC is gone (a zombie process can
-             still exist after kill, but it can't hold a port).
-          3. If the port is STILL bound after the wait, scan
-             /proc/net/tcp to find whatever is holding it (could be a
-             forked child whose PID we never tracked, or a manually-
-             started process), and kill that too.
-          4. State-store row is marked 'stopped' regardless — so the
-             UI never gets stuck thinking the FC is running.
+        SIGKILL is unconditional — Olympe atexit hangs that previously
+        forced us into the SIGKILL fallback after a 1.5–5s SIGTERM grace
+        are now skipped entirely. The user pointed out 'all you need
+        is to send kill <pid>'. Done.
         """
         with self._lock:
             fc = self.state.current_fc()
@@ -561,40 +623,52 @@ class Launcher:
                 return
             fc_id = fc.fc_id
             port = fc.http_port
+            killed_pids = []
             if fc.pid:
-                self._terminate_pid(fc.pid)
-            # Always mark the state row stopped so the UI is consistent
-            # even if subsequent cleanup steps below have hiccups.
+                try:
+                    os.kill(fc.pid, signal.SIGKILL)
+                    killed_pids.append(fc.pid)
+                except ProcessLookupError:
+                    pass
+                except PermissionError as e:
+                    log.warning("SIGKILL fc.pid=%d denied: %s", fc.pid, e)
+            # Catch anything still on the port (forked children, orphan
+            # processes, etc.) — the port is the ground truth.
+            if port:
+                for h_pid in _find_port_holders(int(port)):
+                    if h_pid in killed_pids:
+                        continue
+                    try:
+                        os.kill(h_pid, signal.SIGKILL)
+                        killed_pids.append(h_pid)
+                        log.info("SIGKILL'd port-%d holder pid=%d",
+                                 port, h_pid)
+                    except (ProcessLookupError, PermissionError) as e:
+                        log.warning("SIGKILL pid=%d failed: %s", h_pid, e)
+            # Final safety net — pkill anything matching the FC's
+            # script name, just in case the recorded PID + port-holder
+            # scan both missed something. This covers the case where
+            # the user manually started an FC outside sphinx-control
+            # (different session, different terminal) and our state
+            # has no clue what PID it has.
+            try:
+                script_name = fc.script or "unified_api_server.py"
+                # -9 = SIGKILL, -f = match against full command line
+                # so "unified_api_server.py" matches even though the
+                # python process's own argv[0] is just "python3".
+                r = subprocess.run(
+                    ["pkill", "-9", "-f", script_name],
+                    capture_output=True, text=True, timeout=4,
+                )
+                # rc=0 means at least one killed; rc=1 means none —
+                # both are fine, only worth logging the kill.
+                if r.returncode == 0:
+                    log.info("pkill -9 -f %s swept additional FC procs",
+                             script_name)
+            except (FileNotFoundError, subprocess.TimeoutExpired) as e:
+                log.warning("pkill sweep failed: %s", e)
             self.state.update_fc_status(fc_id, "stopped")
-            # Verify the port is actually freed; if not, hunt down
-            # whatever's still bound to it. Tight timeouts here so the
-            # UI feels responsive — _terminate_pid above already waited
-            # the SIGTERM grace, so the port should be free within
-            # milliseconds of that returning.
-            if port and not _wait_for_port_release(port, timeout_s=1.5):
-                holders = _find_port_holders(int(port))
-                if holders:
-                    log.warning(
-                        "fc %s port %d still bound after PID kill — "
-                        "force-killing port holder PIDs %s",
-                        fc_id, port, holders,
-                    )
-                    for pid in holders:
-                        try:
-                            self._terminate_pid(pid)
-                        except Exception as e:
-                            log.warning(
-                                "force-kill of port-holder pid=%d failed: %s",
-                                pid, e,
-                            )
-                    _wait_for_port_release(port, timeout_s=1.5)
-                else:
-                    log.warning(
-                        "fc %s port %d still bound but no holder found "
-                        "in /proc/net/tcp (kernel TIME_WAIT?)",
-                        fc_id, port,
-                    )
-            log.info("stopped fc %s", fc_id)
+            log.info("stopped fc %s — killed pids=%s", fc_id, killed_pids)
 
     def restart_fc(self) -> FlightControllerRecord:
         """Stop + start the FC reliably.
@@ -858,6 +932,15 @@ class Launcher:
                 drone_id, instance_id, sphinx_pid, endpoint.display(),
                 env.env_id, env.ue4_pid,
             )
+            # Now that sphinx is running, sphinx-cli can talk to it —
+            # apply the deferred world preset (sky etc.) the env asked
+            # for. Idempotent, so running it on every spawn is fine
+            # (cheap, and self-corrects if the world drifted).
+            try:
+                world = self.registry.world(env.world_name)
+                self._apply_post_start_world_params(env.world_name, world)
+            except Exception as e:
+                log.warning("post-spawn world params failed: %s", e)
             return updated
 
     def stop(self, drone_id: str) -> None:
@@ -1120,7 +1203,9 @@ class Launcher:
             self._refresh_session()
         return self.session.env if self.session else {}
 
-    def _launch_ue4(self, env_id: str, world) -> int:
+    def _launch_ue4(self, env_id: str, world,
+                     res_x: int | None = None,
+                     res_y: int | None = None) -> int:
         """Start the UE4 application for the environment. Returns
         ue4_pid. Drone-agnostic: no sphinx is started here."""
         env_log_dir = self.log_dir / env_id
@@ -1142,6 +1227,8 @@ class Launcher:
             instance_id=0,
             endpoint=None,
             config_file=world.config_file,
+            res_x=res_x,
+            res_y=res_y,
         )
         ue4_proc = subprocess.Popen(
             ue4_argv, stdout=ue4_log, stderr=subprocess.STDOUT,
@@ -1235,6 +1322,8 @@ class Launcher:
         instance_id: int,
         endpoint: DroneEndpoint | None,
         config_file: str | None = None,
+        res_x: int | None = None,
+        res_y: int | None = None,
     ) -> tuple[list[str], dict[str, str]]:
         """Build the parrot-ue4-<world> argv.
 
@@ -1246,10 +1335,13 @@ class Launcher:
         """
         argv: list[str] = [world_binary]
         # Parrot's UE4 binaries accept -ResX/-ResY/-Windowed for size.
-        # Resolution is intentionally generous so the operator can see
-        # the arena clearly via Sunshine — UE4 defaults to a small
-        # window otherwise.
-        argv.extend(["-ResX=1280", "-ResY=720", "-Windowed"])
+        # Resolution is configurable per env-start request; defaults
+        # come from launcher.config.ue4.res_x/res_y, falling back to
+        # 1280x1024 (operator's preferred default for the SDC arena).
+        ue4_cfg = self.config.get("ue4", {}) or {}
+        rx = int(res_x or ue4_cfg.get("res_x") or 1280)
+        ry = int(res_y or ue4_cfg.get("res_y") or 1024)
+        argv.extend([f"-ResX={rx}", f"-ResY={ry}", "-Windowed"])
         # `-Port` only relevant in multi-instance mode. When started
         # by `start_environment` we have no endpoint (env-only spawn),
         # and the single-instance default port is fine.
@@ -1258,6 +1350,83 @@ class Launcher:
         if config_file:
             argv.append(f"-config-file={config_file}")
         return argv, {}
+
+    def _hide_ue4_panels(self, ue4_pid: int | None = None) -> None:
+        """Send F10 to the UE4 window after launch so only the 3D
+        viewport is visible (Sphinx's HMI overlay panels — cameras list,
+        details panel, sub-windows — are toggled off via F10 per the
+        UE4 app HMI docs). Best-effort: requires xdotool to be
+        installed and the X DISPLAY environment to be reachable.
+
+        Reads DISPLAY + XAUTHORITY directly from the UE4 process's
+        /proc/<pid>/environ instead of relying on the launcher's own
+        session-detect — guarantees we connect to the same X server
+        the UE4 window is on, which is the only reliable way under
+        gdm/Wayland-X11 mixed sessions where session-detect produces
+        an empty DISPLAY."""
+        if self.dry_run:
+            return
+        if not shutil.which("xdotool"):
+            log.warning("xdotool not installed — can't auto-hide UE panels")
+            return
+        env = dict(os.environ)
+        # Override DISPLAY/XAUTHORITY from the UE4 process if available.
+        if ue4_pid:
+            try:
+                with open(f"/proc/{ue4_pid}/environ", "rb") as f:
+                    raw = f.read()
+                for kv in raw.split(b"\0"):
+                    if kv.startswith(b"DISPLAY="):
+                        env["DISPLAY"] = kv[len(b"DISPLAY="):].decode()
+                    elif kv.startswith(b"XAUTHORITY="):
+                        env["XAUTHORITY"] = kv[len(b"XAUTHORITY="):].decode()
+            except (FileNotFoundError, PermissionError) as e:
+                log.warning("can't read /proc/%d/environ for DISPLAY: %s",
+                            ue4_pid, e)
+        # Poll for the UE4 window — Vulkan + assets loading can take
+        # 5–15 s on first start so a fixed-sleep approach was racy. Try
+        # for up to 30s, sending F10 the moment the window appears.
+        deadline = time.time() + 30.0
+        last_search_rc = None
+        while time.time() < deadline:
+            try:
+                # First, just search — don't chain the key send. That
+                # way we know exactly when the window is up before we
+                # try to send the key.
+                find = subprocess.run(
+                    ["xdotool", "search", "--name", "Development"],
+                    capture_output=True, text=True, timeout=3, env=env,
+                )
+                last_search_rc = find.returncode
+                if find.returncode == 0 and find.stdout.strip():
+                    wids = find.stdout.strip().splitlines()
+                    # Now send F10 to each matched window.
+                    send_ok = False
+                    for wid in wids:
+                        s = subprocess.run(
+                            ["xdotool", "key", "--window", wid,
+                             "--clearmodifiers", "F10"],
+                            capture_output=True, text=True, timeout=3,
+                            env=env,
+                        )
+                        if s.returncode == 0:
+                            send_ok = True
+                    if send_ok:
+                        log.info(
+                            "sent F10 to UE4 window(s) %s — panels hidden "
+                            "(DISPLAY=%s)", wids, env.get("DISPLAY", "?"),
+                        )
+                        return
+                time.sleep(1.0)
+            except (FileNotFoundError, subprocess.TimeoutExpired) as e:
+                log.warning("xdotool poll failed: %s", e)
+                return
+        log.warning(
+            "UE4 window not found by xdotool within 30s "
+            "(last search rc=%s, DISPLAY=%s) — panels NOT hidden, "
+            "press F10 manually in the UE4 window if needed.",
+            last_search_rc, env.get("DISPLAY", "?"),
+        )
 
     def _terminate_pid(self, pid: int, sigterm_grace_s: float = 1.5) -> None:
         """Kill the process group containing ``pid``: send SIGTERM, wait

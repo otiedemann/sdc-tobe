@@ -99,6 +99,12 @@ class SpawnRequest(BaseModel):
 
 class EnvSpawnRequest(BaseModel):
     world_name: str = Field(..., examples=["empty", "sdc_arena"])
+    res_x: int | None = Field(None, ge=320, le=4096,
+                              description="UE window width in pixels (default 1280)")
+    res_y: int | None = Field(None, ge=240, le=4096,
+                              description="UE window height in pixels (default 1024)")
+    hide_panels: bool | None = Field(None,
+                                     description="Send F10 to UE window so only the 3D viewport is visible")
 
 
 class FCSpawnRequest(BaseModel):
@@ -119,6 +125,17 @@ class StatusOK(BaseModel):
 
 @app.get("/", response_class=HTMLResponse)
 def index():
+    # Cache-bust the served static assets via mtime — without this, the
+    # browser cached /static/app.js indefinitely and users continued to
+    # hit old behaviour after we shipped UI fixes (e.g. FC stop button
+    # feedback). Bumping the query string on every page load forces the
+    # browser to refetch when the file actually changes.
+    static_dir = ROOT / "static"
+    def _v(name: str) -> int:
+        try:
+            return int((static_dir / name).stat().st_mtime)
+        except FileNotFoundError:
+            return 0
     return _render(
         "index.html",
         title="Sphinx Control",
@@ -127,6 +144,8 @@ def index():
         network_warning=launcher.network_warning,
         session_warning=launcher.session_warning,
         dry_run=launcher.dry_run,
+        app_js_v=_v("app.js"),
+        app_css_v=_v("app.css"),
     )
 
 
@@ -142,7 +161,12 @@ def api_get_environment():
 @app.post("/api/environment", status_code=201)
 def api_start_environment(req: EnvSpawnRequest):
     try:
-        env = launcher.start_environment(EnvironmentRequest(world_name=req.world_name))
+        env = launcher.start_environment(EnvironmentRequest(
+            world_name=req.world_name,
+            res_x=req.res_x,
+            res_y=req.res_y,
+            hide_panels=req.hide_panels,
+        ))
     except (KeyError, ValueError) as e:
         raise HTTPException(status_code=400, detail=str(e))
     except RuntimeError as e:
