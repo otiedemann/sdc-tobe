@@ -410,6 +410,19 @@ def main() -> int:
             parse_rgb(ns.floor_color_rgb), 0.85,
         )
         print(f"  ✓ {out_dir / 'floor.fbx'}")
+        # Coloured floor zones for the SDC arena: red 7m on left side,
+        # blue 7m on right side, neutral middle handled by the base
+        # floor.fbx. YAML emitter scales these into 7×10.8m strips.
+        _build_unit_cube_fbx(
+            out_dir / "floor_red.fbx", "arena_floor_red",
+            (200, 60, 60), 0.85,
+        )
+        print(f"  ✓ {out_dir / 'floor_red.fbx'}")
+        _build_unit_cube_fbx(
+            out_dir / "floor_blue.fbx", "arena_floor_blue",
+            (60, 80, 200), 0.85,
+        )
+        print(f"  ✓ {out_dir / 'floor_blue.fbx'}")
         _build_unit_cube_fbx(
             out_dir / "pillar.fbx", "arena_pillar",
             parse_rgb(ns.pillar_color_rgb), 0.6,

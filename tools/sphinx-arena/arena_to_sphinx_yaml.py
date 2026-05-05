@@ -716,6 +716,56 @@ def main() -> int:
             n_pillars += 1
 
     if emit_floor:
+        # Coloured arena floor: red 7 m + neutral 6 m + blue 7 m strip,
+        # spanning the full arena depth (10.8 m). Each strip is its
+        # own scaled unit-cube FBX (floor_red, floor (neutral grey),
+        # floor_blue) so we get separate solid-colour zones without
+        # multi-material FBX imports. Strips sit at 5 cm above UE
+        # default ground (z=0) so the playable surface is the
+        # coloured arena, not the cloudy default world.
+        ARENA_LEN = 20.0     # arena X-axis length (-10..+10)
+        ARENA_DEPTH = 10.8   # arena Y-axis depth
+        ZONE_END = 7.0       # red & blue zones each 7 m of the length
+        ZONE_MID = ARENA_LEN - 2 * ZONE_END  # neutral 6 m in middle
+        FLOOR_THICK = 0.10
+        FLOOR_TOP_Z = 0.05
+        zone_z_center = FLOOR_TOP_Z - FLOOR_THICK / 2.0
+        # Per-zone arena X centres
+        red_cx = -ARENA_LEN / 2 + ZONE_END / 2     # = -6.5
+        mid_cx = 0.0
+        blue_cx = ARENA_LEN / 2 - ZONE_END / 2     # = +6.5
+        # Marker-bbox-centred Y (cy = (y_min+y_max)/2)
+        ys = [float(m["y"]) for m in arena.get("markers", [])] or [0.0, 10.8]
+        cy = (min(ys) + max(ys)) / 2.0
+        ax_for_ue_x = axis_map.ue_x[0]
+        ax_for_ue_y = axis_map.ue_y[0]
+        for zone_name, fbx_name, cx_arena, length_m in (
+            ("arena_floor_red",     "floor_red.fbx",  red_cx,  ZONE_END),
+            ("arena_floor_neutral", "floor.fbx",      mid_cx,  ZONE_MID),
+            ("arena_floor_blue",    "floor_blue.fbx", blue_cx, ZONE_END),
+        ):
+            ux_m, uy_m, uz_m = shifted_apply((cx_arena, cy, zone_z_center))
+            loc_cm = (ux_m * 100.0, uy_m * 100.0, uz_m * 100.0)
+            arena_dims = {0: length_m, 1: ARENA_DEPTH}
+            ue_x_size = arena_dims[ax_for_ue_x]
+            ue_y_size = arena_dims[ax_for_ue_y]
+            out_lines.append(
+                f"  # Floor zone {zone_name} — {length_m} × "
+                f"{ARENA_DEPTH} × {FLOOR_THICK} m."
+            )
+            out_lines.append(emit_yaml_block(
+                name=zone_name,
+                fbx_path=fbx_dir / fbx_name,
+                location_cm=loc_cm,
+                rotation_deg=(0.0, 0.0, 0.0),
+                scale=(ue_x_size, ue_y_size, FLOOR_THICK),
+                snap_to_ground=False,
+            ))
+            out_lines.append("")
+        n_floor = 3
+        # Continue to skip the legacy single-50x50 emit block below.
+        emit_floor = False
+    if False:  # legacy single-floor branch — disabled
         # Floor: a unit cube scaled to a generous footprint (default
         # 50×50 m, 1 m thick). Centre it at the arena's marker bbox
         # centre so it covers symmetrically. Built oversized on

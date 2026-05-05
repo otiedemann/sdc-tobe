@@ -404,26 +404,35 @@ class Launcher:
         )
         if not sky_preset:
             return
-        # Give the UE process a moment to come fully up before sphinx-cli
-        # tries to talk to it. 2s is enough on the SDC host.
-        time.sleep(2.0)
-        try:
-            result = subprocess.run(
-                ["sphinx-cli", "param", "-m", "world",
-                 "sky/sky", "preset", sky_preset],
-                capture_output=True, text=True, timeout=8,
-            )
-            if result.returncode == 0:
-                log.info(
-                    "world '%s' sky preset → %s", world_name, sky_preset,
+        # Poll sphinx-cli up to 30 s. After spawn() returns, sphinx is
+        # still initializing and connecting to UE4 — calling sphinx-cli
+        # too early gets 'An instance of Sphinx is not running'. Retry
+        # on a 1.5s cadence until it succeeds or we give up.
+        deadline = time.time() + 30.0
+        attempt = 0
+        last_err = ""
+        while time.time() < deadline:
+            attempt += 1
+            try:
+                result = subprocess.run(
+                    ["sphinx-cli", "param", "-m", "world",
+                     "sky/sky", "preset", sky_preset],
+                    capture_output=True, text=True, timeout=4,
                 )
-            else:
-                log.warning(
-                    "sphinx-cli failed to set sky preset (rc=%d): %s%s",
-                    result.returncode, result.stdout, result.stderr,
-                )
-        except (FileNotFoundError, subprocess.TimeoutExpired) as e:
-            log.warning("sphinx-cli unavailable for sky preset: %s", e)
+                if result.returncode == 0:
+                    log.info(
+                        "world '%s' sky preset → %s (attempt %d)",
+                        world_name, sky_preset, attempt,
+                    )
+                    return
+                last_err = (result.stdout + result.stderr).strip()
+            except (FileNotFoundError, subprocess.TimeoutExpired) as e:
+                last_err = str(e)
+            time.sleep(1.5)
+        log.warning(
+            "sphinx-cli sky preset never succeeded after 30s: %s",
+            last_err,
+        )
 
     def stop_environment(self) -> None:
         """Stop the current environment AND any drones attached to it.
