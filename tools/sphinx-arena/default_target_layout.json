@@ -1,5 +1,5 @@
 {
-  "_comment": "SDC26 target box placements: 3 blue (31-33) right side, 3 red (41-43) left side. Markers aligned with wall markers (red roll=180 like left wall, blue roll=0 like right wall), then rotated -10\u00b0 on the Z axis (yaw=-10\u00b0). Spares 34-36/44-46 disabled.",
+  "_comment": "SDC26 target box placements: 3 blue (31-33) right side, 3 red (41-43) left side. All rotations set to 0 for now (no tilt/twist) \u2014 marker FBX baked orientation determines facing. Spares 34-36/44-46 disabled.",
   "marker_size_m": 0.19,
   "box_size_m": 0.5,
   "boxes": [
@@ -11,9 +11,9 @@
       "y": 8.0,
       "z": 1.0,
       "pitch_deg": 0.0,
-      "yaw_deg": -10.0,
+      "yaw_deg": 0.0,
       "enabled": true,
-      "roll_deg": 180.0
+      "roll_deg": 0.0
     },
     {
       "id": 42,
@@ -23,9 +23,9 @@
       "y": 5.4,
       "z": 1.0,
       "pitch_deg": 0.0,
-      "yaw_deg": -10.0,
+      "yaw_deg": 0.0,
       "enabled": true,
-      "roll_deg": 180.0
+      "roll_deg": 0.0
     },
     {
       "id": 43,
@@ -35,9 +35,9 @@
       "y": 3.0,
       "z": 1.0,
       "pitch_deg": 0.0,
-      "yaw_deg": -10.0,
+      "yaw_deg": 0.0,
       "enabled": true,
-      "roll_deg": 180.0
+      "roll_deg": 0.0
     },
     {
       "id": 31,
@@ -47,7 +47,7 @@
       "y": 8.0,
       "z": 1.0,
       "pitch_deg": 0.0,
-      "yaw_deg": -10.0,
+      "yaw_deg": 0.0,
       "enabled": true,
       "roll_deg": 0.0
     },
@@ -59,7 +59,7 @@
       "y": 5.4,
       "z": 1.0,
       "pitch_deg": 0.0,
-      "yaw_deg": -10.0,
+      "yaw_deg": 0.0,
       "enabled": true,
       "roll_deg": 0.0
     },
@@ -71,7 +71,7 @@
       "y": 3.0,
       "z": 1.0,
       "pitch_deg": 0.0,
-      "yaw_deg": -10.0,
+      "yaw_deg": 0.0,
       "enabled": true,
       "roll_deg": 0.0
     },
@@ -83,7 +83,7 @@
       "y": 0.0,
       "z": 1.0,
       "pitch_deg": 0.0,
-      "yaw_deg": -10.0,
+      "yaw_deg": 0.0,
       "enabled": false,
       "roll_deg": 0.0
     },
@@ -95,7 +95,7 @@
       "y": 0.0,
       "z": 1.0,
       "pitch_deg": 0.0,
-      "yaw_deg": -10.0,
+      "yaw_deg": 0.0,
       "enabled": false,
       "roll_deg": 0.0
     },
@@ -107,7 +107,7 @@
       "y": 0.0,
       "z": 1.0,
       "pitch_deg": 0.0,
-      "yaw_deg": -10.0,
+      "yaw_deg": 0.0,
       "enabled": false,
       "roll_deg": 0.0
     },
@@ -119,9 +119,9 @@
       "y": 0.0,
       "z": 1.0,
       "pitch_deg": 0.0,
-      "yaw_deg": -10.0,
+      "yaw_deg": 0.0,
       "enabled": false,
-      "roll_deg": 180.0
+      "roll_deg": 0.0
     },
     {
       "id": 45,
@@ -131,9 +131,9 @@
       "y": 0.0,
       "z": 1.0,
       "pitch_deg": 0.0,
-      "yaw_deg": -10.0,
+      "yaw_deg": 0.0,
       "enabled": false,
-      "roll_deg": 180.0
+      "roll_deg": 0.0
     },
     {
       "id": 46,
@@ -143,9 +143,9 @@
       "y": 0.0,
       "z": 1.0,
       "pitch_deg": 0.0,
-      "yaw_deg": -10.0,
+      "yaw_deg": 0.0,
       "enabled": false,
-      "roll_deg": 180.0
+      "roll_deg": 0.0
     }
   ]
 }

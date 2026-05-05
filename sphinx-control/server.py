@@ -119,6 +119,17 @@ class StatusOK(BaseModel):
 
 @app.get("/", response_class=HTMLResponse)
 def index():
+    # Cache-bust the served static assets via mtime — without this, the
+    # browser cached /static/app.js indefinitely and users continued to
+    # hit old behaviour after we shipped UI fixes (e.g. FC stop button
+    # feedback). Bumping the query string on every page load forces the
+    # browser to refetch when the file actually changes.
+    static_dir = ROOT / "static"
+    def _v(name: str) -> int:
+        try:
+            return int((static_dir / name).stat().st_mtime)
+        except FileNotFoundError:
+            return 0
     return _render(
         "index.html",
         title="Sphinx Control",
@@ -127,6 +138,8 @@ def index():
         network_warning=launcher.network_warning,
         session_warning=launcher.session_warning,
         dry_run=launcher.dry_run,
+        app_js_v=_v("app.js"),
+        app_css_v=_v("app.css"),
     )
 
 
