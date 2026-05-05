@@ -930,25 +930,31 @@ def main() -> int:
 
     n_actor_paths = 0
     if args.emit_actor_paths:
-        # Closed-loop walking/driving path running OUTSIDE the arena
-        # walls. Coordinates are in WORLD frame (post axis_map +
+        # Smooth elliptical loop running OUTSIDE the arena walls so
+        # actors keep walking/driving without ever stopping at sharp
+        # corners. Coordinates are in WORLD frame (post axis_map +
         # center_offset) in METRES — that's what Sphinx AMS Paths
         # consume. Arena walls (after centering) sit at world
-        # x ≈ ±5.4 (short axis) and y ≈ ±10 (long axis); the path
-        # stays ~2 m beyond that on every side.
-        # Per Sphinx docs, each SplinePoint is "x y z [Action] [Speed]"
-        # with Action ∈ {Walk, Run, Stop} (default Walk) and Speed in
-        # km/h for vehicles. We use a generous 1.5 m elevation so the
-        # actors clear the slightly raised arena floor.
+        # x ≈ ±5.4 (short axis) and y ≈ ±10 (long axis); the ellipse
+        # stays ~2.5 m beyond that on every side.
+        # Per Sphinx docs each SplinePoint is "x y z [Action] [Speed]"
+        # with Action ∈ {Walk, Run, Stop} and Speed in km/h. We use 24
+        # samples around the ellipse so the spline is visually smooth
+        # and ClosedLoop stitches the last point back to the first.
+        import math as _math
+        a = 8.0    # half-width along world X (short side of arena +2.6m)
+        b = 12.5   # half-length along world Y (long side +2.5m)
+        z = 0.40
+        n_pts = 24
         out_lines.append("")
         out_lines.append("Paths:")
         out_lines.append("  - Name: 'PerimeterPath'")
         out_lines.append("    SplinePoints:")
-        for px, py in (
-            ( 7.5, -12.0), ( 7.5,  12.0),
-            (-7.5,  12.0), (-7.5, -12.0),
-        ):
-            out_lines.append(f"      - {px:.2f} {py:.2f} 0.40 Walk 5")
+        for i in range(n_pts):
+            t = 2.0 * _math.pi * i / n_pts
+            px = a * _math.cos(t)
+            py = b * _math.sin(t)
+            out_lines.append(f"      - {px:.2f} {py:.2f} {z:.2f} Walk 5")
         out_lines.append("    ClosedLoop: true")
         out_lines.append("")
         n_actor_paths = 1
