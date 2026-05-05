@@ -1369,8 +1369,6 @@ class Launcher:
         if not shutil.which("xdotool"):
             log.warning("xdotool not installed — can't auto-hide UE panels")
             return
-        # Wait briefly so the window has time to appear.
-        time.sleep(2.0)
         env = dict(os.environ)
         # Override DISPLAY/XAUTHORITY from the UE4 process if available.
         if ue4_pid:
@@ -1385,27 +1383,50 @@ class Launcher:
             except (FileNotFoundError, PermissionError) as e:
                 log.warning("can't read /proc/%d/environ for DISPLAY: %s",
                             ue4_pid, e)
-        # The UE4 window title is "Empty (64-bit Development SF_VULKAN_SM5)"
-        # or similar — match by substring "Development" which all
-        # parrot-ue4-* binaries include.
-        try:
-            r = subprocess.run(
-                ["xdotool", "search", "--name", "Development",
-                 "key", "--clearmodifiers", "F10"],
-                capture_output=True, text=True, timeout=5, env=env,
-            )
-            if r.returncode == 0:
-                log.info("sent F10 to UE4 window — panels hidden "
-                         "(DISPLAY=%s)", env.get("DISPLAY", "?"))
-            else:
-                log.warning(
-                    "xdotool F10 failed (rc=%d) DISPLAY=%s: stdout=%r "
-                    "stderr=%r",
-                    r.returncode, env.get("DISPLAY", "?"),
-                    r.stdout, r.stderr,
+        # Poll for the UE4 window — Vulkan + assets loading can take
+        # 5–15 s on first start so a fixed-sleep approach was racy. Try
+        # for up to 30s, sending F10 the moment the window appears.
+        deadline = time.time() + 30.0
+        last_search_rc = None
+        while time.time() < deadline:
+            try:
+                # First, just search — don't chain the key send. That
+                # way we know exactly when the window is up before we
+                # try to send the key.
+                find = subprocess.run(
+                    ["xdotool", "search", "--name", "Development"],
+                    capture_output=True, text=True, timeout=3, env=env,
                 )
-        except (FileNotFoundError, subprocess.TimeoutExpired) as e:
-            log.warning("xdotool F10 send failed: %s", e)
+                last_search_rc = find.returncode
+                if find.returncode == 0 and find.stdout.strip():
+                    wids = find.stdout.strip().splitlines()
+                    # Now send F10 to each matched window.
+                    send_ok = False
+                    for wid in wids:
+                        s = subprocess.run(
+                            ["xdotool", "key", "--window", wid,
+                             "--clearmodifiers", "F10"],
+                            capture_output=True, text=True, timeout=3,
+                            env=env,
+                        )
+                        if s.returncode == 0:
+                            send_ok = True
+                    if send_ok:
+                        log.info(
+                            "sent F10 to UE4 window(s) %s — panels hidden "
+                            "(DISPLAY=%s)", wids, env.get("DISPLAY", "?"),
+                        )
+                        return
+                time.sleep(1.0)
+            except (FileNotFoundError, subprocess.TimeoutExpired) as e:
+                log.warning("xdotool poll failed: %s", e)
+                return
+        log.warning(
+            "UE4 window not found by xdotool within 30s "
+            "(last search rc=%s, DISPLAY=%s) — panels NOT hidden, "
+            "press F10 manually in the UE4 window if needed.",
+            last_search_rc, env.get("DISPLAY", "?"),
+        )
 
     def _terminate_pid(self, pid: int, sigterm_grace_s: float = 1.5) -> None:
         """Kill the process group containing ``pid``: send SIGTERM, wait
