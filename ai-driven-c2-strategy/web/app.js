@@ -1,10 +1,15 @@
+
 const viewport = document.getElementById('viewport');
 const scene = new THREE.Scene();
 scene.background = new THREE.Color(0x070b12);
 
 const camera = new THREE.PerspectiveCamera(55, 1, 0.1, 1000);
-camera.position.set(0, -17, 10);
-camera.lookAt(0, 5, 0);
+const cameraTarget = new THREE.Vector3(0, 5, 1.6);
+const cameraState = {
+  radius: 22,
+  theta: 0,
+  phi: Math.PI / 3,
+};
 
 const renderer = new THREE.WebGLRenderer({ antialias: true });
 viewport.appendChild(renderer.domElement);
@@ -14,6 +19,15 @@ scene.add(root);
 
 const objects = new Map();
 const commandLines = new Map();
+const pointerState = {
+  active: false,
+  mode: 'rotate',
+  pointerId: null,
+  lastX: 0,
+  lastY: 0,
+  touches: new Map(),
+  pinchDistance: 0,
+};
 
 scene.add(new THREE.AmbientLight(0xffffff, 0.9));
 const light = new THREE.DirectionalLight(0xffffff, 0.8);
@@ -28,6 +42,121 @@ function resize() {
 }
 window.addEventListener('resize', resize);
 resize();
+updateCamera();
+
+function updateCamera() {
+  const sinPhi = Math.sin(cameraState.phi);
+  camera.position.set(
+    cameraTarget.x + cameraState.radius * sinPhi * Math.sin(cameraState.theta),
+    cameraTarget.y - cameraState.radius * sinPhi * Math.cos(cameraState.theta),
+    cameraTarget.z + cameraState.radius * Math.cos(cameraState.phi)
+  );
+  camera.lookAt(cameraTarget);
+}
+
+function clampCamera() {
+  cameraState.radius = Math.min(Math.max(cameraState.radius, 6), 60);
+  cameraState.phi = Math.min(Math.max(cameraState.phi, 0.18), Math.PI / 2 - 0.05);
+  cameraTarget.x = Math.min(Math.max(cameraTarget.x, -16), 16);
+  cameraTarget.y = Math.min(Math.max(cameraTarget.y, -5), 15);
+  cameraTarget.z = Math.min(Math.max(cameraTarget.z, 0), 8);
+}
+
+function rotateView(dx, dy) {
+  cameraState.theta -= dx * 0.006;
+  cameraState.phi -= dy * 0.004;
+  clampCamera();
+  updateCamera();
+}
+
+function panView(dx, dy) {
+  const forward = new THREE.Vector3();
+  camera.getWorldDirection(forward);
+  const right = new THREE.Vector3().crossVectors(forward, camera.up).normalize();
+  const up = new THREE.Vector3().crossVectors(right, forward).normalize();
+  const scale = cameraState.radius * 0.0018;
+  cameraTarget.addScaledVector(right, -dx * scale);
+  cameraTarget.addScaledVector(up, dy * scale);
+  clampCamera();
+  updateCamera();
+}
+
+function zoomView(delta) {
+  cameraState.radius *= Math.exp(delta * 0.001);
+  clampCamera();
+  updateCamera();
+}
+
+function pointerMode(event) {
+  if (event.button === 1 || event.button === 2 || event.shiftKey || event.ctrlKey) {
+    return 'pan';
+  }
+  return 'rotate';
+}
+
+renderer.domElement.addEventListener('contextmenu', (event) => event.preventDefault());
+renderer.domElement.addEventListener('wheel', (event) => {
+  event.preventDefault();
+  zoomView(event.deltaY);
+}, { passive: false });
+
+renderer.domElement.addEventListener('pointerdown', (event) => {
+  renderer.domElement.setPointerCapture(event.pointerId);
+  pointerState.active = true;
+  pointerState.pointerId = event.pointerId;
+  pointerState.lastX = event.clientX;
+  pointerState.lastY = event.clientY;
+  pointerState.mode = pointerMode(event);
+  pointerState.touches.set(event.pointerId, { x: event.clientX, y: event.clientY });
+  pointerState.pinchDistance = currentPinchDistance();
+});
+
+renderer.domElement.addEventListener('pointermove', (event) => {
+  if (pointerState.touches.has(event.pointerId)) {
+    pointerState.touches.set(event.pointerId, { x: event.clientX, y: event.clientY });
+  }
+
+  if (pointerState.touches.size >= 2) {
+    const distance = currentPinchDistance();
+    if (pointerState.pinchDistance > 0 && distance > 0) {
+      zoomView((pointerState.pinchDistance - distance) * 4);
+    }
+    pointerState.pinchDistance = distance;
+    return;
+  }
+
+  if (!pointerState.active || pointerState.pointerId !== event.pointerId) return;
+  const dx = event.clientX - pointerState.lastX;
+  const dy = event.clientY - pointerState.lastY;
+  pointerState.lastX = event.clientX;
+  pointerState.lastY = event.clientY;
+
+  if (pointerState.mode === 'pan') {
+    panView(dx, dy);
+  } else {
+    rotateView(dx, dy);
+  }
+});
+
+renderer.domElement.addEventListener('pointerup', endPointer);
+renderer.domElement.addEventListener('pointercancel', endPointer);
+
+function endPointer(event) {
+  pointerState.touches.delete(event.pointerId);
+  if (pointerState.pointerId === event.pointerId) {
+    pointerState.active = false;
+    pointerState.pointerId = null;
+  }
+  pointerState.pinchDistance = currentPinchDistance();
+}
+
+function currentPinchDistance() {
+  const touches = Array.from(pointerState.touches.values());
+  if (touches.length < 2) return 0;
+  const dx = touches[0].x - touches[1].x;
+  const dy = touches[0].y - touches[1].y;
+  return Math.hypot(dx, dy);
+}
 
 function makeLine(points, color) {
   const geometry = new THREE.BufferGeometry().setFromPoints(points);
@@ -143,13 +272,19 @@ function updateScene(data) {
   }
 }
 
-async function poll() {
-  try {
-    const response = await fetch('/state.json', { cache: 'no-store' });
-    updateScene(await response.json());
-  } catch (error) {
-    document.getElementById('summary').textContent = `State fetch failed: ${error}`;
+function connectStateStream() {
+  if (!window.EventSource) {
+    document.getElementById('summary').textContent = 'This browser does not support Server-Sent Events.';
+    return;
   }
+
+  const events = new EventSource('/events');
+  events.addEventListener('state', (event) => {
+    updateScene(JSON.parse(event.data));
+  });
+  events.onerror = () => {
+    document.getElementById('summary').textContent = 'SSE connection interrupted; reconnecting...';
+  };
 }
 
 function animate() {
@@ -157,6 +292,5 @@ function animate() {
   renderer.render(scene, camera);
 }
 
-setInterval(poll, 300);
-poll();
+connectStateStream();
 animate();

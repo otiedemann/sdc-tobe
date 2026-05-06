@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -19,6 +20,8 @@ class StrategyWebServer:
         web_dir = self.web_dir
 
         class Handler(BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
             def do_GET(self) -> None:  # noqa: N802 - stdlib API name.
                 if self.path in {"/", "/index.html"}:
                     self._send_file(web_dir / "index.html", "text/html; charset=utf-8")
@@ -28,6 +31,8 @@ class StrategyWebServer:
                     self._send_file(web_dir / "style.css", "text/css; charset=utf-8")
                 elif self.path == "/state.json":
                     self._send_json(simulation.snapshot())
+                elif self.path == "/events":
+                    self._send_events(simulation)
                 else:
                     self.send_error(404)
 
@@ -54,6 +59,26 @@ class StrategyWebServer:
                 self.send_header("Content-Length", str(len(data)))
                 self.end_headers()
                 self.wfile.write(data)
+
+            def _send_events(self, simulation: Simulation) -> None:
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+                self.send_header("Cache-Control", "no-store")
+                self.send_header("Connection", "keep-alive")
+                self.send_header("X-Accel-Buffering", "no")
+                self.end_headers()
+
+                event_id = 0
+                while True:
+                    event_id += 1
+                    payload = json.dumps(simulation.snapshot(), separators=(",", ":"))
+                    message = f"id: {event_id}\nevent: state\ndata: {payload}\n\n".encode("utf-8")
+                    try:
+                        self.wfile.write(message)
+                        self.wfile.flush()
+                    except (BrokenPipeError, ConnectionResetError, TimeoutError):
+                        return
+                    time.sleep(0.25)
 
         server = ThreadingHTTPServer((self.host, self.port), Handler)
         server.serve_forever()

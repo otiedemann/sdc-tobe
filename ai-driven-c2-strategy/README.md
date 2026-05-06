@@ -124,3 +124,5 @@ The 3D display uses Three.js from a CDN. It draws:
 - target boxes colored by current owner,
 - command lines and ghost destination markers for own drones,
 - score, match time, current planner mode, and recent events.
+
+The browser receives live state updates through Server-Sent Events at `/events`.

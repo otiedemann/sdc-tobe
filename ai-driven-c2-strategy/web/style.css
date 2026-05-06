@@ -16,6 +16,7 @@ body {
 #viewport {
   position: relative;
   overflow: hidden;
+  touch-action: none;
 }
 
 #hud {
