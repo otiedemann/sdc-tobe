@@ -182,6 +182,12 @@ class ArucoDetector:
         # heading + position with the midpoint of the two IPPE
         # candidates (used for the truly-frontal blind window).
         self.enable_mirror_collapse = True
+        # Thresholds for the mirror-collapse gate (also tunable via
+        # /tune). Sum-near-zero is the real "is this a mirror pair"
+        # check; max|hdg| restricts firing to the truly-frontal blind
+        # window. Defaults match the dataclass values in MissionConfig.
+        self.mirror_collapse_sum_hdg_deg = 5.0
+        self.mirror_collapse_max_hdg_deg = 10.0
 
         # 3D marker corners in marker frame, OpenCV ArUco order TL-TR-BR-BL,
         # marker plane is z=0. With z pointing AWAY from the marker face,
@@ -348,8 +354,8 @@ class ArucoDetector:
                     # the marker normal (= the wrong answer by ~1 m).
                     # Both individual headings being small is what
                     # restricts us to the actual blind window.
-                    mirrored = (abs(hdg0 + hdg1) < 5.0
-                                and max(abs(hdg0), abs(hdg1)) < 10.0)
+                    mirrored = (abs(hdg0 + hdg1) < self.mirror_collapse_sum_hdg_deg
+                                and max(abs(hdg0), abs(hdg1)) < self.mirror_collapse_max_hdg_deg)
                     similar_err = (err0 < 1.0
                                    and err1 < 2.0 * err0 + 0.2)
                     if mirrored and similar_err and self.enable_mirror_collapse:

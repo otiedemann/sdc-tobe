@@ -496,6 +496,10 @@ def cmd_fly(args: argparse.Namespace) -> int:
                 # IPPE branch picker.
                 detector.enable_mirror_collapse = (
                     cfg.enable_ippe_mirror_collapse)
+                detector.mirror_collapse_sum_hdg_deg = float(
+                    cfg.mirror_collapse_sum_hdg_deg)
+                detector.mirror_collapse_max_hdg_deg = float(
+                    cfg.mirror_collapse_max_hdg_deg)
                 # Detect every visible marker so the operator sees them
                 # all in the video overlay -- the script can target any
                 # marker, and even non-target markers in frame are

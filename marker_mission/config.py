@@ -300,6 +300,15 @@ class MissionConfig:
     enable_ippe_prev_anchor: bool = False          # 2d2b8b6 + a3cbd83 -- DANGEROUS
     enable_ippe_aggregate_oob_discard: bool = True # e144c2d (post-revise + final)
 
+    # Mirror-collapse gate. Both branches' headings must mirror each
+    # other (sum near zero) AND be small in absolute terms (truly
+    # frontal). Above max_hdg the drone is genuinely off-axis and the
+    # branches are distinct -- collapsing would smear the right answer.
+    # Tunable so the operator can dial in the corner-noise envelope of
+    # the deployed marker without a redeploy.
+    mirror_collapse_sum_hdg_deg: float = 5.0
+    mirror_collapse_max_hdg_deg: float = 10.0
+
     # ------------------------------------------------------------------------
     def update_from_dict(self, values: dict) -> dict:
         """Apply a {field: value} dict to this cfg in-place. Returns a
@@ -607,6 +616,16 @@ TUNING_FIELDS = {
         "label": "OOB revise + aggregate discard", "kind": "bool",
         "desc": "Final defensive layer: after picking, re-check the per-marker vote against arena bounds and try alt or drop the marker; after weighted average, discard if the result lands OOB (sticky position holds). Default ON.",
     },
+    "mirror_collapse_sum_hdg_deg": {
+        "label": "Mirror-collapse |sum hdg| max", "kind": "float",
+        "unit": "deg", "step": 0.5,
+        "desc": "Maximum |hdg0 + hdg1| for the two IPPE candidates to count as a mirror pair. Sub-degree numerical equality means perfect mirrors. Default 5 deg leaves room for corner-noise asymmetry. Higher = more frames collapse (but risk smearing genuine off-axis geometry).",
+    },
+    "mirror_collapse_max_hdg_deg": {
+        "label": "Mirror-collapse max|hdg|", "kind": "float",
+        "unit": "deg", "step": 0.5,
+        "desc": "Maximum max(|hdg0|, |hdg1|) for mirror collapse to fire. Restricts collapse to the truly-frontal blind window. Too tight and the picker flickers between branches at corner-noise jitter (~12 deg flicker on small markers); too loose and genuine off-axis cases get smeared. Default 10; try 13-15 for small / distant markers.",
+    },
 }
 
 TUNING_GROUPS = [
@@ -638,6 +657,8 @@ TUNING_GROUPS = [
         ["killswitch_key"]),
     ("IPPE branch picker (advanced)",
         ["enable_ippe_mirror_collapse",
+         "mirror_collapse_sum_hdg_deg",
+         "mirror_collapse_max_hdg_deg",
          "enable_ippe_arena_oob_filter",
          "enable_ippe_alt_branch_swap",
          "enable_ippe_prev_anchor",
