@@ -1,0 +1,186 @@
+---
+# Backup playbook: capture sphinx host state to a local tarball.
+#
+# Usage:
+#   ansible-playbook -i inventory.ini backup.yml --ask-pass
+#
+# Optional overrides:
+#   -e "source_host=sphinx.otconsulting.de"
+#   -e "remote_repo=/home/sdc/sdc-tobe"
+#
+# Output:
+#   ./backups/sphinx-state-YYYYMMDD-HHMMSS.tar.gz
+#   ./backups/sphinx-state-YYYYMMDD-HHMMSS.manifest.txt
+#   ./backups/sphinx-state-YYYYMMDD-HHMMSS.apt-packages.txt
+
+- name: Backup sphinx host state
+  hosts: "{{ source_host | default('source') }}"
+  gather_facts: true
+  vars_files:
+    - vars.yml
+
+  vars:
+    ts: "{{ ansible_date_time.iso8601_basic_short | regex_replace('T', '-') }}"
+    remote_staging: "/tmp/sphinx-state-{{ ts }}"
+    remote_archive: "/tmp/{{ archive_name }}"
+
+  tasks:
+    - name: Ensure local backup dir exists
+      delegate_to: localhost
+      become: false
+      ansible.builtin.file:
+        path: "{{ local_backup_dir }}"
+        state: directory
+        mode: "0755"
+
+    - name: Show what we're backing up
+      ansible.builtin.debug:
+        msg:
+          - "Source host : {{ inventory_hostname }}"
+          - "Repo path   : {{ remote_repo }}"
+          - "Archive     : {{ local_backup_dir }}/{{ archive_name }}"
+
+    # ── Repo state ─────────────────────────────────────────────────
+    - name: Capture git revision + dirty state
+      ansible.builtin.shell: |
+        set -e
+        cd {{ remote_repo }}
+        echo "branch: $(git rev-parse --abbrev-ref HEAD)"
+        echo "sha:    $(git rev-parse HEAD)"
+        echo "subject: $(git log -1 --pretty=%s)"
+        echo "dirty:  $(git status --porcelain | wc -l) files modified"
+        echo
+        echo '── git status ──'
+        git status --short
+        echo
+        echo '── unpushed commits ──'
+        git log @{u}..HEAD --oneline 2>/dev/null || echo "(no upstream)"
+      register: git_state
+      changed_when: false
+
+    - name: Save uncommitted diff (for restore replay if needed)
+      ansible.builtin.shell: |
+        cd {{ remote_repo }}
+        git diff HEAD > {{ remote_staging }}/uncommitted.patch
+        git status --short > {{ remote_staging }}/git-status.txt
+      args:
+        creates: "{{ remote_staging }}/uncommitted.patch"
+
+    - name: Stage the state tree
+      ansible.builtin.file:
+        path: "{{ remote_staging }}"
+        state: directory
+        mode: "0755"
+
+    - name: Write git revision file into the staging tree
+      ansible.builtin.copy:
+        dest: "{{ remote_staging }}/git-revision.txt"
+        content: "{{ git_state.stdout }}\n"
+        mode: "0644"
+
+    # ── apt package list (for parity check on restore target) ──────
+    - name: List parrot-* packages installed
+      ansible.builtin.shell: |
+        dpkg -l 'parrot-*' 2>/dev/null | awk '/^ii/{print $2,$3}'
+      register: parrot_pkgs
+      changed_when: false
+
+    - name: Fetch parrot package list to control machine
+      delegate_to: localhost
+      become: false
+      ansible.builtin.copy:
+        dest: "{{ local_backup_dir }}/sphinx-state-{{ ts }}.apt-packages.txt"
+        content: "{{ parrot_pkgs.stdout }}\n"
+        mode: "0644"
+
+    # ── Trim telemetry logs to newest N ────────────────────────────
+    - name: List telemetry logs (newest first)
+      ansible.builtin.shell: |
+        ls -t /home/sdc/.parrot-sphinx/telemetrylogs/ 2>/dev/null | head -{{ telemetry_keep }}
+      register: telem_logs
+      changed_when: false
+
+    # ── Build the tarball ──────────────────────────────────────────
+    - name: Build tar of state paths (skip missing)
+      ansible.builtin.shell: |
+        set -eu
+        cd /
+        # Build a list of paths that actually exist
+        : > /tmp/sphinx-state-paths.{{ ts }}
+        for p in {{ state_paths | map('quote') | join(' ') }}; do
+          # strip leading slash so the archive is relative
+          if [ -e "$p" ]; then
+            echo "${p#/}" >> /tmp/sphinx-state-paths.{{ ts }}
+          fi
+        done
+        # Add the staging tree (revision info, patches)
+        echo "{{ remote_staging | regex_replace('^/', '') }}" >> /tmp/sphinx-state-paths.{{ ts }}
+        tar --warning=no-file-changed \
+            --exclude='*.pyc' \
+            --exclude='__pycache__' \
+            -czf {{ remote_archive }} \
+            -T /tmp/sphinx-state-paths.{{ ts }}
+        ls -la {{ remote_archive }}
+      register: tar_out
+
+    - name: Show archive size
+      ansible.builtin.debug:
+        msg: "{{ tar_out.stdout_lines | last }}"
+
+    # ── Fetch to control machine ───────────────────────────────────
+    - name: Fetch archive
+      ansible.builtin.fetch:
+        src: "{{ remote_archive }}"
+        dest: "{{ local_backup_dir }}/{{ archive_name }}"
+        flat: true
+
+    - name: Write manifest alongside the archive
+      delegate_to: localhost
+      become: false
+      ansible.builtin.copy:
+        dest: "{{ local_backup_dir }}/sphinx-state-{{ ts }}.manifest.txt"
+        mode: "0644"
+        content: |
+          Sphinx state backup
+          ===================
+          source host : {{ inventory_hostname }}
+          captured at : {{ ansible_date_time.iso8601 }}
+          archive     : {{ archive_name }}
+
+          Git state at capture time
+          -------------------------
+          {{ git_state.stdout }}
+
+          Telemetry logs included (newest {{ telemetry_keep }})
+          ----------------------------------------------------
+          {{ telem_logs.stdout }}
+
+          Parrot packages on source
+          -------------------------
+          {{ parrot_pkgs.stdout }}
+
+          Restore
+          -------
+          Target host must already have parrot-sphinx + the
+          parrot-ue4-* world packages above installed.
+
+          ansible-playbook -i inventory.ini restore.yml --ask-pass \
+              -e "target_host=<host> archive={{ archive_name }}"
+
+    # ── Cleanup remote staging ─────────────────────────────────────
+    - name: Remove remote staging dir
+      ansible.builtin.file:
+        path: "{{ remote_staging }}"
+        state: absent
+
+    - name: Remove remote archive
+      ansible.builtin.file:
+        path: "{{ remote_archive }}"
+        state: absent
+
+    - name: Backup complete
+      ansible.builtin.debug:
+        msg:
+          - "✓ Backup written to {{ local_backup_dir }}/{{ archive_name }}"
+          - "  Manifest: {{ local_backup_dir }}/sphinx-state-{{ ts }}.manifest.txt"
+          - "  Restore : ansible-playbook -i inventory.ini restore.yml -e \"archive={{ archive_name }}\""
