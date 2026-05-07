@@ -176,7 +176,14 @@ RUN curl --fail --silent --show-error --location \
 # (it has read access to releases on private repos by default).
 # Local builds: pass --secret id=ghcr_pat,env=GHCR_PAT.
 ARG FIRMWARE_RELEASE_TAG=firmware-cache-v1
-ARG FIRMWARE_FILENAME=anafi.zip.2a2e73c7-2705-4f77-85e3-bfcd53227a7d.firmware
+# This is the filename firmwared 2.15.1 expects for the
+# anafi-pc.ext2.zip URL — it derives "anafi-pc.ext2.zip" from the URL
+# basename, then appends ".<uuid>.firmware" with the URL's hash UUID.
+# The release asset on GitHub is named anafi.zip.<uuid>.firmware (the
+# bare-metal naming convention from an older firmwared version), so
+# we rename on download.
+ARG FIRMWARE_RELEASE_ASSET=anafi.zip.2a2e73c7-2705-4f77-85e3-bfcd53227a7d.firmware
+ARG FIRMWARE_FILENAME=anafi-pc.ext2.zip.2a2e73c7-2705-4f77-85e3-bfcd53227a7d.firmware
 ARG FIRMWARE_REPO=otiedemann/sdc-tobe
 ARG FIRMWARE_SHA256=30409b1c5375a55e440339a4158bfc29c6db4b5af7fa9a85c426c55608937753
 RUN --mount=type=secret,id=ghcr_pat \
@@ -195,9 +202,9 @@ RUN --mount=type=secret,id=ghcr_pat \
             -H "Accept: application/vnd.github+json" \
             "https://api.github.com/repos/${FIRMWARE_REPO}/releases/tags/${FIRMWARE_RELEASE_TAG}" \
           | python3 -c "import sys,json; d=json.load(sys.stdin); \
-                        m=[a for a in d['assets'] if a['name']=='${FIRMWARE_FILENAME}']; \
+                        m=[a for a in d['assets'] if a['name']=='${FIRMWARE_RELEASE_ASSET}']; \
                         print(m[0]['url']) if m else exit(1)") ; \
-        echo "[firmware] downloading ${FIRMWARE_FILENAME}" ; \
+        echo "[firmware] downloading ${FIRMWARE_RELEASE_ASSET} → ${FIRMWARE_FILENAME}" ; \
         curl -fsSL \
             -H "Authorization: Bearer $TOKEN" \
             -H "Accept: application/octet-stream" \
