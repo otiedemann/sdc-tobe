@@ -61,6 +61,15 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # repo is signed by debian.parrot.com.gpg. We install parrot-sphinx plus
 # both UE4 worlds we use (empty for SDC arena, sphx-tests for the
 # populated test scene).
+#
+# Docker-build hardening:
+#   - parrot-sphinx's preinst script exits non-zero in a containerised
+#     build because it tries to start firmwared/systemd services that
+#     don't exist during `docker build`. Install supporting bits +
+#     policy-rc.d (returns 101 = "do not start any service during
+#     install") + a noop systemctl so the maintainer scripts succeed.
+#   - The actual systemd / udev wiring is recreated at runtime by
+#     the entrypoint, so masking it during build is safe.
 RUN curl --fail --silent --show-error --location \
         https://debian.parrot.com/gpg \
       | gpg --dearmor \
@@ -69,10 +78,29 @@ RUN curl --fail --silent --show-error --location \
         https://debian.parrot.com/ $(lsb_release -cs) main generic" \
       | tee /etc/apt/sources.list.d/debian.parrot.com.list \
     && apt-get update \
+    # supporting libs the parrot maintainer scripts call into
     && apt-get install -y --no-install-recommends \
-        parrot-sphinx \
-        parrot-ue4-empty \
-        parrot-ue4-sphx-tests \
+        systemd systemd-sysv dbus udev kmod \
+    # policy-rc.d: any service start during install returns 101 (skip)
+    && printf '#!/bin/sh\nexit 101\n' > /usr/sbin/policy-rc.d \
+    && chmod +x /usr/sbin/policy-rc.d \
+    # stub systemctl so daemon-reload / start commands no-op
+    && dpkg-divert --local --rename --add /bin/systemctl \
+    && printf '#!/bin/sh\necho "[stub systemctl] $*" >&2\nexit 0\n' > /bin/systemctl \
+    && chmod +x /bin/systemctl \
+    # parrot install — DKMS modules (ulogger-dkms) will fail to build
+    # against a non-existent kernel, that's expected and harmless
+    # for sim use; force the install to continue past those.
+    && (apt-get install -y --no-install-recommends \
+        parrot-sphinx parrot-ue4-empty parrot-ue4-sphx-tests \
+        || (echo "[parrot install] retrying with --fix-broken" \
+            && dpkg --configure -a || true \
+            && apt-get install -y --fix-broken --no-install-recommends \
+                parrot-sphinx parrot-ue4-empty parrot-ue4-sphx-tests)) \
+    # restore real systemctl + drop policy-rc.d
+    && rm -f /bin/systemctl \
+    && dpkg-divert --local --rename --remove /bin/systemctl \
+    && rm -f /usr/sbin/policy-rc.d \
     && rm -rf /var/lib/apt/lists/*
 
 # ── Tailscale ──────────────────────────────────────────────────────────

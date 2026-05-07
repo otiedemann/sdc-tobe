@@ -34,9 +34,13 @@ permissions:
 jobs:
   build:
     runs-on: ubuntu-22.04
+    env:
+      # Opt into Node 24 ahead of the June 2026 deadline to silence
+      # the deprecation warning on @v3/@v4 javascript actions.
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
