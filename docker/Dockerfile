@@ -55,6 +55,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         python3-numpy \
         build-essential pkg-config \
         ffmpeg \
+        # firmwared's hook scripts rely on these standard utilities
+        # (e.g. curl.hook line 123 calls `file` to MIME-sniff the
+        # downloaded firmware, then `unzip` to crack open the .ext2.zip).
+        # The CUDA base image is minimised and ships none of them.
+        file unzip xz-utils \
     && rm -rf /var/lib/apt/lists/* \
     # Ubuntu 22.04's python3-opencv apt package is OpenCV 4.5.x
     # where cv2.aruco still has drawMarker (not generateImageMarker).
