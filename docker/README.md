@@ -113,8 +113,9 @@ Dedicated, your own box, on-demand Vast.ai), you can pass
 for fresh Ubuntu 22.04 GPU servers: [`cloud-bootstrap.sh`](cloud-bootstrap.sh).
 
 Provider-specific walkthroughs:
-- [DataCrunch](DATACRUNCH.md) — EU, hourly billing (~0.40 €/h RTX 4090)
-- [Hetzner Dedicated](HETZNER.md) — DE, monthly billing (~80 €/Mt)
+- **[AWS EC2](AWS.md)** — eu-central-1, Spot pricing (~€0.18/h g4dn.xlarge T4) — *recommended for ad-hoc flying*
+- [DataCrunch](DATACRUNCH.md) — EU, hourly billing (RTX 4090 sometimes available ~0.40 €/h)
+- [Hetzner Dedicated](HETZNER.md) — DE, monthly billing (~80 €/Mt) — *recommended for 24/7 use*
 
 ## Run on Lambda Labs / other GPU clouds
 
