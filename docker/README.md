@@ -107,10 +107,14 @@ that firmwared needs.** The image won't work there. For RunPod
 specifically the symptom is the drone goes STOPPED right after
 spawn with `mount: Operation not permitted` in firmwared.log.
 
-If you control the Docker daemon (Hetzner, Lambda, DataCrunch, your
-own box, on-demand Vast.ai), you can pass `--privileged` and the
-image runs cleanly. There's a one-shot bootstrap for fresh Hetzner
-Cloud GPU servers — see [HETZNER.md](HETZNER.md).
+If you control the Docker daemon (DataCrunch, Lambda, Hetzner
+Dedicated, your own box, on-demand Vast.ai), you can pass
+`--privileged` and the image runs cleanly. One-shot bootstrap script
+for fresh Ubuntu 22.04 GPU servers: [`cloud-bootstrap.sh`](cloud-bootstrap.sh).
+
+Provider-specific walkthroughs:
+- [DataCrunch](DATACRUNCH.md) — EU, hourly billing (~0.40 €/h RTX 4090)
+- [Hetzner Dedicated](HETZNER.md) — DE, monthly billing (~80 €/Mt)
 
 ## Run on Lambda Labs / other GPU clouds
 

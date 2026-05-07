@@ -1,28 +1,30 @@
-# Running sdc-sphinx on Hetzner (or any Linux VM with root)
+# Running sdc-sphinx on Hetzner Dedicated (DE, monthly)
 
-Hetzner Cloud GPU + Hetzner Dedicated both work. So do Lambda Labs,
-DataCrunch, OVHcloud, or any provider that gives you a Linux VM with
-root SSH and an NVIDIA GPU.
-
-The Hetzner option is the cheapest pay-as-you-go path in the EU. As
-of 2026:
+> **Hetzner Cloud has no GPU instances** as of 2026 — they only sell
+> hourly CPU/RAM VMs there. GPUs at Hetzner are only available as
+> **Dedicated Servers** (the "Robot" product), billed monthly.
+>
+> If you want **hourly EU GPU billing**, use [DataCrunch](DATACRUNCH.md)
+> instead. This file covers the monthly Hetzner Dedicated path.
 
 | Plan | Price | Use case |
 |---|---|---|
-| Hetzner Cloud **GEX44** (RTX 4000 Ada, 32 GB RAM) | ~0.91 €/h, capped at ~149 €/month | pay-per-hour, stop the server when not flying |
-| Hetzner Dedicated **AX-** with consumer GPU | ~80 €/month fixed | always-on, cheapest if you fly daily |
+| Hetzner **AX42** with RTX 4000 Ada | ~80 €/month fixed | always-on, cheapest if you fly daily |
+| Hetzner **AX44/AX52** with bigger GPU | ~120–200 €/month | larger VRAM headroom |
+
+Order at <https://www.hetzner.com/dedicated-rootserver/matrix-gpu/>.
+1-month minimum, then daily-cancellable.
 
 ## One-shot install
 
-After a Hetzner Cloud GPU server with **Ubuntu 22.04** is up, SSH in
-and run:
+After your Dedicated server is provisioned with **Ubuntu 22.04**:
 
 ```bash
 export GHCR_PAT=ghp_xxxxxxxxxxxxxxxxxxxxxxxx          # read:packages
 export TS_AUTHKEY=tskey-auth-xxxxxxxxxxxxxxxxxxxxx    # optional but recommended
 export TS_HOSTNAME=sphinx-hetzner
 
-curl -sSL https://raw.githubusercontent.com/otiedemann/sdc-tobe/main/docker/hetzner-bootstrap.sh \
+curl -sSL https://raw.githubusercontent.com/otiedemann/sdc-tobe/main/docker/cloud-bootstrap.sh \
   | sudo -E bash -s -- ghcr.io/otiedemann/sdc-sphinx:latest
 ```
 
