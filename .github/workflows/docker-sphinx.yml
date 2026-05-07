@@ -39,6 +39,23 @@ jobs:
       # the deprecation warning on @v3/@v4 javascript actions.
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
     steps:
+      # GHA's ubuntu-22.04 runner has ~14 GB free, but parrot-ue4-empty
+      # (~675 MB), parrot-ue4-sphx-tests (~1.2 GB), parrot-sphinx
+      # (~282 MB), Blender, parrot-olympe, opencv-contrib-python and
+      # the cuda base together overflow that. The runner ships with
+      # 30+ GB of toolchains we never use (dotnet, Android SDK, ghc,
+      # CodeQL, …); freeing those buys us ~25 GB before the build.
+      - name: Free disk space on runner
+        uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: true
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          docker-images: false   # we DO want docker layers
+          swap-storage: false
+
       - name: Checkout
         uses: actions/checkout@v5
 
