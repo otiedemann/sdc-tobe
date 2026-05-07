@@ -52,6 +52,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         libasound2 libgbm1 libdbus-1-3 \
         net-tools iputils-ping iproute2 \
         python3 python3-venv python3-pip python3-dev \
+        python3-opencv python3-numpy \
         build-essential pkg-config \
         ffmpeg \
     && rm -rf /var/lib/apt/lists/*
@@ -210,12 +211,25 @@ RUN python3 -m venv /home/sdc/sdc-tobe/sphinx-control/.venv \
 # `--build-arg PREBUILD_ARENA=0` to skip; the entrypoint will build
 # the arena on first container start instead. Default = 1 (build now).
 ARG PREBUILD_ARENA=1
+# Full pipeline:
+#   make pngs        — generate ArUco marker PNGs (needs python3-opencv)
+#   make fbxs        — Blender wraps each PNG into aruco_NNN.fbx
+#   make arena-static— floor / wall / pillar / spectator FBXs
+#   make logos       — fetch logo PNGs (best-effort; needs network)
+#   make paintings   — Blender wraps logos into painting_*.fbx
+#   make yaml        — emit arena.yml referencing all of the above
+# `|| true` on logos so a network blip doesn't break the build —
+# paintings just won't render (the YAML emitter skips missing FBXs).
 RUN if [ "${PREBUILD_ARENA}" = "1" ]; then \
-        cd /home/sdc/sdc-tobe/tools/sphinx-arena \
-        && make arena-static && make yaml \
-        || echo "(arena pre-build best-effort; will rebuild at runtime if needed)" ; \
+        set -e ; \
+        cd /home/sdc/sdc-tobe/tools/sphinx-arena ; \
+        make pngs ; \
+        make fbxs ; \
+        make arena-static ; \
+        (make logos && make paintings) || echo "(logos/paintings skipped — non-fatal)" ; \
+        make yaml ; \
     else \
-        echo "PREBUILD_ARENA=0 — skipping arena build (entrypoint will run it on first start)" ; \
+        echo "PREBUILD_ARENA=0 — entrypoint will build on first start" ; \
     fi
 
 # ── Entrypoint ─────────────────────────────────────────────────────────

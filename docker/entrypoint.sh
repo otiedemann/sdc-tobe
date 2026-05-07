@@ -111,9 +111,13 @@ fi
 # painfully slow. Detect a missing arena.yml and build it now on
 # real x86 hardware — first container start takes ~30 s longer but
 # every subsequent start is instant.
-if [ ! -f "${REPO}/tools/sphinx-arena/out/arena.yml" ]; then
-    log "arena.yml missing — building arena assets now (one-time, ~30 s)"
-    su sdc -c "cd ${REPO}/tools/sphinx-arena && make arena-static && make yaml" \
+if [ ! -f "${REPO}/tools/sphinx-arena/out/arena.yml" ] \
+   || [ ! -f "${REPO}/tools/sphinx-arena/out/fbx/aruco_001.fbx" ]; then
+    log "arena assets missing — building now (one-time, ~60 s)"
+    su sdc -c "cd ${REPO}/tools/sphinx-arena \
+        && make pngs && make fbxs && make arena-static \
+        && (make logos && make paintings || true) \
+        && make yaml" \
         || echo "[entrypoint] WARNING: arena build failed (continuing)" >&2
 fi
 
