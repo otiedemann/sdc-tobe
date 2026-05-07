@@ -30,6 +30,7 @@ from pydantic import BaseModel, Field
 from launcher import EnvironmentRequest, FCRequest, LaunchRequest, Launcher
 from state import StateStore
 from worlds import Registry
+import sphinx_cli
 
 logging.basicConfig(
     level=os.getenv("SPHINX_CONTROL_LOG_LEVEL", "INFO").upper(),
@@ -450,6 +451,51 @@ def _sphinx_info() -> dict[str, Any]:
         # The binary still exists (we checked above), so just say so.
         pass
     return {"available": True, "binary": binary, "version": version}
+
+
+# ─── sphinx-cli passthrough ─────────────────────────────────────
+#
+# These thin wrappers expose `sphinx-cli param` and `sphinx-cli action`
+# to the web UI so operators can adjust runtime world / drone /
+# sensor parameters without SSHing in. The catalogue (curated subset
+# of https://developer.parrot.com/docs/sphinx/all_control_references.html)
+# drives the dropdowns; the /raw endpoint covers anything else.
+
+
+class SphinxParamRequest(BaseModel):
+    module: str
+    param: str
+    value: str | None = None
+
+
+class SphinxActionRequest(BaseModel):
+    module: str
+    action: str
+    args: list[str] = Field(default_factory=list)
+
+
+class SphinxRawRequest(BaseModel):
+    args: list[str]
+
+
+@app.get("/api/sphinx-cli/catalogue")
+def api_sphinx_catalogue():
+    return sphinx_cli.catalogue()
+
+
+@app.post("/api/sphinx-cli/param")
+def api_sphinx_param(req: SphinxParamRequest):
+    return sphinx_cli.call_param(req.module, req.param, req.value)
+
+
+@app.post("/api/sphinx-cli/action")
+def api_sphinx_action(req: SphinxActionRequest):
+    return sphinx_cli.call_action(req.module, req.action, req.args)
+
+
+@app.post("/api/sphinx-cli/raw")
+def api_sphinx_raw(req: SphinxRawRequest):
+    return sphinx_cli.call_raw(req.args)
 
 
 # ─── healthz ─────────────────────────────────────────────────────

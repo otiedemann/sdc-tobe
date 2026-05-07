@@ -130,6 +130,61 @@
       <pre id="connections-output">(select a drone)</pre>
     </section>
 
+    <section id="sphinx-cli-section">
+      <div class="section-header">
+        <h2>Sphinx CLI <span class="count" id="sphinx-cli-count">…</span></h2>
+        <a href="https://developer.parrot.com/docs/sphinx/all_control_references.html"
+           target="_blank" class="muted" style="font-size:12px;">
+          control reference ↗
+        </a>
+      </div>
+      <p class="muted">
+        Runtime params &amp; actions, mirrored from
+        <code>sphinx-cli param/action</code>. Pick a module, choose a
+        key, optionally set a value, then Send. Anything not listed
+        is still callable via the <em>Raw</em> input below.
+      </p>
+
+      <form id="sphinx-cli-form" style="grid-template-columns: 1fr 1fr 1fr 1fr auto;">
+        <label>Module
+          <select id="sphinx-module">
+            <option value="">— pick —</option>
+          </select>
+        </label>
+        <label>Kind
+          <select id="sphinx-kind">
+            <option value="param">param</option>
+            <option value="action">action</option>
+          </select>
+        </label>
+        <label>Key
+          <select id="sphinx-key">
+            <option value="">— pick module —</option>
+          </select>
+        </label>
+        <label>Value / args
+          <input id="sphinx-value" type="text"
+                 placeholder='e.g. indoor  or  "0 0 1 0 0 0"' />
+        </label>
+        <button type="submit" id="sphinx-submit">Send</button>
+      </form>
+      <p class="muted" id="sphinx-key-help" style="margin-top:6px;"></p>
+
+      <details style="margin-top:12px;">
+        <summary class="muted" style="cursor:pointer;">Raw passthrough</summary>
+        <form id="sphinx-raw-form"
+              style="grid-template-columns: 1fr auto; margin-top:8px;">
+          <label>sphinx-cli args
+            <input id="sphinx-raw-args" type="text"
+                   placeholder="e.g. list-modules  or  param -m world sky/sky" />
+          </label>
+          <button type="submit" class="secondary">Run</button>
+        </form>
+      </details>
+
+      <pre id="sphinx-cli-output" style="margin-top:12px;">(no calls yet)</pre>
+    </section>
+
     <section id="system-section">
       <h2>System</h2>
       <pre id="system-output">loading…</pre>

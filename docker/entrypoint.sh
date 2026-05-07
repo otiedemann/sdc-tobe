@@ -125,8 +125,12 @@ fi
 case "${1:-sphinx-control}" in
     sphinx-control)
         log "starting sphinx-control on 0.0.0.0:8090 as user sdc"
-        # Run as 'sdc' (Sphinx refuses root). Inherit DISPLAY via env.
-        exec su sdc -c "cd ${REPO}/sphinx-control \
+        # Source parrot-sphinx-setenv.sh so `pysphinx` is importable
+        # from sphinx-control (the bundled Python lib lives under
+        # /opt/parrot-sphinx/usr/lib/...). Run as 'sdc' (Sphinx
+        # refuses root). DISPLAY inherits via env.
+        exec su sdc -c ". /opt/parrot-sphinx/usr/bin/parrot-sphinx-setenv.sh \
+            && cd ${REPO}/sphinx-control \
             && DISPLAY=${DISPLAY} \
                .venv/bin/uvicorn server:app --host 0.0.0.0 --port 8090"
         ;;
