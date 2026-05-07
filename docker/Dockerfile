@@ -130,12 +130,21 @@ RUN curl --fail --silent --show-error --location \
     # parrot install — DKMS modules (ulogger-dkms) may fail to build
     # against a non-existent kernel, that's expected and harmless
     # for sim use; force the install to continue past those.
-    && (apt-get install -y --no-install-recommends \
-        parrot-sphinx parrot-ue4-empty parrot-ue4-sphx-tests \
+    #
+    # The parrot-sphinx preinst calls `read` directly to ask the
+    # operator to type "yes" for the EULA — debconf seeding alone
+    # doesn't cover that. We pipe `yes yes` (which prints "yes\n"
+    # forever) into apt-get's stdin so the preinst's read gets a
+    # "yes" answer. APT_LISTCHANGES_FRONTEND=none + DEBIAN_FRONTEND
+    # noninteractive prevent other prompts from blocking.
+    && (yes yes | DEBIAN_FRONTEND=noninteractive APT_LISTCHANGES_FRONTEND=none \
+            apt-get install -y --no-install-recommends \
+                parrot-sphinx parrot-ue4-empty parrot-ue4-sphx-tests \
         || (echo "[parrot install] retrying with --fix-broken" \
-            && dpkg --configure -a || true \
-            && apt-get install -y --fix-broken --no-install-recommends \
-                parrot-sphinx parrot-ue4-empty parrot-ue4-sphx-tests)) \
+            && yes yes | dpkg --configure -a || true \
+            && yes yes | DEBIAN_FRONTEND=noninteractive \
+                apt-get install -y --fix-broken --no-install-recommends \
+                    parrot-sphinx parrot-ue4-empty parrot-ue4-sphx-tests)) \
     # restore real systemctl + drop policy-rc.d
     && rm -f /bin/systemctl \
     && dpkg-divert --local --rename --remove /bin/systemctl \
