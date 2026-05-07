@@ -309,7 +309,14 @@ function fcButtonsLock(activeBtn, label) {
 
 $("#fc-start-btn").addEventListener("click", async () => {
   const unlock = fcButtonsLock("#fc-start-btn", "starting…");
-  try { await jpost("/api/fc", {}); }
+  // Optional per-start overrides: drone IP and HTTP port. Empty
+  // fields fall back to flight_controller.* in config.yaml.
+  const ip   = document.getElementById("fc-anafi-ip").value.trim();
+  const port = document.getElementById("fc-http-port").value.trim();
+  const body = {};
+  if (ip)   body.anafi_ip = ip;
+  if (port) body.http_port = parseInt(port, 10);
+  try { await jpost("/api/fc", body); }
   catch (e) { unlock(); alert(`fc start failed: ${e.message}`); return; }
   unlock();
   await loadFC();

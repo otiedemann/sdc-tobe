@@ -82,6 +82,20 @@ if [ "${SDC_GIT_PULL}" = "1" ]; then
         || echo "[entrypoint] WARNING: git pull failed (continuing)" >&2
 fi
 
+# Sim-friendly default: point the FC at the simulated Anafi IP
+# instead of the real-Anafi-over-Wi-Fi default 192.168.42.1. Sphinx
+# 2 with netns mode → 10.202.0.1; older sphinx-control ports mode
+# also resolves there. Operator can still override per-start via
+# the UI's Anafi-IP input. Set SDC_ANAFI_IP at Pod-launch time to
+# pick a different default (e.g. 172.21.0.2 for some setups).
+SDC_ANAFI_IP="${SDC_ANAFI_IP:-10.202.0.1}"
+if grep -q '^[[:space:]]*anafi_ip:[[:space:]]*null' \
+       "${REPO}/sphinx-control/config.yaml" 2>/dev/null; then
+    log "patching config.yaml: anafi_ip null → ${SDC_ANAFI_IP}"
+    sed -i "s|^\([[:space:]]*\)anafi_ip:[[:space:]]*null|\1anafi_ip: \"${SDC_ANAFI_IP}\"|" \
+        "${REPO}/sphinx-control/config.yaml"
+fi
+
 # Make sure both venvs are there (rebuilds happen if the operator
 # mounted a fresh repo over /home/sdc/sdc-tobe).
 if [ ! -x "${REPO}/sphinx-control/.venv/bin/uvicorn" ]; then
