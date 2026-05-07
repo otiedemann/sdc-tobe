@@ -159,13 +159,18 @@ RUN groupadd -g ${SDC_GID} sdc \
     && mkdir -p /home/sdc && chown -R sdc:sdc /home/sdc
 
 # ── sdc-tobe repo ──────────────────────────────────────────────────────
-# Default branch is main. Override with `--build-arg SDC_BRANCH=...`.
-ARG SDC_REPO_URL=https://github.com/otiedemann/sdc-tobe.git
-ARG SDC_BRANCH=main
-USER sdc
+# COPY from the build context rather than git-clone, because the
+# upstream repo is private and the build sandbox has no credentials.
+# The build context IS the repo (both `docker build .` from a local
+# checkout AND the GitHub Actions workflow which runs after a
+# checkout step), so this is also faster than cloning.
+#
+# The entrypoint can still `git pull` at runtime via SDC_GIT_PULL=1
+# — that runs as user `sdc` who can supply credentials interactively
+# or via a mounted ~/.git-credentials.
 WORKDIR /home/sdc
-RUN git clone --branch "${SDC_BRANCH}" --depth 50 \
-        "${SDC_REPO_URL}" /home/sdc/sdc-tobe
+COPY --chown=sdc:sdc . /home/sdc/sdc-tobe
+USER sdc
 
 # ── Python deps for sphinx-control ─────────────────────────────────────
 # Build a project-local venv so the entrypoint doesn't need network on

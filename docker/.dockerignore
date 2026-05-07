@@ -1,5 +1,7 @@
-# Don't ship local working state into the image
-.git/
+# Don't ship local working state into the image.
+# Note: .git is INCLUDED so the entrypoint's optional `git pull`
+# (SDC_GIT_PULL=1) works. If image size becomes an issue, comment
+# back in to drop it.
 .venv/
 **/.venv/
 **/__pycache__/
