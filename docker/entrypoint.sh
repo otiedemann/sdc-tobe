@@ -82,6 +82,19 @@ if [ "${SDC_GIT_PULL}" = "1" ]; then
         || echo "[entrypoint] WARNING: git pull failed (continuing)" >&2
 fi
 
+# sphinx-control reads config.yaml; the repo only ships
+# config.example.yaml. On first container start, copy the example
+# in place so the launcher has something to load — without this the
+# FC falls back to controller_unified's hardwired 192.168.42.1
+# (the real-Anafi-over-Wi-Fi IP, useless inside the container).
+if [ ! -f "${REPO}/sphinx-control/config.yaml" ] \
+   && [ -f "${REPO}/sphinx-control/config.example.yaml" ]; then
+    log "creating sphinx-control/config.yaml from example"
+    cp "${REPO}/sphinx-control/config.example.yaml" \
+       "${REPO}/sphinx-control/config.yaml"
+    chown sdc:sdc "${REPO}/sphinx-control/config.yaml"
+fi
+
 # Sim-friendly default: point the FC at the simulated Anafi IP
 # instead of the real-Anafi-over-Wi-Fi default 192.168.42.1. Sphinx
 # 2 with netns mode → 10.202.0.1; older sphinx-control ports mode
@@ -128,7 +141,7 @@ fi
 # command line minimal — defaults are fine for headless sim.
 if command -v firmwared >/dev/null 2>&1; then
     if ! pgrep -x firmwared >/dev/null 2>&1; then
-        log "starting firmwared"
+        log "starting firmwared (binary: $(command -v firmwared))"
         firmwared >/var/log/firmwared.log 2>&1 &
         # Wait briefly for the socket
         for _ in 1 2 3 4 5 6 7 8 9 10; do
@@ -136,7 +149,11 @@ if command -v firmwared >/dev/null 2>&1; then
             sleep 0.5
         done
         if [ ! -S /var/run/firmwared.sock ]; then
-            echo "[entrypoint] WARNING: /var/run/firmwared.sock didn't appear within 5s — drone spawn will fail until firmwared is reachable" >&2
+            echo "[entrypoint] WARNING: /var/run/firmwared.sock didn't appear within 5s — dumping firmwared log:" >&2
+            tail -30 /var/log/firmwared.log >&2 || true
+            echo "[entrypoint] drone spawn will fail until firmwared is reachable" >&2
+        else
+            log "firmwared up — socket: /var/run/firmwared.sock"
         fi
     fi
 else
