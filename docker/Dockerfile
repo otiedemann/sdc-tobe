@@ -155,6 +155,62 @@ RUN curl --fail --silent --show-error --location \
     # Safe for sim — no untrusted firmware to constrain.
     && printf 'FIRMWARED_DISABLE_APPARMOR = "y"\n' > /etc/firmwared.conf
 
+# ── Pre-seed the cached anafi firmware ─────────────────────────────────
+# Parrot's `firmware.parrot.com/Versions/anafi/pc/#latest/` URL no longer
+# lists `hardware_id = anafi4k` in its metadata, so spawning the
+# anafi4k.drone descriptor fails with:
+#   [Wrn] Firmware.cc: cannot find hardware 'anafi4k' among:
+#   [Err] AutomatonPrepFw.cc: Firmware doesn't support requested hardware
+#
+# We ship the older cached firmware (from May 2026) as a GitHub release
+# asset and unpack it into firmwared's cache dir at image-build time.
+# firmwared keys its cache by a hash derived from the URL, so when
+# sphinx asks it to prepare anafi-pc.ext2.zip from #latest, firmwared
+# computes that same hash, finds our pre-seeded file at
+#   /usr/share/firmwared/firmwares/anafi.zip.<uuid>.firmware
+# and uses it without ever hitting the network. The cached binary
+# DOES list anafi4k → drone spawn succeeds.
+#
+# Source: GitHub release `firmware-cache-v1` on the same repo.
+# Build-time auth: GHA's GITHUB_TOKEN is passed as a build secret
+# (it has read access to releases on private repos by default).
+# Local builds: pass --secret id=ghcr_pat,env=GHCR_PAT.
+ARG FIRMWARE_RELEASE_TAG=firmware-cache-v1
+ARG FIRMWARE_FILENAME=anafi.zip.2a2e73c7-2705-4f77-85e3-bfcd53227a7d.firmware
+ARG FIRMWARE_REPO=otiedemann/sdc-tobe
+ARG FIRMWARE_SHA256=30409b1c5375a55e440339a4158bfc29c6db4b5af7fa9a85c426c55608937753
+RUN --mount=type=secret,id=ghcr_pat \
+    set -e ; \
+    mkdir -p /usr/share/firmwared/firmwares ; \
+    if [ -f /run/secrets/ghcr_pat ]; then \
+        TOKEN="$(cat /run/secrets/ghcr_pat)"; \
+    else \
+        echo "[firmware] ghcr_pat secret missing — skipping pre-seed; container will download fresh on first drone spawn (may not include anafi4k)" ; \
+        TOKEN="" ; \
+    fi ; \
+    if [ -n "$TOKEN" ]; then \
+        # Resolve the asset's API URL via the GitHub releases API
+        ASSET_URL=$(curl -sSL \
+            -H "Authorization: Bearer $TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${FIRMWARE_REPO}/releases/tags/${FIRMWARE_RELEASE_TAG}" \
+          | python3 -c "import sys,json; d=json.load(sys.stdin); \
+                        m=[a for a in d['assets'] if a['name']=='${FIRMWARE_FILENAME}']; \
+                        print(m[0]['url']) if m else exit(1)") ; \
+        echo "[firmware] downloading ${FIRMWARE_FILENAME}" ; \
+        curl -fsSL \
+            -H "Authorization: Bearer $TOKEN" \
+            -H "Accept: application/octet-stream" \
+            -o /usr/share/firmwared/firmwares/${FIRMWARE_FILENAME} \
+            "$ASSET_URL" ; \
+        echo "[firmware] verifying sha256" ; \
+        echo "${FIRMWARE_SHA256}  /usr/share/firmwared/firmwares/${FIRMWARE_FILENAME}" \
+            | sha256sum -c - ; \
+        chown root:firmwared /usr/share/firmwared/firmwares/${FIRMWARE_FILENAME} ; \
+        chmod 600 /usr/share/firmwared/firmwares/${FIRMWARE_FILENAME} ; \
+        ls -la /usr/share/firmwared/firmwares/ ; \
+    fi
+
 # ── Tailscale ──────────────────────────────────────────────────────────
 # Lets the operator reach sphinx-control + the camera stream from
 # anywhere without exposing ports publicly. Inside a container we run

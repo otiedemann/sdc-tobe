@@ -90,5 +90,10 @@ jobs:
             ${{ steps.tags.outputs.latest }}
           build-args: |
             PREBUILD_ARENA=${{ github.event.inputs.prebuild_arena || '1' }}
+          # GITHUB_TOKEN has read access to releases on the same repo
+          # by default — used by Dockerfile to fetch the anafi4k-
+          # supporting firmware from the firmware-cache-v1 release.
+          secrets: |
+            ghcr_pat=${{ secrets.GITHUB_TOKEN }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
