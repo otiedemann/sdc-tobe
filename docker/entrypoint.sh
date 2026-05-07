@@ -82,8 +82,8 @@ if [ "${SDC_GIT_PULL}" = "1" ]; then
         || echo "[entrypoint] WARNING: git pull failed (continuing)" >&2
 fi
 
-# Make sure the venv's there (rebuilds happen if user mounted a fresh
-# repo over /home/sdc/sdc-tobe)
+# Make sure both venvs are there (rebuilds happen if the operator
+# mounted a fresh repo over /home/sdc/sdc-tobe).
 if [ ! -x "${REPO}/sphinx-control/.venv/bin/uvicorn" ]; then
     log "sphinx-control venv missing — rebuilding"
     su sdc -c "python3 -m venv ${REPO}/sphinx-control/.venv \
@@ -92,6 +92,17 @@ if [ ! -x "${REPO}/sphinx-control/.venv/bin/uvicorn" ]; then
             fastapi uvicorn pyyaml requests sqlalchemy psutil \
             $(test -f ${REPO}/sphinx-control/requirements.txt && \
               echo -r ${REPO}/sphinx-control/requirements.txt)"
+fi
+
+# Repo-level venv for the unified flight-controller (path is hard-
+# coded in sphinx-control/config.yaml as flight_controller.python =
+# /home/sdc/sdc-tobe/.venv/bin/python). Without this the UI's
+# "FC start" button fails with FileNotFoundError on /python.
+if [ ! -x "${REPO}/.venv/bin/python" ]; then
+    log "flight-controller venv missing — rebuilding (this can take a few minutes; parrot-olympe is large)"
+    su sdc -c "python3 -m venv ${REPO}/.venv \
+        && ${REPO}/.venv/bin/pip install --upgrade pip wheel \
+        && ${REPO}/.venv/bin/pip install -r ${REPO}/controller_unified/requirements.txt"
 fi
 
 # ── 3b. Lazy arena build (if image was built with PREBUILD_ARENA=0) ───

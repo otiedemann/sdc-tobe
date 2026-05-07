@@ -172,9 +172,15 @@ WORKDIR /home/sdc
 COPY --chown=sdc:sdc . /home/sdc/sdc-tobe
 USER sdc
 
-# ── Python deps for sphinx-control ─────────────────────────────────────
-# Build a project-local venv so the entrypoint doesn't need network on
-# every container start. requirements.txt lives at the repo root.
+# ── Python deps: TWO venvs ─────────────────────────────────────────────
+# sphinx-control/.venv  — FastAPI/uvicorn dashboard (port 8090)
+# .venv                 — flight-controller (controller_unified,
+#                          parrot-olympe, etc.) — used when the
+#                          operator hits "FC start" in the UI; path
+#                          is hard-coded in sphinx-control/config.yaml
+#                          as flight_controller.python.
+# Both are pre-built so the entrypoint doesn't need network on every
+# container start.
 RUN python3 -m venv /home/sdc/sdc-tobe/sphinx-control/.venv \
     && /home/sdc/sdc-tobe/sphinx-control/.venv/bin/pip install --no-cache-dir \
         --upgrade pip \
@@ -184,7 +190,16 @@ RUN python3 -m venv /home/sdc/sdc-tobe/sphinx-control/.venv \
        else \
          /home/sdc/sdc-tobe/sphinx-control/.venv/bin/pip install --no-cache-dir \
             fastapi uvicorn pyyaml requests sqlalchemy psutil ; \
-       fi
+       fi \
+    # Repo-level venv for the unified flight-controller. Its
+    # requirements pull in parrot-olympe (large; amd64-only — that's
+    # fine, the image targets linux/amd64). If FC startup still
+    # fails for a missing module, add it to
+    # controller_unified/requirements.txt and rebuild.
+    && python3 -m venv /home/sdc/sdc-tobe/.venv \
+    && /home/sdc/sdc-tobe/.venv/bin/pip install --no-cache-dir --upgrade pip wheel \
+    && /home/sdc/sdc-tobe/.venv/bin/pip install --no-cache-dir \
+        -r /home/sdc/sdc-tobe/controller_unified/requirements.txt
 
 # ── Pre-build arena assets ─────────────────────────────────────────────
 # Doing this at build time means a fresh container can serve the
