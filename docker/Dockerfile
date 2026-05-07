@@ -130,8 +130,19 @@ RUN python3 -m venv /home/sdc/sdc-tobe/sphinx-control/.venv \
 # ── Pre-build arena assets ─────────────────────────────────────────────
 # Doing this at build time means a fresh container can serve the
 # arena immediately — no first-launch Blender re-export.
-RUN cd /home/sdc/sdc-tobe/tools/sphinx-arena && make arena-static && make yaml \
-    || echo "(arena pre-build best-effort; will rebuild at runtime if needed)"
+#
+# CROSS-BUILDING: Blender runs amd64-only and QEMU-emulating it on an
+# M1 Mac (arm64 host) takes 30+ minutes for this step alone. Pass
+# `--build-arg PREBUILD_ARENA=0` to skip; the entrypoint will build
+# the arena on first container start instead. Default = 1 (build now).
+ARG PREBUILD_ARENA=1
+RUN if [ "${PREBUILD_ARENA}" = "1" ]; then \
+        cd /home/sdc/sdc-tobe/tools/sphinx-arena \
+        && make arena-static && make yaml \
+        || echo "(arena pre-build best-effort; will rebuild at runtime if needed)" ; \
+    else \
+        echo "PREBUILD_ARENA=0 — skipping arena build (entrypoint will run it on first start)" ; \
+    fi
 
 # ── Entrypoint ─────────────────────────────────────────────────────────
 USER root

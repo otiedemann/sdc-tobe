@@ -155,13 +155,68 @@ docker exec -it <ctr> tailscale --socket=/var/run/tailscale/tailscaled.sock \
     up --authkey=tskey-... --hostname=sdc-sphinx-docker
 ```
 
+## Building on Apple Silicon (M1/M2/M3)
+
+Yes — Docker buildx will cross-build a `linux/amd64` image on an
+arm64 host. Two practical caveats:
+
+- **It's slow.** apt installs run under QEMU emulation. Expect
+  5–15 min for the base build, vs. ~3 min on native x86.
+- **The pre-build arena step (Blender) is the slowest** under QEMU
+  — 30+ min if not skipped. The default cross-build skips it
+  (`PREBUILD_ARENA=0`) and lets the entrypoint build the arena on
+  first container start (when it's running on real x86 hardware,
+  ~30 s).
+
+The `build-amd64.sh` helper does the right thing:
+
+```bash
+# Build for amd64, load locally (won't run on M1, but pushable)
+./docker/build-amd64.sh
+
+# Build + push directly to a registry
+./docker/build-amd64.sh --push ghcr.io/yourname/sdc-sphinx:latest
+
+# Force pre-build the arena anyway (slower, but every container start
+# is instant after that)
+./docker/build-amd64.sh --prebuild-arena
+```
+
+The image won't run usefully on the M1 itself — there's no Vulkan-
+capable GPU passthrough — but you can pull and run it on any x86
+GPU host (RunPod / Lambda / EC2 g4dn / your own box).
+
+### Faster: build on a x86 GitHub Actions runner
+
+`.github/workflows/docker-sphinx.yml` builds the image natively on a
+GitHub-hosted ubuntu-22.04 runner (real x86) and pushes to GHCR.
+Trigger it with:
+
+```bash
+gh workflow run docker-sphinx.yml
+# or push a tag:
+git tag docker-v0.1 && git push --tags
+```
+
+Pull from any host:
+```bash
+docker pull ghcr.io/<your-org>/sdc-sphinx:latest
+```
+
+This is the fastest option if you're on an M1 — no local QEMU work
+at all, and the cached layers make subsequent builds quick.
+
 ## Files
 
 ```
 docker/
 ├── README.md            ← this file
-├── Dockerfile           ← image definition
+├── Dockerfile           ← image definition (PREBUILD_ARENA build-arg)
 ├── docker-compose.yml   ← local-host launcher
-├── entrypoint.sh        ← Xvfb + tailscaled + sphinx-control bootstrap
+├── entrypoint.sh        ← Xvfb + tailscaled + lazy arena build + sphinx-control
+├── build-amd64.sh       ← cross-build helper for M1/M2/M3 Macs
 └── .dockerignore        ← keeps build context lean
+
+.github/workflows/
+└── docker-sphinx.yml    ← native amd64 build on GitHub Actions → GHCR
 ```

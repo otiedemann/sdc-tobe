@@ -94,6 +94,18 @@ if [ ! -x "${REPO}/sphinx-control/.venv/bin/uvicorn" ]; then
               echo -r ${REPO}/sphinx-control/requirements.txt)"
 fi
 
+# ── 3b. Lazy arena build (if image was built with PREBUILD_ARENA=0) ───
+# When the image is cross-built on an M1 Mac, the Blender step is
+# usually skipped (PREBUILD_ARENA=0) because QEMU emulation makes it
+# painfully slow. Detect a missing arena.yml and build it now on
+# real x86 hardware — first container start takes ~30 s longer but
+# every subsequent start is instant.
+if [ ! -f "${REPO}/tools/sphinx-arena/out/arena.yml" ]; then
+    log "arena.yml missing — building arena assets now (one-time, ~30 s)"
+    su sdc -c "cd ${REPO}/tools/sphinx-arena && make arena-static && make yaml" \
+        || echo "[entrypoint] WARNING: arena build failed (continuing)" >&2
+fi
+
 # ── 4. Hand off to the requested command ───────────────────────────────
 case "${1:-sphinx-control}" in
     sphinx-control)
