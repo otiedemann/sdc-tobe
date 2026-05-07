@@ -80,7 +80,7 @@ RUN curl --fail --silent --show-error --location \
     && apt-get update \
     # supporting libs the parrot maintainer scripts call into
     && apt-get install -y --no-install-recommends \
-        systemd systemd-sysv dbus udev kmod \
+        systemd systemd-sysv dbus udev kmod debconf-utils \
     # policy-rc.d: any service start during install returns 101 (skip)
     && printf '#!/bin/sh\nexit 101\n' > /usr/sbin/policy-rc.d \
     && chmod +x /usr/sbin/policy-rc.d \
@@ -88,7 +88,46 @@ RUN curl --fail --silent --show-error --location \
     && dpkg-divert --local --rename --add /bin/systemctl \
     && printf '#!/bin/sh\necho "[stub systemctl] $*" >&2\nexit 0\n' > /bin/systemctl \
     && chmod +x /bin/systemctl \
-    # parrot install — DKMS modules (ulogger-dkms) will fail to build
+    # ── License pre-acceptance ─────────────────────────────────────
+    # parrot-sphinx's preinst exits with "License not approved.
+    # Installation will abort." unless the EULA was accepted. Cover
+    # all the mechanisms the maintainer scripts could be using:
+    #   1. debconf-set-selections for the various plausible keys
+    #   2. SPHINX_ACCEPT_EULA env var (common pattern)
+    #   3. Pre-create marker files at the locations the script
+    #      probably checks
+    # We dump the actual preinst at the start so the build log
+    # shows exactly what gates the install — useful if Parrot
+    # changes the gate in a future release.
+    && apt-get download parrot-sphinx \
+    && PSDEB=$(ls parrot-sphinx_*.deb | head -1) \
+    && mkdir -p /tmp/ps-control \
+    && dpkg-deb -e "$PSDEB" /tmp/ps-control \
+    && echo "── parrot-sphinx preinst (first 80 lines) ──" \
+    && head -80 /tmp/ps-control/preinst 2>&1 || true \
+    && echo "── parrot-sphinx templates ──" \
+    && cat /tmp/ps-control/templates 2>&1 || true \
+    && echo "── end ──" \
+    && for q in license eula license-accepted accept-license accept-eula; do \
+         echo "parrot-sphinx parrot-sphinx/$q boolean true" \
+           | debconf-set-selections; \
+         echo "parrot-sphinx parrot-sphinx/$q select Yes" \
+           | debconf-set-selections; \
+         echo "parrot-sphinx parrot-sphinx/$q seen true" \
+           | debconf-set-selections; \
+       done \
+    # Common file markers some packages check
+    && mkdir -p /etc/parrot-sphinx /var/lib/parrot-sphinx \
+    && touch /etc/parrot-sphinx/license-accepted \
+             /var/lib/parrot-sphinx/license-accepted \
+             /etc/parrot-sphinx/.eula-accepted \
+    # Env vars the preinst might honour
+    && export SPHINX_ACCEPT_EULA=yes \
+             SPHINX_LICENSE_ACCEPTED=yes \
+             PARROT_LICENSE_ACCEPTED=yes \
+             PARROT_SPHINX_LICENSE_ACCEPTED=yes \
+             ACCEPT_EULA=yes \
+    # parrot install — DKMS modules (ulogger-dkms) may fail to build
     # against a non-existent kernel, that's expected and harmless
     # for sim use; force the install to continue past those.
     && (apt-get install -y --no-install-recommends \
@@ -101,6 +140,8 @@ RUN curl --fail --silent --show-error --location \
     && rm -f /bin/systemctl \
     && dpkg-divert --local --rename --remove /bin/systemctl \
     && rm -f /usr/sbin/policy-rc.d \
+    && rm -f parrot-sphinx_*.deb \
+    && rm -rf /tmp/ps-control \
     && rm -rf /var/lib/apt/lists/*
 
 # ── Tailscale ──────────────────────────────────────────────────────────
