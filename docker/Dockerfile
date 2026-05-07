@@ -52,10 +52,15 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         libasound2 libgbm1 libdbus-1-3 \
         net-tools iputils-ping iproute2 \
         python3 python3-venv python3-pip python3-dev \
-        python3-opencv python3-numpy \
+        python3-numpy \
         build-essential pkg-config \
         ffmpeg \
-    && rm -rf /var/lib/apt/lists/*
+    && rm -rf /var/lib/apt/lists/* \
+    # Ubuntu 22.04's python3-opencv apt package is OpenCV 4.5.x
+    # where cv2.aruco still has drawMarker (not generateImageMarker).
+    # generate_aruco_pngs.py uses the 4.7+ name, so install a newer
+    # opencv-contrib-python via pip instead.
+    && pip3 install --no-cache-dir 'opencv-contrib-python>=4.7'
 
 # ── Parrot apt repo + Sphinx packages ──────────────────────────────────
 # Per https://developer.parrot.com/docs/sphinx/installation.html the apt
