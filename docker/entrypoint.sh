@@ -132,6 +132,34 @@ if [ ! -x "${REPO}/.venv/bin/python" ]; then
         && ${REPO}/.venv/bin/pip install -r ${REPO}/controller_unified/requirements.txt"
 fi
 
+# ── 3-pre. SSH server ──────────────────────────────────────────────────
+# Run sshd inside the container so operators can `ssh root@host -p <vast-port>`
+# for live debugging. Vast/RunPod expose a port → 22 mapping by default;
+# bare-metal hosts can hit it on the container's local 22 once they're
+# already on the host. Generates host keys on first start, then reuses.
+#
+# Authorised keys come from $SSH_PUBLIC_KEY env var (Vast injects this
+# automatically with all the keys you registered on your account) OR
+# from /root/.ssh/authorized_keys if you mount one in.
+if command -v sshd >/dev/null 2>&1; then
+    mkdir -p /var/run/sshd /root/.ssh
+    chmod 700 /root/.ssh
+    if [ -n "${SSH_PUBLIC_KEY:-}" ]; then
+        echo "$SSH_PUBLIC_KEY" >> /root/.ssh/authorized_keys
+        chmod 600 /root/.ssh/authorized_keys
+        log "installed SSH key from SSH_PUBLIC_KEY env var"
+    fi
+    # Generate host keys if they don't exist (first run)
+    [ -f /etc/ssh/ssh_host_ed25519_key ] || ssh-keygen -A >/dev/null 2>&1
+    # Permit root login via key (no password — disable PasswordAuth)
+    sed -i 's/^#*PermitRootLogin.*/PermitRootLogin prohibit-password/' /etc/ssh/sshd_config
+    sed -i 's/^#*PasswordAuthentication.*/PasswordAuthentication no/' /etc/ssh/sshd_config
+    if ! pgrep -x sshd >/dev/null 2>&1; then
+        log "starting sshd on port 22"
+        /usr/sbin/sshd -D >/var/log/sshd.log 2>&1 &
+    fi
+fi
+
 # ── 3a. firmwared ──────────────────────────────────────────────────────
 # The parrot-sphinx package ships /usr/bin/firmwared, normally started
 # via systemd on bare-metal Ubuntu. In a docker container there's no

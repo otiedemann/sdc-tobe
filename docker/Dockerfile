@@ -45,7 +45,7 @@ ENV NVIDIA_VISIBLE_DEVICES=all
 #   container by default
 RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates curl wget gnupg lsb-release sudo \
-        git openssh-client sshpass \
+        git openssh-client openssh-server sshpass \
         xvfb x11-utils xdotool xauth \
         libvulkan1 mesa-vulkan-drivers vulkan-tools libegl1 libgl1 \
         libglu1-mesa libxcb1 libxcb-xinerama0 libxkbcommon0 libnss3 \
@@ -268,10 +268,11 @@ COPY docker/entrypoint.sh /usr/local/bin/entrypoint.sh
 RUN chmod +x /usr/local/bin/entrypoint.sh
 
 # Ports
+# 22   — sshd for live debugging (Vast/RunPod will publish on a high port)
 # 8090 — sphinx-control web UI / REST
 # 9080 — drone-1 (sphinx) HTTP control endpoint
 # 41251 — tailscale magicsock (UDP)
-EXPOSE 8090 9080
+EXPOSE 22 8090 9080
 EXPOSE 41251/udp
 
 ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
