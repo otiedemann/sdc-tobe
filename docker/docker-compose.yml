@@ -1,0 +1,51 @@
+version: "3.8"
+
+# Local docker-compose for the SDC sphinx simulator.
+#
+# Usage:
+#   export TS_AUTHKEY=tskey-...   # optional
+#   docker compose -f docker/docker-compose.yml up --build
+#
+# On a Linux host with NVIDIA Container Toolkit installed.
+# On macOS / Windows there's no Vulkan-capable GPU passthrough;
+# this image will run on those hosts but the UE4 viewport will be
+# slow / buggy. Use a Linux+NVIDIA host (RunPod / Lambda / your own).
+
+services:
+  sphinx:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    image: sdc-sphinx:latest
+    container_name: sdc-sphinx
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: ["gpu", "compute", "graphics", "utility"]
+    environment:
+      - TS_AUTHKEY=${TS_AUTHKEY:-}
+      - TS_HOSTNAME=sdc-sphinx-docker
+      - SDC_GIT_PULL=1
+      - SDC_BRANCH=main
+      - XVFB_RES=1280x1024x24
+    ports:
+      - "8090:8090"   # sphinx-control web UI
+      - "9080:9080"   # drone-1 sphinx HTTP
+    # Tailscale needs CAP_NET_ADMIN even in userspace-networking mode
+    # for some kernels. Without this, tailscaled may still come up but
+    # MagicDNS is wonky.
+    cap_add:
+      - NET_ADMIN
+      - SYS_ADMIN
+    # Keep flight logs + state across restarts
+    volumes:
+      - sphinx-state:/home/sdc/.parrot-sphinx
+      - sphinx-logs:/home/sdc/sdc-tobe/sphinx-control/logs
+    restart: unless-stopped
+
+volumes:
+  sphinx-state:
+  sphinx-logs:

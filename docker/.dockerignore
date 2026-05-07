@@ -1,0 +1,16 @@
+# Don't ship local working state into the image
+.git/
+.venv/
+**/.venv/
+**/__pycache__/
+**/*.pyc
+**/node_modules/
+ansible/sphinx-state/backups/
+sphinx-control/sphinx_control.db
+sphinx-control/logs/
+tools/sphinx-arena/out/markers/
+tools/sphinx-arena/out/logos/
+*.tar.gz
+*.mp4
+*.jsonl
+.DS_Store
