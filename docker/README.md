@@ -99,6 +99,19 @@ docker compose -f docker/docker-compose.yml up --build
 4. **Spawn a drone** in sphinx-control. The drone's HTTP endpoint
    becomes available at `:9080` (or via Tailscale at the same port).
 
+## Run on Hetzner / Lambda / any VM with root SSH
+
+**RunPod and most "container-as-a-service" providers (Modal, Beam,
+serverless Vast.ai, Salad) block the loop-mount and AppArmor calls
+that firmwared needs.** The image won't work there. For RunPod
+specifically the symptom is the drone goes STOPPED right after
+spawn with `mount: Operation not permitted` in firmwared.log.
+
+If you control the Docker daemon (Hetzner, Lambda, DataCrunch, your
+own box, on-demand Vast.ai), you can pass `--privileged` and the
+image runs cleanly. There's a one-shot bootstrap for fresh Hetzner
+Cloud GPU servers — see [HETZNER.md](HETZNER.md).
+
 ## Run on Lambda Labs / other GPU clouds
 
 Same as RunPod — any host with NVIDIA Container Toolkit can run this.
