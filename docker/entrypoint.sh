@@ -105,6 +105,30 @@ if [ ! -x "${REPO}/.venv/bin/python" ]; then
         && ${REPO}/.venv/bin/pip install -r ${REPO}/controller_unified/requirements.txt"
 fi
 
+# ── 3a. firmwared ──────────────────────────────────────────────────────
+# The parrot-sphinx package ships /usr/bin/firmwared, normally started
+# via systemd on bare-metal Ubuntu. In a docker container there's no
+# systemd, so we start it ourselves. Without firmwared, every drone
+# spawn dies with sphinx complaining it can't reach the firmware
+# manager. Run as root (firmwared chroots itself) and keep the
+# command line minimal — defaults are fine for headless sim.
+if command -v firmwared >/dev/null 2>&1; then
+    if ! pgrep -x firmwared >/dev/null 2>&1; then
+        log "starting firmwared"
+        firmwared >/var/log/firmwared.log 2>&1 &
+        # Wait briefly for the socket
+        for _ in 1 2 3 4 5 6 7 8 9 10; do
+            [ -S /var/run/firmwared.sock ] && break
+            sleep 0.5
+        done
+        if [ ! -S /var/run/firmwared.sock ]; then
+            echo "[entrypoint] WARNING: /var/run/firmwared.sock didn't appear within 5s — drone spawn will fail until firmwared is reachable" >&2
+        fi
+    fi
+else
+    log "firmwared not on PATH — drone spawn will fail (parrot-sphinx incomplete?)"
+fi
+
 # ── 3b. Lazy arena build (if image was built with PREBUILD_ARENA=0) ───
 # When the image is cross-built on an M1 Mac, the Blender step is
 # usually skipped (PREBUILD_ARENA=0) because QEMU emulation makes it

@@ -133,7 +133,13 @@ RUN curl --fail --silent --show-error --location \
     && rm -f /usr/sbin/policy-rc.d \
     && rm -f parrot-sphinx_*.deb \
     && rm -rf /tmp/ps-extract \
-    && rm -rf /var/lib/apt/lists/*
+    && rm -rf /var/lib/apt/lists/* \
+    # The parrot-sphinx postinst creates the `firmwared` group;
+    # add sdc to it so `sphinx` can talk to /var/run/firmwared.sock.
+    # Without this every drone spawn dies with:
+    #   "ERROR : You should be a member of the firmwared group to run sphinx."
+    && (getent group firmwared >/dev/null || groupadd firmwared) \
+    && usermod -aG firmwared sdc
 
 # ── Tailscale ──────────────────────────────────────────────────────────
 # Lets the operator reach sphinx-control + the camera stream from
