@@ -89,60 +89,36 @@ RUN curl --fail --silent --show-error --location \
     && printf '#!/bin/sh\necho "[stub systemctl] $*" >&2\nexit 0\n' > /bin/systemctl \
     && chmod +x /bin/systemctl \
     # ── License pre-acceptance ─────────────────────────────────────
-    # parrot-sphinx's preinst exits with "License not approved.
-    # Installation will abort." unless the EULA was accepted. Cover
-    # all the mechanisms the maintainer scripts could be using:
-    #   1. debconf-set-selections for the various plausible keys
-    #   2. SPHINX_ACCEPT_EULA env var (common pattern)
-    #   3. Pre-create marker files at the locations the script
-    #      probably checks
-    # We dump the actual preinst at the start so the build log
-    # shows exactly what gates the install — useful if Parrot
-    # changes the gate in a future release.
+    # parrot-sphinx's preinst computes md5sum of
+    # /opt/parrot-sphinx/usr/share/sphinx/license/content and skips
+    # the EULA prompt entirely if it matches a known hash
+    # (da368dad2f2296800a3f985a4c8f2d03 in the 2.15.1 build). On a
+    # FIRST install that file doesn't exist yet (the deb hasn't
+    # unpacked), so the script falls through to a debconf prompt
+    # which can't be answered in a headless build.
+    #
+    # Trick: extract the license file from the deb's data archive
+    # into the right path BEFORE apt-get install runs. preinst then
+    # sees the matching md5, prints "License has not changed", and
+    # skips the prompt.
     && apt-get download parrot-sphinx \
     && PSDEB=$(ls parrot-sphinx_*.deb | head -1) \
-    && mkdir -p /tmp/ps-control \
-    && dpkg-deb -e "$PSDEB" /tmp/ps-control \
-    && echo "── parrot-sphinx preinst (first 80 lines) ──" \
-    && head -80 /tmp/ps-control/preinst 2>&1 || true \
-    && echo "── parrot-sphinx templates ──" \
-    && cat /tmp/ps-control/templates 2>&1 || true \
-    && echo "── end ──" \
-    && for q in license eula license-accepted accept-license accept-eula; do \
-         echo "parrot-sphinx parrot-sphinx/$q boolean true" \
-           | debconf-set-selections; \
-         echo "parrot-sphinx parrot-sphinx/$q select Yes" \
-           | debconf-set-selections; \
-         echo "parrot-sphinx parrot-sphinx/$q seen true" \
-           | debconf-set-selections; \
-       done \
-    # Common file markers some packages check
-    && mkdir -p /etc/parrot-sphinx /var/lib/parrot-sphinx \
-    && touch /etc/parrot-sphinx/license-accepted \
-             /var/lib/parrot-sphinx/license-accepted \
-             /etc/parrot-sphinx/.eula-accepted \
-    # Env vars the preinst might honour
-    && export SPHINX_ACCEPT_EULA=yes \
-             SPHINX_LICENSE_ACCEPTED=yes \
-             PARROT_LICENSE_ACCEPTED=yes \
-             PARROT_SPHINX_LICENSE_ACCEPTED=yes \
-             ACCEPT_EULA=yes \
+    && mkdir -p /tmp/ps-extract \
+    && dpkg-deb -x "$PSDEB" /tmp/ps-extract \
+    && mkdir -p /opt/parrot-sphinx/usr/share/sphinx/license \
+    && cp /tmp/ps-extract/opt/parrot-sphinx/usr/share/sphinx/license/content \
+          /opt/parrot-sphinx/usr/share/sphinx/license/content \
+    && echo "── pre-seeded license file md5 ──" \
+    && md5sum /opt/parrot-sphinx/usr/share/sphinx/license/content \
     # parrot install — DKMS modules (ulogger-dkms) may fail to build
     # against a non-existent kernel, that's expected and harmless
     # for sim use; force the install to continue past those.
-    #
-    # The parrot-sphinx preinst calls `read` directly to ask the
-    # operator to type "yes" for the EULA — debconf seeding alone
-    # doesn't cover that. We pipe `yes yes` (which prints "yes\n"
-    # forever) into apt-get's stdin so the preinst's read gets a
-    # "yes" answer. APT_LISTCHANGES_FRONTEND=none + DEBIAN_FRONTEND
-    # noninteractive prevent other prompts from blocking.
-    && (yes yes | DEBIAN_FRONTEND=noninteractive APT_LISTCHANGES_FRONTEND=none \
+    && (DEBIAN_FRONTEND=noninteractive APT_LISTCHANGES_FRONTEND=none \
             apt-get install -y --no-install-recommends \
                 parrot-sphinx parrot-ue4-empty parrot-ue4-sphx-tests \
         || (echo "[parrot install] retrying with --fix-broken" \
-            && yes yes | dpkg --configure -a || true \
-            && yes yes | DEBIAN_FRONTEND=noninteractive \
+            && dpkg --configure -a || true \
+            && DEBIAN_FRONTEND=noninteractive \
                 apt-get install -y --fix-broken --no-install-recommends \
                     parrot-sphinx parrot-ue4-empty parrot-ue4-sphx-tests)) \
     # restore real systemctl + drop policy-rc.d
@@ -150,7 +126,7 @@ RUN curl --fail --silent --show-error --location \
     && dpkg-divert --local --rename --remove /bin/systemctl \
     && rm -f /usr/sbin/policy-rc.d \
     && rm -f parrot-sphinx_*.deb \
-    && rm -rf /tmp/ps-control \
+    && rm -rf /tmp/ps-extract \
     && rm -rf /var/lib/apt/lists/*
 
 # ── Tailscale ──────────────────────────────────────────────────────────
