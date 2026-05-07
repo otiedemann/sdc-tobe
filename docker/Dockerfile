@@ -138,7 +138,17 @@ RUN curl --fail --silent --show-error --location \
     # creates it; we guard for the case it didn't run cleanly under
     # our license-md5 shortcut). Adding sdc to it happens AFTER
     # user creation, further down in the Dockerfile.
-    && (getent group firmwared >/dev/null || groupadd firmwared)
+    && (getent group firmwared >/dev/null || groupadd firmwared) \
+    # firmwared hard-fails to start without AppArmor support in the
+    # kernel namespace (init_subsystems → ENOSYS). Inside an
+    # unprivileged container (RunPod, etc.) /sys/kernel/security/
+    # apparmor/ isn't reachable, so disable AppArmor at the
+    # firmwared config level. Verified in a live container:
+    #   I firmwared_config: loading configuration from "/etc/firmwared.conf"
+    #   W firmwared_config: AppArmor disabled, this is dangerous
+    #   I firmwared_firmwares: done indexing firmwares
+    # Safe for sim — no untrusted firmware to constrain.
+    && printf 'FIRMWARED_DISABLE_APPARMOR = "y"\n' > /etc/firmwared.conf
 
 # ── Tailscale ──────────────────────────────────────────────────────────
 # Lets the operator reach sphinx-control + the camera stream from
