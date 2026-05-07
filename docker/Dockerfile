@@ -134,12 +134,11 @@ RUN curl --fail --silent --show-error --location \
     && rm -f parrot-sphinx_*.deb \
     && rm -rf /tmp/ps-extract \
     && rm -rf /var/lib/apt/lists/* \
-    # The parrot-sphinx postinst creates the `firmwared` group;
-    # add sdc to it so `sphinx` can talk to /var/run/firmwared.sock.
-    # Without this every drone spawn dies with:
-    #   "ERROR : You should be a member of the firmwared group to run sphinx."
-    && (getent group firmwared >/dev/null || groupadd firmwared) \
-    && usermod -aG firmwared sdc
+    # Ensure the firmwared group exists (the postinst usually
+    # creates it; we guard for the case it didn't run cleanly under
+    # our license-md5 shortcut). Adding sdc to it happens AFTER
+    # user creation, further down in the Dockerfile.
+    && (getent group firmwared >/dev/null || groupadd firmwared)
 
 # ── Tailscale ──────────────────────────────────────────────────────────
 # Lets the operator reach sphinx-control + the camera stream from
@@ -168,7 +167,12 @@ ARG SDC_GID=1000
 RUN groupadd -g ${SDC_GID} sdc \
     && useradd -m -u ${SDC_UID} -g ${SDC_GID} -s /bin/bash sdc \
     && echo 'sdc ALL=(ALL) NOPASSWD: ALL' >> /etc/sudoers \
-    && mkdir -p /home/sdc && chown -R sdc:sdc /home/sdc
+    && mkdir -p /home/sdc && chown -R sdc:sdc /home/sdc \
+    # Add sdc to the firmwared group (created earlier in the parrot
+    # install step) so `sphinx` can open /var/run/firmwared.sock.
+    # Without this, drone spawn aborts with:
+    #   "ERROR : You should be a member of the firmwared group to run sphinx."
+    && usermod -aG firmwared sdc
 
 # ── sdc-tobe repo ──────────────────────────────────────────────────────
 # COPY from the build context rather than git-clone, because the
