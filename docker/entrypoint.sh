@@ -31,6 +31,22 @@ REPO=/home/sdc/sdc-tobe
 
 log() { printf '\n[entrypoint] %s\n' "$*"; }
 
+# ── 0. Vulkan ICD selection ─────────────────────────────────────────────
+# Some hosts (Vast.ai, AWS g4dn, others) ship multiple Vulkan ICDs
+# where one or more are broken. The Vulkan loader walks them in order
+# during instance creation; if a broken one segfaults, UE4 dies during
+# plugin load (we've seen this on every cloud host with NVIDIA + Mesa
+# coexistence). Fix: restrict UE4 to ONLY the NVIDIA ICD by setting
+# VK_ICD_FILENAMES — bypasses loader auto-discovery entirely.
+if [ -z "${VK_ICD_FILENAMES:-}" ]; then
+    NVIDIA_ICD=$(find /usr/share/vulkan/icd.d /etc/vulkan/icd.d \
+                 -name 'nvidia*.json' 2>/dev/null | head -1)
+    if [ -n "$NVIDIA_ICD" ]; then
+        export VK_ICD_FILENAMES="$NVIDIA_ICD"
+        log "VK_ICD_FILENAMES=$NVIDIA_ICD (forces UE4 to NVIDIA Vulkan only)"
+    fi
+fi
+
 # ── 1. Xvfb ─────────────────────────────────────────────────────────────
 log "starting Xvfb on ${DISPLAY} (res=${XVFB_RES})"
 # -screen 0 W×H×D ; -ac disables host-based access control (the
@@ -227,10 +243,12 @@ case "${1:-sphinx-control}" in
         # Source parrot-sphinx-setenv.sh so `pysphinx` is importable
         # from sphinx-control (the bundled Python lib lives under
         # /opt/parrot-sphinx/usr/lib/...). Run as 'sdc' (Sphinx
-        # refuses root). DISPLAY inherits via env.
+        # refuses root). DISPLAY + VK_ICD_FILENAMES inherit via env
+        # so child UE4 processes use the right Vulkan driver.
         exec su sdc -c ". /opt/parrot-sphinx/usr/bin/parrot-sphinx-setenv.sh \
             && cd ${REPO}/sphinx-control \
             && DISPLAY=${DISPLAY} \
+               VK_ICD_FILENAMES=${VK_ICD_FILENAMES:-} \
                .venv/bin/uvicorn server:app --host 0.0.0.0 --port 8090"
         ;;
     bash|sh|shell)
