@@ -109,6 +109,22 @@ if grep -q '^[[:space:]]*anafi_ip:[[:space:]]*null' \
         "${REPO}/sphinx-control/config.yaml"
 fi
 
+# Fresh Docker named volumes are created owned by root, but sphinx-
+# control runs as user `sdc` (Sphinx refuses root). When the
+# volumes mount over the image's existing dirs the ownership
+# resets to root and sdc can't write into them — the launcher then
+# fails on env-start with "Permission denied: .../logs/env-XXXXXX".
+# Chown the two mount points to sdc on every start; idempotent.
+for d in "${REPO}/sphinx-control/logs" /home/sdc/.parrot-sphinx; do
+    if [ -d "$d" ]; then
+        owner=$(stat -c '%U' "$d" 2>/dev/null || echo unknown)
+        if [ "$owner" != "sdc" ]; then
+            log "chown $d → sdc:sdc (was $owner)"
+            chown -R sdc:sdc "$d" 2>/dev/null || true
+        fi
+    fi
+done
+
 # Make sure both venvs are there (rebuilds happen if the operator
 # mounted a fresh repo over /home/sdc/sdc-tobe).
 if [ ! -x "${REPO}/sphinx-control/.venv/bin/uvicorn" ]; then
