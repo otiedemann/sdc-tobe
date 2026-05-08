@@ -38,13 +38,40 @@ log() { printf '\n[entrypoint] %s\n' "$*"; }
 # plugin load (we've seen this on every cloud host with NVIDIA + Mesa
 # coexistence). Fix: restrict UE4 to ONLY the NVIDIA ICD by setting
 # VK_ICD_FILENAMES — bypasses loader auto-discovery entirely.
-if [ -z "${VK_ICD_FILENAMES:-}" ]; then
-    NVIDIA_ICD=$(find /usr/share/vulkan/icd.d /etc/vulkan/icd.d \
-                 -name 'nvidia*.json' 2>/dev/null | head -1)
-    if [ -n "$NVIDIA_ICD" ]; then
-        export VK_ICD_FILENAMES="$NVIDIA_ICD"
-        log "VK_ICD_FILENAMES=$NVIDIA_ICD (forces UE4 to NVIDIA Vulkan only)"
+#
+# AWS g4dn complication: the NVIDIA Container Toolkit version on
+# Amazon Linux / Ubuntu Deep Learning AMIs sometimes mounts
+# libGLX_nvidia.so but forgets to mount the matching nvidia_icd.json
+# manifest. UE4 then can't find the ICD even though the driver lib
+# is present. Detect that case and create the JSON on the fly.
+NVIDIA_ICD=$(find /usr/share/vulkan/icd.d /etc/vulkan/icd.d \
+             -name 'nvidia*.json' 2>/dev/null | head -1)
+if [ -z "$NVIDIA_ICD" ]; then
+    # No NVIDIA ICD JSON — check if the driver lib is mounted anyway
+    NVIDIA_LIB=$(find /usr/lib /usr/lib64 /usr/lib/x86_64-linux-gnu \
+                 -maxdepth 3 -name 'libGLX_nvidia.so*' 2>/dev/null | head -1)
+    if [ -n "$NVIDIA_LIB" ]; then
+        log "NVIDIA driver lib found ($NVIDIA_LIB) but ICD JSON missing — creating it"
+        mkdir -p /usr/share/vulkan/icd.d
+        cat > /usr/share/vulkan/icd.d/nvidia_icd.json <<EOF
+{
+    "file_format_version" : "1.0.0",
+    "ICD": {
+        "library_path": "$(basename "$NVIDIA_LIB")",
+        "api_version" : "1.3.0"
+    }
+}
+EOF
+        NVIDIA_ICD=/usr/share/vulkan/icd.d/nvidia_icd.json
     fi
+fi
+if [ -n "${VK_ICD_FILENAMES:-}" ]; then
+    log "VK_ICD_FILENAMES already set externally: $VK_ICD_FILENAMES"
+elif [ -n "$NVIDIA_ICD" ]; then
+    export VK_ICD_FILENAMES="$NVIDIA_ICD"
+    log "VK_ICD_FILENAMES=$NVIDIA_ICD (forces UE4 to NVIDIA Vulkan only)"
+else
+    log "no NVIDIA Vulkan ICD or driver lib found — UE4 will likely segfault on launch"
 fi
 
 # ── 1. Xvfb ─────────────────────────────────────────────────────────────
