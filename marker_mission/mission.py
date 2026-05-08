@@ -58,6 +58,7 @@ from .config import (CALIB_DIR, FLIGHTS_DIR, DEFAULT_DATA_DIR,
 from .controller import MissionController, MissionState, Phase
 from . import mission_script as ms
 from .drone_api import DroneApi, MjpegStreamReader, TelemetrySnapshot
+from .kalman import PositionKalman, ned_velocity_to_arena
 from .recorder import FlightRecorder, make_flight_dir, write_meta
 from .ui import LatestFrame, UiServer
 from .web_calibration import CalibrationCapture
@@ -475,6 +476,12 @@ def cmd_fly(args: argparse.Namespace) -> int:
         # 2026-04-28_18-06-58_unknown (pose frozen identical for 120 s).
         last_seen_ts = 0.0
         last_expired = False
+        # Position Kalman filter state. Lives across loop iterations
+        # (function-local closure variables persist). Reset on
+        # disable -> enable transitions and on dt > kalman_reset_gap_s.
+        position_kf = PositionKalman()
+        kf_last_t = 0.0
+        kf_enabled_prev = False
         while not stop.is_set():
             frame, jpg, ts = reader.latest()
             if frame is None or ts == last_seen_ts:
@@ -598,12 +605,74 @@ def cmd_fly(args: argparse.Namespace) -> int:
                         enable_aggregate_oob_discard=
                             cfg.enable_ippe_aggregate_oob_discard)
                     if est is not None:
+                        # Optional position Kalman filter. When enabled,
+                        # the world_position_m we publish is the KF
+                        # smoothed value; the per-marker raw values
+                        # below are unaffected (operator can still see
+                        # what each marker individually voted for).
+                        if cfg.enable_position_kalman:
+                            kf_now = time.monotonic()
+                            kf_dt = ((kf_now - kf_last_t)
+                                     if kf_last_t > 0.0 else 0.0)
+                            # Reset on disable -> enable, or large gap.
+                            if (not kf_enabled_prev
+                                    or kf_dt > cfg.kalman_reset_gap_s):
+                                position_kf.reset()
+                                kf_dt = 0.0
+                            # Sync params live so /tune-time changes
+                            # take effect on the next tick.
+                            position_kf.accel_var = float(cfg.kalman_accel_var)
+                            position_kf.pos_meas_var = float(
+                                cfg.kalman_pos_meas_var)
+                            position_kf.vel_meas_var = float(
+                                cfg.kalman_vel_meas_var)
+                            if kf_dt > 0.0 and position_kf.initialised:
+                                position_kf.predict(kf_dt)
+                            position_kf.update_position(
+                                np.asarray(est.position_m, dtype=float))
+                            # IMU velocity update (NED -> arena).
+                            # Anafi vgx/vgy/vgz come out in cm/s, see
+                            # comment in tools/replay_kalman.py.
+                            if (arena_for_swap is not None
+                                    and arena_for_swap
+                                    .magnetic_north_arena_yaw_deg is not None
+                                    and tel_for_swap is not None):
+                                try:
+                                    vN = float(
+                                        tel_for_swap.raw["vgx"]) / 100.0
+                                    vE = float(
+                                        tel_for_swap.raw["vgy"]) / 100.0
+                                    vD = float(
+                                        tel_for_swap.raw["vgz"]) / 100.0
+                                    arena_vel = ned_velocity_to_arena(
+                                        vN, vE, vD,
+                                        float(arena_for_swap
+                                              .magnetic_north_arena_yaw_deg))
+                                    position_kf.update_velocity(arena_vel)
+                                except (KeyError, TypeError, ValueError):
+                                    pass
+                            kf_last_t = kf_now
+                            kf_pos = position_kf.position()
+                            world_pos = (
+                                (float(kf_pos[0]), float(kf_pos[1]),
+                                 float(kf_pos[2]))
+                                if kf_pos is not None
+                                else (float(est.position_m[0]),
+                                      float(est.position_m[1]),
+                                      float(est.position_m[2])))
+                        else:
+                            # KF disabled: clean up state so re-enable
+                            # starts fresh, and pass the raw aggregate
+                            # through unchanged.
+                            if kf_enabled_prev:
+                                position_kf.reset()
+                                kf_last_t = 0.0
+                            world_pos = (float(est.position_m[0]),
+                                         float(est.position_m[1]),
+                                         float(est.position_m[2]))
+                        kf_enabled_prev = cfg.enable_position_kalman
                         with state.lock:
-                            state.world_position_m = (
-                                float(est.position_m[0]),
-                                float(est.position_m[1]),
-                                float(est.position_m[2]),
-                            )
+                            state.world_position_m = world_pos
                             state.world_position_updated_at = time.monotonic()
                             state.world_position_used_markers = list(
                                 est.used_markers)

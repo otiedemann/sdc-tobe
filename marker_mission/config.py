@@ -309,6 +309,22 @@ class MissionConfig:
     mirror_collapse_sum_hdg_deg: float = 5.0
     mirror_collapse_max_hdg_deg: float = 10.0
 
+    # --- Position Kalman filter (optional, off by default) ------------------
+    # 6-state CV model fed by the arena.estimate_position output (slow,
+    # accurate) plus the Anafi NED velocity rotated into arena frame
+    # (fast, every-tick). When enabled, replaces the raw aggregate
+    # position in state.world_position_m with the KF-smoothed value.
+    # The TO step (which drives RC from world position directly) is
+    # the primary beneficiary; APPROACH/HOLD already smooth marker-frame
+    # quantities and are largely insensitive to world-position jitter.
+    # See marker_mission.kalman.PositionKalman for the math; same code
+    # path tools.replay_kalman uses offline.
+    enable_position_kalman: bool = False
+    kalman_accel_var: float = 0.1            # process noise (m^2/s^4)
+    kalman_pos_meas_var: float = 0.0025      # ArUco R, sigma~5cm
+    kalman_vel_meas_var: float = 0.0025      # IMU R, sigma~5cm/s
+    kalman_reset_gap_s: float = 0.5          # auto-reset on dt larger than this
+
     # ------------------------------------------------------------------------
     def update_from_dict(self, values: dict) -> dict:
         """Apply a {field: value} dict to this cfg in-place. Returns a
@@ -626,6 +642,31 @@ TUNING_FIELDS = {
         "unit": "deg", "step": 0.5,
         "desc": "Maximum max(|hdg0|, |hdg1|) for mirror collapse to fire. Restricts collapse to the truly-frontal blind window. Too tight and the picker flickers between branches at corner-noise jitter (~12 deg flicker on small markers); too loose and genuine off-axis cases get smeared. Default 10; try 13-15 for small / distant markers.",
     },
+
+    "enable_position_kalman": {
+        "label": "Position Kalman filter", "kind": "bool",
+        "desc": "Replace state.world_position_m with the output of a 6-state constant-velocity Kalman filter fed by the ArUco aggregate position + Anafi NED velocity rotated into the arena frame. Helps the TO step (which uses world position directly to drive RC) by smoothing the ~30-40 cm per-tick branch-flicker jitter we see on small markers. APPROACH/HOLD already smooth marker-frame quantities and are largely insensitive. Default OFF -- A/B at /tune.",
+    },
+    "kalman_accel_var": {
+        "label": "KF accel variance (Q)", "kind": "float",
+        "unit": "m^2/s^4", "step": 0.01,
+        "desc": "Process noise: how aggressively the drone is expected to manoeuvre. Higher = KF trusts measurement more (less smoothing); lower = trusts model more (more smoothing, lags fast moves). Default 0.1 was a reasonable middle ground in offline replay.",
+    },
+    "kalman_pos_meas_var": {
+        "label": "KF position R", "kind": "float",
+        "unit": "m^2", "step": 0.0001,
+        "desc": "ArUco position measurement-noise variance. 0.0025 corresponds to sigma=5cm. Raise this if you see the KF pulling toward obvious branch-flip outliers; lower it to track the raw measurement more tightly.",
+    },
+    "kalman_vel_meas_var": {
+        "label": "KF velocity R", "kind": "float",
+        "unit": "m^2/s^2", "step": 0.0001,
+        "desc": "Anafi velocity measurement-noise variance. 0.0025 corresponds to sigma=5cm/s. The Anafi's onboard fusion is normally tight; raise if you see the KF velocity diverging from the IMU dots in the replay plot.",
+    },
+    "kalman_reset_gap_s": {
+        "label": "KF reset gap", "kind": "float",
+        "unit": "s", "step": 0.1,
+        "desc": "Auto-reset the KF when the inter-tick gap exceeds this. Prevents large dt blowing up covariance during long marker-loss windows.",
+    },
 }
 
 TUNING_GROUPS = [
@@ -663,6 +704,12 @@ TUNING_GROUPS = [
          "enable_ippe_alt_branch_swap",
          "enable_ippe_prev_anchor",
          "enable_ippe_aggregate_oob_discard"]),
+    ("Position Kalman filter (advanced)",
+        ["enable_position_kalman",
+         "kalman_accel_var",
+         "kalman_pos_meas_var",
+         "kalman_vel_meas_var",
+         "kalman_reset_gap_s"]),
 ]
 
 
