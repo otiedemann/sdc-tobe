@@ -2,3 +2,7 @@ opencv-contrib-python>=4.8
 numpy>=1.24
 flask>=2.2
 requests>=2.28
+# Optional: only used by tools/replay_kalman.py for the A/B plot.
+# The CSV output works without it; a missing matplotlib triggers a
+# graceful warning instead of a crash.
+matplotlib>=3.5
