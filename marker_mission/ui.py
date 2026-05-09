@@ -444,6 +444,12 @@ const REPLAY_ID = {{ replay_id|tojson }};
 // at page-load time; refresh() updates it each tick from /api/state's
 // drone_connected field, so the Start button enables / disables live.
 let droneConnected = {{ 'true' if drone_connected else 'false' }};
+// Server-rendered initial phase. Lets setMissionButtons() paint the
+// correct Start vs Stop state on the very first frame after a refresh
+// during a flight, instead of flashing "Start mission" until the first
+// /api/state poll lands ~250ms later. Falls back to "init" on pages
+// (replay browser, replay view) that don't supply it.
+const INITIAL_PHASE = {{ (initial_phase if initial_phase is defined else 'init')|tojson }};
 const $ = id => document.getElementById(id);
 
 // Wall colour palette, identical to the /arena tab's WALL_COLORS.
@@ -1441,6 +1447,13 @@ async function refresh() {
     lastPhase = s.phase;
   } catch (e) {}
   setTimeout(refresh, 250);
+}
+// Paint the correct Start/Stop state from the server-rendered phase
+// before the first /api/state lands. Otherwise mid-flight refreshes
+// briefly show the green Start button (and re-arm the script editor)
+// for the ~250ms it takes refresh() to land.
+if (typeof setMissionButtons === 'function') {
+  try { setMissionButtons(INITIAL_PHASE); } catch (e) {}
 }
 refresh();
 </script>
@@ -3497,6 +3510,18 @@ class UiServer:
                     else "@")
 
         def live_ctx(**overrides):
+            # Pull current phase off MissionState so the template can
+            # render the Start/Stop buttons in their correct state from
+            # the very first paint -- avoids the "Start mission" green
+            # button briefly flashing on page load mid-flight, which
+            # the operator could click and re-trigger the controller
+            # before refresh() lands the live phase from /api/state.
+            current_phase = "init"
+            try:
+                if self.state is not None:
+                    current_phase = self.state.snapshot().get("phase") or "init"
+            except Exception:
+                pass
             base = dict(
                 active="video",
                 history_s=self.history_s,
@@ -3508,6 +3533,7 @@ class UiServer:
                 header_label="phase: …",
                 drone_connected=self.drone_connected,
                 killswitch_key=killswitch_key(),
+                initial_phase=current_phase,
             )
             base.update(overrides)
             return base
