@@ -41,6 +41,21 @@ VEL_BLEND = 0.25
 MEAS_BLEND_MIN = 0.35
 MEAS_BLEND_MAX = 0.85
 
+# Re-acquisition consensus (item 3 of position-tracker stability fix).
+# After a marker dropout longer than POSE_HOLD_SEC the previous state is no
+# longer trustworthy as a prior — but a single bad solvePnP fix shouldn't
+# teleport the published position either. The first fresh fix after such a
+# gap is cached, and only accepted once a SECOND fix lands within
+# RECOVERY_DT_S of the first AND within RECOVERY_DIST_M of it. The
+# confirmed measurement is then partially blended toward the predicted
+# state via RECOVERY_ALPHA_SCALE, so even after confirmation the published
+# position doesn't snap. Eliminates the "0→1 ref re-acquisition teleport"
+# class — see flightlog analysis 2026-04-26 (43 m p99 jumps in baseline).
+RECOVERY_GAP_S = 0.5
+RECOVERY_DT_S = 0.5
+RECOVERY_DIST_M = 1.5
+RECOVERY_ALPHA_SCALE = 0.3
+
 
 def has_gui():
     system = platform.system().lower()
@@ -198,9 +213,13 @@ class HeadlessAruCoPositioning:
         # logs (single-marker solvePnP is occasionally wildly wrong, e.g.
         # mirror-pose ambiguity at certain viewing angles). Set 0 to
         # disable. Applies only when a prior state exists AND marker
-        # coverage has been continuous — after a reset, the first fresh
-        # fix is always accepted so tracking can bootstrap.
-        self.max_pose_jump_m = 0.0   # 0 = disabled by default
+        # coverage has been continuous — after a reset or long stale
+        # gap, the re-acquisition consensus check below takes over.
+        # Default 3.0 m — flightlog analysis (2026-04-26, 107 flights)
+        # showed gate=3 m would have rejected 147 catastrophic single-
+        # frame outliers (0.49 % of fresh fixes) including every |Z|>10 m
+        # glitch.
+        self.max_pose_jump_m = 3.0
 
         # last valid pose cache for temporary marker loss
         self.last_valid_pose = None
@@ -212,6 +231,13 @@ class HeadlessAruCoPositioning:
         self.state_pos = None
         self.state_vel = np.zeros(3, dtype=float)
         self.state_ts = None
+
+        # Re-acquisition consensus state (paired with RECOVERY_* constants).
+        # When tracking has been lost (no fresh fix within POSE_HOLD_SEC),
+        # the next fresh fix becomes a candidate; we publish a coast until
+        # a second fresh fix confirms it.
+        self._recovery_candidate_pos = None
+        self._recovery_candidate_ts = 0.0
 
         # ── IMU fusion ───────────────────────────────────────────────────
         # IMU velocity in ARENA frame (m/s), set externally via set_imu_velocity()
@@ -295,11 +321,39 @@ class HeadlessAruCoPositioning:
         return pos
 
     def _reset_motion_state(self):
+        """Clear in-flight prediction state. Called on marker dropouts
+        inside `process_frame`. Does NOT clear `last_valid_pose` (the
+        next frame may still want to publish it as a stale hold)."""
         self.state_pos = None
         self.state_vel = np.zeros(3, dtype=float)
         self.state_ts = None
         self.imu_vel = np.zeros(3, dtype=float)
         self.imu_vel_ts = 0.0
+        self._recovery_candidate_pos = None
+        self._recovery_candidate_ts = 0.0
+
+    def reset_tracker_state(self):
+        """Full reset of every piece of position-tracker state. Call this
+        from the FC's takeoff path so a previous flight's poisoned state
+        cannot leak into the new flight.
+
+        Why this matters: the FC positioner is a long-lived process. If
+        the previous flight ended with `state_pos` pointing at, say,
+        [643, -315, -1866] (a real example from flight 2026-04-24 09-44-43,
+        caused by a bad single-marker fix), that state persists across
+        takeoffs. The EMA filter then takes ~5 s to drag the published
+        position back to reality, during which every consumer (mission
+        logic, UI, autonomous pursuit) sees impossible coordinates.
+        Resetting on takeoff makes each flight start from a clean slate.
+        """
+        self._reset_motion_state()
+        self.last_valid_pose = None
+        self.last_valid_dir = None
+        self.last_valid_ts = 0.0
+        for kf in self.kf_pos:
+            kf.reset()
+        self.direction_filter.reset()
+        self.target_filters = {}
 
     def _predict_state(self, target_ts):
         if self.state_pos is None or self.state_ts is None:
@@ -730,37 +784,92 @@ class HeadlessAruCoPositioning:
         else:
             f_pos_meas = raw_pos.copy()
 
+        # Shared "tracking is currently fresh" predicate — used by both
+        # the pose-jump gate (continuous-tracking outlier reject) and the
+        # re-acquisition consensus check (long-stale recovery).
+        tracking_fresh = (self.last_valid_pose is not None and
+                          self.state_pos is not None and
+                          self.state_ts is not None and
+                          (now_wall - self.last_valid_ts) <= POSE_HOLD_SEC)
+
         # ── Pose-jump gate ────────────────────────────────────────────
         # If the fresh fix disagrees with the predicted state by more
         # than `max_pose_jump_m`, reject it rather than poisoning the
         # filter. The gate only fires when we have an existing state
-        # AND tracking has been continuous (last valid fix within
-        # POSE_HOLD_SEC) — a bootstrap or a genuinely long dropout is
-        # allowed to re-center freely.
+        # AND tracking has been continuous — a bootstrap or a genuinely
+        # long dropout falls through to the re-acquisition consensus
+        # check below.
         try:
             gate_m = float(getattr(self, "max_pose_jump_m", 0.0))
         except Exception:
             gate_m = 0.0
         gate_m = max(0.0, gate_m)
-        if gate_m > 0 and self.state_pos is not None and self.state_ts is not None:
-            tracking_fresh = (self.last_valid_pose is not None and
-                              (now_wall - self.last_valid_ts) <= POSE_HOLD_SEC)
-            if tracking_fresh:
-                pred_gate = self._predict_state(capture_ts)
-                if pred_gate is not None:
-                    jump = float(np.linalg.norm(f_pos_meas - pred_gate))
-                    if jump > gate_m:
-                        # Outlier — return a stale payload coasting on the
-                        # existing state. Next frame will try again with
-                        # fresh markers; if several in a row all agree on
-                        # the jump, POSE_HOLD_SEC eventually elapses and
-                        # the gate bootstraps to the new location.
-                        return _stale_payload(
-                            refs=[int(m) for m in ref_marker_ids],
-                            marker_weights={str(mid): float(w)
-                                            for mid, w in zip(ref_marker_ids, weights)},
-                            seen_ids=seen_ids,
-                        )
+        if gate_m > 0 and tracking_fresh:
+            pred_gate = self._predict_state(capture_ts)
+            if pred_gate is not None:
+                jump = float(np.linalg.norm(f_pos_meas - pred_gate))
+                if jump > gate_m:
+                    # Outlier — return a stale payload coasting on the
+                    # existing state. Next frame will try again with
+                    # fresh markers; if several in a row all agree on
+                    # the jump, POSE_HOLD_SEC eventually elapses and
+                    # the consensus path bootstraps to the new location.
+                    return _stale_payload(
+                        refs=[int(m) for m in ref_marker_ids],
+                        marker_weights={str(mid): float(w)
+                                        for mid, w in zip(ref_marker_ids, weights)},
+                        seen_ids=seen_ids,
+                    )
+
+        # ── Re-acquisition consensus ──────────────────────────────────
+        # If tracking was lost for longer than POSE_HOLD_SEC the previous
+        # state is no longer trustworthy as a prior — but a single bad
+        # solvePnP fix shouldn't teleport the published position either.
+        # Cache the first fresh fix and only accept it once a second fix
+        # confirms it within RECOVERY_DT_S / RECOVERY_DIST_M. The
+        # confirmed fix is partially blended toward the predicted state
+        # (RECOVERY_ALPHA_SCALE) so even after confirmation we don't snap.
+        if (not tracking_fresh) and self.state_pos is not None:
+            cand_pos = self._recovery_candidate_pos
+            cand_ts = float(self._recovery_candidate_ts or 0.0)
+            cand_age = float(capture_ts) - cand_ts
+            if cand_pos is None or cand_age > RECOVERY_DT_S:
+                # No candidate (or candidate timed out) — start a new one
+                # and coast.
+                self._recovery_candidate_pos = f_pos_meas.copy()
+                self._recovery_candidate_ts = float(capture_ts)
+                return _stale_payload(
+                    refs=[int(m) for m in ref_marker_ids],
+                    marker_weights={str(mid): float(w)
+                                    for mid, w in zip(ref_marker_ids, weights)},
+                    seen_ids=seen_ids,
+                )
+            cand_dist = float(np.linalg.norm(f_pos_meas - cand_pos))
+            if cand_dist > RECOVERY_DIST_M:
+                # Two fresh fixes disagree — replace the candidate and
+                # keep coasting. We never confirm an inconsistent pair.
+                self._recovery_candidate_pos = f_pos_meas.copy()
+                self._recovery_candidate_ts = float(capture_ts)
+                return _stale_payload(
+                    refs=[int(m) for m in ref_marker_ids],
+                    marker_weights={str(mid): float(w)
+                                    for mid, w in zip(ref_marker_ids, weights)},
+                    seen_ids=seen_ids,
+                )
+            # Confirmed re-acquisition — partially blend the measurement
+            # toward the predicted state so the published position
+            # doesn't snap. _update_motion_state below will then absorb
+            # the (already-softened) measurement at its normal alpha.
+            pred_now = self._predict_state(capture_ts)
+            if pred_now is not None:
+                f_pos_meas = pred_now + RECOVERY_ALPHA_SCALE * (f_pos_meas - pred_now)
+            self._recovery_candidate_pos = None
+            self._recovery_candidate_ts = 0.0
+        else:
+            # Continuous tracking (or genuine cold-start with no state).
+            # Drop any pending candidate from a previous gap.
+            self._recovery_candidate_pos = None
+            self._recovery_candidate_ts = 0.0
 
         # Apply delayed measurement update at capture time, then predict to evaluation time.
         quality = float(np.mean(weights)) * min(1.0, len(weights) / 3.0)

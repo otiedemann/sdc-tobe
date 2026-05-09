@@ -343,7 +343,7 @@ HTTP_PORT = int(os.getenv("HTTP_PORT", "8080"))
 # newer/older build than the FC (the single most confusing bug source:
 # "I updated the code but it still behaves like the old version" —
 # because only one of the two was actually restarted).
-CODE_VERSION = "2026-04-24-cr (FC version endpoint + C2/FC mismatch check)"
+CODE_VERSION = "2026-04-26-da (position tracker stability: takeoff state reset + pose-jump gate default 3 m + re-acquisition consensus)"
 
 
 def _read_fc_git_revision() -> dict:
@@ -923,7 +923,12 @@ _pos_cfg: dict = {
     # Pose-jump gate (metres). Reject a fresh fix if it disagrees with
     # the Kalman-predicted state by more than this. Kills the
     # catastrophic >10 m single-marker glitches. 0 = disabled.
-    "max_pose_jump_m":      0.0,
+    # Default 3.0 — flightlog analysis (2026-04-26, 107 flights) showed
+    # this would have rejected 147 catastrophic single-frame outliers
+    # (0.49 % of fresh fixes) including every |Z|>10 m glitch that
+    # broke pursuit missions. Operators can still set it to 0 via the
+    # web UI to disable the gate for debugging.
+    "max_pose_jump_m":      3.0,
     # Target-box marker size. SDC26 target boxes use 19 cm ArUco
     # stickers; arena walls use 50 cm. Markers with ID ≥ 30 are
     # solvePnP-ed against this smaller corner set so target positions
@@ -4216,6 +4221,23 @@ def api_takeoff():
             hold_s = SAFE_TAKEOFF_S if safe_takeoff_enabled else 3.0
             start_discrete_window(hold_s)
             b.before_discrete_command()
+            # Position-tracker state reset BEFORE the takeoff actually
+            # commits. The FC positioner is a long-lived process; a
+            # previous flight's last_valid_pose / state_pos / KF state
+            # leaks into the new flight unless we explicitly clear it.
+            # Field log analysis (2026-04-26, 107 flights) found multiple
+            # cases where takeoff began with a poisoned state at e.g.
+            # Z = -1866 m, with the EMA filter then taking ~5 s to drag
+            # the published position back to reality. See
+            # ctrl_position.HeadlessAruCoPositioning.reset_tracker_state.
+            try:
+                if _pos_processor is not None and hasattr(
+                    _pos_processor, "reset_tracker_state"
+                ):
+                    _pos_processor.reset_tracker_state()
+                    print("[POS] tracker state reset on takeoff")
+            except Exception as re:
+                print(f"[POS] tracker reset on takeoff failed: {re}")
             ok, msg = b.takeoff()
             b.after_discrete_command()
             if ok:
