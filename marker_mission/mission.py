@@ -653,6 +653,7 @@ def cmd_fly(args: argparse.Namespace) -> int:
                                     pass
                             kf_last_t = kf_now
                             kf_pos = position_kf.position()
+                            kf_vel = position_kf.velocity()
                             world_pos = (
                                 (float(kf_pos[0]), float(kf_pos[1]),
                                  float(kf_pos[2]))
@@ -660,6 +661,10 @@ def cmd_fly(args: argparse.Namespace) -> int:
                                 else (float(est.position_m[0]),
                                       float(est.position_m[1]),
                                       float(est.position_m[2])))
+                            world_vel: Optional[tuple[float, float, float]] = (
+                                (float(kf_vel[0]), float(kf_vel[1]),
+                                 float(kf_vel[2]))
+                                if kf_vel is not None else None)
                         else:
                             # KF disabled: clean up state so re-enable
                             # starts fresh, and pass the raw aggregate
@@ -670,6 +675,7 @@ def cmd_fly(args: argparse.Namespace) -> int:
                             world_pos = (float(est.position_m[0]),
                                          float(est.position_m[1]),
                                          float(est.position_m[2]))
+                            world_vel = None
                         kf_enabled_prev = cfg.enable_position_kalman
                         with state.lock:
                             state.world_position_m = world_pos
@@ -683,6 +689,7 @@ def cmd_fly(args: argparse.Namespace) -> int:
                                 tuple(float(c) for c in
                                       est.per_marker_position_m[mid])
                                 for mid in est.used_markers]
+                            state.world_velocity_m_kf = world_vel
                 # Active target's pose method (or empty if not in view).
                 with state.lock:
                     state.target_pose_method = (

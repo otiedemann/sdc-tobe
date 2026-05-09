@@ -49,6 +49,12 @@ _CSV_FIELDS = [
     "target_distance_m", "target_relative_heading_deg",
     "mission_step_idx",
     "world_x", "world_y", "world_z", "world_n_used", "world_position_age_s",
+    # Position Kalman filter velocity output (arena frame, m/s) when
+    # cfg.enable_position_kalman is True. Empty when KF is disabled
+    # or hasn't initialised yet. world_x/y/z above already carries
+    # the KF position when the filter is on (no separate raw column
+    # in the same flight; A/B by toggling the switch between flights).
+    "world_vx_kf", "world_vy_kf", "world_vz_kf",
     "target_pose_method", "arena_pose_methods", "arena_per_marker_world",
     "rc_lr", "rc_fb", "rc_ud", "rc_yaw",
     "tel_battery", "tel_yaw", "tel_pitch", "tel_roll",
@@ -321,6 +327,11 @@ class FlightRecorder:
             wpa = snap.get("world_position_age_s")
             row["world_position_age_s"] = (
                 f"{wpa:.3f}" if wpa is not None else "")
+            wvk = snap.get("world_velocity_m_kf")
+            if wvk is not None:
+                row["world_vx_kf"] = f"{wvk[0]:.4f}"
+                row["world_vy_kf"] = f"{wvk[1]:.4f}"
+                row["world_vz_kf"] = f"{wvk[2]:.4f}"
             row["target_pose_method"] = snap.get("target_pose_method", "") or ""
             wpm = snap.get("world_position_pose_methods") or []
             # Format as "id:method|id:method" so the CSV stays one

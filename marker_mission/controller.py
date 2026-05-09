@@ -412,6 +412,13 @@ class MissionState:
     world_position_pose_methods: List[str] = field(default_factory=list)
     world_position_per_marker: List[tuple[float, float, float]] = field(
         default_factory=list)
+    # Position Kalman filter velocity output (arena frame, m/s). None
+    # whenever ``cfg.enable_position_kalman`` is False or the filter
+    # hasn't yet seen a position measurement to initialise. Logged in
+    # the per-flight CSV alongside the position so post-flight
+    # analysis can plot the KF velocity track without re-running the
+    # offline replay.
+    world_velocity_m_kf: Optional[tuple[float, float, float]] = None
     # solvePnP method for the controller's active TARGET marker
     # (whatever pose_holder.get() returned this tick). "" when the
     # target marker isn't currently in view.
@@ -474,6 +481,7 @@ class MissionState:
             self.world_position_used_markers = []
             self.world_position_pose_methods = []
             self.world_position_per_marker = []
+            self.world_velocity_m_kf = None
             self.target_pose_method = ""
             self.arena_yaw_deg = None
             self.arena_yaw_updated_at = 0.0
@@ -527,6 +535,9 @@ class MissionState:
                     self.world_position_pose_methods),
                 "world_position_per_marker": [list(p) for p in
                                               self.world_position_per_marker],
+                "world_velocity_m_kf": (list(self.world_velocity_m_kf)
+                                        if self.world_velocity_m_kf is not None
+                                        else None),
                 "target_pose_method": self.target_pose_method,
                 "arena_yaw_deg": self.arena_yaw_deg,
                 "arena_yaw_age_s": (
