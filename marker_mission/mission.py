@@ -308,10 +308,31 @@ def cmd_fly(args: argparse.Namespace) -> int:
             # real serial is usually available. Without this refresh
             # the flight directory ends up named "..._unknown" even
             # though the drone is plainly connected.
-            nonlocal serial
+            nonlocal serial, calibration
             tel_now = tel_holder.get()
             if tel_now is not None and tel_now.serial_number:
                 serial = tel_now.serial_number
+            # If we loaded calibration against a stale serial at
+            # startup (drone connected after the 5 s startup window),
+            # retry with the now-known serial. Otherwise the entire
+            # flight runs with default Anafi intrinsics -- cx/cy
+            # offset by ~5 % of image dimension, fx/fy off by ~3 % --
+            # and every marker pose is biased proportionally.
+            if calibration.serial != serial:
+                try:
+                    new_cal = store.load(serial, calibration.resolution,
+                                          allow_default=True)
+                    # Only swap if the new load IS a calibrated one,
+                    # OR if the existing was already a default (so
+                    # mission_meta at least records the live serial
+                    # in calibration.serial instead of "unknown").
+                    if not new_cal.is_default or calibration.is_default:
+                        calibration = new_cal
+                        detector.calibration = new_cal
+                        print(f"[mission] calibration refreshed at "
+                              f"TAKEOFF: {calibration.short_summary()}")
+                except Exception as e:
+                    print(f"[mission] calibration refresh failed: {e}")
             new_dir = make_flight_dir(FLIGHTS_DIR, serial)
             recorder_box[0] = FlightRecorder(new_dir, fps=cfg.record_fps)
             flight_dir_box[0] = new_dir
