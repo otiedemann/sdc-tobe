@@ -3360,6 +3360,17 @@ class UiServer:
             self._replays[flight_id] = rp
             return rp
 
+    @staticmethod
+    def _serial_from_dirname(name: str) -> Optional[str]:
+        """Trailing token of ``<timestamp>_<serial>``. Returns the
+        token when it looks like a real serial, "unknown" when that
+        was the explicit fallback, None when the dir name doesn't
+        carry one at all."""
+        parts = name.rsplit("_", 1)
+        if len(parts) != 2:
+            return None
+        return parts[1] or None
+
     def _list_flights(self) -> list:
         if self.flights_root is None or not self.flights_root.is_dir():
             return []
@@ -3370,16 +3381,32 @@ class UiServer:
             entry = {"flight_id": d.name, "date": d.name,
                      "serial": "?", "duration_s": None,
                      "final_phase": None}
+            # Serial preference, most-authoritative first:
+            #   1) ``outcome.serial`` -- written at flight end from
+            #      live telemetry, even when calibration loaded
+            #      against "unknown" (drone connected late).
+            #   2) directory-name suffix -- set at TAKEOFF from
+            #      tel_holder.get().serial_number; same value as (1)
+            #      in normal flights but available without parsing
+            #      mission_meta.
+            #   3) ``calibration.serial`` -- the serial we loaded
+            #      calibration against at startup; stale if drone
+            #      connected late.
+            dir_serial = self._serial_from_dirname(d.name)
             meta_path = d / "mission_meta.json"
             if meta_path.exists():
                 try:
                     meta = json.loads(meta_path.read_text())
-                    entry["serial"] = (meta.get("calibration") or {}
-                                       ).get("serial") or "?"
-                    entry["final_phase"] = (meta.get("outcome") or {}
-                                             ).get("final_phase")
+                    outcome = meta.get("outcome") or {}
+                    cal = meta.get("calibration") or {}
+                    entry["serial"] = (outcome.get("serial")
+                                       or dir_serial
+                                       or cal.get("serial") or "?")
+                    entry["final_phase"] = outcome.get("final_phase")
                 except Exception:
-                    pass
+                    entry["serial"] = dir_serial or "?"
+            else:
+                entry["serial"] = dir_serial or "?"
             csv_path = d / "flight_log.csv"
             if csv_path.exists():
                 try:
