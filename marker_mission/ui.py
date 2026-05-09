@@ -131,8 +131,22 @@ _PAGE_HEADER = """
 _VIDEO_AND_STATUS_HTML = """
 <section class="grid" style="grid-template-columns: minmax(0,2fr) minmax(0,1fr);">
   <div class="card">
-    <h2>{{ camera_heading }}</h2>
+    <div style="display:flex; align-items:center; justify-content:space-between;
+                gap:.5rem; margin-bottom:.5rem;">
+      <h2 style="margin:0;">{{ camera_heading }}</h2>
+      {% if mode != 'replay' %}
+      <button id="btn-video-restart" type="button" title="Restart camera stream"
+              style="padding:.3rem .65rem; border:1px solid #2a3038;
+                     border-radius:5px; background:#0c0f12; color:var(--fg);
+                     cursor:pointer; font-size:.8rem;">
+        ↻ Restart camera
+      </button>
+      {% endif %}
+    </div>
     <img class="video" src="{{ video_url }}" alt="camera feed">
+    <span id="video-restart-msg" style="font-size:.75rem; color:#aab;
+                                         display:block; min-height:1rem;
+                                         margin-top:.25rem;"></span>
   </div>
   <div class="card">
     {% if mode == 'replay' %}
@@ -901,6 +915,47 @@ function updateStatus(s) {
 }
 if ($('btn-start')) $('btn-start').addEventListener('click', startMission);
 if ($('btn-stop'))  $('btn-stop').addEventListener('click',  stopMission);
+
+async function restartVideo() {
+  const btn = $('btn-video-restart'); const msg = $('video-restart-msg');
+  if (!btn) return;
+  const orig = btn.textContent;
+  btn.disabled = true; btn.textContent = 'Restarting...';
+  if (msg) { msg.textContent = ''; msg.style.color = '#aab'; }
+  try {
+    const r = await fetch('/api/video/restart', {method: 'POST'});
+    const j = await r.json();
+    if (msg) {
+      if (j.ok) {
+        msg.style.color = 'var(--good)';
+        const fr = (j.reader_stats && j.reader_stats.frames_received) || 0;
+        msg.textContent = 'Restarted (frames: ' + fr + ').';
+      } else {
+        msg.style.color = 'var(--bad)';
+        msg.textContent = 'Restart errors: ' + (j.errors || []).join('; ');
+      }
+    }
+    // Force the <img> to reload the stream URL too -- otherwise some
+    // browsers keep displaying the cached frozen frame even after the
+    // server-side reader has reconnected. Append a query param to bust
+    // the request.
+    const img = document.querySelector('img.video');
+    if (img) {
+      const base = (img.getAttribute('src') || '/video.mjpg').split('?')[0];
+      img.src = base + '?t=' + Date.now();
+    }
+  } catch (e) {
+    if (msg) {
+      msg.style.color = 'var(--bad)';
+      msg.textContent = 'Restart failed: ' + e;
+    }
+  } finally {
+    btn.disabled = false; btn.textContent = orig;
+  }
+}
+if ($('btn-video-restart')) {
+  $('btn-video-restart').addEventListener('click', restartVideo);
+}
 
 // ---- Live RC widget (used by /tune; harmless on pages without it) -------
 // Two 2D crosses (lr+fb on the left "throttle stick", yaw+ud on the
@@ -3248,7 +3303,8 @@ class UiServer:
                  controller: Optional[MissionController] = None,
                  flight_dir_provider: Optional[Callable[[], Optional[Path]]] = None,
                  arena_holder=None,
-                 api=None):
+                 api=None,
+                 stream_reader=None):
         self.state = state
         self.frame = latest_frame
         self.host = host
@@ -3265,6 +3321,11 @@ class UiServer:
         # camera-config proxy endpoints. None in view-only / replay
         # mode -- the proxy returns 503.
         self.api = api
+        # MjpegStreamReader handle for the operator's "Restart camera"
+        # button. None in replay mode. When the upstream MJPEG stops
+        # delivering frames but doesn't close the socket, the reader
+        # sits there forever; the button kicks it.
+        self.stream_reader = stream_reader
         # Used to write parameter_changes.csv next to flight_log.csv.
         # mission.py rolls flight_dir between missions, so we receive
         # a callable rather than a fixed Path.
@@ -4143,6 +4204,42 @@ class UiServer:
                 return jsonify({"ok": True, "default": name})
             except Exception as e:
                 return jsonify({"ok": False, "error": str(e)}), 500
+
+        # ---- Camera stream restart -----------------------------------
+        # Operator-pressed button when the camera image freezes. Cycles
+        # the upstream MJPEG stream (api.video_stop -> video_start_mjpeg)
+        # AND the local MjpegStreamReader thread, in that order: kill
+        # the upstream first so the reader gets a clean EOF, then
+        # restart it so the reader's reconnect loop has something to
+        # latch onto. Returns the stream reader's stats post-restart
+        # so the UI can show "frames: N" feedback.
+        @app.post("/api/video/restart")
+        def api_video_restart():
+            errors = []
+            # 1) Cycle upstream. Both calls are best-effort: if the
+            # unified server is itself down, we still want the local
+            # reader to bounce so the operator gets unstuck the moment
+            # the upstream comes back.
+            if self.api is not None:
+                try:
+                    self.api.video_stop()
+                except Exception as e:
+                    errors.append(f"video_stop: {e}")
+                try:
+                    self.api.video_start_mjpeg()
+                except Exception as e:
+                    errors.append(f"video_start_mjpeg: {e}")
+            # 2) Restart local reader.
+            if self.stream_reader is not None:
+                try:
+                    self.stream_reader.restart()
+                except Exception as e:
+                    errors.append(f"reader.restart: {e}")
+            stats = (self.stream_reader.stats
+                     if self.stream_reader is not None else None)
+            return jsonify({"ok": not errors,
+                            "errors": errors,
+                            "reader_stats": stats})
 
         # ---- Camera live config passthrough (proxy to upstream) -------
         # GET hits the unified API server and returns its config JSON

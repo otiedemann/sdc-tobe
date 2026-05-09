@@ -223,6 +223,19 @@ class MjpegStreamReader:
         if self._thread:
             self._thread.join(timeout=2.0)
 
+    def restart(self) -> None:
+        """Stop the read thread + start a fresh one. Used by the
+        operator's "Restart camera" UI button when the upstream MJPEG
+        stops delivering frames but doesn't error out (e.g. Anafi
+        keepalive lost without socket close). Doesn't touch the
+        unified-server's video stream itself -- caller pairs this
+        with ``DroneApi.video_stop`` / ``video_start_mjpeg`` when an
+        upstream cycle is also wanted."""
+        self.stop()
+        self._stop = threading.Event()
+        self._thread = None
+        self.start()
+
     # ------------------------------------------------------------------ read
     def latest(self) -> tuple[Optional[np.ndarray], Optional[bytes], float]:
         with self._lock:

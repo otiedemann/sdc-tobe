@@ -448,7 +448,8 @@ def cmd_fly(args: argparse.Namespace) -> int:
                   controller=controller,
                   flight_dir_provider=lambda: flight_dir_box[0],
                   arena_holder=arena_holder,
-                  api=api)
+                  api=api,
+                  stream_reader=reader)
     ui.start()
     print(f"[mission] UI running at {ui.url()} (camera) and {ui.url()}/charts")
 
