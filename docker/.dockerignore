@@ -1,0 +1,18 @@
+# Don't ship local working state into the image.
+# Note: .git is INCLUDED so the entrypoint's optional `git pull`
+# (SDC_GIT_PULL=1) works. If image size becomes an issue, comment
+# back in to drop it.
+.venv/
+**/.venv/
+**/__pycache__/
+**/*.pyc
+**/node_modules/
+ansible/sphinx-state/backups/
+sphinx-control/sphinx_control.db
+sphinx-control/logs/
+tools/sphinx-arena/out/markers/
+tools/sphinx-arena/out/logos/
+*.tar.gz
+*.mp4
+*.jsonl
+.DS_Store

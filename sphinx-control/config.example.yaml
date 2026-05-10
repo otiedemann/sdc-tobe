@@ -121,15 +121,20 @@ ue4:
 # Verified working with Sphinx 2.15.1 on the SDC fleet:
 #   sphinx /opt/parrot-sphinx/usr/share/sphinx/drones/anafi4k.drone::firmware=...
 drone_profiles:
-  - name: "anafi"
+  # Only profile we actually want: anafi-4k. Requires the cached
+  # firmware (baked into the image at
+  # /usr/share/firmwared/firmwares/anafi-pc.ext2.zip.<uuid>.firmware)
+  # because the latest Parrot CDN build drops the anafi4k hardware
+  # tag — drone spawn aborts with:
+  #   [Err] Firmware doesn't support requested hardware anafi4k
+  # The cached firmware (May 2026 vintage) DOES list anafi4k so
+  # firmwared accepts the spawn request.
+  #
+  # Other profiles (anafi.drone, anafi_ai.drone) intentionally
+  # removed — operator only wants the 4K hardware variant.
+  - name: "anafi-4k"
     descriptor: "anafi4k.drone"
-    description: "Anafi 4K (default fleet drone, Sphinx-verified)."
-  - name: "anafi-usa"
-    descriptor: "anafi_usa.drone"
-    description: "Anafi USA / Thermal."
-  - name: "anafi-ai"
-    descriptor: "anafi_ai.drone"
-    description: "Anafi Ai (newest, more compute-heavy)."
+    description: "Anafi 4K (uses pre-seeded firmware in image)."
 
 # ── Flight controller (unified_api_server.py) ──────────────────
 # Optional: lets the dashboard launch the controller_unified service

@@ -1,0 +1,44 @@
+# Paths and behaviour shared between backup.yml and restore.yml.
+# Override on the CLI with `-e "key=value"`.
+
+# Path to the sdc-tobe checkout on the remote host.
+remote_repo: "/home/sdc/sdc-tobe"
+
+# Where the backup tarball is fetched to on the control machine, and
+# where it's pushed from for restore. Both backup/restore set this.
+local_backup_dir: "{{ playbook_dir }}/backups"
+
+# Files & directories captured by the backup. Anything in here is
+# considered runtime state — the simulator binaries themselves
+# (parrot-sphinx + parrot-ue4-*) are NOT captured (they're system
+# packages installed via apt). Restore assumes the target already
+# has those packages.
+state_paths:
+  # sdc-tobe runtime config + working tree state
+  - "{{ remote_repo }}/sphinx-control/config.yaml"
+  - "{{ remote_repo }}/sphinx-control/sphinx_control.db"
+  - "{{ remote_repo }}/sphinx-control/logs"
+  - "{{ remote_repo }}/controller_unified/arena_config.json"
+  - "{{ remote_repo }}/controller_unified/position_config.json"
+  - "{{ remote_repo }}/controller_unified/flight_config.json"
+  - "{{ remote_repo }}/controller_unified/api_command_log.jsonl"
+  - "{{ remote_repo }}/controller/position_presets.json"
+  - "{{ remote_repo }}/controller/drones_config.json"
+  # Built arena assets — saves ~10 min of Blender re-export per restore
+  - "{{ remote_repo }}/tools/sphinx-arena/out"
+  # Camera calibration .npz files (per-drone)
+  - "{{ remote_repo }}/aruco-position"
+  # Sphinx UE4 settings (HMI panel state, sky preset, etc.)
+  - "/home/sdc/.parrot-sphinx/unreal_sphinx/settings.json"
+  # Recent telemetry logs (last 10 only — controlled in the playbook)
+  - "/home/sdc/.parrot-sphinx/telemetrylogs"
+
+# How many telemetry logs to keep in the backup (newest N).
+telemetry_keep: 10
+
+# Branch we expect the repo to be on after restore. Used to verify
+# the restored checkout — restore does NOT change branches automatically.
+expected_branch: "main"
+
+# Filename for the backup archive. {{ ts }} is filled in at runtime.
+archive_name: "sphinx-state-{{ ts }}.tar.gz"

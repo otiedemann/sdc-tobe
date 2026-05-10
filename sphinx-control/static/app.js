@@ -309,7 +309,14 @@ function fcButtonsLock(activeBtn, label) {
 
 $("#fc-start-btn").addEventListener("click", async () => {
   const unlock = fcButtonsLock("#fc-start-btn", "starting…");
-  try { await jpost("/api/fc", {}); }
+  // Optional per-start overrides: drone IP and HTTP port. Empty
+  // fields fall back to flight_controller.* in config.yaml.
+  const ip   = document.getElementById("fc-anafi-ip").value.trim();
+  const port = document.getElementById("fc-http-port").value.trim();
+  const body = {};
+  if (ip)   body.anafi_ip = ip;
+  if (port) body.http_port = parseInt(port, 10);
+  try { await jpost("/api/fc", body); }
   catch (e) { unlock(); alert(`fc start failed: ${e.message}`); return; }
   unlock();
   await loadFC();
@@ -408,11 +415,177 @@ if (stopAllBtn) stopAllBtn.addEventListener("click", async () => {
   await loadDrones();
 });
 
+// ── Sphinx CLI panel ──────────────────────────────────────────────
+// Wraps /api/sphinx-cli/{catalogue,param,action,raw}. Drives the
+// "Module / Kind / Key / Value" form: picking a module repopulates
+// the Key dropdown with the catalogue entries (params or actions
+// depending on the Kind selector), and shows per-key help text.
+let SPHINX_CATALOGUE = null;
+
+async function sphinxLoadCatalogue() {
+  try {
+    const r = await fetch('/api/sphinx-cli/catalogue');
+    if (!r.ok) return;
+    SPHINX_CATALOGUE = await r.json();
+    const mods = SPHINX_CATALOGUE.modules || [];
+    const moduleSel = document.getElementById('sphinx-module');
+    if (!moduleSel) return;
+    document.getElementById('sphinx-cli-count').textContent =
+      mods.length + ' modules';
+    // Group <option>s by category for navigability
+    const byCat = {};
+    mods.forEach(m => { (byCat[m.category] = byCat[m.category] || []).push(m); });
+    moduleSel.innerHTML = '<option value="">— pick —</option>';
+    Object.keys(byCat).sort().forEach(cat => {
+      const og = document.createElement('optgroup');
+      og.label = cat;
+      byCat[cat].forEach(m => {
+        const opt = document.createElement('option');
+        opt.value = m.name;
+        opt.textContent = m.label;
+        og.appendChild(opt);
+      });
+      moduleSel.appendChild(og);
+    });
+  } catch (e) {
+    console.error('sphinx catalogue load failed', e);
+  }
+}
+
+function sphinxRefreshKeys() {
+  const moduleSel = document.getElementById('sphinx-module');
+  const kindSel   = document.getElementById('sphinx-kind');
+  const keySel    = document.getElementById('sphinx-key');
+  const help      = document.getElementById('sphinx-key-help');
+  if (!moduleSel || !keySel || !SPHINX_CATALOGUE) return;
+  keySel.innerHTML = '';
+  help.textContent = '';
+  const mod = (SPHINX_CATALOGUE.modules || [])
+                .find(m => m.name === moduleSel.value);
+  if (!mod) {
+    keySel.innerHTML = '<option value="">— pick module —</option>';
+    return;
+  }
+  const list = (kindSel.value === 'action') ? mod.actions : mod.params;
+  if (!list || !list.length) {
+    keySel.innerHTML = '<option value="">(no ' + kindSel.value
+      + 's catalogued — use Raw or type into Value)</option>';
+    return;
+  }
+  keySel.innerHTML = '<option value="">— pick —</option>';
+  list.forEach(item => {
+    const opt = document.createElement('option');
+    opt.value = item.key;
+    opt.textContent = item.key;
+    keySel.appendChild(opt);
+  });
+}
+
+function sphinxKeyHelp() {
+  const moduleSel = document.getElementById('sphinx-module');
+  const kindSel   = document.getElementById('sphinx-kind');
+  const keySel    = document.getElementById('sphinx-key');
+  const help      = document.getElementById('sphinx-key-help');
+  const valueIn   = document.getElementById('sphinx-value');
+  if (!SPHINX_CATALOGUE) return;
+  const mod = (SPHINX_CATALOGUE.modules || [])
+                .find(m => m.name === moduleSel.value);
+  if (!mod) { help.textContent = ''; return; }
+  const list = (kindSel.value === 'action') ? mod.actions : mod.params;
+  const item = (list || []).find(p => p.key === keySel.value);
+  if (!item) { help.textContent = ''; return; }
+  if (kindSel.value === 'action') {
+    const sig = (item.args || [])
+      .map(([n, t]) => n + ':' + t).join(', ');
+    help.textContent = item.description + (sig ? '   args: (' + sig + ')' : '');
+    valueIn.placeholder = sig
+      ? 'space-separated values: ' + (item.args || []).map(a => a[0]).join(' ')
+      : '(no args)';
+  } else {
+    let extra = '';
+    if (item.options && item.options.length) {
+      extra = '   options: ' + item.options.join(', ');
+    }
+    help.textContent = (item.description || '') + ' [' + item.kind + ']' + extra;
+    valueIn.placeholder = item.options && item.options.length
+      ? item.options[0] : '(empty = read current value)';
+  }
+}
+
+function sphinxOutput(o) {
+  const pre = document.getElementById('sphinx-cli-output');
+  if (!pre) return;
+  const ts = new Date().toLocaleTimeString();
+  const cmd = (o && o.cmd ? o.cmd.join(' ') : '?');
+  const tag = o && o.ok ? '✓' : '✗';
+  const out = (o && (o.stdout || '')).trim();
+  const err = (o && (o.stderr || '')).trim();
+  pre.textContent = ts + ' ' + tag + ' rc=' + (o ? o.rc : '?')
+    + '\n$ ' + cmd
+    + (out ? '\n' + out : '')
+    + (err ? '\n[stderr] ' + err : '');
+}
+
+async function sphinxSubmit(ev) {
+  ev.preventDefault();
+  const module  = document.getElementById('sphinx-module').value;
+  const kind    = document.getElementById('sphinx-kind').value;
+  const key     = document.getElementById('sphinx-key').value;
+  const valueIn = document.getElementById('sphinx-value').value;
+  if (!module || !key) { alert('pick a module and key'); return; }
+  let body, url;
+  if (kind === 'action') {
+    url  = '/api/sphinx-cli/action';
+    body = { module, action: key,
+             args: valueIn.trim() ? valueIn.trim().split(/\s+/) : [] };
+  } else {
+    url  = '/api/sphinx-cli/param';
+    body = { module, param: key,
+             value: valueIn === '' ? null : valueIn };
+  }
+  const r = await fetch(url, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+  const j = await r.json().catch(() => ({}));
+  sphinxOutput(j);
+}
+
+async function sphinxRawSubmit(ev) {
+  ev.preventDefault();
+  const args = document.getElementById('sphinx-raw-args').value
+                  .trim().split(/\s+/).filter(Boolean);
+  if (!args.length) return;
+  const r = await fetch('/api/sphinx-cli/raw', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ args }),
+  });
+  const j = await r.json().catch(() => ({}));
+  sphinxOutput(j);
+}
+
+function sphinxWire() {
+  const f = document.getElementById('sphinx-cli-form');
+  const r = document.getElementById('sphinx-raw-form');
+  if (!f) return;
+  f.addEventListener('submit', sphinxSubmit);
+  if (r) r.addEventListener('submit', sphinxRawSubmit);
+  document.getElementById('sphinx-module').addEventListener('change', () => {
+    sphinxRefreshKeys(); sphinxKeyHelp();
+  });
+  document.getElementById('sphinx-kind').addEventListener('change', () => {
+    sphinxRefreshKeys(); sphinxKeyHelp();
+  });
+  document.getElementById('sphinx-key').addEventListener('change', sphinxKeyHelp);
+}
+
 (async function init() {
   await Promise.all([loadProfiles(), loadWorlds(), loadSystem()]);
   await loadEnvironment();
   await loadDrones();
   await loadFC();
+  sphinxWire();
+  await sphinxLoadCatalogue();
   setInterval(loadEnvironment, REFRESH_MS);
   setInterval(loadDrones, REFRESH_MS);
   setInterval(loadFC, REFRESH_MS);

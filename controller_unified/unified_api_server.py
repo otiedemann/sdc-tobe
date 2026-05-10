@@ -709,6 +709,130 @@ _video_mode = "off"
 _video_last_jpeg = b""
 _video_jpeg_lock = threading.Lock()
 _video_streaming = False
+
+# ── SIM VIDEO PATCH ─────────────────────────────────
+# Read frames from a SIMULATED Parrot Anafi (Sphinx) via pysphinx
+# instead of Olympe's pdraw/RTSP path — the sim drone does NOT host
+# an RTSP server. We reuse the same _video_last_jpeg cache and
+# _pos_frame_q so all downstream consumers (web /api/video, position
+# tracker, recorder) see the sim feed identically to a real Anafi.
+import os as _os_sim_video
+_SIM_IP_PREFIXES = ("10.202.0.", "172.21.0.")
+
+
+def _is_sim_anafi_ip(ip):
+    return any(str(ip).startswith(p) for p in _SIM_IP_PREFIXES)
+
+
+def _sim_video_loop(machine_name="anafi", camera_name="horizontal_camera"):
+    """Read Sphinx camera frames and feed the same pipeline as Olympe.
+
+    Uses the high-level pysphinx API:
+        s = Sphinx()                       # connects to localhost:8383
+        cam = s.get_camera(machine, name)  # returns SphinxShmCamera
+        ok, fr = cam.read()                # ok=bool, fr=SphinxShmFrame
+        bgra = fr.buffer                   # ndarray (h, w, 4) uint8 B8G8R8A8
+        fr.release()                       # return frame to pool
+    """
+    global _video_last_jpeg, _video_frame_count, _video_streaming
+    sphx_lib = "/opt/parrot-sphinx/usr/lib/python/site-packages"
+    if sphx_lib not in sys.path:
+        sys.path.insert(0, sphx_lib)
+    sphx_so = "/opt/parrot-sphinx/usr/lib"
+    cur_ld = _os_sim_video.environ.get("LD_LIBRARY_PATH", "")
+    if sphx_so not in cur_ld:
+        _os_sim_video.environ["LD_LIBRARY_PATH"] = (sphx_so + ":" + cur_ld) if cur_ld else sphx_so
+    try:
+        from pysphinx.sphinx import Sphinx  # noqa
+    except Exception as e:
+        print(f"[SIM-VIDEO] pysphinx import failed: {e}")
+        _video_streaming = False
+        return
+
+    sphx = None
+    cam = None
+    try:
+        sphx = Sphinx()
+        info = sphx.get_info()
+        if info is None:
+            print("[SIM-VIDEO] sphinx daemon not reachable on :8383")
+            _video_streaming = False
+            return
+        names = sphx.get_camera_names(machine_name)
+        if camera_name not in names:
+            print(f"[SIM-VIDEO] camera '{camera_name}' not in {names}; falling back")
+            if names:
+                camera_name = names[0]
+            else:
+                print("[SIM-VIDEO] no cameras at all — aborting")
+                _video_streaming = False
+                return
+        cam = sphx.get_camera(machine_name, camera_name)
+        print(f"[SIM-VIDEO] machine={machine_name} cam={camera_name} type={type(cam).__name__}")
+    except Exception as e:
+        print(f"[SIM-VIDEO] camera setup failed: {e}")
+        _video_streaming = False
+        return
+
+    print("[SIM-VIDEO] reader thread started")
+    last_warn = 0.0
+    try:
+        while _video_streaming:
+            try:
+                ok, fr = cam.read(timeout=1.0)
+            except Exception as e:
+                t = time.monotonic()
+                if t - last_warn > 5.0:
+                    print(f"[SIM-VIDEO] cam.read err: {e}")
+                    last_warn = t
+                time.sleep(0.05)
+                continue
+            if not ok or fr is None:
+                time.sleep(0.005)
+                continue
+            try:
+                buf = fr.buffer  # ndarray (h, w, ch)
+                # Sphinx delivers B8G8R8A8 → drop alpha, already BGR for cv2
+                if buf.ndim == 3 and buf.shape[2] >= 3:
+                    bgr = buf[:, :, :3]
+                else:
+                    bgr = buf
+                ok2, jpg = cv2.imencode(".jpg", bgr,
+                    [int(cv2.IMWRITE_JPEG_QUALITY), VIDEO_JPEG_QUALITY])
+                if ok2:
+                    with _video_jpeg_lock:
+                        _video_last_jpeg = jpg.tobytes()
+                    _video_frame_count += 1
+                    if _video_frame_count == 1:
+                        h, w = bgr.shape[:2]
+                        print(f"[SIM-VIDEO] First frame: {w}x{h}")
+                with _pos_cfg_lock:
+                    _pos_enabled = _pos_cfg.get("enabled", False)
+                with _rec_lock:
+                    _rec_active = _rec_enabled
+                if _pos_enabled or _rec_active:
+                    try:
+                        _pos_frame_q.put_nowait((bgr.copy(), time.monotonic()))
+                    except queue.Full:
+                        pass
+            except Exception as ex:
+                if _video_frame_count == 0:
+                    print(f"[SIM-VIDEO] frame process error: {ex}")
+            finally:
+                try:
+                    fr.release()
+                except Exception:
+                    pass
+    finally:
+        if cam is not None:
+            try:
+                cam.release()
+            except Exception:
+                pass
+        print(f"[SIM-VIDEO] reader thread exiting (frames={_video_frame_count})")
+
+
+# ── END SIM VIDEO PATCH ─────────────────────────────────
 _video_forward_proc = None
 _video_forward_target = ""
 _video_frame_count = 0
@@ -2753,6 +2877,23 @@ class OlympeBackend(DroneBackend):
             return False, "drone not connected"
         if not HAS_CV2:
             return False, "cv2 not installed — pip install opencv-python-headless"
+
+        # ── sim dispatch ── if connected to a Sphinx-simulated Anafi
+        # (10.202.0.x / 172.21.0.x), the drone has no RTSP stream;
+        # use pysphinx to read the camera directly.
+        if _is_sim_anafi_ip(getattr(self, "ip", "")):
+            with self.__class__._video_start_mutex:
+                if _video_streaming and _video_mode == "mjpeg":
+                    return True, "sim mjpeg already streaming"
+                _video_mode = "mjpeg"
+                _video_last_jpeg = b""
+                _video_frame_count = 0
+                _video_streaming = True
+                th = threading.Thread(target=_sim_video_loop,
+                                      daemon=True, name="sphinx-sim-video")
+                th.start()
+                print("[ANAFI] sim drone detected — using pysphinx camera reader")
+                return True, "sim mjpeg started (pysphinx)"
 
         with self.__class__._video_start_mutex:
             # Re-check inside the mutex — another thread may have started

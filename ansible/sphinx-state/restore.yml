@@ -1,0 +1,221 @@
+---
+# Restore playbook: push a state archive onto a target host that
+# already has parrot-sphinx + the same parrot-ue4-* world packages.
+#
+# Usage:
+#   ansible-playbook -i inventory.ini restore.yml --ask-pass \
+#       -e "target_host=<host> archive=sphinx-state-2026-05-05-1234.tar.gz"
+#
+# Optional overrides:
+#   -e "remote_repo=/home/sdc/sdc-tobe"
+#   -e "skip_repo_clone=true"   # repo already exists, just merge state
+#   -e "restart_service=false"  # don't restart sphinx-control after
+
+- name: Restore sphinx host state
+  hosts: "{{ target_host | default('target') }}"
+  gather_facts: true
+  vars_files:
+    - vars.yml
+
+  vars:
+    archive_path_local: "{{ local_backup_dir }}/{{ archive }}"
+    remote_archive: "/tmp/{{ archive }}"
+    skip_repo_clone: false
+    restart_service: true
+    repo_remote_url: "https://github.com/otiedemann/sdc-tobe.git"
+
+  pre_tasks:
+    - name: Verify archive variable is set
+      ansible.builtin.fail:
+        msg: "Set 'archive' on the CLI: -e archive=sphinx-state-...tar.gz"
+      when: archive is not defined or archive == ''
+
+    - name: Verify local archive exists
+      delegate_to: localhost
+      become: false
+      ansible.builtin.stat:
+        path: "{{ archive_path_local }}"
+      register: archive_stat
+
+    - name: Fail if archive missing
+      ansible.builtin.fail:
+        msg: "Archive not found at {{ archive_path_local }}"
+      when: not archive_stat.stat.exists
+
+  tasks:
+    - name: Show plan
+      ansible.builtin.debug:
+        msg:
+          - "Target host : {{ inventory_hostname }}"
+          - "Archive     : {{ archive_path_local }} ({{ (archive_stat.stat.size / 1024 / 1024) | round(1) }} MB)"
+          - "Repo path   : {{ remote_repo }}"
+          - "Restart svc : {{ restart_service }}"
+
+    # ── Preflight: are the simulator binaries installed? ───────────
+    - name: Check parrot-sphinx is installed
+      ansible.builtin.command: which sphinx
+      register: sphinx_check
+      changed_when: false
+      failed_when: false
+
+    - name: Fail if parrot-sphinx missing
+      ansible.builtin.fail:
+        msg: |
+          parrot-sphinx is NOT installed on {{ inventory_hostname }}.
+          Install it FIRST per https://developer.parrot.com/docs/sphinx/installation.html
+          then re-run this playbook.
+      when: sphinx_check.rc != 0
+
+    - name: Check parrot-ue4 worlds installed
+      ansible.builtin.shell: |
+        for w in parrot-ue4-empty parrot-ue4-sphx-tests; do
+          if ! command -v $w >/dev/null 2>&1; then
+            echo "MISSING: $w"
+          fi
+        done
+      register: ue4_check
+      changed_when: false
+
+    - name: Warn if any parrot-ue4-* world is missing
+      ansible.builtin.debug:
+        msg:
+          - "Missing UE4 worlds — install them before launching:"
+          - "{{ ue4_check.stdout_lines }}"
+      when: ue4_check.stdout != ''
+
+    # ── Clone the repo if it isn't there ───────────────────────────
+    - name: Stat repo dir
+      ansible.builtin.stat:
+        path: "{{ remote_repo }}/.git"
+      register: repo_stat
+
+    - name: Clone sdc-tobe repo
+      ansible.builtin.git:
+        repo: "{{ repo_remote_url }}"
+        dest: "{{ remote_repo }}"
+        version: "{{ expected_branch }}"
+      when:
+        - not repo_stat.stat.exists
+        - not skip_repo_clone | bool
+
+    - name: Pull latest on existing repo
+      ansible.builtin.shell: |
+        cd {{ remote_repo }}
+        git fetch
+        git checkout {{ expected_branch }} || true
+        git pull --ff-only || echo "(local diverges — restored state will overlay it)"
+      register: pull_out
+      changed_when: "'Already up to date' not in pull_out.stdout"
+      when: repo_stat.stat.exists
+
+    # ── Push the archive ───────────────────────────────────────────
+    - name: Copy archive to target host
+      ansible.builtin.copy:
+        src: "{{ archive_path_local }}"
+        dest: "{{ remote_archive }}"
+        mode: "0644"
+
+    # ── Backup existing state on target before overwrite ───────────
+    - name: Snapshot pre-restore state on target
+      ansible.builtin.shell: |
+        cd /
+        ts=$(date +%Y%m%d-%H%M%S)
+        out=/tmp/sphinx-pre-restore-${ts}.tar.gz
+        tar --warning=no-file-changed -czf $out \
+          {% for p in state_paths %}
+          $(test -e {{ p }} && echo {{ p | regex_replace('^/', '') }} || true) \
+          {% endfor %}
+          2>/dev/null || true
+        echo $out
+      register: prerestore_path
+      changed_when: false
+
+    - name: Show pre-restore snapshot
+      ansible.builtin.debug:
+        msg: "Pre-restore snapshot saved at {{ prerestore_path.stdout_lines | last }}"
+
+    # ── Extract ────────────────────────────────────────────────────
+    - name: Extract archive at /
+      ansible.builtin.shell: |
+        cd /
+        tar -xzf {{ remote_archive }} \
+            --no-same-owner \
+            --no-same-permissions
+      register: extract_out
+
+    # ── Re-apply uncommitted patch if present ──────────────────────
+    - name: Look for uncommitted.patch in extracted state
+      ansible.builtin.find:
+        paths: "/tmp"
+        patterns: "uncommitted.patch"
+        recurse: true
+      register: patch_find
+
+    - name: Re-apply uncommitted patch (best effort)
+      ansible.builtin.shell: |
+        cd {{ remote_repo }}
+        git apply --reject --whitespace=nowarn {{ patch_find.files[0].path }} \
+            2>&1 | tail -20 || true
+      when: patch_find.matched > 0
+      register: patch_apply
+      changed_when: patch_apply.rc == 0
+
+    - name: Show patch reapply result
+      ansible.builtin.debug:
+        var: patch_apply.stdout_lines
+      when: patch_apply is defined and patch_apply.stdout_lines is defined
+
+    # ── Verify ─────────────────────────────────────────────────────
+    - name: Verify key files restored
+      ansible.builtin.stat:
+        path: "{{ item }}"
+      loop:
+        - "{{ remote_repo }}/sphinx-control/config.yaml"
+        - "{{ remote_repo }}/tools/sphinx-arena/out/arena.yml"
+        - "{{ remote_repo }}/controller_unified/arena_config.json"
+      register: verify
+      failed_when: not verify.stat.exists
+
+    - name: Cleanup transferred archive
+      ansible.builtin.file:
+        path: "{{ remote_archive }}"
+        state: absent
+
+    # ── Optional: restart sphinx-control ───────────────────────────
+    - name: Stop existing sphinx-control
+      ansible.builtin.shell: pkill -f 'uvicorn server:app' || true
+      when: restart_service | bool
+      changed_when: false
+
+    - name: Start sphinx-control
+      ansible.builtin.shell: |
+        cd {{ remote_repo }}/sphinx-control
+        if [ ! -d .venv ]; then
+          python3 -m venv .venv
+          .venv/bin/pip install -r requirements.txt
+        fi
+        nohup .venv/bin/uvicorn server:app --host 0.0.0.0 --port 8090 \
+            > /tmp/sphinx-control.log 2>&1 &
+      when: restart_service | bool
+      changed_when: true
+
+    - name: Wait briefly for service
+      ansible.builtin.pause:
+        seconds: 4
+      when: restart_service | bool
+
+    - name: Probe sphinx-control
+      ansible.builtin.uri:
+        url: http://localhost:8090/api/system
+        return_content: true
+      register: probe
+      failed_when: false
+      when: restart_service | bool
+
+    - name: Restore complete
+      ansible.builtin.debug:
+        msg:
+          - "✓ Restore done on {{ inventory_hostname }}"
+          - "  Pre-restore snapshot: {{ prerestore_path.stdout_lines | last }}"
+          - "  sphinx-control probe: {{ probe.status | default('skipped') }}"
+          - "  Open the dashboard at http://{{ inventory_hostname }}:8090/"

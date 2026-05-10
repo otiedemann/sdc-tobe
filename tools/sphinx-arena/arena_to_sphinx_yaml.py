@@ -673,6 +673,18 @@ def main() -> int:
             }
             pw, ph = _PAINTING_SIZE_M
             for logo_name, wall, offset in PAINTINGS:
+                # Defensive: if the painting FBX wasn't built (logo
+                # PNG missing, network blip during make logos, etc.)
+                # SKIP this entry instead of emitting a YAML
+                # reference UE4 will choke on. The whole world fails
+                # to load otherwise — one missing file kills the env.
+                fbx_full = fbx_dir / f"painting_{logo_name}.fbx"
+                if not fbx_full.is_file():
+                    out_lines.append(
+                        f"  # Painting — {logo_name} on {wall} wall "
+                        f"SKIPPED ({fbx_full.name} not present)"
+                    )
+                    continue
                 cwx, cwy, long_is_x = wall_centres[wall]
                 # Apply offset along the wall's long axis
                 if long_is_x:
