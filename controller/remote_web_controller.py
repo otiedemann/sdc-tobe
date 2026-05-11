@@ -57,8 +57,11 @@ except ImportError:
     HAS_CV2 = False
 
 # Runs on remote PC. Proxies to Pi API server.
-HTTP_HOST = "0.0.0.0"
-HTTP_PORT = 8090
+HTTP_HOST = os.getenv("C2_HTTP_HOST", "0.0.0.0")
+# Default 8090; override with C2_HTTP_PORT to avoid clashing with
+# sphinx-control (which also defaults to 8090) when both run on the
+# same host.
+HTTP_PORT = int(os.getenv("C2_HTTP_PORT", "8090"))
 TIMEOUT_CMD = float(os.getenv("PI_TIMEOUT_CMD", "8.0"))
 TIMEOUT_STATUS = float(os.getenv("PI_TIMEOUT_STATUS", "0.5"))
 # Fast per-keystroke commands — RC / key_down / key_up. These are
@@ -1690,6 +1693,7 @@ HTML = """
             <option value=\"off\">Off</option>
             <option value=\"mjpeg\">Way 1: MJPEG (decoded on Pi)</option>
             <option value=\"forward\">Way 2: UDP Forward (decoded on C2)</option>
+            <option value=\"h264\">Way 3: H.264 (NVENC, sim only)</option>
           </select>
           <button id=\"video_toggle\">Start Video</button>
         </div>
@@ -1706,6 +1710,8 @@ HTML = """
         </div>
         <div id=\"video_container\" style=\"margin-top:8px;display:none;\">
           <img id=\"video_img\" src=\"\" alt=\"video stream\" style=\"width:480px;height:auto;\" />
+          <video id=\"video_vid\" autoplay muted playsinline controls
+                 style=\"width:480px;height:auto;display:none;background:#000;\"></video>
         </div>
       </div>
       <div class=\"panel\">
@@ -4526,7 +4532,34 @@ const videoStatus = document.getElementById('video_status');
 const videoUrl = document.getElementById('video_url');
 const videoContainer = document.getElementById('video_container');
 const videoImg = document.getElementById('video_img');
+const videoVid = document.getElementById('video_vid');
 let videoActive = false;
+// Holds the mpegts.js player when we're in h264 mode; cleared on stop
+// so we don't leak MSE source-buffer state between mode switches.
+let videoH264Player = null;
+
+// mpegts.js gives Chrome/Firefox MSE-based MPEG-TS playback. Safari plays
+// the raw stream from <video src=> directly, so it doesn't need this.
+// We load on demand so the page stays light when nobody picks H.264.
+function loadMpegtsJs() {
+  if (window.mpegts) return Promise.resolve(window.mpegts);
+  return new Promise((resolve, reject) => {
+    const s = document.createElement('script');
+    s.src = 'https://cdn.jsdelivr.net/npm/mpegts.js@1.7.3/dist/mpegts.min.js';
+    s.onload = () => window.mpegts ? resolve(window.mpegts)
+                                   : reject(new Error('mpegts.js failed to expose global'));
+    s.onerror = () => reject(new Error('mpegts.js failed to load (no internet?)'));
+    document.head.appendChild(s);
+  });
+}
+
+function teardownH264Player() {
+  if (videoH264Player) {
+    try { videoH264Player.destroy(); } catch {}
+    videoH264Player = null;
+  }
+  try { videoVid.removeAttribute('src'); videoVid.load(); } catch {}
+}
 
 // Shared video-start logic — used by the manual toggle AND by the
 // auto-start path that fires as soon as the page loads. Both paths
@@ -4534,8 +4567,14 @@ let videoActive = false;
 async function startVideoStream(mode) {
   mode = mode || videoMode.value || 'mjpeg';
   if (mode === 'off') return false;
+  // Always start from a clean slate when switching modes
+  teardownH264Player();
+  videoImg.style.display = 'none'; videoImg.src = '';
+  videoVid.style.display = 'none';
   try {
-    const r = await fetch('/proxy/video/start', {method:'POST',
+    const startUrl = (mode === 'h264')
+        ? '/proxy/video/h264/start' : '/proxy/video/start';
+    const r = await fetch(startUrl, {method:'POST',
       headers:{'Content-Type':'application/json'},
       body:JSON.stringify({mode})});
     const d = await r.json();
@@ -4545,18 +4584,65 @@ async function startVideoStream(mode) {
     }
     videoActive = true;
     videoToggle.textContent = 'Stop Video';
-    videoStatus.textContent = 'Mode: ' + d.mode;
     videoContainer.style.display = '';
-    if (d.mode === 'mjpeg') {
+    if (mode === 'mjpeg' && d.mode === 'mjpeg') {
+      videoImg.style.display = '';
       videoImg.src = '/proxy/video?' + Date.now();
       videoUrl.style.display = '';
       videoUrl.innerHTML = 'Direct: <b>' + (d.stream_url || '') + '</b>';
-    } else if (d.mode === 'forward') {
+      videoStatus.textContent = 'Mode: mjpeg';
+    } else if (mode === 'forward' && d.mode === 'forward') {
+      videoImg.style.display = '';
       videoImg.src = '/proxy/video/forward_stream?' + Date.now();
       videoUrl.style.display = '';
       videoUrl.innerHTML = 'UDP → C2 decode → MJPEG';
+      videoStatus.textContent = 'Mode: forward';
+    } else if (mode === 'h264') {
+      // H.264 over MPEG-TS — Safari plays it natively; Chrome/Firefox
+      // need mpegts.js. Try mpegts.js first if available, else fall
+      // back to <video src=> for Safari.
+      videoVid.style.display = '';
+      videoUrl.style.display = '';
+      videoUrl.innerHTML = 'H.264 NVENC → MPEG-TS — ' +
+        (d.stream_url ? '<b>' + d.stream_url + '</b>' : '');
+      videoStatus.textContent = 'Mode: h264 (loading…)';
+      try {
+        const mp = await loadMpegtsJs();
+        if (mp && mp.isSupported && mp.isSupported()) {
+          videoH264Player = mp.createPlayer({
+            type: 'mpegts',
+            isLive: true,
+            url: '/proxy/video/h264',
+          }, {
+            enableStashBuffer: false,
+            // Aggressive live-edge chasing: skip ahead whenever the
+            // buffered playhead falls more than ~1 s behind realtime,
+            // and keep a minimal stash so we render the newest frame.
+            liveBufferLatencyChasing: true,
+            liveBufferLatencyMaxLatency: 1.0,
+            liveBufferLatencyMinRemain: 0.2,
+            lazyLoad: false,
+            autoCleanupSourceBuffer: true,
+            seekType: 'range',
+          });
+          videoH264Player.attachMediaElement(videoVid);
+          videoH264Player.load();
+          videoH264Player.play();
+          videoStatus.textContent = 'Mode: h264 (mpegts.js / MSE)';
+        } else {
+          // Safari path — give the <video> the raw stream
+          videoVid.src = '/proxy/video/h264?' + Date.now();
+          videoVid.play().catch(() => {});
+          videoStatus.textContent = 'Mode: h264 (native MPEG-TS)';
+        }
+      } catch (e) {
+        // Last-ditch fallback: try native <video src=> anyway
+        videoVid.src = '/proxy/video/h264?' + Date.now();
+        videoVid.play().catch(() => {});
+        videoStatus.textContent = 'Mode: h264 (native, mpegts.js fail: ' + e.message + ')';
+      }
     }
-    videoMode.value = d.mode;
+    videoMode.value = mode;
     return true;
   } catch (e) {
     videoStatus.textContent = 'Error: ' + e;
@@ -4571,7 +4657,9 @@ videoToggle.onclick = async () => {
     videoToggle.textContent = 'Start Video';
     videoContainer.style.display = 'none';
     videoUrl.style.display = 'none';
-    videoImg.src = '';
+    videoImg.src = ''; videoImg.style.display = 'none';
+    videoVid.style.display = 'none';
+    teardownH264Player();
     videoStatus.textContent = 'Mode: off';
     return;
   }
@@ -4818,7 +4906,23 @@ async function refreshVideoStatus() {
       videoMode.value = d.mode;
     }
     if (videoActive) {
-      videoStatus.textContent = 'Mode: ' + d.mode + ' | has_frame: ' + (d.has_frame||false);
+      // /api/video/status reports the underlying MJPEG producer state.
+      // For h264 mode, the producer says "mjpeg" because the H.264
+      // encoder is parasitic on the same source — show the user the
+      // mode they actually selected, not the producer mode.
+      const fps = (d.frames_decoded != null && refreshVideoStatus._lastF != null)
+          ? Math.round((d.frames_decoded - refreshVideoStatus._lastF) / 5)
+          : null;
+      refreshVideoStatus._lastF = d.frames_decoded;
+      if (videoMode.value === 'h264') {
+        videoStatus.textContent = 'Mode: h264 (NVENC)' +
+          (fps != null ? `  |  source ${fps} fps` : '') +
+          '  |  has_frame: ' + (d.has_frame || false);
+      } else {
+        videoStatus.textContent = 'Mode: ' + d.mode +
+          (fps != null ? `  |  ${fps} fps` : '') +
+          '  |  has_frame: ' + (d.has_frame || false);
+      }
     }
   } catch {}
 }
@@ -9489,6 +9593,35 @@ def proxy_video_status():
         return (r.text, r.status_code, {"Content-Type": "application/json"})
     except Exception as e:
         return jsonify(ok=False, error=str(e), mode="off"), 502
+
+
+# ── H.264 (NVENC) — sim-only, way faster than MJPEG in browsers ─────
+# The FC exposes /api/video/h264 (MPEG-TS over HTTP, ~700 kbps for
+# 1280x720 vs ~8 Mbps for the MJPEG path). We just stream it through
+# unchanged. The start endpoint kicks the producer if it wasn't running.
+
+
+@app.post("/proxy/video/h264/start")
+def proxy_video_h264_start():
+    log_command("video_h264_start")
+    r = pi_post("/api/video/h264/start")
+    return (r.text, r.status_code,
+            {"Content-Type": r.headers.get("Content-Type", "application/json")})
+
+
+@app.get("/proxy/video/h264")
+def proxy_video_h264_feed():
+    """Pass-through proxy for the FC's H.264-over-MPEG-TS stream."""
+    try:
+        r = _http_session.get(f"{PI_BASE}/api/video/h264",
+                              stream=True, timeout=30)
+        return Response(
+            r.iter_content(chunk_size=32768),
+            mimetype=r.headers.get("Content-Type", "video/mp2t"),
+            headers={"Cache-Control": "no-cache, no-store"},
+        )
+    except Exception as e:
+        return jsonify(ok=False, error=str(e)), 502
 
 
 # ---------------------------------------------------------------------------
