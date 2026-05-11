@@ -16,6 +16,10 @@ echo "[install] copying /opt files..."
 sudo cp -a opt/. /opt/
 sudo chmod +x /opt/sdc-tobe/sphinx-control/sphinx-bootstrap.sh
 
+echo "[install] installing repo-local bin scripts under /opt/sdc-tobe/infra/aws/bin..."
+sudo install -d -m 755 /opt/sdc-tobe/infra/aws/bin
+sudo install -m 755 bin/fc-healthcheck.sh /opt/sdc-tobe/infra/aws/bin/
+
 echo "[install] reloading systemd + cron..."
 sudo systemctl daemon-reload
 sudo systemctl reload cron 2>/dev/null || sudo systemctl restart cron
@@ -28,7 +32,8 @@ for u in \
   sphinx-bootstrap.service \
   marker-mission.service \
   c2-controller.service \
-  auto-shutdown.timer
+  auto-shutdown.timer \
+  fc-healthcheck.timer
 do
   sudo systemctl enable "$u" 2>&1 | grep -v "already enabled" || true
 done

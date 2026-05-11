@@ -1,0 +1,14 @@
+[Unit]
+Description=Periodic FC connection health check (every 60 s)
+
+[Timer]
+# First fire 5 min after boot — give bootstrap room to complete its own
+# verify+restart loop without us double-restarting.
+OnBootSec=5min
+# Then every 60 s
+OnUnitActiveSec=60s
+AccuracySec=5s
+Unit=fc-healthcheck.service
+
+[Install]
+WantedBy=timers.target

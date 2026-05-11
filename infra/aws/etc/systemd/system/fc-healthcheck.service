@@ -1,0 +1,12 @@
+[Unit]
+Description=FC connection health check (restart FC if stuck disconnected)
+# Don't try to heal anything until bootstrap has actually run once
+After=sphinx-bootstrap.service
+
+[Service]
+Type=oneshot
+# /opt/sdc-tobe/infra/aws/bin/fc-healthcheck.sh decides whether to
+# restart the FC. It tracks "consecutive disconnected" state in
+# /run/fc-healthcheck.misses so it only acts after persistent failure,
+# not on a single transient blip.
+ExecStart=/opt/sdc-tobe/infra/aws/bin/fc-healthcheck.sh
