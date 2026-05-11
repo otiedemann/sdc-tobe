@@ -715,11 +715,18 @@ _video_streaming = False
 # here in addition to its JPEG output, so the /api/video/h264 endpoint
 # can feed an ffmpeg subprocess that NVENC-encodes H.264 over MPEG-TS.
 # Producer is reused; we don't run a second pysphinx reader.
+#
+# The publish path is LAZY: when no /api/video/h264 client is connected,
+# _sim_h264_active_clients == 0 and the producer skips the bgr.copy()
+# + condition.notify_all() — saving ~40 MB/s of memcpy on the hot path.
+# Counter is incremented when a client enters api_video_h264_stream and
+# decremented when its generator exits.
 _sim_bgr_latest = None              # np.ndarray (h, w, 3) BGR, or None
 _sim_bgr_resolution = None          # (width, height) once first frame seen
 _sim_bgr_frame_id = 0               # monotonic counter — new frame iff this ticks
 _sim_bgr_lock = threading.Lock()
 _sim_bgr_condition = threading.Condition(_sim_bgr_lock)
+_sim_h264_active_clients = 0        # only publish BGR if > 0
 
 # ── SIM VIDEO PATCH ─────────────────────────────────
 # Read frames from a SIMULATED Parrot Anafi (Sphinx) via pysphinx
@@ -832,16 +839,20 @@ def _sim_video_loop(machine_name="anafi", camera_name="horizontal_camera"):
                     bgr = buf[:, :, :3]
                 else:
                     bgr = buf
-                # Publish raw BGR for H.264 fan-out (cheap if no h264
-                # subscriber). The .copy() is required: ``fr.buffer`` is
-                # backed by sphinx shm and sphinx will overwrite it on
-                # ``fr.release()`` below.
-                global _sim_bgr_latest, _sim_bgr_resolution, _sim_bgr_frame_id
-                with _sim_bgr_condition:
-                    _sim_bgr_latest = bgr.copy()
-                    _sim_bgr_resolution = (bgr.shape[1], bgr.shape[0])
-                    _sim_bgr_frame_id += 1
-                    _sim_bgr_condition.notify_all()
+                # Publish raw BGR for H.264 fan-out only when a client
+                # is actively consuming /api/video/h264. The .copy() is
+                # required when we do publish: ``fr.buffer`` is backed
+                # by sphinx shm and sphinx will overwrite it on
+                # ``fr.release()`` below. When no client is connected
+                # we skip the copy entirely — ~40 MB/s of avoided
+                # memcpy on the steady-state hot path.
+                if _sim_h264_active_clients > 0:
+                    global _sim_bgr_latest, _sim_bgr_resolution, _sim_bgr_frame_id
+                    with _sim_bgr_condition:
+                        _sim_bgr_latest = bgr.copy()
+                        _sim_bgr_resolution = (bgr.shape[1], bgr.shape[0])
+                        _sim_bgr_frame_id += 1
+                        _sim_bgr_condition.notify_all()
                 ok2, jpg = cv2.imencode(".jpg", bgr,
                     [int(cv2.IMWRITE_JPEG_QUALITY), VIDEO_JPEG_QUALITY])
                 if ok2:
@@ -5104,6 +5115,12 @@ def api_video_h264_stop():
 def api_video_h264_stream():
     """Live H.264-over-MPEG-TS stream. Spawns one ffmpeg subprocess per
     client; producer is the sim_video_loop's BGR fan-out buffer."""
+    # Mark a subscriber so the producer starts publishing BGR frames.
+    # The producer skips its bgr.copy() + notify_all() when this is 0,
+    # which is the steady-state cost path (no h264 clients).
+    global _sim_h264_active_clients
+    with _sim_bgr_condition:
+        _sim_h264_active_clients += 1
     # Wait up to 5 s for the producer to publish a frame so we know
     # what resolution to encode at.
     deadline = time.monotonic() + 5.0
@@ -5111,6 +5128,7 @@ def api_video_h264_stream():
         while _sim_bgr_latest is None and time.monotonic() < deadline:
             _sim_bgr_condition.wait(timeout=0.5)
         if _sim_bgr_latest is None:
+            _sim_h264_active_clients -= 1
             return jsonify(error="no frames yet — POST /api/video/h264/start first"), 503
         width, height = _sim_bgr_resolution
 
@@ -5159,6 +5177,7 @@ def api_video_h264_stream():
     feeder_t.start()
 
     def stream_response():
+        global _sim_h264_active_clients
         try:
             while True:
                 chunk = proc.stdout.read(64 * 1024)
@@ -5175,6 +5194,12 @@ def api_video_h264_stream():
                     proc.kill()
                 except Exception:
                     pass
+            # Drop the subscription so the producer reverts to its
+            # cheap path. wake any waiters so feeders observing
+            # stop_event can exit promptly.
+            with _sim_bgr_condition:
+                _sim_h264_active_clients = max(0, _sim_h264_active_clients - 1)
+                _sim_bgr_condition.notify_all()
 
     return Response(stream_response(), mimetype="video/mp2t",
                     headers={"Cache-Control": "no-cache, no-store",

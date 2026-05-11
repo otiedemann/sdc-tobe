@@ -93,6 +93,22 @@ if ! olympe_reachable; then
     log "drone NOT olympe-reachable after 90s — will start FC anyway, but expect connect retries"
 fi
 
+# 4b. Cap the drone camera framerate. Default is 30 fps which makes the
+# firmware's pimp-video pipeline encode 30 H.264 fps internally —
+# nobody on our stack consumes that stream (we read via pysphinx shm),
+# so it's pure waste at ~200 % CPU per camera. 15 fps halves that and
+# matches our SIM_PRODUCER_FPS cap downstream.
+SPHX_ENV=/opt/parrot-sphinx/usr/bin/parrot-sphinx-setenv.sh
+if [ -r "$SPHX_ENV" ]; then
+    # shellcheck disable=SC1090
+    . "$SPHX_ENV"
+    for CAM in horizontal_camera vertical_camera; do
+        sphinx-cli param "camera/$CAM" framerate 15 >/dev/null 2>&1 \
+            && log "set camera/$CAM framerate=15" \
+            || log "could not set camera/$CAM framerate (continuing)"
+    done
+fi
+
 # 5. flight controller
 FC=$(curl -s http://localhost:8090/api/fc)
 if [ "$FC" = "null" ] || [ -z "$FC" ]; then
