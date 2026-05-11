@@ -17,6 +17,8 @@ import logging
 import os
 import shutil
 import subprocess
+import threading
+import time
 from pathlib import Path
 from typing import Any
 
@@ -335,6 +337,118 @@ def api_drone_connections(drone_id: str):
         return launcher.connections_for(drone_id)
     except KeyError:
         raise HTTPException(status_code=404, detail="drone not found")
+
+
+# ─── API: recover ──────────────────────────────────────────────
+# "Big red button" — tears down env+drone+FC and re-runs the on-disk
+# bootstrap script that brings the whole stack back from scratch.
+# Useful when one of the layers gets wedged in a state that's faster
+# to nuke than to debug: stale netns, dead sphinx daemon, FC stuck on
+# half-dead Olympe, etc.
+#
+# Implementation is intentionally dumb: shell out to
+# /opt/sdc-tobe/sphinx-control/sphinx-bootstrap.sh, which is the same
+# script systemd runs at boot under sphinx-bootstrap.service. We just
+# pre-tear-down env+FC so the script does a real rebuild instead of
+# its "already running, skipping" idempotent path.
+
+_BOOTSTRAP_SCRIPT = ROOT / "sphinx-bootstrap.sh"
+
+_recover_state: dict[str, Any] = {
+    "running": False,
+    "step": "idle",          # human-readable current step
+    "log": [],               # list of {ts, msg}; capped at 200
+    "started_at": None,
+    "finished_at": None,
+    "rc": None,              # subprocess return code or None if still running
+    "error": None,
+}
+_recover_lock = threading.Lock()
+
+
+def _recover_log(msg: str) -> None:
+    line = {"ts": time.time(), "msg": msg}
+    log_arr = _recover_state["log"]
+    log_arr.append(line)
+    if len(log_arr) > 200:
+        del log_arr[: len(log_arr) - 200]
+    log.info("recover: %s", msg)
+
+
+def _recover_worker() -> None:
+    try:
+        _recover_state["error"] = None
+        _recover_state["rc"] = None
+        _recover_state["log"] = []
+        _recover_state["started_at"] = time.time()
+        _recover_state["finished_at"] = None
+
+        _recover_state["step"] = "stopping flight controller"
+        _recover_log("stop FC")
+        try:
+            launcher.stop_fc()
+        except Exception as e:
+            _recover_log(f"stop_fc warn: {e}")
+        time.sleep(3)
+
+        _recover_state["step"] = "stopping environment"
+        _recover_log("stop environment (also stops drones)")
+        try:
+            launcher.stop_environment()
+        except Exception as e:
+            _recover_log(f"stop_environment warn: {e}")
+        time.sleep(4)
+
+        if not _BOOTSTRAP_SCRIPT.is_file():
+            raise RuntimeError(
+                f"bootstrap script not found at {_BOOTSTRAP_SCRIPT}"
+            )
+
+        _recover_state["step"] = "running bootstrap script"
+        _recover_log(f"exec {_BOOTSTRAP_SCRIPT}")
+        proc = subprocess.Popen(
+            ["bash", str(_BOOTSTRAP_SCRIPT)],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            bufsize=1,
+            text=True,
+        )
+        assert proc.stdout is not None
+        for raw in iter(proc.stdout.readline, ""):
+            line = raw.rstrip()
+            if line:
+                _recover_log(line)
+        rc = proc.wait()
+        _recover_state["rc"] = rc
+        _recover_state["step"] = "done" if rc == 0 else f"failed (rc={rc})"
+        _recover_log(f"bootstrap exited rc={rc}")
+    except Exception as e:
+        _recover_state["error"] = f"{type(e).__name__}: {e}"
+        _recover_state["step"] = "errored"
+        log.exception("recover errored")
+    finally:
+        _recover_state["running"] = False
+        _recover_state["finished_at"] = time.time()
+
+
+@app.post("/api/recover")
+def api_recover():
+    """Trigger an asynchronous full-stack rebuild. Returns immediately."""
+    with _recover_lock:
+        if _recover_state["running"]:
+            raise HTTPException(409, detail="recovery already in progress")
+        _recover_state["running"] = True
+        _recover_state["step"] = "starting"
+        _recover_state["log"] = []
+    threading.Thread(
+        target=_recover_worker, daemon=True, name="recover"
+    ).start()
+    return {"ok": True, "running": True}
+
+
+@app.get("/api/recover/status")
+def api_recover_status():
+    return _recover_state
 
 
 # ─── API: worlds, profiles, system ──────────────────────────────

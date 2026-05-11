@@ -222,3 +222,61 @@ pre {
 .muted { color: var(--muted); font-size: 12px; }
 .endpoint { font-family: ui-monospace, monospace; color: var(--accent); }
 .pids { font-family: ui-monospace, monospace; color: var(--muted); font-size: 11px; }
+
+/* ── Recover-all panel ─────────────────────────────────────────── */
+#recover-section {
+  background: linear-gradient(135deg, #2a1410 0%, #1a0f0c 100%);
+  border: 1px solid #5b1f15;
+  border-radius: 8px;
+  padding: 16px 20px;
+  margin-bottom: 16px;
+}
+.recover-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 20px;
+}
+.recover-summary h2 { margin: 0 0 4px; color: #f5a791; font-size: 16px; }
+.recover-summary p { margin: 0; }
+.recover-btn {
+  background: #c2410c;
+  color: #fff;
+  border: none;
+  font-size: 16px;
+  font-weight: 600;
+  padding: 14px 28px;
+  border-radius: 6px;
+  cursor: pointer;
+  box-shadow: 0 2px 6px rgba(194, 65, 12, 0.4);
+  transition: background 0.15s, transform 0.05s;
+  white-space: nowrap;
+}
+.recover-btn:hover:not(:disabled) { background: #ea580c; }
+.recover-btn:active:not(:disabled) { transform: translateY(1px); }
+.recover-btn:disabled {
+  background: #4a2516;
+  color: #a88a7d;
+  cursor: not-allowed;
+  box-shadow: none;
+}
+.recover-status {
+  margin-top: 12px;
+  padding-top: 12px;
+  border-top: 1px solid #5b1f15;
+}
+.recover-step {
+  font-weight: 600;
+  color: #f5a791;
+  margin-bottom: 6px;
+}
+.recover-log {
+  background: #0f0807;
+  border: 1px solid #5b1f15;
+  border-radius: 4px;
+  color: #ddd;
+  font-size: 11px;
+  max-height: 240px;
+  overflow-y: auto;
+  margin: 0;
+}

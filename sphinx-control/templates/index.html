@@ -32,6 +32,20 @@
   {% endif %}
 
   <main>
+    <section id="recover-section">
+      <div class="recover-row">
+        <div class="recover-summary">
+          <h2>Something stuck?</h2>
+          <p class="muted">Tears down FC + drone + environment and rebuilds everything from scratch via <code>sphinx-bootstrap.sh</code>. ~60 s. Use when video/commands have gone unresponsive and you'd rather not debug.</p>
+        </div>
+        <button type="button" id="recover-btn" class="recover-btn">Recover all</button>
+      </div>
+      <div id="recover-status" class="recover-status" style="display:none;">
+        <div class="recover-step" id="recover-step">starting…</div>
+        <pre id="recover-log" class="recover-log"></pre>
+      </div>
+    </section>
+
     <section id="env-section">
       <h2>Environment (the world)</h2>
       <p class="muted">Step 1: Start the simulator world. UE4 launches alone; the operator can fly the spectator camera (F1–F5 to switch cameras, right-click + WASD for free-fly) and inspect the arena before adding any drone.</p>

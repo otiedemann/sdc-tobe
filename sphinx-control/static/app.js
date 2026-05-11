@@ -578,12 +578,84 @@ function sphinxWire() {
   document.getElementById('sphinx-key').addEventListener('change', sphinxKeyHelp);
 }
 
+// ── "Recover all" — big button that re-runs sphinx-bootstrap.sh ──
+
+let recoverPollTimer = null;
+
+function recoverRender(s) {
+  const panel = document.getElementById('recover-status');
+  const stepEl = document.getElementById('recover-step');
+  const logEl = document.getElementById('recover-log');
+  const btn = document.getElementById('recover-btn');
+  if (!panel || !stepEl || !logEl || !btn) return;
+  const hasContent = s && (s.running || (s.log && s.log.length));
+  panel.style.display = hasContent ? '' : 'none';
+  if (!hasContent) { btn.disabled = false; btn.textContent = 'Recover all'; return; }
+  const prefix = s.running ? '⏳ ' : (s.rc === 0 ? '✅ ' : '❌ ');
+  stepEl.textContent = prefix + (s.step || 'unknown');
+  logEl.textContent = (s.log || []).map(e => e.msg).join('\n');
+  logEl.scrollTop = logEl.scrollHeight;
+  btn.disabled = !!s.running;
+  btn.textContent = s.running ? 'Recovering…' : 'Recover all';
+}
+
+async function recoverPoll() {
+  try {
+    const r = await fetch('/api/recover/status', {cache: 'no-store'});
+    const s = await r.json();
+    recoverRender(s);
+    if (!s.running && recoverPollTimer) {
+      clearInterval(recoverPollTimer);
+      recoverPollTimer = null;
+    }
+  } catch (e) { /* swallow; next poll retries */ }
+}
+
+async function recoverClick() {
+  if (!confirm("Tear down FC + drone + environment and rebuild from scratch?\n\nTakes ~60 s. Any in-flight session is lost.")) return;
+  const btn = document.getElementById('recover-btn');
+  btn.disabled = true;
+  btn.textContent = 'Starting…';
+  try {
+    const r = await fetch('/api/recover', {method: 'POST'});
+    if (r.status === 409) {
+      alert("A recovery is already running.");
+    } else if (!r.ok) {
+      alert("Could not start recovery: HTTP " + r.status);
+    }
+  } catch (e) {
+    alert("Could not start recovery: " + e);
+    btn.disabled = false; btn.textContent = 'Recover all';
+    return;
+  }
+  await recoverPoll();
+  if (!recoverPollTimer) {
+    recoverPollTimer = setInterval(recoverPoll, 1500);
+  }
+}
+
+function recoverWire() {
+  const btn = document.getElementById('recover-btn');
+  if (btn) btn.addEventListener('click', recoverClick);
+  // Adopt an in-flight recovery if the page was just reloaded
+  recoverPoll().then(() => {
+    fetch('/api/recover/status', {cache:'no-store'}).then(r => r.json())
+      .then(s => {
+        if (s.running && !recoverPollTimer) {
+          recoverPollTimer = setInterval(recoverPoll, 1500);
+        }
+      })
+      .catch(() => {});
+  });
+}
+
 (async function init() {
   await Promise.all([loadProfiles(), loadWorlds(), loadSystem()]);
   await loadEnvironment();
   await loadDrones();
   await loadFC();
   sphinxWire();
+  recoverWire();
   await sphinxLoadCatalogue();
   setInterval(loadEnvironment, REFRESH_MS);
   setInterval(loadDrones, REFRESH_MS);
