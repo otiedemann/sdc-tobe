@@ -710,6 +710,17 @@ _video_last_jpeg = b""
 _video_jpeg_lock = threading.Lock()
 _video_streaming = False
 
+# ── H.264 fan-out state (sim only) ────────────────────────
+# The sim video producer (_sim_video_loop below) writes raw BGR frames
+# here in addition to its JPEG output, so the /api/video/h264 endpoint
+# can feed an ffmpeg subprocess that NVENC-encodes H.264 over MPEG-TS.
+# Producer is reused; we don't run a second pysphinx reader.
+_sim_bgr_latest = None              # np.ndarray (h, w, 3) BGR, or None
+_sim_bgr_resolution = None          # (width, height) once first frame seen
+_sim_bgr_frame_id = 0               # monotonic counter — new frame iff this ticks
+_sim_bgr_lock = threading.Lock()
+_sim_bgr_condition = threading.Condition(_sim_bgr_lock)
+
 # ── SIM VIDEO PATCH ─────────────────────────────────
 # Read frames from a SIMULATED Parrot Anafi (Sphinx) via pysphinx
 # instead of Olympe's pdraw/RTSP path — the sim drone does NOT host
@@ -797,6 +808,16 @@ def _sim_video_loop(machine_name="anafi", camera_name="horizontal_camera"):
                     bgr = buf[:, :, :3]
                 else:
                     bgr = buf
+                # Publish raw BGR for H.264 fan-out (cheap if no h264
+                # subscriber). The .copy() is required: ``fr.buffer`` is
+                # backed by sphinx shm and sphinx will overwrite it on
+                # ``fr.release()`` below.
+                global _sim_bgr_latest, _sim_bgr_resolution, _sim_bgr_frame_id
+                with _sim_bgr_condition:
+                    _sim_bgr_latest = bgr.copy()
+                    _sim_bgr_resolution = (bgr.shape[1], bgr.shape[0])
+                    _sim_bgr_frame_id += 1
+                    _sim_bgr_condition.notify_all()
                 ok2, jpg = cv2.imencode(".jpg", bgr,
                     [int(cv2.IMWRITE_JPEG_QUALITY), VIDEO_JPEG_QUALITY])
                 if ok2:
@@ -4952,6 +4973,189 @@ def api_video_stop():
     if b:
         b.video_stop_all()
     return jsonify(ok=True, mode="off")
+
+
+# ── H.264 endpoint (sim only) ───────────────────────────────────────
+# Same source as /api/video (the sim_video_loop producer), but encoded
+# H.264 over MPEG-TS via NVENC. Browsers play this via the <video>
+# element using their hardware H.264 decoder — no MJPEG main-thread
+# decode bottleneck, ~5x less bandwidth than MJPEG at the same quality.
+#
+# Usage:
+#   curl -X POST /api/video/h264/start     # ensure producer is running
+#   <video src="/api/video/h264">          # browser plays MPEG-TS live
+#   ffplay http://host:8080/api/video/h264 # works in any player too
+#
+# One ffmpeg subprocess per concurrent viewer (cheap on NVENC). The
+# subprocess is torn down automatically when the client disconnects.
+
+H264_TARGET_FPS = 15
+H264_BITRATE = "1500k"           # ample for 1280x720@15 with deltas
+# Keep keyframe interval SHORT for live streams — if a viewer joins
+# mid-stream or a packet drops, the player can only resume on the next
+# I-frame. With the source occasionally dipping to 5-7 fps, a frame-
+# count-based GOP would span >2 s; force keyframes every wall-clock
+# second instead.
+H264_GOP = 5
+H264_FORCE_KEY = "expr:gte(t,n_forced*1)"   # 1 keyframe every 1.0 s
+
+
+def _h264_encoder_cmd(width: int, height: int) -> list[str]:
+    """Build the ffmpeg command line. Prefer GPU (NVENC) on the T4; fall
+    back to libx264 if NVENC isn't available."""
+    common_in = [
+        "ffmpeg", "-loglevel", "error", "-hide_banner",
+        "-f", "rawvideo", "-pix_fmt", "bgr24",
+        "-s", f"{width}x{height}", "-r", str(H264_TARGET_FPS),
+        "-i", "pipe:0",
+    ]
+    # NVENC low-latency preset (p1 = fastest, tune=ll = low-latency)
+    # `-force_key_frames` + `-g` together guarantee the player sees an
+    # I-frame within 1 s even if the source rate drops.
+    nvenc_out = [
+        "-c:v", "h264_nvenc",
+        "-preset", "p1", "-tune", "ll", "-zerolatency", "1",
+        "-rc", "cbr", "-b:v", H264_BITRATE,
+        "-g", str(H264_GOP), "-bf", "0",
+        "-force_key_frames", H264_FORCE_KEY,
+        "-pix_fmt", "yuv420p",
+        "-f", "mpegts", "-muxdelay", "0", "-muxpreload", "0",
+        "pipe:1",
+    ]
+    # libx264 fallback if NVENC is not in this ffmpeg build
+    x264_out = [
+        "-c:v", "libx264",
+        "-preset", "ultrafast", "-tune", "zerolatency",
+        "-b:v", H264_BITRATE,
+        "-g", str(H264_GOP), "-bf", "0",
+        "-force_key_frames", H264_FORCE_KEY,
+        "-pix_fmt", "yuv420p",
+        "-f", "mpegts", "-muxdelay", "0", "-muxpreload", "0",
+        "pipe:1",
+    ]
+    # Quick probe — done once per process, cached in module attr
+    enc = getattr(_h264_encoder_cmd, "_pref_enc", None)
+    if enc is None:
+        try:
+            import subprocess as _sp
+            out = _sp.run(["ffmpeg", "-hide_banner", "-encoders"],
+                          capture_output=True, text=True, timeout=3).stdout
+            enc = "h264_nvenc" if "h264_nvenc" in out else "libx264"
+        except Exception:
+            enc = "libx264"
+        _h264_encoder_cmd._pref_enc = enc
+    return common_in + (nvenc_out if enc == "h264_nvenc" else x264_out)
+
+
+@app.post("/api/video/h264/start")
+def api_video_h264_start():
+    """Make sure the sim video producer is up so BGR frames are flowing.
+    Reuses the existing /api/video/start mjpeg producer — same source,
+    different consumer."""
+    b = backend
+    if b is None:
+        return jsonify(ok=False, error="controller not ready"), 503
+    if not _is_sim_anafi_ip(getattr(b, "ip", "")):
+        return jsonify(ok=False,
+                       error="H.264 fan-out is sim-only"), 400
+    # If the MJPEG producer isn't already running, kick it off. We don't
+    # change _video_mode — that stays tied to MJPEG-vs-forward semantics.
+    if not _video_streaming:
+        ok, msg = b.video_start_mjpeg()
+        if not ok:
+            return jsonify(ok=False, error=msg), 500
+    return jsonify(ok=True, stream_url=f"http://{request.host}/api/video/h264",
+                   mime="video/mp2t",
+                   note="play in browser <video> tag, or `ffplay <url>`")
+
+
+@app.post("/api/video/h264/stop")
+def api_video_h264_stop():
+    """No-op for the H.264 path — clients tear down their own subprocess
+    when they disconnect. Provided for API symmetry."""
+    return jsonify(ok=True)
+
+
+@app.get("/api/video/h264")
+def api_video_h264_stream():
+    """Live H.264-over-MPEG-TS stream. Spawns one ffmpeg subprocess per
+    client; producer is the sim_video_loop's BGR fan-out buffer."""
+    # Wait up to 5 s for the producer to publish a frame so we know
+    # what resolution to encode at.
+    deadline = time.monotonic() + 5.0
+    with _sim_bgr_condition:
+        while _sim_bgr_latest is None and time.monotonic() < deadline:
+            _sim_bgr_condition.wait(timeout=0.5)
+        if _sim_bgr_latest is None:
+            return jsonify(error="no frames yet — POST /api/video/h264/start first"), 503
+        width, height = _sim_bgr_resolution
+
+    import subprocess as _sp
+    cmd = _h264_encoder_cmd(width, height)
+    proc = _sp.Popen(cmd, stdin=_sp.PIPE, stdout=_sp.PIPE,
+                     stderr=_sp.DEVNULL, bufsize=0)
+
+    # Background feeder: read latest BGR from the shared buffer at the
+    # source rate, push to ffmpeg stdin. Stops when client disconnects
+    # (BrokenPipeError) or the producer goes idle.
+    stop_event = threading.Event()
+
+    def feeder():
+        last_id = 0
+        frame_interval = 1.0 / H264_TARGET_FPS
+        try:
+            while not stop_event.is_set():
+                with _sim_bgr_condition:
+                    waited = _sim_bgr_condition.wait_for(
+                        lambda: _sim_bgr_frame_id != last_id
+                                or stop_event.is_set(),
+                        timeout=2.0,
+                    )
+                    if stop_event.is_set():
+                        return
+                    if not waited:
+                        # Producer stalled; loop and try again
+                        continue
+                    frame = _sim_bgr_latest
+                    last_id = _sim_bgr_frame_id
+                if frame is None:
+                    continue
+                try:
+                    proc.stdin.write(frame.tobytes())
+                except (BrokenPipeError, ValueError, OSError):
+                    return
+        finally:
+            try:
+                proc.stdin.close()
+            except Exception:
+                pass
+
+    feeder_t = threading.Thread(target=feeder, daemon=True,
+                                name="h264-feeder")
+    feeder_t.start()
+
+    def stream_response():
+        try:
+            while True:
+                chunk = proc.stdout.read(64 * 1024)
+                if not chunk:
+                    break
+                yield chunk
+        finally:
+            stop_event.set()
+            try:
+                proc.terminate()
+                proc.wait(timeout=2)
+            except Exception:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+
+    return Response(stream_response(), mimetype="video/mp2t",
+                    headers={"Cache-Control": "no-cache, no-store",
+                             "X-Encoder": getattr(_h264_encoder_cmd,
+                                                  "_pref_enc", "?")})
 
 
 @app.get("/api/video/status")
