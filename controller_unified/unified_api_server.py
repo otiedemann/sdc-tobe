@@ -787,6 +787,18 @@ def _sim_video_loop(machine_name="anafi", camera_name="horizontal_camera"):
 
     print("[SIM-VIDEO] reader thread started")
     last_warn = 0.0
+    # Rate-cap the heavy per-frame work (JPEG encode + BGR copy + queue
+    # pushes). Sphinx happily delivers 28+ fps on a fast host; sustaining
+    # that rate through cv2.imencode + BGR memcpy eats ~4 CPU cores in
+    # this Python process, which starves Olympe's command path and the
+    # operator sees "video reacts to my key presses 20+ s late". Capping
+    # the *processed* rate to SIM_PRODUCER_FPS keeps the FC light and
+    # the displayed video at a uniform cadence. Frames that arrive
+    # faster than the cap are read-and-released (sphinx shm doesn't
+    # back up) but skipped before encode.
+    SIM_PRODUCER_FPS = int(os.getenv("SIM_PRODUCER_FPS", "15"))
+    _min_dt = 1.0 / max(1, SIM_PRODUCER_FPS)
+    _last_emit = 0.0
     try:
         while _video_streaming:
             try:
@@ -801,6 +813,18 @@ def _sim_video_loop(machine_name="anafi", camera_name="horizontal_camera"):
             if not ok or fr is None:
                 time.sleep(0.005)
                 continue
+            # Skip frames that arrive faster than the producer target
+            # rate. We must still consume + release the shm frame so
+            # sphinx's queue doesn't back up, hence the read-then-skip
+            # rather than a sleep before read.
+            _now = time.monotonic()
+            if _now - _last_emit < _min_dt:
+                try:
+                    fr.release()
+                except Exception:
+                    pass
+                continue
+            _last_emit = _now
             try:
                 buf = fr.buffer  # ndarray (h, w, ch)
                 # Sphinx delivers B8G8R8A8 → drop alpha, already BGR for cv2
