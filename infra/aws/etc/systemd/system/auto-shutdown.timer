@@ -1,0 +1,13 @@
+[Unit]
+Description=Auto-shutdown the instance 3 hours after boot
+Documentation=man:systemd.timer(5)
+
+[Timer]
+# OnBootSec uses CLOCK_BOOTTIME — counts wall time since boot, survives suspends.
+OnBootSec=3h
+# Run only once per boot
+RemainAfterElapse=yes
+Unit=auto-shutdown.service
+
+[Install]
+WantedBy=timers.target

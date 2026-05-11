@@ -1,0 +1,18 @@
+[Unit]
+Description=Marker mission UI + planner (sdc-tobe marker_mission branch)
+After=network.target sphinx-control.service
+Wants=sphinx-control.service
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/opt/sdc-tobe-marker
+ExecStart=/opt/sdc-tobe-marker/.venv/bin/python3 -m marker_mission.mission --ui-port 9090 --api-url http://127.0.0.1:8080
+Restart=on-failure
+RestartSec=5s
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

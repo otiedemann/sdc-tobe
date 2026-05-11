@@ -1,0 +1,7 @@
+# Nightly stop of the EC2 instance at 21:00 local time.
+# /sbin/shutdown -h ... performs an OS halt; EC2 sees a "stop" because
+# the instance's shutdown-behavior is "stop" (the default for on-demand).
+# Costs: EBS storage continues, no compute charges while stopped.
+SHELL=/bin/bash
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+0 21 * * * root /sbin/shutdown -h +1 "scheduled nightly shutdown via /etc/cron.d/nightly-shutdown"

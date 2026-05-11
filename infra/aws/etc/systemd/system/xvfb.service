@@ -1,0 +1,20 @@
+[Unit]
+# Misnamed for historical reasons — this actually runs Xorg with the
+# NVIDIA driver on :99, not Xvfb. We swapped to a real NVIDIA-backed
+# X server because Xvfb's software GLX silently produces black frames
+# for UE4's vertical_camera SceneCaptureComponent, which keeps the sim
+# Anafi's `vertical_camera` sensor at sensorState=0 → takeoff is
+# blocked. See infra/aws/etc/X11/xorg.conf.nvidia-headless.
+Description=Xorg headless on :99 (NVIDIA-backed for sphinx UE4)
+After=network.target
+Before=sphinx-control.service
+
+[Service]
+Type=simple
+User=root
+ExecStart=/usr/bin/Xorg :99 -config /etc/X11/xorg.conf.nvidia-headless -nolisten tcp -noreset
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

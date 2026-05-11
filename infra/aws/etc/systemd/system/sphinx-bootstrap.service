@@ -1,0 +1,18 @@
+[Unit]
+Description=Auto-bring-up sphinx env + drone + FC after boot
+After=sphinx-control.service network-online.target
+Wants=sphinx-control.service
+Before=marker-mission.service
+
+[Service]
+Type=oneshot
+User=ubuntu
+Group=ubuntu
+ExecStart=/opt/sdc-tobe/sphinx-control/sphinx-bootstrap.sh
+TimeoutStartSec=300
+RemainAfterExit=yes
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

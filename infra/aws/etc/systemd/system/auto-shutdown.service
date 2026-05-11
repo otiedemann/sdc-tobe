@@ -1,0 +1,11 @@
+[Unit]
+Description=Auto-shutdown trigger (3h after boot)
+# Don't fire if an operator already explicitly inhibited it
+ConditionPathExists=!/var/run/no-auto-shutdown
+
+[Service]
+Type=oneshot
+# 1-minute grace so any logged-in user sees the wall message before halt.
+# `shutdown -h` halts the OS; EC2 with Shutdown behavior = Stop translates
+# that to a stop (no compute charges, EBS state preserved).
+ExecStart=/sbin/shutdown -h +1 "Automatic shutdown: instance has been up 3h since boot."

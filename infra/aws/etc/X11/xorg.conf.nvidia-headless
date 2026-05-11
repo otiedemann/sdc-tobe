@@ -1,0 +1,82 @@
+# Headless NVIDIA Xorg config for the sphinx AWS instance.
+#
+# Why a real Xorg (not Xvfb): UE4 in -preferNvidia mode needs a GPU-
+# backed GLX surface to render the per-camera SceneCaptureComponents.
+# Xvfb only provides Mesa swrast GLX, which silently produces black
+# frames for the simulated Anafi's vertical_camera and keeps that
+# sensor at sensorState=0 — blocking takeoff. With NVIDIA Xorg the
+# T4 renders normally and the sensor flips to 1 within ~10 s.
+#
+# How this was generated (one-time, then hand-edited):
+#   sudo nvidia-xconfig \
+#     --busid=PCI:0:30:0 \
+#     --allow-empty-initial-configuration \
+#     --virtual=1920x1080 \
+#     -o /etc/X11/xorg.conf.nvidia-headless
+#
+# Then ConnectedMonitor "DFP-0" was added under Section "Device" to
+# trick the driver into believing a display is attached (required on
+# driver >= 470; the older --use-display-device=None option was
+# removed). Without ConnectedMonitor Xorg fails to start with
+# "no screens found".
+#
+# The virtual size 1920x1080 was chosen empirically: 1280x1024 was
+# too small to fit UE4's window + the second (vertical) SceneCapture
+# render target, and the vertical_camera sensor would stay at 0.
+# Bumping to 1920x1080 unblocked it.
+#
+# BusID PCI:0:30:0 is the T4 on a g4dn.xlarge / g4dn.2xlarge. If you
+# move to a different GPU instance type (g5, g6), re-run nvidia-xconfig
+# above and merge the new BusID in.
+
+Section "ServerLayout"
+    Identifier     "Layout0"
+    Screen      0  "Screen0"
+    InputDevice    "Keyboard0" "CoreKeyboard"
+    InputDevice    "Mouse0" "CorePointer"
+EndSection
+
+Section "Files"
+EndSection
+
+Section "InputDevice"
+    Identifier     "Mouse0"
+    Driver         "mouse"
+    Option         "Protocol" "auto"
+    Option         "Device" "/dev/psaux"
+    Option         "Emulate3Buttons" "no"
+    Option         "ZAxisMapping" "4 5"
+EndSection
+
+Section "InputDevice"
+    Identifier     "Keyboard0"
+    Driver         "kbd"
+EndSection
+
+Section "Monitor"
+    Identifier     "Monitor0"
+    VendorName     "Unknown"
+    ModelName      "Unknown"
+    Option         "DPMS"
+EndSection
+
+Section "Device"
+    Option         "ConnectedMonitor" "DFP-0"
+    Identifier     "Device0"
+    Driver         "nvidia"
+    VendorName     "NVIDIA Corporation"
+    BusID          "PCI:0:30:0"
+EndSection
+
+Section "Screen"
+    Option         "HardDPMS" "False"
+    Identifier     "Screen0"
+    Device         "Device0"
+    Monitor        "Monitor0"
+    DefaultDepth    24
+    Option         "AllowEmptyInitialConfiguration" "True"
+    SubSection     "Display"
+        Virtual     1920 1080
+        Depth       24
+    EndSubSection
+EndSection

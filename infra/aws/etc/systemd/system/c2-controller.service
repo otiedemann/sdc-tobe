@@ -1,0 +1,22 @@
+[Unit]
+Description=Remote web controller (C2 UI; proxies to FC on :8080)
+After=network.target sphinx-bootstrap.service
+Wants=sphinx-bootstrap.service
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/opt/sdc-tobe/controller
+Environment=C2_HTTP_PORT=8070
+Environment=PI_BASE=http://localhost:8080
+Environment=REMOTE_COMMAND_LOG_PATH=/opt/sdc-tobe/controller/remote_command_log.jsonl
+Environment=FLIGHT_LOG_DIR=/opt/sdc-tobe/controller/flight_logs
+ExecStart=/opt/sdc-tobe/.venv/bin/python /opt/sdc-tobe/controller/remote_web_controller.py
+Restart=on-failure
+RestartSec=5s
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
