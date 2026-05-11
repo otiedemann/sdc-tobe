@@ -87,17 +87,8 @@
           <span class="fc-status">no flight controller running</span>
         </div>
       </div>
-      <form id="fc-form" style="grid-template-columns: 1fr 1fr auto; margin-bottom:8px;">
-        <label>Anafi IP
-          <input id="fc-anafi-ip" type="text"
-                 placeholder="leave blank to use config default"
-                 list="fc-anafi-ip-presets" />
-          <datalist id="fc-anafi-ip-presets">
-            <option value="10.202.0.1">Sphinx sim (netns default)</option>
-            <option value="172.21.0.2">Sphinx 2 sim (newer default)</option>
-            <option value="192.168.42.1">Real Anafi over Wi-Fi</option>
-          </datalist>
-        </label>
+      <p class="muted" style="margin:4px 0;">Anafi IP is fixed at <code>10.202.0.1</code> (sphinx sim).</p>
+      <form id="fc-form" style="grid-template-columns: 1fr auto; margin-bottom:8px;">
         <label>HTTP port
           <input id="fc-http-port" type="number" placeholder="8080" />
         </label>

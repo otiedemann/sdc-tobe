@@ -213,10 +213,14 @@ def api_get_fc():
 
 @app.post("/api/fc", status_code=201)
 def api_start_fc(req: FCSpawnRequest):
+    # Anafi IP is hardcoded to the sphinx sim address. Any value
+    # the caller supplied is ignored on purpose — operator policy is
+    # that this server only ever flies the simulated Anafi at
+    # 10.202.0.1, never a different netns/IP or a real Wi-Fi Anafi.
     try:
         fc = launcher.start_fc(FCRequest(
             cwd=req.cwd, python=req.python, script=req.script,
-            http_port=req.http_port, anafi_ip=req.anafi_ip,
+            http_port=req.http_port, anafi_ip="10.202.0.1",
         ))
     except (KeyError, ValueError) as e:
         raise HTTPException(status_code=400, detail=str(e))
