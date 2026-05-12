@@ -62,12 +62,27 @@ PY
 }
 
 fc_connected() {
+    # Test 1: telemetry says connected
     local con
     con=$(curl -s --max-time 2 "$FC_API/api/telemetry" 2>/dev/null | \
         python3 -c "import json,sys
 try: print(json.load(sys.stdin).get('connected'))
 except Exception: pass" 2>/dev/null)
-    [ "$con" = "True" ]
+    [ "$con" = "True" ] || return 1
+
+    # Test 2: NOT in the stale-connected wedge state. Even one
+    # "Too many ping failures" line in the recent FC log means ARSDK
+    # keepalive is gone — telemetry's connected flag will linger as
+    # True for a while, but every command (takeoff, RC) silently fails.
+    # We catch the wedge before declaring the FC healthy.
+    local fc_log
+    fc_log=$(ls -t /opt/sdc-tobe/sphinx-control/logs/fc-*/fc.log 2>/dev/null | head -1)
+    if [ -n "$fc_log" ] && [ -f "$fc_log" ]; then
+        if tail -n 200 "$fc_log" 2>/dev/null | grep -q 'Too many ping failures'; then
+            return 1
+        fi
+    fi
+    return 0
 }
 
 # Force every sim-related process gone. Used after an API teardown to

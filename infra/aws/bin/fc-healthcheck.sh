@@ -26,7 +26,7 @@ set -u
 MISSES_STATE=/run/fc-healthcheck.misses
 RESTART_STATE=/run/fc-healthcheck.last-restart
 THRESHOLD=3                              # consecutive disconnected before A) acts
-WEDGE_PATTERN_THRESHOLD=2                # "Too many ping failures" lines required before B) acts
+WEDGE_PATTERN_THRESHOLD=1                # "Too many ping failures" lines required before B) acts
 WEDGE_TAIL_LINES=200                     # how many recent log lines to inspect
 COOLDOWN_S=300                           # don't restart more than once / 5 min
 FC_API=http://localhost:8080
@@ -44,36 +44,37 @@ within_cooldown() {
     [ $((now_ts - last_ts)) -lt "$COOLDOWN_S" ]
 }
 
+BOOTSTRAP=/opt/sdc-tobe/sphinx-control/sphinx-bootstrap.sh
+
 restart_fc() {
     local reason="$1"
-    log "restarting FC via sphinx-control — $reason"
-    curl -s --max-time 5 -X DELETE "$SPC_API/api/fc" >/dev/null
-    # Mark restart time NOW so even if POST fails we still respect cooldown
+    log "delegating recovery to sphinx-bootstrap.sh — $reason"
+    # Mark restart time NOW so even if bootstrap fails we still respect
+    # cooldown and don't relaunch every minute.
     date +%s > "$RESTART_STATE"
     : > "$MISSES_STATE"
 
-    # sphinx-control has a known bug where right after DELETE its port-
-    # availability check sometimes incorrectly returns "port 8080
-    # already in use" even though `fuser 8080/tcp` shows nothing. The
-    # stale state clears after ~10-30 s. Retry POST several times with
-    # increasing backoff. We deliberately do NOT restart sphinx-control
-    # as a workaround — its reconcile on startup tears down the live
-    # env+drone subprocesses too, which is much worse than a temporarily
-    # unrecoverable FC.
-    local attempt resp pid
-    for attempt in 1 2 3 4 5 6; do
-        sleep $((attempt * 6))   # 6,12,18,24,30,36s — total ~2 min before giving up
-        resp=$(curl -s --max-time 10 -X POST "$SPC_API/api/fc" \
-               -H "Content-Type: application/json" -d "{}")
-        if echo "$resp" | grep -q '"pid"'; then
-            pid=$(echo "$resp" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("pid"))')
-            log "FC restart ok (pid=$pid) on attempt $attempt"
-            return 0
-        fi
-        log "  POST attempt $attempt failed: $(echo "$resp" | head -c 160)"
-    done
-    log "FC restart FAILED after $attempt attempts — manual intervention or wait for next timer fire (cooldown $COOLDOWN_S s)"
-    return 1
+    # bootstrap.sh is the single source of truth for "get sim healthy":
+    #   * stage 1 (env) — only restarts if UE4 missing per API
+    #   * stage 2 (drone) — respawns drone if unreachable, with
+    #                       restart_firmwared_full() escalation if
+    #                       that fails too
+    #   * stage 3 (FC) — DELETE+POST with retries; if connected=false
+    #                    persists OR the FC log shows "Too many ping
+    #                    failures", we land here.
+    # On a healthy box it's a ~4 s no-op; on a wedged FC, ~15 s; on a
+    # wedged firmwared, ~90 s. All bounded.
+    if [ ! -x "$BOOTSTRAP" ]; then
+        log "ERROR: $BOOTSTRAP not found / not executable"
+        return 1
+    fi
+    if "$BOOTSTRAP"; then
+        log "bootstrap reports healthy"
+        return 0
+    else
+        log "bootstrap exited non-zero — sim probably needs hands"
+        return 1
+    fi
 }
 
 # ── precondition: a registered FC exists ──────────────────────────
