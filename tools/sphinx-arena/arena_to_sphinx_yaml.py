@@ -83,8 +83,9 @@ DEFAULT_OUT_YAML = Path(__file__).parent / "out" / "arena.yml"
 #
 #   left:  roll = 180°
 #   right: roll =   0°
-#   front: roll = 270°
-#   back:  roll =  90°
+#   front: roll =  90°   (marker_mission convention: front wall at +Y,
+#   back:  roll = 270°    back wall at -Y. Front/back swapped relative
+#                         to the old "+y = back" arena convention.)
 #
 # WALL_FALLBACK_DIRECTION_DEG / direction_deg fields are still used by
 # the marker-inward-offset code (to compute which way to nudge each
@@ -94,8 +95,8 @@ MARKER_YAW_DEG: float = 0.0
 WALL_ROLL_DEG: dict[str, float] = {
     "left":  180.0,
     "right":   0.0,
-    "front": 270.0,
-    "back":   90.0,
+    "front":  90.0,
+    "back":  270.0,
 }
 
 # Per-marker direction is now read directly from arena_config.json's
@@ -104,10 +105,12 @@ WALL_ROLL_DEG: dict[str, float] = {
 # wall name to derive a sensible default.  Strongly preferred: set
 # direction_deg explicitly on every marker in arena_config.json.
 WALL_FALLBACK_DIRECTION_DEG: dict[str, float] = {
-    "left":   0.0,    # x=-10, inward = arena +X (0° in arena polar)
-    "right":  180.0,  # x=+10, inward = arena -X
-    "front":  90.0,   # y=0,   inward = arena +Y
-    "back":  -90.0,   # y=max, inward = arena -Y
+    # marker_mission convention: centred origin, +x=right, +y=front.
+    # "inward" = direction from the wall toward the arena centre.
+    "left":   0.0,    # x = -W/2, inward = arena +X
+    "right":  180.0,  # x = +W/2, inward = arena -X
+    "front": -90.0,   # y = +D/2, inward = arena -Y
+    "back":   90.0,   # y = -D/2, inward = arena +Y
 }
 
 
