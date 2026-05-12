@@ -13,20 +13,19 @@ Writes:
     a converted UE4 coordinate.
 
 Coordinate-system conversion:
-  Arena frame  (from ``arena_config.json``): metres, right-handed,
+  Arena frame  (from marker_mission's default): metres, right-handed,
                 +X = arena right, +Y = arena forward (away from origin
                 wall), +Z = up. Origin is the arena floor centre.
   Sphinx/UE4 frame: centimetres, left-handed, +X = forward, +Y = right,
                 +Z = up. (Default UE convention: ``X-forward, Y-right,
                 Z-up`` with metres × 100.)
 
-  The ``--axis-map`` flag controls which arena axis becomes which UE
-  axis, since groundtruth axis orientation depends on how you place the
-  arena's "front" wall in the UE world. Default ``y2x,x2y_neg,z2z`` puts
-  the arena +Y direction along UE +X (forward) and arena +X along UE -Y
-  (right→left), which matches a UE world set up "looking down the long
-  axis from origin". Verify visually after first launch and adjust if
-  markers land on the wrong wall.
+  The mapping is fixed: arena (x, y, z) → UE (y, x, z) × 100. That is,
+  arena forward (+Y) → UE forward (+X) and arena right (+X) → UE right
+  (+Y) — so the drone's "forward" and "right" line up with the arena's,
+  and the operator's top-down view of the simulator matches their
+  top-down view of the arena. Determinant −1 (a reflection), which is
+  exactly what's needed to bridge the RH→LH handedness gap.
 
 Marker rotation (``Rotation`` field):
   Each FBX plane is built to face -Y in its local frame (see
@@ -43,14 +42,57 @@ from __future__ import annotations
 import argparse
 import json
 import sys
-from dataclasses import dataclass
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-DEFAULT_ARENA_CONFIG = REPO_ROOT / "controller_unified" / "arena_config.json"
+# Source of truth for the arena layout is marker_mission.arena.default_arena()
+# — see load_arena_layout() below. controller_unified/arena_config.json is
+# kept around for legacy callers but is not used by this script anymore;
+# pass --arena-config explicitly if you need to point at a custom JSON.
+DEFAULT_ARENA_CONFIG: Path | None = None
 DEFAULT_TARGET_LAYOUT = Path(__file__).parent / "default_target_layout.json"
 DEFAULT_FBX_DIR = Path(__file__).parent / "out" / "fbx"
 DEFAULT_OUT_YAML = Path(__file__).parent / "out" / "arena.yml"
+
+
+def _load_marker_mission_default() -> dict:
+    """Return the marker_mission default arena as the dict shape this
+    script consumes (matches the controller_unified/arena_config.json
+    schema, including the ``direction_deg`` field derived from each
+    marker's wall via :data:`WALL_FALLBACK_DIRECTION_DEG`)."""
+    sys.path.insert(0, str(REPO_ROOT))
+    try:
+        from marker_mission.arena import default_arena  # type: ignore
+    finally:
+        # Keep sys.path clean for callers that import this module.
+        try:
+            sys.path.remove(str(REPO_ROOT))
+        except ValueError:
+            pass
+    cfg = default_arena()
+    markers_out = []
+    for m in sorted(cfg.markers.values(), key=lambda x: x.id):
+        wall = m.wall
+        markers_out.append({
+            "id": int(m.id),
+            "label": m.label,
+            "wall": wall,
+            "x": float(m.position_m[0]),
+            "y": float(m.position_m[1]),
+            "z": float(m.position_m[2]),
+            # direction_deg is the marker's INWARD-facing direction in
+            # arena coords. marker_mission stores wall membership only,
+            # so derive the inward direction from the wall.
+            "direction_deg": WALL_FALLBACK_DIRECTION_DEG.get(wall, 0.0),
+        })
+    return {
+        "marker_size_m": float(cfg.marker_size_m),
+        "width_m": float(cfg.width_m),
+        "depth_m": float(cfg.depth_m),
+        "top_z_m": float(cfg.top_z_m),
+        "bottom_z_m": float(cfg.bottom_z_m),
+        "markers": markers_out,
+    }
 
 
 # Marker orientation in YAML. The Sphinx YAML's per-mesh ``Rotation``
@@ -81,11 +123,11 @@ DEFAULT_OUT_YAML = Path(__file__).parent / "out" / "arena.yml"
 # orientation is set by ROLL — not yaw, as the math kept predicting.
 # This is the single source of truth for marker rotation.
 #
-#   left:  roll = 180°
-#   right: roll =   0°
+#   left:  roll =   0°   (arena +X → UE +Y mapping: left wall at UE -Y,
+#   right: roll = 180°    right wall at UE +Y — swapped relative to the
+#                         old y2x,x2y_neg mapping.)
 #   front: roll =  90°   (marker_mission convention: front wall at +Y,
-#   back:  roll = 270°    back wall at -Y. Front/back swapped relative
-#                         to the old "+y = back" arena convention.)
+#   back:  roll = 270°    back wall at -Y. Unchanged by the axis swap.)
 #
 # WALL_FALLBACK_DIRECTION_DEG / direction_deg fields are still used by
 # the marker-inward-offset code (to compute which way to nudge each
@@ -93,8 +135,8 @@ DEFAULT_OUT_YAML = Path(__file__).parent / "out" / "arena.yml"
 MARKER_PITCH_DEG: float = 0.0
 MARKER_YAW_DEG: float = 0.0
 WALL_ROLL_DEG: dict[str, float] = {
-    "left":  180.0,
-    "right":   0.0,
+    "left":    0.0,
+    "right": 180.0,
     "front":  90.0,
     "back":  270.0,
 }
@@ -114,30 +156,10 @@ WALL_FALLBACK_DIRECTION_DEG: dict[str, float] = {
 }
 
 
-def arena_dir_to_ue_yaw(direction_deg_arena: float) -> float:
-    """Convert a marker's facing direction (in arena coord polar) to a
-    UE4 FRotator yaw value, given the default axis_map y2x,x2y_neg.
-
-    With marker FBX rotation X+90° in Blender, the plane normal lands
-    at UE +X after Sphinx's axis conversion. UE positive yaw α rotates
-    +X to (cos α, sin α). Setting that equal to (sin θ, -cos θ) — the
-    arena→UE mapping of arena dir θ — gives α = θ - 90°.
-
-    Per-wall (with geometric direction_deg in arena_config.json):
-      left  (dir=0°):    yaw = -90°
-      right (dir=180°):  yaw =  90°
-      front (dir=90°):   yaw =   0°
-      back  (dir=-90°):  yaw = -180° (= 180°)
-    """
-    return direction_deg_arena - 90.0
-
-
-# Legacy alias kept so older code that imports WALL_YAW_DEG still works.
-# Computed from WALL_FALLBACK_DIRECTION_DEG via the same conversion.
-WALL_YAW_DEG: dict[str, float] = {
-    wall: arena_dir_to_ue_yaw(d)
-    for wall, d in WALL_FALLBACK_DIRECTION_DEG.items()
-}
+# Rotation is per-wall ROLL only; no yaw is required to aim the
+# markers at the arena interior under the fixed (y, x, z) axis swap.
+WALL_YAW_DEG: dict[str, float] = {wall: 0.0
+                                  for wall in WALL_FALLBACK_DIRECTION_DEG}
 
 
 # Paintings: one logo per wall, mounted at mid-height between the
@@ -167,31 +189,16 @@ PAINTINGS: list[tuple[str, str, float]] = [
 ]
 
 
-@dataclass(frozen=True)
-class AxisMap:
-    """How arena (x, y, z) maps to UE (x, y, z). Each entry is a tuple
-    ``(arena_axis, sign)`` where ``arena_axis ∈ {0,1,2}`` and ``sign ∈ {+1,-1}``.
-    Default: arena +Y → UE +X, arena +X → UE -Y, arena +Z → UE +Z."""
+def arena_to_ue_m(arena_xyz_m: tuple[float, float, float]) -> tuple[float, float, float]:
+    """Fixed arena → UE conversion (still in metres; multiply by 100
+    for the UE Location field).
 
-    ue_x: tuple[int, int]  # default: (1, +1) — arena Y becomes UE X
-    ue_y: tuple[int, int]  # default: (0, -1) — arena X becomes UE -Y
-    ue_z: tuple[int, int]  # default: (2, +1) — arena Z becomes UE Z
-
-    def apply(self, arena_xyz_m: tuple[float, float, float]) -> tuple[float, float, float]:
-        ax, ay, az = arena_xyz_m
-        a = (ax, ay, az)
-        ux = a[self.ue_x[0]] * self.ue_x[1]
-        uy = a[self.ue_y[0]] * self.ue_y[1]
-        uz = a[self.ue_z[0]] * self.ue_z[1]
-        return (ux, uy, uz)
-
-
-_AXIS_MAP_PRESETS: dict[str, AxisMap] = {
-    "y2x,x2y_neg,z2z": AxisMap(ue_x=(1, +1), ue_y=(0, -1), ue_z=(2, +1)),
-    "x2x,y2y,z2z":     AxisMap(ue_x=(0, +1), ue_y=(1, +1), ue_z=(2, +1)),
-    "x2x_neg,y2y,z2z": AxisMap(ue_x=(0, -1), ue_y=(1, +1), ue_z=(2, +1)),
-    "y2x_neg,x2y,z2z": AxisMap(ue_x=(1, -1), ue_y=(0, +1), ue_z=(2, +1)),
-}
+    arena (x, y, z) → UE (y, x, z): arena forward (+Y) becomes UE
+    forward (+X), arena right (+X) becomes UE right (+Y), arena up
+    (+Z) stays UE up (+Z). Determinant −1, which is the RH→LH
+    handedness flip needed between arena and UE."""
+    ax, ay, az = arena_xyz_m
+    return (ay, ax, az)
 
 
 def fmt3(x: float, y: float, z: float) -> str:
@@ -344,7 +351,11 @@ collect_nets = collect_walls
 
 def main() -> int:
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("--arena-config", type=Path, default=DEFAULT_ARENA_CONFIG)
+    p.add_argument("--arena-config", type=Path, default=DEFAULT_ARENA_CONFIG,
+                   help="Optional JSON arena config to override marker_mission's "
+                        "default_arena(). If omitted, marker_mission's default "
+                        "is the source of truth (16 markers, 10 × 20 m, "
+                        "clockwise order starting at front).")
     p.add_argument("--target-layout", type=Path, default=DEFAULT_TARGET_LAYOUT)
     p.add_argument("--fbx-dir", type=Path, default=DEFAULT_FBX_DIR,
                    help="Directory holding the FBX files built by build_marker_fbx.py.")
@@ -355,11 +366,6 @@ def main() -> int:
                         "If omitted, the local --fbx-dir is used as-is. Useful "
                         "when generating the YAML on a Mac but Sphinx runs on "
                         "an Ubuntu box where the path is different.")
-    p.add_argument(
-        "--axis-map", choices=sorted(_AXIS_MAP_PRESETS.keys()),
-        default="y2x,x2y_neg,z2z",
-        help="Arena→UE axis mapping. Default puts arena +Y along UE +X.",
-    )
     p.add_argument(
         "--wall-marker-size-m-override", type=float, default=None,
         help="Override the wall-marker physical size (otherwise read from "
@@ -467,8 +473,6 @@ def main() -> int:
     )
     args = p.parse_args()
 
-    axis_map = _AXIS_MAP_PRESETS[args.axis_map]
-
     # Apply CLI yaw overrides on top of the module-level defaults.
     wall_yaws = dict(WALL_YAW_DEG)
     if args.yaw_front is not None:
@@ -482,8 +486,14 @@ def main() -> int:
     marker_pitch = (args.marker_pitch if args.marker_pitch is not None
                     else MARKER_PITCH_DEG)
 
-    with args.arena_config.open() as f:
-        arena = json.load(f)
+    if args.arena_config is None:
+        arena = _load_marker_mission_default()
+        print(f"Arena source: marker_mission.arena.default_arena() "
+              f"(use --arena-config to override)")
+    else:
+        with args.arena_config.open() as f:
+            arena = json.load(f)
+        print(f"Arena source: {args.arena_config}")
     with args.target_layout.open() as f:
         targets = json.load(f)
 
@@ -520,9 +530,9 @@ def main() -> int:
         return shifted_apply((ax, ay, az + _ARENA_Z_OFFSET_M))
 
     def shifted_apply(arena_xyz: tuple[float, float, float]) -> tuple[float, float, float]:
-        """Apply --center-arena shift then axis_map."""
+        """Apply --center-arena shift then the fixed arena → UE swap."""
         ox, oy, oz = center_offset
-        return axis_map.apply(
+        return arena_to_ue_m(
             (arena_xyz[0] - ox, arena_xyz[1] - oy, arena_xyz[2] - oz)
         )
 
@@ -531,7 +541,7 @@ def main() -> int:
     out_lines.append("# Auto-generated by tools/sphinx-arena/arena_to_sphinx_yaml.py")
     out_lines.append("# Do not edit by hand — re-run with `make yaml` after changing")
     out_lines.append("# arena_config.json or default_target_layout.json.")
-    out_lines.append(f"# Axis map: {args.axis_map}  (arena → UE)")
+    out_lines.append("# Axis map: arena (x, y, z) → UE (y, x, z) × 100")
     out_lines.append(f"# Center arena at UE origin: {args.center_arena} "
                      f"(offset arena {center_offset})")
     out_lines.append(f"# Wall marker size: {wall_size} m")
@@ -722,15 +732,14 @@ def main() -> int:
         # single-mesh-single-material approach Sphinx renders
         # reliably) and scales it per-axis into a long thin tall slab.
         # Position is at each wall's plane in arena coords.
-        ax_for_ue_x = axis_map.ue_x[0]
-        ax_for_ue_y = axis_map.ue_y[0]
         for wall in collect_walls(arena.get("markers", [])):
             ux_m, uy_m, uz_m = shifted_apply_with_zlift((wall["x"], wall["y"], wall["z"]))
             loc_cm = (ux_m * 100.0, uy_m * 100.0, uz_m * 100.0)
-            arena_scales = {0: wall["sx"], 1: wall["sy"], 2: wall["sz"]}
-            ue_x_scale = arena_scales[ax_for_ue_x]
-            ue_y_scale = arena_scales[ax_for_ue_y]
-            ue_z_scale = arena_scales[2]
+            # arena (x,y,z) → UE (y,x,z): arena's Y-extent scales UE's
+            # X-extent and vice versa.
+            ue_x_scale = wall["sy"]
+            ue_y_scale = wall["sx"]
+            ue_z_scale = wall["sz"]
             out_lines.append(
                 f"  # Perimeter wall — {wall['name']}."
             )
@@ -841,8 +850,6 @@ def main() -> int:
         # Marker-bbox-centred Y (cy = (y_min+y_max)/2)
         ys = [float(m["y"]) for m in arena.get("markers", [])] or [0.0, 10.8]
         cy = (min(ys) + max(ys)) / 2.0
-        ax_for_ue_x = axis_map.ue_x[0]
-        ax_for_ue_y = axis_map.ue_y[0]
         for zone_name, fbx_name, cx_arena, length_m in (
             ("arena_floor_red",     "floor_red.fbx",  red_cx,  ZONE_END),
             ("arena_floor_neutral", "floor.fbx",      mid_cx,  ZONE_MID),
@@ -850,9 +857,10 @@ def main() -> int:
         ):
             ux_m, uy_m, uz_m = shifted_apply((cx_arena, cy, zone_z_center))
             loc_cm = (ux_m * 100.0, uy_m * 100.0, uz_m * 100.0)
-            arena_dims = {0: length_m, 1: ARENA_DEPTH}
-            ue_x_size = arena_dims[ax_for_ue_x]
-            ue_y_size = arena_dims[ax_for_ue_y]
+            # arena (x,y,z) → UE (y,x,z): arena's Y-depth scales UE_X,
+            # arena's X-length scales UE_Y.
+            ue_x_size = ARENA_DEPTH
+            ue_y_size = length_m
             out_lines.append(
                 f"  # Floor zone {zone_name} — {length_m} × "
                 f"{ARENA_DEPTH} × {FLOOR_THICK} m."
@@ -989,7 +997,7 @@ def main() -> int:
     print(f"  paintings: {n_paintings}")
     print(f"  spectators: {n_spectators}")
     print(f"  actor paths: {n_actor_paths}")
-    print(f"  axis map: {args.axis_map}")
+    print(f"  axis map: arena (x, y, z) → UE (y, x, z) × 100")
     print(f"  fbx dir (in YAML): {fbx_dir}")
     return 0
 
