@@ -12,6 +12,17 @@ cd "$(dirname "$0")"
 echo "[install] copying /etc files..."
 sudo cp -a etc/. /etc/
 
+# sudoers drop-ins MUST be 0440 (root:root) or sudo silently ignores
+# them. Force-fix mode here regardless of what cp picked up.
+if [ -d /etc/sudoers.d ]; then
+    sudo chmod 0440 /etc/sudoers.d/sphinx-bootstrap 2>/dev/null || true
+    sudo chown root:root /etc/sudoers.d/sphinx-bootstrap 2>/dev/null || true
+    # validate — visudo -cf returns non-zero on syntax error
+    sudo visudo -cf /etc/sudoers.d/sphinx-bootstrap >/dev/null \
+        && echo "  sudoers drop-in syntax ok" \
+        || echo "  WARNING: sudoers drop-in has a syntax error!"
+fi
+
 echo "[install] copying /opt files..."
 sudo cp -a opt/. /opt/
 sudo chmod +x /opt/sdc-tobe/sphinx-control/sphinx-bootstrap.sh

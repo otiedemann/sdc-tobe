@@ -1,0 +1,22 @@
+# Let the `ubuntu` user (which sphinx-bootstrap.service runs as) trigger
+# the systemd restarts our recovery script needs without a password prompt.
+#
+# Two recovery branches in sphinx-bootstrap.sh need these:
+#
+#   restart_sphinx_control()  →  systemctl restart sphinx-control
+#       (when sphinx-control's DB has a phantom env entry DELETE can't clear)
+#
+#   restart_firmwared_full()  →  stop sphinx-control/marker-mission/c2-controller,
+#                                 restart firmwared (clears stale loop mounts),
+#                                 start them again
+#       (when drone spawn dies with "Exit is pending" — firmwared is wedged)
+#
+# Scoped to exact commands. Don't broaden without a real need.
+ubuntu ALL=(root) NOPASSWD: /usr/bin/systemctl restart sphinx-control, \
+                            /usr/bin/systemctl restart sphinx-control.service, \
+                            /usr/bin/systemctl restart firmwared, \
+                            /usr/bin/systemctl restart firmwared.service, \
+                            /usr/bin/systemctl stop sphinx-control, \
+                            /usr/bin/systemctl stop sphinx-control marker-mission c2-controller, \
+                            /usr/bin/systemctl start sphinx-control, \
+                            /usr/bin/systemctl start c2-controller marker-mission
