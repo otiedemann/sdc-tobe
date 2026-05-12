@@ -10,7 +10,18 @@ set -euo pipefail
 cd "$(dirname "$0")"
 
 echo "[install] copying /etc files..."
-sudo cp -a etc/. /etc/
+# NOTE: `cp -a` preserves the *caller's* uid/gid on the source tree,
+# which (when the repo is cloned as ubuntu) silently chowns /etc and
+# every subdir we touch to ubuntu:ubuntu. sudo then refuses to run
+# because /etc/sudoers.d is "owned by uid 1000, should be 0".
+# Use --preserve=mode (not =all) and force ownership back to root.
+sudo cp -r --preserve=mode etc/. /etc/
+# Re-assert root ownership on every dir/file we just placed under /etc.
+# Walk the source tree so we don't accidentally chown unrelated /etc
+# entries that happen to share a name.
+while IFS= read -r -d '' rel; do
+    sudo chown root:root "/etc/$rel"
+done < <(cd etc && find . -mindepth 1 -print0)
 
 # sudoers drop-ins MUST be 0440 (root:root) or sudo silently ignores
 # them. Force-fix mode here regardless of what cp picked up.
@@ -24,6 +35,9 @@ if [ -d /etc/sudoers.d ]; then
 fi
 
 echo "[install] copying /opt files..."
+# /opt/sdc-tobe IS the git checkout (cloned as ubuntu) — keep it that
+# way so `git pull` keeps working. cp -a preserves ubuntu ownership,
+# which matches dst here. (Only /etc above is sensitive.)
 sudo cp -a opt/. /opt/
 sudo chmod +x /opt/sdc-tobe/sphinx-control/sphinx-bootstrap.sh
 
