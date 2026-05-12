@@ -2,6 +2,12 @@
 
 Real-time drone detection using YOLO11n for the Swarm Drone Challenge arena.
 
+**Pre-trained model is ready to use** in [`pretrained/`](pretrained/) —
+mAP50 = 0.967 on the Seraphim test set. See
+[`pretrained/README.md`](pretrained/README.md) for metrics, file format
+guide, and code snippets. The rest of this README is the training +
+deployment pipeline.
+
 ## Quick Start
 
 ### 1. Install dependencies
