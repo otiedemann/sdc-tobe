@@ -1,0 +1,51 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="680" height="520" viewBox="0 0 680 520" role="img">
+<title>Relative heading around the marker, top-down view</title>
+<desc>Top-down diagram showing how relative_heading_deg measures the drone's bearing around the marker, with 0 degrees in front of the marker, plus 90 degrees on the marker's own right, minus 90 degrees on its own left, and plus or minus 180 degrees behind it.</desc>
+<style>
+  .t { font: 500 14px -apple-system,"Segoe UI",sans-serif; fill: #2C2C2A; }
+  .ts { font: 400 12px -apple-system,"Segoe UI",sans-serif; fill: #2C2C2A; }
+  .th { font: 500 14px -apple-system,"Segoe UI",sans-serif; fill: #2C2C2A; }
+</style>
+<defs>
+  <marker id="arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+    <path d="M2 1L8 5L2 9" fill="none" stroke="context-stroke" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+  </marker>
+</defs>
+
+<text class="ts" x="340" y="30" text-anchor="middle">Top-down view, drone always faces the marker</text>
+
+<circle cx="340" cy="270" r="160" fill="none" stroke="#5F5E5A" stroke-width="0.5" stroke-dasharray="3 3"/>
+
+<line x1="180" y1="270" x2="500" y2="270" stroke="#888780" stroke-width="0.5"/>
+<line x1="340" y1="110" x2="340" y2="430" stroke="#888780" stroke-width="0.5"/>
+
+<rect x="320" y="258" width="40" height="24" rx="2" fill="#FAECE7" stroke="#993C1D" stroke-width="0.5"/>
+<text class="ts" x="340" y="274" text-anchor="middle" fill="#712B13">Marker</text>
+
+<line x1="340" y1="258" x2="340" y2="170" stroke="#993C1D" stroke-width="1.5" stroke-dasharray="4 3" marker-end="url(#arrow)"/>
+<text class="ts" x="350" y="230" fill="#712B13">outward normal</text>
+<text class="ts" x="350" y="245" fill="#712B13">(heading 0°)</text>
+
+<polygon points="340,110 333,128 347,128" fill="#0F6E56"/>
+<text class="th" x="340" y="100" text-anchor="middle" fill="#085041">heading 0°</text>
+<text class="ts" x="340" y="148" text-anchor="middle">in front of marker</text>
+
+<polygon points="500,270 482,263 482,277" fill="#0F6E56"/>
+<text class="th" x="510" y="265" fill="#085041">heading +90°</text>
+<text class="ts" x="510" y="282">marker's own right</text>
+<text class="ts" x="510" y="297">(operator's left)</text>
+
+<polygon points="180,270 198,263 198,277" fill="#0F6E56"/>
+<text class="th" x="170" y="265" text-anchor="end" fill="#085041">heading −90°</text>
+<text class="ts" x="170" y="282" text-anchor="end">marker's own left</text>
+<text class="ts" x="170" y="297" text-anchor="end">(operator's right)</text>
+
+<polygon points="340,430 333,412 347,412" fill="#0F6E56"/>
+<text class="th" x="340" y="455" text-anchor="middle" fill="#085041">heading ±180°</text>
+<text class="ts" x="340" y="475" text-anchor="middle">behind marker</text>
+
+<path d="M 410 145 A 130 130 0 0 1 470 205" fill="none" stroke="#7F77DD" stroke-width="2" marker-end="url(#arrow)"/>
+<text class="th" x="478" y="160" fill="#3C3489">+ (CW)</text>
+
+<text class="ts" x="40" y="500">Positive heading is clockwise from above (right-hand rule about world up).</text>
+</svg>
