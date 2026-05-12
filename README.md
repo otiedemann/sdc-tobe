@@ -23,6 +23,7 @@ automatically at boot via systemd.
 | 8080 | **FC** (`controller_unified`)        | Flight controller HTTP API — talks Olympe to the drone           |
 | 8090 | **sphinx-control**                   | Sim dashboard — start/stop env, drones, FC                       |
 | 9090 | **marker-mission**                   | Mission planner UI — scripted ArUco missions                     |
+| 9091 | **drone-detector-ui**                | Collision-detector dashboard — live video + YOLO overlay + evasion config |
 
 Open these in your browser over Tailscale:
 

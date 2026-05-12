@@ -1,0 +1,26 @@
+[Unit]
+Description=Drone collision-detector dashboard (:9091)
+# Don't try to start before the FC (whose /api/video this thing proxies)
+# is plausibly up. sphinx-bootstrap.service ends with FC connected.
+After=network.target sphinx-bootstrap.service
+Wants=sphinx-bootstrap.service
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/opt/sdc-tobe
+# Defaults: FC at localhost:8080, model at the committed pretrained .onnx.
+# Override via /etc/systemd/system/drone-detector-ui.service.d/override.conf
+# if needed.
+Environment=DETECTOR_UI_PORT=9091
+Environment=FC_BASE=http://localhost:8080
+Environment=MODEL_PATH=/opt/sdc-tobe/drone_detection/pretrained/yolo11n_seraphim_e37.onnx
+ExecStart=/opt/sdc-tobe/.venv/bin/python /opt/sdc-tobe/drone_detection/detector_ui.py
+Restart=on-failure
+RestartSec=5s
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

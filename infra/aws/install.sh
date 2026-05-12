@@ -62,6 +62,7 @@ for u in \
   sphinx-bootstrap.service \
   marker-mission.service \
   c2-controller.service \
+  drone-detector-ui.service \
   auto-shutdown.timer \
   fc-healthcheck.timer
 do

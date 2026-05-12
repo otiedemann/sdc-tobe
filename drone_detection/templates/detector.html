@@ -1,0 +1,349 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Drone Collision Detector</title>
+<style>
+  :root {
+    --bg: #0e1116;
+    --panel: #161b22;
+    --panel2: #1f242c;
+    --fg: #e6e6e6;
+    --muted: #8a929a;
+    --accent: #3fb950;
+    --warn: #d29922;
+    --danger: #f85149;
+    --border: #30363d;
+  }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--fg);
+         font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+         font-size: 14px; }
+  header { display:flex; align-items:center; gap:16px; padding:10px 16px;
+           background:var(--panel); border-bottom:1px solid var(--border); }
+  header h1 { margin:0; font-size:18px; }
+  header .pill { padding: 2px 8px; border-radius: 10px; font-size: 12px;
+                 background: var(--panel2); }
+  .pill.on  { background: var(--accent); color: black; }
+  .pill.off { background: var(--border); }
+  .pill.armed { background: var(--danger); color: white; }
+
+  main { display: grid;
+         grid-template-columns: 1fr 360px;
+         gap: 12px; padding: 12px;
+         max-width: 1600px; margin: 0 auto; }
+
+  .video-wrap { position: relative; background: black;
+                border: 1px solid var(--border); border-radius: 6px;
+                overflow: hidden; }
+  .video-wrap img { display:block; width: 100%; height: auto; }
+  .video-wrap svg { position: absolute; top:0; left:0;
+                    width: 100%; height: 100%; pointer-events: none; }
+  .video-wrap .crosshair { stroke: rgba(255,255,255,0.25); stroke-width: 1; }
+  .video-wrap .bbox      { fill: none; stroke: var(--danger); stroke-width: 3; }
+  .video-wrap .bbox-text { fill: var(--danger); font: bold 13px sans-serif;
+                           paint-order: stroke; stroke: black; stroke-width: 3px;
+                           stroke-linejoin: round; }
+  .video-wrap .threat-vec{ stroke: var(--warn); stroke-width: 3; }
+
+  aside { display: flex; flex-direction: column; gap: 12px; }
+  .panel { background: var(--panel); border: 1px solid var(--border);
+           border-radius: 6px; padding: 12px; }
+  .panel h2 { margin: 0 0 8px 0; font-size: 14px; color: var(--muted);
+              text-transform: uppercase; letter-spacing: 1px; }
+  .row { display: grid; grid-template-columns: 1fr 110px;
+         gap: 8px; align-items: center; margin: 6px 0; }
+  .row label { color: var(--muted); }
+  input, button { background: var(--panel2); color: var(--fg);
+                  border: 1px solid var(--border); border-radius: 4px;
+                  padding: 6px 8px; font: inherit; width: 100%; }
+  input:focus, button:focus { outline: 1px solid var(--accent); }
+  button { cursor: pointer; }
+  button.primary  { background: var(--accent); color: black; border-color: var(--accent); }
+  button.danger   { background: var(--danger); color: white; border-color: var(--danger); }
+  button.warn     { background: var(--warn); color: black; border-color: var(--warn); }
+  button.row-btn  { grid-column: 1 / span 2; }
+
+  .stat { display: grid; grid-template-columns: 1fr auto; gap: 8px;
+          padding: 4px 0; font-variant-numeric: tabular-nums; }
+  .stat .k { color: var(--muted); }
+  .stat .v { font-weight: bold; }
+  .stat .v.zero { color: var(--muted); font-weight: normal; }
+
+  .det-list { max-height: 200px; overflow: auto; font-size: 12px;
+              font-variant-numeric: tabular-nums; }
+  .det-list .det { padding: 4px 0; border-bottom: 1px solid var(--border); }
+  .det-list .det:last-child { border-bottom: 0; }
+  .det-list .empty { color: var(--muted); padding: 8px 0; }
+
+  .rc-display { display: grid; grid-template-columns: repeat(4, 1fr);
+                gap: 8px; text-align: center; margin-top: 6px; }
+  .rc-display div { background: var(--panel2); padding: 6px;
+                    border-radius: 4px; font-variant-numeric: tabular-nums; }
+  .rc-display .lbl { font-size: 11px; color: var(--muted); }
+  .rc-display .val { font-size: 18px; font-weight: bold; }
+  .rc-display .val.neg { color: var(--danger); }
+  .rc-display .val.pos { color: var(--accent); }
+
+  .footer-note { color: var(--muted); font-size: 11px; padding: 8px 16px; }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>Drone Collision Detector</h1>
+  <span class="pill" id="pill-running">detector: off</span>
+  <span class="pill" id="pill-armed">evasion: disarmed</span>
+  <span class="pill" id="pill-fps">— fps</span>
+  <span class="pill" id="pill-frame">— × —</span>
+</header>
+
+<main>
+  <section class="video-wrap" id="video-wrap">
+    <img id="video" src="" alt="(click Start to load video)" />
+    <svg id="overlay" viewBox="0 0 1280 720" preserveAspectRatio="none">
+      <line class="crosshair" x1="640" y1="0"   x2="640" y2="720" />
+      <line class="crosshair" x1="0"   y1="360" x2="1280" y2="360" />
+      <g id="boxes"></g>
+    </svg>
+  </section>
+
+  <aside>
+    <div class="panel">
+      <h2>Detector</h2>
+      <div class="row">
+        <label>FC api_base</label>
+        <input id="cfg-api_base" />
+      </div>
+      <div class="row">
+        <label>model_path</label>
+        <input id="cfg-model_path" />
+      </div>
+      <div class="row">
+        <label>conf threshold</label>
+        <input id="cfg-conf_threshold" type="number" step="0.05" min="0.05" max="0.95" />
+      </div>
+      <div class="row" style="grid-template-columns: 1fr 1fr; gap:6px;">
+        <button class="primary" id="btn-start">Start</button>
+        <button class="danger"  id="btn-stop">Stop</button>
+      </div>
+      <button class="row-btn" id="btn-apply" style="margin-top:6px;">Apply config</button>
+    </div>
+
+    <div class="panel">
+      <h2>Evasion gains (RC magnitude per direction)</h2>
+      <div class="row">
+        <label>bank left (intruder right)</label>
+        <input id="cfg-bank_left"  type="number" min="0" max="100" />
+      </div>
+      <div class="row">
+        <label>bank right (intruder left)</label>
+        <input id="cfg-bank_right" type="number" min="0" max="100" />
+      </div>
+      <div class="row">
+        <label>climb (intruder below)</label>
+        <input id="cfg-bank_up"    type="number" min="0" max="100" />
+      </div>
+      <div class="row">
+        <label>descend (intruder above)</label>
+        <input id="cfg-bank_down"  type="number" min="0" max="100" />
+      </div>
+      <div class="row">
+        <label>evade conf min</label>
+        <input id="cfg-evade_conf_min" type="number" step="0.05" min="0.05" max="0.95" />
+      </div>
+      <div class="row">
+        <label>evade bbox min (px²)</label>
+        <input id="cfg-evade_bbox_min" type="number" min="0" step="100" />
+      </div>
+      <div class="row">
+        <label>evade rate (Hz)</label>
+        <input id="cfg-evade_rate_hz" type="number" min="1" max="50" />
+      </div>
+      <div class="row" style="grid-template-columns: 1fr 1fr; gap:6px;">
+        <button class="warn"   id="btn-arm">Arm evasion</button>
+        <button class="danger" id="btn-disarm">Disarm</button>
+      </div>
+      <p style="color:var(--muted); font-size:11px; margin: 8px 0 0;">
+        When armed, RC sticks are POSTed to <code>/api/rc</code> on the
+        FC at the evade-rate above. The drone will <em>actively bank</em>
+        away from detected drones. Confirm the FC is the right one
+        before arming.
+      </p>
+    </div>
+
+    <div class="panel">
+      <h2>RC command (computed)</h2>
+      <div class="rc-display" id="rc-display">
+        <div><div class="lbl">roll</div><div class="val" id="rc-roll">0</div></div>
+        <div><div class="lbl">pitch</div><div class="val" id="rc-pitch">0</div></div>
+        <div><div class="lbl">yaw</div><div class="val" id="rc-yaw">0</div></div>
+        <div><div class="lbl">throttle</div><div class="val" id="rc-throttle">0</div></div>
+      </div>
+      <div class="stat"><span class="k">reason</span><span class="v" id="rc-reason">—</span></div>
+      <div class="stat"><span class="k">last sent</span><span class="v" id="rc-sent">—</span></div>
+    </div>
+
+    <div class="panel">
+      <h2>Detections (<span id="det-count">0</span>)</h2>
+      <div class="det-list" id="det-list">
+        <div class="empty">— none —</div>
+      </div>
+    </div>
+  </aside>
+</main>
+
+<div class="footer-note">
+  Overlay is drawn client-side from <code>/api/state</code> (200 ms poll).
+  Video is a direct MJPEG proxy of the FC's <code>/api/video</code>.
+</div>
+
+<script>
+const $ = (id) => document.getElementById(id);
+
+const CFG_KEYS = [
+  'api_base', 'model_path', 'conf_threshold',
+  'bank_left', 'bank_right', 'bank_up', 'bank_down',
+  'evade_conf_min', 'evade_bbox_min', 'evade_rate_hz',
+];
+
+function fillConfig(cfg) {
+  for (const k of CFG_KEYS) {
+    const el = $('cfg-' + k);
+    if (el && document.activeElement !== el) el.value = cfg[k];
+  }
+}
+
+function collectConfig() {
+  const out = {};
+  for (const k of CFG_KEYS) {
+    const el = $('cfg-' + k);
+    if (!el) continue;
+    out[k] = (el.type === 'number') ? parseFloat(el.value) : el.value;
+  }
+  return out;
+}
+
+async function applyConfig() {
+  const cfg = collectConfig();
+  const r = await fetch('/api/config', {
+    method: 'POST',
+    headers: {'Content-Type':'application/json'},
+    body: JSON.stringify(cfg),
+  });
+  const cur = await r.json();
+  fillConfig(cur);
+}
+
+async function startDetector() {
+  await applyConfig();
+  await fetch('/api/start', {method: 'POST'});
+  // (re)attach the video stream
+  $('video').src = '/api/video?t=' + Date.now();
+}
+
+async function stopDetector() {
+  await fetch('/api/stop', {method: 'POST'});
+  $('video').src = '';
+}
+
+async function arm() {
+  if (!confirm('ARM evasion: the FC will receive live RC commands. Continue?')) return;
+  await applyConfig();
+  await fetch('/api/arm', {method: 'POST'});
+}
+async function disarm() { await fetch('/api/disarm', {method: 'POST'}); }
+
+$('btn-start').onclick  = startDetector;
+$('btn-stop').onclick   = stopDetector;
+$('btn-apply').onclick  = applyConfig;
+$('btn-arm').onclick    = arm;
+$('btn-disarm').onclick = disarm;
+
+// ── poll state ───────────────────────────────────────────────────────
+let lastTickTs = 0;
+let lastFrameCount = 0;
+let fpsEMA = 0;
+
+function setRC(id, val) {
+  const el = $('rc-' + id);
+  el.textContent = val;
+  el.classList.remove('neg', 'pos');
+  if (val > 0) el.classList.add('pos');
+  if (val < 0) el.classList.add('neg');
+}
+
+async function tick() {
+  try {
+    const s = await (await fetch('/api/state')).json();
+    // pills
+    $('pill-running').textContent = 'detector: ' + (s.running ? 'on' : 'off');
+    $('pill-running').className = 'pill ' + (s.running ? 'on' : 'off');
+    $('pill-armed').textContent = 'evasion: ' + (s.armed ? 'ARMED' : 'disarmed');
+    $('pill-armed').className   = 'pill ' + (s.armed ? 'armed' : 'off');
+    $('pill-frame').textContent = `${s.frame_w} × ${s.frame_h}`;
+
+    fillConfig(s.config);
+
+    // overlay
+    $('overlay').setAttribute('viewBox', `0 0 ${s.frame_w} ${s.frame_h}`);
+    const boxes = $('boxes');
+    boxes.innerHTML = '';
+    for (const d of s.detections) {
+      const [x, y, w, h] = d.bbox;
+      boxes.insertAdjacentHTML('beforeend',
+        `<rect class="bbox" x="${x}" y="${y}" width="${w}" height="${h}"/>` +
+        `<text class="bbox-text" x="${x+4}" y="${Math.max(16, y-4)}">drone ${(d.confidence*100).toFixed(0)}%</text>`
+      );
+    }
+    if (s.rc.intruder) {
+      const i = s.rc.intruder;
+      const cx = i.bbox[0] + i.bbox[2]/2;
+      const cy = i.bbox[1] + i.bbox[3]/2;
+      const fx = s.frame_w/2, fy = s.frame_h/2;
+      boxes.insertAdjacentHTML('beforeend',
+        `<line class="threat-vec" x1="${fx}" y1="${fy}" x2="${cx}" y2="${cy}"/>`
+      );
+    }
+
+    // RC display
+    setRC('roll',     s.rc.roll);
+    setRC('pitch',    s.rc.pitch);
+    setRC('yaw',      s.rc.yaw);
+    setRC('throttle', s.rc.throttle);
+    $('rc-reason').textContent = s.rc.reason || '—';
+    if (s.last_rc_sent.ts > 0) {
+      const age = Math.max(0, Date.now()/1000 - s.last_rc_sent.ts);
+      $('rc-sent').textContent =
+        `(roll=${s.last_rc_sent.roll} pitch=${s.last_rc_sent.pitch} thr=${s.last_rc_sent.throttle}) ${age.toFixed(1)}s ago`;
+    } else {
+      $('rc-sent').textContent = '—';
+    }
+
+    // detection list
+    $('det-count').textContent = s.detections.length;
+    const list = $('det-list');
+    if (s.detections.length === 0) {
+      list.innerHTML = '<div class="empty">— none —</div>';
+    } else {
+      list.innerHTML = s.detections
+        .slice()
+        .sort((a, b) => b.bbox_area - a.bbox_area)
+        .map(d => {
+          const conf = (d.confidence * 100).toFixed(0);
+          const sz   = d.bbox_area.toFixed(0);
+          const rx   = d.rel_x.toFixed(2);
+          const ry   = d.rel_y.toFixed(2);
+          return `<div class="det">conf=${conf}% size=${sz}px² rel=(${rx}, ${ry})</div>`;
+        }).join('');
+    }
+  } catch (err) {
+    // service offline — leave UI stale, retry next tick
+  }
+}
+
+setInterval(tick, 200);
+tick();
+</script>
+</body>
+</html>
