@@ -5,13 +5,16 @@
 #   A) "obvious" disconnect — telemetry.connected=false for ≥3 consecutive
 #      checks (~3 min of true disconnection).
 #
-#   B) "stuck-connected wedge" — telemetry says connected=true, but the
-#      FC log shows the unmistakable Olympe-wedged pattern (ARSDK ping
-#      failures, "Unable to stop piloting interface", or piling-up
-#      "connection retries failed"). This is the failure mode we hit
-#      after a flaky cold boot: state cache stays warm so connected=true,
-#      but the command channel is dead and every takeoff returns
-#      "takeoff_failed" silently.
+#   B) "stuck-connected wedge" — telemetry says connected=true, but
+#      the FC log shows "Too many ping failures" — ARSDK keepalive lost.
+#      That's the smoking-gun of "state cache stays warm so
+#      connected=true, but the command channel is actually dead".
+#      Earlier versions of this script ALSO tripped on
+#      "Unable to stop piloting interface", but that pattern fires
+#      during normal land/takeoff cycles when Olympe tries piloting-
+#      cleanup twice on a now-landed drone — we got a false positive
+#      restart on 2026-05-12 that killed a healthy FC. Drop that
+#      signal; require ping-failures explicitly.
 #
 # Either way, never restart more than once every COOLDOWN_S seconds to
 # avoid thrashing. State lives under /run/ (tmpfs) so misses are wiped
@@ -23,8 +26,8 @@ set -u
 MISSES_STATE=/run/fc-healthcheck.misses
 RESTART_STATE=/run/fc-healthcheck.last-restart
 THRESHOLD=3                              # consecutive disconnected before A) acts
-WEDGE_PATTERN_THRESHOLD=3                # wedge-line hits in WEDGE_TAIL_LINES before B) acts
-WEDGE_TAIL_LINES=80                      # how many recent log lines to inspect
+WEDGE_PATTERN_THRESHOLD=2                # "Too many ping failures" lines required before B) acts
+WEDGE_TAIL_LINES=200                     # how many recent log lines to inspect
 COOLDOWN_S=300                           # don't restart more than once / 5 min
 FC_API=http://localhost:8080
 SPC_API=http://localhost:8090
@@ -119,12 +122,13 @@ if [ -z "$FC_LOG" ] || [ ! -f "$FC_LOG" ]; then
     exit 0   # no log to inspect; nothing more to do
 fi
 
-# Patterns. Order matters only for readability; all are equally fatal.
-#   "Too many ping failures"               — arsdk-level keepalive lost
-#   "Unable to stop piloting interface"    — Olympe piloting state machine dead
-#   "connection retries failed"            — discovery never completed cleanly
+# Only "Too many ping failures" is a definitive wedge signal — it means
+# arsdk lost keepalive with the drone, so the command channel is dead
+# even if the state cache hasn't noticed yet. The other patterns we
+# tried (Unable to stop piloting interface, connection retries failed)
+# fire during normal operation and produced false positives.
 WEDGE_HITS=$(tail -n "$WEDGE_TAIL_LINES" "$FC_LOG" 2>/dev/null | \
-  grep -cE 'Too many ping failures|Unable to stop piloting interface|_do_connect - .* connection retries failed')
+  grep -cE 'Too many ping failures')
 
 if [ "${WEDGE_HITS:-0}" -ge "$WEDGE_PATTERN_THRESHOLD" ]; then
     log "wedge: $WEDGE_HITS bad lines in last $WEDGE_TAIL_LINES of $FC_LOG (connected=true but command channel likely dead)"
