@@ -22,9 +22,11 @@ infra/aws/
 │       ├── auto-shutdown.service       #   (target of the timer)
 │       ├── xvfb.service                # Xorg on :99 (name is historical)
 │       ├── sphinx-bootstrap.service    # oneshot: env + drone + FC
-│       ├── marker-mission.service      # :9090
+│       ├── marker-mission.service      # :9090 (runs from /opt/sdc-tobe + .venv-marker)
 │       ├── marker-mission.service.d/
 │       │   └── wait-bootstrap.conf     # wait for sphinx-bootstrap
+│       ├── fc-healthcheck.service      # restart FC if disconnected
+│       ├── fc-healthcheck.timer        # fires every 60 s
 │       └── c2-controller.service       # :8070 remote_web_controller
 └── opt/sdc-tobe/sphinx-control/
     └── sphinx-bootstrap.sh             # the script run by sphinx-bootstrap.service

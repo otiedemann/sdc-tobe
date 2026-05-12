@@ -155,8 +155,10 @@ sim up automatically — see `sphinx-control/sphinx-bootstrap.sh`.
 
 ### `:9090` — marker-mission
 
-Mission planner UI on the `marker_mission` branch, served as a separate
-worktree at `/opt/sdc-tobe-marker`. Source: `marker_mission/`.
+Mission planner UI. Source: `marker_mission/` in the main branch (merged
+in PR #18). Runs from `/opt/sdc-tobe` with its own dedicated venv at
+`/opt/sdc-tobe/.venv-marker` so its matplotlib + flask dependencies stay
+isolated from the FC's Olympe environment.
 
 **Mission script DSL** (one command per line, `#` for comments):
 
@@ -262,7 +264,7 @@ sphinx-control/            sim manager
   server.py                the :8090 service
   launcher.py              drone/env/FC subprocess management
   sphinx-bootstrap.sh      systemd oneshot bring-up
-marker_mission/            mission DSL + planner UI (on marker_mission branch)
+marker_mission/            mission DSL + planner UI
   mission.py               the :9090 service
   docs/                    DSL reference
 tools/

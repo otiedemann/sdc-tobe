@@ -1,5 +1,5 @@
 [Unit]
-Description=Marker mission UI + planner (sdc-tobe marker_mission branch)
+Description=Marker mission UI + planner (sdc-tobe main branch)
 After=network.target sphinx-control.service
 Wants=sphinx-control.service
 
@@ -7,8 +7,11 @@ Wants=sphinx-control.service
 Type=simple
 User=ubuntu
 Group=ubuntu
-WorkingDirectory=/opt/sdc-tobe-marker
-ExecStart=/opt/sdc-tobe-marker/.venv/bin/python3 -m marker_mission.mission --ui-port 9090 --api-url http://127.0.0.1:8080
+# marker_mission lives in the main repo since PR #18 merged. It has
+# its own venv (.venv-marker) separate from the FC's .venv so its
+# matplotlib + jinja stack doesn't pollute the Olympe environment.
+WorkingDirectory=/opt/sdc-tobe
+ExecStart=/opt/sdc-tobe/.venv-marker/bin/python3 -m marker_mission.mission --ui-port 9090 --api-url http://127.0.0.1:8080
 Restart=on-failure
 RestartSec=5s
 StandardOutput=journal

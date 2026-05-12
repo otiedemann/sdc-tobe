@@ -17,8 +17,27 @@ sudo cp -a opt/. /opt/
 sudo chmod +x /opt/sdc-tobe/sphinx-control/sphinx-bootstrap.sh
 
 echo "[install] installing repo-local bin scripts under /opt/sdc-tobe/infra/aws/bin..."
-sudo install -d -m 755 /opt/sdc-tobe/infra/aws/bin
-sudo install -m 755 bin/fc-healthcheck.sh /opt/sdc-tobe/infra/aws/bin/
+# Skip if the source and destination are already the same file (happens
+# when this script runs from /opt/sdc-tobe/infra/aws on a deployed box).
+SRC=$(realpath bin/fc-healthcheck.sh)
+DST=/opt/sdc-tobe/infra/aws/bin/fc-healthcheck.sh
+if [ "$SRC" != "$DST" ]; then
+    sudo install -d -m 755 /opt/sdc-tobe/infra/aws/bin
+    sudo install -m 755 bin/fc-healthcheck.sh "$DST"
+fi
+
+echo "[install] ensuring marker_mission venv exists at /opt/sdc-tobe/.venv-marker..."
+# marker-mission.service expects this venv. It's intentionally separate
+# from the FC's /opt/sdc-tobe/.venv so matplotlib + the marker_mission
+# deps don't have to coexist with the Olympe SDK.
+if [ ! -x /opt/sdc-tobe/.venv-marker/bin/python3 ]; then
+    sudo -u ubuntu python3 -m venv /opt/sdc-tobe/.venv-marker
+    sudo -u ubuntu /opt/sdc-tobe/.venv-marker/bin/pip install --upgrade pip wheel --quiet
+fi
+if [ -f /opt/sdc-tobe/marker_mission/requirements.txt ]; then
+    sudo -u ubuntu /opt/sdc-tobe/.venv-marker/bin/pip install \
+        -r /opt/sdc-tobe/marker_mission/requirements.txt --quiet
+fi
 
 echo "[install] reloading systemd + cron..."
 sudo systemctl daemon-reload
