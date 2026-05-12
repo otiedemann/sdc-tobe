@@ -286,6 +286,7 @@ docker/
 - **`libjsonrpccpp-{common,server,client}0` are `apt-mark manual`** — if those packages get auto-removed (as happened once after a Docker purge), UE4 crashes during init because gzserver's `libsphinx_fwman.so` can't bind port 8383.
 - **EC2 Spot instances can be reclaimed** without warning. If `start-instances` fails with "no Spot capacity", relaunch the EBS root on an On-Demand instance via the AMI route — see `docker/AWS.md`.
 - **The host runs Xorg with NVIDIA on `:99`**, not Xvfb. Xvfb has software GLX which doesn't produce frames for the vertical camera SceneCaptureComponent → takeoff is blocked by `sensorState=0`. If you find Xvfb running here, the host was rebuilt from a stale image and needs the NVIDIA-Xorg setup re-applied.
+- **Never `olympe.Drone("10.202.0.1").connect()` while the FC is running.** ARSDK on the Anafi is single-controller per drone — your probe evicts the FC's session, the FC's keepalive immediately fails (`Too many ping failures`), and the wedge propagates. If you need to inspect drone state, hit the FC's HTTP API instead (`curl :8080/api/state | jq`) or stop the FC first with `curl -X DELETE :8090/api/fc`. Same trap from any second Olympe client — including a second instance of `sphinx-cli` if it grows an Olympe consumer.
 
 ---
 
