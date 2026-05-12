@@ -68,7 +68,7 @@ DEFAULT_WIDTH_M = 10.0
 DEFAULT_DEPTH_M = 20.0
 DEFAULT_TOP_Z_M = 4.0
 DEFAULT_BOTTOM_Z_M = 2.0
-DEFAULT_MARKER_SIZE_M = 0.18
+DEFAULT_MARKER_SIZE_M = 0.5
 
 
 # ---------------------------------------------------------------------------
