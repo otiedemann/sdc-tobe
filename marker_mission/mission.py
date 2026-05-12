@@ -261,11 +261,17 @@ def cmd_fly(args: argparse.Namespace) -> int:
             print(f"[mission] could not load any arena ({e}); "
                   f"world position estimator disabled")
             arena = None
+    # When an arena is loaded, the arena's marker_size_m wins over the
+    # cfg default: the Arena tab is the operator-facing source of truth
+    # for marker geometry, and a mismatch would scale every distance /
+    # world-position estimate by the ratio. vision_worker continues to
+    # sync on every tick so live edits in /arena propagate without a
+    # restart.
     if arena is not None and abs(arena.marker_size_m - cfg.marker_size_m) > 1e-3:
-        print(f"[mission] WARNING: arena marker_size_m="
-              f"{arena.marker_size_m} differs from cfg.marker_size_m="
-              f"{cfg.marker_size_m}; controller still uses cfg value "
-              f"for the detector")
+        print(f"[mission] marker_size_m: arena={arena.marker_size_m:.3f} "
+              f"vs cfg={cfg.marker_size_m:.3f} -- using arena value "
+              f"(detector + solvePnP)")
+        detector.set_marker_size(arena.marker_size_m)
     arena_holder = _ArenaHolder(arena)
 
     pose_holder = _PoseHolder()
@@ -529,6 +535,16 @@ def cmd_fly(args: argparse.Namespace) -> int:
                     cfg.mirror_collapse_sum_hdg_deg)
                 detector.mirror_collapse_max_hdg_deg = float(
                     cfg.mirror_collapse_max_hdg_deg)
+                # Live-sync marker size from the active arena. The
+                # operator-facing source of truth is /arena, not cfg
+                # -- a Save in the Arena tab swaps the active arena
+                # via arena_holder, and the detector picks up the new
+                # size on the next frame. set_marker_size is a no-op
+                # when the value is unchanged.
+                _arena_now = arena_holder.get()
+                detector.set_marker_size(
+                    _arena_now.marker_size_m if _arena_now is not None
+                    else cfg.marker_size_m)
                 # Detect every visible marker so the operator sees them
                 # all in the video overlay -- the script can target any
                 # marker, and even non-target markers in frame are

@@ -192,11 +192,26 @@ class ArucoDetector:
         # 3D marker corners in marker frame, OpenCV ArUco order TL-TR-BR-BL,
         # marker plane is z=0. With z pointing AWAY from the marker face,
         # the camera sits at z>0 when looking at the marker face-on.
+        self._obj_pts: np.ndarray = np.zeros((4, 3), dtype=np.float64)
+        self._rebuild_obj_pts()
+
+    def _rebuild_obj_pts(self) -> None:
         s = self.marker_size / 2.0
         self._obj_pts = np.array([[-s,  s, 0.0],
                                   [ s,  s, 0.0],
                                   [ s, -s, 0.0],
                                   [-s, -s, 0.0]], dtype=np.float64)
+
+    def set_marker_size(self, marker_size_m: float) -> None:
+        """Live update of the physical marker side length. Cheap when
+        unchanged (no-op); rebuilds the solvePnP object points when
+        it actually changes. Called every tick from ``vision_worker``
+        so a Save in the Arena tab propagates without a restart."""
+        new = float(marker_size_m)
+        if abs(new - self.marker_size) <= 1e-6:
+            return
+        self.marker_size = new
+        self._rebuild_obj_pts()
 
     # ------------------------------------------------------------------ scan
     def detect(self, frame_bgr: np.ndarray,
