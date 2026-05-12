@@ -111,10 +111,15 @@ ue4_apps:
 # UE4 runtime tuning.
 ue4:
   # Initial drone pose, "x y z roll pitch yaw" (metres, radians) — space
-  # separated to match Sphinx's <pose> XML element format. z=0.5 lifts
-  # the drone above the raised arena floor (top at +0.40 m) so it
-  # doesn't fall through on spawn.
-  drone_spawn_pose: "0 0 0.5 0 0 0"
+  # separated to match Sphinx's <pose> XML element format.
+  #
+  # Floor was raised by 0.40 m in commit ccd85d9 (arena/walls/markers
+  # lifted to make room for ArUco floor markers). The Anafi body half-
+  # height is ~5 cm, so a spawn at z=0.5 puts the drone *touching* the
+  # raised floor; Gazebo's collision physics promptly flags it as
+  # "emergency" and every takeoff returns takeoff_failed. Spawn higher
+  # so the drone is clearly in free air on init.
+  drone_spawn_pose: "0 0 1.5 0 0 0"
 
 # Drone profiles available to the dashboard. The descriptor file under
 # sphinx.drone_descriptor_dir must exist for the profile to be usable.
