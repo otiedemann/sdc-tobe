@@ -249,12 +249,14 @@ _PILLAR_WIDTH_M = 0.20
 _HALF_PILLAR_M = _PILLAR_WIDTH_M / 2.0
 _PILLAR_HEIGHT_M = 6.0
 
-# Wall → (dx, dy) outward offset for the pillar relative to the marker (x,y).
+# Wall → (dx, dy) outward offset for the pillar relative to the marker
+# (x, y). marker_mission convention: centred origin, +x = right,
+# +y = front. "Outward" = away from arena centre.
 WALL_OUTWARD_OFFSET_M: dict[str, tuple[float, float]] = {
-    "left":  (-_HALF_PILLAR_M, 0.0),   # x = -10  → pillar pushed to -10.1
-    "right": (+_HALF_PILLAR_M, 0.0),   # x = +10  → +10.1
-    "back":  (0.0, +_HALF_PILLAR_M),   # y = 10.8 → 10.9
-    "front": (0.0, -_HALF_PILLAR_M),   # y = 0    → -0.1
+    "left":  (-_HALF_PILLAR_M, 0.0),   # x = -W/2 → pillar pushed to -W/2 - 0.1
+    "right": (+_HALF_PILLAR_M, 0.0),   # x = +W/2 → +W/2 + 0.1
+    "front": (0.0, +_HALF_PILLAR_M),   # y = +D/2 → +D/2 + 0.1
+    "back":  (0.0, -_HALF_PILLAR_M),   # y = -D/2 → -D/2 - 0.1
 }
 
 
@@ -325,11 +327,13 @@ def collect_walls(markers: list[dict],
         {"name": "wall_right",
          "x": x_max + o, "y": (y_min + y_max) / 2, "z": z_center,
          "sx": thickness_m, "sy": long_y, "sz": height_m},
+        # marker_mission convention: front wall at +Y (largest y),
+        # back wall at -Y (smallest y).
         {"name": "wall_front",
-         "x": (x_min + x_max) / 2, "y": y_min - o, "z": z_center,
+         "x": (x_min + x_max) / 2, "y": y_max + o, "z": z_center,
          "sx": long_x, "sy": thickness_m, "sz": height_m},
         {"name": "wall_back",
-         "x": (x_min + x_max) / 2, "y": y_max + o, "z": z_center,
+         "x": (x_min + x_max) / 2, "y": y_min - o, "z": z_center,
          "sx": long_x, "sy": thickness_m, "sz": height_m},
     ]
 
