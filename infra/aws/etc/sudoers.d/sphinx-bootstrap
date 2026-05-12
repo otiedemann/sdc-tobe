@@ -16,6 +16,8 @@ ubuntu ALL=(root) NOPASSWD: /usr/bin/systemctl restart sphinx-control, \
                             /usr/bin/systemctl restart sphinx-control.service, \
                             /usr/bin/systemctl restart firmwared, \
                             /usr/bin/systemctl restart firmwared.service, \
+                            /usr/bin/systemctl restart --no-block sphinx-bootstrap.service, \
+                            /usr/bin/systemctl restart sphinx-bootstrap.service, \
                             /usr/bin/systemctl stop sphinx-control, \
                             /usr/bin/systemctl stop sphinx-control marker-mission c2-controller, \
                             /usr/bin/systemctl start sphinx-control, \

@@ -340,115 +340,127 @@ def api_drone_connections(drone_id: str):
 
 
 # ─── API: recover ──────────────────────────────────────────────
-# "Big red button" — tears down env+drone+FC and re-runs the on-disk
-# bootstrap script that brings the whole stack back from scratch.
-# Useful when one of the layers gets wedged in a state that's faster
-# to nuke than to debug: stale netns, dead sphinx daemon, FC stuck on
-# half-dead Olympe, etc.
+# "Big red button" — runs the on-disk sphinx-bootstrap.sh which drives
+# the whole stack (env, drone, FC) back to a healthy state from any
+# starting state.
 #
-# Implementation is intentionally dumb: shell out to
-# /opt/sdc-tobe/sphinx-control/sphinx-bootstrap.sh, which is the same
-# script systemd runs at boot under sphinx-bootstrap.service. We just
-# pre-tear-down env+FC so the script does a real rebuild instead of
-# its "already running, skipping" idempotent path.
+# Implementation note (had a painful bug here): bootstrap.sh's nuclear
+# recovery path can call `systemctl stop sphinx-control` (when firmwared
+# has stale loop-mount state and only a firmwared restart unblocks it).
+# If we Popen() bootstrap as a CHILD of sphinx-control, the stop kills
+# the whole cgroup — bootstrap dies mid-recovery and sphinx-control
+# never comes back. Suicide.
+#
+# So we launch via `systemctl start sphinx-bootstrap.service` instead.
+# That service is configured at boot anyway; firing it manually runs
+# bootstrap in its own systemd cgroup, independent of sphinx-control.
+# We read status + live log via journalctl.
 
-_BOOTSTRAP_SCRIPT = ROOT / "sphinx-bootstrap.sh"
-
-_recover_state: dict[str, Any] = {
-    "running": False,
-    "step": "idle",          # human-readable current step
-    "log": [],               # list of {ts, msg}; capped at 200
-    "started_at": None,
-    "finished_at": None,
-    "rc": None,              # subprocess return code or None if still running
-    "error": None,
-}
-_recover_lock = threading.Lock()
+_BOOTSTRAP_UNIT = "sphinx-bootstrap.service"
 
 
-def _recover_log(msg: str) -> None:
-    line = {"ts": time.time(), "msg": msg}
-    log_arr = _recover_state["log"]
-    log_arr.append(line)
-    if len(log_arr) > 200:
-        del log_arr[: len(log_arr) - 200]
-    log.info("recover: %s", msg)
+def _run(cmd: list[str], timeout: float = 5.0) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        cmd, capture_output=True, text=True, timeout=timeout, check=False,
+    )
 
 
-def _recover_worker() -> None:
-    try:
-        _recover_state["error"] = None
-        _recover_state["rc"] = None
-        _recover_state["log"] = []
-        _recover_state["started_at"] = time.time()
-        _recover_state["finished_at"] = None
+def _bootstrap_unit_state() -> dict[str, Any]:
+    r = _run([
+        "systemctl", "show", _BOOTSTRAP_UNIT,
+        "-p", "ActiveState,SubState,Result,ExecMainStartTimestamp,ExecMainExitTimestamp",
+    ])
+    parsed = dict(
+        line.split("=", 1)
+        for line in r.stdout.strip().splitlines()
+        if "=" in line
+    )
+    active = parsed.get("ActiveState", "unknown")
+    sub = parsed.get("SubState", "unknown")
+    # systemd represents a one-shot's "in progress" as activating/start;
+    # success as active/exited; failure as failed/failed.
+    is_running = (active == "activating") or (sub == "start") or (sub == "running")
+    return {
+        "active_state": active,
+        "sub_state": sub,
+        "result": parsed.get("Result"),
+        "running": is_running,
+        "started_at": parsed.get("ExecMainStartTimestamp") or None,
+        "finished_at": parsed.get("ExecMainExitTimestamp") or None,
+    }
 
-        _recover_state["step"] = "stopping flight controller"
-        _recover_log("stop FC")
-        try:
-            launcher.stop_fc()
-        except Exception as e:
-            _recover_log(f"stop_fc warn: {e}")
-        time.sleep(3)
 
-        _recover_state["step"] = "stopping environment"
-        _recover_log("stop environment (also stops drones)")
-        try:
-            launcher.stop_environment()
-        except Exception as e:
-            _recover_log(f"stop_environment warn: {e}")
-        time.sleep(4)
-
-        if not _BOOTSTRAP_SCRIPT.is_file():
-            raise RuntimeError(
-                f"bootstrap script not found at {_BOOTSTRAP_SCRIPT}"
-            )
-
-        _recover_state["step"] = "running bootstrap script"
-        _recover_log(f"exec {_BOOTSTRAP_SCRIPT}")
-        proc = subprocess.Popen(
-            ["bash", str(_BOOTSTRAP_SCRIPT)],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            bufsize=1,
-            text=True,
-        )
-        assert proc.stdout is not None
-        for raw in iter(proc.stdout.readline, ""):
-            line = raw.rstrip()
-            if line:
-                _recover_log(line)
-        rc = proc.wait()
-        _recover_state["rc"] = rc
-        _recover_state["step"] = "done" if rc == 0 else f"failed (rc={rc})"
-        _recover_log(f"bootstrap exited rc={rc}")
-    except Exception as e:
-        _recover_state["error"] = f"{type(e).__name__}: {e}"
-        _recover_state["step"] = "errored"
-        log.exception("recover errored")
-    finally:
-        _recover_state["running"] = False
-        _recover_state["finished_at"] = time.time()
+def _bootstrap_journal_lines(since: str = "5 minutes ago", limit: int = 200) -> list[dict[str, Any]]:
+    r = _run([
+        "journalctl", "-u", _BOOTSTRAP_UNIT,
+        "--since", since, "--no-pager", "-o", "short-iso",
+        "-n", str(limit),
+    ], timeout=3.0)
+    lines = []
+    # Drop systemd's own unit-lifecycle chatter and keep only the
+    # bootstrap script's stdout. The script logs lines like
+    # "[bootstrap <iso-ts>] stage 1 skip: env healthy (UE4 alive)".
+    _SYSTEMD_NOISE_PREFIXES = (
+        "Starting ", "Started ", "Stopping ", "Stopped ",
+        "Activating ", "Deactivated ", "Finished ",
+        "sphinx-bootstrap.service:",
+        "Reloading ", "Reloaded ",
+    )
+    for raw in r.stdout.splitlines():
+        if ": " not in raw:
+            continue
+        ts, _, msg = raw.partition(" ")
+        # Split "<host> <unit>[pid]: <message>"
+        _, _, after_colon = raw.partition(": ")
+        if any(after_colon.startswith(p) for p in _SYSTEMD_NOISE_PREFIXES):
+            continue
+        if not after_colon:
+            continue
+        lines.append({"ts": ts, "msg": after_colon})
+    return lines
 
 
 @app.post("/api/recover")
 def api_recover():
-    """Trigger an asynchronous full-stack rebuild. Returns immediately."""
-    with _recover_lock:
-        if _recover_state["running"]:
-            raise HTTPException(409, detail="recovery already in progress")
-        _recover_state["running"] = True
-        _recover_state["step"] = "starting"
-        _recover_state["log"] = []
-    threading.Thread(
-        target=_recover_worker, daemon=True, name="recover"
-    ).start()
+    """Trigger an asynchronous full-stack rebuild. Returns immediately.
+
+    Uses systemctl restart (not start) so a unit in active/exited state
+    re-runs. --no-block returns before bootstrap finishes; UI polls
+    /api/recover/status for progress.
+    """
+    state = _bootstrap_unit_state()
+    if state["running"]:
+        raise HTTPException(409, detail="recovery already in progress")
+    r = _run([
+        "sudo", "-n", "systemctl", "restart", "--no-block", _BOOTSTRAP_UNIT,
+    ])
+    if r.returncode != 0:
+        log.error("recover: systemctl restart failed: %s", r.stderr.strip())
+        raise HTTPException(
+            500,
+            detail=f"systemctl restart {_BOOTSTRAP_UNIT}: {r.stderr.strip() or r.stdout.strip()}",
+        )
+    log.info("recover: triggered %s", _BOOTSTRAP_UNIT)
     return {"ok": True, "running": True}
 
 
 @app.get("/api/recover/status")
 def api_recover_status():
-    return _recover_state
+    state = _bootstrap_unit_state()
+    state["log"] = _bootstrap_journal_lines()
+    # Friendly "step" string for the UI banner
+    if state["running"]:
+        # Surface the last bootstrap log line as the "step" — that's
+        # what the script just printed (e.g. "stage 2: drone unreachable").
+        last = state["log"][-1] if state["log"] else None
+        state["step"] = last["msg"] if last else "running"
+    elif state["result"] == "success":
+        state["step"] = "done"
+    elif state["result"] in (None, "", "in-process"):
+        state["step"] = "idle"
+    else:
+        state["step"] = f"failed ({state['result']})"
+    return state
 
 
 # ─── API: worlds, profiles, system ──────────────────────────────
