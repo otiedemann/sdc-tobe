@@ -1,150 +1,154 @@
 {
-  "marker_size_m": 0.495,
+  "marker_size_m": 0.5,
+  "_direction_comment": "direction_deg per marker: angle in arena coords of the marker's outward-facing normal (where 0\u00b0 = arena +X, 90\u00b0 = arena +Y). The Sphinx YAML emitter converts this to UE4 yaw via ue_yaw = direction_deg - 90 (under axis_map y2x,x2y_neg). For wall markers the value is just the wall's outward direction.",
+  "width_m": 10.0,
+  "depth_m": 20.0,
+  "top_z_m": 4.0,
+  "bottom_z_m": 2.0,
   "markers": [
     {
       "id": 1,
-      "label": "Left A hight",
-      "x": -10.0,
-      "y": 5.4,
+      "label": "Front high #1",
+      "x": 0.0,
+      "y": 10.0,
       "z": 4.0,
-      "wall": "left",
-      "direction_deg": 0.0
-    },
-    {
-      "id": 9,
-      "label": "Left A low",
-      "x": -10.0,
-      "y": 5.4,
-      "z": 2.0,
-      "wall": "left",
-      "direction_deg": 0.0
+      "wall": "front",
+      "direction_deg": 90.0
     },
     {
       "id": 2,
-      "label": "Front Left high",
-      "x": -5.0,
-      "y": 10.8,
+      "label": "Right high #2",
+      "x": 5.0,
+      "y": 5.0,
       "z": 4.0,
-      "wall": "back",
-      "direction_deg": -90.0
-    },
-    {
-      "id": 10,
-      "label": "Front Left low",
-      "x": -5.0,
-      "y": 10.8,
-      "z": 2.0,
-      "wall": "back",
-      "direction_deg": -90.0
+      "wall": "right",
+      "direction_deg": 0.0
     },
     {
       "id": 3,
-      "label": "Front Middle high",
-      "x": 0.0,
-      "y": 10.8,
+      "label": "Right high #3",
+      "x": 5.0,
+      "y": 0.0,
       "z": 4.0,
-      "wall": "back",
-      "direction_deg": -90.0
-    },
-    {
-      "id": 11,
-      "label": "Front Middle low",
-      "x": 0.0,
-      "y": 10.8,
-      "z": 2.0,
-      "wall": "back",
-      "direction_deg": -90.0
+      "wall": "right",
+      "direction_deg": 0.0
     },
     {
       "id": 4,
-      "label": "Front Right high",
+      "label": "Right high #4",
       "x": 5.0,
-      "y": 10.8,
+      "y": -5.0,
       "z": 4.0,
-      "wall": "back",
-      "direction_deg": -90.0
-    },
-    {
-      "id": 12,
-      "label": "Front Right low",
-      "x": 5.0,
-      "y": 10.8,
-      "z": 2.0,
-      "wall": "back",
-      "direction_deg": -90.0
+      "wall": "right",
+      "direction_deg": 0.0
     },
     {
       "id": 5,
-      "label": "Right A high",
-      "x": 10.0,
-      "y": 5.4,
+      "label": "Back high #5",
+      "x": 0.0,
+      "y": -10.0,
       "z": 4.0,
-      "wall": "right",
-      "direction_deg": 180.0
-    },
-    {
-      "id": 13,
-      "label": "Right A low",
-      "x": 10.0,
-      "y": 5.4,
-      "z": 2.0,
-      "wall": "right",
-      "direction_deg": 180.0
+      "wall": "back",
+      "direction_deg": -90.0
     },
     {
       "id": 6,
-      "label": "Back Right high",
-      "x": 5.0,
-      "y": 0.0,
+      "label": "Left high #6",
+      "x": -5.0,
+      "y": -5.0,
       "z": 4.0,
-      "wall": "front",
-      "direction_deg": 90.0
-    },
-    {
-      "id": 14,
-      "label": "Back Right low",
-      "x": 5.0,
-      "y": 0.0,
-      "z": 2.0,
-      "wall": "front",
-      "direction_deg": 90.0
+      "wall": "left",
+      "direction_deg": 180.0
     },
     {
       "id": 7,
-      "label": "Back Middle high",
-      "x": 0.0,
+      "label": "Left high #7",
+      "x": -5.0,
       "y": 0.0,
       "z": 4.0,
-      "wall": "front",
-      "direction_deg": 90.0
-    },
-    {
-      "id": 15,
-      "label": "Back Middle low",
-      "x": 0.0,
-      "y": 0.0,
-      "z": 2.0,
-      "wall": "front",
-      "direction_deg": 90.0
+      "wall": "left",
+      "direction_deg": 180.0
     },
     {
       "id": 8,
-      "label": "Back Left B high",
+      "label": "Left high #8",
       "x": -5.0,
-      "y": 0.0,
+      "y": 5.0,
       "z": 4.0,
+      "wall": "left",
+      "direction_deg": 180.0
+    },
+    {
+      "id": 9,
+      "label": "Front low #9",
+      "x": 0.0,
+      "y": 10.0,
+      "z": 2.0,
       "wall": "front",
       "direction_deg": 90.0
     },
     {
-      "id": 16,
-      "label": "Back Left B low",
+      "id": 10,
+      "label": "Right low #10",
+      "x": 5.0,
+      "y": 5.0,
+      "z": 2.0,
+      "wall": "right",
+      "direction_deg": 0.0
+    },
+    {
+      "id": 11,
+      "label": "Right low #11",
+      "x": 5.0,
+      "y": 0.0,
+      "z": 2.0,
+      "wall": "right",
+      "direction_deg": 0.0
+    },
+    {
+      "id": 12,
+      "label": "Right low #12",
+      "x": 5.0,
+      "y": -5.0,
+      "z": 2.0,
+      "wall": "right",
+      "direction_deg": 0.0
+    },
+    {
+      "id": 13,
+      "label": "Back low #13",
+      "x": 0.0,
+      "y": -10.0,
+      "z": 2.0,
+      "wall": "back",
+      "direction_deg": -90.0
+    },
+    {
+      "id": 14,
+      "label": "Left low #14",
+      "x": -5.0,
+      "y": -5.0,
+      "z": 2.0,
+      "wall": "left",
+      "direction_deg": 180.0
+    },
+    {
+      "id": 15,
+      "label": "Left low #15",
       "x": -5.0,
       "y": 0.0,
       "z": 2.0,
-      "wall": "front",
-      "direction_deg": 90.0
+      "wall": "left",
+      "direction_deg": 180.0
+    },
+    {
+      "id": 16,
+      "label": "Left low #16",
+      "x": -5.0,
+      "y": 5.0,
+      "z": 2.0,
+      "wall": "left",
+      "direction_deg": 180.0
     }
-  ],
-  "_direction_comment": "direction_deg per marker: angle in arena coords of the marker's outward-facing normal (where 0\u00b0 = arena +X, 90\u00b0 = arena +Y). The Sphinx YAML emitter converts this to UE4 yaw via ue_yaw = direction_deg - 90 (under axis_map y2x,x2y_neg). For wall markers the value is just the wall's inward direction; for non-standard placements set direction_deg explicitly per marker."
+  ]
 }
