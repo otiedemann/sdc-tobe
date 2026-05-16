@@ -215,31 +215,17 @@
       when: mode == 'marker-mission'
 
     # ── 4. Post-deploy health probe ────────────────────────────────
-    # Resolve the actual mission UI port from MissionConfig on the
-    # host (default 8080, but operators commonly save per-host
-    # overrides via the /tune page). For fc mode there's no per-host
-    # state so we use the deployment-wide default (8080).
-    - name: Read MissionConfig.ui_port from host (marker-mission mode)
-      ansible.builtin.slurp:
-        src: /home/sdc/.marker_mission/config.json
-      register: mm_cfg_slurp
-      when: mode == 'marker-mission'
-      ignore_errors: true
-
-    - name: Resolve probe port (marker-mission, from MissionConfig)
-      ansible.builtin.set_fact:
-        probe_port: "{{ (mm_cfg_slurp.content | b64decode | from_json).ui_port }}"
-      when:
-        - mode == 'marker-mission'
-        - mm_cfg_slurp is defined
-        - mm_cfg_slurp.content is defined
-
-    - name: Resolve probe port (fallback)
+    # Both units bind 8080 by deployment convention. marker_mission's
+    # combined entry point (marker_mission/app.py) hard-codes 8080
+    # regardless of MissionConfig.ui_port, so we don't need to slurp
+    # the host's MissionConfig — fc_port / mm_port_default both
+    # default to 8080 at the top of this playbook.
+    - name: Set probe port
       ansible.builtin.set_fact:
         probe_port: "{{ fc_port if mode == 'fc' else mm_port_default }}"
-      when: probe_port is not defined
+      when: mode in ['fc', 'marker-mission']
 
-    - name: Show resolved probe port
+    - name: Show probe port
       ansible.builtin.debug:
         msg: "Probing port {{ probe_port }} (mode={{ mode }})"
       when: mode in ['fc', 'marker-mission']

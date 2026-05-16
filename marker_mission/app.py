@@ -102,18 +102,20 @@ def main() -> int:
     if argv[0] == "fly" and "--in-process" not in argv:
         argv = [argv[0], "--in-process"] + argv[1:]
 
-    # Step 3: spawn the combined Flask app on a daemon thread so the
-    # mission setup (which registers UI routes on the same app) and
-    # the flight loop run on the main thread. We resolve port now
-    # rather than after argv parsing — for the rare case the operator
-    # passes --ui-port, the daemon may have started on the default
-    # port. Acceptable: --ui-port from CLI gets through to mission
-    # but the Flask app stays on cfg.ui_port. If you need a custom
-    # port, set MM_UI_PORT in the environment.
+    # Step 3: spawn the combined Flask app on a daemon thread. The
+    # systemd entry point ALWAYS binds 8080 — the deployment
+    # convention is "the FC port", and the combined-app unit
+    # Conflicts= sdc-fc so only one ever holds it. MissionConfig.
+    # ui_port is intentionally NOT consulted here even when the
+    # operator has pinned a per-host value via /tune; otherwise the
+    # unified-API surface and the mission UI would land on different
+    # ports per host, breaking external integrations and the
+    # playbook's port probe.
     host = cfg.ui_host
-    port = cfg.ui_port
+    port = 8080
     print(f"[app] Combined Flask app on {host}:{port} "
-          f"(unified routes + marker_mission UI)")
+          f"(unified routes + marker_mission UI; "
+          f"MissionConfig.ui_port={cfg.ui_port} ignored)")
     _t.Thread(target=_serve_combined_app, args=(host, port),
               daemon=True, name="combined-flask").start()
 
