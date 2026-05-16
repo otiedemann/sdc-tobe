@@ -355,26 +355,21 @@ class MissionConfig:
     @classmethod
     def load(cls, path: Optional[Path] = None) -> "MissionConfig":
         cfg = cls()
-        # Default snapshot overlay (operator-pinned via "Set as default"
-        # on /tune). Sits between the dataclass defaults and
-        # ``config.json`` so it's a *better baseline* than the dataclass
-        # defaults but the operator's most-recent live state in
-        # ``config.json`` still wins. Env always overrides everything.
-        snap_name = get_default("tune")
-        if snap_name:
-            snap_path = SNAPSHOTS_DIR / f"{snap_name}.json"
-            if snap_path.exists():
-                try:
-                    blob = json.loads(snap_path.read_text())
-                    for k, v in blob.items():
-                        if hasattr(cfg, k):
-                            setattr(cfg, k, v)
-                except Exception as e:
-                    print(f"[config] default snapshot {snap_name!r}"
-                          f" unreadable: {e}")
-            else:
-                print(f"[config] default snapshot {snap_name!r}"
-                      f" not found; skipped")
+        # Layering (later overlay wins):
+        #   1. dataclass defaults (`cls()` above)
+        #   2. ``config.json`` — live state from the last /tune Save
+        #   3. pinned default snapshot (`Set as default` on /tune)
+        #   4. env vars (MM_*)
+        #
+        # The pinned snapshot wins over config.json so "Set as default"
+        # behaves as the operator expects: pinning a preset actually
+        # applies that preset on the next mission load, even when an
+        # older config.json has stale values for the same keys. To
+        # opt out of the preset for a single key, edit it via /tune
+        # and Apply — but the next service restart will re-apply the
+        # pinned snapshot. To make a /tune change stick, either Save
+        # AND clear the pin (Set as default → clear), or re-Save the
+        # snapshot itself with the new value.
         path = path or Path(os.environ.get("MM_CONFIG_PATH",
                                            DEFAULT_DATA_DIR / "config.json"))
         if path.exists():
@@ -385,6 +380,23 @@ class MissionConfig:
                         setattr(cfg, k, v)
             except Exception as e:
                 print(f"[config] could not load {path}: {e}")
+        snap_name = get_default("tune")
+        if snap_name:
+            snap_path = SNAPSHOTS_DIR / f"{snap_name}.json"
+            if snap_path.exists():
+                try:
+                    blob = json.loads(snap_path.read_text())
+                    for k, v in blob.items():
+                        if hasattr(cfg, k):
+                            setattr(cfg, k, v)
+                    print(f"[config] default snapshot {snap_name!r} applied"
+                          f" (overrides config.json for the keys it sets)")
+                except Exception as e:
+                    print(f"[config] default snapshot {snap_name!r}"
+                          f" unreadable: {e}")
+            else:
+                print(f"[config] default snapshot {snap_name!r}"
+                      f" not found; skipped")
         # Environment overrides win
         for f in cfg.__dataclass_fields__:
             ev = os.environ.get(f"MM_{f.upper()}")
