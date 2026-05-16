@@ -245,12 +245,20 @@
       when: mode in ['fc', 'marker-mission']
       register: telemetry_probe
 
+    # The /mission route is registered by UiServer LATE in mission
+    # setup — after a 5 s drone-connection probe + arena load + video
+    # start. Flask is listening from second 1, so a naive probe races
+    # and gets a 404. Retry up to 60 s so the playbook waits through
+    # the worst-case "no drone connected, Olympe retries" path.
     - name: Probe /mission (marker-mission only — confirms UI routes attached)
       ansible.builtin.uri:
         url: "http://127.0.0.1:{{ probe_port }}/mission"
         status_code: 200
       when: mode == 'marker-mission'
       register: mission_ui_probe
+      retries: 30
+      delay: 2
+      until: mission_ui_probe.status | default(0) == 200
 
     - name: Deploy complete
       ansible.builtin.debug:
