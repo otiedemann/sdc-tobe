@@ -1,0 +1,205 @@
+---
+# Deploy the flight-controller systemd units (sdc-fc + marker-mission)
+# and select which one is the active service. The two are mutually
+# exclusive (Conflicts= in each unit file) — exactly one is enabled
+# + started; the other is disabled + stopped.
+#
+# Usage:
+#   # Roll out + start marker-mission (combined Flask app)
+#   ansible-playbook -i inventory.ini deploy.yml \
+#       -e "target=flightctrl2 mode=marker-mission"
+#
+#   # Roll out + start sdc-fc (HTTP-only, legacy)
+#   ansible-playbook -i inventory.ini deploy.yml \
+#       -e "target=flightctrl2 mode=fc"
+#
+#   # Just install the units, leave both stopped (staging / dry run)
+#   ansible-playbook -i inventory.ini deploy.yml \
+#       -e "target=flightctrl2 mode=none"
+#
+# What it does:
+#   1. Pulls origin/main on the host's sdc-tobe checkout so the unit
+#      files + start scripts in the repo match what's installed.
+#   2. Installs both unit files to /etc/systemd/system/ (idempotent).
+#   3. systemctl daemon-reload.
+#   4. Picks ONE of (fc, marker-mission, none):
+#        - Disables + stops the unselected unit (no-op if already off).
+#        - Enables + (re)starts the selected unit.
+#   5. Probes the selected unit's HTTP port to confirm it's serving.
+
+- name: Deploy SDC flight-controller systemd units
+  hosts: "{{ target | default('flightctrl') }}"
+  gather_facts: false
+  become: true
+
+  vars:
+    repo: /home/sdc/sdc-tobe
+    branch: main
+    mode: marker-mission   # default if not passed on the CLI
+    unit_dir: /etc/systemd/system
+    fc_unit: sdc-fc.service
+    mm_unit: marker-mission.service
+    # The selected unit's listening port — used by the post-deploy
+    # health probe. Both units' default ports are documented in their
+    # respective unit files / start scripts.
+    fc_port: 5050
+    mm_port: 8080
+
+  pre_tasks:
+    - name: Validate mode
+      ansible.builtin.fail:
+        msg: "mode must be one of: fc, marker-mission, none (got '{{ mode }}')"
+      when: mode not in ['fc', 'marker-mission', 'none']
+
+    - name: Show plan
+      ansible.builtin.debug:
+        msg:
+          - "Host          : {{ inventory_hostname }}"
+          - "Repo          : {{ repo }}@{{ branch }}"
+          - "Mode          : {{ mode }}"
+          - "Will enable   : {{ {'fc': fc_unit, 'marker-mission': mm_unit, 'none': '(none)'}[mode] }}"
+          - "Will disable  : {{ {'fc': mm_unit, 'marker-mission': fc_unit, 'none': 'both'}[mode] }}"
+
+  tasks:
+    # ── 1. Repo sync ────────────────────────────────────────────────
+    - name: Stat repo
+      ansible.builtin.stat:
+        path: "{{ repo }}/.git"
+      register: repo_git
+      become: false
+
+    - name: Fail if repo missing
+      ansible.builtin.fail:
+        msg: |
+          {{ repo }} is not a git checkout on {{ inventory_hostname }}.
+          Clone it first:
+            sudo -u sdc git clone https://github.com/otiedemann/sdc-tobe.git {{ repo }}
+      when: not repo_git.stat.exists
+
+    - name: Pull latest on the host repo
+      ansible.builtin.shell: |
+        set -e
+        cd {{ repo }}
+        git fetch --prune origin {{ branch }}
+        git checkout {{ branch }} 2>/dev/null || true
+        git reset --hard origin/{{ branch }}
+        git log -1 --oneline
+      register: git_pull
+      changed_when: "'Already up to date' not in git_pull.stdout"
+      become: true
+      become_user: sdc
+
+    - name: Show resulting HEAD
+      ansible.builtin.debug:
+        var: git_pull.stdout_lines
+
+    # ── 2. Install unit files (idempotent — Ansible's `copy` only
+    #      restarts/notifies on actual content change) ──────────────
+    - name: Install sdc-fc.service
+      ansible.builtin.copy:
+        src: "{{ repo }}/controller_unified/systemd/sdc-fc.service"
+        dest: "{{ unit_dir }}/{{ fc_unit }}"
+        remote_src: true
+        owner: root
+        group: root
+        mode: "0644"
+      notify: daemon-reload
+
+    - name: Install marker-mission.service
+      ansible.builtin.copy:
+        src: "{{ repo }}/marker_mission/systemd/marker-mission.service"
+        dest: "{{ unit_dir }}/{{ mm_unit }}"
+        remote_src: true
+        owner: root
+        group: root
+        mode: "0644"
+      notify: daemon-reload
+
+    - name: Ensure start scripts are executable
+      ansible.builtin.file:
+        path: "{{ item }}"
+        mode: "0755"
+      loop:
+        - "{{ repo }}/controller_unified/systemd/sdc-fc-start.sh"
+        - "{{ repo }}/controller_unified/systemd/sdc-fc-update.sh"
+        - "{{ repo }}/marker_mission/systemd/marker-mission-start.sh"
+      become: true
+      become_user: sdc
+
+    - name: Flush handlers so daemon-reload runs before enable/start below
+      ansible.builtin.meta: flush_handlers
+
+    # ── 3. Switch active unit ──────────────────────────────────────
+    # ORDER MATTERS: stop+disable the loser FIRST so the winner can
+    # bind ports cleanly. Conflicts= in the unit files would also
+    # handle this, but doing it explicitly here makes the playbook
+    # output legible.
+
+    - name: Disable + stop sdc-fc (loser when mode != fc)
+      ansible.builtin.systemd:
+        name: "{{ fc_unit }}"
+        enabled: false
+        state: stopped
+      when: mode != 'fc'
+      register: fc_stop
+      failed_when:
+        - fc_stop.failed | default(false)
+        - "'not loaded' not in (fc_stop.msg | default(''))"
+
+    - name: Disable + stop marker-mission (loser when mode != marker-mission)
+      ansible.builtin.systemd:
+        name: "{{ mm_unit }}"
+        enabled: false
+        state: stopped
+      when: mode != 'marker-mission'
+      register: mm_stop
+      failed_when:
+        - mm_stop.failed | default(false)
+        - "'not loaded' not in (mm_stop.msg | default(''))"
+
+    - name: Enable + start sdc-fc
+      ansible.builtin.systemd:
+        name: "{{ fc_unit }}"
+        enabled: true
+        state: started
+      when: mode == 'fc'
+
+    - name: Enable + (re)start marker-mission
+      ansible.builtin.systemd:
+        name: "{{ mm_unit }}"
+        enabled: true
+        # `restarted` rather than `started` so a unit-file content
+        # change from step 2 actually takes effect even when the
+        # daemon was already running on the old definition.
+        state: restarted
+      when: mode == 'marker-mission'
+
+    # ── 4. Post-deploy health probe ────────────────────────────────
+    - name: Wait for selected service to bind its port
+      ansible.builtin.wait_for:
+        host: 127.0.0.1
+        port: "{{ {'fc': fc_port, 'marker-mission': mm_port}[mode] }}"
+        timeout: 30
+      when: mode in ['fc', 'marker-mission']
+
+    - name: Probe /api/telemetry
+      ansible.builtin.uri:
+        url: "http://127.0.0.1:{{ {'fc': fc_port, 'marker-mission': mm_port}[mode] }}/api/telemetry"
+        return_content: true
+        status_code: 200
+      when: mode in ['fc', 'marker-mission']
+      register: telemetry_probe
+
+    - name: Deploy complete
+      ansible.builtin.debug:
+        msg:
+          - "✓ Deploy done on {{ inventory_hostname }}"
+          - "  Mode             : {{ mode }}"
+          - "  HEAD             : {{ git_pull.stdout_lines | last }}"
+          - "  Telemetry probe  : {{ (telemetry_probe.status | default('skipped')) }}"
+          - "  Telemetry connected: {{ (telemetry_probe.json.connected | default('n/a')) if mode != 'none' else 'n/a' }}"
+
+  handlers:
+    - name: daemon-reload
+      ansible.builtin.systemd:
+        daemon_reload: true

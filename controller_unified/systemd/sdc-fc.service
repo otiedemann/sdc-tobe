@@ -3,6 +3,14 @@ Description=SDC flight controller (unified_api_server.py)
 Documentation=file:/home/sdc/sdc-tobe/controller_unified/systemd/README.md
 After=network-online.target
 Wants=network-online.target
+
+# Mutual exclusion with marker-mission: only one of these owns the
+# drone backend at a time. systemd stops the other unit when this one
+# starts (and vice versa). Both units must NOT be enabled at boot —
+# the Ansible playbook (ansible/fc-deploy/deploy.yml) enables exactly
+# one based on the operator's choice.
+Conflicts=marker-mission.service
+
 # Watchdog rate-limit (these live under [Unit], not [Service]):
 # if the process crash-loops 5× in 300s systemd gives up and marks the
 # unit 'failed'. Clear with `systemctl reset-failed sdc-fc`.

@@ -1,0 +1,61 @@
+[Unit]
+Description=marker_mission (combined Flask app — unified drone backend + mission UI in one process)
+Documentation=file:/home/sdc/sdc-tobe/marker_mission/systemd/README.md
+After=network-online.target
+Wants=network-online.target
+
+# Mutual exclusion: only one of (sdc-fc, marker-mission) talks to the
+# drone at a time. systemd's Conflicts= directive guarantees that
+# starting marker-mission stops sdc-fc and vice versa, so an operator
+# never needs to remember the order. Both units must NOT be enabled
+# at the same time, or the boot-order race could leave the "wrong"
+# one running; the Ansible playbook (ansible/fc-deploy/deploy.yml)
+# enforces this by enabling exactly one.
+Conflicts=sdc-fc.service
+
+# Watchdog rate-limit: if the process crash-loops 5× in 300s, systemd
+# gives up and marks the unit failed. Clear with
+# `systemctl reset-failed marker-mission`. Window picked to match
+# sdc-fc.service (~90s worst-case ExecStartPre + a couple of retries).
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=sdc
+Group=sdc
+WorkingDirectory=/home/sdc/sdc-tobe
+Environment=HOME=/home/sdc
+Environment=SDC_FC_REPO=/home/sdc/sdc-tobe
+Environment=SDC_FC_BRANCH=main
+# Additional env vars (DRONE_TYPE, DRONE_IP, MM_DATA_DIR, …) belong in
+# a drop-in: /etc/systemd/system/marker-mission.service.d/override.conf
+
+# Pull latest on every (re)start — same update script as sdc-fc so the
+# two units stay version-locked on the same revision. Exits 0 if
+# origin is unreachable, so a flaky network never blocks startup.
+ExecStartPre=/home/sdc/sdc-tobe/controller_unified/systemd/sdc-fc-update.sh
+ExecStart=/home/sdc/sdc-tobe/marker_mission/systemd/marker-mission-start.sh
+
+# Cap the total startup window (ExecStartPre + Flask bind). The
+# update script's own 15s ls-remote + 30s fetch keeps worst case well
+# under this; mission setup itself is < 5s once imports are warm.
+TimeoutStartSec=120s
+
+# ── Watchdog: restart on crash ──────────────────────────────────────
+Restart=always
+RestartSec=3s
+
+# ── Signal handling ─────────────────────────────────────────────────
+# mission.py installs a SIGINT handler that lands the drone cleanly,
+# then exits. SIGTERM (systemd's default) would kill mid-flight.
+KillSignal=SIGINT
+TimeoutStopSec=15
+
+# ── Logging ─────────────────────────────────────────────────────────
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=marker-mission
+
+[Install]
+WantedBy=multi-user.target
