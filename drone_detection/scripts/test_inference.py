@@ -96,9 +96,14 @@ class YOLOv11_OpenCV:
             self.conf_thresh, self.nms_thresh
         )
 
+        # NMSBoxes return shape varies by OpenCV version:
+        #   ≤ 4.5: list[list[int]]  → each `i` is `[idx]`
+        #   ≥ 4.7: np.ndarray[int32], 1-D → each `i` is a numpy scalar
+        # np.atleast_1d + .ravel() flattens both shapes to a 1-D int array.
+        indices = np.atleast_1d(np.asarray(indices)).ravel()
         results = []
         for i in indices:
-            idx = i if isinstance(i, int) else i[0]
+            idx = int(i)
             cid = int(class_ids[idx])
             results.append({
                 "class": self.class_names[cid] if cid < len(self.class_names) else f"class_{cid}",

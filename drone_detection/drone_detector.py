@@ -207,9 +207,14 @@ class DroneDetector:
         )
 
         img_cx, img_cy = w / 2.0, h / 2.0
+        # NMSBoxes return shape varies by OpenCV version:
+        #   ≤ 4.5: list[list[int]]  → each `i` is `[idx]`
+        #   ≥ 4.7: np.ndarray[int32], 1-D → each `i` is a numpy scalar
+        # np.atleast_1d + .ravel() flattens both shapes to a 1-D int array.
+        indices = np.atleast_1d(np.asarray(indices)).ravel()
         results = []
         for i in indices:
-            idx = i if isinstance(i, int) else i[0]
+            idx = int(i)
             x, y, bwidth, bheight = rects[idx]
             cx = x + bwidth / 2
             cy = y + bheight / 2
