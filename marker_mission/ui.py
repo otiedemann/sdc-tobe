@@ -3512,6 +3512,23 @@ class UiServer:
     def _register_routes(self) -> None:
         app = self.app
 
+        # Combined-mode race: marker_mission/app.py starts the Flask
+        # daemon serving unified_api_server's routes BEFORE this method
+        # runs. Any deploy probe (ansible's wait_for + /api/telemetry)
+        # that lands in that window finalises Flask's URL map, and
+        # Flask 3.x's _check_setup_finished then raises AssertionError
+        # the moment we try @app.get("/mission") below. The route
+        # additions themselves work fine — Flask's check is
+        # precautionary about lookup-time consistency — so we reset the
+        # "first request seen" latch before re-opening setup. Safe in
+        # this codebase because UiServer is the only thing that
+        # registers routes post-startup (unified_api_server adds all
+        # its routes inside init_backend_and_threads).
+        try:
+            app._got_first_request = False
+        except AttributeError:
+            pass
+
         # Per-request context. Returning a fresh dict each call lets
         # the live cfg.killswitch_key + self.drone_connected propagate
         # to the rendered HTML on every page load (operators can tune
