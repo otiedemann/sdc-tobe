@@ -1,0 +1,18 @@
+{
+  "bind": {"host": "127.0.0.1", "port": 8090},
+  "fcs": [
+    {"name": "flightctrl1", "host": "flightctrl1", "port": 8080},
+    {"name": "flightctrl2", "host": "flightctrl2", "port": 8080},
+    {"name": "flightctrl3", "host": "flightctrl3", "port": 8080},
+    {"name": "flightctrl4", "host": "flightctrl4", "port": 8080},
+    {"name": "flightctrl5", "host": "flightctrl5", "port": 8080},
+    {"name": "flightctrl6", "host": "flightctrl6", "port": 8080}
+  ],
+  "emergency_land_key": "?",
+  "state_poll_hz": 5.0,
+  "ui_refresh_hz": 2.0,
+  "calibration_sync_seconds": 30.0,
+  "fc_request_timeout_s": 2.0,
+  "library_dir": "marker_mission_c2/calibrations",
+  "log_level": "INFO"
+}
