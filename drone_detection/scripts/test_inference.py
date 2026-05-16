@@ -12,6 +12,9 @@ Usage:
     # Test on live MJPEG stream (from unified API server)
     python test_inference.py --model best.onnx --source http://flightctrl1:8080/api/video
 
+    # Test against the MacBook / built-in webcam (device 0)
+    python test_inference.py --model best.onnx --source 0 --show
+
     # Use Ultralytics .pt model (requires PyTorch)
     python test_inference.py --model best.pt --source image.jpg
 
@@ -168,10 +171,23 @@ def main():
 
     source = args.source
 
-    # ── MJPEG stream ──
-    if source.startswith("http"):
-        print(f"Connecting to MJPEG stream: {source}")
-        cap = cv2.VideoCapture(source)
+    # ── Webcam (numeric device index) or MJPEG stream ──
+    is_webcam = source.isdigit()
+    if is_webcam or source.startswith("http"):
+        if is_webcam:
+            dev_index = int(source)
+            # On macOS the default backend (AVFoundation) is usually correct
+            # but it can be slow to open; passing CAP_AVFOUNDATION explicitly
+            # skips OpenCV's backend autodetect and shaves ~2 s off startup.
+            if sys.platform == "darwin":
+                print(f"Opening macOS webcam device {dev_index} via AVFoundation…")
+                cap = cv2.VideoCapture(dev_index, cv2.CAP_AVFOUNDATION)
+            else:
+                print(f"Opening webcam device {dev_index}…")
+                cap = cv2.VideoCapture(dev_index)
+        else:
+            print(f"Connecting to MJPEG stream: {source}")
+            cap = cv2.VideoCapture(source)
         if not cap.isOpened():
             print("ERROR: Cannot open stream")
             sys.exit(1)
