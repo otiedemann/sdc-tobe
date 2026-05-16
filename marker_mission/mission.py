@@ -1023,6 +1023,16 @@ def _build_parser() -> argparse.ArgumentParser:
     pf.add_argument("--api-url", default=None,
                     help="base URL of the unified API server "
                          "(e.g. http://127.0.0.1:5050)")
+    pf.add_argument("--drone-ip", default=None,
+                    help="Override the drone's IP address (default "
+                         "192.168.42.1 for a real Anafi). Useful when "
+                         "talking to the Sphinx simulator where the drone "
+                         "may live at 127.0.0.1 (ports mode) or "
+                         "10.202.0.1 (netns mode). Only effective when "
+                         "the FC is started in-process by "
+                         "marker_mission.app; HTTP mode (--api-url) "
+                         "ignores it because the remote FC is already "
+                         "configured with its own drone IP.")
     pf.add_argument("--ui-port", type=int, default=None,
                     help="port for the operator UI (default 8080)")
     pf.add_argument("--in-process", action="store_true",

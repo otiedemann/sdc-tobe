@@ -31,9 +31,31 @@ The legacy entry points are kept and mutually exclusive:
 """
 from __future__ import annotations
 
+import argparse
 import logging
+import os
 import sys
 from pathlib import Path
+
+
+def _apply_drone_ip_override() -> None:
+    """Peek at sys.argv for ``--drone-ip <X>`` (or ``--drone-ip=X``) and,
+    if present, set the ``ANAFI_IP`` env var BEFORE ``unified_api_server``
+    decides which drone to connect to. The FC reads ``ANAFI_IP`` in
+    :func:`controller_unified.unified_api_server.detect_drone` and also
+    when constructing :class:`olympe.Drone`, so setting it here is the
+    only injection point that works for both code paths.
+
+    The flag itself stays declared on ``marker_mission.mission``'s
+    ``fly`` subparser so ``--help`` documents it and argparse accepts
+    it; this function just front-runs that parser to get the IP applied
+    early enough."""
+    pre = argparse.ArgumentParser(add_help=False)
+    pre.add_argument("--drone-ip", default=None)
+    known, _ = pre.parse_known_args(sys.argv[1:])
+    if known.drone_ip:
+        os.environ["ANAFI_IP"] = known.drone_ip
+        print(f"[app] --drone-ip override: ANAFI_IP={known.drone_ip}")
 
 # Make ``import unified_api_server`` and ``import drone_core`` work as
 # sibling top-level modules. The launcher used to do this by setting
@@ -78,6 +100,11 @@ def main() -> int:
     import threading as _t
 
     logging.getLogger("werkzeug").setLevel(logging.WARNING)
+
+    # Step 0: honour --drone-ip BEFORE the FC reads ANAFI_IP. Must run
+    # before init_backend_and_threads() — the env var is consulted once
+    # at backend init and cached, so setting it later has no effect.
+    _apply_drone_ip_override()
 
     # Step 1: bring up the drone backend + its background threads.
     # If this fails (e.g. neither djitellopy nor olympe installed),
