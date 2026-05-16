@@ -32,7 +32,7 @@ import numpy as np
 from flask import (Flask, Response, jsonify, render_template_string,
                     request, send_file)
 
-from .config import MissionConfig, tuning_view
+from .config import CALIB_DIR, MissionConfig, tuning_view
 from .controller import MissionController, MissionState
 
 
@@ -4396,6 +4396,159 @@ class UiServer:
             if not ok:
                 return jsonify({"ok": False, "error": msg}), 409
             return jsonify({"ok": True, "msg": msg})
+
+        # ---- Calibration file CRUD (used by marker_mission_c2 to mirror
+        # .npz files into a central library so a drone can be moved to a
+        # different flight controller without manual file copies). Each
+        # file is name-validated against the same anafi_<serial>_<res>
+        # pattern that CalibrationStore writes so a malicious filename
+        # can't escape calib_dir. ----------------------------------------
+        import re as _cal_re
+        _CAL_NAME_RE = _cal_re.compile(
+            r"^anafi_[A-Za-z0-9_\-]+_[A-Za-z0-9]+\.npz$")
+
+        def _cal_dir() -> Path:
+            base = (self.cfg.calib_dir
+                    if self.cfg and getattr(self.cfg, "calib_dir", None)
+                    else CALIB_DIR)
+            return Path(base)
+
+        @app.get("/api/calibrate/files")
+        def api_calibrate_files_list():
+            d = _cal_dir()
+            entries: list[dict] = []
+            if d.exists():
+                for path in sorted(d.glob("anafi_*.npz")):
+                    try:
+                        stat = path.stat()
+                    except OSError:
+                        continue
+                    entry: dict = {
+                        "name": path.name,
+                        "mtime": stat.st_mtime,
+                        "size": stat.st_size,
+                    }
+                    # Pull scalar metadata out of the .npz; the small
+                    # fields we read are loaded directly without
+                    # bringing the calibration matrix into memory.
+                    try:
+                        with np.load(path, allow_pickle=False) as npz:
+                            if "serial" in npz:
+                                entry["serial"] = str(npz["serial"])
+                            if "resolution" in npz:
+                                entry["resolution"] = str(npz["resolution"])
+                            if "rms_error" in npz:
+                                entry["rms_error"] = float(npz["rms_error"])
+                            if "image_size" in npz:
+                                entry["image_size"] = [
+                                    int(v) for v in npz["image_size"]]
+                            if "calibrated_at" in npz:
+                                entry["calibrated_at"] = str(
+                                    npz["calibrated_at"])
+                            if "notes" in npz:
+                                entry["notes"] = str(npz["notes"])
+                    except Exception as e:
+                        entry["read_error"] = str(e)
+                    entries.append(entry)
+            return jsonify({"files": entries})
+
+        @app.get("/api/calibrate/files/<name>")
+        def api_calibrate_files_get(name: str):
+            if not _CAL_NAME_RE.match(name):
+                return jsonify({"ok": False,
+                                "error": "invalid filename"}), 400
+            path = _cal_dir() / name
+            if not path.is_file():
+                return jsonify({"ok": False,
+                                "error": "not found"}), 404
+            return send_file(str(path),
+                             mimetype="application/octet-stream")
+
+        @app.post("/api/calibrate/files/<name>")
+        def api_calibrate_files_put(name: str):
+            if not _CAL_NAME_RE.match(name):
+                return jsonify({"ok": False,
+                                "error": "invalid filename"}), 400
+            blob = request.get_data(cache=False, as_text=False)
+            if not blob:
+                return jsonify({"ok": False,
+                                "error": "empty body"}), 400
+            if len(blob) > 1_048_576:
+                return jsonify({"ok": False,
+                                "error": "calibration file > 1 MiB"}), 413
+            # Validate as a NumPy .npz with the required arrays before
+            # writing — rejects garbage at the door so a corrupt push
+            # never replaces a working calibration.
+            import io as _io
+            try:
+                with np.load(_io.BytesIO(blob), allow_pickle=False) as npz:
+                    for k in ("camera_matrix", "dist_coeffs", "image_size"):
+                        if k not in npz:
+                            return jsonify({"ok": False,
+                                            "error": f"npz missing {k}"}), 400
+            except Exception as e:
+                return jsonify({"ok": False,
+                                "error": f"not a valid npz: {e}"}), 400
+            d = _cal_dir()
+            d.mkdir(parents=True, exist_ok=True)
+            target = d / name
+            tmp = target.with_suffix(target.suffix + ".tmp")
+            try:
+                with open(tmp, "wb") as f:
+                    f.write(blob)
+                    f.flush()
+                    try:
+                        import os as _os
+                        _os.fsync(f.fileno())
+                    except OSError:
+                        pass
+                import os as _os
+                _os.replace(tmp, target)
+            except OSError as e:
+                return jsonify({"ok": False,
+                                "error": f"write failed: {e}"}), 500
+            return jsonify({"ok": True, "name": name,
+                            "path": str(target), "size": len(blob)})
+
+        @app.delete("/api/calibrate/files/<name>")
+        def api_calibrate_files_delete(name: str):
+            if not _CAL_NAME_RE.match(name):
+                return jsonify({"ok": False,
+                                "error": "invalid filename"}), 400
+            path = _cal_dir() / name
+            if not path.exists():
+                return jsonify({"ok": False, "error": "not found"}), 404
+            try:
+                path.unlink()
+            except OSError as e:
+                return jsonify({"ok": False,
+                                "error": f"delete failed: {e}"}), 500
+            return jsonify({"ok": True})
+
+        # ---- Identity: which physical drone is currently on this FC.
+        # Used by marker_mission_c2 to (a) show "drone serial" in the
+        # per-FC card and (b) warn when an operator pushes a library
+        # calibration whose serial doesn't match this FC's drone.
+        @app.get("/api/identity")
+        def api_identity():
+            import socket as _socket
+            serial = None
+            connected = False
+            try:
+                snap = self.state.snapshot()
+                tel = snap.get("telemetry") or {}
+                serial = (tel.get("serial_number") or tel.get("serial")
+                          or None)
+                connected = bool(snap.get("drone_connected")
+                                  or self.drone_connected)
+            except Exception:
+                pass
+            return jsonify({
+                "hostname": _socket.gethostname(),
+                "drone_serial": serial,
+                "drone_connected": connected,
+                "marker_mission_version": "1.x",
+            })
 
         @app.post("/api/start")
         def api_start():
