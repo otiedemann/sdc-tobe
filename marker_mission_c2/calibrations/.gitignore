@@ -1,0 +1,6 @@
+# C2 mirrors FC calibration .npz files here at runtime — these are
+# data, not source. Keep the directory in git but never commit the
+# files it accumulates.
+*.npz
+*.json
+!.gitkeep

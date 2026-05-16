@@ -12,6 +12,13 @@ from __future__ import annotations
 
 PAGE_OVERVIEW = """
 <main>
+  <div style="display:flex; gap:.5rem; align-items:center;
+              margin-bottom:.75rem; flex-wrap:wrap;">
+    <button type="button" class="btn" id="btn-video-all">
+      Show all video
+    </button>
+    <span id="video-all-msg" style="font-size:.78rem; color:#aab;"></span>
+  </div>
   <div class="grid"
        style="grid-template-columns: repeat(auto-fit, minmax(360px, 1fr));"
        id="fc-grid">
@@ -161,6 +168,50 @@ PAGE_OVERVIEW = """
     }
   }
   document.addEventListener('c2:overview', e => updateCards(e.detail));
+
+  // Show/Hide all video — clicks each per-card video toggle so the
+  // cache-busting + slot-replace logic stays in exactly one place.
+  // Two-mode button: if any card is currently OFF, treat the click
+  // as "turn ALL on" (clicks only the off cards). Otherwise treat it
+  // as "turn ALL off" (clicks every card).
+  const btnVideoAll = document.getElementById('btn-video-all');
+  const videoAllMsg = document.getElementById('video-all-msg');
+  function syncVideoAllLabel() {
+    const toggles = document.querySelectorAll('[data-role=video-toggle]');
+    if (!toggles.length) return;
+    let on = 0;
+    toggles.forEach(t => { if (t.dataset.on === '1') on++; });
+    btnVideoAll.textContent = on === toggles.length
+      ? 'Hide all video' : 'Show all video';
+    videoAllMsg.textContent = on + '/' + toggles.length + ' streaming';
+  }
+  if (btnVideoAll) {
+    btnVideoAll.addEventListener('click', () => {
+      const toggles = Array.from(
+        document.querySelectorAll('[data-role=video-toggle]'));
+      if (!toggles.length) return;
+      const allOn = toggles.every(t => t.dataset.on === '1');
+      const target = !allOn;  // true = turn all ON, false = OFF
+      // Stagger the clicks ~50 ms apart so the browser doesn't open
+      // six MJPEG sockets in the exact same event-loop tick — keeps
+      // the network panel readable and avoids head-of-line bursts.
+      toggles.forEach((t, i) => {
+        const isOn = t.dataset.on === '1';
+        if (isOn !== target) {
+          setTimeout(() => { t.click(); }, i * 50);
+        }
+      });
+      setTimeout(syncVideoAllLabel, toggles.length * 50 + 100);
+    });
+    // Refresh label whenever any per-card toggle was clicked.
+    document.addEventListener('click', ev => {
+      const t = ev.target;
+      if (t instanceof HTMLElement && t.dataset.role === 'video-toggle') {
+        setTimeout(syncVideoAllLabel, 50);
+      }
+    });
+    document.addEventListener('c2:overview', () => syncVideoAllLabel());
+  }
 
   // Per-card button wiring (event-delegated so it survives DOM rerenders).
   document.addEventListener('click', async ev => {

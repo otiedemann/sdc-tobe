@@ -17,9 +17,10 @@ import logging
 import signal
 import threading
 from concurrent.futures import Future
+from pathlib import Path
 from typing import Any, Awaitable, Callable
 
-from flask import Flask, jsonify, render_template_string, request
+from flask import Flask, jsonify, render_template_string, request, send_file
 
 from .calibration_sync import CalibrationLibrary, is_valid_calibration_name
 from .config import C2Config
@@ -95,6 +96,20 @@ def _build_app(cfg: C2Config, pool: FCPool, library: CalibrationLibrary,
     def _await(coro: Awaitable[Any], timeout: float = 10.0) -> Any:
         return loop.submit(coro, timeout=timeout)
 
+    # ------------------------------------------------------------ logo
+    # Mirrors marker_mission's /team_logo.png — same source asset so
+    # both surfaces stay visually consistent. Cached for an hour;
+    # browsers only fetch the 2.8 MiB transparent PNG once per session.
+    @app.get("/team_logo.png")
+    def team_logo():
+        repo_root = Path(__file__).resolve().parent.parent
+        p = repo_root / "1_Doc" / "team_logo_transparent.png"
+        if not p.is_file():
+            return ("logo not found", 404)
+        resp = send_file(str(p), mimetype="image/png")
+        resp.headers["Cache-Control"] = "public, max-age=3600"
+        return resp
+
     # ------------------------------------------------------------ pages
     @app.get("/")
     def page_overview():
@@ -164,6 +179,40 @@ def _build_app(cfg: C2Config, pool: FCPool, library: CalibrationLibrary,
                     and "not running" in str(payload.get("error", "")))
         return jsonify({"ok": ok, "payload": payload, "noop": noop,
                         "error": None if ok else _err(payload)})
+
+    # ----------------------------------------------------------- start all
+    # Fan out POST /api/start to every configured FC. No script body —
+    # each FC uses its own active draft (set per-FC from the overview
+    # card editor or fleet-broadcast via /scripts). 409 "mission
+    # already running" is mapped to noop=True so the UI shows green for
+    # FCs already in flight.
+    @app.post("/api/c2/start-all")
+    def api_start_all():
+        async def fan_out():
+            clients = pool.all_clients()
+            coros = [c.start_mission(None) for c in clients]
+            results = await asyncio.gather(*coros, return_exceptions=True)
+            return {c.spec.name: r for c, r in zip(clients, results)}
+
+        raw = _await(fan_out(), timeout=30.0)
+        out: dict[str, dict] = {}
+        for name, r in raw.items():
+            if isinstance(r, Exception):
+                log.error("start-all %s failed: %s", name, r)
+                out[name] = {"ok": False, "error": str(r)}
+                continue
+            ok, payload = r
+            entry: dict[str, Any] = {"ok": bool(ok), "payload": payload}
+            if not ok:
+                err = _err(payload)
+                # Map "already running" / 409 to a soft success so the
+                # UI shows green for FCs that didn't need to be started.
+                if "already running" in err or "already started" in err:
+                    entry = {"ok": True, "noop": True, "reason": err}
+                else:
+                    entry["error"] = err
+            out[name] = entry
+        return jsonify(out)
 
     # --------------------------------------------------------- emergency land
     @app.post("/api/c2/emergency-land-all")

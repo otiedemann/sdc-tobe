@@ -62,8 +62,16 @@ _BASE_CSS = """
                     padding:.7rem 1.1rem; border-radius:8px;
                     font-weight:700; font-size:1rem; cursor:pointer;
                     box-shadow:0 1px 0 #7f1d1d inset, 0 0 0 1px #991b1b;
-                    letter-spacing:.02em; }
+                    letter-spacing:.02em; margin-left:.5rem; }
   .btn-emergency:hover { background:#ef4444; }
+  /* Start-all button: green (fleet-level positive action), confirms
+     before firing because it launches every drone you have. */
+  .btn-start-all { background:#16a34a; color:#062613; border:0;
+                    padding:.7rem 1.1rem; border-radius:8px;
+                    font-weight:700; font-size:1rem; cursor:pointer;
+                    box-shadow:0 1px 0 #14532d inset, 0 0 0 1px #166534;
+                    letter-spacing:.02em; }
+  .btn-start-all:hover { background:#22c55e; }
   /* Compact per-FC connection-dot strip in the topbar. */
   .fc-dots { display:flex; gap:.35rem; align-items:center;
               font-size:.78rem; color:#aab; }
@@ -108,7 +116,10 @@ _BASE_CSS = """
 # JS poll lands. JS replaces the dot classes on each refresh.
 _HEADER_HTML = """
 <header>
-  <h1>marker_mission · C2</h1>
+  <img src="/team_logo.png" alt="team logo"
+       style="width:64px; height:64px; object-fit:contain;
+              display:block; margin-right:.6rem;">
+  <h1 style="line-height:1.15;">to be defined<br>C2 mission control</h1>
   <nav>
     <a href="/" class="{{ 'active' if active=='overview' else '' }}">Overview</a>
     <a href="/arena" class="{{ 'active' if active=='arena' else '' }}">Arena</a>
@@ -123,8 +134,13 @@ _HEADER_HTML = """
     </span>
     {% endfor %}
   </span>
+  <button type="button" id="btn-start-all"
+          class="btn-start-all" style="margin-left:auto;"
+          title="Start every drone using its own active mission script">
+    ▶ Start all
+  </button>
   <button type="button" id="btn-emergency-land"
-          class="btn-emergency" style="margin-left:auto;"
+          class="btn-emergency"
           title="Land all configured drones (key: {{ emergency_land_key }})">
     EMERGENCY LAND ALL ({{ emergency_land_key }})
   </button>
@@ -202,6 +218,41 @@ function fireEmergencyLand() {
                                   'partial'));
 }
 
+function _startAllResults(results) {
+  let started = 0, noop = 0, fail = 0;
+  const failed = [];
+  for (const name of Object.keys(results || {})) {
+    const r = results[name] || {};
+    if (r.ok && r.noop) noop++;
+    else if (r.ok) started++;
+    else { fail++; failed.push(name); }
+  }
+  let text, kind = 'ok';
+  if (fail === 0) {
+    text = 'Start all: ' + started + ' started'
+            + (noop ? ', ' + noop + ' already running' : '');
+  } else {
+    text = 'Start all: ' + started + ' started, ' + fail
+            + ' failed (' + failed.join(', ') + ')';
+    kind = 'partial';
+  }
+  _emergencyBanner(text, kind);
+}
+
+function fireStartAll() {
+  // Confirm before launching — every drone you have will take off
+  // using its own active script.
+  if (!confirm('Start every drone? Each FC will run its own active '
+               + 'mission script. Continue?')) return;
+  _emergencyBanner('Start all: launching every drone…', 'partial');
+  _beep(420, 250);
+  fetch('/api/c2/start-all', {method: 'POST'})
+    .then(r => r.json())
+    .then(j => _startAllResults(j))
+    .catch(e => _emergencyBanner('Start all request failed: ' + e,
+                                  'partial'));
+}
+
 document.addEventListener('keydown', e => {
   if (!EMERGENCY_KEY) return;
   if (e.ctrlKey || e.metaKey || e.altKey) return;
@@ -218,6 +269,8 @@ document.addEventListener('keydown', e => {
 document.addEventListener('DOMContentLoaded', () => {
   const btn = document.getElementById('btn-emergency-land');
   if (btn) btn.addEventListener('click', fireEmergencyLand);
+  const btnStart = document.getElementById('btn-start-all');
+  if (btnStart) btnStart.addEventListener('click', fireStartAll);
   // Kick off the topbar-dot poller. Each page may also use the overview
   // payload for its own widgets via window._latestOverview.
   if (!window._c2OverviewPollerStarted) {
