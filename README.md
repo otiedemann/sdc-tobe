@@ -20,17 +20,16 @@ automatically at boot via systemd.
 | Port | Service                              | What it does                                                     |
 |-----:|--------------------------------------|------------------------------------------------------------------|
 | 8070 | **C2 / remote web controller**       | Operator UI — manual flight, video, telemetry, recording          |
-| 8080 | **FC** (`controller_unified`)        | Flight controller HTTP API — talks Olympe to the drone           |
+| 8080 | **FC** or **marker-mission**         | Mutually exclusive: either unified_api_server.py (HTTP-only) OR `marker_mission.app` (combined: HTTP API + mission UI in one process) |
 | 8090 | **sphinx-control**                   | Sim dashboard — start/stop env, drones, FC                       |
-| 9090 | **marker-mission**                   | Mission planner UI — scripted ArUco missions                     |
 | 9091 | **drone-detector-ui**                | Collision-detector dashboard — live video + YOLO overlay + evasion config |
 
 Open these in your browser over Tailscale:
 
 - `http://sphinx3.otconsulting.de:8070/` — **start here for manual flight**
 - `http://sphinx3.otconsulting.de:8090/` — sim manager / "is the drone up?"
-- `http://sphinx3.otconsulting.de:9090/` — marker-mission scripting
-- `http://sphinx3.otconsulting.de:8080/` — raw FC API (not a UI)
+- `http://sphinx3.otconsulting.de:8080/` — FC HTTP API (always present)
+  - …and `:8080/mission` when marker-mission mode is active — scripted ArUco missions
 
 ---
 
@@ -53,8 +52,9 @@ Open these in your browser over Tailscale:
                                     │     uses sphinx-bootstrap.service  │
                                     │     to spawn env+drone+FC at boot  │
                                     │                                    │
-                                    │  marker-mission :9090              │
-                                    │     calls FC, runs scripts         │
+                                    │  marker-mission :8080 (combined)   │
+                                    │     in-process drone control +     │
+                                    │     mission UI (/mission)          │
                                     └────────────────────────────────────┘
 ```
 
@@ -154,12 +154,20 @@ Selected endpoints:
 `sphinx-bootstrap.service` calls these in order at boot to bring the
 sim up automatically — see `sphinx-control/sphinx-bootstrap.sh`.
 
-### `:9090` — marker-mission
+### `:8080/mission` — marker-mission (combined app)
 
-Mission planner UI. Source: `marker_mission/` in the main branch (merged
-in PR #18). Runs from `/opt/sdc-tobe` with its own dedicated venv at
-`/opt/sdc-tobe/.venv-marker` so its matplotlib + flask dependencies stay
-isolated from the FC's Olympe environment.
+Mission planner UI. Source: `marker_mission/` in the main branch.
+Runs as `python -m marker_mission.app`, which boots one Flask app
+serving both the unified drone REST API AND the mission UI on the
+same port (8080 by default). Drone control inside marker_mission is
+in-process via `drone_core` — no HTTP round-trip from the mission
+controller to the FC.
+
+The legacy two-process setup (FC HTTP on :8080 + mission on :9090)
+is retired; use the Ansible playbook in `ansible/fc-deploy/` to
+switch a host between FC-only mode and combined-app mode (mutually
+exclusive — both units `Conflicts=` each other in their `[Unit]`
+section so they can never run together).
 
 **Mission script DSL** (one command per line, `#` for comments):
 
@@ -195,7 +203,7 @@ required for SSH.
 ```bash
 systemctl is-active firmwared xvfb sphinx-control sphinx-bootstrap \
                     marker-mission c2-controller
-sudo ss -lntp | awk '/:8070|:8080|:8090|:9090/ {print $4}'
+sudo ss -lntp | awk '/:8070|:8080|:8090/ {print $4}'
 ```
 
 ### Tail logs
@@ -266,7 +274,8 @@ sphinx-control/            sim manager
   launcher.py              drone/env/FC subprocess management
   sphinx-bootstrap.sh      systemd oneshot bring-up
 marker_mission/            mission DSL + planner UI
-  mission.py               the :9090 service
+  app.py                   combined entry point (FC + UI on :8080)
+  mission.py               the mission state machine + CLI
   docs/                    DSL reference
 tools/
   perf_probe.py            end-to-end perf measurement
@@ -282,7 +291,7 @@ docker/
 
 ## Common gotchas
 
-- **`sphinx3.otconsulting.de` is a Tailnet hostname** (resolves to `100.x.x.x`). It only works on devices joined to your Tailscale tailnet. From outside the tailnet, use the EC2 public IP — and that requires the AWS Security Group to allow inbound on the relevant port (8070, 8080, 8090, 9090).
+- **`sphinx3.otconsulting.de` is a Tailnet hostname** (resolves to `100.x.x.x`). It only works on devices joined to your Tailscale tailnet. From outside the tailnet, use the EC2 public IP — and that requires the AWS Security Group to allow inbound on the relevant port (8070, 8080, 8090).
 - **GitHub auth on the box uses SSH**, not HTTPS. The deploy key for `sdc-tobe` lives at `~/.ssh/github_ed25519`. Use `git pull` and `git push` over `git@github.com:otiedemann/sdc-tobe.git`.
 - **`libjsonrpccpp-{common,server,client}0` are `apt-mark manual`** — if those packages get auto-removed (as happened once after a Docker purge), UE4 crashes during init because gzserver's `libsphinx_fwman.so` can't bind port 8383.
 - **EC2 Spot instances can be reclaimed** without warning. If `start-instances` fails with "no Spot capacity", relaunch the EBS root on an On-Demand instance via the AMI route — see `docker/AWS.md`.

@@ -39,11 +39,15 @@
     unit_dir: /etc/systemd/system
     fc_unit: sdc-fc.service
     mm_unit: marker-mission.service
-    # The selected unit's listening port — used by the post-deploy
-    # health probe. Both units' default ports are documented in their
-    # respective unit files / start scripts.
-    fc_port: 5050
-    mm_port: 8080
+    # Default listening port for both units. unified_api_server reads
+    # HTTP_PORT from env (default 8080); marker_mission's combined app
+    # reads MissionConfig.ui_port (default 8080). The two units are
+    # mutually exclusive, so sharing the port is fine — only one ever
+    # binds. For marker-mission the playbook still reads MissionConfig
+    # on the host below to honour per-host overrides (operators tune
+    # the port via the /tune page) before falling back to this value.
+    fc_port: 8080
+    mm_port_default: 8080
 
   pre_tasks:
     - name: Validate mode
@@ -59,6 +63,42 @@
           - "Mode          : {{ mode }}"
           - "Will enable   : {{ {'fc': fc_unit, 'marker-mission': mm_unit, 'none': '(none)'}[mode] }}"
           - "Will disable  : {{ {'fc': mm_unit, 'marker-mission': fc_unit, 'none': 'both'}[mode] }}"
+
+    # Catch hand-started python processes that own a port the new
+    # service needs to bind. Without this the deploy "succeeds" but
+    # the squatter keeps serving (this bit us on flightctrl2: a
+    # 4-hour-old `python unified_api_server.py` was on :8080, an
+    # equally-old `python -m marker_mission.mission --ui-port 8090`
+    # was on :8090, and our marker-mission.service silently failed
+    # to bind 8090 — the probe found the squatter and went green).
+    - name: Detect non-systemd python on ports 5050/8080/8090
+      ansible.builtin.shell: |
+        for p in 5050 8080 8090; do
+          pids=$(ss -tlnp 2>/dev/null | awk -v port=":$p" '$0 ~ port {match($0,/pid=([0-9]+)/,m); print m[1]}' | sort -u)
+          for pid in $pids; do
+            unit=$(systemctl status "$pid" 2>/dev/null \
+                   | awk -F'─' '/●/{print $NF}' | head -1)
+            cmd=$(ps -p "$pid" -o cmd= 2>/dev/null)
+            if [ -z "$unit" ]; then
+              echo "STRAY pid=$pid port=$p cmd=$cmd"
+            fi
+          done
+        done
+      register: stray_check
+      changed_when: false
+      become: true
+
+    - name: Fail if non-systemd python is squatting our ports
+      ansible.builtin.fail:
+        msg: |
+          Found python process(es) holding deploy ports that are NOT
+          managed by systemd. Stop them by hand before re-running, e.g.
+            sudo kill -INT <pid>
+          Then re-run this playbook. Details:
+          {{ stray_check.stdout }}
+      when:
+        - stray_check.stdout is defined
+        - stray_check.stdout | length > 0
 
   tasks:
     # ── 1. Repo sync ────────────────────────────────────────────────
@@ -175,29 +215,67 @@
       when: mode == 'marker-mission'
 
     # ── 4. Post-deploy health probe ────────────────────────────────
+    # Resolve the actual mission UI port from MissionConfig on the
+    # host (default 8080, but operators commonly save per-host
+    # overrides via the /tune page). For fc mode there's no per-host
+    # state so we use the deployment-wide default (8080).
+    - name: Read MissionConfig.ui_port from host (marker-mission mode)
+      ansible.builtin.slurp:
+        src: /home/sdc/.marker_mission/config.json
+      register: mm_cfg_slurp
+      when: mode == 'marker-mission'
+      ignore_errors: true
+
+    - name: Resolve probe port (marker-mission, from MissionConfig)
+      ansible.builtin.set_fact:
+        probe_port: "{{ (mm_cfg_slurp.content | b64decode | from_json).ui_port }}"
+      when:
+        - mode == 'marker-mission'
+        - mm_cfg_slurp is defined
+        - mm_cfg_slurp.content is defined
+
+    - name: Resolve probe port (fallback)
+      ansible.builtin.set_fact:
+        probe_port: "{{ fc_port if mode == 'fc' else mm_port_default }}"
+      when: probe_port is not defined
+
+    - name: Show resolved probe port
+      ansible.builtin.debug:
+        msg: "Probing port {{ probe_port }} (mode={{ mode }})"
+      when: mode in ['fc', 'marker-mission']
+
     - name: Wait for selected service to bind its port
       ansible.builtin.wait_for:
         host: 127.0.0.1
-        port: "{{ {'fc': fc_port, 'marker-mission': mm_port}[mode] }}"
+        port: "{{ probe_port }}"
         timeout: 30
       when: mode in ['fc', 'marker-mission']
 
     - name: Probe /api/telemetry
       ansible.builtin.uri:
-        url: "http://127.0.0.1:{{ {'fc': fc_port, 'marker-mission': mm_port}[mode] }}/api/telemetry"
+        url: "http://127.0.0.1:{{ probe_port }}/api/telemetry"
         return_content: true
         status_code: 200
       when: mode in ['fc', 'marker-mission']
       register: telemetry_probe
 
+    - name: Probe /mission (marker-mission only — confirms UI routes attached)
+      ansible.builtin.uri:
+        url: "http://127.0.0.1:{{ probe_port }}/mission"
+        status_code: 200
+      when: mode == 'marker-mission'
+      register: mission_ui_probe
+
     - name: Deploy complete
       ansible.builtin.debug:
         msg:
           - "✓ Deploy done on {{ inventory_hostname }}"
-          - "  Mode             : {{ mode }}"
-          - "  HEAD             : {{ git_pull.stdout_lines | last }}"
-          - "  Telemetry probe  : {{ (telemetry_probe.status | default('skipped')) }}"
+          - "  Mode               : {{ mode }}"
+          - "  HEAD               : {{ git_pull.stdout_lines | last }}"
+          - "  Probed port        : {{ probe_port | default('n/a') }}"
+          - "  /api/telemetry     : {{ (telemetry_probe.status | default('skipped')) }}"
           - "  Telemetry connected: {{ (telemetry_probe.json.connected | default('n/a')) if mode != 'none' else 'n/a' }}"
+          - "  /mission (UI)      : {{ (mission_ui_probe.status | default('skipped')) }}"
 
   handlers:
     - name: daemon-reload

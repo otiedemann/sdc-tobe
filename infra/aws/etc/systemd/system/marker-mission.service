@@ -1,17 +1,22 @@
 [Unit]
-Description=Marker mission UI + planner (sdc-tobe main branch)
+Description=Marker mission combined app (sdc-tobe main branch)
 After=network.target sphinx-control.service
 Wants=sphinx-control.service
+# Mutual exclusion with the legacy HTTP-only FC. Both units share port
+# 8080 by default; Conflicts= lets either be started without the
+# operator having to stop the other first.
+Conflicts=fc-standalone.service sdc-fc.service
 
 [Service]
 Type=simple
 User=ubuntu
 Group=ubuntu
-# marker_mission lives in the main repo since PR #18 merged. It has
-# its own venv (.venv-marker) separate from the FC's .venv so its
-# matplotlib + jinja stack doesn't pollute the Olympe environment.
+# AWS host has a separate .venv-marker so the mission's matplotlib +
+# jinja deps don't pollute the Olympe environment. With the combined
+# entry point that venv now ALSO needs Olympe (since unified_api_server
+# runs in-process); see infra/aws/install.sh for the dependency union.
 WorkingDirectory=/opt/sdc-tobe
-ExecStart=/opt/sdc-tobe/.venv-marker/bin/python3 -m marker_mission.mission --ui-port 9090 --api-url http://127.0.0.1:8080
+ExecStart=/opt/sdc-tobe/.venv-marker/bin/python3 -m marker_mission.app
 Restart=on-failure
 RestartSec=5s
 StandardOutput=journal

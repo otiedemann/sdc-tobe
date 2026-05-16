@@ -22,7 +22,7 @@ infra/aws/
 │       ├── auto-shutdown.service       #   (target of the timer)
 │       ├── xvfb.service                # Xorg on :99 (name is historical)
 │       ├── sphinx-bootstrap.service    # oneshot: env + drone + FC
-│       ├── marker-mission.service      # :9090 (runs from /opt/sdc-tobe + .venv-marker)
+│       ├── marker-mission.service      # :8080 (combined app — Conflicts= sdc-fc.service)
 │       ├── marker-mission.service.d/
 │       │   └── wait-bootstrap.conf     # wait for sphinx-bootstrap
 │       ├── fc-healthcheck.service      # restart FC if disconnected
@@ -52,7 +52,7 @@ firmwared.service ──┬── xvfb.service (NVIDIA Xorg on :99)
                             │   POST /api/drones
                             │   POST /api/fc
                             ▼
-                     marker-mission.service (:9090)
+                     marker-mission.service (:8080)
                      c2-controller.service  (:8070)
 
 (separate, fires once 3h after boot)  auto-shutdown.timer
@@ -105,7 +105,7 @@ After this the next reboot will bring up everything in order.
 systemctl list-units --type=service --state=running | grep -E \
   'firmwared|xvfb|sphinx-control|marker-mission|c2-controller'
 systemctl list-timers --no-pager | grep auto-shutdown
-sudo ss -lntp | awk '/:8070|:8080|:8090|:8383|:9090/ {print $4}'
+sudo ss -lntp | awk '/:8070|:8080|:8090|:8383/ {print $4}'
 ```
 
 You should see all five units active, `auto-shutdown.timer` in the
