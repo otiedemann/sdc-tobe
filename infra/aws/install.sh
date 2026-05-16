@@ -34,6 +34,13 @@ if [ -d /etc/sudoers.d ]; then
         || echo "  WARNING: sudoers drop-in has a syntax error!"
 fi
 
+echo "[install] running ldconfig for any new /etc/ld.so.conf.d entries..."
+# Picks up etc/ld.so.conf.d/parrot-sphinx.conf so pysphinx can find
+# libtelemetry.so & friends after a fresh image. Without this, the
+# FC's sim-video reader fails to import pysphinx and the video feed
+# silently stays dark.
+sudo ldconfig
+
 echo "[install] copying /opt files..."
 # /opt/sdc-tobe IS the git checkout (cloned as ubuntu) — keep it that
 # way so `git pull` keeps working. cp -a preserves ubuntu ownership,
