@@ -182,3 +182,112 @@ def do_rc(lr: Any = 0, fb: Any = 0, ud: Any = 0, yaw: Any = 0,
         "rc": {"lr": lr, "fb": fb, "ud": ud, "yaw": yaw},
         "duration_ms": dur_ms,
     }, 200
+
+
+# ---------------------------------------------------------------------------
+# Rotation
+# ---------------------------------------------------------------------------
+
+def do_rotate(direction: Any = "", deg: Any = 45) -> tuple[dict, int]:
+    """Discrete CW/CCW rotation. Degrees clamped to [1, 360]."""
+    import unified_api_server as _srv  # sibling import; see header note
+    b = _srv.backend
+    with _srv.conn_lock:
+        connected = _srv.conn_state["connected"]
+    if not connected or b is None:
+        return {"ok": False, "error": "controller not ready"}, 503
+    direction = str(direction or "").lower()
+    if direction not in {"cw", "ccw"}:
+        return {"ok": False, "error": "dir must be one of cw|ccw"}, 400
+    try:
+        degrees = max(1, min(360, int(deg)))
+        _srv.start_discrete_window(
+            1.0 if _srv.drone_type == "tello" else max(1.0, degrees / 90)
+        )
+        ok, msg = b.rotate(direction, degrees)
+        if ok:
+            return {"ok": True, "dir": direction, "deg": degrees}, 200
+        return {"ok": False, "error": msg}, 500
+    except Exception as e:
+        return {"ok": False, "error": str(e)}, 500
+
+
+# ---------------------------------------------------------------------------
+# Video pipeline (MJPEG / forward)
+# ---------------------------------------------------------------------------
+
+def do_video_start(mode: str = "mjpeg",
+                   target_host: str | None = None,
+                   target_port: int | None = None,
+                   stream_url: str | None = None) -> tuple[dict, int]:
+    """Start the backend video pipeline. ``stream_url`` is only used
+    in the response payload — the HTTP route fills it with the
+    request's ``http://<host>/api/video``; in-proc callers leave it
+    as None and consume frames via :func:`iter_video_jpegs` instead."""
+    import unified_api_server as _srv  # sibling import; see header note
+    b = _srv.backend
+    if b is None:
+        return {"ok": False, "error": "controller not ready"}, 503
+    try:
+        if mode == "mjpeg" and _srv._video_streaming and _srv._video_mode == "mjpeg":
+            return {"ok": True, "mode": "mjpeg",
+                    "message": "already streaming",
+                    "stream_url": stream_url}, 200
+        b.video_stop_all()
+        if mode == "mjpeg":
+            ok, msg = b.video_start_mjpeg()
+            if ok:
+                _srv._video_mode = "mjpeg"
+                return {"ok": True, "mode": "mjpeg",
+                        "message": msg, "stream_url": stream_url}, 200
+            print(f"[{_srv.drone_type.upper()}] video_start_mjpeg failed: {msg}")
+            return {"ok": False, "error": msg}, 500
+        elif mode == "forward":
+            if not target_host:
+                return {"ok": False, "error": "target_host required"}, 400
+            tport = int(target_port if target_port is not None
+                        else _srv.VIDEO_UDP_FORWARD_PORT)
+            ok, msg = b.video_start_forward(target_host, tport)
+            if ok:
+                _srv._video_mode = "forward"
+                return {
+                    "ok": True, "mode": "forward", "message": msg,
+                    "target": f"{target_host}:{tport}",
+                    "viewer_cmd": (
+                        f"ffplay -fflags nobuffer -flags low_delay "
+                        f"-framedrop -probesize 32 -analyzeduration 0 "
+                        f"udp://0.0.0.0:{tport}"
+                    ),
+                }, 200
+            print(f"[{_srv.drone_type.upper()}] video_start_forward failed: {msg}")
+            return {"ok": False, "error": msg}, 500
+        return {"ok": False, "error": f"unknown mode: {mode}"}, 400
+    except Exception as e:
+        traceback.print_exc()
+        return {"ok": False, "error": str(e)}, 500
+
+
+def do_video_stop() -> tuple[dict, int]:
+    """Tear down the backend video pipeline. Idempotent."""
+    import unified_api_server as _srv  # sibling import; see header note
+    b = _srv.backend
+    if b:
+        b.video_stop_all()
+    return {"ok": True, "mode": "off"}, 200
+
+
+def iter_video_jpegs():
+    """Yield the latest JPEG frame whenever one is available — an
+    in-proc replacement for the ``/api/video`` MJPEG endpoint. Caller
+    decides what to do with each frame (decode + OpenCV, save to disk,
+    forward to another consumer). Stops when the server is shutting
+    down or the video pipeline transitions away from mjpeg mode."""
+    import unified_api_server as _srv  # sibling import; see header note
+    if _srv._video_mode != "mjpeg":
+        return
+    b = _srv.backend
+    while _srv.running and _srv._video_mode == "mjpeg":
+        jpg = b.get_video_jpeg() if b else b""
+        if jpg:
+            yield jpg
+        time.sleep(1.0 / max(1, _srv.VIDEO_FPS))

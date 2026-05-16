@@ -4868,24 +4868,12 @@ def api_move():
 
 @app.post("/api/rotate")
 def api_rotate():
-    b = backend
-    with conn_lock:
-        connected = conn_state["connected"]
-    if not connected or b is None:
-        return jsonify(ok=False, error="controller not ready"), 503
     data = request.get_json(silent=True) or {}
-    direction = str(data.get("dir", "")).lower()
-    if direction not in {"cw", "ccw"}:
-        return jsonify(ok=False, error="dir must be one of cw|ccw"), 400
-    try:
-        degrees = max(1, min(360, int(data.get("deg", 45))))
-        start_discrete_window(1.0 if drone_type == "tello" else max(1.0, degrees / 90))
-        ok, msg = b.rotate(direction, degrees)
-        if ok:
-            return jsonify(ok=True, dir=direction, deg=degrees)
-        return jsonify(ok=False, error=msg), 500
-    except Exception as e:
-        return jsonify(ok=False, error=str(e)), 500
+    payload, status = drone_core.do_rotate(
+        direction=data.get("dir", ""),
+        deg=data.get("deg", 45),
+    )
+    return jsonify(payload), status
 
 
 @app.post("/api/go")
@@ -5160,68 +5148,35 @@ def api_moveto():
 def api_video_feed():
     if _video_mode != "mjpeg":
         return jsonify(ok=False, error="MJPEG not active. POST /api/video/start with mode=mjpeg"), 400
-    b = backend
+    # The HTTP-layer mjpeg wrapper just frames each jpeg with the
+    # multipart boundary. The actual frame-acquisition loop lives in
+    # drone_core.iter_video_jpegs so in-proc callers can use the same
+    # source.
     def gen():
-        while running and _video_mode == "mjpeg":
-            jpg = b.get_video_jpeg() if b else b""
-            if jpg:
-                yield (b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + jpg + b"\r\n")
-            time.sleep(1.0 / max(1, VIDEO_FPS))
+        for jpg in drone_core.iter_video_jpegs():
+            yield (b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + jpg + b"\r\n")
     return Response(gen(), mimetype="multipart/x-mixed-replace; boundary=frame")
 
 
 @app.post("/api/video/start")
 def api_video_start():
-    global _video_mode
-    b = backend
-    if b is None:
-        return jsonify(ok=False, error="controller not ready"), 503
-    try:
-        data = request.get_json(silent=True) or {}
-        mode = data.get("mode", "mjpeg")
-        # Idempotency guard: if we're already in the requested mode AND
-        # frames are actively flowing, just return OK. The old code
-        # blindly called video_stop_all() + video_start_mjpeg() here,
-        # which tore down and rebuilt the Anafi decoder on every invoke
-        # — several seconds of dropped frames, which showed up as a
-        # frozen position tracker after every takeoff.
-        if mode == "mjpeg" and _video_streaming and _video_mode == "mjpeg":
-            return jsonify(ok=True, mode="mjpeg", message="already streaming",
-                           stream_url=f"http://{request.host}/api/video")
-        # Mode transition (or pipeline was off) — full stop, then start.
-        b.video_stop_all()
-        if mode == "mjpeg":
-            ok, msg = b.video_start_mjpeg()
-            if ok:
-                _video_mode = "mjpeg"
-                return jsonify(ok=True, mode="mjpeg", message=msg, stream_url=f"http://{request.host}/api/video")
-            print(f"[{drone_type.upper()}] video_start_mjpeg failed: {msg}")
-            return jsonify(ok=False, error=msg), 500
-        elif mode == "forward":
-            target_host = data.get("target_host")
-            target_port = int(data.get("target_port", VIDEO_UDP_FORWARD_PORT))
-            if not target_host:
-                return jsonify(ok=False, error="target_host required"), 400
-            ok, msg = b.video_start_forward(target_host, target_port)
-            if ok:
-                _video_mode = "forward"
-                return jsonify(ok=True, mode="forward", message=msg, target=f"{target_host}:{target_port}",
-                               viewer_cmd=f"ffplay -fflags nobuffer -flags low_delay -framedrop -probesize 32 -analyzeduration 0 udp://0.0.0.0:{target_port}")
-            print(f"[{drone_type.upper()}] video_start_forward failed: {msg}")
-            return jsonify(ok=False, error=msg), 500
-        return jsonify(ok=False, error=f"unknown mode: {mode}"), 400
-    except Exception as e:
-        import traceback
-        traceback.print_exc()
-        return jsonify(ok=False, error=str(e)), 500
+    data = request.get_json(silent=True) or {}
+    payload, status = drone_core.do_video_start(
+        mode=data.get("mode", "mjpeg"),
+        target_host=data.get("target_host"),
+        target_port=data.get("target_port"),
+        # HTTP route fills the absolute stream URL so the response is
+        # directly usable by browser/curl clients; in-proc callers
+        # leave this as None and consume frames via iter_video_jpegs().
+        stream_url=f"http://{request.host}/api/video",
+    )
+    return jsonify(payload), status
 
 
 @app.post("/api/video/stop")
 def api_video_stop():
-    b = backend
-    if b:
-        b.video_stop_all()
-    return jsonify(ok=True, mode="off")
+    payload, status = drone_core.do_video_stop()
+    return jsonify(payload), status
 
 
 # ── H.264 endpoint (sim only) ───────────────────────────────────────
