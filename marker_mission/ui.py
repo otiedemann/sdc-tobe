@@ -112,7 +112,7 @@ _PAGE_HEADER = """
               display:block; margin-right:.8rem;">
   <h1 style="line-height:1.15;">to be defined<br>mission control</h1>
   <nav>
-    <a href="/" class="{{ 'active' if active=='video' else '' }}">Camera</a>
+    <a href="/mission" class="{{ 'active' if active=='video' else '' }}">Camera</a>
     <a href="/charts" class="{{ 'active' if active=='charts' else '' }}">Charts</a>
     <a href="/replay" class="{{ 'active' if active=='replay' else '' }}">Replay</a>
     <a href="/tune" class="{{ 'active' if active=='tune' else '' }}">Tune</a>

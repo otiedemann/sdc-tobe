@@ -276,6 +276,48 @@ def do_video_stop() -> tuple[dict, int]:
     return {"ok": True, "mode": "off"}, 200
 
 
+# ---------------------------------------------------------------------------
+# Flight envelope (soft ceiling)
+# ---------------------------------------------------------------------------
+
+def do_set_ceiling(ceiling_m: Any) -> tuple[dict, int]:
+    """Push the soft altitude ceiling to the FC. Same effect as
+    ``POST /api/config/ceiling`` — sets ``MAX_ALTITUDE_M`` (the value
+    the RC tick loop clamps every climb stick against), persists it
+    to ``flight_config.json``, and best-effort updates the Anafi
+    firmware ``MaxAltitude`` cap so the autopilot itself enforces it
+    as a second line of defence.
+
+    marker_mission calls this at startup with ``MissionConfig.max_height_m``
+    so the FC ceiling never disagrees with what the mission's PD
+    output would otherwise produce — without this the FC clamped any
+    mission climb to its persisted ``flight_config.json`` value
+    (typically 2 m), leaving altitude-limited markers unreachable."""
+    import unified_api_server as _srv  # sibling import; see header note
+    try:
+        v = float(ceiling_m)
+    except (TypeError, ValueError):
+        return {"ok": False, "error": "ceiling_m required (float, metres)"}, 400
+    v = max(0.5, min(150.0, v))
+    _srv.MAX_ALTITUDE_M = v
+    firmware_result = None
+    b = _srv.backend
+    try:
+        if b is not None and hasattr(b, "set_settings"):
+            r = b.set_settings({"max_altitude_m": v})
+            firmware_result = r.get("max_altitude_m",
+                                    r.get("max_altitude_m_error"))
+    except Exception as e:
+        firmware_result = f"firmware_error: {e}"
+    try:
+        _srv._save_flight_config({"max_altitude_m": v})
+    except Exception:
+        pass
+    print(f"[CEILING] set to {v}m (firmware={firmware_result})")
+    return {"ok": True, "ceiling_m": v,
+            "firmware_result": firmware_result}, 200
+
+
 def iter_video_jpegs():
     """Yield the latest JPEG frame whenever one is available — an
     in-proc replacement for the ``/api/video`` MJPEG endpoint. Caller

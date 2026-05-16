@@ -172,6 +172,19 @@ def cmd_fly(args: argparse.Namespace) -> int:
         api = DroneApiInProc()
         print(f"[mission] in-process mode: drone_core direct dispatch "
               f"(--api-url ignored)")
+        # Push the mission's altitude envelope to the FC so the FC's
+        # MAX_ALTITUDE_M (which clamps every climb stick) doesn't
+        # silently veto mission climbs above whatever the operator
+        # last persisted in flight_config.json. Only meaningful
+        # in-proc — the HTTP path can't get here before the user has
+        # done the corresponding /tune step manually.
+        try:
+            res = api.set_ceiling(cfg.max_height_m)
+            print(f"[mission] FC ceiling aligned to "
+                  f"max_height_m={cfg.max_height_m}m "
+                  f"(firmware={res.get('firmware_result')})")
+        except Exception as e:
+            print(f"[mission] WARNING: failed to push ceiling to FC: {e}")
     else:
         api = DroneApi(cfg.api_base_url, cfg.request_timeout_s)
         print(f"[mission] contacting API server at {cfg.api_base_url} ...")

@@ -5440,35 +5440,12 @@ def api_ceiling_get():
 
 @app.post("/api/config/ceiling")
 def api_ceiling_set():
-    """Set the soft ceiling (metres above ground). Also pushes the same
-    value to the Anafi firmware MaxAltitude where supported — belt and
-    braces, because the firmware limit gets enforced by the drone's own
-    autopilot and is a useful second line of defence."""
-    global MAX_ALTITUDE_M
     data = request.get_json(silent=True) or {}
-    try:
-        v = float(data.get("ceiling_m") or data.get("max_altitude_m"))
-    except (TypeError, ValueError):
-        return jsonify(ok=False, error="ceiling_m required (float, metres)"), 400
-    v = max(0.5, min(150.0, v))
-    MAX_ALTITUDE_M = v
-    firmware_result = None
-    # Also try to apply the firmware cap — don't let its failure veto
-    # the software ceiling, since the software one is the real safety.
-    b = backend
-    try:
-        if b is not None and hasattr(b, "set_settings"):
-            r = b.set_settings({"max_altitude_m": v})
-            firmware_result = r.get("max_altitude_m", r.get("max_altitude_m_error"))
-    except Exception as e:
-        firmware_result = f"firmware_error: {e}"
-    # Persist so a server restart keeps the value
-    try:
-        _save_flight_config({"max_altitude_m": v})
-    except Exception:
-        pass
-    print(f"[CEILING] set to {v}m (firmware={firmware_result})")
-    return jsonify(ok=True, ceiling_m=v, firmware_result=firmware_result)
+    payload, status = drone_core.do_set_ceiling(
+        data.get("ceiling_m") if data.get("ceiling_m") is not None
+        else data.get("max_altitude_m")
+    )
+    return jsonify(payload), status
 
 
 @app.get("/api/config/arena_safety")

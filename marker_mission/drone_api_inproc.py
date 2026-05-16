@@ -126,6 +126,15 @@ class DroneApiInProc:
     def rc_zero(self) -> dict:
         return self.rc(0, 0, 0, 0, duration_ms=200)
 
+    def set_ceiling(self, ceiling_m: float) -> dict:
+        """Push the soft altitude ceiling to the FC. mission.py calls
+        this on startup so the FC's MAX_ALTITUDE_M (which clamps every
+        climb stick at the wire) matches MissionConfig.max_height_m
+        — without it the FC's persisted flight_config.json ceiling
+        wins, and mission can't reach markers mounted higher than
+        whatever the operator last saved on /tune."""
+        return self._unwrap(*drone_core.do_set_ceiling(ceiling_m))
+
     def camera_config_get(self) -> dict:
         # The /api/camera/config endpoint isn't migrated to drone_core
         # yet — fall through to the Flask test_client so we keep the
