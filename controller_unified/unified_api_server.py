@@ -38,6 +38,17 @@ except ImportError:
     _HAS_JSON_PROVIDER = False
 import json as _json
 
+# Drone-control core: route handlers above /api/takeoff, /api/land,
+# /api/rc, /api/emergency and /api/telemetry delegate to this module's
+# do_*/get_* functions, so an in-process consumer (marker_mission) can
+# bypass the HTTP layer entirely. drone_core lazy-imports this module
+# back to reach the shared globals — no circular-import cost because
+# the back-references are resolved at first call, not at module load.
+# Sibling import (no relative ``.``) because this file is launched as
+# a top-level script (`python unified_api_server.py`) with cwd set to
+# the controller_unified/ directory by the launcher.
+import drone_core
+
 # ---------------------------------------------------------------------------
 # Architecture detection. The SDC26 flight controller is an x86 Linux
 # box running Olympe + Anafi (NOT a Raspberry Pi — comments and module
@@ -4515,90 +4526,14 @@ def _auto_record_after_takeoff(grace_s: float = 2.5):
 
 @app.post("/api/takeoff")
 def api_takeoff():
-    global flying, takeoff_cooldown_until
-    b = backend
-    with conn_lock:
-        connected = conn_state["connected"]
-    if not connected or b is None:
-        return jsonify(ok=False, error="controller not ready"), 503
-    try:
-        if not flying:
-            hold_s = SAFE_TAKEOFF_S if safe_takeoff_enabled else 3.0
-            start_discrete_window(hold_s)
-            b.before_discrete_command()
-            ok, msg = b.takeoff()
-            b.after_discrete_command()
-            if ok:
-                flying = True
-                takeoff_cooldown_until = time.time() + hold_s
-                # Belt-and-braces: ensure every flight is recorded. The C2
-                # FlightLogger normally fires /api/video/record/start with a
-                # matched-name mp4 within ~1 s of seeing flying=True; this
-                # thread is the fallback for C2-less operation.
-                try:
-                    threading.Thread(
-                        target=_auto_record_after_takeoff,
-                        kwargs={"grace_s": 2.5},
-                        daemon=True, name="auto-record",
-                    ).start()
-                except Exception as te:
-                    print(f"[REC] Could not spawn auto-record thread: {te}")
-            else:
-                print(f"[{drone_type.upper()}] Takeoff returned ok=False msg={msg}")
-                return jsonify(ok=False, error=msg), 500
-        return jsonify(ok=True, flying=flying, safe_takeoff=safe_takeoff_enabled)
-    except Exception as e:
-        import traceback
-        traceback.print_exc()
-        # Tello: attempt recovery on failure
-        if drone_type == "tello":
-            rok, rmsg = b.recover()
-            return jsonify(ok=False, error="takeoff_failed", recovered=rok, message=rmsg), 500
-        return jsonify(ok=False, error=str(e)), 500
+    payload, status = drone_core.do_takeoff()
+    return jsonify(payload), status
 
 
 @app.post("/api/land")
 def api_land():
-    global flying, rc_override, rc_override_until
-    b = backend
-    with conn_lock:
-        connected = conn_state["connected"]
-    if not connected or b is None:
-        return jsonify(ok=False, error="controller not ready"), 503
-    try:
-        if not flying:
-            return jsonify(ok=True, flying=False)
-        start_discrete_window(3.0)
-        with pressed_lock:
-            pressed_web.clear()
-            key_last_seen.clear()
-        with rc_lock:
-            rc_override = None
-            rc_override_until = 0.0
-        b.before_discrete_command()
-        ok, msg = b.land()
-        b.after_discrete_command()
-        if ok:
-            flying = False
-            # Close any auto-started recording so its mp4 is properly
-            # finalised on disk. If C2's FlightLogger is the one driving
-            # recording it will call /api/video/record/stop itself; doing
-            # it here as well is idempotent (the second call returns
-            # ok=False "not recording", which we ignore).
-            try:
-                _stop_recording_internal(reason="land")
-            except Exception as se:
-                print(f"[REC] Auto-stop on land failed: {se}")
-            return jsonify(ok=True, flying=False)
-        print(f"[{drone_type.upper()}] Land returned ok=False msg={msg}")
-        return jsonify(ok=False, error=msg), 500
-    except Exception as e:
-        import traceback
-        traceback.print_exc()
-        if drone_type == "tello":
-            rok, rmsg = b.recover()
-            return jsonify(ok=False, error="land_failed", recovered=rok, message=rmsg), 500
-        return jsonify(ok=False, error=str(e)), 500
+    payload, status = drone_core.do_land()
+    return jsonify(payload), status
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -4905,17 +4840,8 @@ def api_flip():
 
 @app.post("/api/emergency")
 def api_emergency():
-    global flying
-    b = backend
-    if b is None:
-        return jsonify(ok=False, error="controller not ready"), 503
-    try:
-        ok, msg = b.emergency()
-        flying = False
-        return jsonify(ok=ok)
-    except Exception as e:
-        flying = False
-        return jsonify(ok=False, error=str(e)), 500
+    payload, status = drone_core.do_emergency()
+    return jsonify(payload), status
 
 
 @app.post("/api/move")
@@ -4986,22 +4912,15 @@ def api_go():
 
 @app.post("/api/rc")
 def api_rc():
-    global rc_override, rc_override_until
     data = request.get_json(silent=True) or {}
-    def clamp(v):
-        try:
-            return max(-100, min(100, int(v)))
-        except Exception:
-            return 0
-    lr = clamp(data.get("lr", 0))
-    fb = clamp(data.get("fb", 0))
-    ud = clamp(data.get("ud", 0))
-    yaw = clamp(data.get("yaw", 0))
-    dur_ms = max(50, min(2000, int(data.get("duration_ms", 250))))
-    with rc_lock:
-        rc_override = (lr, fb, ud, yaw)
-        rc_override_until = time.time() + (dur_ms / 1000.0)
-    return jsonify(ok=True, rc={"lr": lr, "fb": fb, "ud": ud, "yaw": yaw}, duration_ms=dur_ms)
+    payload, status = drone_core.do_rc(
+        lr=data.get("lr", 0),
+        fb=data.get("fb", 0),
+        ud=data.get("ud", 0),
+        yaw=data.get("yaw", 0),
+        duration_ms=data.get("duration_ms", 250),
+    )
+    return jsonify(payload), status
 
 
 @app.post("/api/recover")
@@ -5942,8 +5861,9 @@ def _build_telemetry_payload() -> dict:
 
 @app.get("/api/telemetry")
 def api_telemetry():
-    payload = _build_telemetry_payload()
+    payload, status = drone_core.get_telemetry_payload()
     resp = jsonify(payload)
+    resp.status_code = status
     resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
     resp.headers["Pragma"] = "no-cache"
     resp.headers["Expires"] = "0"
