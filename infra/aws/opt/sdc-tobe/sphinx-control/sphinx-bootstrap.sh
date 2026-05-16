@@ -234,6 +234,19 @@ else
 fi
 
 # ─── stage 3: FC connected ──────────────────────────────────────
+#
+# SPHINX_BOOTSTRAP_SKIP_FC=1 disables this stage entirely. Set on the
+# sphinx-bootstrap.service unit so boot + Recover only bring up env +
+# drone — the operator then starts whichever FC they want manually
+# (controller_unified's unified_api_server.py, marker_mission.app, or
+# something else). Stage 1 + 2 still run because the sim isn't useful
+# without UE4 and a spawned drone.
+
+if [ "${SPHINX_BOOTSTRAP_SKIP_FC:-0}" = "1" ]; then
+    log "stage 3 skip: SPHINX_BOOTSTRAP_SKIP_FC=1 (FC must be started manually)"
+    log "recovery done — env+drone healthy, FC intentionally not started"
+    exit 0
+fi
 
 if fc_connected; then
     log "stage 3 skip: FC connected"

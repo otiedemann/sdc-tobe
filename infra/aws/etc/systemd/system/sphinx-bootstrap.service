@@ -1,5 +1,5 @@
 [Unit]
-Description=Auto-bring-up sphinx env + drone + FC after boot
+Description=Auto-bring-up sphinx env + drone after boot (FC started manually)
 After=sphinx-control.service network-online.target
 Wants=sphinx-control.service
 Before=marker-mission.service
@@ -8,6 +8,11 @@ Before=marker-mission.service
 Type=oneshot
 User=ubuntu
 Group=ubuntu
+# Skip stage 3 (unified_api_server.py FC bring-up). The boot path leaves
+# env + drone healthy and the operator starts the FC of their choice
+# manually (e.g. `python -m marker_mission.app --drone-ip 10.202.0.1`).
+# Set to 0 (or unset) to re-enable the legacy auto-FC behaviour.
+Environment=SPHINX_BOOTSTRAP_SKIP_FC=1
 ExecStart=/opt/sdc-tobe/sphinx-control/sphinx-bootstrap.sh
 TimeoutStartSec=300
 RemainAfterExit=yes
