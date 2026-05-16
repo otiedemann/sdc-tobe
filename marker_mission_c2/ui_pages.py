@@ -481,15 +481,20 @@ PAGE_TUNE = """
       <input type="checkbox" id="tune-also-save">
       Also persist with /api/tune/save on each selected FC
     </label>
+    <label style="font-size:.85rem; display:inline-flex; align-items:center;
+                  gap:.3rem; margin-left:1rem;">
+      <input type="checkbox" id="tune-only-changed">
+      Send only fields I edited (diff vs source FC)
+    </label>
   </div>
 
   <div class="card">
     <h2>Tuning parameters</h2>
     <p style="color:#aab; font-size:.85rem; margin:0 0 .5rem 0;">
-      Edits below are local until you press
-      <em>Apply to selected FCs</em>. The form is generated from the
-      source FC's current values; reload to pick up new fields after a
-      marker_mission upgrade.
+      Apply pushes every field shown to each selected FC — useful for
+      sync'ing a source FC's full config to the rest of the fleet.
+      Tick <em>Send only fields I edited</em> if you want to override
+      just a few values without touching the rest.
     </p>
     <div id="tune-form"
          style="display:grid;
@@ -554,9 +559,14 @@ PAGE_TUNE = """
     }
   }
 
-  function collectUpdates() {
-    // Diff against originalValues; only fields the operator changed are
-    // included so other FCs keep whatever they already had per-field.
+  function collectUpdates(opts) {
+    // Apply = "make the selected FCs match what the form shows" — so
+    // by default we send EVERY field, not just the diff. That matches
+    // the C2's "load from one FC, push to others" model where the
+    // source FC is canonical. If the operator only wants to override
+    // a subset of fields they can clear the rest (or use the "only
+    // changed" checkbox if surfaced later).
+    const onlyChanged = !!(opts && opts.onlyChanged);
     const updates = {};
     document.querySelectorAll('#tune-form input').forEach(el => {
       const k = el.dataset.name;
@@ -568,14 +578,22 @@ PAGE_TUNE = """
         const f = Number(el.value);
         if (Number.isNaN(f)) return;
         v = f;
+      } else if (kind === 'null' && el.value === '') {
+        // Field was null on the source FC and the operator left it
+        // empty — skip rather than push the string "" which the FC
+        // would type-check against a numeric field and reject.
+        return;
       } else {
         v = el.value;
       }
-      const orig = originalValues[k];
-      const same = (kind === 'bool') ? (orig === v)
-                    : (kind === 'number') ? (Number(orig) === v)
-                    : (String(orig === null ? '' : orig) === String(v));
-      if (!same) updates[k] = v;
+      if (onlyChanged) {
+        const orig = originalValues[k];
+        const same = (kind === 'bool') ? (orig === v)
+                      : (kind === 'number') ? (Number(orig) === v)
+                      : (String(orig === null ? '' : orig) === String(v));
+        if (same) return;
+      }
+      updates[k] = v;
     });
     return updates;
   }
@@ -616,9 +634,12 @@ PAGE_TUNE = """
       msg.textContent = 'no FCs selected'; msg.style.color = '#f87171';
       return;
     }
-    const updates = collectUpdates();
+    const onlyChanged = $('tune-only-changed') && $('tune-only-changed').checked;
+    const updates = collectUpdates({onlyChanged});
     if (!Object.keys(updates).length) {
-      msg.textContent = 'no field changes to apply';
+      msg.textContent = onlyChanged
+        ? 'no field changes vs source FC to apply'
+        : 'load a source FC first';
       msg.style.color = '#facc15';
       return;
     }
