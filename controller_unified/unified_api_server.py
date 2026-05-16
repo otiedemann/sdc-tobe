@@ -6870,7 +6870,16 @@ def api_arena_config_reset():
 # Main
 # ═══════════════════════════════════════════════════════════════════════════
 
-def main():
+def init_backend_and_threads() -> bool:
+    """Bring up the drone backend and start the supporting background
+    threads (telemetry, reconnect, RC, watchdog, drone-ping, optional
+    positioning). Does NOT start the HTTP server — that's the caller's
+    job, so the combined ``marker_mission/app.py`` entry point can
+    reuse this setup and then run its own Flask app instance.
+
+    Returns True on success, False if backend selection failed (caller
+    should abort). Idempotent: safe to call once per process at boot.
+    """
     global backend, drone_type, drone_ip
 
     drone_type, drone_ip = detect_drone_type()
@@ -6878,18 +6887,18 @@ def main():
     if drone_type == "tello":
         if not HAS_TELLO_SDK:
             print("ERROR: djitellopy not installed. pip install djitellopy")
-            return
+            return False
         logging.getLogger("djitellopy").setLevel(logging.CRITICAL)
         backend = TelloBackend(drone_ip)
     elif drone_type == "anafi":
         if not HAS_OLYMPE_SDK:
             print("ERROR: olympe not installed.")
-            return
+            return False
         logging.getLogger("olympe").setLevel(logging.WARNING)
         backend = OlympeBackend(drone_ip)
     else:
         print(f"ERROR: Unknown drone type: {drone_type}")
-        return
+        return False
 
     logging.getLogger("werkzeug").setLevel(logging.ERROR)
 
@@ -6928,7 +6937,6 @@ def main():
         print(f"[ANAFI] Positioning thread started (enabled={_pos_cfg.get('enabled', False)})")
 
     tag = drone_type.upper()
-    print(f"[{tag}] Unified API server: http://{HTTP_HOST}:{HTTP_PORT}")
     print(f"[{tag}] Drone: {drone_type} @ {drone_ip} (auto-reconnect; watchdog={REMOTE_TIMEOUT_S}s)")
     print(f"[{tag}] SDKs available: tello={HAS_TELLO_SDK}, olympe={HAS_OLYMPE_SDK}")
     print(f"[{tag}] Code version: {CODE_VERSION}")
@@ -6937,6 +6945,18 @@ def main():
               f"({_FC_GIT_REVISION.get('branch','?')}"
               f"{' dirty' if _FC_GIT_REVISION.get('dirty') else ''}) — "
               f"{_FC_GIT_REVISION.get('subject','')[:80]}")
+    return True
+
+
+def main():
+    """Standalone HTTP-only entry point. Brings up the backend +
+    threads, then runs Flask on the unified port. The combined entry
+    point ``marker_mission/app.py`` does NOT call this — it calls
+    ``init_backend_and_threads()`` itself and runs the same ``app``
+    on the mission's port instead."""
+    if not init_backend_and_threads():
+        return
+    print(f"[{drone_type.upper()}] Unified API server: http://{HTTP_HOST}:{HTTP_PORT}")
     app.run(host=HTTP_HOST, port=HTTP_PORT, threaded=True, use_reloader=False)
 
 

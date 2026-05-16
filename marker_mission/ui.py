@@ -3317,7 +3317,8 @@ class UiServer:
                  flight_dir_provider: Optional[Callable[[], Optional[Path]]] = None,
                  arena_holder=None,
                  api=None,
-                 stream_reader=None):
+                 stream_reader=None,
+                 external_app: Optional["Flask"] = None):
         self.state = state
         self.frame = latest_frame
         self.host = host
@@ -3359,7 +3360,18 @@ class UiServer:
         # shared across browser tabs, but that's fine for our scale.
         self._replays: dict = {}
         self._replays_lock = threading.Lock()
-        self.app = Flask(__name__)
+        # When ``external_app`` is provided (the combined entry point
+        # in ``marker_mission/app.py``), attach our routes to that
+        # Flask app instead of creating our own. ``self.owns_app`` then
+        # tells :meth:`start` to skip ``app.run`` — the caller drives
+        # the server. In standalone mode (existing behaviour),
+        # ``external_app=None`` keeps the previous Flask-per-UI model.
+        if external_app is not None:
+            self.app = external_app
+            self.owns_app = False
+        else:
+            self.app = Flask(__name__)
+            self.owns_app = True
         self._register_routes()
         self._thread: Optional[threading.Thread] = None
 
@@ -3538,9 +3550,16 @@ class UiServer:
             base.update(overrides)
             return base
 
-        @app.get("/")
-        def index():
+        # Operator dashboard root. In standalone mode this also serves
+        # at "/" so existing bookmarks keep working. In the combined
+        # app (marker_mission/app.py), "/" is owned by unified_api_server
+        # — only "/mission" is registered to avoid the collision.
+        @app.get("/mission")
+        def mission_index():
             return render_template_string(_PAGE_VIDEO, **live_ctx())
+        if self.owns_app:
+            app.add_url_rule("/", endpoint="index_root",
+                             view_func=mission_index)
 
         @app.get("/charts")
         def charts():
@@ -4270,7 +4289,12 @@ class UiServer:
         # ---- Camera live config passthrough (proxy to upstream) -------
         # GET hits the unified API server and returns its config JSON
         # to the calibrate page. POST forwards the form payload back.
-        @app.get("/api/camera/config")
+        # Routed at /api/mission/camera/config because /api/camera/config
+        # is owned by unified_api_server in the combined Flask app —
+        # this rename keeps both surfaces reachable on one port. In
+        # standalone mode the old path is also registered so existing
+        # frontend code keeps working without a coordinated rollout.
+        @app.get("/api/mission/camera/config")
         def api_camera_config_get_proxy():
             try:
                 cfg = self.api.camera_config_get() if self.api else None
@@ -4282,7 +4306,7 @@ class UiServer:
             # Upstream returns {ok, config} -- pass through.
             return jsonify(cfg)
 
-        @app.post("/api/camera/config")
+        @app.post("/api/mission/camera/config")
         def api_camera_config_set_proxy():
             data = request.get_json(silent=True)
             if not isinstance(data, dict):
@@ -4296,6 +4320,24 @@ class UiServer:
                 return jsonify({"ok": False,
                                 "error": "drone api not wired"}), 503
             return jsonify(resp)
+
+        # Back-compat: standalone mode also exposes the old paths so
+        # existing /calibrate frontend code keeps working without a
+        # coordinated URL update. Skipped in combined mode because
+        # unified_api_server owns /api/camera/config there.
+        if self.owns_app:
+            app.add_url_rule(
+                "/api/camera/config",
+                endpoint="api_camera_config_get_legacy",
+                view_func=api_camera_config_get_proxy,
+                methods=["GET"],
+            )
+            app.add_url_rule(
+                "/api/camera/config",
+                endpoint="api_camera_config_set_legacy",
+                view_func=api_camera_config_set_proxy,
+                methods=["POST"],
+            )
 
         @app.get("/api/calibrate/status")
         def api_calibrate_status():
@@ -4564,6 +4606,12 @@ class UiServer:
 
     def start(self) -> None:
         if self._thread and self._thread.is_alive():
+            return
+        if not self.owns_app:
+            # Combined mode: the embedding entry point (marker_mission/
+            # app.py) owns the Flask lifecycle. Our routes are already
+            # registered on its app from __init__; there's nothing
+            # else for us to start.
             return
         def run():
             # Disable Flask's request log spam

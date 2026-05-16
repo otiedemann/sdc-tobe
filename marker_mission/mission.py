@@ -58,6 +58,7 @@ from .config import (CALIB_DIR, FLIGHTS_DIR, DEFAULT_DATA_DIR,
 from .controller import MissionController, MissionState, Phase
 from . import mission_script as ms
 from .drone_api import DroneApi, MjpegStreamReader, TelemetrySnapshot
+from .drone_api_inproc import DroneApiInProc, InProcMjpegReader
 from .kalman import PositionKalman, ned_velocity_to_arena
 from .recorder import FlightRecorder, make_flight_dir, write_meta
 from .ui import LatestFrame, UiServer
@@ -166,8 +167,14 @@ def cmd_fly(args: argparse.Namespace) -> int:
     # default Anafi intrinsics and the telemetry_worker re-checks
     # connectivity in the background so the Start button unlocks as
     # soon as the drone shows up.
-    api = DroneApi(cfg.api_base_url, cfg.request_timeout_s)
-    print(f"[mission] contacting API server at {cfg.api_base_url} ...")
+    in_process = bool(getattr(args, "in_process", False))
+    if in_process:
+        api = DroneApiInProc()
+        print(f"[mission] in-process mode: drone_core direct dispatch "
+              f"(--api-url ignored)")
+    else:
+        api = DroneApi(cfg.api_base_url, cfg.request_timeout_s)
+        print(f"[mission] contacting API server at {cfg.api_base_url} ...")
     serial = "unknown"
     initially_connected = False
     deadline = time.monotonic() + 5.0
@@ -224,7 +231,10 @@ def cmd_fly(args: argparse.Namespace) -> int:
             api.video_start_mjpeg()
         except Exception as e:
             print(f"[mission] video_start_mjpeg failed: {e} (will retry)")
-    reader = MjpegStreamReader(api.video_url())
+    if in_process:
+        reader = InProcMjpegReader()
+    else:
+        reader = MjpegStreamReader(api.video_url())
     reader.start()
     detector = ArucoDetector(calibration, cfg.marker_size_m, cfg.aruco_dict)
     detector.enable_mirror_collapse = cfg.enable_ippe_mirror_collapse
@@ -442,6 +452,13 @@ def cmd_fly(args: argparse.Namespace) -> int:
 
     cal_capture = CalibrationCapture(reader, CALIB_DIR, fps=cfg.record_fps)
 
+    # In combined-app mode the Flask lifecycle is owned by the
+    # unified-server side; hand UiServer its app so our routes register
+    # there instead of UiServer creating its own.
+    external_app = None
+    if in_process:
+        import unified_api_server as _srv
+        external_app = _srv.app
     ui = UiServer(state, latest_ann_frame,
                   host=cfg.ui_host, port=cfg.ui_port,
                   history_s=cfg.ui_telemetry_history_s,
@@ -455,9 +472,14 @@ def cmd_fly(args: argparse.Namespace) -> int:
                   flight_dir_provider=lambda: flight_dir_box[0],
                   arena_holder=arena_holder,
                   api=api,
-                  stream_reader=reader)
+                  stream_reader=reader,
+                  external_app=external_app)
     ui.start()
-    print(f"[mission] UI running at {ui.url()} (camera) and {ui.url()}/charts")
+    if in_process:
+        print(f"[mission] UI routes registered on combined Flask app "
+              f"(served by marker_mission.app)")
+    else:
+        print(f"[mission] UI running at {ui.url()} (camera) and {ui.url()}/charts")
 
     # ---------- 4. Background workers ------------------------------------
     stop = threading.Event()
@@ -990,6 +1012,12 @@ def _build_parser() -> argparse.ArgumentParser:
                          "(e.g. http://127.0.0.1:5050)")
     pf.add_argument("--ui-port", type=int, default=None,
                     help="port for the operator UI (default 8080)")
+    pf.add_argument("--in-process", action="store_true",
+                    help="Talk to unified_api_server directly in-memory "
+                         "via drone_core (no HTTP). Requires that "
+                         "marker_mission/app.py was the entry point so "
+                         "the unified backend is loaded in this process. "
+                         "Ignores --api-url.")
     pf.add_argument("--resolution", default="720p",
                     help="video resolution label for calibration lookup")
     pf.add_argument("--arena-config", default=None,
