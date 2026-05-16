@@ -306,13 +306,34 @@ def _build_app(cfg: C2Config, pool: FCPool, library: CalibrationLibrary,
         if not ok or not isinstance(payload, dict):
             return jsonify({"ok": False, "error": _err(payload)}), 200
         # marker_mission's /api/tune returns
-        # {pyd_form_fields, current_values, ...}. We only need the
-        # current values for the C2 editor — the form schema lives on
-        # each FC and we don't try to reconcile differences across FC
-        # versions in v1.
-        values = (payload.get("current_values")
-                  or payload.get("values")
-                  or {})
+        # {groups: [{name, items: [{name, value, kind, label, ...}]}]}.
+        # We flatten that to a flat {field_name: value} dict for the
+        # C2 editor — schema (groups / labels / hints) lives on each
+        # FC and we don't try to reconcile cross-FC version differences
+        # in v1. Older shapes (current_values / values) are kept as
+        # graceful fallbacks for forward compatibility, but the live
+        # marker_mission ships only `groups`.
+        values: dict[str, Any] = {}
+        groups = payload.get("groups")
+        if isinstance(groups, list):
+            for g in groups:
+                if not isinstance(g, dict):
+                    continue
+                items = g.get("items") or []
+                if not isinstance(items, list):
+                    continue
+                for item in items:
+                    if not isinstance(item, dict):
+                        continue
+                    name = item.get("name")
+                    if isinstance(name, str) and name:
+                        values[name] = item.get("value")
+        if not values:
+            # Legacy shapes — kept for FCs running older marker_mission
+            # ahead of an upgrade.
+            values = (payload.get("current_values")
+                      or payload.get("values")
+                      or {})
         return jsonify({"ok": True, "values": values})
 
     @app.post("/api/c2/tune/apply")
