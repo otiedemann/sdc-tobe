@@ -172,6 +172,39 @@ def _intrusion_detected(ctx: _ScoreCtx) -> bool:
 # Task factories
 # ---------------------------------------------------------------------------
 
+def _safe_hover_xy(s: StrategySettings, marker_xy: Tuple[float, float],
+                   inset_m: float = 1.5) -> Tuple[float, float]:
+    """Compute a safe (x, y) for the drone to hover at, given a wall-
+    mounted marker's position. We do TWO transforms:
+
+    1. **Pull toward arena centre by ``inset_m``** so the drone is
+       ~1.5 m clear of the wall the marker is mounted on. Without this,
+       the drone would be commanded TO the wall coordinate (e.g.
+       target 31 sits at (5, 8) which is the +X wall itself) and
+       overshoot it.
+    2. **Clamp to the arena's safe inner box** (half-extent minus
+       ``arena.safety_margin_m``). Belt-and-braces — if the marker
+       position drifts past the wall (sometimes happens with the SDC
+       arena tooling) we still don't generate an OOB script.
+    """
+    mx, my = float(marker_xy[0]), float(marker_xy[1])
+    half_w = s.arena.width_m / 2.0 - s.arena.safety_margin_m
+    half_d = s.arena.depth_m / 2.0 - s.arena.safety_margin_m
+    # Step 1: pull toward origin.  unit-vector from marker→(0,0)
+    import math
+    r = math.hypot(mx, my)
+    if r > 1e-6:
+        ux, uy = -mx / r, -my / r
+        sx = mx + ux * inset_m
+        sy = my + uy * inset_m
+    else:
+        sx, sy = mx, my
+    # Step 2: clamp to safe arena box.
+    sx = max(-half_w, min(half_w, sx))
+    sy = max(-half_d, min(half_d, sy))
+    return (sx, sy)
+
+
 def build_attacker_task(
     fc: str,
     ctx: _ScoreCtx,
@@ -186,6 +219,10 @@ def build_attacker_task(
     Falls back to a plain :class:`HoldAboveTarget` if no partner is
     available (solo attacker — never executes the 10-pt move, just
     holds).
+
+    The hover position is **not** the marker's coordinate (which sits
+    on the wall) — it's pulled inward by :func:`_safe_hover_xy` so the
+    drone stages safely inside the arena.
     """
     s = ctx.settings
     pos = target_pos(target_marker_id)
@@ -193,24 +230,27 @@ def build_attacker_task(
         log.warning("attacker on %s: target_id %s has no known position",
                     fc, target_marker_id)
         return Idle(fc)
+    safe_xy = _safe_hover_xy(s, (pos[0], pos[1]))
     partner_pos = (target_pos(partner_target_marker_id)
                    if partner_target_marker_id is not None else None)
+    partner_safe = (_safe_hover_xy(s, (partner_pos[0], partner_pos[1]))
+                    if partner_pos is not None else None)
 
-    if partner_fc is not None and partner_pos is not None:
+    if partner_fc is not None and partner_safe is not None:
         return SyncAttackPair(
             target=fc,
             target_marker_id=target_marker_id,
-            target_pos=(pos[0], pos[1]),
+            target_pos=safe_xy,
             hover_alt_m=s.attack.hover_alt_m,
             strike_alt_m=s.attack.strike_alt_m,
             partner_fc=partner_fc,
-            partner_target_pos=(partner_pos[0], partner_pos[1]),
+            partner_target_pos=partner_safe,
             sync_window_s=s.attack.sync_window_s,
             ready_radius_m=1.5,
         )
     return HoldAboveTarget(
         target=fc, target_marker_id=target_marker_id,
-        hover_alt_m=s.attack.hover_alt_m, target_pos=(pos[0], pos[1]),
+        hover_alt_m=s.attack.hover_alt_m, target_pos=safe_xy,
     )
 
 

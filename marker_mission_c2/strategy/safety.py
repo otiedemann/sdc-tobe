@@ -40,11 +40,14 @@ class SafetyConfig:
     # actually performs the descent; STOP_MISSION just ends the script.
     battery_critical_pct: float = 12.0
 
-    # Geofence in arena coords. None = no fence on that axis. Used for
-    # logging-only warnings (see module docstring).
+    # Geofence in arena coords. None = no fence on that axis. When
+    # ``geofence_enforce=True`` (default), a pose outside any bound is
+    # treated as an emergency and the gate forces STOP_MISSION — the
+    # drone lands where it is. Set False to revert to log-only.
     bounds_x_m: Optional[Tuple[float, float]] = None
     bounds_y_m: Optional[Tuple[float, float]] = None
     bounds_z_m: Optional[Tuple[float, float]] = None
+    geofence_enforce: bool = True
 
     # Throttle repeated stop spam: don't re-issue STOP_MISSION to a drone
     # more often than this. Without it, every tick where the FC is still
@@ -160,10 +163,39 @@ class SafetyGate:
                 state.t,
             )
 
-        # Geofence: warn, don't override. Mission script owns enforcement.
+        # Geofence: hard-enforced when ``cfg.geofence_enforce`` is set.
+        # Any axis breach → STOP_MISSION (the FC's safe-shutdown path
+        # lands the drone where it is). Without this, a runaway mission
+        # script can fly the drone straight through a wall — exactly
+        # what bit us once.
+        if self.cfg.geofence_enforce and obs.pose is not None:
+            breach = self._geofence_breach(obs)
+            if breach:
+                return self._stop(cmd, f"geofence breach: {breach}", state.t)
+
+        # Always log non-fatal warnings (used to be the only path).
         self._maybe_warn_geofence(obs)
 
         return SafetyVerdict(cmd, "")
+
+    def _geofence_breach(self, obs: DroneObservation) -> Optional[str]:
+        """Return a human-readable breach description, or None if the
+        pose is inside every configured bound. Used by the strict
+        enforcement path above."""
+        x, y, z = obs.pose
+        for axis, value, bounds in (
+            ("x", x, self.cfg.bounds_x_m),
+            ("y", y, self.cfg.bounds_y_m),
+            ("z", z, self.cfg.bounds_z_m),
+        ):
+            if bounds is None:
+                continue
+            lo, hi = bounds
+            if value < lo:
+                return f"{axis}={value:.2f} < {lo:.2f}"
+            if value > hi:
+                return f"{axis}={value:.2f} > {hi:.2f}"
+        return None
 
     # ----- internals -----
 

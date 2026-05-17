@@ -62,12 +62,24 @@ def build_planner(cfg, settings_obj: StrategySettings) -> SwarmPlanner:
     )
 
 
-def build_safety(cfg) -> SafetyGate:
-    """Default safety: stop on stale poll / battery <12 % / link drop.
-    Override for arena-specific geofence or different thresholds."""
+def build_safety(cfg, settings_obj: StrategySettings) -> SafetyGate:
+    """Default safety: stop on stale poll / battery <12 % / link drop /
+    geofence breach. Bounds are read from
+    :class:`StrategySettings.arena` and pulled inward by
+    ``safety_margin_m`` so the enforcement boundary sits inside the
+    physical wall — the drone must STOP_MISSION *before* reaching the
+    wall, not after clipping through it.
+    """
+    a = settings_obj.arena
+    half_w = a.width_m / 2.0 - a.safety_margin_m
+    half_d = a.depth_m / 2.0 - a.safety_margin_m
     return SafetyGate(SafetyConfig(
         poll_stale_s=max(3.0, 2.0 / max(0.1, cfg.state_poll_hz) * 6.0),
         battery_critical_pct=12.0,
+        bounds_x_m=(-half_w, half_w),
+        bounds_y_m=(-half_d, half_d),
+        bounds_z_m=(0.2, 5.5),  # 20 cm floor → 5.5 m ceiling
+        geofence_enforce=True,
     ))
 
 
@@ -93,7 +105,7 @@ async def run(cfg, tick_hz: float,
     )
     world_model = SwarmWorldModel(pool)
     planner = build_planner(cfg, settings_obj)
-    safety = build_safety(cfg)
+    safety = build_safety(cfg, settings_obj)
     match_state = MatchState(duration_s=settings_obj.match.duration_s)
     runner = SwarmRunner(
         pool=pool,
