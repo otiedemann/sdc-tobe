@@ -187,6 +187,7 @@ section so they can never run together).
 | `UD` | `rc [seconds]` | Raw up/down stick |
 | `YAW` | `deg` | Discrete rotation, `deg` ∈ `[-180,+180]` (+cw, -ccw) |
 | `RC` | `lr fb ud yaw [seconds]` | All four sticks at once (yaw stays a stick) |
+| `SCOUT` | — | Slow 360° yaw spin (CW, stick=15) — "look around" |
 
 Seconds may be fractional (`1.5`, `0.25`). Full docs at
 `marker_mission/docs/MISSION_REFERENCE.md`.

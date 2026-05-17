@@ -311,6 +311,25 @@ command, whose yaw field stays a stick in `[-100, +100]`.
 
 ---
 
+### `SCOUT`
+
+> Slow 360° yaw spin — a "look around" step.
+
+Sends a fixed yaw stick of `+15` (CW) and waits until cumulative
+yaw telemetry has rotated by 360°, then enters the standard brake
+phase. Useful for visual situational awareness — the rate is low
+enough that the camera passes slowly through every heading instead
+of blurring. On Anafi indoor a full turn at stick 15 typically
+takes 10–15 seconds.
+
+Takes no arguments. Falls into a safety timeout (30 s) if telemetry
+yaw is stuck so the script never hangs.
+
+The journal reports the result, e.g.
+`[ctrl] scout complete (rotated +361°, brake 0.42s)`.
+
+---
+
 ### `RC <lr> <fb> <ud> <yaw> [<seconds>]`
 
 > All four RC sticks at once for `seconds`.

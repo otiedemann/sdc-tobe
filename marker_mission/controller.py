@@ -75,6 +75,7 @@ class Phase(enum.Enum):
     DANCE     = "dance"     # mission-script DANCE step (programmed RC routine)
     RC        = "rc"        # mission-script LR / FB / UD / RC (raw stick + timer)
     ROTATE    = "rotate"    # mission-script YAW (discrete rotation by N deg)
+    SCOUT     = "scout"     # mission-script SCOUT (slow 360° yaw spin)
     LAND      = "land"
     DONE      = "done"
     ABORT     = "abort"
@@ -279,6 +280,17 @@ class PoseSmoother:
 RC_BRAKE_SPEED_THRESHOLD_CMS: float = 8.0
 RC_BRAKE_MAX_SETTLE_S: float = 1.5
 
+# SCOUT step — operator-facing "slow 360° look-around" command. Yaw
+# stick is set to ``SCOUT_YAW_STICK`` and held until cumulative yaw
+# telemetry has rotated by SCOUT_TARGET_DEG, then we enter the
+# standard brake phase. SCOUT_MAX_DRIVE_S is a safety cap that
+# defeats a stuck-telemetry hang. The stick value of 15 was the
+# operator's spec — gentle enough to actually let the camera observe
+# the surroundings during the spin.
+SCOUT_YAW_STICK: int = 15
+SCOUT_TARGET_DEG: float = 360.0
+SCOUT_MAX_DRIVE_S: float = 30.0
+
 
 # ---------------------------------------------------------------------------
 # Dead-reckoning position estimator
@@ -413,6 +425,13 @@ class MissionState:
     # momentum.
     rc_step_braking: bool = False
     rc_step_brake_started: Optional[float] = None
+    # SCOUT step (slow 360° yaw spin). Drives the yaw stick at
+    # SCOUT_YAW_STICK and tracks ``cur_yaw - prev_yaw`` (wrap-safe)
+    # into ``scout_accumulated_deg`` until |accumulated| >= 360°.
+    # Reuses the rc_step_braking flag for the post-drive brake.
+    scout_started_at: Optional[float] = None
+    scout_last_yaw_deg: Optional[float] = None
+    scout_accumulated_deg: float = 0.0
     # AWAIT step: when set, _step_idle / _step_hold advance the
     # script as soon as this marker id appears in
     # state.visible_marker_ids (see vision_worker). Cleared on every
@@ -510,6 +529,9 @@ class MissionState:
             self.rc_step_until = None
             self.rc_step_braking = False
             self.rc_step_brake_started = None
+            self.scout_started_at = None
+            self.scout_last_yaw_deg = None
+            self.scout_accumulated_deg = 0.0
             self.await_marker_id = None
             self.visible_marker_ids = []
             self.dance_mode = None
@@ -939,6 +961,8 @@ class MissionController:
                     self._step_dance(tel, now)
                 elif phase == Phase.RC:
                     self._step_rc(tel, now)
+                elif phase == Phase.SCOUT:
+                    self._step_scout(tel, now)
                 elif phase == Phase.ROTATE:
                     # YAW step runs synchronously in
                     # _apply_step_to_phase and calls _advance_script
@@ -1535,6 +1559,95 @@ class MissionController:
                 f"rc step complete (brake {elapsed:.2f}s, {reason})"
             )
 
+    # ------------------------------------------------------------- scout
+    def _step_scout(self, tel: Optional[TelemetrySnapshot],
+                    now: float) -> None:
+        """Mission-script SCOUT step: slow 360° yaw spin.
+
+        Two-phase like _step_rc:
+        1. DRIVE — pin yaw stick at SCOUT_YAW_STICK and accumulate
+           ``cur_yaw - prev_yaw`` (wrap-safe to [-180, +180]) until
+           |accumulated| >= SCOUT_TARGET_DEG, or until
+           SCOUT_MAX_DRIVE_S elapses (safety cap if telemetry hangs).
+        2. BRAKE — zero sticks, wait for body-frame speed to drop
+           below RC_BRAKE_SPEED_THRESHOLD_CMS (or the 1.5 s timeout).
+           Shares state with _step_rc's brake so the next step starts
+           from a clean hover.
+        """
+        with self.state.lock:
+            started = self.state.scout_started_at or now
+            accumulated = float(self.state.scout_accumulated_deg)
+            last_yaw = self.state.scout_last_yaw_deg
+            braking = bool(self.state.rc_step_braking)
+            brake_started = self.state.rc_step_brake_started
+
+        if not braking:
+            # DRIVE phase ─ keep the yaw stick at SCOUT_YAW_STICK and
+            # accumulate rotation from telemetry.
+            self._send_rc(0, 0, 0, SCOUT_YAW_STICK,
+                          enforce_cfg_caps=False)
+            cur_yaw = tel.yaw_deg if tel is not None else None
+            if cur_yaw is not None:
+                with self.state.lock:
+                    if self.state.scout_last_yaw_deg is None:
+                        self.state.scout_last_yaw_deg = float(cur_yaw)
+                    else:
+                        # Wrap-safe delta: project (cur - prev) into
+                        # [-180, +180] before adding to the cumulative
+                        # rotation. Without this a -179 → +179 wrap
+                        # registers as +358° in one tick.
+                        delta = (
+                            (float(cur_yaw) - self.state.scout_last_yaw_deg
+                             + 540.0) % 360.0 - 180.0
+                        )
+                        self.state.scout_accumulated_deg += delta
+                        self.state.scout_last_yaw_deg = float(cur_yaw)
+                        accumulated = self.state.scout_accumulated_deg
+            elapsed = now - started
+            with self.state.lock:
+                self.state.note = (
+                    f"SCOUT: {accumulated:+.0f}° / {SCOUT_TARGET_DEG:g}° "
+                    f"(t={elapsed:.1f}s)"
+                )
+            if (abs(accumulated) >= SCOUT_TARGET_DEG
+                    or elapsed >= SCOUT_MAX_DRIVE_S):
+                reason = (
+                    f"target reached ({accumulated:+.0f}°)"
+                    if abs(accumulated) >= SCOUT_TARGET_DEG
+                    else f"timeout {elapsed:.1f}s ({accumulated:+.0f}°)"
+                )
+                with self.state.lock:
+                    self.state.rc_step_braking = True
+                    self.state.rc_step_brake_started = now
+                print(f"[ctrl] scout drive done: {reason}")
+            return
+
+        # BRAKE phase ─ same shape as _step_rc's brake. Drone has
+        # rotational momentum; zero the sticks and wait for the
+        # body-frame speed to drop below threshold (the Anafi yaw
+        # damps fast — usually well under 1 s — but we keep the
+        # standard cap so a stuck telemetry feed can't hang the
+        # mission).
+        self._send_rc(0, 0, 0, 0, enforce_cfg_caps=False)
+        speed = self._body_speed_cms(tel)
+        elapsed_brake = (now - brake_started) if brake_started is not None else 0.0
+        with self.state.lock:
+            self.state.note = (
+                f"SCOUT brake: speed={speed:.0f}cm/s "
+                f"elapsed={elapsed_brake:.2f}s"
+                if speed is not None
+                else f"SCOUT brake: speed=? elapsed={elapsed_brake:.2f}s"
+            )
+        settled = (
+            (speed is not None and speed < RC_BRAKE_SPEED_THRESHOLD_CMS)
+            or elapsed_brake >= RC_BRAKE_MAX_SETTLE_S
+        )
+        if settled:
+            self._advance_script(
+                f"scout complete (rotated {accumulated:+.0f}°, "
+                f"brake {elapsed_brake:.2f}s)"
+            )
+
     @staticmethod
     def _body_speed_cms(tel: Optional[TelemetrySnapshot]) -> Optional[float]:
         """Body-frame speed magnitude in cm/s from the Anafi
@@ -2083,6 +2196,24 @@ class MissionController:
                    f"lr={step.rc_lr}")
             self._set_phase(Phase.RC,
                             note + f" {tag} {step.seconds:g}s")
+            return
+        if step.kind == "SCOUT":
+            # Slow 360° yaw spin for visual situational awareness.
+            # Drive phase uses Phase.SCOUT (separate handler tracks
+            # cumulative yaw against SCOUT_TARGET_DEG); brake phase
+            # reuses the rc_step_braking flag once the drive is done,
+            # so the next step starts from a clean hover.
+            with self.state.lock:
+                self.state.scout_started_at = time.monotonic()
+                self.state.scout_last_yaw_deg = None
+                self.state.scout_accumulated_deg = 0.0
+                self.state.rc_step_braking = False
+                self.state.rc_step_brake_started = None
+            self._set_phase(
+                Phase.SCOUT,
+                note + f" yaw_stick={SCOUT_YAW_STICK} "
+                       f"target=±{SCOUT_TARGET_DEG:g}°"
+            )
             return
         if step.kind == "YAW":
             # Discrete rotation by ``rotation_deg`` degrees, +CW.

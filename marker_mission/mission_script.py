@@ -6,7 +6,7 @@ that ``MissionController._advance_script`` walks one at a time. The
 language is one-command-per-line, case-insensitive, with ``#`` comments
 and blank lines ignored.
 
-Fourteen commands:
+Fifteen commands:
 
     TAKEOFF
     APPROACH [<marker-id>] [<distance>]
@@ -22,6 +22,7 @@ Fourteen commands:
     UD       <rc> [<seconds>]                      +up / -down,     rc in [-100, +100]
     YAW      <deg>                                 +cw / -ccw,      deg in [-180, +180]
     RC       <lr> <fb> <ud> <yaw> [<seconds>]      all four sticks at once
+    SCOUT                                          slow 360° yaw spin (cw, stick=15)
 
 LR / FB / UD / RC are raw-RC steps: pin the listed stick(s) to the
 given value(s) for the given duration (default 1 second; fractional
@@ -292,6 +293,19 @@ def parse(text: str, defaults: dict) -> List[Step]:
                                   f"got {deg}")
             out.append(Step(kind="YAW", rotation_deg=deg,
                             line_no=raw_line_no))
+        elif cmd == "SCOUT":
+            # Slow 360° yaw spin for visual situational awareness.
+            # Yaw stick is hardcoded at 15 (a gentle rate that still
+            # completes a full turn in ~10-15 s on Anafi indoor —
+            # slow enough that the operator can actually see the
+            # surroundings the camera passes through). No
+            # arguments; advances once telemetry confirms the yaw
+            # has accumulated 360°, then enters the standard brake
+            # phase like the other raw-RC steps.
+            if args:
+                raise ScriptError(raw_line_no,
+                                  f"SCOUT takes no arguments, got {args}")
+            out.append(Step(kind="SCOUT", line_no=raw_line_no))
         elif cmd == "RC":
             # All four sticks at once: RC <lr> <fb> <ud> <yaw> [<seconds>].
             # Order matches the drone-stick convention
@@ -399,6 +413,8 @@ def format(steps: List[Step]) -> str:
                 )
         elif s.kind == "YAW":
             lines.append(f"YAW {int(s.rotation_deg or 0)}")
+        elif s.kind == "SCOUT":
+            lines.append("SCOUT")
         elif s.kind == "DANCE":
             lines.append(f"DANCE {s.seconds:g} {s.mode}")
         else:
