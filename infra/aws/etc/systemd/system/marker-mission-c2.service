@@ -1,0 +1,28 @@
+[Unit]
+Description=marker_mission_c2 — fleet command-and-control dashboard
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+# WorkingDirectory matters: the C2 reads its config from a path
+# relative to the repo root (config.json next to marker_mission_c2/
+# itself) and writes calibration mirrors into
+# ``marker_mission_c2/calibrations/`` — both lookups assume cwd is
+# the repo root.
+WorkingDirectory=/opt/sdc-tobe
+# .venv-c2 is the dedicated venv for the C2 + strategy stack.
+# Created by infra/aws/install.sh, separate from .venv (FC / Olympe)
+# and .venv-marker (marker_mission combined app) so the three
+# dependency trees don't shadow each other.
+ExecStart=/opt/sdc-tobe/.venv-c2/bin/python3 -m marker_mission_c2 \
+          --config /opt/sdc-tobe/marker_mission_c2/config.json
+Restart=on-failure
+RestartSec=5s
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

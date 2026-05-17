@@ -71,6 +71,27 @@ if [ -f /opt/sdc-tobe/marker_mission/requirements.txt ]; then
         -r /opt/sdc-tobe/marker_mission/requirements.txt --quiet
 fi
 
+echo "[install] ensuring marker_mission_c2 venv exists at /opt/sdc-tobe/.venv-c2..."
+# marker-mission-c2.service (the fleet dashboard) and the optional
+# marker_mission_c2.strategy.app (operator UI on :8091) share this venv.
+# Deps are flask + httpx — separate from .venv so a future C2 dep bump
+# doesn't drag the FC's Olympe runtime into pip-install dependency hell.
+if [ ! -x /opt/sdc-tobe/.venv-c2/bin/python3 ]; then
+    sudo -u ubuntu python3 -m venv /opt/sdc-tobe/.venv-c2
+    sudo -u ubuntu /opt/sdc-tobe/.venv-c2/bin/pip install --upgrade pip wheel --quiet
+fi
+if [ -f /opt/sdc-tobe/marker_mission_c2/requirements.txt ]; then
+    sudo -u ubuntu /opt/sdc-tobe/.venv-c2/bin/pip install \
+        -r /opt/sdc-tobe/marker_mission_c2/requirements.txt --quiet
+fi
+
+echo "[install] ensuring marker_mission_c2/config.json exists..."
+if [ ! -f /opt/sdc-tobe/marker_mission_c2/config.json ]; then
+    sudo -u ubuntu cp /opt/sdc-tobe/marker_mission_c2/config.example.json \
+                      /opt/sdc-tobe/marker_mission_c2/config.json
+    echo "  copied from config.example.json — edit fcs[] for this host"
+fi
+
 echo "[install] reloading systemd + cron..."
 sudo systemctl daemon-reload
 sudo systemctl reload cron 2>/dev/null || sudo systemctl restart cron
@@ -88,6 +109,7 @@ for u in \
   sphinx-bootstrap.service \
   c2-controller.service \
   drone-detector-ui.service \
+  marker-mission-c2.service \
   auto-shutdown.timer \
   fc-healthcheck.timer
 do
