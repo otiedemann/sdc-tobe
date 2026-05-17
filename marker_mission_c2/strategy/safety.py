@@ -67,14 +67,46 @@ class SafetyGate:
     doesn't spam STOP. Stateless w.r.t. the rest of the strategy
     pipeline — calling ``gate`` on the same inputs always produces a
     deterministic result modulo the cooldown clock.
+
+    Two operator switches:
+      * ``armed`` (default False) — when False, every non-IDLE command
+        is turned into IDLE before reaching the FC. The strategy still
+        runs (ticks, world-model, planner), the UI still updates — the
+        only thing suppressed is dispatch. Operator hits Arm to let
+        commands flow; Disarm to mute them again. Booting disarmed is
+        the safety property — a fresh-boot drone never auto-takes-off.
+      * ``hold_all`` (default False) — emergency override that *replaces*
+        every command with STOP_MISSION. Use for "land everyone now".
     """
 
-    def __init__(self, cfg: SafetyConfig, manual_hold_all: bool = False):
+    def __init__(self, cfg: SafetyConfig,
+                 manual_hold_all: bool = False,
+                 armed: bool = False):
         self.cfg = cfg
         self._manual_hold_all = bool(manual_hold_all)
+        self._armed = bool(armed)
         self._last_stop_at: dict[str, float] = {}
 
     # ----- operator switches -----
+
+    def arm(self) -> None:
+        """Allow commands to flow downstream. Operator-triggered;
+        defaults to OFF at startup so a fresh-boot strategy can't
+        auto-fly a drone."""
+        if not self._armed:
+            log.warning("safety: ARMED — strategy commands will dispatch")
+        self._armed = True
+
+    def disarm(self) -> None:
+        """Block all command dispatch. Strategy keeps ticking + the
+        UI keeps updating — only the side-effects to the FC are
+        suppressed."""
+        if self._armed:
+            log.warning("safety: DISARMED — strategy commands will be IDLE")
+        self._armed = False
+
+    def is_armed(self) -> bool:
+        return self._armed
 
     def hold_all(self, on: bool) -> None:
         """Engage / release the manual emergency hold. While engaged,
@@ -88,6 +120,17 @@ class SafetyGate:
         obs = state.drones.get(cmd.target)
         if obs is None:
             return SafetyVerdict(cmd, "")
+
+        # Disarmed: drop any non-IDLE command. We don't STOP_MISSION
+        # the FC — that would land any drone that the operator might
+        # be flying via the FC's own UI. We just refuse to dispatch
+        # *our* commands until armed.
+        if not self._armed and cmd.kind != CmdKind.IDLE:
+            return SafetyVerdict(
+                FCCommand.idle(cmd.target),
+                "strategy disarmed (Arm via UI to dispatch)",
+                overridden=True,
+            )
 
         if self._manual_hold_all:
             return self._stop(cmd, "manual emergency hold engaged", state.t)

@@ -113,6 +113,7 @@ async def run(cfg, tick_hz: float,
             settings_path=settings_path,
             planner=planner,
             match_state=match_state,
+            safety=safety,
         )
         start_web(web_app, host=web_host, port=web_port)
         log.info("strategy: open http://%s:%d/ to view live arena + settings",

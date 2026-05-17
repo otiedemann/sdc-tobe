@@ -75,6 +75,7 @@ def make_app(
     settings_path: Optional[Path] = None,
     planner=None,
     match_state=None,
+    safety=None,
 ) -> Flask:
     """Build the strategy web app.
 
@@ -220,7 +221,31 @@ def make_app(
         }
         if match_state is not None:
             payload.update(match_state.snapshot())
+        if safety is not None:
+            payload["armed"] = bool(safety.is_armed())
         return jsonify(payload)
+
+    # ---- strategy arm/disarm ----
+
+    @app.get("/api/strategy/armed")
+    def api_strategy_armed_get():
+        if safety is None:
+            return jsonify(error="safety not wired"), 503
+        return jsonify(armed=bool(safety.is_armed()))
+
+    @app.post("/api/strategy/arm")
+    def api_strategy_arm():
+        if safety is None:
+            return jsonify(error="safety not wired"), 503
+        safety.arm()
+        return jsonify(ok=True, armed=True)
+
+    @app.post("/api/strategy/disarm")
+    def api_strategy_disarm():
+        if safety is None:
+            return jsonify(error="safety not wired"), 503
+        safety.disarm()
+        return jsonify(ok=True, armed=False)
 
     # ---- match clock ----
 
@@ -235,6 +260,12 @@ def make_app(
         if match_state is None:
             return jsonify(error="match_state not wired"), 503
         match_state.start_match()
+        # Starting a match implies "go" — auto-arm the strategy so the
+        # operator's intent is one click, not two. Stopping a match
+        # does NOT auto-disarm (operator might want to inspect mid-air
+        # without the strategy fighting them).
+        if safety is not None:
+            safety.arm()
         return jsonify(ok=True, **match_state.snapshot())
 
     @app.post("/api/match/stop")
@@ -380,10 +411,20 @@ _INDEX_HTML = f"""<!doctype html>
         <button type="button" id="duration-save" style="padding:4px 8px;">save</button>
       </div>
     </div>
+    <div>
+      <div class="muted" style="font-size:11px; text-transform:uppercase;">strategy</div>
+      <button type="button" id="arm-toggle" style="padding:6px 14px; font-weight:600;">— </button>
+    </div>
     <div style="margin-left:auto;">
       <button class="primary" type="button" id="match-start">Start match</button>
       <button type="button" id="match-stop">Stop</button>
     </div>
+  </div>
+  <div id="disarm-banner" class="warn" style="display:none; margin-top:8px;
+       padding:6px 10px; border:1px solid #aa6; border-radius:4px; background:#3a2f10;">
+    ⚠ <b>Strategy disarmed.</b> Planner is running and reporting roles
+    on the arena view, but no commands are being pushed to FCs — the
+    drone stays grounded until you click <b>Arm</b> or <b>Start match</b>.
   </div>
 </div>
 
@@ -508,6 +549,8 @@ function drawMatch(data) {{
   const DUR_INPUT = document.getElementById("match-duration");
   const BTN_START = document.getElementById("match-start");
   const BTN_STOP = document.getElementById("match-stop");
+  const ARM_BTN = document.getElementById("arm-toggle");
+  const DISARM_BANNER = document.getElementById("disarm-banner");
 
   // strategy alive indicator
   const ticks = data.ticks || {{}};
@@ -517,6 +560,14 @@ function drawMatch(data) {{
     (lastAge < 3.0 ? "ticking" : "stalled (" + lastAge.toFixed(1) + "s ago)");
   STR.textContent = aliveText + " · " + (ticks.count || 0) + " ticks · " + hz;
   STR.className = (lastAge == null || lastAge < 3.0) ? "ok" : "err";
+
+  // arm state
+  const armed = !!data.armed;
+  ARM_BTN.textContent = armed ? "ARMED — click to disarm" : "DISARMED — click to arm";
+  ARM_BTN.style.background = armed ? "#3a2c14" : "#10401a";
+  ARM_BTN.style.borderColor = armed ? "#a73" : "#3a6";
+  ARM_BTN.style.color = armed ? "#fc8" : "#9d6";
+  DISARM_BANNER.style.display = armed ? "none" : "block";
 
   // match clock
   const m = data.match || {{}};
@@ -547,6 +598,13 @@ async function postMatch(suffix) {{
 
 document.getElementById("match-start").onclick = () => postMatch("start");
 document.getElementById("match-stop").onclick  = () => postMatch("stop");
+document.getElementById("arm-toggle").onclick = async () => {{
+  // Read CURRENT armed state from button text — avoids stale closure
+  // over an old data snapshot if the user clicks fast.
+  const armed = document.getElementById("arm-toggle").textContent.startsWith("ARMED");
+  await fetch("/api/strategy/" + (armed ? "disarm" : "arm"), {{method: "POST"}});
+  tick();
+}};
 document.getElementById("duration-save").onclick = async () => {{
   const v = parseFloat(document.getElementById("match-duration").value);
   if (!isFinite(v) || v < 1) return;
