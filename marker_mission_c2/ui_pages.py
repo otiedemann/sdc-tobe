@@ -44,7 +44,10 @@ PAGE_OVERVIEW = """
     {% for fc in fc_specs %}
     <div class="fc-card" data-fc="{{ fc.name }}">
       <h3>
-        <span class="dot dot-stale" data-role="dot"></span>
+        <span class="dot dot-stale" data-role="dot"
+              title="C2 ↔ FC link"></span>
+        <span class="dot dot-stale" data-role="drone-dot"
+              title="FC ↔ drone link"></span>
         <span>{{ fc.name }}</span>
         <span style="margin-left:auto; font-size:.75rem; color:#aab;
                      font-weight:400;">
@@ -152,12 +155,29 @@ PAGE_OVERVIEW = """
       if (!card) continue;
       const fc = overview[name];
       const dot = card.querySelector('[data-role=dot]');
+      const droneDot = card.querySelector('[data-role=drone-dot]');
       if (!fc) {
         dot.className = 'dot dot-stale';
+        if (droneDot) droneDot.className = 'dot dot-stale';
         continue;
       }
       dot.className = fc.connection_ok ? 'dot dot-on'
         : (fc.last_state_age_s !== null && fc.last_state_age_s < 5 ? 'dot dot-stale' : 'dot dot-off');
+      // Drone-link dot: stays grey if we can't reach the FC (we
+      // genuinely don't know), green if FC says drone_connected,
+      // red if FC is reachable but reports no drone.
+      if (droneDot) {
+        if (!fc.connection_ok) {
+          droneDot.className = 'dot dot-stale';
+          droneDot.title = name + ' ↔ drone: unknown (FC down)';
+        } else if (fc.drone_connected) {
+          droneDot.className = 'dot dot-on';
+          droneDot.title = name + ' ↔ drone: connected';
+        } else {
+          droneDot.className = 'dot dot-off';
+          droneDot.title = name + ' ↔ drone: not connected';
+        }
+      }
       const st = fc.state || {};
       const tel = st.telemetry || {};
       const phaseEl = card.querySelector('[data-role=phase]');

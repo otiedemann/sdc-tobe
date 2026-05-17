@@ -143,7 +143,11 @@ _HEADER_HTML = """
   <span class="fc-dots" id="topbar-dots">
     {% for fc in fc_specs %}
     <span class="item" data-fc="{{ fc.name }}">
-      <span class="dot dot-stale" data-role="dot"></span>{{ fc.name }}
+      <span class="dot dot-stale" data-role="dot"
+            title="C2 ↔ FC link"></span>
+      <span class="dot dot-stale" data-role="drone-dot"
+            title="FC ↔ drone link"></span>
+      {{ fc.name }}
     </span>
     {% endfor %}
   </span>
@@ -297,13 +301,31 @@ function _updateTopbarDots(overview) {
     const item = document.querySelector('.fc-dots .item[data-fc="' + name + '"]');
     if (!item) continue;
     const dot = item.querySelector('[data-role=dot]');
+    const droneDot = item.querySelector('[data-role=drone-dot]');
     const fc = (overview && overview[name]) || null;
+    // C2 ↔ FC link.
     let cls = 'dot dot-stale';
     if (fc && fc.connection_ok) cls = 'dot dot-on';
     else if (fc) cls = 'dot dot-off';
     dot.className = cls;
-    item.title = fc && fc.last_error ? (name + ': ' + fc.last_error)
-                                       : (name + ': ' + (fc && fc.connection_ok ? 'ok' : 'down'));
+    dot.title = 'C2 ↔ ' + name + ': '
+                + (fc && fc.connection_ok ? 'ok'
+                   : (fc && fc.last_error ? fc.last_error : 'down'));
+    // FC ↔ drone link. Stays grey when we can't reach the FC (we
+    // don't know either way) and goes red specifically when the FC
+    // is reachable but reports no drone.
+    if (droneDot) {
+      let dcls = 'dot dot-stale';
+      if (fc && fc.connection_ok) {
+        dcls = fc.drone_connected ? 'dot dot-on' : 'dot dot-off';
+      }
+      droneDot.className = dcls;
+      droneDot.title = name + ' ↔ drone: '
+                       + (!fc || !fc.connection_ok ? 'unknown (FC down)'
+                          : fc.drone_connected ? 'connected'
+                          : 'not connected');
+    }
+    item.title = '';  // per-dot titles supersede; clear the wrapping one
   }
 }
 
