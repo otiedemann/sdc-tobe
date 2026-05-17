@@ -78,16 +78,28 @@ _BASE_CSS = """
   .fc-dots .item { display:inline-flex; align-items:center; gap:.25rem;
                     padding:.15rem .4rem; border-radius:4px;
                     background:#0c0f12; }
-  /* Card flag: per-FC mission cards on the overview. */
+  /* Card flag: per-FC mission cards on the overview. CSS containment
+     scopes layout + paint cost to the card so a single video frame
+     never triggers a full-page reflow — critical when six MJPEG
+     streams are decoding in parallel. */
   .fc-card { background: var(--card); border-radius: 8px;
-              padding: .85rem; min-width: 0; }
+              padding: .85rem; min-width: 0;
+              contain: layout paint style;
+              content-visibility: auto;
+              contain-intrinsic-size: 480px; }
   .fc-card header { background:transparent; padding:0; margin-bottom:.5rem;
                      gap:.5rem; }
   .fc-card h3 { margin:0; font-size:1rem; font-weight:600;
                   display:flex; align-items:center; gap:.4rem; }
+  /* Video slot: capped at 480 px so decode buffers stay small even
+     when the FC delivers 1280×720 — the operator can pop the card's
+     native UI for full-res. min-height keeps the card layout stable
+     when video flips on/off. */
   .video-slot { background:#000; border-radius:6px; min-height:160px;
                  display:flex; align-items:center; justify-content:center;
-                 color:#444; font-size:.8rem; margin:.5rem 0; }
+                 color:#444; font-size:.8rem; margin:.5rem 0;
+                 max-width:480px;
+                 contain: layout paint style; }
   .video-slot img { width:100%; height:auto; display:block;
                      border-radius:6px; background:#000; }
   .stat-grid { display:grid; grid-template-columns: auto 1fr;

@@ -4751,13 +4751,43 @@ class UiServer:
 
         @app.get("/video.mjpg")
         def video():
+            # Optional ?fps=N to cap the MJPEG output rate (clamped to
+            # 1..30). Useful for the C2 dashboard when six streams
+            # are running side-by-side and the browser's decode +
+            # paint pipeline starts dropping work. Default ≈20 fps
+            # preserves the historical behaviour for the FC's own
+            # /mission page. We also de-dup: if no new frame has
+            # arrived since the last send, sleep+continue rather than
+            # re-emit the same JPEG bytes (so a slow drone doesn't
+            # cause us to flood the wire with stale duplicates at the
+            # cap rate).
+            fps_raw = request.args.get("fps", "20")
+            try:
+                fps = float(fps_raw)
+            except ValueError:
+                fps = 20.0
+            fps = max(1.0, min(30.0, fps))
+            min_interval = 1.0 / fps
+
             def gen():
+                last_ts = 0.0
+                last_send = 0.0
                 while True:
+                    now = time.monotonic()
+                    wait = (last_send + min_interval) - now
+                    if wait > 0:
+                        time.sleep(min(wait, 0.05))
+                        continue
                     jpg, ts = self.frame.get()
-                    if jpg:
+                    if jpg and ts != last_ts:
                         yield (b"--frame\r\nContent-Type: image/jpeg\r\n\r\n"
                                + jpg + b"\r\n")
-                    time.sleep(0.05)
+                        last_ts = ts
+                        last_send = time.monotonic()
+                    else:
+                        # No fresh frame from the drone yet — short
+                        # sleep before polling self.frame again.
+                        time.sleep(0.02)
             return Response(gen(),
                             mimetype="multipart/x-mixed-replace; boundary=frame")
 

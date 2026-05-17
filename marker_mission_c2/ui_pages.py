@@ -50,7 +50,7 @@ PAGE_OVERVIEW = """
       <div class="video-slot" data-role="video-slot">video off</div>
       <div style="display:flex; gap:.4rem; flex-wrap:wrap; margin-top:.4rem;">
         <button type="button" class="btn btn-ghost" data-role="video-toggle"
-                data-mjpeg-url="http://{{ fc.host }}:{{ fc.port }}/video.mjpg">
+                data-mjpeg-url="/video/{{ fc.name }}.mjpg">
           Show video
         </button>
         <button type="button" class="btn btn-good" data-role="start">
@@ -240,9 +240,19 @@ PAGE_OVERVIEW = """
       } else {
         slot.innerHTML = '';
         const img = document.createElement('img');
-        // Cache-bust so a previous closed-then-reopened stream doesn't
-        // rebind to a stale connection.
-        img.src = url + '?t=' + Date.now();
+        // decoding=async pushes JPEG decode off the main thread so
+        // six parallel streams don't starve UI interactivity. The fps
+        // cap scales with concurrent streams: solo card gets 20 fps,
+        // multi-card drops to 10 (a 6-stream sweep on a laptop GPU
+        // is the difference between smooth and chunky).
+        img.decoding = 'async';
+        img.loading = 'eager';  // overview is the operator's primary surface
+        const otherOn = document.querySelectorAll(
+          '[data-role=video-toggle][data-on="1"]').length;
+        const fps = otherOn >= 1 ? 10 : 20;
+        // Cache-bust + fps so a previous closed-then-reopened stream
+        // doesn't rebind to a stale connection.
+        img.src = url + '?fps=' + fps + '&t=' + Date.now();
         slot.appendChild(img);
         t.dataset.on = '1';
         t.textContent = 'Hide video';

@@ -110,6 +110,45 @@ def _build_app(cfg: C2Config, pool: FCPool, library: CalibrationLibrary,
         resp.headers["Cache-Control"] = "public, max-age=3600"
         return resp
 
+    # ------------------------------------------------------------ video proxy
+    # MJPEG passthrough so the browser only opens connections to the
+    # C2 host (one origin, kinder to browser per-host connection
+    # caps, and no CORS surprises). We forward ?fps= straight through
+    # to the FC so when an operator activates all six streams the
+    # marker_mission-side rate cap kicks in BEFORE bytes hit the
+    # wire — both bandwidth and browser decode budget benefit.
+    @app.get("/video/<fc>.mjpg")
+    def proxy_video(fc: str):
+        spec = next((f for f in cfg.fcs if f.name == fc), None)
+        if spec is None:
+            return ("unknown fc", 404)
+        # Default fps cap matches the overview's "Show all video"
+        # threshold; single-card mode can override via ?fps=20.
+        fps = request.args.get("fps", "10")
+        try:
+            float(fps)
+        except ValueError:
+            fps = "10"
+        upstream_url = f"{spec.base_url}/video.mjpg?fps={fps}"
+        # We deliberately do this with `requests` (sync), not the
+        # async httpx client, because Flask handlers stream synchronously
+        # and we want one OS thread per active stream — easier to reason
+        # about than bridging an async generator across threads.
+        import requests as _requests
+
+        def gen():
+            with _requests.get(upstream_url, stream=True,
+                                timeout=(3.0, None)) as r:
+                if r.status_code != 200:
+                    return
+                for chunk in r.iter_content(chunk_size=8192):
+                    if chunk:
+                        yield chunk
+        from flask import Response as _Response
+        return _Response(
+            gen(),
+            mimetype="multipart/x-mixed-replace; boundary=frame")
+
     # ------------------------------------------------------------ pages
     @app.get("/")
     def page_overview():
