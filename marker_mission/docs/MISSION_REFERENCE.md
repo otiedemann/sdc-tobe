@@ -219,6 +219,20 @@ Done when the timer expires.
 
 ---
 
+### `LR <rc> [<seconds>]`
+
+> Left / right (strafe) raw RC stick for `seconds`.
+
+- `rc`: integer in `[-100, +100]`. Positive moves the drone right
+  (relative to its current heading), negative left.
+- `seconds`: how long to hold the stick. Floats accepted (`0.5`,
+  `1.75`, …). Defaults to `1` when omitted.
+
+Example: `LR -30 0.5` strafes left at stick=-30 for half a second.
+Other RC channels are zeroed for the duration.
+
+---
+
 ### `FB <rc> [<seconds>]`
 
 > Forward / back raw RC stick for `seconds`.
@@ -259,22 +273,23 @@ for height jogging only within the envelope.
 
 ---
 
-### `RC <fb> <ud> <yaw> [<seconds>]`
+### `RC <lr> <fb> <ud> <yaw> [<seconds>]`
 
-> All three RC sticks at once for `seconds`.
+> All four RC sticks at once for `seconds`.
 
-- `fb` / `ud` / `yaw`: integers in `[-100, +100]`. Sign conventions
-  match the single-axis commands above.
+- `lr` / `fb` / `ud` / `yaw`: integers in `[-100, +100]`. Sign
+  conventions match the single-axis commands above.
 - `seconds`: how long to hold. Floats accepted. Defaults to `1`.
 
-Example: `RC 30 -10 20 1.5` runs (forward=30, down=10, cw=20) for
-1.5 seconds. The LR (strafe) channel is intentionally absent from the
-short form — use the single-axis commands or extend this command if
-you need it.
+Order matches the drone-joystick convention (roll, pitch, throttle,
+yaw → lr, fb, ud, yaw).
 
-Round-trip behaviour: a script step where exactly one of fb/ud/yaw is
-non-zero is canonicalised back to `FB` / `UD` / `YAW`; multi-axis
-steps round-trip as `RC`.
+Example: `RC -20 30 -10 20 1.5` runs (left=20, forward=30, down=10,
+cw=20) for 1.5 seconds.
+
+Round-trip behaviour: a script step where exactly one of lr/fb/ud/yaw
+is non-zero is canonicalised back to `LR` / `FB` / `UD` / `YAW`;
+multi-axis (and all-zero) steps round-trip as `RC`.
 
 ---
 
