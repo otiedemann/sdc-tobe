@@ -10,13 +10,10 @@ copy, so reads here are cheap.
 """
 from __future__ import annotations
 
-import dataclasses
 import logging
 import time
 from dataclasses import dataclass, field
 from typing import Mapping, Optional, Tuple
-
-import requests
 
 log = logging.getLogger("c2.strategy.world")
 
@@ -80,23 +77,27 @@ class SwarmWorldModel:
       state.telemetry.battery        → battery_pct
       state.telemetry.yaw            → yaw_deg
       state.mission.phase            → phase
+      state.world_position_m         → pose       (THE source of truth)
 
-    Pose is *not* in ``/api/state`` — the FC only publishes it on
-    ``/api/position``. We fetch that endpoint per online FC inside
-    :meth:`observe` so the strategy sees ``pose`` whenever the FC's
-    positioning solver has a fresh fix. Stale / disabled / missing
-    position responses leave ``pose=None`` and don't block the tick.
+    Pose is read from ``state.world_position_m`` — the marker_mission
+    arena-aware solver's output, same field the FC's own UI shows as
+    "World position". The legacy ``/api/position`` endpoint reports a
+    different position (different solver, different coordinate frame
+    — gave bogus y=22.7 m values on a 20 m-deep arena) and is
+    deliberately NOT used here. ``world_position_age_s`` indicates
+    freshness; we treat a missing or stale value as "no fix" and
+    leave ``pose=None``.
     """
 
-    POSITION_FETCH_TIMEOUT_S = 0.3
+    # World position is considered stale beyond this — drone may be
+    # mid-flight but the solver lost its marker lock; the strategy
+    # should treat that the same as "no pose" rather than acting on a
+    # multi-second-old fix.
+    POSE_FRESHNESS_S = 2.0
 
     def __init__(self, fc_pool) -> None:
         # Avoid hard import so this module is testable without httpx.
         self._pool = fc_pool
-        # One requests.Session keeps an HTTP keepalive per FC, so each
-        # /api/position fetch is a sub-10 ms TCP-reused round trip on
-        # the same tailnet — fine to call at the strategy tick rate.
-        self._http = requests.Session()
 
     def observe(self) -> SwarmState:
         t = time.monotonic()
@@ -104,11 +105,8 @@ class SwarmWorldModel:
         drones: dict[str, DroneObservation] = {}
         for name, entry in snap.items():
             try:
-                obs = _extract(name, entry)
-                pose = self._fetch_pose(name, entry)
-                if pose is not None:
-                    obs = dataclasses.replace(obs, pose=pose)
-                drones[name] = obs
+                drones[name] = _extract(name, entry,
+                                        pose_freshness_s=self.POSE_FRESHNESS_S)
             except Exception:
                 log.exception("world_model: failed to extract obs for %s", name)
                 drones[name] = DroneObservation(
@@ -120,49 +118,15 @@ class SwarmWorldModel:
                 )
         return SwarmState(t=t, drones=drones)
 
-    def _fetch_pose(self, name: str,
-                    entry: dict) -> Optional[Tuple[float, float, float]]:
-        """Best-effort GET /api/position. Returns ``None`` on any failure
-        (FC offline, timeout, stale fix, malformed payload) — the caller
-        leaves :attr:`DroneObservation.pose` as ``None`` in that case.
-        Pose only appears once the FC's positioning solver has a live
-        marker lock (typically after takeoff), so ``None`` is the
-        steady-state for a drone sitting on the ground."""
-        if not entry.get("connection_ok"):
-            return None
-        base = entry.get("base_url")
-        if not base:
-            return None
-        try:
-            r = self._http.get(f"{base}/api/position",
-                               timeout=self.POSITION_FETCH_TIMEOUT_S)
-        except requests.RequestException:
-            return None
-        if r.status_code != 200:
-            return None
-        try:
-            data = r.json()
-        except ValueError:
-            return None
-        if not data or not data.get("ok") or data.get("stale"):
-            return None
-        pos = data.get("pos")
-        if not isinstance(pos, (list, tuple)) or len(pos) < 3:
-            return None
-        try:
-            return (float(pos[0]), float(pos[1]), float(pos[2]))
-        except (TypeError, ValueError):
-            return None
-
 
 # ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------
 
-def _extract(name: str, entry: dict) -> DroneObservation:
+def _extract(name: str, entry: dict,
+             pose_freshness_s: float = 2.0) -> DroneObservation:
     state = entry.get("state") or {}
     tel = (state.get("telemetry") or {}) if isinstance(state, dict) else {}
-    pos = (state.get("position") or {}) if isinstance(state, dict) else {}
     mission = (state.get("mission") or {}) if isinstance(state, dict) else {}
 
     def _f(d: dict, k: str) -> Optional[float]:
@@ -174,10 +138,25 @@ def _extract(name: str, entry: dict) -> DroneObservation:
         except (TypeError, ValueError):
             return None
 
-    pose_xyz = None
-    px = _f(pos, "x_m"); py = _f(pos, "y_m"); pz = _f(pos, "z_m")
-    if px is not None and py is not None and pz is not None:
-        pose_xyz = (px, py, pz)
+    # Pose: read from state.world_position_m (marker_mission's arena
+    # solver). Treat stale fixes (> pose_freshness_s) as "no pose" so
+    # the strategy doesn't act on a multi-second-old position.
+    pose_xyz: Optional[Tuple[float, float, float]] = None
+    wp = state.get("world_position_m") if isinstance(state, dict) else None
+    wp_age = state.get("world_position_age_s") if isinstance(state, dict) else None
+    if (isinstance(wp, (list, tuple)) and len(wp) >= 3
+            and (wp_age is None or float(wp_age) <= pose_freshness_s)):
+        try:
+            pose_xyz = (float(wp[0]), float(wp[1]), float(wp[2]))
+        except (TypeError, ValueError):
+            pose_xyz = None
+
+    # Phase lives at state.phase (top-level), not state.mission.phase
+    # on the current FC. Try both for resilience across FC versions.
+    phase = state.get("phase") if isinstance(state.get("phase"), str) else None
+    if phase is None:
+        phase = (mission.get("phase")
+                 if isinstance(mission.get("phase"), str) else None)
 
     return DroneObservation(
         name=name,
@@ -185,12 +164,14 @@ def _extract(name: str, entry: dict) -> DroneObservation:
         drone_connected=bool(entry.get("drone_connected")),
         flying=bool(tel.get("flying")),
         battery_pct=_f(tel, "battery"),
-        phase=mission.get("phase") if isinstance(mission.get("phase"), str) else None,
+        phase=phase,
         pose=pose_xyz,
         yaw_deg=_f(tel, "yaw"),
-        last_marker_id=(int(state.get("last_marker_id"))
-                        if isinstance(state.get("last_marker_id"), (int, float))
-                        else None),
+        last_marker_id=(int(state.get("active_marker_id"))
+                        if isinstance(state.get("active_marker_id"), (int, float))
+                        else (int(state.get("last_marker_id"))
+                              if isinstance(state.get("last_marker_id"), (int, float))
+                              else None)),
         serial=entry.get("drone_serial"),
         last_error=entry.get("last_error"),
         age_s=(float(entry.get("last_state_age_s"))
