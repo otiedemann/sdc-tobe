@@ -77,6 +77,18 @@ def make_app(
     app = Flask("c2-strategy-web")
     path = Path(settings_path) if settings_path else DEFAULT_PATH
 
+    @app.after_request
+    def _no_cache(response):
+        # The pages and JSON endpoints are tiny and re-read fresh state
+        # every poll. Stale caches have already caused one round of
+        # confusion (browser kept rendering an old broken SVG layout
+        # after the server-side fix). Force every response to be
+        # uncacheable — these are operator-facing pages, not assets.
+        response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+        response.headers["Pragma"] = "no-cache"
+        response.headers["Expires"] = "0"
+        return response
+
     # ---- pages ----
 
     @app.get("/")
@@ -248,15 +260,24 @@ _INDEX_HTML = f"""<!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
+<meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
+<meta http-equiv="Pragma" content="no-cache">
+<meta http-equiv="Expires" content="0">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Strategy — live arena</title>
 <style>{_BASE_CSS}
   .arena-wrap {{ background:#0a0b0e; border:1px solid #222; border-radius:6px;
                 padding:8px; }}
   svg.arena {{ width:100%; max-width:880px; height:auto; display:block; }}
-  text.lbl {{ font:11px -apple-system,system-ui,sans-serif; fill:#9aa; }}
-  text.id {{ font:10px monospace; fill:#dde; }}
   .drone-table th, .drone-table td {{ font-size:12px; }}
+  /* Zone legend — HTML, not SVG text, so font-size is reliable across
+     every browser. SVG <text> sized in mixed pixel/viewBox units is
+     a portability landmine; HTML <span> just renders at 12px. */
+  .zone-legend {{ display:flex; gap:14px; flex-wrap:wrap; margin-top:8px;
+                  font-size:12px; color:#9aa; }}
+  .zone-legend .swatch {{ display:inline-block; width:14px; height:14px;
+                          border-radius:3px; vertical-align:middle;
+                          margin-right:6px; }}
 </style>
 </head>
 <body>
@@ -271,6 +292,7 @@ _INDEX_HTML = f"""<!doctype html>
 <div class="row">
   <div class="arena-wrap">
     <svg class="arena" id="arena" viewBox="-12 -7 24 14" preserveAspectRatio="xMidYMid meet"></svg>
+    <div class="zone-legend" id="zone-legend"></div>
   </div>
   <div style="min-width:280px;">
     <h2>Drones</h2>
@@ -284,6 +306,7 @@ _INDEX_HTML = f"""<!doctype html>
 <script>
 const SVG = document.getElementById("arena");
 const TBODY = document.querySelector("#drone-table tbody");
+const LEGEND = document.getElementById("zone-legend");
 const STATUS = document.getElementById("status");
 
 // Arena → image transform: image_x = arena_y, image_y = arena_x.
@@ -311,15 +334,19 @@ function draw(state) {{
   svg += `<rect x="${{-halfD+m}}" y="${{-halfW+m}}" width="${{A.depth_m-2*m}}" height="${{A.width_m-2*m}}" `
        + `fill="none" stroke="#445" stroke-dasharray="0.2 0.2" stroke-width="0.04"/>`;
 
-  // Zone bands along arena X axis (= image Y axis). Pull tuples from the API.
-  function band(xRange, fill, label) {{
+  // Zone bands along arena X axis (= image Y axis). Solid colour only;
+  // labels go in the HTML legend below to dodge SVG-text sizing
+  // weirdness across browsers.
+  const ourColor   = team === "red" ? "rgba(255,80,80,0.18)"  : "rgba(80,160,255,0.18)";
+  const enemyColor = team === "red" ? "rgba(80,160,255,0.18)" : "rgba(255,80,80,0.18)";
+  const neutralColor = "rgba(200,200,200,0.08)";
+  function band(xRange, fill) {{
     const [lo, hi] = xRange;
     svg += `<rect x="${{-halfD}}" y="${{lo}}" width="${{A.depth_m}}" height="${{hi - lo}}" fill="${{fill}}" />`;
-    svg += `<text class="lbl" x="${{-halfD + 0.3}}" y="${{(lo+hi)/2 + 0.4}}" style="font-size:11px">${{label}}</text>`;
   }}
-  band(Z.our_home_x_m,     team === "red" ? "rgba(255,80,80,0.10)"  : "rgba(80,160,255,0.10)", `OUR HOME (${{team}})`);
-  band(Z.enemy_home_x_m,   team === "red" ? "rgba(80,160,255,0.10)" : "rgba(255,80,80,0.10)",  "ENEMY HOME");
-  band(Z.neutral_zone_x_m, "rgba(200,200,200,0.05)", "NEUTRAL");
+  band(Z.our_home_x_m,     ourColor);
+  band(Z.enemy_home_x_m,   enemyColor);
+  band(Z.neutral_zone_x_m, neutralColor);
 
   // Drones
   let rows = "";
@@ -336,7 +363,9 @@ function draw(state) {{
     svg += `<g transform="translate(${{ix}},${{iy}}) rotate(${{yaw}})">`
         +  `<polygon points="0,-0.35 0.25,0.25 -0.25,0.25" fill="${{color}}" stroke="#000" stroke-width="0.03"/>`
         +  `</g>`;
-    svg += `<text class="id" x="${{ix + 0.35}}" y="${{iy + 0.1}}" style="font-size:10px">${{name}} · ${{az.toFixed(1)}}m</text>`;
+    // No SVG <text> for drone names — the side table is the canonical
+    // source of "which dot is which". Keeps the arena viz robust to
+    // SVG-text browser quirks.
     rows += `<tr><td>${{name}}</td><td>${{d.role}}</td><td>${{d.cruise_altitude_m.toFixed(1)}}m</td>`
          +  `<td>${{ax.toFixed(1)}}, ${{ay.toFixed(1)}}, ${{az.toFixed(1)}}</td>`
          +  `<td>${{d.battery_pct == null ? "–" : Math.round(d.battery_pct) + "%"}}</td></tr>`;
@@ -344,6 +373,14 @@ function draw(state) {{
 
   SVG.innerHTML = svg;
   TBODY.innerHTML = rows || `<tr><td colspan="5" class="muted">no drones reporting</td></tr>`;
+
+  // Zone legend (HTML, immune to SVG-text sizing weirdness)
+  LEGEND.innerHTML =
+      `<span><span class="swatch" style="background:${{ourColor}}"></span>OUR HOME (${{team}})</span>`
+    + `<span><span class="swatch" style="background:${{neutralColor}}"></span>NEUTRAL</span>`
+    + `<span><span class="swatch" style="background:${{enemyColor}}"></span>ENEMY HOME</span>`
+    + `<span><span class="swatch" style="background:rgba(159,232,138,0.7); border:1px solid #000"></span>flying</span>`
+    + `<span><span class="swatch" style="background:rgba(255,204,136,0.7); border:1px solid #000"></span>on ground</span>`;
 }}
 
 async function tick() {{
@@ -367,6 +404,9 @@ _SETTINGS_HTML = f"""<!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
+<meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
+<meta http-equiv="Pragma" content="no-cache">
+<meta http-equiv="Expires" content="0">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Strategy — settings</title>
 <style>{_BASE_CSS}
