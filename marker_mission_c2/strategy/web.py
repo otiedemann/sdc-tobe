@@ -73,7 +73,17 @@ def make_app(
     world_model: SwarmWorldModel,
     c2_cfg,
     settings_path: Optional[Path] = None,
+    planner=None,
 ) -> Flask:
+    """Build the strategy web app.
+
+    ``planner`` is optional — if supplied (and is a
+    :class:`RoleAssignmentPlanner` or anything with
+    ``current_role_for(fc)``), the ``/api/state`` endpoint reports the
+    *live* role per drone instead of the operator-pinned role from
+    settings. Pinning still drives the planner; the UI just shows what
+    the strategy actually decided.
+    """
     app = Flask("c2-strategy-web")
     path = Path(settings_path) if settings_path else DEFAULT_PATH
 
@@ -153,6 +163,16 @@ def make_app(
         enemy_targets = sorted(settings_obj.enemy_target_ids)
         drones_out = {}
         for name, obs in state.drones.items():
+            live_role = None
+            score = None
+            if planner is not None and hasattr(planner, "current_role_for"):
+                live_role = planner.current_role_for(name)
+                if hasattr(planner, "current_score_for"):
+                    score = planner.current_score_for(name)
+            # Show the live role when the planner has one, else fall
+            # back to the settings-pinned role. Both come from the
+            # same Role enum, so the UI doesn't have to special-case.
+            role_value = live_role or settings_obj.role_for(name).value
             drones_out[name] = {
                 "name": obs.name,
                 "online": obs.online,
@@ -165,7 +185,12 @@ def make_app(
                 "last_marker_id": obs.last_marker_id,
                 "serial": obs.serial,
                 "age_s": obs.age_s,
-                "role": settings_obj.role_for(name).value,
+                "role": role_value,
+                "role_pinned": (
+                    settings_obj.drones.get(name).role.value
+                    if name in settings_obj.drones else "idle"
+                ),
+                "role_score": score,
                 "cruise_altitude_m": settings_obj.cruise_altitude_for(name),
             }
         return jsonify({
@@ -358,7 +383,14 @@ function draw(state) {{
     }}
     const [ax, ay, az] = d.pose;
     const {{ ix, iy }} = toImg(ax, ay);
-    const color = d.flying ? "#9fe88a" : (d.online ? "#fc8" : "#866");
+    // Colour code by role: attacker = green-yellow, defender = orange,
+    // scout = teal, idle = grey. Dim if not online.
+    const ROLE_FILL = {{
+      "attacker": "#9fe88a", "defender": "#ffb070",
+      "scout":    "#7fd7e0", "idle":     "#8a8e94",
+    }};
+    let color = ROLE_FILL[d.role] || "#8a8e94";
+    if (!d.online) color = "#444a52";
     const yaw = (d.yaw_deg ?? 0) - 90;  // 0° = nose +Y in arena
     svg += `<g transform="translate(${{ix}},${{iy}}) rotate(${{yaw}})">`
         +  `<polygon points="0,-0.35 0.25,0.25 -0.25,0.25" fill="${{color}}" stroke="#000" stroke-width="0.03"/>`
@@ -366,7 +398,12 @@ function draw(state) {{
     // No SVG <text> for drone names — the side table is the canonical
     // source of "which dot is which". Keeps the arena viz robust to
     // SVG-text browser quirks.
-    rows += `<tr><td>${{name}}</td><td>${{d.role}}</td><td>${{d.cruise_altitude_m.toFixed(1)}}m</td>`
+    const roleDisplay = (d.role_pinned && d.role_pinned !== "idle" && d.role_pinned !== d.role)
+        ? `${{d.role}} <span class="muted">(pin:${{d.role_pinned}})</span>`
+        : (d.role_pinned && d.role_pinned !== "idle")
+            ? `${{d.role}} <span class="muted">(pin)</span>`
+            : d.role;
+    rows += `<tr><td>${{name}}</td><td>${{roleDisplay}}</td><td>${{d.cruise_altitude_m.toFixed(1)}}m</td>`
          +  `<td>${{ax.toFixed(1)}}, ${{ay.toFixed(1)}}, ${{az.toFixed(1)}}</td>`
          +  `<td>${{d.battery_pct == null ? "–" : Math.round(d.battery_pct) + "%"}}</td></tr>`;
   }}
@@ -374,13 +411,15 @@ function draw(state) {{
   SVG.innerHTML = svg;
   TBODY.innerHTML = rows || `<tr><td colspan="5" class="muted">no drones reporting</td></tr>`;
 
-  // Zone legend (HTML, immune to SVG-text sizing weirdness)
+  // Zone + role legend (HTML, immune to SVG-text sizing weirdness)
   LEGEND.innerHTML =
       `<span><span class="swatch" style="background:${{ourColor}}"></span>OUR HOME (${{team}})</span>`
     + `<span><span class="swatch" style="background:${{neutralColor}}"></span>NEUTRAL</span>`
     + `<span><span class="swatch" style="background:${{enemyColor}}"></span>ENEMY HOME</span>`
-    + `<span><span class="swatch" style="background:rgba(159,232,138,0.7); border:1px solid #000"></span>flying</span>`
-    + `<span><span class="swatch" style="background:rgba(255,204,136,0.7); border:1px solid #000"></span>on ground</span>`;
+    + `<span><span class="swatch" style="background:#9fe88a; border:1px solid #000"></span>attacker</span>`
+    + `<span><span class="swatch" style="background:#ffb070; border:1px solid #000"></span>defender</span>`
+    + `<span><span class="swatch" style="background:#7fd7e0; border:1px solid #000"></span>scout</span>`
+    + `<span><span class="swatch" style="background:#8a8e94; border:1px solid #000"></span>idle</span>`;
 }}
 
 async function tick() {{
@@ -549,10 +588,17 @@ async function load() {{
   for (const fc of top.fcs) {{
     const cur = cfg.drones[fc.name] || {{role: "idle", altitude_m: 1.5}};
     const tr = document.createElement("tr");
+    // "idle" is the "auto / let the strategy decide" value — pin a
+    // specific role (attacker/scout/defender) only when you need to
+    // force one drone. The default `idle` lets RoleAssignmentPlanner
+    // pick each tick from live state.
     tr.innerHTML = `<td>${{fc.name}}</td>
       <td><select data-fc="${{fc.name}}" data-k="role">
-        ${{["attacker","scout","defender","idle"].map(r =>
-            `<option value="${{r}}"${{r===cur.role?" selected":""}}>${{r}}</option>`).join("")}}
+        ${{[["idle","(auto — strategy decides)"],
+            ["attacker","attacker (pinned)"],
+            ["scout","scout (pinned)"],
+            ["defender","defender (pinned)"]].map(([r, label]) =>
+              `<option value="${{r}}"${{r===cur.role?" selected":""}}>${{label}}</option>`).join("")}}
       </select></td>
       <td><input type="number" step="0.1" data-fc="${{fc.name}}" data-k="altitude_m" value="${{cur.altitude_m}}"></td>`;
     tbody.appendChild(tr);

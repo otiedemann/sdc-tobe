@@ -33,12 +33,19 @@ from .tasks import (
     StopMission,
     ApplyTune,
     SetArena,
+    Goto,
+    HoldAboveTarget,
+    WaitInNeutral,
+    ReclaimOnIntrusion,
+    SyncAttackPair,
 )
 from .planner import (
     SwarmPlanner,
     StaticAssignmentPlanner,
     UtilityPlanner,
+    RoleAssignmentPlanner,
 )
+from . import roles
 from .safety import (
     SafetyConfig,
     SafetyGate,
@@ -68,7 +75,11 @@ __all__ = [
     "DroneObservation", "SwarmState", "SwarmWorldModel",
     "FCCommand", "CmdKind", "DroneTask",
     "Idle", "StartMission", "StopMission", "ApplyTune", "SetArena",
+    "Goto", "HoldAboveTarget", "WaitInNeutral",
+    "ReclaimOnIntrusion", "SyncAttackPair",
     "SwarmPlanner", "StaticAssignmentPlanner", "UtilityPlanner",
+    "RoleAssignmentPlanner",
+    "roles",
     "SafetyConfig", "SafetyGate", "SafetyVerdict",
     "SwarmRunner", "TickRecord",
     "TeamColor", "Role", "StrategySettings",

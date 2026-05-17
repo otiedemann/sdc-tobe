@@ -1,5 +1,15 @@
 # `marker_mission_c2.strategy` — reactive strategy layer for the fleet C2
 
+> **What's new**: the default planner is now
+> :class:`RoleAssignmentPlanner` — every tick the strategy decides each
+> drone's role (`attacker` / `defender` / `scout` / `idle`) from live
+> state plus :class:`StrategySettings`, and dispatches a role-specific
+> task that pushes a `marker_mission` mission-script to the FC.
+> The previous `role` setting now means "pin this drone to this role
+> (override the auto-assignment)"; default `idle` = let the strategy
+> decide. See [Role-aware execution](#role-aware-execution) below.
+
+
 Five small modules that sit *on top of* the existing
 `marker_mission_c2` machinery (`fc_pool`, `fc_client`, `config`, etc.)
 without modifying any of it. The strategy stack decides what each
@@ -81,6 +91,72 @@ pool is already collecting.
   tick → gate → dispatch. Dispatches all FCs in parallel with
   `asyncio.gather` so one slow FC can't stall the others.
 - Optional `on_tick(record)` hook for SSE / logging / replay.
+
+## Role-aware execution
+
+The planner shipped in `app.py`'s `build_planner()` is now
+`RoleAssignmentPlanner`. Per tick:
+
+1. **`roles.score_attacker / score_defender / score_scout`** rate every
+   drone for every role. Each score factors in: battery (with per-role
+   floor), live position, an optional operator pin
+   (`settings.drones[fc].role`). Pin = `Role.IDLE` (the default) means
+   "auto"; any other value forces that role with score `1000`.
+2. **Greedy assignment** under caps (`max_attackers=2,
+   max_defenders=1` by default — exactly the doctrine for the 10-pt
+   strike + one home-zone watcher). Tied scores break by drone name.
+3. **Per-drone task** built by the matching `roles.build_*_task(...)`
+   factory:
+   - `Role.ATTACKER` → `SyncAttackPair` (paired with the other
+     attacker on a qualifying target pair from `settings.attack_pair_targets()`),
+     or `HoldAboveTarget` if no partner.
+   - `Role.DEFENDER` → `WaitInNeutral`, unless intrusion detected →
+     `ReclaimOnIntrusion` (intrusion detection currently stubbed —
+     pending an enemy-pose channel).
+   - `Role.SCOUT` → `WaitInNeutral` at the drone's neutral-band slot.
+   - `Role.IDLE` → `Idle` (no commands sent).
+
+Each role task generates a marker_mission mission-script and pushes
+it via `START_MISSION`. The FC's own mission player executes it and
+talks to Olympe — the strategy stays at 1 Hz, flight control runs at
+the FC's native rate.
+
+### The 10-point sync-strike, end-to-end
+
+```text
+Tick N      planner picks {fc1: ATTACKER → target 41,  fc2: ATTACKER → target 42}
+            build_attacker_task wires fc1 with partner=fc2, fc2 with partner=fc1
+            both tasks emit:  TAKEOFF / TO <target_xy> <hover_alt> / HOOVER 9999
+            FCs fly to staging.
+
+Tick N+k    both attackers' poses ≤ ready_radius_m of their respective targets
+            SyncAttackPair flips both tasks to PHASE_STRIKE on the SAME tick
+            both tasks emit:  TO <target_xy> <strike_alt> / HOOVER 2 / LAND
+            FCs descend together (within one tick = ≤1 s synchronisation).
+
+Tick N+k+m  fc1.flying = False → PHASE_DONE → task.done=True → planner
+            re-evaluates this slot.
+```
+
+Tested with a fake pool: pinning a drone to a role with insufficient
+battery still returns `IDLE` (safety floor wins over operator intent);
+when battery recovers, the pin takes effect immediately on the next
+tick.
+
+### Tuning knobs
+
+All in `StrategySettings`:
+
+| Knob | Effect on the role planner |
+| --- | --- |
+| `attack.hover_alt_m`         | stage altitude for `HoldAboveTarget` / `SyncAttackPair` (PHASE_HOLD) |
+| `attack.strike_alt_m`        | dive altitude for `SyncAttackPair` (PHASE_STRIKE) |
+| `attack.sync_window_s`       | unused yet — placeholder for the time-bounded sync abort |
+| `attack.pair_targets_override` | which marker pairs qualify; `null` derives every pair of own_target_ids |
+| `defender.intercept_radius_m` | how close enemy must be to trigger `ReclaimOnIntrusion` (also unused until enemy positions are wired) |
+| `arena.safety_margin_m`      | edge clip; safety gate still warns when a pose breaches |
+| `drones[fc].role`            | operator pin; `idle` (default) = auto |
+| `drones[fc].altitude_m`      | cruise altitude per FC — used by `WaitInNeutral` slot calc |
 
 ## Wiring it up
 

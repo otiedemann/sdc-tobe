@@ -169,3 +169,78 @@ class UtilityPlanner(SwarmPlanner):
                 task = prev[1]
             out[fc] = task
         return out
+
+
+# ---------------------------------------------------------------------------
+# Role-aware planner — the default in app.py
+# ---------------------------------------------------------------------------
+
+class RoleAssignmentPlanner(SwarmPlanner):
+    """Per tick, decide each drone's *role* from live state +
+    :class:`StrategySettings`, then build a role-specific
+    :class:`DroneTask` for it. The role is the strategy's output, not
+    its input — operators see "Sphinx3 is currently attacker" change
+    in real time.
+
+    Caps and scoring live in :mod:`marker_mission_c2.strategy.roles`.
+
+    The previously-running role per drone is cached so we don't
+    pointlessly re-build (and ``reset``) the same task class every
+    tick — the FC sees a smooth script-push only when the role
+    actually changes.
+    """
+
+    def __init__(self, settings, *,
+                 max_attackers: int = 2,
+                 max_defenders: int = 1):
+        # Late import to keep planner.py decoupled from the
+        # role-scoring module (so a project that wants its own role
+        # logic can swap roles.py without changing planner.py).
+        from . import roles as _roles
+        self._roles = _roles
+        self._settings = settings
+        self._max_attackers = int(max_attackers)
+        self._max_defenders = int(max_defenders)
+        self._last_decisions = {}  # fc → RoleDecision
+
+    def decide(self, state: SwarmState) -> Mapping[str, DroneTask]:
+        decisions = self._roles.decide_roles(
+            state, self._settings,
+            max_attackers=self._max_attackers,
+            max_defenders=self._max_defenders,
+        )
+        out: dict = {}
+        for fc, decision in decisions.items():
+            prev = self._last_decisions.get(fc)
+            # If the role hasn't changed, reuse the previous task
+            # instance so its internal state (e.g. ``_fired``,
+            # ``_phase`` on SyncAttackPair) persists across ticks.
+            if (prev is not None
+                    and prev.role == decision.role
+                    and type(prev.task) is type(decision.task)):
+                out[fc] = prev.task
+                # Keep the cached decision's TASK but update role +
+                # score (since they may shift slightly tick-to-tick).
+                self._last_decisions[fc] = type(decision)(
+                    fc=fc, role=decision.role,
+                    score=decision.score, task=prev.task,
+                )
+            else:
+                if prev is not None:
+                    log.info("planner: %s role %s → %s",
+                             fc, prev.role.value, decision.role.value)
+                decision.task.reset()
+                out[fc] = decision.task
+                self._last_decisions[fc] = decision
+        return out
+
+    def current_role_for(self, fc: str) -> Optional[str]:
+        """Last assigned role for ``fc`` (e.g. ``"attacker"``), or
+        ``None`` if the planner hasn't ticked yet. Read by the web UI
+        so the operator sees the *live* role, not the optional pin."""
+        d = self._last_decisions.get(fc)
+        return d.role.value if d is not None else None
+
+    def current_score_for(self, fc: str) -> Optional[float]:
+        d = self._last_decisions.get(fc)
+        return d.score if d is not None else None
