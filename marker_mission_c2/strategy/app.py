@@ -30,6 +30,7 @@ import sys
 
 from marker_mission_c2.config import load_config
 from marker_mission_c2.fc_pool import FCPool
+from marker_mission_c2.settings import SettingsStore as C2SettingsStore
 
 from .planner import StaticAssignmentPlanner, SwarmPlanner
 from .runner import SwarmRunner
@@ -82,7 +83,14 @@ async def run(cfg, tick_hz: float,
               settings_obj: StrategySettings,
               web_host: str, web_port: int, web_enabled: bool,
               settings_path) -> None:
-    pool = FCPool(cfg)
+    # FCPool needs the C2's own SettingsStore (disabled_fcs etc.).
+    # Point at the canonical runtime/settings.json so the strategy
+    # honours whatever the main C2 dashboard's /settings page has
+    # silenced. The strategy never writes to it — only the dashboard
+    # process does — so there's no lock contention with running both
+    # at once.
+    c2_settings = C2SettingsStore()
+    pool = FCPool(cfg, c2_settings)
     await pool.start()
     log.info("strategy: FCPool up with %d FC(s)", len(cfg.fcs))
     log.info(
