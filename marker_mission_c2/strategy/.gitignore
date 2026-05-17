@@ -1,0 +1,3 @@
+# Per-host strategy settings — written by --save-settings or the web UI.
+# settings.example.json (committed) is the fallback if no local file exists.
+settings.json

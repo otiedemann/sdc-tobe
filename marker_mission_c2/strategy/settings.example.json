@@ -1,0 +1,30 @@
+{
+  "team_color": "red",
+  "own_target_ids_override": null,
+  "enemy_target_ids_override": null,
+  "live_targets_only": true,
+  "arena": {
+    "width_m": 10.0,
+    "depth_m": 20.0,
+    "safety_margin_m": 0.5,
+    "red_home_x_m":     [-5.0, -2.0],
+    "blue_home_x_m":    [ 2.0,  5.0],
+    "neutral_zone_x_m": [-2.0,  2.0]
+  },
+  "drones": {
+    "flightctrl1": {"role": "attacker", "altitude_m": 1.2},
+    "flightctrl2": {"role": "attacker", "altitude_m": 1.8},
+    "flightctrl3": {"role": "scout",    "altitude_m": 2.4},
+    "flightctrl4": {"role": "defender", "altitude_m": 3.0}
+  },
+  "attack": {
+    "hover_alt_m": 3.5,
+    "strike_alt_m": 1.5,
+    "sync_window_s": 1.5,
+    "pair_targets_override": null,
+    "home_zone_clear": true
+  },
+  "defender": {
+    "intercept_radius_m": 2.5
+  }
+}
