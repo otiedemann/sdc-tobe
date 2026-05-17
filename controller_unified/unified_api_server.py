@@ -2562,8 +2562,28 @@ class OlympeBackend(DroneBackend):
         last_err = None
         for attempt in range(3):
             try:
-                with command_lock:
+                # Try to grab command_lock briefly so we serialise with
+                # any in-flight piloting command. If it's held (e.g.
+                # the mission's controller thread is mid-moveBy.wait()
+                # during an _IMU step), DO NOT block — fall through and
+                # send Landing without the lock. Anafi handles
+                # preemption at the firmware level: the Landing command
+                # supersedes whatever moveBy was running, regardless of
+                # who's holding our Python-side serialisation lock.
+                #
+                # Earlier bug: killswitch /api/land waited on this lock
+                # for up to 30 s while moveBy.wait() held it, so the
+                # drone never started landing. Now the killswitch
+                # always gets through within ~100 ms.
+                acquired = command_lock.acquire(timeout=0.1)
+                try:
                     result = d(Landing()).wait(_timeout=10)
+                finally:
+                    if acquired:
+                        command_lock.release()
+                if not acquired:
+                    print(f"[ANAFI] Landing attempt {attempt}: lock "
+                          f"contested — sent without serialisation")
                 ok = False
                 try:
                     ok = result.success() if result is not None else False
