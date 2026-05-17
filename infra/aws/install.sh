@@ -107,6 +107,7 @@ for u in \
   c2-controller.service \
   drone-detector-ui.service \
   marker-mission-c2.service \
+  strategy.service \
   auto-shutdown.timer \
   fc-healthcheck.timer
 do
