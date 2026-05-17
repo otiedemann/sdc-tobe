@@ -1,0 +1,6 @@
+{
+  "team_color": "red",
+  "own_target_ids_override": null,
+  "enemy_target_ids_override": null,
+  "live_targets_only": true
+}

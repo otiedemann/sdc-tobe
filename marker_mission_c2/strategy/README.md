@@ -147,6 +147,53 @@ def build_planner(cfg):
     ])
 ```
 
+## Operator-tunable settings (`settings.py`)
+
+Knobs that change match-to-match live in their own JSON, separate from
+`marker_mission_c2/config.json` (which is fleet-topology stuff that
+hardly ever changes).
+
+| field                       | meaning                                                       |
+| --------------------------- | ------------------------------------------------------------- |
+| `team_color`                | `"red"` (own ids 41–46) or `"blue"` (own ids 31–36)          |
+| `own_target_ids_override`   | replace the team-derived own-target set (rare; null = use team) |
+| `enemy_target_ids_override` | replace the team-derived enemy set (rare; null = use team)    |
+| `live_targets_only`         | ignore xx4/xx5/xx6 spares (default true)                      |
+
+Resolution: `--strategy-settings` flag → `$MARKER_MISSION_C2_STRATEGY_SETTINGS`
+env → `./marker_mission_c2/strategy/settings.json` →
+`./marker_mission_c2/strategy/settings.example.json` → defaults.
+
+Run-time:
+
+```bash
+# Flip team for one run only
+python -m marker_mission_c2.strategy.app --team blue
+
+# Flip + persist (settings.json gets written)
+python -m marker_mission_c2.strategy.app --team blue --save-settings
+```
+
+Programmatic use — a planner that prefers our own targets:
+
+```python
+from marker_mission_c2.strategy import (
+    settings as s, UtilityPlanner, StartMission, Idle,
+)
+cfg = s.load()                     # picks up settings.json
+
+def score_attack(state, fc):
+    obs = state.drones[fc]
+    if not obs.last_marker_id:                     return -1.0
+    if cfg.is_own_target(obs.last_marker_id):       return  10.0
+    if cfg.is_enemy_target(obs.last_marker_id):     return  -5.0
+    return 0.0
+```
+
+Mutating `cfg.team_color = TeamColor.BLUE` at run time flips
+`own_target_ids` / `enemy_target_ids` on the *next* read — every
+derived property is computed at access time, no recreation needed.
+
 ## Tradeoffs we accepted
 
 - **Reactive only.** The strategy looks one tick ahead. No multi-step

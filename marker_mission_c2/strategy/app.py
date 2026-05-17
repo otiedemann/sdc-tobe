@@ -34,6 +34,7 @@ from marker_mission_c2.fc_pool import FCPool
 from .planner import StaticAssignmentPlanner, SwarmPlanner
 from .runner import SwarmRunner
 from .safety import SafetyConfig, SafetyGate
+from .settings import StrategySettings, TeamColor, load as load_settings, save as save_settings
 from .tasks import Idle
 from .world_model import SwarmWorldModel
 
@@ -76,10 +77,17 @@ def build_safety(cfg) -> SafetyGate:
     ))
 
 
-async def run(cfg, tick_hz: float) -> None:
+async def run(cfg, tick_hz: float,
+              settings_obj: StrategySettings) -> None:
     pool = FCPool(cfg)
     await pool.start()
     log.info("strategy: FCPool up with %d FC(s)", len(cfg.fcs))
+    log.info(
+        "strategy: team=%s  own=%s  enemy=%s",
+        settings_obj.team_color.value,
+        sorted(settings_obj.own_target_ids),
+        sorted(settings_obj.enemy_target_ids),
+    )
     planner = build_planner(cfg)
     safety = build_safety(cfg)
     runner = SwarmRunner(
@@ -132,6 +140,17 @@ def main() -> int:
     p.add_argument("--config", default=None,
                    help="Override C2 config path (else uses the same "
                         "resolution as `python -m marker_mission_c2`).")
+    p.add_argument("--strategy-settings", default=None,
+                   help="Path to a strategy settings JSON (else resolves "
+                        "via $MARKER_MISSION_C2_STRATEGY_SETTINGS, the "
+                        "package's settings.json, then settings.example.json).")
+    p.add_argument("--team", choices=["red", "blue"], default=None,
+                   help="Override team_color for this run only. Combined "
+                        "with --save-settings to persist.")
+    p.add_argument("--save-settings", action="store_true",
+                   help="Write the effective settings back to settings.json "
+                        "before starting the runner (so the next launch "
+                        "picks them up).")
     p.add_argument("--tick-hz", type=float, default=1.0)
     p.add_argument("-v", "--verbose", action="store_true")
     args = p.parse_args()
@@ -142,7 +161,15 @@ def main() -> int:
     )
 
     cfg = load_config(args.config)
-    asyncio.run(run(cfg, args.tick_hz))
+
+    settings_obj = load_settings(args.strategy_settings)
+    if args.team:
+        settings_obj.team_color = TeamColor.parse(args.team)
+    if args.save_settings:
+        path = save_settings(settings_obj, args.strategy_settings)
+        log.info("strategy: settings saved to %s", path)
+
+    asyncio.run(run(cfg, args.tick_hz, settings_obj))
     return 0
 
 

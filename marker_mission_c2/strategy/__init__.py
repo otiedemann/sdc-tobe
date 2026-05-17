@@ -48,6 +48,16 @@ from .runner import (
     SwarmRunner,
     TickRecord,
 )
+from .settings import (
+    TeamColor,
+    StrategySettings,
+    RED_TARGET_IDS,
+    BLUE_TARGET_IDS,
+    RED_LIVE_IDS,
+    BLUE_LIVE_IDS,
+    WALL_MARKER_IDS,
+)
+from . import settings  # exposed so callers can do `settings.load(...)`
 
 __all__ = [
     "DroneObservation", "SwarmState", "SwarmWorldModel",
@@ -56,4 +66,8 @@ __all__ = [
     "SwarmPlanner", "StaticAssignmentPlanner", "UtilityPlanner",
     "SafetyConfig", "SafetyGate", "SafetyVerdict",
     "SwarmRunner", "TickRecord",
+    "TeamColor", "StrategySettings",
+    "RED_TARGET_IDS", "BLUE_TARGET_IDS",
+    "RED_LIVE_IDS", "BLUE_LIVE_IDS", "WALL_MARKER_IDS",
+    "settings",
 ]
