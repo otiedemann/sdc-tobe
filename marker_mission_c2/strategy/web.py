@@ -205,9 +205,12 @@ def make_app(
             "drones": drones_out,
             "team_color": settings_obj.team_color.value,
             "zones": {
-                "our_home_x_m": list(settings_obj.our_home_x_m),
-                "enemy_home_x_m": list(settings_obj.enemy_home_x_m),
+                "our_home_x_m":     list(settings_obj.our_home_x_m),
+                "our_home_y_m":     list(settings_obj.our_home_y_m),
+                "enemy_home_x_m":   list(settings_obj.enemy_home_x_m),
+                "enemy_home_y_m":   list(settings_obj.enemy_home_y_m),
                 "neutral_zone_x_m": list(settings_obj.arena.neutral_zone_x_m),
+                "neutral_zone_y_m": list(settings_obj.arena.neutral_zone_y_m),
             },
             "arena": {
                 "width_m": settings_obj.arena.width_m,
@@ -473,19 +476,22 @@ function draw(state) {{
   svg += `<rect x="${{-halfD+m}}" y="${{-halfW+m}}" width="${{A.depth_m-2*m}}" height="${{A.width_m-2*m}}" `
        + `fill="none" stroke="#445" stroke-dasharray="0.2 0.2" stroke-width="0.04"/>`;
 
-  // Zone bands along arena X axis (= image Y axis). Solid colour only;
-  // labels go in the HTML legend below to dodge SVG-text sizing
-  // weirdness across browsers.
+  // Zone rectangles: each zone has an X range (left/right band) AND
+  // a Y range (depth slice). Image: image_x = arena_y, image_y =
+  // arena_x. Solid colour only; labels live in the HTML legend below
+  // to dodge SVG-text sizing weirdness across browsers.
   const ourColor   = team === "red" ? "rgba(255,80,80,0.18)"  : "rgba(80,160,255,0.18)";
   const enemyColor = team === "red" ? "rgba(80,160,255,0.18)" : "rgba(255,80,80,0.18)";
   const neutralColor = "rgba(200,200,200,0.08)";
-  function band(xRange, fill) {{
-    const [lo, hi] = xRange;
-    svg += `<rect x="${{-halfD}}" y="${{lo}}" width="${{A.depth_m}}" height="${{hi - lo}}" fill="${{fill}}" />`;
+  function zone(xRange, yRange, fill) {{
+    const [xLo, xHi] = xRange;
+    const [yLo, yHi] = yRange;
+    svg += `<rect x="${{yLo}}" y="${{xLo}}" `
+         + `width="${{yHi - yLo}}" height="${{xHi - xLo}}" fill="${{fill}}" />`;
   }}
-  band(Z.our_home_x_m,     ourColor);
-  band(Z.enemy_home_x_m,   enemyColor);
-  band(Z.neutral_zone_x_m, neutralColor);
+  zone(Z.our_home_x_m,     Z.our_home_y_m,     ourColor);
+  zone(Z.enemy_home_x_m,   Z.enemy_home_y_m,   enemyColor);
+  zone(Z.neutral_zone_x_m, Z.neutral_zone_y_m, neutralColor);
 
   // Drones
   let rows = "";
@@ -677,15 +683,24 @@ _SETTINGS_HTML = f"""<!doctype html>
     <label>width_m (along X)</label><input type="number" step="0.1" id="arena.width_m">
     <label>depth_m (along Y)</label><input type="number" step="0.1" id="arena.depth_m">
     <label>safety_margin_m</label><input type="number" step="0.05" id="arena.safety_margin_m">
-    <label>red_home_x_m</label>
+    <label>red_home_x_m (left band)</label>
     <div class="row2"><input type="number" step="0.1" id="arena.red_home_x_m.lo"> to
                        <input type="number" step="0.1" id="arena.red_home_x_m.hi"></div>
-    <label>blue_home_x_m</label>
+    <label>red_home_y_m (depth)</label>
+    <div class="row2"><input type="number" step="0.1" id="arena.red_home_y_m.lo"> to
+                       <input type="number" step="0.1" id="arena.red_home_y_m.hi"></div>
+    <label>blue_home_x_m (right band)</label>
     <div class="row2"><input type="number" step="0.1" id="arena.blue_home_x_m.lo"> to
                        <input type="number" step="0.1" id="arena.blue_home_x_m.hi"></div>
+    <label>blue_home_y_m (depth)</label>
+    <div class="row2"><input type="number" step="0.1" id="arena.blue_home_y_m.lo"> to
+                       <input type="number" step="0.1" id="arena.blue_home_y_m.hi"></div>
     <label>neutral_zone_x_m</label>
     <div class="row2"><input type="number" step="0.1" id="arena.neutral_zone_x_m.lo"> to
                        <input type="number" step="0.1" id="arena.neutral_zone_x_m.hi"></div>
+    <label>neutral_zone_y_m</label>
+    <div class="row2"><input type="number" step="0.1" id="arena.neutral_zone_y_m.lo"> to
+                       <input type="number" step="0.1" id="arena.neutral_zone_y_m.hi"></div>
   </div>
 </fieldset>
 
@@ -771,10 +786,16 @@ async function load() {{
   setVal("arena.safety_margin_m", cfg.arena.safety_margin_m);
   setVal("arena.red_home_x_m.lo", cfg.arena.red_home_x_m[0]);
   setVal("arena.red_home_x_m.hi", cfg.arena.red_home_x_m[1]);
+  setVal("arena.red_home_y_m.lo", cfg.arena.red_home_y_m[0]);
+  setVal("arena.red_home_y_m.hi", cfg.arena.red_home_y_m[1]);
   setVal("arena.blue_home_x_m.lo", cfg.arena.blue_home_x_m[0]);
   setVal("arena.blue_home_x_m.hi", cfg.arena.blue_home_x_m[1]);
+  setVal("arena.blue_home_y_m.lo", cfg.arena.blue_home_y_m[0]);
+  setVal("arena.blue_home_y_m.hi", cfg.arena.blue_home_y_m[1]);
   setVal("arena.neutral_zone_x_m.lo", cfg.arena.neutral_zone_x_m[0]);
   setVal("arena.neutral_zone_x_m.hi", cfg.arena.neutral_zone_x_m[1]);
+  setVal("arena.neutral_zone_y_m.lo", cfg.arena.neutral_zone_y_m[0]);
+  setVal("arena.neutral_zone_y_m.hi", cfg.arena.neutral_zone_y_m[1]);
 
   // drones table — one row per FC from topology, prefilled with current assignment
   const tbody = document.querySelector("#drones-table tbody");
@@ -831,8 +852,11 @@ function gather() {{
       depth_m:          getNum("arena.depth_m"),
       safety_margin_m:  getNum("arena.safety_margin_m"),
       red_home_x_m:     [getNum("arena.red_home_x_m.lo"),     getNum("arena.red_home_x_m.hi")],
+      red_home_y_m:     [getNum("arena.red_home_y_m.lo"),     getNum("arena.red_home_y_m.hi")],
       blue_home_x_m:    [getNum("arena.blue_home_x_m.lo"),    getNum("arena.blue_home_x_m.hi")],
+      blue_home_y_m:    [getNum("arena.blue_home_y_m.lo"),    getNum("arena.blue_home_y_m.hi")],
       neutral_zone_x_m: [getNum("arena.neutral_zone_x_m.lo"), getNum("arena.neutral_zone_x_m.hi")],
+      neutral_zone_y_m: [getNum("arena.neutral_zone_y_m.lo"), getNum("arena.neutral_zone_y_m.hi")],
     }},
     drones: drones,
     attack: {{

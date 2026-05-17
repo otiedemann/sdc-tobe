@@ -110,22 +110,30 @@ class ArenaSettings:
     :mod:`marker_mission_c2.strategy.safety`; this field is its
     single source of truth.
 
-    The three ``*_x_m`` ranges divide the arena into three bands
-    along X:
+    Each zone is a 2D **rectangle** defined by an X-range and a Y-range
+    (both inclusive). The X-ranges partition the arena into three
+    bands across width; the Y-ranges further restrict each zone to a
+    sub-span of depth (default: the full depth, ``-D/2 .. +D/2``, so
+    zones behave exactly like the old full-depth bands unless the
+    operator opts in).
 
-      red_home_x_m       deep on the -X side (red's territory)
-      neutral_zone_x_m   middle band (scouts park here)
-      blue_home_x_m      deep on the +X side (blue's territory)
+      red_home_x_m / red_home_y_m       red's territory (LEFT, -X side)
+      neutral_zone_x_m / neutral_y_m    middle band (scouts park here)
+      blue_home_x_m / blue_home_y_m     blue's territory (RIGHT, +X side)
 
     Helpers on :class:`StrategySettings` pick the "ours" / "theirs"
-    band based on ``team_color`` so the rest of the code is team-agnostic.
+    rectangle based on ``team_color`` so the rest of the code is
+    team-agnostic.
     """
     width_m: float = 10.0
     depth_m: float = 20.0
     safety_margin_m: float = 0.5
     red_home_x_m:     Tuple[float, float] = (-5.0, -2.0)
+    red_home_y_m:     Tuple[float, float] = (-10.0, 10.0)
     blue_home_x_m:    Tuple[float, float] = ( 2.0,  5.0)
+    blue_home_y_m:    Tuple[float, float] = (-10.0, 10.0)
     neutral_zone_x_m: Tuple[float, float] = (-2.0,  2.0)
+    neutral_zone_y_m: Tuple[float, float] = (-10.0, 10.0)
 
 
 @dataclass
@@ -252,21 +260,42 @@ class StrategySettings:
                 else self.arena.blue_home_x_m)
 
     @property
+    def our_home_y_m(self) -> Tuple[float, float]:
+        return (self.arena.red_home_y_m if self.team_color == TeamColor.RED
+                else self.arena.blue_home_y_m)
+
+    @property
     def enemy_home_x_m(self) -> Tuple[float, float]:
         return (self.arena.blue_home_x_m if self.team_color == TeamColor.RED
                 else self.arena.red_home_x_m)
 
-    def is_in_home_zone(self, x: float) -> bool:
-        lo, hi = self.our_home_x_m
-        return lo <= float(x) <= hi
+    @property
+    def enemy_home_y_m(self) -> Tuple[float, float]:
+        return (self.arena.blue_home_y_m if self.team_color == TeamColor.RED
+                else self.arena.red_home_y_m)
 
-    def is_in_enemy_zone(self, x: float) -> bool:
-        lo, hi = self.enemy_home_x_m
-        return lo <= float(x) <= hi
+    @staticmethod
+    def _in_rect(x: float, y: Optional[float],
+                 x_range: Tuple[float, float],
+                 y_range: Tuple[float, float]) -> bool:
+        if not (x_range[0] <= float(x) <= x_range[1]):
+            return False
+        # y is optional for backward compat with callers that only
+        # care about the X axis (e.g. plotting a horizontal band).
+        if y is None:
+            return True
+        return y_range[0] <= float(y) <= y_range[1]
 
-    def is_in_neutral_zone(self, x: float) -> bool:
-        lo, hi = self.arena.neutral_zone_x_m
-        return lo <= float(x) <= hi
+    def is_in_home_zone(self, x: float, y: Optional[float] = None) -> bool:
+        return self._in_rect(x, y, self.our_home_x_m, self.our_home_y_m)
+
+    def is_in_enemy_zone(self, x: float, y: Optional[float] = None) -> bool:
+        return self._in_rect(x, y, self.enemy_home_x_m, self.enemy_home_y_m)
+
+    def is_in_neutral_zone(self, x: float, y: Optional[float] = None) -> bool:
+        return self._in_rect(x, y,
+                             self.arena.neutral_zone_x_m,
+                             self.arena.neutral_zone_y_m)
 
     def is_within_arena(self, x: float, y: float,
                         margin_m: Optional[float] = None) -> bool:
@@ -350,8 +379,11 @@ class StrategySettings:
                 "depth_m": self.arena.depth_m,
                 "safety_margin_m": self.arena.safety_margin_m,
                 "red_home_x_m":     list(self.arena.red_home_x_m),
+                "red_home_y_m":     list(self.arena.red_home_y_m),
                 "blue_home_x_m":    list(self.arena.blue_home_x_m),
+                "blue_home_y_m":    list(self.arena.blue_home_y_m),
                 "neutral_zone_x_m": list(self.arena.neutral_zone_x_m),
+                "neutral_zone_y_m": list(self.arena.neutral_zone_y_m),
             },
             "drones": {
                 name: {
@@ -400,13 +432,21 @@ def _tuple2(v, default: Tuple[float, float]) -> Tuple[float, float]:
 
 def _from_dict(d: dict) -> StrategySettings:
     arena_d = d.get("arena") or {}
+    # Default Y ranges span the full depth so old configs (no Y fields)
+    # behave exactly like the old "full-depth bands". Width / depth
+    # default first so the Y default uses the actual configured depth.
+    _depth = float(arena_d.get("depth_m", 20.0))
+    _full_y = (-_depth / 2.0, _depth / 2.0)
     arena = ArenaSettings(
         width_m=float(arena_d.get("width_m", 10.0)),
-        depth_m=float(arena_d.get("depth_m", 20.0)),
+        depth_m=_depth,
         safety_margin_m=float(arena_d.get("safety_margin_m", 0.5)),
         red_home_x_m=_tuple2(arena_d.get("red_home_x_m"), (-5.0, -2.0)),
+        red_home_y_m=_tuple2(arena_d.get("red_home_y_m"), _full_y),
         blue_home_x_m=_tuple2(arena_d.get("blue_home_x_m"), (2.0, 5.0)),
+        blue_home_y_m=_tuple2(arena_d.get("blue_home_y_m"), _full_y),
         neutral_zone_x_m=_tuple2(arena_d.get("neutral_zone_x_m"), (-2.0, 2.0)),
+        neutral_zone_y_m=_tuple2(arena_d.get("neutral_zone_y_m"), _full_y),
     )
 
     drones_d = d.get("drones") or {}
