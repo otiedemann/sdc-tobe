@@ -1,7 +1,11 @@
 [Unit]
-Description=Marker mission combined app (sdc-tobe main branch)
-After=network.target sphinx-control.service
+Description=Marker mission combined app — FC + mission UI on :8080 (sim drone @ 10.202.0.1)
+After=network.target sphinx-control.service sphinx-bootstrap.service
 Wants=sphinx-control.service
+# sphinx-bootstrap brings up env + drone; the FC can only Olympe-connect
+# once the drone is reachable at 10.202.0.1, so wait for bootstrap's
+# RemainAfterExit=yes to flip "done" before we start.
+Requires=sphinx-bootstrap.service
 # Mutual exclusion with the legacy HTTP-only FC. Both units share port
 # 8080 by default; Conflicts= lets either be started without the
 # operator having to stop the other first.
@@ -16,7 +20,10 @@ Group=ubuntu
 # entry point that venv now ALSO needs Olympe (since unified_api_server
 # runs in-process); see infra/aws/install.sh for the dependency union.
 WorkingDirectory=/opt/sdc-tobe
-ExecStart=/opt/sdc-tobe/.venv-marker/bin/python3 -m marker_mission.app
+# --drone-ip 10.202.0.1 points the FC at the Sphinx-sim drone in its
+# netns. Switch the IP (or just remove the flag — defaults to a real
+# Anafi at 192.168.42.1) if this host is ever pointed at hardware.
+ExecStart=/opt/sdc-tobe/.venv-marker/bin/python3 -m marker_mission.app --drone-ip 10.202.0.1
 Restart=on-failure
 RestartSec=5s
 StandardOutput=journal

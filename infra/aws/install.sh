@@ -99,14 +99,10 @@ sudo systemctl reload cron 2>/dev/null || sudo systemctl restart cron
 echo "[install] enabling units..."
 # Order matters less than that they're all enabled — systemd resolves
 # After=/Wants= ordering at activation time.
-# marker-mission.service is intentionally NOT enabled here — operators
-# start the marker_mission UI manually (combined-app entry point with
-# whatever --drone-ip they need). If a host wants it auto-started, run
-#   sudo systemctl enable --now marker-mission.service
-# explicitly.
 for u in \
   xvfb.service \
   sphinx-bootstrap.service \
+  marker-mission.service \
   c2-controller.service \
   drone-detector-ui.service \
   marker-mission-c2.service \
@@ -115,9 +111,6 @@ for u in \
 do
   sudo systemctl enable "$u" 2>&1 | grep -v "already enabled" || true
 done
-
-echo "[install] disabling marker-mission.service if it was previously enabled..."
-sudo systemctl disable --now marker-mission.service 2>&1 | grep -v "not loaded\|not enabled" || true
 
 echo "[install] tz check (target: Europe/Berlin so the 21:00 cron is local)..."
 TZ_NOW=$(timedatectl | awk '/Time zone/ {print $3}')
