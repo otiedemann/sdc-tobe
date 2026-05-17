@@ -219,6 +219,33 @@ Done when the timer expires.
 
 ---
 
+### Raw-RC steps — `LR` / `FB` / `UD` / `RC` — and the brake phase
+
+`LR`, `FB`, `UD`, and the multi-axis `RC` are all *two-phase* steps:
+
+1. **Drive** — pin the operator-typed sticks for the configured
+   `seconds`. The FC ceiling, arena guard, and watchdog still clamp
+   at the wire; the mission-side PD-tuning caps
+   (`cfg.*_rc_max`) are bypassed so a hand-typed `LR 20` reaches
+   the drone as 20, not whatever the closed-loop output cap is.
+2. **Brake** — once the drive timer expires, the controller holds
+   zero sticks and waits until the body-frame velocity drops below
+   ~8 cm/s (or a 1.5-second timeout fires). This makes consecutive
+   steps composable: `FB +20 3` followed by `FB -20 3` reverses
+   from a hover, not from a forward velocity, so the net positions
+   actually cancel.
+
+Without the brake the Anafi's velocity controller decelerates
+asymmetrically — a +20 forward stick builds velocity fast, but the
+opposite -20 stick spends most of its time braking that velocity
+rather than accelerating backward. Inserting an explicit settle
+between steps avoids that.
+
+The brake is automatic; no script syntax change. The operator sees
+it in the journal as `[ctrl] rc step complete (brake 0.42s, speed=7cm/s < 8)`.
+
+---
+
 ### `LR <rc> [<seconds>]`
 
 > Left / right (strafe) raw RC stick for `seconds`.

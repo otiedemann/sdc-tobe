@@ -267,6 +267,20 @@ class PoseSmoother:
 
 
 # ---------------------------------------------------------------------------
+# Raw-RC step (LR / FB / UD / RC) brake settings.
+# After the drive timer expires _step_rc sends zero sticks and waits
+# until the body-frame velocity (vgx² + vgy² + vgz²)^½ drops below
+# ``RC_BRAKE_SPEED_THRESHOLD_CMS`` — at which point the drone has
+# essentially stopped and the next step starts from a clean baseline.
+# ``RC_BRAKE_MAX_SETTLE_S`` caps the wait so a stuck telemetry feed
+# never hangs the script. Numbers tuned for Anafi indoor — the
+# stabiliser brakes hard, so most steps settle in well under 1 s.
+# ---------------------------------------------------------------------------
+RC_BRAKE_SPEED_THRESHOLD_CMS: float = 8.0
+RC_BRAKE_MAX_SETTLE_S: float = 1.5
+
+
+# ---------------------------------------------------------------------------
 # Dead-reckoning position estimator
 # ---------------------------------------------------------------------------
 #
@@ -391,6 +405,14 @@ class MissionState:
     rc_step_ud: int = 0
     rc_step_yaw: int = 0
     rc_step_until: Optional[float] = None
+    # Two-phase RC step: once the drive timer expires we enter a
+    # brake phase that holds zero sticks until the IMU reports near-
+    # zero body-frame velocity (or a max-settle timeout fires).
+    # Stops the drone before the NEXT step starts so commands like
+    # FB +20 then FB -20 don't ride on top of each other's residual
+    # momentum.
+    rc_step_braking: bool = False
+    rc_step_brake_started: Optional[float] = None
     # AWAIT step: when set, _step_idle / _step_hold advance the
     # script as soon as this marker id appears in
     # state.visible_marker_ids (see vision_worker). Cleared on every
@@ -486,6 +508,8 @@ class MissionState:
             self.rc_step_ud = 0
             self.rc_step_yaw = 0
             self.rc_step_until = None
+            self.rc_step_braking = False
+            self.rc_step_brake_started = None
             self.await_marker_id = None
             self.visible_marker_ids = []
             self.dance_mode = None
@@ -1447,30 +1471,85 @@ class MissionController:
 
     # -------------------------------------------------------------- rc (script)
     def _step_rc(self, tel: Optional[TelemetrySnapshot], now: float) -> None:
-        """Mission-script LR / FB / UD / RC step: pin the operator-typed
-        sticks to their values for ``state.rc_step_until - now`` seconds.
-        Bypasses the per-channel ``cfg.*_rc_max`` caps because those are
-        PD-tuning bounds for the closed-loop controllers — applying them
-        to raw operator input silently shrinks (e.g.) ``LR 20`` to ``4``
-        on a host with ``lat_rc_max=4``. FC ceiling / arena guard still
-        clamp at the wire — a UD command above the ceiling is reduced
-        to 0 by the FC, by design."""
+        """Mission-script LR / FB / UD / RC step. Two-phase:
+
+        1. DRIVE — pin the operator-typed sticks until ``rc_step_until``.
+        2. BRAKE — once the timer expires, hold zero sticks until the
+           IMU body-frame velocity drops below RC_BRAKE_SPEED_THRESHOLD_CMS
+           (or RC_BRAKE_MAX_SETTLE_S elapses). The Anafi stabiliser does
+           the actual braking; we just wait long enough that the next
+           step starts from a hover, not on top of residual momentum.
+
+        Bypasses ``cfg.*_rc_max`` (those are PD-tuning bounds for the
+        closed-loop controllers — applying them to operator input
+        silently shrinks LR 20 to 4 on a host with ``lat_rc_max=4``).
+        FC ceiling and arena guard still clamp at the wire."""
         with self.state.lock:
             lr = int(self.state.rc_step_lr)
             fb = int(self.state.rc_step_fb)
             ud = int(self.state.rc_step_ud)
             yaw = int(self.state.rc_step_yaw)
             until = self.state.rc_step_until
-        self._send_rc(lr, fb, ud, yaw, enforce_cfg_caps=False)
+            braking = bool(self.state.rc_step_braking)
+            brake_started = self.state.rc_step_brake_started
+
+        if not braking:
+            # ── DRIVE phase ─────────────────────────────────────────
+            self._send_rc(lr, fb, ud, yaw, enforce_cfg_caps=False)
+            with self.state.lock:
+                remain = (until - now) if until is not None else None
+                self.state.note = (
+                    f"RC drive: lr={lr} fb={fb} ud={ud} yaw={yaw}"
+                    + (f", {remain:.1f}s remaining" if remain is not None
+                       else "")
+                )
+            if until is not None and now >= until:
+                # Drive timer expired — flip into brake phase. Next
+                # tick starts the velocity-based settle.
+                with self.state.lock:
+                    self.state.rc_step_braking = True
+                    self.state.rc_step_brake_started = now
+            return
+
+        # ── BRAKE phase ─────────────────────────────────────────────
+        self._send_rc(0, 0, 0, 0, enforce_cfg_caps=False)
+        speed = self._body_speed_cms(tel)
+        elapsed = (now - brake_started) if brake_started is not None else 0.0
         with self.state.lock:
-            remain = (until - now) if until is not None else None
             self.state.note = (
-                f"RC: lr={lr} fb={fb} ud={ud} yaw={yaw}"
-                + (f", {remain:.1f}s remaining" if remain is not None
-                   else "")
+                f"RC brake: speed={speed:.0f}cm/s elapsed={elapsed:.2f}s"
+                if speed is not None
+                else f"RC brake: speed=? elapsed={elapsed:.2f}s"
             )
-        if until is not None and now >= until:
-            self._advance_script("rc step complete")
+        # Settle conditions:
+        #   - body speed below threshold (drone is effectively still), OR
+        #   - max-settle elapsed (don't hang on stuck telemetry)
+        settled = (
+            speed is not None and speed < RC_BRAKE_SPEED_THRESHOLD_CMS
+        ) or elapsed >= RC_BRAKE_MAX_SETTLE_S
+        if settled:
+            reason = (f"speed={speed:.0f}cm/s < {RC_BRAKE_SPEED_THRESHOLD_CMS:g}"
+                      if speed is not None and speed < RC_BRAKE_SPEED_THRESHOLD_CMS
+                      else f"timeout {elapsed:.2f}s")
+            self._advance_script(
+                f"rc step complete (brake {elapsed:.2f}s, {reason})"
+            )
+
+    @staticmethod
+    def _body_speed_cms(tel: Optional[TelemetrySnapshot]) -> Optional[float]:
+        """Body-frame speed magnitude in cm/s from the Anafi
+        ``vgx/vgy/vgz`` telemetry. Returns None if the telemetry
+        snapshot is missing any axis — caller treats that as
+        ``don't settle yet``, falling back to the brake timeout."""
+        if tel is None or tel.raw is None:
+            return None
+        try:
+            vgx = float(tel.raw.get("vgx", 0.0))
+            vgy = float(tel.raw.get("vgy", 0.0))
+            vgz = float(tel.raw.get("vgz", 0.0))
+        except (TypeError, ValueError):
+            return None
+        return (vgx * vgx + vgy * vgy + vgz * vgz) ** 0.5
 
     # ------------------------------------------------------------ height (script)
     def _step_height(self, tel: Optional[TelemetrySnapshot],
@@ -1983,10 +2062,10 @@ class MissionController:
                             note + f" pause {step.seconds:g}s")
             return
         if step.kind == "RC":
-            # Raw RC step (LR / FB / UD / RC): pin sticks for `seconds`.
-            # The FC ceiling and arena guards still apply because
-            # _send_rc goes through the same /api/rc path the
-            # operator's joystick uses.
+            # Raw RC step (LR / FB / UD / RC): pin sticks for `seconds`,
+            # then enter the brake phase. The FC ceiling and arena
+            # guards still apply because _send_rc goes through the
+            # same /api/rc path the operator's joystick uses.
             with self.state.lock:
                 self.state.rc_step_lr = int(step.rc_lr)
                 self.state.rc_step_fb = int(step.rc_fb)
@@ -1994,6 +2073,10 @@ class MissionController:
                 self.state.rc_step_yaw = int(step.rc_yaw)
                 self.state.rc_step_until = (time.monotonic()
                                              + float(step.seconds))
+                # Reset brake state so the new step starts in the
+                # DRIVE phase, even if the previous one was mid-brake.
+                self.state.rc_step_braking = False
+                self.state.rc_step_brake_started = None
             tag = (f"fb={step.rc_fb}" if step.rc_fb else
                    f"ud={step.rc_ud}" if step.rc_ud else
                    f"yaw={step.rc_yaw}" if step.rc_yaw else
