@@ -143,6 +143,26 @@ wait_for() {
 # ─── stage 0: sphinx-control is up ──────────────────────────────
 
 log "starting recovery / bootstrap"
+
+# Operator can request a HARD recover via the dashboard. Two triggers,
+# whichever exists at start wins (then we consume both):
+#   /tmp/sphinx-bootstrap-hard.flag   — created by /api/recover?hard=1
+#   SPHINX_BOOTSTRAP_HARD=1           — env override (manual / debug)
+#
+# Hard mode bypasses the "drone reachable → skip" healthchecks that
+# can't see emergency state, and always restarts firmwared up front.
+# This is the only known way to clear an Olympe FlyingState=emergency
+# without rebooting the host (firmwared owns the netns + loop-mounts;
+# until it restarts the simulated drone is "connected but wedged").
+HARD_FLAG=/tmp/sphinx-bootstrap-hard.flag
+if [ -f "$HARD_FLAG" ] || [ "${SPHINX_BOOTSTRAP_HARD:-0}" = "1" ]; then
+    rm -f "$HARD_FLAG"
+    log "HARD mode requested — restarting firmwared before normal bootstrap"
+    if ! restart_firmwared_full; then
+        log "abort: hard reset failed"; exit 1
+    fi
+fi
+
 spc_up() { curl -sf --max-time 2 "$SPC_API/api/environment" >/dev/null 2>&1; }
 if ! wait_for "sphinx-control API on :9090" spc_up 60; then
     log "abort: sphinx-control not answering"; exit 1

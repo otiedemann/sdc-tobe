@@ -421,16 +421,30 @@ def _bootstrap_journal_lines(since: str = "5 minutes ago", limit: int = 200) -> 
 
 
 @app.post("/api/recover")
-def api_recover():
+def api_recover(hard: bool = False):
     """Trigger an asynchronous full-stack rebuild. Returns immediately.
 
     Uses systemctl restart (not start) so a unit in active/exited state
     re-runs. --no-block returns before bootstrap finishes; UI polls
     /api/recover/status for progress.
+
+    ``?hard=1`` (or ``?hard=true``) makes the bootstrap restart firmwared
+    up front. Use this when a drone has crashed into
+    ``FlyingState=emergency`` — Olympe.connect() still succeeds in that
+    state so the normal recover's stage-2 healthcheck declares it fine
+    and does nothing. Restarting firmwared clears the netns + loop-mounts
+    underneath the simulated drone, after which the bootstrap's stage-2
+    naturally spawns a fresh one.
     """
     state = _bootstrap_unit_state()
     if state["running"]:
         raise HTTPException(409, detail="recovery already in progress")
+    if hard:
+        try:
+            Path("/tmp/sphinx-bootstrap-hard.flag").touch()
+            log.info("recover: HARD flag set — firmwared will be restarted")
+        except OSError as e:
+            log.warning("recover: couldn't create hard flag: %s", e)
     r = _run([
         "sudo", "-n", "systemctl", "restart", "--no-block", _BOOTSTRAP_UNIT,
     ])
@@ -440,8 +454,8 @@ def api_recover():
             500,
             detail=f"systemctl restart {_BOOTSTRAP_UNIT}: {r.stderr.strip() or r.stdout.strip()}",
         )
-    log.info("recover: triggered %s", _BOOTSTRAP_UNIT)
-    return {"ok": True, "running": True}
+    log.info("recover: triggered %s (hard=%s)", _BOOTSTRAP_UNIT, hard)
+    return {"ok": True, "running": True, "hard": hard}
 
 
 @app.get("/api/recover/status")
