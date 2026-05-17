@@ -13,7 +13,7 @@ clients can address them individually.
 
 ## What you get
 
-- **Dashboard** at `http://<host>:8090/`: list active drones, spawn
+- **Dashboard** at `http://<host>:9090/`: list active drones, spawn
   new ones, restart/stop/delete individual or all drones, view who's
   connected to each.
 - **REST API** at `/api/*` for scripting (see "API reference" below).
@@ -59,8 +59,8 @@ cd sdc-tobe/sphinx-control
 ./install.sh --enable           # ...and enable+start it
 ```
 
-By default the service listens on `0.0.0.0:8090`. Open the dashboard
-at `http://<host>:8090/`.
+By default the service listens on `0.0.0.0:9090`. Open the dashboard
+at `http://<host>:9090/`.
 
 ## Quick start (development on macOS)
 
@@ -70,7 +70,7 @@ python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
 cp config.example.yaml config.yaml
-uvicorn server:app --host 127.0.0.1 --port 8090 --reload
+uvicorn server:app --host 127.0.0.1 --port 9090 --reload
 ```
 
 Sphinx is auto-detected as missing → **dry-run mode kicks in** and
@@ -85,7 +85,7 @@ and edit. Key knobs:
 
 ```yaml
 host: "0.0.0.0"
-port: 8090
+port: 9090
 state_db: "./sphinx_control.db"
 max_drones: 10            # cap on simultaneous instances
 network:
@@ -205,7 +205,7 @@ curl http://100.85.42.7:9081/...
 # Drone 2:
 curl http://100.85.42.7:9082/...
 # Management dashboard:
-open http://100.85.42.7:8090/
+open http://100.85.42.7:9090/
 ```
 
 That's it — Tailscale already routes traffic to the host; the ports
@@ -266,7 +266,7 @@ GET    /api/system                 host + Tailscale + Sphinx info
 Example: spawn a drone via curl
 
 ```bash
-curl -X POST http://localhost:8090/api/drones \
+curl -X POST http://localhost:9090/api/drones \
      -H 'Content-Type: application/json' \
      -d '{"drone_profile":"anafi","world_name":"empty"}'
 ```
@@ -276,7 +276,7 @@ curl -X POST http://localhost:8090/api/drones \
 ```
               ┌────────────────────────────────┐
               │  sphinx-control (this service) │
-              │  uvicorn FastAPI :8090         │
+              │  uvicorn FastAPI :9090         │
               └────────┬───────────────────────┘
                        │
         spawns subprocesses + tracks PIDs

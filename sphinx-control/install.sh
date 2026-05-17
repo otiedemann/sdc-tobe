@@ -60,6 +60,6 @@ echo
 echo "Sphinx Control installed."
 echo "Run manually:"
 echo "  source $VENV/bin/activate"
-echo "  uvicorn server:app --host 0.0.0.0 --port 8090"
+echo "  uvicorn server:app --host 0.0.0.0 --port 9090"
 echo
-echo "Then open http://<host>:8090/"
+echo "Then open http://<host>:9090/"

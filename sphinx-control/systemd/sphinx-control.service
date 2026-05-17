@@ -12,7 +12,7 @@ Group=sdc
 WorkingDirectory=/home/sdc/sdc-tobe/sphinx-control
 Environment=SPHINX_CONTROL_CONFIG=/home/sdc/sdc-tobe/sphinx-control/config.yaml
 Environment=PATH=/home/sdc/sdc-tobe/sphinx-control/.venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
-ExecStart=/home/sdc/sdc-tobe/sphinx-control/.venv/bin/uvicorn server:app --host 0.0.0.0 --port 8090
+ExecStart=/home/sdc/sdc-tobe/sphinx-control/.venv/bin/uvicorn server:app --host 0.0.0.0 --port 9090
 Restart=on-failure
 RestartSec=3s
 

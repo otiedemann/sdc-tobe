@@ -20,7 +20,7 @@ log() { echo "[bootstrap $(date -Iseconds)] $*"; }
 
 FC_VENV=/opt/sdc-tobe/.venv
 DRONE_IP=10.202.0.1
-SPC_API=http://localhost:8090
+SPC_API=http://localhost:9090
 FC_API=http://localhost:8080
 SPHINX_RPC_PORT=8383
 
@@ -144,7 +144,7 @@ wait_for() {
 
 log "starting recovery / bootstrap"
 spc_up() { curl -sf --max-time 2 "$SPC_API/api/environment" >/dev/null 2>&1; }
-if ! wait_for "sphinx-control API on :8090" spc_up 60; then
+if ! wait_for "sphinx-control API on :9090" spc_up 60; then
     log "abort: sphinx-control not answering"; exit 1
 fi
 

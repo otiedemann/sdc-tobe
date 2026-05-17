@@ -5,7 +5,9 @@
 # Where to bind the management web UI. 0.0.0.0 = listen on all interfaces
 # (so Tailscale and LAN can reach it). Use 127.0.0.1 for localhost-only.
 host: "0.0.0.0"
-port: 8090
+# Moved from 8090 → 9090 to avoid collision with marker_mission_c2 main
+# dashboard on :8090 and the strategy operator UI on :8091.
+port: 9090
 
 # Where the SQLite state DB lives. Persists across service restarts so
 # spawned drones survive a reboot of the management service (the actual

@@ -30,7 +30,7 @@ WEDGE_PATTERN_THRESHOLD=1                # "Too many ping failures" lines requir
 WEDGE_TAIL_LINES=200                     # how many recent log lines to inspect
 COOLDOWN_S=300                           # don't restart more than once / 5 min
 FC_API=http://localhost:8080
-SPC_API=http://localhost:8090
+SPC_API=http://localhost:9090
 
 log() { logger -t fc-healthcheck "$*"; echo "$*"; }
 

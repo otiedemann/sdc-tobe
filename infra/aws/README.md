@@ -44,7 +44,7 @@ parrot-sphinx deb package, not from this repo):
 ```
 firmwared.service ──┬── xvfb.service (NVIDIA Xorg on :99)
                     │
-                    └── sphinx-control.service (:8090)
+                    └── sphinx-control.service (:9090)
                             │
                             ▼
                      sphinx-bootstrap.service  (oneshot, ~60 s)
@@ -105,7 +105,7 @@ After this the next reboot will bring up everything in order.
 systemctl list-units --type=service --state=running | grep -E \
   'firmwared|xvfb|sphinx-control|marker-mission|c2-controller'
 systemctl list-timers --no-pager | grep auto-shutdown
-sudo ss -lntp | awk '/:8070|:8080|:8090|:8383/ {print $4}'
+sudo ss -lntp | awk '/:8070|:8080|:9090|:8383/ {print $4}'
 ```
 
 You should see all five units active, `auto-shutdown.timer` in the

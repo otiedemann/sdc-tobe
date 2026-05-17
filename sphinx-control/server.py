@@ -6,7 +6,7 @@ Run with::
     python3 -m venv .venv && source .venv/bin/activate
     pip install -r requirements.txt
     cp config.example.yaml config.yaml   # then edit
-    uvicorn server:app --host 0.0.0.0 --port 8090
+    uvicorn server:app --host 0.0.0.0 --port 9090
 
 Or via the provided systemd unit.
 """
