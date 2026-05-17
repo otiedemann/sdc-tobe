@@ -426,6 +426,14 @@ document.addEventListener('keydown', e => {
   // keystroke through means the killswitch is purely additive.
   _killswitchBanner();
   _beep(220, 350);                                    // distinct lower tone
+  // /api/land goes STRAIGHT to the FC and tells Anafi to land —
+  // works regardless of mission phase, and the Landing command
+  // preempts any in-flight moveBy / rotate the mission's _IMU
+  // steps are blocked on. /api/stop runs in parallel so the
+  // mission state machine winds down cleanly; we never want
+  // killswitch availability to depend on the mission controller
+  // being responsive.
+  fetch('/api/land', {method: 'POST'}).catch(() => {});
   fetch('/api/stop', {method: 'POST'}).catch(() => {});
 });
 </script>
@@ -536,8 +544,15 @@ function fmt(v, unit, prec) {
 
 // ---- Status panel (only runs if its DOM elements are present) -----------
 const TERMINAL_PHASES = new Set(['done', 'abort']);
+// Phases during which "Stop & land" must remain reachable. Anything
+// the controller can sit in (per Phase enum in controller.py) that
+// ISN'T 'init' / 'done' / 'abort' goes here. Otherwise the operator
+// loses the kill switch mid-mission — exactly what happened on
+// rc/rotate/scout/move_imu/goto when those phases were introduced
+// without updating this set.
 const STOPPABLE_PHASES = new Set(['takeoff','search','align','height_align',
                                    'approach','hold','idle','height','dance',
+                                   'goto','rc','rotate','scout','move_imu',
                                    'land']);
 let stopRequested = false;
 function setScriptLocked(locked) {
@@ -5056,18 +5071,22 @@ class UiServer:
 
         @app.post("/api/stop")
         def api_stop():
+            # No phase guard. Killswitch availability must NEVER depend
+            # on what the mission state machine thinks. If there's a
+            # stop handler we always invoke it; if the controller is
+            # already done/aborted the handler just no-ops. Lets the
+            # killswitch keystroke + the Stop button still tear down
+            # any leftover state when phase=init/done/abort.
             if self.on_stop is None:
                 return jsonify({"ok": False,
                                 "error": "no stop handler registered"}), 500
             phase = self.state.snapshot().get("phase")
-            if phase in ("init", "done", "abort"):
-                return jsonify({"ok": False,
-                                "error": f"mission not running (phase={phase})"}), 409
             try:
                 self.on_stop()
             except Exception as e:
-                return jsonify({"ok": False, "error": str(e)}), 500
-            return jsonify({"ok": True})
+                return jsonify({"ok": False, "error": str(e),
+                                "phase": phase}), 500
+            return jsonify({"ok": True, "phase": phase})
 
         @app.get("/video.mjpg")
         def video():
