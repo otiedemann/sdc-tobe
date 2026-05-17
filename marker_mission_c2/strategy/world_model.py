@@ -10,10 +10,13 @@ copy, so reads here are cheap.
 """
 from __future__ import annotations
 
+import dataclasses
 import logging
 import time
 from dataclasses import dataclass, field
 from typing import Mapping, Optional, Tuple
+
+import requests
 
 log = logging.getLogger("c2.strategy.world")
 
@@ -76,14 +79,24 @@ class SwarmWorldModel:
 
       state.telemetry.battery        → battery_pct
       state.telemetry.yaw            → yaw_deg
-      state.position.{x_m,y_m,z_m}   → pose
       state.mission.phase            → phase
-      state.last_marker_id           → last_marker_id
+
+    Pose is *not* in ``/api/state`` — the FC only publishes it on
+    ``/api/position``. We fetch that endpoint per online FC inside
+    :meth:`observe` so the strategy sees ``pose`` whenever the FC's
+    positioning solver has a fresh fix. Stale / disabled / missing
+    position responses leave ``pose=None`` and don't block the tick.
     """
+
+    POSITION_FETCH_TIMEOUT_S = 0.3
 
     def __init__(self, fc_pool) -> None:
         # Avoid hard import so this module is testable without httpx.
         self._pool = fc_pool
+        # One requests.Session keeps an HTTP keepalive per FC, so each
+        # /api/position fetch is a sub-10 ms TCP-reused round trip on
+        # the same tailnet — fine to call at the strategy tick rate.
+        self._http = requests.Session()
 
     def observe(self) -> SwarmState:
         t = time.monotonic()
@@ -91,7 +104,11 @@ class SwarmWorldModel:
         drones: dict[str, DroneObservation] = {}
         for name, entry in snap.items():
             try:
-                drones[name] = _extract(name, entry)
+                obs = _extract(name, entry)
+                pose = self._fetch_pose(name, entry)
+                if pose is not None:
+                    obs = dataclasses.replace(obs, pose=pose)
+                drones[name] = obs
             except Exception:
                 log.exception("world_model: failed to extract obs for %s", name)
                 drones[name] = DroneObservation(
@@ -102,6 +119,40 @@ class SwarmWorldModel:
                     age_s=None,
                 )
         return SwarmState(t=t, drones=drones)
+
+    def _fetch_pose(self, name: str,
+                    entry: dict) -> Optional[Tuple[float, float, float]]:
+        """Best-effort GET /api/position. Returns ``None`` on any failure
+        (FC offline, timeout, stale fix, malformed payload) — the caller
+        leaves :attr:`DroneObservation.pose` as ``None`` in that case.
+        Pose only appears once the FC's positioning solver has a live
+        marker lock (typically after takeoff), so ``None`` is the
+        steady-state for a drone sitting on the ground."""
+        if not entry.get("connection_ok"):
+            return None
+        base = entry.get("base_url")
+        if not base:
+            return None
+        try:
+            r = self._http.get(f"{base}/api/position",
+                               timeout=self.POSITION_FETCH_TIMEOUT_S)
+        except requests.RequestException:
+            return None
+        if r.status_code != 200:
+            return None
+        try:
+            data = r.json()
+        except ValueError:
+            return None
+        if not data or not data.get("ok") or data.get("stale"):
+            return None
+        pos = data.get("pos")
+        if not isinstance(pos, (list, tuple)) or len(pos) < 3:
+            return None
+        try:
+            return (float(pos[0]), float(pos[1]), float(pos[2]))
+        except (TypeError, ValueError):
+            return None
 
 
 # ---------------------------------------------------------------------------
