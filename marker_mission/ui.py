@@ -118,6 +118,7 @@ _PAGE_HEADER = """
     <a href="/tune" class="{{ 'active' if active=='tune' else '' }}">Tune</a>
     <a href="/arena" class="{{ 'active' if active=='arena' else '' }}">Arena</a>
     <a href="/calibrate" class="{{ 'active' if active=='calibrate' else '' }}">Calibrate</a>
+    <a href="/settings" class="{{ 'active' if active=='settings' else '' }}">Settings</a>
   </nav>
   <span style="margin-left:auto; font-size:.85rem; color:#aab;"
         id="phase">{{ header_label or 'phase: …' }}</span>
@@ -3300,6 +3301,188 @@ refreshList();
 
 
 # ---------------------------------------------------------------------------
+# Settings page (import / export of local settings + backup history)
+# ---------------------------------------------------------------------------
+_PAGE_SETTINGS = _PAGE_BASE_CSS + _PAGE_HEADER + _COMMON_SCRIPT + _PAGE_GRID_OPEN + """
+<section class="card" style="grid-column: span 2;">
+  <h2 style="margin-top:0;">Settings — Import / Export</h2>
+  <p style="color:#aab; max-width:760px;">
+    Bundles every editable piece of mission state on this host
+    (live tune, live mission, live arena, plus every saved snapshot)
+    into one zip file. Camera calibrations and per-flight artefacts
+    are intentionally NOT included — they are host-specific.
+    <br><br>
+    Importing REPLACES (does not merge) the in-scope state. A backup
+    of the pre-import state is saved automatically so you can revert
+    from the history table below.
+  </p>
+
+  <div style="display:flex; gap:1rem; flex-wrap:wrap; margin-top:1rem;">
+    <div style="flex:1 1 320px; padding:.8rem; border:1px solid #2a3038;
+                border-radius:6px; background:#0c0f12;">
+      <h3 style="margin-top:0;">Export</h3>
+      <p style="color:#aab; font-size:.9rem;">
+        Downloads a zip named <code>sdc-fc&lt;N&gt;-settings-&lt;ts&gt;.zip</code>.
+      </p>
+      <a id="btn-export" href="/api/mission/settings/export"
+         class="button"
+         style="display:inline-block; padding:.5rem 1rem;
+                background:#1a73e8; color:#fff; border-radius:4px;
+                text-decoration:none;">⤓ Export</a>
+    </div>
+
+    <div style="flex:1 1 320px; padding:.8rem; border:1px solid #2a3038;
+                border-radius:6px; background:#0c0f12;">
+      <h3 style="margin-top:0;">Import</h3>
+      <p style="color:#aab; font-size:.9rem;">
+        Replaces ALL in-scope state with the contents of the uploaded
+        zip. Pre-import backup is created automatically.
+      </p>
+      <input id="import-file" type="file" accept=".zip"
+             style="display:block; margin-bottom:.5rem; color:var(--fg);">
+      <button id="btn-import" type="button"
+              style="padding:.5rem 1rem; background:#dc2626; color:#fff;
+                     border:0; border-radius:4px; cursor:pointer;"
+              disabled>⤒ Import (replace)</button>
+      <span id="import-status" style="margin-left:.5rem; color:#aab;
+                                       font-size:.85rem;"></span>
+    </div>
+  </div>
+</section>
+
+<section class="card" style="grid-column: span 2;">
+  <h2 style="margin-top:0;">Backup history</h2>
+  <p style="color:#aab; font-size:.9rem; max-width:760px;">
+    Each import / revert auto-creates a backup with the
+    pre-operation state. Restoring from a backup is itself another
+    import, so an accidental revert is itself revertible.
+  </p>
+  <table id="backup-table" style="width:100%; border-collapse:collapse; margin-top:.5rem;">
+    <thead>
+      <tr style="text-align:left; border-bottom:1px solid #2a3038;">
+        <th style="padding:.4rem .3rem;">Created</th>
+        <th style="padding:.4rem .3rem;">Origin</th>
+        <th style="padding:.4rem .3rem;">Host</th>
+        <th style="padding:.4rem .3rem; text-align:right;">Files</th>
+        <th style="padding:.4rem .3rem; text-align:right;">Size</th>
+        <th style="padding:.4rem .3rem;">Actions</th>
+      </tr>
+    </thead>
+    <tbody id="backup-rows">
+      <tr><td colspan="6" style="padding:.6rem .3rem; color:#aab;">
+        Loading…
+      </td></tr>
+    </tbody>
+  </table>
+</section>
+
+<script>
+(function() {
+  const fileEl = document.getElementById('import-file');
+  const btnImport = document.getElementById('btn-import');
+  const status = document.getElementById('import-status');
+  const tbody = document.getElementById('backup-rows');
+
+  fileEl.addEventListener('change', () => {
+    btnImport.disabled = !fileEl.files || !fileEl.files.length;
+    status.textContent = '';
+  });
+
+  btnImport.addEventListener('click', async () => {
+    if (!fileEl.files || !fileEl.files.length) return;
+    const f = fileEl.files[0];
+    if (!confirm(`Replace ALL local settings with the contents of\\n${f.name}?\\nA backup of the current state will be created first.`)) {
+      return;
+    }
+    btnImport.disabled = true;
+    status.textContent = 'uploading…';
+    const fd = new FormData();
+    fd.append('file', f);
+    try {
+      const r = await fetch('/api/mission/settings/import', {method: 'POST', body: fd});
+      const j = await r.json();
+      if (!r.ok || !j.ok) {
+        status.textContent = 'failed: ' + (j.error || r.status);
+        btnImport.disabled = false;
+        return;
+      }
+      status.textContent = `ok — backup ${j.backup_id} created, ${j.manifest.files.length} files imported`;
+      // Reload backup list and prompt operator to refresh live cfg.
+      await refreshBackups();
+    } catch (e) {
+      status.textContent = 'failed: ' + e;
+      btnImport.disabled = false;
+    }
+  });
+
+  async function refreshBackups() {
+    const r = await fetch('/api/mission/settings/backups', {cache: 'no-store'});
+    if (!r.ok) {
+      tbody.innerHTML = '<tr><td colspan="6" style="padding:.6rem .3rem; color:#f87171;">failed to list backups</td></tr>';
+      return;
+    }
+    const j = await r.json();
+    const rows = (j.backups || []).map(b => {
+      const sizeKB = (b.size_bytes / 1024).toFixed(1);
+      const created = new Date(b.modified_at_unix * 1000).toLocaleString();
+      const origin = b.origin || '?';
+      const host = b.host_id || '?';
+      return `<tr style="border-bottom:1px solid #1a1f25;">
+        <td style="padding:.4rem .3rem; font-family:monospace; font-size:.85rem;">${created}<br><span style="color:#6b7280;">${b.name}</span></td>
+        <td style="padding:.4rem .3rem;"><span style="padding:.1rem .4rem; background:#1a1f25; border-radius:3px; font-size:.75rem;">${origin}</span></td>
+        <td style="padding:.4rem .3rem;">${host}</td>
+        <td style="padding:.4rem .3rem; text-align:right;">${b.file_count}</td>
+        <td style="padding:.4rem .3rem; text-align:right;">${sizeKB} KB</td>
+        <td style="padding:.4rem .3rem;">
+          <a href="/api/mission/settings/backups/${encodeURIComponent(b.name)}/download"
+             style="color:#58c4ff; text-decoration:none; margin-right:.6rem;">↓ download</a>
+          <button data-restore="${b.name}"
+                  style="padding:.2rem .55rem; background:#1a73e8; color:#fff; border:0; border-radius:3px; cursor:pointer; font-size:.8rem;">⟲ restore</button>
+          <button data-delete="${b.name}"
+                  style="padding:.2rem .55rem; background:transparent; color:#f87171; border:1px solid #2a3038; border-radius:3px; cursor:pointer; font-size:.8rem; margin-left:.3rem;">✕</button>
+        </td>
+      </tr>`;
+    });
+    tbody.innerHTML = rows.length ? rows.join('') :
+      '<tr><td colspan="6" style="padding:.6rem .3rem; color:#aab;">No backups yet — they appear here after the first import or revert.</td></tr>';
+    tbody.querySelectorAll('button[data-restore]').forEach(b => {
+      b.addEventListener('click', async () => {
+        const name = b.getAttribute('data-restore');
+        if (!confirm(`Restore from ${name}?\\nA pre-revert backup of the current state will be created first.`)) return;
+        b.disabled = true;
+        const r = await fetch(`/api/mission/settings/backups/${encodeURIComponent(name)}/restore`, {method: 'POST'});
+        const j = await r.json();
+        if (!r.ok || !j.ok) {
+          alert('restore failed: ' + (j.error || r.status));
+          b.disabled = false;
+          return;
+        }
+        alert(`ok — restored from ${j.restored_from}, pre-revert backup ${j.backup_id} saved.`);
+        await refreshBackups();
+      });
+    });
+    tbody.querySelectorAll('button[data-delete]').forEach(b => {
+      b.addEventListener('click', async () => {
+        const name = b.getAttribute('data-delete');
+        if (!confirm(`Delete ${name}? Cannot be undone.`)) return;
+        const r = await fetch(`/api/mission/settings/backups/${encodeURIComponent(name)}`, {method: 'DELETE'});
+        const j = await r.json().catch(() => ({}));
+        if (!r.ok || !j.ok) {
+          alert('delete failed: ' + (j.error || r.status));
+          return;
+        }
+        await refreshBackups();
+      });
+    });
+  }
+
+  refreshBackups();
+})();
+</script>
+""" + _PAGE_GRID_CLOSE + _SHARED_SCRIPT
+
+
+# ---------------------------------------------------------------------------
 # UI server
 # ---------------------------------------------------------------------------
 
@@ -3712,6 +3895,141 @@ class UiServer:
                     time.sleep(0.05)
             return Response(gen(),
                             mimetype="multipart/x-mixed-replace; boundary=frame")
+
+        # ---- Settings: import / export / backup history ---------------
+        # Routes live under /api/mission/settings/* to avoid colliding
+        # with the unified server's /api/settings (which carries the
+        # FC flight envelope — max_altitude_m, max_tilt, …, NOT the
+        # local marker_mission state we ship here).
+        from . import settings_io
+
+        def _reload_live_cfg_after_import(source: str) -> None:
+            """Bring the running mission's cfg + arena in sync with
+            the freshly-imported state, so the operator doesn't need
+            a service restart for the new values to take effect."""
+            if self.cfg is None:
+                return
+            try:
+                fresh = MissionConfig.load()
+                before = {k: getattr(self.cfg, k, None)
+                          for k in self.cfg.__dataclass_fields__}
+                self.cfg.update_from_dict({
+                    k: getattr(fresh, k)
+                    for k in self.cfg.__dataclass_fields__
+                })
+                if self.controller is not None:
+                    self.controller.apply_config_changes()
+                self._log_param_changes(before, source=source)
+            except Exception as e:
+                print(f"[settings] live reload after {source} failed: {e}")
+            # Arena: if a holder is wired in, reload from the live JSON
+            # so vision_worker picks the new layout on its next tick.
+            if self.arena_holder is not None:
+                try:
+                    from .arena import load_priority_arena
+                    fresh_arena = load_priority_arena()
+                    if hasattr(self.arena_holder, "set"):
+                        self.arena_holder.set(fresh_arena)
+                except Exception as e:
+                    print(f"[settings] arena live reload after {source} "
+                          f"failed: {e}")
+
+        @app.get("/settings")
+        def settings_page():
+            return render_template_string(
+                _PAGE_SETTINGS, active="settings",
+                history_s=self.history_s,
+                mode="live",
+                state_url="/api/state",
+                video_url="/video.mjpg",
+                replay_id=None,
+                header_label="local settings",
+                drone_connected=self.drone_connected,
+                killswitch_key=killswitch_key(),
+            )
+
+        @app.get("/api/mission/settings/export")
+        def api_settings_export():
+            try:
+                zip_bytes, fname = settings_io.export_zip()
+            except Exception as e:
+                return jsonify({"ok": False, "error": str(e)}), 500
+            resp = Response(zip_bytes, mimetype="application/zip")
+            resp.headers["Content-Disposition"] = (
+                f'attachment; filename="{fname}"'
+            )
+            resp.headers["Cache-Control"] = "no-store"
+            return resp
+
+        @app.post("/api/mission/settings/import")
+        def api_settings_import():
+            f = request.files.get("file")
+            if f is None or not f.filename:
+                return jsonify({"ok": False,
+                                "error": "missing 'file' form field"}), 400
+            zip_bytes = f.read()
+            if not zip_bytes:
+                return jsonify({"ok": False,
+                                "error": "uploaded file is empty"}), 400
+            try:
+                result = settings_io.import_zip(zip_bytes)
+            except (ValueError, KeyError, OSError) as e:
+                return jsonify({"ok": False, "error": str(e)}), 400
+            except Exception as e:
+                return jsonify({"ok": False, "error": str(e)}), 500
+            _reload_live_cfg_after_import("settings-import")
+            return jsonify({"ok": True, **result})
+
+        @app.get("/api/mission/settings/backups")
+        def api_settings_backups():
+            try:
+                return jsonify({"ok": True,
+                                "backups": settings_io.list_backups()})
+            except Exception as e:
+                return jsonify({"ok": False, "error": str(e)}), 500
+
+        @app.post("/api/mission/settings/backups/<name>/restore")
+        def api_settings_restore(name):
+            try:
+                result = settings_io.restore_backup(name)
+            except FileNotFoundError as e:
+                return jsonify({"ok": False, "error": str(e)}), 404
+            except ValueError as e:
+                return jsonify({"ok": False, "error": str(e)}), 400
+            except Exception as e:
+                return jsonify({"ok": False, "error": str(e)}), 500
+            _reload_live_cfg_after_import("settings-restore")
+            return jsonify({"ok": True, **result})
+
+        @app.get("/api/mission/settings/backups/<name>/download")
+        def api_settings_backup_download(name):
+            try:
+                data = settings_io.read_backup_bytes(name)
+            except FileNotFoundError as e:
+                return jsonify({"ok": False, "error": str(e)}), 404
+            except ValueError as e:
+                return jsonify({"ok": False, "error": str(e)}), 400
+            except Exception as e:
+                return jsonify({"ok": False, "error": str(e)}), 500
+            resp = Response(data, mimetype="application/zip")
+            resp.headers["Content-Disposition"] = (
+                f'attachment; filename="{name}"'
+            )
+            resp.headers["Cache-Control"] = "no-store"
+            return resp
+
+        @app.delete("/api/mission/settings/backups/<name>")
+        def api_settings_backup_delete(name):
+            try:
+                ok = settings_io.delete_backup(name)
+            except ValueError as e:
+                return jsonify({"ok": False, "error": str(e)}), 400
+            except Exception as e:
+                return jsonify({"ok": False, "error": str(e)}), 500
+            if not ok:
+                return jsonify({"ok": False,
+                                "error": "backup not found"}), 404
+            return jsonify({"ok": True, "name": name})
 
         # ---- Calibration ----------------------------------------------
         @app.get("/calibrate")
