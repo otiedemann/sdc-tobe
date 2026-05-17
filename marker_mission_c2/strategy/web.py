@@ -315,7 +315,7 @@ function draw(state) {{
   function band(xRange, fill, label) {{
     const [lo, hi] = xRange;
     svg += `<rect x="${{-halfD}}" y="${{lo}}" width="${{A.depth_m}}" height="${{hi - lo}}" fill="${{fill}}" />`;
-    svg += `<text class="lbl" x="${{-halfD + 0.3}}" y="${{(lo+hi)/2 + 0.4}}" font-size="0.6">${{label}}</text>`;
+    svg += `<text class="lbl" x="${{-halfD + 0.3}}" y="${{(lo+hi)/2 + 0.4}}" style="font-size:11px">${{label}}</text>`;
   }}
   band(Z.our_home_x_m,     team === "red" ? "rgba(255,80,80,0.10)"  : "rgba(80,160,255,0.10)", `OUR HOME (${{team}})`);
   band(Z.enemy_home_x_m,   team === "red" ? "rgba(80,160,255,0.10)" : "rgba(255,80,80,0.10)",  "ENEMY HOME");
@@ -336,7 +336,7 @@ function draw(state) {{
     svg += `<g transform="translate(${{ix}},${{iy}}) rotate(${{yaw}})">`
         +  `<polygon points="0,-0.35 0.25,0.25 -0.25,0.25" fill="${{color}}" stroke="#000" stroke-width="0.03"/>`
         +  `</g>`;
-    svg += `<text class="id" x="${{ix + 0.35}}" y="${{iy + 0.1}}" font-size="0.45">${{name}} · ${{az.toFixed(1)}}m</text>`;
+    svg += `<text class="id" x="${{ix + 0.35}}" y="${{iy + 0.1}}" style="font-size:10px">${{name}} · ${{az.toFixed(1)}}m</text>`;
     rows += `<tr><td>${{name}}</td><td>${{d.role}}</td><td>${{d.cruise_altitude_m.toFixed(1)}}m</td>`
          +  `<td>${{ax.toFixed(1)}}, ${{ay.toFixed(1)}}, ${{az.toFixed(1)}}</td>`
          +  `<td>${{d.battery_pct == null ? "–" : Math.round(d.battery_pct) + "%"}}</td></tr>`;
