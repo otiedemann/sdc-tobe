@@ -119,9 +119,14 @@ class ArenaMarker:
 
 @dataclass
 class ArenaConfig:
-    """Loaded arena layout. ``marker_size_m`` is informational here -- the
-    controller still drives the detector with ``cfg.marker_size_m``;
-    this field is what the layout file says it printed at.
+    """Loaded arena layout. ``marker_size_m`` is the operator-facing
+    source of truth for marker geometry: ``mission.py`` syncs it into
+    the detector every tick (``detector.set_marker_size``), so a /arena
+    Save propagates to solvePnP without a restart. The ``cfg.marker_size_m``
+    field on :class:`MissionConfig` is only consulted as a fallback when
+    no arena is loaded — in production an arena always is, and the
+    cfg value is effectively ignored. The video overlay reads
+    ``detector.marker_size`` to stay consistent with this convention.
 
     The ``width_m`` / ``depth_m`` / ``top_z_m`` / ``bottom_z_m`` fields
     are metadata used by the Arena tab to re-render the arena on the

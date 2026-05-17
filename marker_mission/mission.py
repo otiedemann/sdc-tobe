@@ -806,10 +806,17 @@ def cmd_fly(args: argparse.Namespace) -> int:
                 # video showing -16 deg next to a CSV row at +12 deg
                 # at the same instant.
                 snap = state.snapshot()
+                # Marker size shown on the overlay must match what
+                # solvePnP is actually using — detector.marker_size is
+                # kept in sync with arena_holder.get().marker_size_m
+                # every tick above, so it's the single source of truth.
+                # cfg.marker_size_m was the older path and is stale
+                # whenever an arena has been loaded (which is always,
+                # in production).
                 lines = [
                     f"phase: {snap['phase']}",
                     f"target id={active_mid}  "
-                    f"size={cfg.marker_size_m*100:.0f}cm",
+                    f"size={detector.marker_size*100:.0f}cm",
                 ]
                 d_s = snap.get("distance_m")
                 y_s = snap.get("yaw_to_marker_deg")

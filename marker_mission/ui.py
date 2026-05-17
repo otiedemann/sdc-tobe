@@ -4277,7 +4277,7 @@ class UiServer:
             )
 
         def _arena_payload_to_config(data):
-            from .arena import ArenaConfig
+            from .arena import ArenaConfig, DEFAULT_MARKER_SIZE_M
             markers = []
             for m in (data.get("markers") or []):
                 markers.append({
@@ -4289,7 +4289,8 @@ class UiServer:
                     "z": float(m["z"]),
                 })
             payload = {
-                "marker_size_m": float(data.get("marker_size_m", 0.18)),
+                "marker_size_m": float(data.get("marker_size_m",
+                                                DEFAULT_MARKER_SIZE_M)),
                 "width_m":       float(data.get("width_m", 10.0)),
                 "depth_m":       float(data.get("depth_m", 25.0)),
                 "top_z_m":       float(data.get("top_z_m", 4.0)),
@@ -4383,7 +4384,7 @@ class UiServer:
 
         @app.post("/api/arena/default")
         def api_arena_default():
-            from .arena import default_arena
+            from .arena import default_arena, DEFAULT_MARKER_SIZE_M
             data = request.get_json(silent=True) or {}
             try:
                 arena_obj = default_arena(
@@ -4391,7 +4392,8 @@ class UiServer:
                     depth_m=float(data.get("depth_m", 25.0)),
                     top_z_m=float(data.get("top_z_m", 4.0)),
                     bottom_z_m=float(data.get("bottom_z_m", 2.0)),
-                    marker_size_m=float(data.get("marker_size_m", 0.18)))
+                    marker_size_m=float(data.get("marker_size_m",
+                                                  DEFAULT_MARKER_SIZE_M)))
             except Exception as e:
                 return jsonify({"error": str(e)}), 400
             return jsonify(arena_obj.to_json_dict())
