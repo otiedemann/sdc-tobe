@@ -76,6 +76,8 @@ def make_app(
     planner=None,
     match_state=None,
     safety=None,
+    event_log=None,
+    runner=None,
 ) -> Flask:
     """Build the strategy web app.
 
@@ -180,6 +182,11 @@ def make_app(
             # back to the settings-pinned role. Both come from the
             # same Role enum, so the UI doesn't have to special-case.
             role_value = live_role or settings_obj.role_for(name).value
+            task_name = None
+            last_script = None
+            if runner is not None:
+                task_name = runner.current_task_for(name)
+                last_script = runner.current_script_for(name)
             drones_out[name] = {
                 "name": obs.name,
                 "online": obs.online,
@@ -199,6 +206,8 @@ def make_app(
                 ),
                 "role_score": score,
                 "cruise_altitude_m": settings_obj.cruise_altitude_for(name),
+                "task": task_name,
+                "last_script": last_script,
             }
         payload = {
             "t": state.t,
@@ -241,6 +250,8 @@ def make_app(
         if safety is None:
             return jsonify(error="safety not wired"), 503
         safety.arm()
+        if event_log is not None:
+            event_log.add("arm", "strategy ARMED")
         return jsonify(ok=True, armed=True)
 
     @app.post("/api/strategy/disarm")
@@ -248,7 +259,26 @@ def make_app(
         if safety is None:
             return jsonify(error="safety not wired"), 503
         safety.disarm()
+        if event_log is not None:
+            event_log.add("disarm", "strategy DISARMED")
         return jsonify(ok=True, armed=False)
+
+    # ---- event log ----
+
+    @app.get("/api/strategy/events")
+    def api_strategy_events():
+        if event_log is None:
+            return jsonify(error="event_log not wired"), 503
+        try:
+            limit = int(request.args.get("limit", 50))
+        except (TypeError, ValueError):
+            limit = 50
+        since = request.args.get("since_seq")
+        since_seq = int(since) if since and since.isdigit() else None
+        return jsonify(
+            events=event_log.recent(limit=limit, since_seq=since_seq),
+            latest_seq=event_log.latest_seq(),
+        )
 
     # ---- match clock ----
 
@@ -263,12 +293,11 @@ def make_app(
         if match_state is None:
             return jsonify(error="match_state not wired"), 503
         match_state.start_match()
-        # Starting a match implies "go" — auto-arm the strategy so the
-        # operator's intent is one click, not two. Stopping a match
-        # does NOT auto-disarm (operator might want to inspect mid-air
-        # without the strategy fighting them).
         if safety is not None:
             safety.arm()
+        if event_log is not None:
+            event_log.add("match_start",
+                          f"match started (duration {match_state.snapshot()['match']['duration_s']:.0f}s)")
         return jsonify(ok=True, **match_state.snapshot())
 
     @app.post("/api/match/stop")
@@ -276,6 +305,8 @@ def make_app(
         if match_state is None:
             return jsonify(error="match_state not wired"), 503
         match_state.stop_match()
+        if event_log is not None:
+            event_log.add("match_stop", "match stopped")
         return jsonify(ok=True, **match_state.snapshot())
 
     @app.post("/api/match/duration")
@@ -436,13 +467,32 @@ _INDEX_HTML = f"""<!doctype html>
     <svg class="arena" id="arena" viewBox="-12 -7 24 14" preserveAspectRatio="xMidYMid meet"></svg>
     <div class="zone-legend" id="zone-legend"></div>
   </div>
-  <div style="min-width:280px;">
+  <div style="min-width:360px;">
     <h2>Drones</h2>
     <table class="drone-table" id="drone-table">
-      <thead><tr><th>FC</th><th>role</th><th>alt</th><th>pos</th><th>batt</th></tr></thead>
+      <thead><tr><th>FC</th><th>role</th><th>task</th><th>alt</th><th>pos</th><th>batt</th></tr></thead>
       <tbody></tbody>
     </table>
   </div>
+</div>
+
+<h2>Events</h2>
+<div class="card" style="padding:0; max-height:320px; overflow-y:auto;">
+  <table id="events-table" style="width:100%; font-size:12px;">
+    <thead style="position:sticky; top:0; background:#15171c; z-index:1;">
+      <tr><th style="width:80px;">time</th>
+          <th style="width:100px;">drone</th>
+          <th style="width:110px;">kind</th>
+          <th>message</th></tr>
+    </thead>
+    <tbody><tr><td colspan="4" class="muted" style="padding:8px;">no events yet</td></tr></tbody>
+  </table>
+</div>
+
+<h2 style="margin-top:18px;">Last pushed script per drone</h2>
+<div class="card" id="scripts-card">
+  <pre id="scripts-pre" style="margin:0; font-size:12px; line-height:1.4;
+       color:#bdf; white-space:pre-wrap;">(no scripts pushed yet)</pre>
 </div>
 
 <script>
@@ -497,8 +547,11 @@ function draw(state) {{
   let rows = "";
   for (const [name, d] of Object.entries(state.drones)) {{
     if (!d.pose) {{
-      rows += `<tr><td>${{name}}</td><td>${{d.role}}</td><td>${{d.cruise_altitude_m.toFixed(1)}}m</td>`
-           +  `<td class="muted">no pose</td><td>${{d.battery_pct == null ? "–" : Math.round(d.battery_pct) + "%"}}</td></tr>`;
+      rows += `<tr><td>${{name}}</td><td>${{d.role}}</td>`
+           +  `<td>${{d.task || "—"}}</td>`
+           +  `<td>${{d.cruise_altitude_m.toFixed(1)}}m</td>`
+           +  `<td class="muted">no pose</td>`
+           +  `<td>${{d.battery_pct == null ? "–" : Math.round(d.battery_pct) + "%"}}</td></tr>`;
       continue;
     }}
     const [ax, ay, az] = d.pose;
@@ -523,13 +576,26 @@ function draw(state) {{
         : (d.role_pinned && d.role_pinned !== "idle")
             ? `${{d.role}} <span class="muted">(pin)</span>`
             : d.role;
-    rows += `<tr><td>${{name}}</td><td>${{roleDisplay}}</td><td>${{d.cruise_altitude_m.toFixed(1)}}m</td>`
+    rows += `<tr><td>${{name}}</td><td>${{roleDisplay}}</td>`
+         +  `<td>${{d.task || "—"}}</td>`
+         +  `<td>${{d.cruise_altitude_m.toFixed(1)}}m</td>`
          +  `<td>${{ax.toFixed(1)}}, ${{ay.toFixed(1)}}, ${{az.toFixed(1)}}</td>`
          +  `<td>${{d.battery_pct == null ? "–" : Math.round(d.battery_pct) + "%"}}</td></tr>`;
   }}
 
   SVG.innerHTML = svg;
-  TBODY.innerHTML = rows || `<tr><td colspan="5" class="muted">no drones reporting</td></tr>`;
+  TBODY.innerHTML = rows || `<tr><td colspan="6" class="muted">no drones reporting</td></tr>`;
+
+  // Per-drone last-pushed-script panel
+  const scriptsPre = document.getElementById("scripts-pre");
+  if (scriptsPre) {{
+    const parts = [];
+    for (const [name, d] of Object.entries(state.drones)) {{
+      if (!d.last_script) continue;
+      parts.push(`# ${{name}}\\n${{d.last_script.trim()}}`);
+    }}
+    scriptsPre.textContent = parts.length ? parts.join("\\n\\n") : "(no scripts pushed yet)";
+  }}
 
   // Zone + role legend (HTML, immune to SVG-text sizing weirdness)
   LEGEND.innerHTML =
@@ -621,6 +687,63 @@ document.getElementById("duration-save").onclick = async () => {{
   tick();
 }};
 
+// Events panel — colour by kind, sticky timestamp.
+const EVENTS_TBODY = document.querySelector("#events-table tbody");
+const EVENT_COLORS = {{
+  role_change: "#fc8",
+  script_push: "#7cf",
+  safety:      "#f88",
+  arm:         "#9d6",
+  disarm:      "#fc8",
+  match_start: "#9d6",
+  match_stop:  "#fc8",
+  info:        "#9aa",
+}};
+let LAST_EVENT_SEQ = 0;
+let EVENT_HISTORY = [];   // newest-first, capped to MAX
+
+const MAX_EVENT_HISTORY = 200;
+
+function fmtWall(t) {{
+  const d = new Date(t * 1000);
+  return d.toLocaleTimeString("en-GB", {{hour12: false}});
+}}
+
+function renderEvents() {{
+  if (!EVENT_HISTORY.length) {{
+    EVENTS_TBODY.innerHTML =
+      `<tr><td colspan="4" class="muted" style="padding:8px;">no events yet</td></tr>`;
+    return;
+  }}
+  EVENTS_TBODY.innerHTML = EVENT_HISTORY.map(e => {{
+    const color = EVENT_COLORS[e.kind] || "#9aa";
+    const msg = e.msg.length > 200 ? e.msg.slice(0, 200) + "…" : e.msg;
+    return `<tr>
+      <td class="muted" style="font-family:monospace; font-size:11px;">${{fmtWall(e.t_wall)}}</td>
+      <td style="font-size:11px;">${{e.drone || "—"}}</td>
+      <td style="color:${{color}}; font-weight:600;">${{e.kind}}</td>
+      <td style="font-family:monospace; font-size:11px;">${{msg}}</td>
+    </tr>`;
+  }}).join("");
+}}
+
+async function pollEvents() {{
+  try {{
+    const url = "/api/strategy/events?limit=50"
+              + (LAST_EVENT_SEQ ? "&since_seq=" + LAST_EVENT_SEQ : "");
+    const r = await fetch(url);
+    if (!r.ok) return;
+    const data = await r.json();
+    const fresh = (data.events || []).filter(e => e.seq > LAST_EVENT_SEQ);
+    if (fresh.length) {{
+      LAST_EVENT_SEQ = data.latest_seq;
+      // fresh are newest-first; prepend to history.
+      EVENT_HISTORY = fresh.concat(EVENT_HISTORY).slice(0, MAX_EVENT_HISTORY);
+      renderEvents();
+    }}
+  }} catch (e) {{ /* ignore transient fetch errors */ }}
+}}
+
 async function tick() {{
   try {{
     const r = await fetch("/api/state");
@@ -634,6 +757,7 @@ async function tick() {{
   }}
 }}
 tick(); setInterval(tick, 500);
+pollEvents(); setInterval(pollEvents, 1000);
 </script>
 </body>
 </html>"""

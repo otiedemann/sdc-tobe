@@ -69,6 +69,7 @@ class SwarmRunner:
         tick_hz: float = 1.0,
         on_tick: Optional[Callable[[TickRecord], Awaitable[None] | None]] = None,
         match_state=None,
+        event_log=None,
     ):
         self._pool = pool
         self._world = world_model or SwarmWorldModel(pool)
@@ -82,6 +83,16 @@ class SwarmRunner:
         self._dt = 1.0 / max(0.1, float(tick_hz))
         self._on_tick = on_tick
         self._match_state = match_state
+        self._event_log = event_log
+        # Per-drone observability: latest assigned task name, latest
+        # dispatched FCCommand, latest pushed script content. Exposed
+        # via current_task_for() / current_script_for() so the web
+        # layer can surface them on /api/state without reaching into
+        # the runner's internals.
+        self._last_task_name: dict = {}
+        self._last_script: dict = {}
+        self._last_dispatched: dict = {}
+        self._last_role: dict = {}
         self._stop = asyncio.Event()
         self._task: Optional[asyncio.Task] = None
 
@@ -125,6 +136,23 @@ class SwarmRunner:
                     # not delay the others.
                     coros = []
                     for fc, task in assignments.items():
+                        self._last_task_name[fc] = task.name
+                        # Role-change event (planner re-decides each
+                        # tick; the planner has already cached and
+                        # only flips when the role really changes,
+                        # but we double-check here for the log).
+                        live_role = None
+                        if hasattr(self._planner, "current_role_for"):
+                            live_role = self._planner.current_role_for(fc)
+                        if (self._event_log is not None
+                                and live_role is not None
+                                and self._last_role.get(fc) != live_role):
+                            self._event_log.add(
+                                "role_change",
+                                f"{self._last_role.get(fc, '—')} → {live_role}",
+                                drone=fc,
+                            )
+                            self._last_role[fc] = live_role
                         try:
                             cmd = task.tick(state)
                         except Exception:
@@ -133,8 +161,44 @@ class SwarmRunner:
                         verd = self._safety.gate(cmd, state)
                         if verd.overridden:
                             overrides[fc] = verd.reason
+                            if self._event_log is not None:
+                                # script_push that got muted to idle by
+                                # safety is also a safety event the
+                                # operator wants to see.
+                                self._event_log.add(
+                                    "safety",
+                                    verd.reason,
+                                    drone=fc,
+                                    payload={
+                                        "original_kind": cmd.kind.value,
+                                        "result_kind": verd.cmd.kind.value,
+                                    },
+                                )
                         dispatched[fc] = verd.cmd
                         if verd.cmd.kind != CmdKind.IDLE:
+                            # New script push or stop — log it for the
+                            # operator. Skip if the dispatched payload
+                            # is identical to last time (the task may
+                            # re-push the same script if FC goes idle).
+                            self._last_dispatched[fc] = verd.cmd
+                            if (verd.cmd.kind == CmdKind.START_MISSION
+                                    and self._event_log is not None):
+                                script = verd.cmd.payload.get("script", "")
+                                # Compact one-liner for the event msg
+                                # (the full script lives in payload).
+                                pretty = script.strip().replace("\n", " / ")
+                                self._last_script[fc] = script
+                                self._event_log.add(
+                                    "script_push", pretty[:160],
+                                    drone=fc,
+                                    payload={"script": script},
+                                )
+                            elif (verd.cmd.kind == CmdKind.STOP_MISSION
+                                    and self._event_log is not None):
+                                self._event_log.add(
+                                    "script_push", "STOP_MISSION",
+                                    drone=fc,
+                                )
                             coros.append(self._dispatch(verd.cmd))
 
                     if coros:
@@ -165,6 +229,17 @@ class SwarmRunner:
             log.info("strategy runner stopped")
 
     # ---------- dispatch ----------
+
+    # ---------- public introspection (web reads these) ----------
+
+    def current_task_for(self, fc: str) -> Optional[str]:
+        return self._last_task_name.get(fc)
+
+    def current_script_for(self, fc: str) -> Optional[str]:
+        return self._last_script.get(fc)
+
+    def last_dispatched_for(self, fc: str):
+        return self._last_dispatched.get(fc)
 
     async def _dispatch(self, cmd: FCCommand) -> None:
         """Apply one command to one FC via the existing
