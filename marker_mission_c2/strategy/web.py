@@ -534,8 +534,14 @@ function draw(state) {{
   const enemyColor = team === "red" ? "rgba(80,160,255,0.18)" : "rgba(255,80,80,0.18)";
   const neutralColor = "rgba(200,200,200,0.08)";
   function zone(xRange, yRange, fill) {{
-    const [xLo, xHi] = xRange;
-    const [yLo, yHi] = yRange;
+    // Defensively normalise lo/hi in case the API ships a swapped
+    // tuple — a zone with lo > hi would otherwise render as a
+    // zero-or-negative-size rect (invisible). Python side also
+    // auto-sorts on load; this is belt-and-braces.
+    const xLo = Math.min(xRange[0], xRange[1]);
+    const xHi = Math.max(xRange[0], xRange[1]);
+    const yLo = Math.min(yRange[0], yRange[1]);
+    const yHi = Math.max(yRange[0], yRange[1]);
     svg += `<rect x="${{yLo}}" y="${{xLo}}" `
          + `width="${{yHi - yLo}}" height="${{xHi - xLo}}" fill="${{fill}}" />`;
   }}

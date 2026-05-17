@@ -278,13 +278,19 @@ class StrategySettings:
     def _in_rect(x: float, y: Optional[float],
                  x_range: Tuple[float, float],
                  y_range: Tuple[float, float]) -> bool:
-        if not (x_range[0] <= float(x) <= x_range[1]):
+        # Normalise lo/hi here too — defence in depth so the helper
+        # works correctly even if the caller hands in a swapped tuple
+        # (e.g. settings loaded from an external source we didn't
+        # sanitise through _tuple2).
+        x_lo, x_hi = min(x_range[0], x_range[1]), max(x_range[0], x_range[1])
+        if not (x_lo <= float(x) <= x_hi):
             return False
         # y is optional for backward compat with callers that only
         # care about the X axis (e.g. plotting a horizontal band).
         if y is None:
             return True
-        return y_range[0] <= float(y) <= y_range[1]
+        y_lo, y_hi = min(y_range[0], y_range[1]), max(y_range[0], y_range[1])
+        return y_lo <= float(y) <= y_hi
 
     def is_in_home_zone(self, x: float, y: Optional[float] = None) -> bool:
         return self._in_rect(x, y, self.our_home_x_m, self.our_home_y_m)
@@ -422,12 +428,18 @@ EXAMPLE_PATH = _DIR / "settings.example.json"
 
 
 def _tuple2(v, default: Tuple[float, float]) -> Tuple[float, float]:
+    """Parse a [lo, hi] pair from JSON. Auto-normalises to ascending
+    order so a swapped pair like [-2, -5] saved from the form (lo/hi
+    fields entered backwards) is interpreted as the operator clearly
+    meant: range from −5 to −2. Belt-and-braces against an operator
+    typo wiping out a zone."""
     if v is None:
         return default
     try:
-        return (float(v[0]), float(v[1]))
+        a, b = float(v[0]), float(v[1])
     except (KeyError, IndexError, TypeError, ValueError) as e:
         raise ValueError(f"expected [min, max] pair, got {v!r}: {e}") from e
+    return (min(a, b), max(a, b))
 
 
 def _from_dict(d: dict) -> StrategySettings:
