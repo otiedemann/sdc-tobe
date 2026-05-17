@@ -32,7 +32,7 @@ from marker_mission_c2.config import load_config
 from marker_mission_c2.fc_pool import FCPool
 from marker_mission_c2.settings import SettingsStore as C2SettingsStore
 
-from .planner import StaticAssignmentPlanner, SwarmPlanner
+from .planner import RoleAssignmentPlanner, StaticAssignmentPlanner, SwarmPlanner
 from .runner import SwarmRunner
 from .safety import SafetyConfig, SafetyGate
 from .settings import StrategySettings, TeamColor, load as load_settings, save as save_settings
@@ -43,31 +43,22 @@ from .world_model import SwarmWorldModel
 log = logging.getLogger("c2.strategy.app")
 
 
-def build_planner(cfg) -> SwarmPlanner:
-    """Default planner: every configured FC is Idle. Override this
-    function (or pass your own planner to :class:`SwarmRunner`) to
-    inject real assignments.
+def build_planner(cfg, settings_obj: StrategySettings) -> SwarmPlanner:
+    """Default planner: :class:`RoleAssignmentPlanner` — every tick the
+    strategy decides each drone's role (attacker / scout / defender /
+    idle) from live state + settings, then builds a role-specific
+    task. Operator pins (``settings.drones[fc].role``) override the
+    auto-assignment.
 
-    Examples::
-
-        from .tasks import StartMission
-        return StaticAssignmentPlanner({
-            "flightctrl1": StartMission("flightctrl1", script=open("scripts/scout.txt").read()),
-            "flightctrl2": StartMission("flightctrl2", script=open("scripts/attack.txt").read()),
-        })
-
-    or, utility-based::
-
-        from .planner import UtilityPlanner
-        return UtilityPlanner(candidates=[
-            ("scout",  lambda fc: StartMission(fc, script=SCOUT_SCRIPT),
-                       lambda s, fc: 1.0 if needs_scout(s) else -inf,  1),
-            ("attack", lambda fc: StartMission(fc, script=ATK_SCRIPT),
-                       lambda s, fc: score_attacker(s, fc),            None),
-        ])
+    Override this function (or pass your own planner to
+    :class:`SwarmRunner`) if you want a hand-crafted assignment
+    instead.
     """
-    return StaticAssignmentPlanner({spec.name: Idle(spec.name)
-                                    for spec in cfg.fcs})
+    return RoleAssignmentPlanner(
+        settings_obj,
+        max_attackers=2,
+        max_defenders=1,
+    )
 
 
 def build_safety(cfg) -> SafetyGate:
@@ -100,7 +91,7 @@ async def run(cfg, tick_hz: float,
         sorted(settings_obj.enemy_target_ids),
     )
     world_model = SwarmWorldModel(pool)
-    planner = build_planner(cfg)
+    planner = build_planner(cfg, settings_obj)
     safety = build_safety(cfg)
     runner = SwarmRunner(
         pool=pool,
@@ -117,6 +108,7 @@ async def run(cfg, tick_hz: float,
             world_model=world_model,
             c2_cfg=cfg,
             settings_path=settings_path,
+            planner=planner,
         )
         start_web(web_app, host=web_host, port=web_port)
         log.info("strategy: open http://%s:%d/ to view live arena + settings",

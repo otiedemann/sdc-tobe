@@ -203,3 +203,270 @@ class SetArena(DroneTask):
 
     def done(self, state: SwarmState) -> bool:
         return self._fired
+
+
+# ---------------------------------------------------------------------------
+# Flight tasks (role-driven)
+#
+# These tasks generate marker_mission script text (the same DSL the FC's
+# /api/mission/script endpoint accepts — TAKEOFF / APPROACH / HOOVER /
+# TO / HEIGHT / LAND / etc., documented in marker_mission/mission_script.py)
+# and push it via START_MISSION. The strategy reasons about WHICH script
+# to run; the FC's mission player executes it, talks to Olympe, owns
+# stick-level control. That split keeps the strategy at 1 Hz (script-push
+# cadence) while flight control stays at marker_mission's native rate.
+#
+# Tasks emit a *fresh* script only when they actually want to change the
+# drone's behaviour — re-emitting the same script every tick would
+# constantly restart the FC's mission player. Each task tracks its
+# "last pushed script" in ``self._last_script`` and only re-pushes when
+# the content changes.
+# ---------------------------------------------------------------------------
+
+def _format_script(*lines: str) -> str:
+    """Join script lines with newlines, dropping blanks. The FC's script
+    parser is tolerant of trailing newlines."""
+    return "\n".join(l for l in lines if l) + "\n"
+
+
+class _ScriptingTask(DroneTask):
+    """Base class for tasks that work by pushing a marker_mission script.
+    Subclasses build the script in :meth:`_compose_script` (returning
+    ``None`` for "no change"); the wrapper handles change detection so we
+    only push when the script content differs from the last push."""
+
+    name = "scripting_task"
+
+    def __init__(self, target: str) -> None:
+        super().__init__(target)
+        self._last_script: Optional[str] = None
+        self._done: bool = False
+
+    def reset(self) -> None:
+        self._last_script = None
+        self._done = False
+
+    def _compose_script(self, state: SwarmState) -> Optional[str]:
+        """Return the script text we want the FC to be running right now,
+        or ``None`` to leave the FC's current mission untouched."""
+        return None
+
+    def tick(self, state: SwarmState) -> FCCommand:
+        script = self._compose_script(state)
+        if script is None or script == self._last_script:
+            return FCCommand.idle(self.target)
+        self._last_script = script
+        return FCCommand(
+            target=self.target, kind=CmdKind.START_MISSION,
+            payload={"script": script},
+        )
+
+    def done(self, state: SwarmState) -> bool:
+        return self._done
+
+
+class Goto(_ScriptingTask):
+    """Fly to a specified (x, y, z) arena point and hover there.
+
+    Generates a one-line ``TO`` script. Used as the baseline navigation
+    task and as a building block for the other role tasks.
+    """
+    name = "goto"
+
+    def __init__(self, target: str, x: float, y: float, z: float,
+                 hover_s: float = 9999.0) -> None:
+        super().__init__(target)
+        self.x = float(x)
+        self.y = float(y)
+        self.z = float(z)
+        self.hover_s = float(hover_s)
+
+    def _compose_script(self, state: SwarmState) -> Optional[str]:
+        return _format_script(
+            "TAKEOFF",
+            f"TO {self.x:.2f} {self.y:.2f} {self.z:.2f}",
+            f"HOOVER {self.hover_s:.0f}",
+        )
+
+
+class HoldAboveTarget(_ScriptingTask):
+    """Stage at ``hover_alt_m`` directly above ``target_id`` and hold.
+
+    This is the attacker's *pre-strike* posture during the 10-pt
+    maneuver — both attackers reach this state, then
+    :class:`SyncAttackPair` flips them into the dive script.
+    """
+    name = "hold_above"
+
+    def __init__(self, target: str, target_marker_id: int,
+                 hover_alt_m: float, target_pos: tuple) -> None:
+        super().__init__(target)
+        self.target_marker_id = int(target_marker_id)
+        self.hover_alt_m = float(hover_alt_m)
+        # target_pos is (x, y) of the marker in arena coords; the
+        # planner passes this in from arena_config so this task doesn't
+        # have to know about marker layouts.
+        self.target_x = float(target_pos[0])
+        self.target_y = float(target_pos[1])
+
+    def _compose_script(self, state: SwarmState) -> Optional[str]:
+        return _format_script(
+            "TAKEOFF",
+            f"TO {self.target_x:.2f} {self.target_y:.2f} {self.hover_alt_m:.2f}",
+            "HOOVER 9999",
+        )
+
+
+class WaitInNeutral(_ScriptingTask):
+    """Park a non-attacking drone in the neutral band at its cruise
+    altitude. The slot (x, y) is computed by the planner from the
+    arena geometry + per-drone offset so multiple drones don't collide.
+    """
+    name = "wait_in_neutral"
+
+    def __init__(self, target: str, x: float, y: float, alt_m: float) -> None:
+        super().__init__(target)
+        self.x = float(x)
+        self.y = float(y)
+        self.alt_m = float(alt_m)
+
+    def _compose_script(self, state: SwarmState) -> Optional[str]:
+        return _format_script(
+            "TAKEOFF",
+            f"TO {self.x:.2f} {self.y:.2f} {self.alt_m:.2f}",
+            "HOOVER 9999",
+        )
+
+
+class ReclaimOnIntrusion(_ScriptingTask):
+    """Defender behaviour: a friendly target is being approached by an
+    enemy drone — fly over and reclaim. Built as ``APPROACH <our_id>``
+    at a short distance; the FC's existing approach controller handles
+    the close-in.
+    """
+    name = "reclaim"
+
+    def __init__(self, target: str, target_marker_id: int,
+                 hover_distance_m: float = 1.0) -> None:
+        super().__init__(target)
+        self.target_marker_id = int(target_marker_id)
+        self.hover_distance_m = float(hover_distance_m)
+
+    def _compose_script(self, state: SwarmState) -> Optional[str]:
+        return _format_script(
+            "TAKEOFF",
+            f"APPROACH {self.target_marker_id} {self.hover_distance_m:.2f}",
+            "HOOVER 9999",
+        )
+
+
+class SyncAttackPair(_ScriptingTask):
+    """The 10-point simultaneous-strike maneuver.
+
+    Phases:
+      ``hold``     — staging at ``hover_alt_m`` above ``target_marker_id``.
+                     We emit the same script as :class:`HoldAboveTarget`
+                     and watch for our partner to also report a pose
+                     close to *their* target.
+      ``strike``   — once both attackers report "in position" within
+                     ``sync_window_s``, push a dive script: descend to
+                     ``strike_alt_m``, brief hover, then RTH (LAND).
+                     The strategy pushes this script on the same tick
+                     to both attackers — sub-second sync at the
+                     script-push level.
+      ``done``     — drone reports ``not flying`` after RTH; planner
+                     can re-assign the slot.
+
+    The partner-readiness check is duck-typed against world state — we
+    look at ``state.drones[partner_fc].pose`` and require it within
+    ``ready_radius_m`` of the *partner's* target. The planner sets
+    that up when it builds the pair.
+    """
+    name = "sync_attack"
+
+    PHASE_HOLD = "hold"
+    PHASE_STRIKE = "strike"
+    PHASE_DONE = "done"
+
+    def __init__(
+        self,
+        target: str,
+        target_marker_id: int,
+        target_pos: tuple,
+        hover_alt_m: float,
+        strike_alt_m: float,
+        partner_fc: Optional[str] = None,
+        partner_target_pos: Optional[tuple] = None,
+        sync_window_s: float = 1.5,
+        ready_radius_m: float = 1.5,
+    ) -> None:
+        super().__init__(target)
+        self.target_marker_id = int(target_marker_id)
+        self.target_x = float(target_pos[0])
+        self.target_y = float(target_pos[1])
+        self.hover_alt_m = float(hover_alt_m)
+        self.strike_alt_m = float(strike_alt_m)
+        self.partner_fc = partner_fc
+        self.partner_target_pos = partner_target_pos
+        self.sync_window_s = float(sync_window_s)
+        self.ready_radius_m = float(ready_radius_m)
+        self._phase: str = self.PHASE_HOLD
+        self._strike_start_t: Optional[float] = None
+
+    def reset(self) -> None:
+        super().reset()
+        self._phase = self.PHASE_HOLD
+        self._strike_start_t = None
+
+    def _am_in_position(self, state: SwarmState) -> bool:
+        obs = state.drones.get(self.target)
+        if obs is None or obs.pose is None:
+            return False
+        dx = obs.pose[0] - self.target_x
+        dy = obs.pose[1] - self.target_y
+        return (dx * dx + dy * dy) <= (self.ready_radius_m ** 2)
+
+    def _partner_in_position(self, state: SwarmState) -> bool:
+        if self.partner_fc is None or self.partner_target_pos is None:
+            return True  # solo strike — no partner gating
+        obs = state.drones.get(self.partner_fc)
+        if obs is None or obs.pose is None:
+            return False
+        dx = obs.pose[0] - float(self.partner_target_pos[0])
+        dy = obs.pose[1] - float(self.partner_target_pos[1])
+        return (dx * dx + dy * dy) <= (self.ready_radius_m ** 2)
+
+    def _compose_script(self, state: SwarmState) -> Optional[str]:
+        if self._phase == self.PHASE_DONE:
+            return None
+
+        # Hold phase: emit (and keep emitting) the staging script.
+        if self._phase == self.PHASE_HOLD:
+            both_ready = self._am_in_position(state) and self._partner_in_position(state)
+            if both_ready:
+                # Flip to strike. The script we return on THIS tick is
+                # the strike script — the runner pushes it now.
+                self._phase = self.PHASE_STRIKE
+                self._strike_start_t = state.t
+                return _format_script(
+                    f"TO {self.target_x:.2f} {self.target_y:.2f} {self.strike_alt_m:.2f}",
+                    "HOOVER 2",
+                    "LAND",
+                )
+            return _format_script(
+                "TAKEOFF",
+                f"TO {self.target_x:.2f} {self.target_y:.2f} {self.hover_alt_m:.2f}",
+                "HOOVER 9999",
+            )
+
+        # Strike phase: don't change the script, just wait for the
+        # drone to report not-flying (LAND completed).
+        obs = state.drones.get(self.target)
+        if obs is not None and not obs.flying:
+            self._phase = self.PHASE_DONE
+            self._done = True
+        return None  # leave the strike script running on the FC
+
+    @property
+    def phase(self) -> str:
+        return self._phase
