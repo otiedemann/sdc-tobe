@@ -253,7 +253,22 @@ class _ScriptingTask(DroneTask):
 
     def tick(self, state: SwarmState) -> FCCommand:
         script = self._compose_script(state)
-        if script is None or script == self._last_script:
+        if script is None:
+            return FCCommand.idle(self.target)
+
+        # Re-push if either:
+        #   (a) the script content has changed since we last pushed, or
+        #   (b) the FC reports its mission phase is "init" / blank —
+        #       meaning the FC has nothing running (it was restarted,
+        #       the mission completed, the operator hit stop, etc.).
+        #       Without (b) the task would emit IDLE forever after the
+        #       first push and the drone would sit on the ground while
+        #       the strategy thinks it's already executing.
+        obs = state.drones.get(self.target)
+        fc_idle = (obs is not None and
+                   (obs.phase is None or obs.phase.lower() in ("init", "ready", "done", "")))
+
+        if script == self._last_script and not fc_idle:
             return FCCommand.idle(self.target)
         self._last_script = script
         return FCCommand(
