@@ -174,6 +174,23 @@ class SwarmRunner:
                                         "result_kind": verd.cmd.kind.value,
                                     },
                                 )
+                            # Circuit breaker: any STOP_MISSION from
+                            # safety also auto-disarms the strategy.
+                            # Otherwise we thrash — the FC ends the
+                            # mission, the task re-pushes on the next
+                            # phase=init tick, the drone takes off,
+                            # safety fires again, repeat. Auto-disarm
+                            # breaks the loop and forces the operator
+                            # to inspect before re-arming.
+                            if (verd.cmd.kind == CmdKind.STOP_MISSION
+                                    and self._safety.is_armed()):
+                                self._safety.disarm()
+                                if self._event_log is not None:
+                                    self._event_log.add(
+                                        "disarm",
+                                        f"auto-disarm: safety fired STOP_MISSION ({verd.reason})",
+                                        drone=fc,
+                                    )
                         dispatched[fc] = verd.cmd
                         if verd.cmd.kind != CmdKind.IDLE:
                             # New script push or stop — log it for the
