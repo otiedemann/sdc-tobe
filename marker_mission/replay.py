@@ -165,6 +165,11 @@ class FlightReplay:
             self.state.mission_script = self.script_steps
         self.frame = LatestFrame()
         self._last_pos_ms = -1.0
+        # Multiplier applied to ``target_t_s * 1000`` before seeking.
+        # 1.0 = mp4 header matches reality (no correction). Overwritten
+        # in _ensure_cap if header fps disagrees with the measured
+        # effective fps (CSV duration / MP4 frame count).
+        self._seek_scale: float = 1.0
 
         # Playback controls.
         self._lock = threading.Lock()
@@ -372,9 +377,44 @@ class FlightReplay:
     def _ensure_cap(self) -> None:
         """Open the VideoCapture in the calling thread the first time
         we need it. Used so the cap is owned by the playback worker
-        rather than the constructor's thread."""
+        rather than the constructor's thread.
+
+        Also detects the *effective* frame rate of the recording.
+        ``raw.mp4`` is written by ``cv2.VideoWriter`` with a stamped
+        header fps (default 25) regardless of how fast frames actually
+        arrived from Olympe — typical Anafi streams are 10–20 fps,
+        which made a 25-fps header lie. Without correcting for it
+        ``CAP_PROP_POS_MSEC`` seeks land at the wrong moment and
+        replay runs ``header_fps / effective_fps`` × too fast
+        (~1.75× on the flightctrl3/4 sim).
+
+        Effective fps is derived from CSV duration vs MP4 frame count
+        (both ground-truth from this same flight). ``_seek_scale`` is
+        the factor we apply to every ``target_t_s`` so cv2's mp4-time
+        seeks land on the right frame; sequential reads still increment
+        ``_last_pos_ms`` in cv2's mp4-time space, no other change
+        needed."""
         if self.cap is None and self.video_path is not None:
             self.cap = cv2.VideoCapture(str(self.video_path))
+            self._seek_scale = 1.0
+            try:
+                header_fps = float(self.cap.get(cv2.CAP_PROP_FPS) or 0.0)
+                nframes = float(self.cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0.0)
+                if (header_fps > 0.0 and nframes > 1.0
+                        and self.duration_s > 0.0):
+                    effective_fps = nframes / self.duration_s
+                    # Only scale when the discrepancy is real (> 5%).
+                    # Inside that band, MP4 header and CSV agree —
+                    # leave seeks untouched.
+                    if abs(effective_fps - header_fps) / header_fps > 0.05:
+                        self._seek_scale = effective_fps / header_fps
+                        print(f"[replay] {self.flight_id}: header fps "
+                              f"{header_fps:.2f} vs effective fps "
+                              f"{effective_fps:.2f} (CSV {self.duration_s:.2f}s, "
+                              f"{int(nframes)} frames) — seek scale "
+                              f"{self._seek_scale:.3f}")
+            except Exception as e:
+                print(f"[replay] {self.flight_id}: fps probe failed: {e}")
 
     def _row_at_video_time(self, video_t_s: float) -> int:
         """Find the CSV row whose log time is closest to ``video_t_s``.
@@ -590,10 +630,16 @@ class FlightReplay:
         target_t_ms, then publish the last frame we got. Sequential
         reads are far cheaper than explicit seeks; we only seek for
         big jumps (initial load, backward seek, forward leap larger
-        than ~1.5 s)."""
+        than ~1.5 s).
+
+        ``_seek_scale`` corrects for the recorder's stamped fps
+        disagreeing with the actual stream rate (see _ensure_cap).
+        Without it a 25-fps-stamped raw.mp4 that actually arrived at
+        ~14 fps replays ~1.75× too fast."""
         if self.cap is None:
             return
-        target_t_ms = target_t_s * 1000.0
+        # Map CSV-time → cv2's mp4-time before comparing/seeking.
+        target_t_ms = target_t_s * 1000.0 * self._seek_scale
         big_jump = (self._last_pos_ms < 0
                     or target_t_ms < self._last_pos_ms - 200.0
                     or target_t_ms > self._last_pos_ms + 1500.0)
