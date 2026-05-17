@@ -20,15 +20,23 @@ Fourteen commands:
     LR       <rc> [<seconds>]                      +right / -left,  rc in [-100, +100]
     FB       <rc> [<seconds>]                      +forward / -back, rc in [-100, +100]
     UD       <rc> [<seconds>]                      +up / -down,     rc in [-100, +100]
-    YAW      <rc> [<seconds>]                      +cw / -ccw,      rc in [-100, +100]
+    YAW      <deg>                                 +cw / -ccw,      deg in [-180, +180]
     RC       <lr> <fb> <ud> <yaw> [<seconds>]      all four sticks at once
 
-LR / FB / UD / YAW / RC are raw-RC steps: pin the listed stick(s) to
-the given value(s) for the given duration (default 1 second;
-fractional values such as ``1.5`` are accepted), and leave the other
-channels at 0. The FC ceiling / arena guard still clamp at the wire —
-a UD +100 above the ceiling gets reduced to 0 by the FC. Useful for
+LR / FB / UD / RC are raw-RC steps: pin the listed stick(s) to the
+given value(s) for the given duration (default 1 second; fractional
+values such as ``1.5`` are accepted), and leave the other channels
+at 0. The FC ceiling / arena guard still clamp at the wire — a
+UD +100 above the ceiling gets reduced to 0 by the FC. Useful for
 hand-tuning a position or jogging the drone during a script.
+
+YAW is different: it's a discrete rotation by the given number of
+degrees (positive = CW from above, negative = CCW), not a stick rate.
+``YAW 90`` rotates exactly 90° and then advances; the step takes as
+long as the firmware needs to complete the rotation. If you really
+do want a raw yaw-stick rate (e.g. for very small / slow turns),
+use the multi-axis ``RC`` command whose yaw field is still a stick
+in [-100, +100].
 
 AWAIT behaves like HOOVER (HOLD-style station-keeping if the previous
 step was APPROACH, otherwise IDLE) but exits early as soon as the
@@ -94,13 +102,18 @@ class Step:
     world_x: Optional[float] = None
     world_y: Optional[float] = None
     yaw: Optional[object] = None       # float or "auto" or None
-    # Raw RC sticks for kind="RC" (FB / UD / YAW commands). Each axis
-    # in [-100, +100]; clamped at parse time. Zero on every non-RC
+    # Raw RC sticks for kind="RC" (FB / UD / LR / RC commands). Each
+    # axis in [-100, +100]; clamped at parse time. Zero on every non-RC
     # step. seconds carries the duration as for HOOVER / PAUSE.
     rc_lr: int = 0
     rc_fb: int = 0
     rc_ud: int = 0
     rc_yaw: int = 0
+    # Discrete rotation in degrees for kind="YAW" (the rebranded yaw
+    # command). Range [-180, +180]; positive = CW. None on every
+    # non-YAW step. No seconds — api.rotate is synchronous and the
+    # step advances when it returns.
+    rotation_deg: Optional[int] = None
     line_no: int = 0                    # 1-based source line, for diagnostics
 
 
@@ -230,7 +243,10 @@ def parse(text: str, defaults: dict) -> List[Step]:
                             world_x=wx, world_y=wy, height=wz,
                             yaw=yaw_arg,
                             line_no=raw_line_no))
-        elif cmd in ("LR", "FB", "UD", "YAW"):
+        elif cmd in ("LR", "FB", "UD"):
+            # Raw RC stick for ``seconds``. ``rc`` is the protocol
+            # value [-100, +100]; the FC ceiling, arena guard and
+            # watchdog still clamp at the wire.
             if len(args) not in (1, 2):
                 raise ScriptError(raw_line_no,
                                   f"{cmd} takes 1-2 arguments "
@@ -250,11 +266,32 @@ def parse(text: str, defaults: dict) -> List[Step]:
                 step.rc_lr = rc
             elif cmd == "FB":
                 step.rc_fb = rc
-            elif cmd == "UD":
+            else:  # UD
                 step.rc_ud = rc
-            else:  # YAW
-                step.rc_yaw = rc
             out.append(step)
+        elif cmd == "YAW":
+            # Discrete rotation by N degrees, range [-180, +180].
+            # Positive = CW (looking down). Synchronous on the FC
+            # side — the step advances when api.rotate returns. No
+            # seconds argument because the rotation has its own
+            # duration determined by the firmware's yaw rate.
+            #
+            # Earlier YAW was a raw-stick command (like LR/FB/UD)
+            # — that's been demoted to the multi-axis RC command's
+            # yaw field for the rare case the operator wants a rate
+            # rather than an angle.
+            if len(args) != 1:
+                raise ScriptError(raw_line_no,
+                                  f"YAW takes exactly 1 argument "
+                                  f"(<deg>, +cw / -ccw, "
+                                  f"range [-180, +180]), got {len(args)}")
+            deg = _parse_int(args[0], raw_line_no, "YAW deg")
+            if not (-180 <= deg <= 180):
+                raise ScriptError(raw_line_no,
+                                  f"YAW deg must be in [-180, +180], "
+                                  f"got {deg}")
+            out.append(Step(kind="YAW", rotation_deg=deg,
+                            line_no=raw_line_no))
         elif cmd == "RC":
             # All four sticks at once: RC <lr> <fb> <ud> <yaw> [<seconds>].
             # Order matches the drone-stick convention
@@ -341,25 +378,27 @@ def format(steps: List[Step]) -> str:
             lines.append(" ".join(parts))
         elif s.kind == "RC":
             # Round-trip rule:
-            #   - exactly one of lr/fb/ud/yaw non-zero → LR/FB/UD/YAW
-            #     form (operator-friendly short syntax)
-            #   - any other combination (incl. all zero) → RC form
-            #     (preserves the multi-axis intent)
-            axes = (s.rc_lr, s.rc_fb, s.rc_ud, s.rc_yaw)
-            nonzero = sum(1 for v in axes if v != 0)
-            if nonzero == 1 and s.rc_lr != 0:
+            #   - exactly one of lr/fb/ud non-zero AND yaw stick is
+            #     zero → LR/FB/UD short form
+            #   - everything else (multi-axis, yaw-stick non-zero,
+            #     or all-zero) → RC form (preserves the multi-axis
+            #     intent; YAW the command-name is reserved for the
+            #     discrete-rotation kind below)
+            non_yaw_axes = (s.rc_lr, s.rc_fb, s.rc_ud)
+            nonzero = sum(1 for v in non_yaw_axes if v != 0)
+            if nonzero == 1 and s.rc_yaw == 0 and s.rc_lr != 0:
                 lines.append(f"LR {s.rc_lr} {s.seconds:g}")
-            elif nonzero == 1 and s.rc_fb != 0:
+            elif nonzero == 1 and s.rc_yaw == 0 and s.rc_fb != 0:
                 lines.append(f"FB {s.rc_fb} {s.seconds:g}")
-            elif nonzero == 1 and s.rc_ud != 0:
+            elif nonzero == 1 and s.rc_yaw == 0 and s.rc_ud != 0:
                 lines.append(f"UD {s.rc_ud} {s.seconds:g}")
-            elif nonzero == 1 and s.rc_yaw != 0:
-                lines.append(f"YAW {s.rc_yaw} {s.seconds:g}")
             else:
                 lines.append(
                     f"RC {s.rc_lr} {s.rc_fb} {s.rc_ud} {s.rc_yaw} "
                     f"{s.seconds:g}"
                 )
+        elif s.kind == "YAW":
+            lines.append(f"YAW {int(s.rotation_deg or 0)}")
         elif s.kind == "DANCE":
             lines.append(f"DANCE {s.seconds:g} {s.mode}")
         else:

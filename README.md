@@ -185,8 +185,8 @@ section so they can never run together).
 | `LR` | `rc [seconds]` | Raw strafe stick (+right, -left), `rc` ∈ `[-100,+100]`, default 1 s |
 | `FB` | `rc [seconds]` | Raw forward/back stick |
 | `UD` | `rc [seconds]` | Raw up/down stick |
-| `YAW` | `rc [seconds]` | Raw yaw stick (+cw, -ccw) |
-| `RC` | `lr fb ud yaw [seconds]` | All four sticks at once |
+| `YAW` | `deg` | Discrete rotation, `deg` ∈ `[-180,+180]` (+cw, -ccw) |
+| `RC` | `lr fb ud yaw [seconds]` | All four sticks at once (yaw stays a stick) |
 
 Seconds may be fractional (`1.5`, `0.25`). Full docs at
 `marker_mission/docs/MISSION_REFERENCE.md`.

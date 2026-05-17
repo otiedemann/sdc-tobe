@@ -73,7 +73,8 @@ class Phase(enum.Enum):
     HEIGHT    = "height"    # mission-script HEIGHT step (climb/descend to target)
     GOTO      = "goto"      # mission-script TO step (drive to arena-frame point)
     DANCE     = "dance"     # mission-script DANCE step (programmed RC routine)
-    RC        = "rc"        # mission-script FB / UD / YAW (raw stick + timer)
+    RC        = "rc"        # mission-script LR / FB / UD / RC (raw stick + timer)
+    ROTATE    = "rotate"    # mission-script YAW (discrete rotation by N deg)
     LAND      = "land"
     DONE      = "done"
     ABORT     = "abort"
@@ -914,6 +915,15 @@ class MissionController:
                     self._step_dance(tel, now)
                 elif phase == Phase.RC:
                     self._step_rc(tel, now)
+                elif phase == Phase.ROTATE:
+                    # YAW step runs synchronously in
+                    # _apply_step_to_phase and calls _advance_script
+                    # before the controller ever ticks this phase.
+                    # The branch is here for completeness so an
+                    # unexpected stuck-in-ROTATE state can't pin the
+                    # loop; just zero the sticks and idle until the
+                    # next _advance_script lands.
+                    self._send_rc(0, 0, 0, 0)
                 elif phase == Phase.LAND:
                     self._step_land(tel, now)
                 elif phase in (Phase.DONE, Phase.ABORT):
@@ -1437,18 +1447,21 @@ class MissionController:
 
     # -------------------------------------------------------------- rc (script)
     def _step_rc(self, tel: Optional[TelemetrySnapshot], now: float) -> None:
-        """Mission-script FB / UD / YAW step: pin one stick to the
-        parsed value for ``state.rc_step_until - now`` seconds, leave
-        the others at 0. FC ceiling / arena guard still clamp at the
-        wire — a UD command above the ceiling is reduced to 0 by the
-        FC, by design, so this never bypasses safety limits."""
+        """Mission-script LR / FB / UD / RC step: pin the operator-typed
+        sticks to their values for ``state.rc_step_until - now`` seconds.
+        Bypasses the per-channel ``cfg.*_rc_max`` caps because those are
+        PD-tuning bounds for the closed-loop controllers — applying them
+        to raw operator input silently shrinks (e.g.) ``LR 20`` to ``4``
+        on a host with ``lat_rc_max=4``. FC ceiling / arena guard still
+        clamp at the wire — a UD command above the ceiling is reduced
+        to 0 by the FC, by design."""
         with self.state.lock:
             lr = int(self.state.rc_step_lr)
             fb = int(self.state.rc_step_fb)
             ud = int(self.state.rc_step_ud)
             yaw = int(self.state.rc_step_yaw)
             until = self.state.rc_step_until
-        self._send_rc(lr, fb, ud, yaw)
+        self._send_rc(lr, fb, ud, yaw, enforce_cfg_caps=False)
         with self.state.lock:
             remain = (until - now) if until is not None else None
             self.state.note = (
@@ -1970,7 +1983,7 @@ class MissionController:
                             note + f" pause {step.seconds:g}s")
             return
         if step.kind == "RC":
-            # Raw RC step (FB / UD / YAW): pin sticks for `seconds`.
+            # Raw RC step (LR / FB / UD / RC): pin sticks for `seconds`.
             # The FC ceiling and arena guards still apply because
             # _send_rc goes through the same /api/rc path the
             # operator's joystick uses.
@@ -1987,6 +2000,34 @@ class MissionController:
                    f"lr={step.rc_lr}")
             self._set_phase(Phase.RC,
                             note + f" {tag} {step.seconds:g}s")
+            return
+        if step.kind == "YAW":
+            # Discrete rotation by ``rotation_deg`` degrees, +CW.
+            # api.rotate is synchronous (blocks on the FC's discrete-
+            # command window), so by the time we _advance_script the
+            # firmware has confirmed the rotation completed. No phase
+            # tick handler is needed; the brief Phase.ROTATE shows on
+            # the UI for the operator's situational awareness.
+            deg = int(step.rotation_deg or 0)
+            self._set_phase(Phase.ROTATE,
+                            note + f" {deg:+d}deg")
+            if deg == 0:
+                # No-op rotation — skip the API call entirely.
+                self._advance_script("yaw 0 — no-op")
+                return
+            direction = "cw" if deg > 0 else "ccw"
+            magnitude = max(1, min(180, abs(deg)))
+            try:
+                self.api.rotate(direction, magnitude)
+                self._advance_script(
+                    f"yaw {deg:+d}deg complete ({direction} {magnitude})"
+                )
+            except DroneApiError as e:
+                # Don't abort the whole mission for a transient
+                # rotate failure; log and move on so subsequent
+                # steps (notably LAND) still execute.
+                print(f"[ctrl] yaw rotate {deg:+d}deg failed: {e}")
+                self._advance_script(f"yaw rotate failed: {e}")
             return
         if step.kind == "LAND":
             self._set_phase(Phase.LAND, note)
@@ -2098,13 +2139,29 @@ class MissionController:
 
     # ---------------------------------------------------------------- helpers
     def _send_rc(self, lr: int, fb: int, ud: int, yaw: int,
-                 dry_run: bool = False) -> None:
+                 dry_run: bool = False,
+                 enforce_cfg_caps: bool = True) -> None:
         cfg = self.cfg
-        # Final clamp -- in case PD output and individual clips disagree.
-        lr  = max(-cfg.lat_rc_max, min(cfg.lat_rc_max, int(round(lr))))
-        fb  = max(-cfg.fwd_rc_max, min(cfg.fwd_rc_max, int(round(fb))))
-        ud  = max(-cfg.ud_rc_max,  min(cfg.ud_rc_max,  int(round(ud))))
-        yaw = max(-cfg.yaw_rc_max, min(cfg.yaw_rc_max, int(round(yaw))))
+        if enforce_cfg_caps:
+            # Final clamp -- in case PD output and individual clips disagree.
+            lr  = max(-cfg.lat_rc_max, min(cfg.lat_rc_max, int(round(lr))))
+            fb  = max(-cfg.fwd_rc_max, min(cfg.fwd_rc_max, int(round(fb))))
+            ud  = max(-cfg.ud_rc_max,  min(cfg.ud_rc_max,  int(round(ud))))
+            yaw = max(-cfg.yaw_rc_max, min(cfg.yaw_rc_max, int(round(yaw))))
+        else:
+            # Operator-typed raw RC (mission-script FB / UD / LR / RC):
+            # the per-channel cfg.* caps are PD-tuning bounds designed
+            # for closed-loop control output (where any larger stick
+            # would put the tuned response in non-linear territory).
+            # They were silently shrinking operator-typed values —
+            # YAW 90 became 18 on a host with yaw_rc_max=18, LR 20
+            # became 4 on a host with lat_rc_max=4. For raw steps we
+            # only clamp to the protocol limit [-100, +100]; the FC
+            # ceiling, arena guard and watchdog still clamp at the wire.
+            lr  = max(-100, min(100, int(round(lr))))
+            fb  = max(-100, min(100, int(round(fb))))
+            ud  = max(-100, min(100, int(round(ud))))
+            yaw = max(-100, min(100, int(round(yaw))))
         # Altitude envelope: forbid further climb above max_height_m and
         # forbid further descent below min_height_m. Applies to every
         # phase (HEIGHT_ALIGN's PD output and the takeoff climb both

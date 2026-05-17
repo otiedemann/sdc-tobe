@@ -263,13 +263,24 @@ for height jogging only within the envelope.
 
 ---
 
-### `YAW <rc> [<seconds>]`
+### `YAW <deg>`
 
-> Yaw (rotate in place) raw RC stick for `seconds`.
+> Discrete rotation by `deg` degrees.
 
-- `rc`: integer in `[-100, +100]`. Positive yaws clockwise (viewed
-  from above), negative counter-clockwise.
-- `seconds`: as for `FB`.
+- `deg`: integer in `[-180, +180]`. Positive rotates clockwise
+  (viewed from above), negative counter-clockwise. Range `[-180,
+  +180]` because there's never a need for more than a half-turn
+  in either direction (a `+180` and `-180` end at the same heading).
+- No `seconds` argument: the rotation is synchronous on the FC
+  side — the step advances when the firmware confirms completion.
+  Duration is determined by the firmware's yaw rate.
+
+Example: `YAW 90` rotates 90° clockwise, then advances; `YAW -90`
+rotates 90° counter-clockwise.
+
+If you really do want a raw yaw-stick rate (rare — usually only
+for very small / slow correction turns), use the multi-axis `RC`
+command, whose yaw field stays a stick in `[-100, +100]`.
 
 ---
 
