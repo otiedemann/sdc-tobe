@@ -36,6 +36,7 @@ from .runner import SwarmRunner
 from .safety import SafetyConfig, SafetyGate
 from .settings import StrategySettings, TeamColor, load as load_settings, save as save_settings
 from .tasks import Idle
+from .web import make_app as make_web_app, start_in_background as start_web
 from .world_model import SwarmWorldModel
 
 log = logging.getLogger("c2.strategy.app")
@@ -78,7 +79,9 @@ def build_safety(cfg) -> SafetyGate:
 
 
 async def run(cfg, tick_hz: float,
-              settings_obj: StrategySettings) -> None:
+              settings_obj: StrategySettings,
+              web_host: str, web_port: int, web_enabled: bool,
+              settings_path) -> None:
     pool = FCPool(cfg)
     await pool.start()
     log.info("strategy: FCPool up with %d FC(s)", len(cfg.fcs))
@@ -88,17 +91,28 @@ async def run(cfg, tick_hz: float,
         sorted(settings_obj.own_target_ids),
         sorted(settings_obj.enemy_target_ids),
     )
+    world_model = SwarmWorldModel(pool)
     planner = build_planner(cfg)
     safety = build_safety(cfg)
     runner = SwarmRunner(
         pool=pool,
-        world_model=SwarmWorldModel(pool),
+        world_model=world_model,
         planner=planner,
         safety=safety,
         tick_hz=tick_hz,
         on_tick=_log_record,
     )
     await runner.start()
+    if web_enabled:
+        web_app = make_web_app(
+            settings_obj=settings_obj,
+            world_model=world_model,
+            c2_cfg=cfg,
+            settings_path=settings_path,
+        )
+        start_web(web_app, host=web_host, port=web_port)
+        log.info("strategy: open http://%s:%d/ to view live arena + settings",
+                 "localhost" if web_host == "0.0.0.0" else web_host, web_port)
     try:
         # Park until SIGINT / SIGTERM
         await _wait_for_signal()
@@ -152,6 +166,14 @@ def main() -> int:
                         "before starting the runner (so the next launch "
                         "picks them up).")
     p.add_argument("--tick-hz", type=float, default=1.0)
+    p.add_argument("--web-host", default="0.0.0.0",
+                   help="Bind host for the operator UI (default 0.0.0.0).")
+    p.add_argument("--web-port", type=int, default=8091,
+                   help="Bind port for the operator UI (default 8091). "
+                        "8090 is the main C2 dashboard — keep them apart.")
+    p.add_argument("--no-web", action="store_true",
+                   help="Do not start the operator UI. The strategy "
+                        "runner still runs headless.")
     p.add_argument("-v", "--verbose", action="store_true")
     args = p.parse_args()
 
@@ -169,7 +191,13 @@ def main() -> int:
         path = save_settings(settings_obj, args.strategy_settings)
         log.info("strategy: settings saved to %s", path)
 
-    asyncio.run(run(cfg, args.tick_hz, settings_obj))
+    asyncio.run(run(
+        cfg, args.tick_hz, settings_obj,
+        web_host=args.web_host,
+        web_port=args.web_port,
+        web_enabled=not args.no_web,
+        settings_path=args.strategy_settings,
+    ))
     return 0
 
 

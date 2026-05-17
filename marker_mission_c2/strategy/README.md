@@ -147,6 +147,28 @@ def build_planner(cfg):
     ])
 ```
 
+## Operator web UI
+
+The strategy app embeds a tiny operator UI on a background Flask thread.
+Defaults to **`http://<host>:8091/`** (8090 is the main C2 dashboard —
+keeps them apart). Starts automatically with `strategy.app`; pass
+`--no-web` to disable, or `--web-port N` to move it.
+
+| Page | What it does |
+|------|---|
+| `/`         | Live top-down arena view. SVG drawn from `SwarmWorldModel.observe()`, polls `/api/state` at 2 Hz. Shows zone bands (our home / neutral / enemy), safety-margin outline, each drone's pose with role + altitude badge. |
+| `/settings` | Form bound to `StrategySettings`. Every section from the schema below is editable. **Save** validates via `_from_dict` (so a bad team string is rejected with a clear 400) and mutates the *live* instance — the running planner sees the new values on the next tick, no restart needed. **Reload from disk** re-reads `settings.json` so two operators editing in different tools stay in sync. |
+
+JSON API (useful for scripted edits or a custom UI):
+
+| route                          | method | use                                                                   |
+| ------------------------------ | ------ | --------------------------------------------------------------------- |
+| `/api/topology`                | GET    | FC list from the active C2 config (drives the per-FC table)            |
+| `/api/settings`                | GET    | current settings as JSON                                              |
+| `/api/settings`                | POST   | replace settings — body = same shape as `settings.example.json`        |
+| `/api/settings/reload`         | POST   | re-read `settings.json` from disk                                     |
+| `/api/state`                   | GET    | live SwarmState (drones + zones + targets) — what `/` polls            |
+
 ## Operator-tunable settings (`settings.py`)
 
 Knobs that change match-to-match live in their own JSON, separate from
