@@ -1,5 +1,5 @@
 {
-  "_comment": "SDC26 target markers. Layout updated to fit the current 10x20 arena (width along X, depth along Y). Red team uses 44/45/46 (live) on the -X side; blue team uses 31/32/33 (live) on the +X side. Orientation uses ROLL only (same empirical rule as the wall markers \u2014 see WALL_ROLL_DEG in arena_to_sphinx_yaml.py). Red boxes use roll=0 (same as left wall, faces arena +X / UE +Y, toward the blue zone); blue boxes use roll=180 (same as right wall, faces arena -X / UE -Y, toward the red zone). 41-43 and 34-36 are disabled spares parked at origin.",
+  "_comment": "SDC26 target markers, regs-aligned layout. Per \u00a71.1 the playing field is split along the long (Y) axis into red (5 m) + neutral (10 m) + blue (5 m) strips. Three targets per team, centred along their zone's Y midline (red y=-7.5, blue y=+7.5) and spread across the 10 m width at x = -3 / 0 / +3. Rotation uses ROLL only (same empirical rule as wall markers): red boxes use roll=270 (back-wall convention, faces arena +Y toward neutral); blue boxes use roll=90 (front-wall convention, faces -Y toward neutral). 41-43 and 34-36 are disabled spares parked at origin so their FBX assets stay registered for the post-capture ID flip.",
   "marker_size_m": 0.19,
   "box_size_m": 0.5,
   "boxes": [
@@ -7,73 +7,73 @@
       "id": 44,
       "team": "red",
       "label": "Red top",
-      "x": -4.5,
-      "y": 6.0,
+      "x": -3.0,
+      "y": -7.5,
       "z": 1.0,
       "pitch_deg": 0.0,
       "yaw_deg": 0.0,
       "enabled": true,
-      "roll_deg": 0.0
+      "roll_deg": 270.0
     },
     {
       "id": 45,
       "team": "red",
       "label": "Red middle",
-      "x": -4.5,
-      "y": 0.0,
+      "x": 0.0,
+      "y": -7.5,
       "z": 1.0,
       "pitch_deg": 0.0,
       "yaw_deg": 0.0,
       "enabled": true,
-      "roll_deg": 0.0
+      "roll_deg": 270.0
     },
     {
       "id": 46,
       "team": "red",
       "label": "Red bottom",
-      "x": -4.5,
-      "y": -6.0,
+      "x": 3.0,
+      "y": -7.5,
       "z": 1.0,
       "pitch_deg": 0.0,
       "yaw_deg": 0.0,
       "enabled": true,
-      "roll_deg": 0.0
+      "roll_deg": 270.0
     },
     {
       "id": 31,
       "team": "blue",
       "label": "Blue top",
-      "x": 4.5,
-      "y": 6.0,
+      "x": -3.0,
+      "y": 7.5,
       "z": 1.0,
       "pitch_deg": 0.0,
       "yaw_deg": 0.0,
       "enabled": true,
-      "roll_deg": 180.0
+      "roll_deg": 90.0
     },
     {
       "id": 32,
       "team": "blue",
       "label": "Blue middle",
-      "x": 4.5,
-      "y": 0.0,
+      "x": 0.0,
+      "y": 7.5,
       "z": 1.0,
       "pitch_deg": 0.0,
       "yaw_deg": 0.0,
       "enabled": true,
-      "roll_deg": 180.0
+      "roll_deg": 90.0
     },
     {
       "id": 33,
       "team": "blue",
       "label": "Blue bottom",
-      "x": 4.5,
-      "y": -6.0,
+      "x": 3.0,
+      "y": 7.5,
       "z": 1.0,
       "pitch_deg": 0.0,
       "yaw_deg": 0.0,
       "enabled": true,
-      "roll_deg": 180.0
+      "roll_deg": 90.0
     },
     {
       "id": 41,

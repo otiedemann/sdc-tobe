@@ -823,47 +823,51 @@ def main() -> int:
             n_spectators += 1
 
     if emit_floor:
-        # Coloured arena floor: red 7 m + neutral 6 m + blue 7 m strip,
-        # spanning the full arena depth (10.8 m). Each strip is its
-        # own scaled unit-cube FBX (floor_red, floor (neutral grey),
-        # floor_blue) so we get separate solid-colour zones without
-        # multi-material FBX imports. Strips sit at 5 cm above UE
-        # default ground (z=0) so the playable surface is the
-        # coloured arena, not the cloudy default world.
-        ARENA_LEN = 20.0     # arena X-axis length (-10..+10)
-        ARENA_DEPTH = 10.8   # arena Y-axis depth
-        ZONE_END = 7.0       # red & blue zones each 7 m of the length
-        ZONE_MID = ARENA_LEN - 2 * ZONE_END  # neutral 6 m in middle
-        # parrot-ue4-empty has a BUILT-IN checkered arena floor that
-        # sits ABOVE z=0 (visible in user screenshots as a checker
-        # rectangle floating above our coloured zones). Raise our
-        # floor's top to z=+0.40 m so it hides that built-in mesh
-        # too. Drone spawn z=0 still works — UE4 collisions ignore
-        # the single-frame intersection.
+        # Coloured arena floor, per SDC26 regs §1.1: a 20 m × 10 m field
+        # split along its LONG axis into red (5 m) + neutral (10 m) +
+        # blue (5 m) strips, each spanning the full 10 m width.
+        #
+        # marker_mission convention places the long axis along arena Y
+        # (depth = 20 m) and the short axis along arena X (width = 10 m),
+        # so the zone STRIPS are perpendicular to Y: red sits at small
+        # Y, blue at large Y, neutral in the middle. Earlier code had
+        # this reversed (assumed long axis = X), which dropped the red
+        # and blue strips OUTSIDE the playing field at x = ±6.5 m.
+        #
+        # Each strip is its own scaled unit-cube FBX (floor_red, floor
+        # (neutral grey), floor_blue) so we get separate solid-colour
+        # zones without multi-material FBX imports. Strips sit at the
+        # raised floor height (top at z=+0.40 m) so they hide both
+        # UE4's built-in checker ground and the cloudy default world.
+        ARENA_Y_LENGTH = 20.0  # arena depth (long axis), 20 m
+        ARENA_X_WIDTH  = 10.8  # arena width (short axis) + small overlap
+        ZONE_TEAM      = 5.0   # red and blue zones, each 5 m along Y
+        ZONE_NEUTRAL   = ARENA_Y_LENGTH - 2 * ZONE_TEAM  # 10 m middle
         FLOOR_THICK = 0.50
         FLOOR_TOP_Z = 0.40
         zone_z_center = FLOOR_TOP_Z - FLOOR_THICK / 2.0
-        # Per-zone arena X centres
-        red_cx = -ARENA_LEN / 2 + ZONE_END / 2     # = -6.5
-        mid_cx = 0.0
-        blue_cx = ARENA_LEN / 2 - ZONE_END / 2     # = +6.5
-        # Marker-bbox-centred Y (cy = (y_min+y_max)/2)
-        ys = [float(m["y"]) for m in arena.get("markers", [])] or [0.0, 10.8]
-        cy = (min(ys) + max(ys)) / 2.0
-        for zone_name, fbx_name, cx_arena, length_m in (
-            ("arena_floor_red",     "floor_red.fbx",  red_cx,  ZONE_END),
-            ("arena_floor_neutral", "floor.fbx",      mid_cx,  ZONE_MID),
-            ("arena_floor_blue",    "floor_blue.fbx", blue_cx, ZONE_END),
+        # Per-zone arena Y centres (zones split the long axis).
+        red_cy  = -ARENA_Y_LENGTH / 2 + ZONE_TEAM / 2     # = -7.5
+        mid_cy  = 0.0
+        blue_cy =  ARENA_Y_LENGTH / 2 - ZONE_TEAM / 2     # = +7.5
+        # Cross-axis (arena X) centre — marker bbox midpoint, normally 0.
+        xs = [float(m["x"]) for m in arena.get("markers", [])] or [-5.0, +5.0]
+        cx = (min(xs) + max(xs)) / 2.0
+        for zone_name, fbx_name, cy_arena, length_m in (
+            ("arena_floor_red",     "floor_red.fbx",  red_cy,  ZONE_TEAM),
+            ("arena_floor_neutral", "floor.fbx",      mid_cy,  ZONE_NEUTRAL),
+            ("arena_floor_blue",    "floor_blue.fbx", blue_cy, ZONE_TEAM),
         ):
-            ux_m, uy_m, uz_m = shifted_apply((cx_arena, cy, zone_z_center))
+            ux_m, uy_m, uz_m = shifted_apply((cx, cy_arena, zone_z_center))
             loc_cm = (ux_m * 100.0, uy_m * 100.0, uz_m * 100.0)
-            # arena (x,y,z) → UE (y,x,z): arena's Y-depth scales UE_X,
-            # arena's X-length scales UE_Y.
-            ue_x_size = ARENA_DEPTH
-            ue_y_size = length_m
+            # Under axis_map y2x,x2y,z2z:
+            #   arena Y → UE X  → zone length along Y scales UE_X
+            #   arena X → UE Y  → full arena width scales UE_Y
+            ue_x_size = length_m
+            ue_y_size = ARENA_X_WIDTH
             out_lines.append(
                 f"  # Floor zone {zone_name} — {length_m} × "
-                f"{ARENA_DEPTH} × {FLOOR_THICK} m."
+                f"{ARENA_X_WIDTH} × {FLOOR_THICK} m (Y×X×Z, arena coords)."
             )
             out_lines.append(emit_yaml_block(
                 name=zone_name,
