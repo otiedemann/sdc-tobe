@@ -6,3 +6,9 @@ requests>=2.28
 # The CSV output works without it; a missing matplotlib triggers a
 # graceful warning instead of a crash.
 matplotlib>=3.5
+# Parrot Olympe SDK — needed because marker_mission.app's combined
+# entry point imports controller_unified.unified_api_server in-process,
+# which Olympe-connects to the drone. Without this the FC service
+# crashes at startup with `ERROR: olympe not installed.` and falls
+# into a systemd Restart=on-failure loop.
+parrot-olympe>=7.7
