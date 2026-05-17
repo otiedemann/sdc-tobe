@@ -1,2 +1,6 @@
 flask>=2.2
 httpx>=0.27
+# Used by marker_mission_c2.server.proxy_video for streaming MJPEG
+# fan-out from each FC. Without this the per-FC `Show video` button
+# crashes with ModuleNotFoundError on a fresh venv.
+requests>=2.31
