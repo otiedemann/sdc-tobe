@@ -153,12 +153,57 @@ Knobs that change match-to-match live in their own JSON, separate from
 `marker_mission_c2/config.json` (which is fleet-topology stuff that
 hardly ever changes).
 
+### Top-level
+
 | field                       | meaning                                                       |
 | --------------------------- | ------------------------------------------------------------- |
 | `team_color`                | `"red"` (own ids 41–46) or `"blue"` (own ids 31–36)          |
 | `own_target_ids_override`   | replace the team-derived own-target set (rare; null = use team) |
 | `enemy_target_ids_override` | replace the team-derived enemy set (rare; null = use team)    |
 | `live_targets_only`         | ignore xx4/xx5/xx6 spares (default true)                      |
+
+### `arena.*`
+
+Arena geometry + zone definitions. Red team owns the -X side, blue the
++X side — the helpers below pick "ours" / "theirs" automatically based
+on `team_color`.
+
+| field              | type           | default        | meaning                                |
+| ------------------ | -------------- | -------------- | -------------------------------------- |
+| `width_m`          | float          | 10             | arena X extent (x ∈ ±5)                |
+| `depth_m`          | float          | 20             | arena Y extent (y ∈ ±10)               |
+| `safety_margin_m`  | float          | 0.5            | clip-back margin from any wall          |
+| `red_home_x_m`     | `[lo, hi]`     | `[-5, -2]`     | red's home band along X                 |
+| `blue_home_x_m`    | `[lo, hi]`     | `[ 2,  5]`     | blue's home band along X                |
+| `neutral_zone_x_m` | `[lo, hi]`     | `[-2,  2]`     | middle band where scouts park           |
+
+### `drones.<fc_name>.*`
+
+Per-FC role + cruise altitude. Layered altitudes are the primary
+collision-avoidance strategy — give each drone its own slot.
+
+| field         | type    | default | meaning                                          |
+| ------------- | ------- | ------- | ------------------------------------------------ |
+| `role`        | string  | `idle`  | `attacker` / `scout` / `defender` / `idle`       |
+| `altitude_m`  | float   | 1.5     | cruise altitude in arena Z                       |
+
+### `attack.*`
+
+Parameters for the 10-point simultaneous-strike maneuver.
+
+| field                      | type           | default | meaning                                          |
+| -------------------------- | -------------- | ------- | ------------------------------------------------ |
+| `hover_alt_m`              | float          | 3.5     | wait altitude above the assigned target          |
+| `strike_alt_m`             | float          | 1.5     | sync-drop altitude (both attackers descend here) |
+| `sync_window_s`            | float          | 1.5     | how long the first attacker waits for the partner|
+| `pair_targets_override`    | `list[[a,b]]`  | null    | which marker pairs qualify; null = derive from `own_target_ids` (every 2-combination) |
+| `home_zone_clear`          | bool           | true    | abort the strike if any non-attacker friendly is in our home zone |
+
+### `defender.*`
+
+| field                  | type   | default | meaning                                                 |
+| ---------------------- | ------ | ------- | ------------------------------------------------------- |
+| `intercept_radius_m`   | float  | 2.5     | distance enemy must close on one of our targets before defender breaks toward it |
 
 Resolution: `--strategy-settings` flag → `$MARKER_MISSION_C2_STRATEGY_SETTINGS`
 env → `./marker_mission_c2/strategy/settings.json` →
@@ -191,8 +236,21 @@ def score_attack(state, fc):
 ```
 
 Mutating `cfg.team_color = TeamColor.BLUE` at run time flips
-`own_target_ids` / `enemy_target_ids` on the *next* read — every
+`own_target_ids` / `enemy_target_ids` / `our_home_x_m` /
+`enemy_home_x_m` / `attack_pair_targets()` on the *next* read — every
 derived property is computed at access time, no recreation needed.
+
+### Derived helpers worth knowing
+
+| call                                          | use                                    |
+| --------------------------------------------- | -------------------------------------- |
+| `cfg.our_home_x_m` / `cfg.enemy_home_x_m`     | which band is ours / theirs (flips with `team_color`) |
+| `cfg.is_in_home_zone(x)` / `is_in_enemy_zone(x)` / `is_in_neutral_zone(x)` | classify an X coord |
+| `cfg.is_within_arena(x, y)`                   | True iff inside fence by `safety_margin_m` |
+| `cfg.role_for(fc_name)`                       | `Role` enum for that FC (`IDLE` if not assigned) |
+| `cfg.cruise_altitude_for(fc_name)`            | per-FC altitude (1.5 m default if not assigned) |
+| `cfg.fcs_with_role(Role.ATTACKER)`            | list of FC names with that role |
+| `cfg.attack_pair_targets()`                   | list of (a, b) marker pairs that qualify for the 10-pt move; auto-derived from `own_target_ids` unless `pair_targets_override` is set |
 
 ## Tradeoffs we accepted
 

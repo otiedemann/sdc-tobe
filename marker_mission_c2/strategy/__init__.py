@@ -50,7 +50,12 @@ from .runner import (
 )
 from .settings import (
     TeamColor,
+    Role,
     StrategySettings,
+    ArenaSettings,
+    DroneAssignment,
+    AttackSettings,
+    DefenderSettings,
     RED_TARGET_IDS,
     BLUE_TARGET_IDS,
     RED_LIVE_IDS,
@@ -66,7 +71,9 @@ __all__ = [
     "SwarmPlanner", "StaticAssignmentPlanner", "UtilityPlanner",
     "SafetyConfig", "SafetyGate", "SafetyVerdict",
     "SwarmRunner", "TickRecord",
-    "TeamColor", "StrategySettings",
+    "TeamColor", "Role", "StrategySettings",
+    "ArenaSettings", "DroneAssignment",
+    "AttackSettings", "DefenderSettings",
     "RED_TARGET_IDS", "BLUE_TARGET_IDS",
     "RED_LIVE_IDS", "BLUE_LIVE_IDS", "WALL_MARKER_IDS",
     "settings",
