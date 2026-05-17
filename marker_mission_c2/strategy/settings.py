@@ -179,6 +179,16 @@ class DefenderSettings:
     intercept_radius_m: float = 2.5
 
 
+@dataclass
+class MatchSettings:
+    """Match-clock configuration. The clock state itself
+    (start_time, running) is runtime-only — see
+    :class:`marker_mission_c2.strategy.match.MatchState` — but the
+    *duration* of a match is config the operator sets up before
+    pressing Start."""
+    duration_s: float = 600.0   # 10 min default, tweak in the UI / JSON
+
+
 # ---------------------------------------------------------------------------
 # Top-level settings
 # ---------------------------------------------------------------------------
@@ -206,6 +216,7 @@ class StrategySettings:
     drones:   Dict[str, DroneAssignment] = field(default_factory=dict)
     attack:   AttackSettings   = field(default_factory=AttackSettings)
     defender: DefenderSettings = field(default_factory=DefenderSettings)
+    match:    MatchSettings    = field(default_factory=MatchSettings)
 
     # ---------------- derived: target id sets ----------------
 
@@ -363,6 +374,9 @@ class StrategySettings:
             "defender": {
                 "intercept_radius_m": self.defender.intercept_radius_m,
             },
+            "match": {
+                "duration_s": self.match.duration_s,
+            },
         }
 
 
@@ -426,6 +440,11 @@ def _from_dict(d: dict) -> StrategySettings:
         intercept_radius_m=float(defender_d.get("intercept_radius_m", 2.5)),
     )
 
+    match_d = d.get("match") or {}
+    match = MatchSettings(
+        duration_s=float(match_d.get("duration_s", 600.0)),
+    )
+
     return StrategySettings(
         team_color=TeamColor.parse(d.get("team_color", "red")),
         own_target_ids_override=(
@@ -441,6 +460,7 @@ def _from_dict(d: dict) -> StrategySettings:
         drones=drones,
         attack=attack,
         defender=defender,
+        match=match,
     )
 
 

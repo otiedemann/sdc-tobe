@@ -68,6 +68,7 @@ class SwarmRunner:
         safety: Optional[SafetyGate] = None,
         tick_hz: float = 1.0,
         on_tick: Optional[Callable[[TickRecord], Awaitable[None] | None]] = None,
+        match_state=None,
     ):
         self._pool = pool
         self._world = world_model or SwarmWorldModel(pool)
@@ -80,6 +81,7 @@ class SwarmRunner:
         self._safety = safety
         self._dt = 1.0 / max(0.1, float(tick_hz))
         self._on_tick = on_tick
+        self._match_state = match_state
         self._stop = asyncio.Event()
         self._task: Optional[asyncio.Task] = None
 
@@ -106,6 +108,12 @@ class SwarmRunner:
         try:
             while not self._stop.is_set():
                 t0 = time.monotonic()
+                if self._match_state is not None:
+                    # Record the tick first thing so even a tick that
+                    # explodes inside observe()/decide() still bumps
+                    # the counter — operator sees "still alive" in
+                    # the UI even during a transient failure.
+                    self._match_state.record_tick()
                 try:
                     state = self._world.observe()
                     assignments = self._planner.decide(state)

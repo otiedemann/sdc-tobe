@@ -32,6 +32,7 @@ from marker_mission_c2.config import load_config
 from marker_mission_c2.fc_pool import FCPool
 from marker_mission_c2.settings import SettingsStore as C2SettingsStore
 
+from .match import MatchState
 from .planner import RoleAssignmentPlanner, StaticAssignmentPlanner, SwarmPlanner
 from .runner import SwarmRunner
 from .safety import SafetyConfig, SafetyGate
@@ -93,6 +94,7 @@ async def run(cfg, tick_hz: float,
     world_model = SwarmWorldModel(pool)
     planner = build_planner(cfg, settings_obj)
     safety = build_safety(cfg)
+    match_state = MatchState(duration_s=settings_obj.match.duration_s)
     runner = SwarmRunner(
         pool=pool,
         world_model=world_model,
@@ -100,6 +102,7 @@ async def run(cfg, tick_hz: float,
         safety=safety,
         tick_hz=tick_hz,
         on_tick=_log_record,
+        match_state=match_state,
     )
     await runner.start()
     if web_enabled:
@@ -109,6 +112,7 @@ async def run(cfg, tick_hz: float,
             c2_cfg=cfg,
             settings_path=settings_path,
             planner=planner,
+            match_state=match_state,
         )
         start_web(web_app, host=web_host, port=web_port)
         log.info("strategy: open http://%s:%d/ to view live arena + settings",

@@ -74,6 +74,7 @@ def make_app(
     c2_cfg,
     settings_path: Optional[Path] = None,
     planner=None,
+    match_state=None,
 ) -> Flask:
     """Build the strategy web app.
 
@@ -83,6 +84,11 @@ def make_app(
     *live* role per drone instead of the operator-pinned role from
     settings. Pinning still drives the planner; the UI just shows what
     the strategy actually decided.
+
+    ``match_state`` is optional — :class:`marker_mission_c2.strategy.match.MatchState`
+    instance shared with the runner. When supplied, ``/api/state``
+    embeds tick counter + match clock, and the ``/api/match/*``
+    endpoints become operative.
     """
     app = Flask("c2-strategy-web")
     path = Path(settings_path) if settings_path else DEFAULT_PATH
@@ -193,7 +199,7 @@ def make_app(
                 "role_score": score,
                 "cruise_altitude_m": settings_obj.cruise_altitude_for(name),
             }
-        return jsonify({
+        payload = {
             "t": state.t,
             "drones": drones_out,
             "team_color": settings_obj.team_color.value,
@@ -211,7 +217,50 @@ def make_app(
                 "own": own_targets,
                 "enemy": enemy_targets,
             },
-        })
+        }
+        if match_state is not None:
+            payload.update(match_state.snapshot())
+        return jsonify(payload)
+
+    # ---- match clock ----
+
+    @app.get("/api/match")
+    def api_match_get():
+        if match_state is None:
+            return jsonify(error="match_state not wired"), 503
+        return jsonify(match_state.snapshot())
+
+    @app.post("/api/match/start")
+    def api_match_start():
+        if match_state is None:
+            return jsonify(error="match_state not wired"), 503
+        match_state.start_match()
+        return jsonify(ok=True, **match_state.snapshot())
+
+    @app.post("/api/match/stop")
+    def api_match_stop():
+        if match_state is None:
+            return jsonify(error="match_state not wired"), 503
+        match_state.stop_match()
+        return jsonify(ok=True, **match_state.snapshot())
+
+    @app.post("/api/match/duration")
+    def api_match_set_duration():
+        if match_state is None:
+            return jsonify(error="match_state not wired"), 503
+        data = request.get_json(force=True) or {}
+        try:
+            new_dur = float(data["duration_s"])
+        except (KeyError, TypeError, ValueError) as e:
+            return jsonify(error=f"bad duration_s: {e}"), 400
+        match_state.set_duration_s(new_dur)
+        settings_obj.match.duration_s = new_dur
+        # Persist so it survives a runner restart.
+        try:
+            save_settings(settings_obj, str(path))
+        except Exception:
+            log.exception("settings save (match.duration) failed")
+        return jsonify(ok=True, **match_state.snapshot())
 
     return app
 
@@ -314,6 +363,30 @@ _INDEX_HTML = f"""<!doctype html>
 </div>
 
 <h1>Live arena</h1>
+
+<div class="card" id="match-card" style="margin-bottom:14px;">
+  <div style="display:flex; gap:24px; align-items:center; flex-wrap:wrap;">
+    <div>
+      <div class="muted" style="font-size:11px; text-transform:uppercase;">strategy</div>
+      <div id="strategy-status" style="font-size:14px;">—</div>
+    </div>
+    <div>
+      <div class="muted" style="font-size:11px; text-transform:uppercase;">match</div>
+      <div id="match-clock" style="font-size:24px; font-family:monospace; letter-spacing:.05em;">—:—</div>
+    </div>
+    <div>
+      <div class="muted" style="font-size:11px; text-transform:uppercase;">duration</div>
+      <div><input type="number" min="10" step="10" id="match-duration" style="width:90px;"> s
+        <button type="button" id="duration-save" style="padding:4px 8px;">save</button>
+      </div>
+    </div>
+    <div style="margin-left:auto;">
+      <button class="primary" type="button" id="match-start">Start match</button>
+      <button type="button" id="match-stop">Stop</button>
+    </div>
+  </div>
+</div>
+
 <div class="row">
   <div class="arena-wrap">
     <svg class="arena" id="arena" viewBox="-12 -7 24 14" preserveAspectRatio="xMidYMid meet"></svg>
@@ -422,12 +495,75 @@ function draw(state) {{
     + `<span><span class="swatch" style="background:#8a8e94; border:1px solid #000"></span>idle</span>`;
 }}
 
+function fmtTime(s) {{
+  if (s == null || !isFinite(s)) return "—:—";
+  s = Math.max(0, Math.floor(s));
+  const m = Math.floor(s / 60), r = s % 60;
+  return String(m).padStart(2,"0") + ":" + String(r).padStart(2,"0");
+}}
+
+function drawMatch(data) {{
+  const STR = document.getElementById("strategy-status");
+  const CLOCK = document.getElementById("match-clock");
+  const DUR_INPUT = document.getElementById("match-duration");
+  const BTN_START = document.getElementById("match-start");
+  const BTN_STOP = document.getElementById("match-stop");
+
+  // strategy alive indicator
+  const ticks = data.ticks || {{}};
+  const hz = (ticks.hz != null) ? ticks.hz.toFixed(2) + " Hz" : "—";
+  const lastAge = ticks.last_age_s;
+  const aliveText = lastAge == null ? "starting…" :
+    (lastAge < 3.0 ? "ticking" : "stalled (" + lastAge.toFixed(1) + "s ago)");
+  STR.textContent = aliveText + " · " + (ticks.count || 0) + " ticks · " + hz;
+  STR.className = (lastAge == null || lastAge < 3.0) ? "ok" : "err";
+
+  // match clock
+  const m = data.match || {{}};
+  if (m.running) {{
+    CLOCK.textContent = fmtTime(m.remaining_s) + " / " + fmtTime(m.duration_s);
+    CLOCK.style.color = m.expired ? "#f88" : (m.remaining_s < 30 ? "#fc8" : "#9d6");
+    BTN_START.style.display = "none";
+    BTN_STOP.style.display = "";
+  }} else {{
+    CLOCK.textContent = "NOT STARTED";
+    CLOCK.style.color = "#9aa";
+    BTN_START.style.display = "";
+    BTN_STOP.style.display = "none";
+  }}
+
+  // duration input — only update if the user isn't editing it
+  if (document.activeElement !== DUR_INPUT && m.duration_s != null) {{
+    DUR_INPUT.value = m.duration_s;
+  }}
+}}
+
+async function postMatch(suffix) {{
+  try {{
+    await fetch("/api/match/" + suffix, {{method: "POST"}});
+    tick();
+  }} catch (e) {{ console.error(e); }}
+}}
+
+document.getElementById("match-start").onclick = () => postMatch("start");
+document.getElementById("match-stop").onclick  = () => postMatch("stop");
+document.getElementById("duration-save").onclick = async () => {{
+  const v = parseFloat(document.getElementById("match-duration").value);
+  if (!isFinite(v) || v < 1) return;
+  await fetch("/api/match/duration", {{
+    method: "POST", headers: {{"content-type":"application/json"}},
+    body: JSON.stringify({{duration_s: v}})
+  }});
+  tick();
+}};
+
 async function tick() {{
   try {{
     const r = await fetch("/api/state");
     if (!r.ok) throw new Error("HTTP " + r.status);
     const data = await r.json();
     STATUS.className = "muted"; STATUS.textContent = "ok · team=" + data.team_color;
+    drawMatch(data);
     draw(data);
   }} catch (e) {{
     STATUS.className = "err"; STATUS.textContent = "fetch failed: " + e.message;
