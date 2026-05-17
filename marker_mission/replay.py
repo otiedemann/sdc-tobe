@@ -437,7 +437,15 @@ class FlightReplay:
         # while the video shows a slightly different moment.
         self._advance_video_to(self.timeline[idx])
         if self.cap is not None and self._last_pos_ms >= 0:
-            idx = self._row_at_video_time(self._last_pos_ms / 1000.0)
+            # _last_pos_ms is in cv2's mp4-time (post seek-scale
+            # correction). Convert back to real CSV-time before
+            # mapping to a row index — otherwise the telemetry side
+            # panel desyncs from the visible frame whenever the
+            # recorder stamped the wrong fps (raw.mp4 default = 25
+            # but Anafi sims deliver ~14 fps).
+            real_t_s = (self._last_pos_ms / 1000.0
+                        / max(self._seek_scale, 1e-6))
+            idx = self._row_at_video_time(real_t_s)
         row = self.rows[idx]
         # Rebuild a TelemetrySnapshot from the recorded tel_* columns.
         tel_raw: dict = {}
