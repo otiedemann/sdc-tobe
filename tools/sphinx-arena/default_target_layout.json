@@ -1,5 +1,5 @@
 {
-  "_comment": "SDC26 target markers. Layout updated to fit the current 10x20 arena (width along X, depth along Y). Red team uses 44/45/46 (live) on the -X side; blue team uses 31/32/33 (live) on the +X side. Orientation: red pitch=180 (face along +X, inward toward arena centre); blue yaw=180 (face along -X, inward). 41-43 and 34-36 are disabled spares parked at origin.",
+  "_comment": "SDC26 target markers. Layout updated to fit the current 10x20 arena (width along X, depth along Y). Red team uses 44/45/46 (live) on the -X side; blue team uses 31/32/33 (live) on the +X side. Orientation uses ROLL only (same empirical rule as the wall markers \u2014 see WALL_ROLL_DEG in arena_to_sphinx_yaml.py). Red boxes use roll=0 (same as left wall, faces arena +X / UE +Y, toward the blue zone); blue boxes use roll=180 (same as right wall, faces arena -X / UE -Y, toward the red zone). 41-43 and 34-36 are disabled spares parked at origin.",
   "marker_size_m": 0.19,
   "box_size_m": 0.5,
   "boxes": [
@@ -10,7 +10,7 @@
       "x": -4.5,
       "y": 6.0,
       "z": 1.0,
-      "pitch_deg": 180.0,
+      "pitch_deg": 0.0,
       "yaw_deg": 0.0,
       "enabled": true,
       "roll_deg": 0.0
@@ -22,7 +22,7 @@
       "x": -4.5,
       "y": 0.0,
       "z": 1.0,
-      "pitch_deg": 180.0,
+      "pitch_deg": 0.0,
       "yaw_deg": 0.0,
       "enabled": true,
       "roll_deg": 0.0
@@ -34,7 +34,7 @@
       "x": -4.5,
       "y": -6.0,
       "z": 1.0,
-      "pitch_deg": 180.0,
+      "pitch_deg": 0.0,
       "yaw_deg": 0.0,
       "enabled": true,
       "roll_deg": 0.0
@@ -47,9 +47,9 @@
       "y": 6.0,
       "z": 1.0,
       "pitch_deg": 0.0,
-      "yaw_deg": 180.0,
+      "yaw_deg": 0.0,
       "enabled": true,
-      "roll_deg": 0.0
+      "roll_deg": 180.0
     },
     {
       "id": 32,
@@ -59,9 +59,9 @@
       "y": 0.0,
       "z": 1.0,
       "pitch_deg": 0.0,
-      "yaw_deg": 180.0,
+      "yaw_deg": 0.0,
       "enabled": true,
-      "roll_deg": 0.0
+      "roll_deg": 180.0
     },
     {
       "id": 33,
@@ -71,9 +71,9 @@
       "y": -6.0,
       "z": 1.0,
       "pitch_deg": 0.0,
-      "yaw_deg": 180.0,
+      "yaw_deg": 0.0,
       "enabled": true,
-      "roll_deg": 0.0
+      "roll_deg": 180.0
     },
     {
       "id": 41,
