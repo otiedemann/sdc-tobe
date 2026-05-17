@@ -100,6 +100,7 @@ echo "[install] enabling units..."
 # Order matters less than that they're all enabled — systemd resolves
 # After=/Wants= ordering at activation time.
 for u in \
+  sdc-tobe-git-pull.service \
   xvfb.service \
   sphinx-bootstrap.service \
   marker-mission.service \

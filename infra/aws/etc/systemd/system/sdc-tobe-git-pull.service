@@ -1,0 +1,37 @@
+[Unit]
+Description=Auto-pull /opt/sdc-tobe at boot (best-effort)
+After=network-online.target
+Wants=network-online.target
+# Holds back every SDC service until the pull completes (or fails
+# cleanly). Pure ordering — not a hard Requires=, so a failed pull
+# still lets the rest of the box come up on whatever code is already
+# on disk.
+Before=sphinx-control.service \
+       sphinx-bootstrap.service \
+       marker-mission.service \
+       marker-mission-c2.service \
+       c2-controller.service \
+       drone-detector-ui.service \
+       xvfb.service
+
+[Service]
+Type=oneshot
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/opt/sdc-tobe
+# `ExecStart=-` makes the pull best-effort: a transient failure
+# (no network yet, merge conflict from a hand-edited file, github
+# unreachable) doesn't block the dependent services from starting on
+# this boot — they fall back to whatever code is already checked out.
+# The actual git output still lands in `journalctl -u sdc-tobe-git-pull`
+# so the operator can see exactly what happened.
+ExecStart=-/usr/bin/git pull --ff-only
+RemainAfterExit=yes
+StandardOutput=journal
+StandardError=journal
+# A typical fast-forward over the tailnet takes <2 s; 30 s is plenty
+# even for a slow upstream or one that includes a big asset.
+TimeoutStartSec=30
+
+[Install]
+WantedBy=multi-user.target
