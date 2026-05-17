@@ -23,12 +23,13 @@ import logging
 from dataclasses import dataclass
 from typing import Dict, Mapping, Optional, Tuple
 
-from .settings import Role, StrategySettings
+from .settings import MissionMode, Role, StrategySettings
 from .tasks import (
     DroneTask,
     HoldAboveTarget,
     Idle,
     ReclaimOnIntrusion,
+    ScoreAndCaptureLoop,
     SyncAttackPair,
     WaitInNeutral,
 )
@@ -355,6 +356,31 @@ def decide_roles(
     """
     ctx = _ScoreCtx(state=state, settings=settings)
     fcs = list(state.drones.keys())
+
+    # Mission mode = SCORE_CAPTURE short-circuits the role / utility
+    # machinery. Every healthy drone runs the same score-and-capture
+    # loop in parallel. Role is reported as "attacker" so the UI's
+    # colour coding still works; the actual task is
+    # ScoreAndCaptureLoop.
+    if settings.match.mode == MissionMode.SCORE_CAPTURE:
+        out: Dict[str, RoleDecision] = {}
+        for fc in fcs:
+            obs = state.drones.get(fc)
+            if (obs is None or not obs.online or not obs.drone_connected
+                    or obs.battery_pct is None
+                    or obs.battery_pct < _MIN_BATTERY_ATTACKER):
+                out[fc] = RoleDecision(
+                    fc=fc, role=Role.IDLE, score=0.0, task=Idle(fc))
+                continue
+            out[fc] = RoleDecision(
+                fc=fc, role=Role.ATTACKER, score=1.0,
+                task=ScoreAndCaptureLoop(
+                    target=fc, settings=settings,
+                    hover_alt_m=settings.match.score_hover_alt_m,
+                    hover_s=settings.match.score_hover_s,
+                ),
+            )
+        return out
 
     # Score table: roles[fc][role] = score
     scores: Dict[str, Dict[Role, float]] = {fc: {} for fc in fcs}

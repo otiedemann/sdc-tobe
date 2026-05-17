@@ -485,3 +485,132 @@ class SyncAttackPair(_ScriptingTask):
     @property
     def phase(self) -> str:
         return self._phase
+
+
+class ScoreAndCaptureLoop(_ScriptingTask):
+    """Cycle: score one own target → return home → capture one enemy
+    target → return home → next own → next enemy → repeat.
+
+    Generates a fresh mission-script for each cycle phase.
+    marker_mission's mission player runs the script to completion
+    (TAKEOFF / TO target / HOOVER / TO home / HOOVER), at which point
+    the FC reports phase=init. We detect that init transition, advance
+    our internal cycle pointer, and push the next phase's script.
+
+    Hover altitude defaults to 2.5 m — markers sit at z=1.0 with a
+    0.5 m box on top, so 2.5 m puts the drone 1 m clear above the
+    target. Operator can adjust via :attr:`StrategySettings.match.score_hover_alt_m`.
+
+    Per-drone state machine:
+
+      phase = score_own:    fly to settings.own_target_ids[own_idx],
+                            hover ``hover_s`` seconds, return home.
+                            On completion: advance to capture_enemy.
+
+      phase = capture_enemy: fly to settings.enemy_target_ids[enemy_idx],
+                            hover, return home.
+                            On completion: bump own_idx, back to score_own.
+    """
+    name = "score_capture"
+
+    PHASE_SCORE  = "score_own"
+    PHASE_CAPTURE = "capture_enemy"
+
+    def __init__(self, target: str, settings,
+                 hover_alt_m: float = 2.5,
+                 hover_s: float = 5.0) -> None:
+        super().__init__(target)
+        self.settings = settings
+        self.hover_alt_m = float(hover_alt_m)
+        self.hover_s = float(hover_s)
+        self._phase = self.PHASE_SCORE
+        self._own_idx = 0
+        self._enemy_idx = 0
+        # FC-was-active flag detects the falling edge from
+        # mission-running → mission-ended so we can advance the
+        # cycle exactly once per FC cycle.
+        self._fc_was_active = False
+
+    def reset(self) -> None:
+        super().reset()
+        self._phase = self.PHASE_SCORE
+        self._own_idx = 0
+        self._enemy_idx = 0
+        self._fc_was_active = False
+
+    def _current_target_xy(self) -> Optional[tuple]:
+        """The safe hover (x, y) for whichever target this phase
+        wants. Returns ``None`` if the target id has no known
+        position (configuration error)."""
+        # Late import to avoid the tasks → roles → tasks loop.
+        from .roles import _safe_hover_xy, target_pos
+        s = self.settings
+        if self._phase == self.PHASE_SCORE:
+            ids = sorted(s.own_target_ids)
+            if not ids:
+                return None
+            tid = ids[self._own_idx % len(ids)]
+        else:
+            ids = sorted(s.enemy_target_ids)
+            if not ids:
+                return None
+            tid = ids[self._enemy_idx % len(ids)]
+        pos = target_pos(tid)
+        if pos is None:
+            return None
+        return _safe_hover_xy(s, (pos[0], pos[1]))
+
+    def _home_xy(self) -> tuple:
+        """Centroid of our team's home zone — the rally point between
+        cycles. Centroid of the (X, Y) rect."""
+        s = self.settings
+        x_lo, x_hi = s.our_home_x_m
+        y_lo, y_hi = s.our_home_y_m
+        return ((x_lo + x_hi) / 2.0, (y_lo + y_hi) / 2.0)
+
+    def _compose_script(self, state: SwarmState) -> Optional[str]:
+        # Detect the FC ending its previous mission. obs.phase
+        # transitions runtime → init when the mission completes
+        # (LAND, end of script, abort, etc.). We advance the cycle
+        # on the falling edge so each FC mission corresponds to
+        # exactly one phase of our loop.
+        obs = state.drones.get(self.target)
+        fc_active = (obs is not None and obs.phase is not None
+                     and obs.phase.lower()
+                     not in ("init", "ready", "done", ""))
+        if self._fc_was_active and not fc_active:
+            # Mission cycle completed — advance to the next phase
+            # and bump the index of the phase we just left.
+            if self._phase == self.PHASE_SCORE:
+                self._own_idx += 1
+                self._phase = self.PHASE_CAPTURE
+            else:
+                self._enemy_idx += 1
+                self._phase = self.PHASE_SCORE
+        self._fc_was_active = fc_active
+
+        target_xy = self._current_target_xy()
+        if target_xy is None:
+            return None
+        home_x, home_y = self._home_xy()
+        cruise_alt = self.settings.cruise_altitude_for(self.target)
+
+        return _format_script(
+            "TAKEOFF",
+            f"TO {target_xy[0]:.2f} {target_xy[1]:.2f} {self.hover_alt_m:.2f}",
+            f"HOOVER {self.hover_s:.0f}",
+            f"TO {home_x:.2f} {home_y:.2f} {cruise_alt:.2f}",
+            "HOOVER 1",
+        )
+
+    @property
+    def phase(self) -> str:
+        return self._phase
+
+    @property
+    def own_idx(self) -> int:
+        return self._own_idx
+
+    @property
+    def enemy_idx(self) -> int:
+        return self._enemy_idx

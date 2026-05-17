@@ -235,6 +235,7 @@ def make_app(
             payload.update(match_state.snapshot())
         if safety is not None:
             payload["armed"] = bool(safety.is_armed())
+        payload["mission_mode"] = settings_obj.match.mode.value
         return jsonify(payload)
 
     # ---- strategy arm/disarm ----
@@ -434,6 +435,7 @@ _INDEX_HTML = f"""<!doctype html>
     <div>
       <div class="muted" style="font-size:11px; text-transform:uppercase;">strategy</div>
       <div id="strategy-status" style="font-size:14px;">—</div>
+      <div id="mission-mode" class="muted" style="font-size:11px; margin-top:2px;">mode: —</div>
     </div>
     <div>
       <div class="muted" style="font-size:11px; text-transform:uppercase;">match</div>
@@ -638,6 +640,13 @@ function drawMatch(data) {{
     (lastAge < 3.0 ? "ticking" : "stalled (" + lastAge.toFixed(1) + "s ago)");
   STR.textContent = aliveText + " · " + (ticks.count || 0) + " ticks · " + hz;
   STR.className = (lastAge == null || lastAge < 3.0) ? "ok" : "err";
+
+  // Mission mode indicator (sync_strike / score_capture)
+  const modeEl = document.getElementById("mission-mode");
+  if (modeEl && data.mission_mode) {{
+    modeEl.textContent = "mode: " + data.mission_mode;
+    modeEl.className = "ok";
+  }}
 
   // arm state
   const armed = !!data.armed;
@@ -864,6 +873,22 @@ _SETTINGS_HTML = f"""<!doctype html>
   </div>
 </fieldset>
 
+<fieldset><legend>Mission mode</legend>
+  <div class="grid">
+    <label>mode</label>
+    <select id="match.mode">
+      <option value="sync_strike">sync_strike (10-pt: 2 attackers + sync drop)</option>
+      <option value="score_capture">score_capture (loop: own → home → enemy → home)</option>
+    </select>
+    <label>score_hover_alt_m</label><input type="number" step="0.1" id="match.score_hover_alt_m">
+    <label>score_hover_s</label><input type="number" step="0.5" id="match.score_hover_s">
+  </div>
+  <p class="muted" style="font-size:12px;">
+    Mode applies on next planner tick. <code>score_hover_alt_m</code> and <code>score_hover_s</code>
+    only matter when mode is <code>score_capture</code>.
+  </p>
+</fieldset>
+
 <div style="margin-top:14px;">
   <button class="primary" type="button" id="save">Save</button>
   <button type="button" id="reload">Reload from disk</button>
@@ -897,12 +922,20 @@ function textToPairs(s) {{
   return s.split(";").map(part => part.split(",").map(x => parseInt(x.trim(), 10)));
 }}
 
+// Preserve duration across /settings saves — duration is edited
+// on the /live arena page (it has its own save button that hits
+// /api/match/duration). The /settings save shouldn't reset it.
+let LOADED_DURATION_S = 600.0;
+
 async function load() {{
   STATUS.textContent = "loading…";
   const [top, cfg] = await Promise.all([
     fetch("/api/topology").then(r => r.json()),
     fetch("/api/settings").then(r => r.json()),
   ]);
+  if (cfg.match && cfg.match.duration_s != null) {{
+    LOADED_DURATION_S = cfg.match.duration_s;
+  }}
 
   // team
   for (const el of document.querySelectorAll("input[name=team_color]")) {{
@@ -959,6 +992,13 @@ async function load() {{
   // defender
   setVal("defender.intercept_radius_m", cfg.defender.intercept_radius_m);
 
+  // match / mission mode
+  if (cfg.match) {{
+    setVal("match.mode", cfg.match.mode);
+    setVal("match.score_hover_alt_m", cfg.match.score_hover_alt_m);
+    setVal("match.score_hover_s",     cfg.match.score_hover_s);
+  }}
+
   STATUS.className = "muted"; STATUS.textContent = "ok · " + top.settings_path;
 }}
 
@@ -998,6 +1038,15 @@ function gather() {{
     }},
     defender: {{
       intercept_radius_m: getNum("defender.intercept_radius_m"),
+    }},
+    match: {{
+      // duration_s is edited on the /live arena page (separate save
+      // button to /api/match/duration). Preserve the loaded value
+      // so a /settings save doesn't clobber it.
+      duration_s:        LOADED_DURATION_S,
+      mode:              $("match.mode").value,
+      score_hover_alt_m: getNum("match.score_hover_alt_m"),
+      score_hover_s:     getNum("match.score_hover_s"),
     }},
   }};
 }}

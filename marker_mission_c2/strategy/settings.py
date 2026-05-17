@@ -187,14 +187,52 @@ class DefenderSettings:
     intercept_radius_m: float = 2.5
 
 
+class MissionMode(str, Enum):
+    """High-level "what is the swarm trying to do right now".
+
+    The strategy picks a different per-drone task family based on
+    this — `RoleAssignmentPlanner` checks the current mode before
+    deciding what to dispatch.
+
+    Add new modes by extending this enum + the dispatch in
+    :func:`marker_mission_c2.strategy.roles.decide_roles`. The
+    ``parse`` classmethod keeps the JSON form forgiving of casing
+    and aliases.
+    """
+    SYNC_STRIKE   = "sync_strike"      # default: 2 attackers + 10-pt sync drop
+    SCORE_CAPTURE = "score_capture"    # loop: own target → home → enemy target → home
+
+    @classmethod
+    def parse(cls, raw) -> "MissionMode":
+        if isinstance(raw, cls):
+            return raw
+        s = str(raw or "").strip().lower()
+        for m in cls:
+            if m.value == s:
+                return m
+        raise ValueError(
+            f"unknown mission mode {raw!r} — "
+            f"use one of: {[m.value for m in cls]}"
+        )
+
+
 @dataclass
 class MatchSettings:
-    """Match-clock configuration. The clock state itself
-    (start_time, running) is runtime-only — see
-    :class:`marker_mission_c2.strategy.match.MatchState` — but the
-    *duration* of a match is config the operator sets up before
-    pressing Start."""
-    duration_s: float = 600.0   # 10 min default, tweak in the UI / JSON
+    """Match-clock + high-level mission selection.
+
+    The clock state itself (start_time, running) is runtime-only —
+    see :class:`marker_mission_c2.strategy.match.MatchState`. The
+    *duration* + the active *mission mode* are config the operator
+    sets up before pressing Start.
+    """
+    duration_s: float = 600.0
+    mode: MissionMode = MissionMode.SYNC_STRIKE
+    # Score-capture loop parameters (only consulted when mode ==
+    # SCORE_CAPTURE). Hover altitude is set above the marker (which
+    # sits at z=1.0 m with a 0.5 m box on top), so 2.5 m is "1 m
+    # clear above the target".
+    score_hover_alt_m: float = 2.5
+    score_hover_s:     float = 5.0
 
 
 # ---------------------------------------------------------------------------
@@ -414,6 +452,9 @@ class StrategySettings:
             },
             "match": {
                 "duration_s": self.match.duration_s,
+                "mode":              self.match.mode.value,
+                "score_hover_alt_m": self.match.score_hover_alt_m,
+                "score_hover_s":     self.match.score_hover_s,
             },
         }
 
@@ -495,6 +536,9 @@ def _from_dict(d: dict) -> StrategySettings:
     match_d = d.get("match") or {}
     match = MatchSettings(
         duration_s=float(match_d.get("duration_s", 600.0)),
+        mode=MissionMode.parse(match_d.get("mode", "sync_strike")),
+        score_hover_alt_m=float(match_d.get("score_hover_alt_m", 2.5)),
+        score_hover_s=float(match_d.get("score_hover_s", 5.0)),
     )
 
     return StrategySettings(
