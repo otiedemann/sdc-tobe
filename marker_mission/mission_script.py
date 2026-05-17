@@ -6,7 +6,7 @@ that ``MissionController._advance_script`` walks one at a time. The
 language is one-command-per-line, case-insensitive, with ``#`` comments
 and blank lines ignored.
 
-Nine commands:
+Thirteen commands:
 
     TAKEOFF
     APPROACH [<marker-id>] [<distance>]
@@ -17,6 +17,17 @@ Nine commands:
     HEIGHT   [<height>]
     TO       <x> <y> [<z>]
     DANCE    [<seconds>] [<mode>]            mode in {wobble, spin, random}
+    FB       <rc> [<seconds>]                +forward / -back, rc in [-100, +100]
+    UD       <rc> [<seconds>]                +up / -down,     rc in [-100, +100]
+    YAW      <rc> [<seconds>]                +cw / -ccw,      rc in [-100, +100]
+    RC       <fb> <ud> <yaw> [<seconds>]     all three sticks at once
+
+FB / UD / YAW / RC are raw-RC steps: pin the listed stick(s) to the
+given value(s) for the given duration (default 1 second; fractional
+values such as ``1.5`` are accepted), and leave the other channels
+at 0. The FC ceiling / arena guard still clamp at the wire — a
+UD +100 above the ceiling gets reduced to 0 by the FC. Useful for
+hand-tuning a position or jogging the drone during a script.
 
 AWAIT behaves like HOOVER (HOLD-style station-keeping if the previous
 step was APPROACH, otherwise IDLE) but exits early as soon as the
@@ -82,6 +93,13 @@ class Step:
     world_x: Optional[float] = None
     world_y: Optional[float] = None
     yaw: Optional[object] = None       # float or "auto" or None
+    # Raw RC sticks for kind="RC" (FB / UD / YAW commands). Each axis
+    # in [-100, +100]; clamped at parse time. Zero on every non-RC
+    # step. seconds carries the duration as for HOOVER / PAUSE.
+    rc_lr: int = 0
+    rc_fb: int = 0
+    rc_ud: int = 0
+    rc_yaw: int = 0
     line_no: int = 0                    # 1-based source line, for diagnostics
 
 
@@ -211,6 +229,57 @@ def parse(text: str, defaults: dict) -> List[Step]:
                             world_x=wx, world_y=wy, height=wz,
                             yaw=yaw_arg,
                             line_no=raw_line_no))
+        elif cmd in ("FB", "UD", "YAW"):
+            if len(args) not in (1, 2):
+                raise ScriptError(raw_line_no,
+                                  f"{cmd} takes 1-2 arguments "
+                                  f"(<rc> [<seconds>]), got {len(args)}")
+            rc = _parse_int(args[0], raw_line_no, f"{cmd} rc")
+            if not (-100 <= rc <= 100):
+                raise ScriptError(raw_line_no,
+                                  f"{cmd} rc must be in [-100, +100], "
+                                  f"got {rc}")
+            sec = (_parse_float(args[1], raw_line_no, f"{cmd} seconds")
+                   if len(args) >= 2 else 1.0)
+            if sec < 0:
+                raise ScriptError(raw_line_no,
+                                  f"{cmd} seconds must be >= 0, got {sec}")
+            step = Step(kind="RC", seconds=sec, line_no=raw_line_no)
+            if cmd == "FB":
+                step.rc_fb = rc
+            elif cmd == "UD":
+                step.rc_ud = rc
+            else:  # YAW
+                step.rc_yaw = rc
+            out.append(step)
+        elif cmd == "RC":
+            # All three sticks at once: RC <fb> <ud> <yaw> [<seconds>].
+            # The LR (left/right) channel is intentionally absent from
+            # this short form — drift along the marker's local x axis
+            # is the operator's least common need, and adding a 5th
+            # positional arg makes the line hard to read at a glance.
+            # Use FB/UD/YAW individually if you need only one axis.
+            if len(args) not in (3, 4):
+                raise ScriptError(raw_line_no,
+                                  f"RC takes 3-4 arguments "
+                                  f"(<fb> <ud> <yaw> [<seconds>]), "
+                                  f"got {len(args)}")
+            fb = _parse_int(args[0], raw_line_no, "RC fb")
+            ud = _parse_int(args[1], raw_line_no, "RC ud")
+            yaw = _parse_int(args[2], raw_line_no, "RC yaw")
+            for axis_name, axis_val in (("fb", fb), ("ud", ud), ("yaw", yaw)):
+                if not (-100 <= axis_val <= 100):
+                    raise ScriptError(raw_line_no,
+                                      f"RC {axis_name} must be in "
+                                      f"[-100, +100], got {axis_val}")
+            sec = (_parse_float(args[3], raw_line_no, "RC seconds")
+                   if len(args) >= 4 else 1.0)
+            if sec < 0:
+                raise ScriptError(raw_line_no,
+                                  f"RC seconds must be >= 0, got {sec}")
+            out.append(Step(kind="RC", seconds=sec,
+                            rc_fb=fb, rc_ud=ud, rc_yaw=yaw,
+                            line_no=raw_line_no))
         elif cmd == "DANCE":
             if len(args) > 2:
                 raise ScriptError(raw_line_no,
@@ -267,6 +336,23 @@ def format(steps: List[Step]) -> str:
             if numeric_yaw:
                 parts.append(f"{float(s.yaw):g}")
             lines.append(" ".join(parts))
+        elif s.kind == "RC":
+            # Round-trip rule:
+            #   - exactly one of fb/ud/yaw non-zero → FB/UD/YAW form
+            #     (operator-friendly short syntax)
+            #   - any other combination (incl. all zero) → RC form
+            #     (preserves the multi-axis intent)
+            nonzero = sum(1 for v in (s.rc_fb, s.rc_ud, s.rc_yaw) if v != 0)
+            if nonzero == 1 and s.rc_fb != 0:
+                lines.append(f"FB {s.rc_fb} {s.seconds:g}")
+            elif nonzero == 1 and s.rc_ud != 0:
+                lines.append(f"UD {s.rc_ud} {s.seconds:g}")
+            elif nonzero == 1 and s.rc_yaw != 0:
+                lines.append(f"YAW {s.rc_yaw} {s.seconds:g}")
+            else:
+                lines.append(
+                    f"RC {s.rc_fb} {s.rc_ud} {s.rc_yaw} {s.seconds:g}"
+                )
         elif s.kind == "DANCE":
             lines.append(f"DANCE {s.seconds:g} {s.mode}")
         else:

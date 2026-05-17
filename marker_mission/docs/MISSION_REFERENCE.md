@@ -219,6 +219,65 @@ Done when the timer expires.
 
 ---
 
+### `FB <rc> [<seconds>]`
+
+> Forward / back raw RC stick for `seconds`.
+
+- `rc`: integer in `[-100, +100]`. Positive moves the drone forward,
+  negative back.
+- `seconds`: how long to hold the stick. Floats accepted (`0.5`,
+  `1.75`, …). Defaults to `1` when omitted.
+
+Example: `FB 30 0.5` pushes the forward stick to +30 for half a
+second, then advances. Other RC channels are zeroed for the duration.
+
+The FC ceiling, arena guard and watchdog clamp these sticks at the
+wire exactly as they do for the operator's joystick. A `FB` against
+an obstacle the arena guard knows about gets reduced to 0 by the FC.
+
+---
+
+### `UD <rc> [<seconds>]`
+
+> Up / down raw RC stick for `seconds`.
+
+- `rc`: integer in `[-100, +100]`. Positive climbs, negative descends.
+- `seconds`: as for `FB`.
+
+`UD` above the configured ceiling is clamped at the wire — useful
+for height jogging only within the envelope.
+
+---
+
+### `YAW <rc> [<seconds>]`
+
+> Yaw (rotate in place) raw RC stick for `seconds`.
+
+- `rc`: integer in `[-100, +100]`. Positive yaws clockwise (viewed
+  from above), negative counter-clockwise.
+- `seconds`: as for `FB`.
+
+---
+
+### `RC <fb> <ud> <yaw> [<seconds>]`
+
+> All three RC sticks at once for `seconds`.
+
+- `fb` / `ud` / `yaw`: integers in `[-100, +100]`. Sign conventions
+  match the single-axis commands above.
+- `seconds`: how long to hold. Floats accepted. Defaults to `1`.
+
+Example: `RC 30 -10 20 1.5` runs (forward=30, down=10, cw=20) for
+1.5 seconds. The LR (strafe) channel is intentionally absent from the
+short form — use the single-axis commands or extend this command if
+you need it.
+
+Round-trip behaviour: a script step where exactly one of fb/ud/yaw is
+non-zero is canonicalised back to `FB` / `UD` / `YAW`; multi-axis
+steps round-trip as `RC`.
+
+---
+
 ### `LAND`
 
 > Land the drone, then end the script (or move to the next step).

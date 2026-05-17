@@ -182,8 +182,13 @@ section so they can never run together).
 | `HEIGHT` | `[height]` | Climb/descend to arena height (m) |
 | `TO` | `x y [z] [yaw\|auto]` | Drive to arena-frame coordinate |
 | `DANCE` | `[seconds] [mode]` | mode ∈ `wobble \| spin \| random` |
+| `FB` | `rc [seconds]` | Raw forward/back stick, `rc` ∈ `[-100,+100]`, default 1 s |
+| `UD` | `rc [seconds]` | Raw up/down stick |
+| `YAW` | `rc [seconds]` | Raw yaw stick (+cw, -ccw) |
+| `RC` | `fb ud yaw [seconds]` | All three sticks at once |
 
-Full docs at `marker_mission/docs/MISSION_REFERENCE.md`.
+Seconds may be fractional (`1.5`, `0.25`). Full docs at
+`marker_mission/docs/MISSION_REFERENCE.md`.
 
 ---
 

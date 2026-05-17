@@ -73,6 +73,7 @@ class Phase(enum.Enum):
     HEIGHT    = "height"    # mission-script HEIGHT step (climb/descend to target)
     GOTO      = "goto"      # mission-script TO step (drive to arena-frame point)
     DANCE     = "dance"     # mission-script DANCE step (programmed RC routine)
+    RC        = "rc"        # mission-script FB / UD / YAW (raw stick + timer)
     LAND      = "land"
     DONE      = "done"
     ABORT     = "abort"
@@ -381,6 +382,14 @@ class MissionState:
     # the TO target for the requested seconds, the analogue of
     # HOOVER-after-APPROACH (HOLD on the marker).
     goto_hold_until: Optional[float] = None
+    # RC step (FB / UD / YAW): pin a single stick to the parsed
+    # value for ``rc_step_until - now`` seconds. Others ride 0.
+    # All zeros = effectively PAUSE; the parser never produces that.
+    rc_step_lr: int = 0
+    rc_step_fb: int = 0
+    rc_step_ud: int = 0
+    rc_step_yaw: int = 0
+    rc_step_until: Optional[float] = None
     # AWAIT step: when set, _step_idle / _step_hold advance the
     # script as soon as this marker id appears in
     # state.visible_marker_ids (see vision_worker). Cleared on every
@@ -471,6 +480,11 @@ class MissionState:
             self.goto_target_z_m = None
             self.goto_target_yaw_deg = None
             self.goto_hold_until = None
+            self.rc_step_lr = 0
+            self.rc_step_fb = 0
+            self.rc_step_ud = 0
+            self.rc_step_yaw = 0
+            self.rc_step_until = None
             self.await_marker_id = None
             self.visible_marker_ids = []
             self.dance_mode = None
@@ -898,6 +912,8 @@ class MissionController:
                     self._step_goto(tel, now)
                 elif phase == Phase.DANCE:
                     self._step_dance(tel, now)
+                elif phase == Phase.RC:
+                    self._step_rc(tel, now)
                 elif phase == Phase.LAND:
                     self._step_land(tel, now)
                 elif phase in (Phase.DONE, Phase.ABORT):
@@ -1419,6 +1435,30 @@ class MissionController:
         if until is not None and now >= until:
             self._advance_script("idle complete")
 
+    # -------------------------------------------------------------- rc (script)
+    def _step_rc(self, tel: Optional[TelemetrySnapshot], now: float) -> None:
+        """Mission-script FB / UD / YAW step: pin one stick to the
+        parsed value for ``state.rc_step_until - now`` seconds, leave
+        the others at 0. FC ceiling / arena guard still clamp at the
+        wire — a UD command above the ceiling is reduced to 0 by the
+        FC, by design, so this never bypasses safety limits."""
+        with self.state.lock:
+            lr = int(self.state.rc_step_lr)
+            fb = int(self.state.rc_step_fb)
+            ud = int(self.state.rc_step_ud)
+            yaw = int(self.state.rc_step_yaw)
+            until = self.state.rc_step_until
+        self._send_rc(lr, fb, ud, yaw)
+        with self.state.lock:
+            remain = (until - now) if until is not None else None
+            self.state.note = (
+                f"RC: lr={lr} fb={fb} ud={ud} yaw={yaw}"
+                + (f", {remain:.1f}s remaining" if remain is not None
+                   else "")
+            )
+        if until is not None and now >= until:
+            self._advance_script("rc step complete")
+
     # ------------------------------------------------------------ height (script)
     def _step_height(self, tel: Optional[TelemetrySnapshot],
                     now: float) -> None:
@@ -1928,6 +1968,25 @@ class MissionController:
                                           + float(step.seconds))
             self._set_phase(Phase.IDLE,
                             note + f" pause {step.seconds:g}s")
+            return
+        if step.kind == "RC":
+            # Raw RC step (FB / UD / YAW): pin sticks for `seconds`.
+            # The FC ceiling and arena guards still apply because
+            # _send_rc goes through the same /api/rc path the
+            # operator's joystick uses.
+            with self.state.lock:
+                self.state.rc_step_lr = int(step.rc_lr)
+                self.state.rc_step_fb = int(step.rc_fb)
+                self.state.rc_step_ud = int(step.rc_ud)
+                self.state.rc_step_yaw = int(step.rc_yaw)
+                self.state.rc_step_until = (time.monotonic()
+                                             + float(step.seconds))
+            tag = (f"fb={step.rc_fb}" if step.rc_fb else
+                   f"ud={step.rc_ud}" if step.rc_ud else
+                   f"yaw={step.rc_yaw}" if step.rc_yaw else
+                   f"lr={step.rc_lr}")
+            self._set_phase(Phase.RC,
+                            note + f" {tag} {step.seconds:g}s")
             return
         if step.kind == "LAND":
             self._set_phase(Phase.LAND, note)
