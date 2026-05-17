@@ -219,34 +219,31 @@ Done when the timer expires.
 
 ---
 
-### Raw-RC steps — `LR` / `FB` / `UD` / `RC` — and the brake phase
+### Raw-RC vs. closed-loop — the `_RC` / `_IMU` suffix convention
 
-`LR`, `FB`, `UD`, and the multi-axis `RC` are all *two-phase* steps:
+There are **two flavours** of single-axis move command:
+
+| Suffix | Mechanism | Symmetry | Repeatability | When to use |
+|--------|-----------|----------|---------------|-------------|
+| `_RC`  | Raw stick + duration (open-loop PCMD) | Anafi velocity controller is asymmetric (forward ≠ back) | Low — depends on battery / wind / start velocity | Quick jogs, tuning, "press the stick for N seconds" |
+| `_IMU` | Closed-loop position target via `moveBy` (sensor-fused) | Symmetric +/- | High — firmware closes the loop | "Move exactly X metres" or "rotate exactly Y degrees" |
+
+The `_RC` family runs through a two-phase step:
 
 1. **Drive** — pin the operator-typed sticks for the configured
    `seconds`. The FC ceiling, arena guard, and watchdog still clamp
-   at the wire; the mission-side PD-tuning caps
-   (`cfg.*_rc_max`) are bypassed so a hand-typed `LR 20` reaches
-   the drone as 20, not whatever the closed-loop output cap is.
-2. **Brake** — once the drive timer expires, the controller holds
-   zero sticks and waits until the body-frame velocity drops below
-   ~8 cm/s (or a 1.5-second timeout fires). This makes consecutive
-   steps composable: `FB +20 3` followed by `FB -20 3` reverses
-   from a hover, not from a forward velocity, so the net positions
-   actually cancel.
+   at the wire; the mission-side PD-tuning caps (`cfg.*_rc_max`)
+   are bypassed so a hand-typed `LR_RC 20` reaches the drone as 20.
+2. **Brake** — once the drive timer expires, hold zero sticks and
+   wait until body-frame velocity drops below ~8 cm/s (or a 1.5-s
+   timeout fires). This makes consecutive steps composable.
 
-Without the brake the Anafi's velocity controller decelerates
-asymmetrically — a +20 forward stick builds velocity fast, but the
-opposite -20 stick spends most of its time braking that velocity
-rather than accelerating backward. Inserting an explicit settle
-between steps avoids that.
-
-The brake is automatic; no script syntax change. The operator sees
-it in the journal as `[ctrl] rc step complete (brake 0.42s, speed=7cm/s < 8)`.
+The `_IMU` family is synchronous on the FC side — the step blocks
+until the firmware confirms the move has completed.
 
 ---
 
-### `LR <rc> [<seconds>]`
+### `LR_RC <rc> [<seconds>]`
 
 > Left / right (strafe) raw RC stick for `seconds`.
 
@@ -255,59 +252,95 @@ it in the journal as `[ctrl] rc step complete (brake 0.42s, speed=7cm/s < 8)`.
 - `seconds`: how long to hold the stick. Floats accepted (`0.5`,
   `1.75`, …). Defaults to `1` when omitted.
 
-Example: `LR -30 0.5` strafes left at stick=-30 for half a second.
+Example: `LR_RC -30 0.5` strafes left at stick=-30 for half a second.
 Other RC channels are zeroed for the duration.
 
 ---
 
-### `FB <rc> [<seconds>]`
+### `FB_RC <rc> [<seconds>]`
 
 > Forward / back raw RC stick for `seconds`.
 
 - `rc`: integer in `[-100, +100]`. Positive moves the drone forward,
   negative back.
-- `seconds`: how long to hold the stick. Floats accepted (`0.5`,
-  `1.75`, …). Defaults to `1` when omitted.
-
-Example: `FB 30 0.5` pushes the forward stick to +30 for half a
-second, then advances. Other RC channels are zeroed for the duration.
+- `seconds`: as for `LR_RC`.
 
 The FC ceiling, arena guard and watchdog clamp these sticks at the
-wire exactly as they do for the operator's joystick. A `FB` against
-an obstacle the arena guard knows about gets reduced to 0 by the FC.
+wire exactly as they do for the operator's joystick.
+
+**Asymmetry caveat**: Anafi's velocity controller accelerates faster
+forward than backward. A `FB_RC 20 1` produces noticeably more
+forward travel than `FB_RC -20 1` produces backward. For exact "move
+N metres" use `FB_IMU <m>` instead.
 
 ---
 
-### `UD <rc> [<seconds>]`
+### `UD_RC <rc> [<seconds>]`
 
 > Up / down raw RC stick for `seconds`.
 
 - `rc`: integer in `[-100, +100]`. Positive climbs, negative descends.
-- `seconds`: as for `FB`.
+- `seconds`: as for `LR_RC`.
 
-`UD` above the configured ceiling is clamped at the wire — useful
-for height jogging only within the envelope.
+`UD_RC` above the configured ceiling is clamped at the wire.
 
 ---
 
-### `YAW <deg>`
+### `YAW_RC <rc> [<seconds>]`
 
-> Discrete rotation by `deg` degrees.
+> Yaw raw RC stick for `seconds`.
+
+- `rc`: integer in `[-100, +100]`. Positive yaws clockwise (viewed
+  from above), negative counter-clockwise.
+- `seconds`: as for `LR_RC`.
+
+Use this for slow correction turns where you want stick-rate
+semantics. For exact angles use `YAW_IMU <deg>`.
+
+---
+
+### `LR_IMU <meters>` / `FB_IMU <meters>` / `UD_IMU <meters>`
+
+> Closed-loop position-relative move using Anafi's `moveBy`.
+
+- `meters`: signed float. Magnitude in `[0.01, 5.0]` (safety clamp).
+  Sign maps to direction:
+
+  | Command | `+meters` | `-meters` |
+  |---------|-----------|-----------|
+  | `FB_IMU` | forward  | back      |
+  | `LR_IMU` | right    | left      |
+  | `UD_IMU` | up       | down      |
+
+Symmetric in both directions — the firmware handles accel / cruise
+/ decel and parks the drone at the requested offset. The step
+blocks until completion.
+
+Example:
+
+```
+TAKEOFF
+FB_IMU 1.0          # move 1 m forward
+PAUSE 1
+FB_IMU -1.0         # return to start (symmetric)
+LR_IMU 0.5          # 50 cm right
+UD_IMU -0.3         # 30 cm down
+LAND
+```
+
+---
+
+### `YAW_IMU <deg>`
+
+> Discrete rotation by `deg` degrees (closed-loop).
 
 - `deg`: integer in `[-180, +180]`. Positive rotates clockwise
-  (viewed from above), negative counter-clockwise. Range `[-180,
-  +180]` because there's never a need for more than a half-turn
-  in either direction (a `+180` and `-180` end at the same heading).
-- No `seconds` argument: the rotation is synchronous on the FC
-  side — the step advances when the firmware confirms completion.
-  Duration is determined by the firmware's yaw rate.
+  (viewed from above), negative counter-clockwise.
+- No `seconds` argument: synchronous on the FC side — the step
+  advances when the firmware confirms completion.
 
-Example: `YAW 90` rotates 90° clockwise, then advances; `YAW -90`
-rotates 90° counter-clockwise.
-
-If you really do want a raw yaw-stick rate (rare — usually only
-for very small / slow correction turns), use the multi-axis `RC`
-command, whose yaw field stays a stick in `[-100, +100]`.
+Example: `YAW_IMU 90` rotates 90° clockwise, then advances;
+`YAW_IMU -90` rotates 90° counter-clockwise.
 
 ---
 

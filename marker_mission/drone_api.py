@@ -160,6 +160,19 @@ class DroneApi:
         return self._post("/api/rotate", {"dir": direction,
                                           "deg": int(max(1, min(360, degrees)))})
 
+    def move(self, direction: str, cm: int) -> dict:
+        """Closed-loop position-relative move (Olympe moveBy under the
+        hood). Used by FB_IMU / LR_IMU / UD_IMU script steps. The
+        HTTP layer applies a [20, 500] cm safety clamp; sub-20cm
+        requests get clamped up to 20cm."""
+        if direction not in ("forward", "back", "left", "right",
+                             "up", "down"):
+            raise ValueError("direction must be one of "
+                             "forward/back/left/right/up/down")
+        return self._post("/api/move", {"dir": direction,
+                                        "cm": int(cm)},
+                          timeout_s=30.0)
+
     def rc(self, lr: int = 0, fb: int = 0, ud: int = 0, yaw: int = 0,
            duration_ms: int = 300) -> dict:
         return self._post("/api/rc", {

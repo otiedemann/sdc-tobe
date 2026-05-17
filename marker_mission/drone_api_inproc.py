@@ -117,6 +117,20 @@ class DroneApiInProc:
             deg=int(max(1, min(360, degrees))),
         ))
 
+    def move(self, direction: str, cm: int) -> dict:
+        """Closed-loop position-relative move (Olympe moveBy under the
+        hood). Used by mission's FB_IMU / LR_IMU / UD_IMU steps.
+        Bypasses the HTTP route's [20, 500] cm safety clamp so the
+        operator can request sub-20cm moves if they really want them;
+        a SCRIPT-level clamp lives in the parser instead."""
+        if direction not in ("forward", "back", "left", "right",
+                             "up", "down"):
+            raise ValueError("direction must be one of "
+                             "forward/back/left/right/up/down")
+        return self._unwrap(*drone_core.do_move(
+            direction=direction, cm=int(cm),
+        ))
+
     def rc(self, lr: int = 0, fb: int = 0, ud: int = 0, yaw: int = 0,
            duration_ms: int = 300) -> dict:
         return self._unwrap(*drone_core.do_rc(

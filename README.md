@@ -182,11 +182,15 @@ section so they can never run together).
 | `HEIGHT` | `[height]` | Climb/descend to arena height (m) |
 | `TO` | `x y [z] [yaw\|auto]` | Drive to arena-frame coordinate |
 | `DANCE` | `[seconds] [mode]` | mode ∈ `wobble \| spin \| random` |
-| `LR` | `rc [seconds]` | Raw strafe stick (+right, -left), `rc` ∈ `[-100,+100]`, default 1 s |
-| `FB` | `rc [seconds]` | Raw forward/back stick |
-| `UD` | `rc [seconds]` | Raw up/down stick |
-| `YAW` | `deg` | Discrete rotation, `deg` ∈ `[-180,+180]` (+cw, -ccw) |
-| `RC` | `lr fb ud yaw [seconds]` | All four sticks at once (yaw stays a stick) |
+| `LR_RC` | `rc [seconds]` | Raw strafe stick (+right, -left), `rc` ∈ `[-100,+100]`, default 1 s |
+| `FB_RC` | `rc [seconds]` | Raw forward/back stick |
+| `UD_RC` | `rc [seconds]` | Raw up/down stick |
+| `YAW_RC` | `rc [seconds]` | Raw yaw stick (+cw, -ccw) |
+| `LR_IMU` | `meters` | **Closed-loop** strafe by exact distance (+right, -left), `\|m\|` ∈ `[0.01,5.0]` |
+| `FB_IMU` | `meters` | Closed-loop forward/back move |
+| `UD_IMU` | `meters` | Closed-loop up/down move |
+| `YAW_IMU` | `deg` | Closed-loop rotation, `deg` ∈ `[-180,+180]` (+cw, -ccw) |
+| `RC` | `lr fb ud yaw [seconds]` | All four sticks at once |
 | `SCOUT` | — | Slow 360° yaw spin (CW, stick=15) — "look around" |
 
 Seconds may be fractional (`1.5`, `0.25`). Full docs at

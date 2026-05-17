@@ -74,8 +74,9 @@ class Phase(enum.Enum):
     GOTO      = "goto"      # mission-script TO step (drive to arena-frame point)
     DANCE     = "dance"     # mission-script DANCE step (programmed RC routine)
     RC        = "rc"        # mission-script LR / FB / UD / RC (raw stick + timer)
-    ROTATE    = "rotate"    # mission-script YAW (discrete rotation by N deg)
+    ROTATE    = "rotate"    # mission-script YAW_IMU (discrete rotation by N deg)
     SCOUT     = "scout"     # mission-script SCOUT (slow 360° yaw spin)
+    MOVE_IMU  = "move_imu"  # mission-script FB_IMU / LR_IMU / UD_IMU
     LAND      = "land"
     DONE      = "done"
     ABORT     = "abort"
@@ -964,13 +965,19 @@ class MissionController:
                 elif phase == Phase.SCOUT:
                     self._step_scout(tel, now)
                 elif phase == Phase.ROTATE:
-                    # YAW step runs synchronously in
+                    # YAW_IMU step runs synchronously in
                     # _apply_step_to_phase and calls _advance_script
                     # before the controller ever ticks this phase.
                     # The branch is here for completeness so an
                     # unexpected stuck-in-ROTATE state can't pin the
                     # loop; just zero the sticks and idle until the
                     # next _advance_script lands.
+                    self._send_rc(0, 0, 0, 0)
+                elif phase == Phase.MOVE_IMU:
+                    # FB/LR/UD_IMU steps also run synchronously in
+                    # _apply_step_to_phase (api.move blocks on
+                    # moveBy.wait). Same safety-net behaviour as
+                    # Phase.ROTATE.
                     self._send_rc(0, 0, 0, 0)
                 elif phase == Phase.LAND:
                     self._step_land(tel, now)
@@ -2214,6 +2221,31 @@ class MissionController:
                 note + f" yaw_stick={SCOUT_YAW_STICK} "
                        f"target=±{SCOUT_TARGET_DEG:g}°"
             )
+            return
+        if step.kind == "MOVE_IMU":
+            # Closed-loop FB_IMU / LR_IMU / UD_IMU step. Calls
+            # api.move (Olympe moveBy) synchronously; the firmware
+            # handles accel/cruise/decel and stops at the target.
+            # Symmetric +/- (unlike the open-loop *_RC family that
+            # rides Anafi's asymmetric velocity controller).
+            direction = step.move_direction or "forward"
+            meters = float(step.move_distance_m or 0.0)
+            cm = int(round(meters * 100.0))
+            self._set_phase(
+                Phase.MOVE_IMU,
+                note + f" {direction} {meters:g}m ({cm}cm)"
+            )
+            if cm <= 0:
+                self._advance_script(f"move_imu {direction} 0cm — no-op")
+                return
+            try:
+                self.api.move(direction, cm)
+                self._advance_script(
+                    f"move_imu complete ({direction} {meters:g}m)"
+                )
+            except DroneApiError as e:
+                print(f"[ctrl] move_imu {direction} {meters:g}m failed: {e}")
+                self._advance_script(f"move_imu failed: {e}")
             return
         if step.kind == "YAW":
             # Discrete rotation by ``rotation_deg`` degrees, +CW.

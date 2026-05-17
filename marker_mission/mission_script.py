@@ -6,7 +6,17 @@ that ``MissionController._advance_script`` walks one at a time. The
 language is one-command-per-line, case-insensitive, with ``#`` comments
 and blank lines ignored.
 
-Fifteen commands:
+Eighteen commands. Suffix convention:
+
+  * ``_RC`` — raw RC stick at the given deflection for a duration.
+    Open-loop, fast, may drift; use when you want "stick at X% for
+    Y seconds" semantics.
+  * ``_IMU`` — closed-loop position/angle target using Anafi's
+    on-board sensor fusion (IMU + baro + optical flow). Accurate,
+    symmetric +/-, but discrete (the step blocks until the firmware
+    confirms completion).
+
+::
 
     TAKEOFF
     APPROACH [<marker-id>] [<distance>]
@@ -17,12 +27,27 @@ Fifteen commands:
     HEIGHT   [<height>]
     TO       <x> <y> [<z>]
     DANCE    [<seconds>] [<mode>]                  mode in {wobble, spin, random}
-    LR       <rc> [<seconds>]                      +right / -left,  rc in [-100, +100]
-    FB       <rc> [<seconds>]                      +forward / -back, rc in [-100, +100]
-    UD       <rc> [<seconds>]                      +up / -down,     rc in [-100, +100]
-    YAW      <deg>                                 +cw / -ccw,      deg in [-180, +180]
+    LR_RC    <rc> [<seconds>]                      +right / -left,   rc in [-100, +100]
+    FB_RC    <rc> [<seconds>]                      +forward / -back, rc in [-100, +100]
+    UD_RC    <rc> [<seconds>]                      +up / -down,      rc in [-100, +100]
+    YAW_RC   <rc> [<seconds>]                      +cw / -ccw,       rc in [-100, +100]
+    LR_IMU   <meters>                              +right / -left,   |m| in [0.01, 5.0]
+    FB_IMU   <meters>                              +forward / -back, |m| in [0.01, 5.0]
+    UD_IMU   <meters>                              +up / -down,      |m| in [0.01, 5.0]
+    YAW_IMU  <deg>                                 +cw / -ccw,       deg in [-180, +180]
     RC       <lr> <fb> <ud> <yaw> [<seconds>]      all four sticks at once
     SCOUT                                          slow 360° yaw spin (cw, stick=15)
+
+LR_RC / FB_RC / UD_RC / YAW_RC / RC are raw-RC steps: pin the listed
+stick(s) to the given value(s) for the given duration (default 1 s;
+fractional values such as ``1.5`` are accepted), and leave the other
+channels at 0. Followed by an automatic IMU-based brake so the drone
+settles before the next step.
+
+LR_IMU / FB_IMU / UD_IMU / YAW_IMU are closed-loop moves: the firmware
+flies the drone exactly the requested distance / angle and stops.
+Symmetric in both directions (no Anafi velocity-controller asymmetry).
+The step blocks until the move completes.
 
 LR / FB / UD / RC are raw-RC steps: pin the listed stick(s) to the
 given value(s) for the given duration (default 1 second; fractional
@@ -110,11 +135,18 @@ class Step:
     rc_fb: int = 0
     rc_ud: int = 0
     rc_yaw: int = 0
-    # Discrete rotation in degrees for kind="YAW" (the rebranded yaw
+    # Discrete rotation in degrees for kind="YAW" (the YAW_IMU
     # command). Range [-180, +180]; positive = CW. None on every
     # non-YAW step. No seconds — api.rotate is synchronous and the
     # step advances when it returns.
     rotation_deg: Optional[int] = None
+    # Closed-loop position-relative move for kind="MOVE_IMU"
+    # (FB_IMU / LR_IMU / UD_IMU). ``move_direction`` is one of
+    # "forward"/"back"/"left"/"right"/"up"/"down" (sign baked in,
+    # ``move_distance_m`` is always positive). Synchronous via
+    # api.move which wraps Olympe's moveBy.
+    move_direction: Optional[str] = None
+    move_distance_m: Optional[float] = None
     line_no: int = 0                    # 1-based source line, for diagnostics
 
 
@@ -244,10 +276,11 @@ def parse(text: str, defaults: dict) -> List[Step]:
                             world_x=wx, world_y=wy, height=wz,
                             yaw=yaw_arg,
                             line_no=raw_line_no))
-        elif cmd in ("LR", "FB", "UD"):
+        elif cmd in ("LR_RC", "FB_RC", "UD_RC", "YAW_RC"):
             # Raw RC stick for ``seconds``. ``rc`` is the protocol
             # value [-100, +100]; the FC ceiling, arena guard and
-            # watchdog still clamp at the wire.
+            # watchdog still clamp at the wire. Followed by an
+            # automatic IMU-based brake (see controller._step_rc).
             if len(args) not in (1, 2):
                 raise ScriptError(raw_line_no,
                                   f"{cmd} takes 1-2 arguments "
@@ -263,36 +296,66 @@ def parse(text: str, defaults: dict) -> List[Step]:
                 raise ScriptError(raw_line_no,
                                   f"{cmd} seconds must be >= 0, got {sec}")
             step = Step(kind="RC", seconds=sec, line_no=raw_line_no)
-            if cmd == "LR":
+            if cmd == "LR_RC":
                 step.rc_lr = rc
-            elif cmd == "FB":
+            elif cmd == "FB_RC":
                 step.rc_fb = rc
-            else:  # UD
+            elif cmd == "UD_RC":
                 step.rc_ud = rc
+            else:  # YAW_RC
+                step.rc_yaw = rc
             out.append(step)
-        elif cmd == "YAW":
+        elif cmd == "YAW_IMU":
             # Discrete rotation by N degrees, range [-180, +180].
             # Positive = CW (looking down). Synchronous on the FC
             # side — the step advances when api.rotate returns. No
             # seconds argument because the rotation has its own
             # duration determined by the firmware's yaw rate.
-            #
-            # Earlier YAW was a raw-stick command (like LR/FB/UD)
-            # — that's been demoted to the multi-axis RC command's
-            # yaw field for the rare case the operator wants a rate
-            # rather than an angle.
             if len(args) != 1:
                 raise ScriptError(raw_line_no,
-                                  f"YAW takes exactly 1 argument "
+                                  f"YAW_IMU takes exactly 1 argument "
                                   f"(<deg>, +cw / -ccw, "
                                   f"range [-180, +180]), got {len(args)}")
-            deg = _parse_int(args[0], raw_line_no, "YAW deg")
+            deg = _parse_int(args[0], raw_line_no, "YAW_IMU deg")
             if not (-180 <= deg <= 180):
                 raise ScriptError(raw_line_no,
-                                  f"YAW deg must be in [-180, +180], "
+                                  f"YAW_IMU deg must be in [-180, +180], "
                                   f"got {deg}")
             out.append(Step(kind="YAW", rotation_deg=deg,
                             line_no=raw_line_no))
+        elif cmd in ("FB_IMU", "LR_IMU", "UD_IMU"):
+            # Closed-loop position-relative move using Anafi's
+            # moveBy (sensor-fused — IMU + baro + optical flow).
+            # Symmetric +/- (unlike the open-loop *_RC family,
+            # which is bottlenecked by Anafi's asymmetric velocity
+            # controller). The step blocks until the firmware
+            # confirms the move has completed.
+            if len(args) != 1:
+                raise ScriptError(raw_line_no,
+                                  f"{cmd} takes exactly 1 argument "
+                                  f"(<meters>), got {len(args)}")
+            meters = _parse_float(args[0], raw_line_no, f"{cmd} meters")
+            if abs(meters) < 0.01:
+                raise ScriptError(raw_line_no,
+                                  f"{cmd} |meters| must be >= 0.01, "
+                                  f"got {meters}")
+            if abs(meters) > 5.0:
+                raise ScriptError(raw_line_no,
+                                  f"{cmd} |meters| must be <= 5.0 "
+                                  f"(safety cap), got {meters}")
+            direction_map = {
+                "FB_IMU": ("forward", "back"),
+                "LR_IMU": ("right", "left"),
+                "UD_IMU": ("up", "down"),
+            }
+            pos_dir, neg_dir = direction_map[cmd]
+            direction = pos_dir if meters >= 0 else neg_dir
+            out.append(Step(
+                kind="MOVE_IMU",
+                move_direction=direction,
+                move_distance_m=abs(float(meters)),
+                line_no=raw_line_no,
+            ))
         elif cmd == "SCOUT":
             # Slow 360° yaw spin for visual situational awareness.
             # Yaw stick is hardcoded at 15 (a gentle rate that still
@@ -392,27 +455,41 @@ def format(steps: List[Step]) -> str:
             lines.append(" ".join(parts))
         elif s.kind == "RC":
             # Round-trip rule:
-            #   - exactly one of lr/fb/ud non-zero AND yaw stick is
-            #     zero → LR/FB/UD short form
-            #   - everything else (multi-axis, yaw-stick non-zero,
-            #     or all-zero) → RC form (preserves the multi-axis
-            #     intent; YAW the command-name is reserved for the
-            #     discrete-rotation kind below)
-            non_yaw_axes = (s.rc_lr, s.rc_fb, s.rc_ud)
-            nonzero = sum(1 for v in non_yaw_axes if v != 0)
-            if nonzero == 1 and s.rc_yaw == 0 and s.rc_lr != 0:
-                lines.append(f"LR {s.rc_lr} {s.seconds:g}")
-            elif nonzero == 1 and s.rc_yaw == 0 and s.rc_fb != 0:
-                lines.append(f"FB {s.rc_fb} {s.seconds:g}")
-            elif nonzero == 1 and s.rc_yaw == 0 and s.rc_ud != 0:
-                lines.append(f"UD {s.rc_ud} {s.seconds:g}")
+            #   - exactly one of lr/fb/ud/yaw non-zero → the matching
+            #     single-axis short form (LR_RC/FB_RC/UD_RC/YAW_RC)
+            #   - everything else (multi-axis or all-zero) → RC form
+            axes = (s.rc_lr, s.rc_fb, s.rc_ud, s.rc_yaw)
+            nonzero = sum(1 for v in axes if v != 0)
+            if nonzero == 1 and s.rc_lr != 0:
+                lines.append(f"LR_RC {s.rc_lr} {s.seconds:g}")
+            elif nonzero == 1 and s.rc_fb != 0:
+                lines.append(f"FB_RC {s.rc_fb} {s.seconds:g}")
+            elif nonzero == 1 and s.rc_ud != 0:
+                lines.append(f"UD_RC {s.rc_ud} {s.seconds:g}")
+            elif nonzero == 1 and s.rc_yaw != 0:
+                lines.append(f"YAW_RC {s.rc_yaw} {s.seconds:g}")
             else:
                 lines.append(
                     f"RC {s.rc_lr} {s.rc_fb} {s.rc_ud} {s.rc_yaw} "
                     f"{s.seconds:g}"
                 )
         elif s.kind == "YAW":
-            lines.append(f"YAW {int(s.rotation_deg or 0)}")
+            lines.append(f"YAW_IMU {int(s.rotation_deg or 0)}")
+        elif s.kind == "MOVE_IMU":
+            # Re-encode the direction back into the signed-meters form
+            # of the appropriate single-axis IMU command.
+            dir_to_cmd = {
+                "forward": ("FB_IMU", +1),
+                "back":    ("FB_IMU", -1),
+                "right":   ("LR_IMU", +1),
+                "left":    ("LR_IMU", -1),
+                "up":      ("UD_IMU", +1),
+                "down":    ("UD_IMU", -1),
+            }
+            name, sign = dir_to_cmd.get(s.move_direction or "",
+                                         ("FB_IMU", +1))
+            meters = sign * float(s.move_distance_m or 0.0)
+            lines.append(f"{name} {meters:g}")
         elif s.kind == "SCOUT":
             lines.append("SCOUT")
         elif s.kind == "DANCE":

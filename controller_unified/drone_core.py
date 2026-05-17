@@ -185,6 +185,49 @@ def do_rc(lr: Any = 0, fb: Any = 0, ud: Any = 0, yaw: Any = 0,
 
 
 # ---------------------------------------------------------------------------
+# Closed-loop position-relative move (moveBy under the hood)
+# ---------------------------------------------------------------------------
+
+def do_move(direction: Any = "", cm: Any = 20) -> tuple[dict, int]:
+    """Discrete closed-loop move using Anafi's moveBy. ``direction`` is
+    one of ``forward``/``back``/``left``/``right``/``up``/``down``;
+    ``cm`` is the distance in centimetres. Synchronous on the FC side
+    — the call blocks until the firmware confirms the move completed.
+
+    Same wire shape as the existing ``/api/move`` route — that route
+    now delegates here so HTTP and in-proc consumers agree on
+    semantics + the operator-visible safety clamp [20, 500] cm. The
+    in-proc caller (mission's FB_IMU/LR_IMU/UD_IMU steps) goes
+    around the clamp when it needs sub-20cm precision."""
+    import unified_api_server as _srv  # sibling import; see header note
+    b = _srv.backend
+    with _srv.conn_lock:
+        connected = _srv.conn_state["connected"]
+    if not connected or b is None:
+        return {"ok": False, "error": "controller not ready"}, 503
+    direction = str(direction or "").lower()
+    if direction not in {"forward", "back", "left", "right", "up", "down"}:
+        return {"ok": False,
+                "error": "dir must be one of "
+                         "forward|back|left|right|up|down"}, 400
+    try:
+        dist_cm = int(cm)
+    except (TypeError, ValueError):
+        return {"ok": False, "error": "cm must be an integer"}, 400
+    try:
+        _srv.start_discrete_window(
+            1.0 if _srv.drone_type == "tello"
+            else max(1.0, abs(dist_cm) / 50)
+        )
+        ok, msg = b.move(direction, dist_cm)
+        if ok:
+            return {"ok": True, "dir": direction, "cm": dist_cm}, 200
+        return {"ok": False, "error": msg}, 500
+    except Exception as e:
+        return {"ok": False, "error": str(e)}, 500
+
+
+# ---------------------------------------------------------------------------
 # Rotation
 # ---------------------------------------------------------------------------
 

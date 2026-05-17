@@ -7,11 +7,13 @@ A small Python application that:
 3. Recovers each marker's 6-DOF pose using OpenCV's IPPE planar-pose
    solver with a per-drone camera calibration.
 4. Walks an **operator-typed mission script** through a phase-based
-   state machine. The script language has fifteen commands —
+   state machine. The script language has eighteen commands —
    `TAKEOFF`, `APPROACH`, `HOOVER`, `AWAIT`, `PAUSE`, `HEIGHT`, `TO`,
-   `DANCE`, `LR`, `FB`, `UD`, `YAW`, `RC`, `SCOUT`, `LAND` — and
-   omitted arguments fall back to cfg defaults. Seconds arguments
-   may be fractional (`1.5`, `0.25`).
+   `DANCE`, `LR_RC`/`FB_RC`/`UD_RC`/`YAW_RC` (raw stick + duration),
+   `LR_IMU`/`FB_IMU`/`UD_IMU` (closed-loop metres), `YAW_IMU`
+   (closed-loop degrees), `RC` (multi-axis sticks), `SCOUT`,
+   `LAND` — and omitted arguments fall back to cfg defaults.
+   Seconds arguments may be fractional (`1.5`, `0.25`).
    The default script is `TAKEOFF / APPROACH / HOOVER / LAND`,
    equivalent to the original fixed flow.
 5. Computes a **drone world position** in the arena frame by fusing

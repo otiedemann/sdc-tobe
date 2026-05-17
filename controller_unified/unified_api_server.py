@@ -4869,24 +4869,20 @@ def api_emergency():
 
 @app.post("/api/move")
 def api_move():
-    b = backend
-    with conn_lock:
-        connected = conn_state["connected"]
-    if not connected or b is None:
-        return jsonify(ok=False, error="controller not ready"), 503
     data = request.get_json(silent=True) or {}
-    direction = str(data.get("dir", "")).lower()
-    if direction not in {"up", "down", "left", "right", "forward", "back"}:
-        return jsonify(ok=False, error="dir must be one of up|down|left|right|forward|back"), 400
+    # HTTP-layer safety clamp [20, 500] cm — preserved from the old
+    # route. In-proc callers (mission's FB_IMU/LR_IMU/UD_IMU) go
+    # directly to drone_core.do_move when they need sub-20cm
+    # precision.
     try:
         dist_cm = max(20, min(500, int(data.get("cm", 20))))
-        start_discrete_window(1.0 if drone_type == "tello" else max(1.0, dist_cm / 50))
-        ok, msg = b.move(direction, dist_cm)
-        if ok:
-            return jsonify(ok=True, dir=direction, cm=dist_cm)
-        return jsonify(ok=False, error=msg), 500
-    except Exception as e:
-        return jsonify(ok=False, error=str(e)), 500
+    except (TypeError, ValueError):
+        return jsonify(ok=False, error="cm must be an integer"), 400
+    payload, status = drone_core.do_move(
+        direction=data.get("dir", ""),
+        cm=dist_cm,
+    )
+    return jsonify(payload), status
 
 
 @app.post("/api/rotate")
