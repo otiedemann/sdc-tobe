@@ -138,6 +138,7 @@ _HEADER_HTML = """
     <a href="/tune" class="{{ 'active' if active=='tune' else '' }}">Tune</a>
     <a href="/calibrate" class="{{ 'active' if active=='calibrate' else '' }}">Calibrate</a>
     <a href="/scripts" class="{{ 'active' if active=='scripts' else '' }}">Scripts</a>
+    <a href="/settings" class="{{ 'active' if active=='settings' else '' }}">Settings</a>
   </nav>
   <span class="fc-dots" id="topbar-dots">
     {% for fc in fc_specs %}

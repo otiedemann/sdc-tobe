@@ -163,6 +163,19 @@ class AsyncFCClient:
         return await self._post("/api/mission/script",
                                 json_body={"text": text}, timeout=3.0)
 
+    async def list_mission_scripts(self) -> Result:
+        """List the FC's named mission scripts (its
+        ``~/.marker_mission/mission_scripts/*.txt`` directory)."""
+        return await self._get("/api/mission/scripts", timeout=4.0)
+
+    async def load_mission_script_named(self, name: str) -> Result:
+        """Fetch a specific named mission script from the FC. The FC's
+        /load endpoint both reads the file and applies it as the
+        active draft; from the C2's POV we just want the text so we
+        can show / re-broadcast it."""
+        return await self._post(
+            f"/api/mission/scripts/{name}/load", timeout=4.0)
+
     # ------------------------------------------------------- calibration
     async def list_calibrations(self) -> Result:
         return await self._get("/api/calibrate/files", timeout=4.0)

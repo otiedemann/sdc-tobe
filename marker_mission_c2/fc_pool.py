@@ -15,6 +15,7 @@ from typing import Any, Optional
 
 from .config import C2Config, FCSpec
 from .fc_client import AsyncFCClient, make_client
+from .settings import SettingsStore
 
 
 @dataclass
@@ -43,8 +44,9 @@ class FCPool:
     event loop.
     """
 
-    def __init__(self, cfg: C2Config):
+    def __init__(self, cfg: C2Config, settings: SettingsStore):
         self.cfg = cfg
+        self.settings = settings
         self.http = make_client(cfg.fc_request_timeout_s)
         self.clients: dict[str, AsyncFCClient] = {}
         self.states: dict[str, FCState] = {}
@@ -90,8 +92,16 @@ class FCPool:
         await asyncio.sleep(0.05 * list(self.states.keys()).index(spec.name))
         while not self._stop_evt.is_set():
             t0 = time.monotonic()
-            ok, payload = await client.get_state()
-            await self._update_state(spec.name, ok, payload)
+            # Skip the network round-trip entirely when the operator
+            # has disabled this FC from /settings — saves bandwidth,
+            # avoids spurious "down" alerts when an FC is intentionally
+            # offline, and prevents the calibration sync worker from
+            # picking up changes from FCs the operator has silenced.
+            if self.settings.is_fc_enabled(spec.name):
+                ok, payload = await client.get_state()
+                await self._update_state(spec.name, ok, payload)
+            else:
+                await self._mark_disabled(spec.name)
             elapsed = time.monotonic() - t0
             try:
                 await asyncio.wait_for(
@@ -101,6 +111,15 @@ class FCPool:
                 return  # stop event set
             except asyncio.TimeoutError:
                 continue
+
+    async def _mark_disabled(self, name: str) -> None:
+        async with self._locks[name]:
+            st = self.states[name]
+            st.connection_ok = False
+            st.last_error = "disabled"
+            # Wipe the last known state so the overview doesn't show
+            # stale telemetry next to a "disabled" badge.
+            st.last_state = None
 
     async def _update_state(self, name: str, ok: bool, payload: Any) -> None:
         async with self._locks[name]:
@@ -125,16 +144,22 @@ class FCPool:
                 )
 
     # --------------------------------------------------------- public read
-    def snapshot(self) -> dict[str, dict]:
-        """Return a JSON-safe deep copy of every FC's state.
+    def snapshot(self, include_disabled: bool = False) -> dict[str, dict]:
+        """Return a JSON-safe deep copy of every enabled FC's state.
 
-        Called from Flask handlers; the deep copy is essential because the
-        poll loop mutates ``FCState.last_state`` under a lock that Flask
-        doesn't hold.
+        Disabled FCs are excluded by default (so handlers don't have
+        to filter — the overview, fleet broadcasts, and overview-viz
+        all get the right behaviour for free). Pass
+        ``include_disabled=True`` from the /settings page to render
+        the full inventory with their on/off badges.
         """
         out: dict[str, dict] = {}
         now = time.monotonic()
+        disabled = self.settings.disabled_fcs()
         for name, st in self.states.items():
+            is_disabled = name in disabled
+            if is_disabled and not include_disabled:
+                continue
             last_state = copy.deepcopy(st.last_state) if st.last_state else None
             age = (now - st.last_state_monotonic
                    if st.last_state_monotonic else None)
@@ -143,6 +168,7 @@ class FCPool:
                 "host": st.host,
                 "port": st.port,
                 "base_url": f"http://{st.host}:{st.port}",
+                "enabled": not is_disabled,
                 "connection_ok": st.connection_ok,
                 "drone_serial": st.drone_serial,
                 "drone_connected": st.drone_connected,
@@ -161,6 +187,16 @@ class FCPool:
 
     def all_clients(self) -> list[AsyncFCClient]:
         return list(self.clients.values())
+
+    def enabled_clients(self) -> list[AsyncFCClient]:
+        """Clients for FCs the operator hasn't silenced in /settings.
+
+        Fleet broadcasts (start-all, emergency-land-all, push-to-all)
+        should use this so a disabled FC never receives a fan-out
+        command.
+        """
+        disabled = self.settings.disabled_fcs()
+        return [c for n, c in self.clients.items() if n not in disabled]
 
     def client(self, name: str) -> Optional[AsyncFCClient]:
         return self.clients.get(name)

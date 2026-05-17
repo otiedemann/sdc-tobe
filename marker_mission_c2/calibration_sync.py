@@ -120,7 +120,11 @@ class CalibrationLibrary:
         async with self._lock:
             added = 0
             errors: dict[str, str] = {}
-            for client in self.pool.all_clients():
+            # enabled_clients() skips FCs the operator silenced in
+            # /settings. Without this filter the sync worker keeps
+            # hitting unreachable hosts every cycle and flooding the
+            # log with DNS / connection-refused warnings.
+            for client in self.pool.enabled_clients():
                 fc_name = client.spec.name
                 ok, payload = await client.list_calibrations()
                 if not ok or not isinstance(payload, dict):

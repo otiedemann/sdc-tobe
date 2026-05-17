@@ -18,18 +18,20 @@ import signal
 import threading
 from concurrent.futures import Future
 from pathlib import Path
-from typing import Any, Awaitable, Callable
+from typing import Any, Awaitable, Callable, Optional
 
 from flask import Flask, jsonify, render_template_string, request, send_file
 
 from .calibration_sync import CalibrationLibrary, is_valid_calibration_name
 from .config import C2Config
 from .fc_pool import FCPool
+from .settings import SettingsStore
 from .ui_pages import (
     PAGE_ARENA,
     PAGE_CALIBRATE,
     PAGE_OVERVIEW,
     PAGE_SCRIPTS,
+    PAGE_SETTINGS,
     PAGE_TUNE,
 )
 from .ui_shared import common_script, head_block, tail_block, topbar
@@ -71,13 +73,22 @@ class C2Loop:
         self._thread.join(timeout=3.0)
 
 
-def _render(template: str, *, cfg: C2Config, active: str, **extra) -> str:
+def _render(template: str, *, cfg: C2Config, active: str,
+            settings: Optional[SettingsStore] = None, **extra) -> str:
+    # /settings is the one page that needs the FULL inventory (so the
+    # operator can re-enable a disabled FC). Every other page sees
+    # only enabled FCs — keeps checkbox rows / iframe grids / dot
+    # strips in sync with what the fan-outs and snapshot expose.
+    if settings is not None and active != "settings":
+        enabled = lambda n: settings.is_fc_enabled(n)
+    else:
+        enabled = lambda _n: True
     fc_specs = [{"name": f.name, "host": f.host, "port": f.port}
-                for f in cfg.fcs]
+                for f in cfg.fcs if enabled(f.name)]
     ctx = dict(
         active=active,
         fc_specs=fc_specs,
-        fc_names=[f.name for f in cfg.fcs],
+        fc_names=[f.name for f in cfg.fcs if enabled(f.name)],
         emergency_land_key=cfg.emergency_land_key,
         ui_refresh_ms=int(1000.0 / max(0.1, cfg.ui_refresh_hz)),
     )
@@ -89,7 +100,7 @@ def _render(template: str, *, cfg: C2Config, active: str, **extra) -> str:
 
 
 def _build_app(cfg: C2Config, pool: FCPool, library: CalibrationLibrary,
-               loop: C2Loop) -> Flask:
+               settings: SettingsStore, loop: C2Loop) -> Flask:
     app = Flask(__name__)
     log = logging.getLogger("c2.http")
 
@@ -152,23 +163,61 @@ def _build_app(cfg: C2Config, pool: FCPool, library: CalibrationLibrary,
     # ------------------------------------------------------------ pages
     @app.get("/")
     def page_overview():
-        return _render(PAGE_OVERVIEW, cfg=cfg, active="overview")
+        return _render(PAGE_OVERVIEW, cfg=cfg, settings=settings, active="overview")
 
     @app.get("/arena")
     def page_arena():
-        return _render(PAGE_ARENA, cfg=cfg, active="arena")
+        return _render(PAGE_ARENA, cfg=cfg, settings=settings, active="arena")
 
     @app.get("/tune")
     def page_tune():
-        return _render(PAGE_TUNE, cfg=cfg, active="tune")
+        return _render(PAGE_TUNE, cfg=cfg, settings=settings, active="tune")
 
     @app.get("/calibrate")
     def page_calibrate():
-        return _render(PAGE_CALIBRATE, cfg=cfg, active="calibrate")
+        return _render(PAGE_CALIBRATE, cfg=cfg, settings=settings, active="calibrate")
 
     @app.get("/scripts")
     def page_scripts():
-        return _render(PAGE_SCRIPTS, cfg=cfg, active="scripts")
+        return _render(PAGE_SCRIPTS, cfg=cfg, settings=settings, active="scripts")
+
+    @app.get("/settings")
+    def page_settings():
+        return _render(PAGE_SETTINGS, cfg=cfg, settings=settings, active="settings")
+
+    # ------------------------------------------------------------ settings
+    @app.get("/api/c2/settings")
+    def api_settings_get():
+        return jsonify({
+            "fcs": [
+                {"name": f.name, "host": f.host, "port": f.port,
+                 "enabled": settings.is_fc_enabled(f.name)}
+                for f in cfg.fcs
+            ],
+            "arena_draft": settings.arena_draft(),
+        })
+
+    @app.post("/api/c2/settings/fc-enabled")
+    def api_settings_fc_enabled():
+        body = request.get_json(silent=True) or {}
+        name = str(body.get("fc") or "")
+        enabled = bool(body.get("enabled"))
+        if not name or all(f.name != name for f in cfg.fcs):
+            return jsonify({"ok": False,
+                            "error": f"unknown fc: {name}"}), 400
+        settings.set_fc_enabled(name, enabled)
+        return jsonify({"ok": True,
+                        "fc": name, "enabled": enabled})
+
+    @app.post("/api/c2/settings/arena-draft")
+    def api_settings_arena_draft():
+        body = request.get_json(silent=True) or {}
+        payload = body.get("payload")
+        if payload is not None and not isinstance(payload, dict):
+            return jsonify({"ok": False,
+                            "error": "payload must be object or null"}), 400
+        settings.set_arena_draft(payload)
+        return jsonify({"ok": True})
 
     # ------------------------------------------------------------ overview API
     @app.get("/api/c2/overview")
@@ -192,6 +241,10 @@ def _build_app(cfg: C2Config, pool: FCPool, library: CalibrationLibrary,
         if client is None:
             return None, (jsonify({"ok": False,
                                    "error": f"unknown FC: {name}"}), 404)
+        if not settings.is_fc_enabled(name):
+            return None, (jsonify({"ok": False,
+                                   "error": f"FC disabled in /settings: "
+                                            f"{name}"}), 409)
         return client, None
 
     @app.post("/api/c2/<fc>/start")
@@ -228,7 +281,7 @@ def _build_app(cfg: C2Config, pool: FCPool, library: CalibrationLibrary,
     @app.post("/api/c2/start-all")
     def api_start_all():
         async def fan_out():
-            clients = pool.all_clients()
+            clients = pool.enabled_clients()
             coros = [c.start_mission(None) for c in clients]
             results = await asyncio.gather(*coros, return_exceptions=True)
             return {c.spec.name: r for c, r in zip(clients, results)}
@@ -257,7 +310,7 @@ def _build_app(cfg: C2Config, pool: FCPool, library: CalibrationLibrary,
     @app.post("/api/c2/emergency-land-all")
     def api_emergency_land_all():
         async def fan_out():
-            clients = pool.all_clients()
+            clients = pool.enabled_clients()
             coros = [c.stop_mission() for c in clients]
             results = await asyncio.gather(*coros, return_exceptions=True)
             return {c.spec.name: r for c, r in zip(clients, results)}
@@ -326,7 +379,8 @@ def _build_app(cfg: C2Config, pool: FCPool, library: CalibrationLibrary,
             return jsonify({"ok": False, "error": "payload must be object"}), 400
 
         async def fan_out():
-            targets = [pool.client(n) for n in fcs if pool.client(n)]
+            targets = [pool.client(n) for n in fcs
+                       if pool.client(n) and settings.is_fc_enabled(n)]
             coros = [c.set_active_arena(payload) for c in targets]
             results = await asyncio.gather(*coros, return_exceptions=True)
             return {c.spec.name: r for c, r in zip(targets, results)}
@@ -336,6 +390,36 @@ def _build_app(cfg: C2Config, pool: FCPool, library: CalibrationLibrary,
                         "results": _summarize_fan_out(raw)})
 
     # -------------------------------------------------------------- tune
+    # Static defaults from MissionConfig dataclass — no FC needed.
+    # Useful as the page's initial state and for operators who want
+    # to remember "what was the factory default for X" without
+    # round-tripping to a live FC. We pull from the marker_mission
+    # source of truth so a config.py edit shows up here without a C2
+    # code change.
+    @app.get("/api/c2/tune/defaults")
+    def api_tune_defaults():
+        try:
+            # Lazy import — keeps the C2 process startup fast and
+            # tolerates a broken marker_mission install (the rest of
+            # the C2 still works, this endpoint just 503s).
+            from marker_mission.config import MissionConfig, tuning_view
+        except Exception as e:
+            return jsonify({"ok": False,
+                            "error": f"could not import "
+                                     f"marker_mission.config: {e}"}), 503
+        payload = tuning_view(MissionConfig())
+        values: dict[str, Any] = {}
+        for group in payload.get("groups", []) or []:
+            for item in group.get("items", []) or []:
+                name = item.get("name")
+                if isinstance(name, str):
+                    values[name] = item.get("default")
+        return jsonify({
+            "ok": True,
+            "values": values,
+            "source": "marker_mission MissionConfig dataclass defaults",
+        })
+
     @app.get("/api/c2/tune/load-from/<fc>")
     def api_tune_load(fc: str):
         client, err = _fc_or_404(fc)
@@ -387,7 +471,8 @@ def _build_app(cfg: C2Config, pool: FCPool, library: CalibrationLibrary,
             return jsonify({"ok": False, "error": "updates required"}), 400
 
         async def fan_out():
-            targets = [pool.client(n) for n in fcs if pool.client(n)]
+            targets = [pool.client(n) for n in fcs
+                       if pool.client(n) and settings.is_fc_enabled(n)]
 
             async def one(c):
                 ok, payload = await c.apply_tune(updates)
@@ -406,6 +491,44 @@ def _build_app(cfg: C2Config, pool: FCPool, library: CalibrationLibrary,
                         "results": _summarize_fan_out(raw)})
 
     # ----------------------------------------------------------- scripts page
+    # Mirror the arena/tune load-from-FC pattern so the operator can
+    # bring an FC's active draft into the editor before broadcasting.
+    @app.get("/api/c2/scripts/load-from/<fc>")
+    def api_scripts_load_from(fc: str):
+        client, err = _fc_or_404(fc)
+        if err:
+            return err
+        ok, payload = _await(client.get_mission_script(), timeout=5.0)
+        if ok and isinstance(payload, dict):
+            return jsonify({"ok": True, "text": payload.get("text", "")})
+        return jsonify({"ok": False, "error": _err(payload)})
+
+    @app.get("/api/c2/scripts/list-saved/<fc>")
+    def api_scripts_list_saved(fc: str):
+        client, err = _fc_or_404(fc)
+        if err:
+            return err
+        ok, payload = _await(client.list_mission_scripts(), timeout=5.0)
+        if not ok:
+            return jsonify({"ok": False, "error": _err(payload)})
+        # marker_mission returns {scripts: [{name, mtime, size, ...}],
+        # default: name?}. Pass it through verbatim.
+        return jsonify({"ok": True, **(payload if isinstance(payload, dict)
+                                       else {})})
+
+    @app.get("/api/c2/scripts/load-named/<fc>/<name>")
+    def api_scripts_load_named(fc: str, name: str):
+        client, err = _fc_or_404(fc)
+        if err:
+            return err
+        ok, payload = _await(client.load_mission_script_named(name),
+                              timeout=5.0)
+        if ok and isinstance(payload, dict):
+            return jsonify({"ok": True,
+                            "text": payload.get("text", ""),
+                            "name": payload.get("name", name)})
+        return jsonify({"ok": False, "error": _err(payload)})
+
     @app.post("/api/c2/scripts/push")
     def api_scripts_push():
         body = request.get_json(silent=True) or {}
@@ -415,7 +538,8 @@ def _build_app(cfg: C2Config, pool: FCPool, library: CalibrationLibrary,
             return jsonify({"ok": False, "error": "fcs[] required"}), 400
 
         async def fan_out():
-            targets = [pool.client(n) for n in fcs if pool.client(n)]
+            targets = [pool.client(n) for n in fcs
+                       if pool.client(n) and settings.is_fc_enabled(n)]
             coros = [c.set_mission_script(text) for c in targets]
             results = await asyncio.gather(*coros, return_exceptions=True)
             return {c.spec.name: r for c, r in zip(targets, results)}
@@ -433,7 +557,8 @@ def _build_app(cfg: C2Config, pool: FCPool, library: CalibrationLibrary,
             return jsonify({"ok": False, "error": "fcs[] required"}), 400
 
         async def fan_out():
-            targets = [pool.client(n) for n in fcs if pool.client(n)]
+            targets = [pool.client(n) for n in fcs
+                       if pool.client(n) and settings.is_fc_enabled(n)]
 
             async def one(c):
                 # Push the script first so the FC's persisted draft
@@ -460,7 +585,8 @@ def _build_app(cfg: C2Config, pool: FCPool, library: CalibrationLibrary,
             return jsonify({"ok": False, "error": "fcs[] required"}), 400
 
         async def fan_out():
-            targets = [pool.client(n) for n in fcs if pool.client(n)]
+            targets = [pool.client(n) for n in fcs
+                       if pool.client(n) and settings.is_fc_enabled(n)]
             coros = [c.stop_mission() for c in targets]
             results = await asyncio.gather(*coros, return_exceptions=True)
             return {c.spec.name: r for c, r in zip(targets, results)}
@@ -494,6 +620,10 @@ def _build_app(cfg: C2Config, pool: FCPool, library: CalibrationLibrary,
         fc = str(body.get("fc") or "")
         if not fc:
             return jsonify({"ok": False, "error": "fc required"}), 400
+        if not settings.is_fc_enabled(fc):
+            return jsonify({"ok": False,
+                            "error": f"FC disabled in /settings: "
+                                     f"{fc}"}), 409
         result = _await(library.push(name, fc), timeout=15.0)
         status = 200 if result.get("ok") else 502
         return jsonify(result), status
@@ -546,13 +676,14 @@ def run_server(cfg: C2Config) -> int:
     loop = C2Loop()
     loop.start()
 
-    pool = FCPool(cfg)
+    settings = SettingsStore()
+    pool = FCPool(cfg, settings)
     library = CalibrationLibrary(cfg, pool)
 
     loop.submit(pool.start(), timeout=5.0)
     loop.submit(library.start(), timeout=5.0)
 
-    app = _build_app(cfg, pool, library, loop)
+    app = _build_app(cfg, pool, library, settings, loop)
 
     # Best-effort graceful shutdown on Ctrl-C.
     def _on_sigint(_sig, _frame):
