@@ -972,10 +972,33 @@ _video_frame_count = 0
 # ---------------------------------------------------------------------------
 # Positioning state
 # ---------------------------------------------------------------------------
+# DEPRECATED — unified-server positioning subsystem.
+#
+# In the combined marker_mission.app world the actual aruco-based
+# world-position estimator lives in marker_mission/aruco_detector.py +
+# marker_mission/arena.py (the one wired to the /arena tab the
+# operator edits). This subsystem here is a separate, second
+# solvePnP path that reads controller_unified/arena_config.json
+# instead. It used to be the primary positioning path and is kept
+# alive only for legacy HTTP-only deployments and for the few
+# clients that still consume its SSE / MJPEG outputs. Do NOT add
+# new code that depends on it — use marker_mission's detector +
+# arena_holder instead.
+#
+# To minimise CPU cost in the combined deployment, the loop below
+# is gated on subscribers (recording / SSE / MJPEG-video viewers):
+# it no longer runs solvePnP every tick just because the cfg has
+# enabled=True. See positioning_loop() for the gate.
+# ---------------------------------------------------------------------------
 _pos_frame_q: "queue.Queue" = queue.Queue(maxsize=3)   # BGR frames tapped from video cb
 _pos_processor = None   # live HeadlessAruCoPositioning instance (set by positioning_loop)
 _pos_sse_queues: list = []
 _pos_sse_lock = threading.Lock()
+# Live count of clients holding the /api/position/video MJPEG generator
+# open. Incremented inside the generator's try; decremented in its
+# finally. Read by positioning_loop's subscriber gate.
+_pos_video_clients: int = 0
+_pos_video_clients_lock = threading.Lock()
 _pos_st: dict = {
     "x": None, "y": None, "z": None,
     "dx": None, "dy": None,
@@ -6011,14 +6034,42 @@ def _apply_arena_cfg_to_processor(processor):
 
 
 def positioning_loop():
-    """Background thread: reads frames from _pos_frame_q, runs ArUco positioning."""
+    """Background thread — DEPRECATED unified-server positioning path.
+
+    Reads frames from _pos_frame_q, runs ArUco positioning, fans the
+    result out to /api/position SSE clients + the /api/position/video
+    MJPEG and the recorder. Kept alive for legacy HTTP-only clients
+    and the visual annotation overlay; new code should use
+    marker_mission's detector + arena_holder instead (single
+    operator-facing source of truth at /arena, the same one solvePnP
+    already runs on for the camera page).
+
+    Subscriber gate: in addition to the cfg ``enabled`` toggle, we
+    only do the heavy solvePnP work when SOMEONE is consuming the
+    output — at least one of:
+
+      * recording is active (writes annotated frames to disk)
+      * SSE subscriber(s) on /api/position/events
+      * MJPEG viewer(s) on /api/position/video
+
+    When ``enabled`` is True but no subscribers, we still drain
+    _pos_frame_q (so it doesn't grow unbounded) but skip
+    detect+solvePnP. This makes the combined marker_mission.app
+    deployment effectively free when the operator is on the Camera
+    tab (which uses marker_mission's own solvePnP).
+    """
     global _pos_annotated_jpeg
     if not HAS_POSITIONING:
         print("[POS] positioning_loop: HAS_POSITIONING=False, exiting")
         return
 
+    print("[POS] DEPRECATED unified-server positioning subsystem started "
+          "(subscriber-gated; use marker_mission /arena for the operator "
+          "source of truth)")
+
     processor = None
     calib_w = calib_h = None
+    last_idle_drain_warn = 0.0
 
     while running:
         # Check if positioning and/or recording is active.
@@ -6032,6 +6083,32 @@ def positioning_loop():
         if not pos_enabled and not rec_active:
             time.sleep(0.2)
             processor = None  # reset so it reinitialises on enable
+            continue
+
+        # Subscriber gate — once enabled, only do the heavy path when
+        # someone consumes the output. Cheap: a single int read + a
+        # list len. We still drain _pos_frame_q below so the producer
+        # callback doesn't block on a full queue.
+        with _pos_sse_lock:
+            sse_clients = len(_pos_sse_queues)
+        with _pos_video_clients_lock:
+            video_clients = _pos_video_clients
+        has_subscribers = bool(rec_active or sse_clients or video_clients)
+        if pos_enabled and not has_subscribers:
+            # Drain the frame queue so the producer (video callback)
+            # never blocks, then continue. Cheap loop; no solvePnP.
+            try:
+                while True:
+                    _pos_frame_q.get_nowait()
+            except queue.Empty:
+                pass
+            now_drain = time.monotonic()
+            if now_drain - last_idle_drain_warn > 30.0:
+                print(f"[POS] idle (cfg.enabled=True but no subscribers) "
+                      f"— skipping solvePnP, draining frame queue")
+                last_idle_drain_warn = now_drain
+            time.sleep(0.2)
+            processor = None  # reset so it reinitialises on first subscriber
             continue
 
         # Get a frame
@@ -6351,20 +6428,36 @@ def api_position_events():
 
 @app.get("/api/position/video")
 def api_position_video():
-    """MJPEG stream with ArUco annotations — served at the rate frames are produced."""
+    """MJPEG stream with ArUco annotations from the DEPRECATED unified-
+    server positioning subsystem. Served at the rate frames are
+    produced. Use marker_mission's ``/video.mjpg`` (annotated by the
+    same /arena the operator edits) for new clients.
+
+    Each open generator increments ``_pos_video_clients`` so
+    positioning_loop knows there's a subscriber and runs solvePnP.
+    The counter drops back when the client disconnects (try/finally).
+    """
+    global _pos_video_clients
     def gen():
+        global _pos_video_clients
+        with _pos_video_clients_lock:
+            _pos_video_clients += 1
         last_sent = None
-        while running:
-            with _pos_annotated_lock:
-                jpg = _pos_annotated_jpeg
-            if not jpg:
-                with _video_jpeg_lock:
-                    jpg = _video_last_jpeg
-            if jpg and jpg is not last_sent:
-                last_sent = jpg
-                yield (b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + jpg + b"\r\n")
-            else:
-                time.sleep(0.02)   # 50 Hz poll — tight but not a busy-spin
+        try:
+            while running:
+                with _pos_annotated_lock:
+                    jpg = _pos_annotated_jpeg
+                if not jpg:
+                    with _video_jpeg_lock:
+                        jpg = _video_last_jpeg
+                if jpg and jpg is not last_sent:
+                    last_sent = jpg
+                    yield (b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + jpg + b"\r\n")
+                else:
+                    time.sleep(0.02)   # 50 Hz poll — tight but not a busy-spin
+        finally:
+            with _pos_video_clients_lock:
+                _pos_video_clients = max(0, _pos_video_clients - 1)
     return Response(gen(), mimetype="multipart/x-mixed-replace; boundary=frame",
                     headers={"Cache-Control": "no-cache"})
 
