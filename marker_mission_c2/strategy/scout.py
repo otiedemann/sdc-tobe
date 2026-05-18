@@ -77,20 +77,25 @@ class ScoutRole(Role):
         if script is None:
             return noop("scout: cannot compose script")
 
-        # Re-push only when the FC has *truly* exhausted the previous
-        # script. Phase.IDLE is mid-script HOOVER and must not trigger.
-        # Phase.RC is our continuous yaw drive — also not "finished".
+        # Push only when the FC is truly idle — i.e. phase == init/done.
+        # Phase.IDLE is mid-script HOOVER and must NOT trigger a push (the
+        # C2 would reject it). The "never_pushed" guard alone isn't enough
+        # after a strategy restart: the FC may still be running an old
+        # mission from before the restart, and pushing while it runs
+        # produces the script_push_failed storm we saw.
         now = time.time()
         rs = ctx.role_state
         never_pushed = not rs.last_pushed_script
         fc_finished = ctx.state.phase in ("init", "done", "")
         long_enough = (now - rs.last_pushed_unix_s) >= 2.0
 
+        if not fc_finished:
+            return noop(f"scout: FC busy (phase={ctx.state.phase})")
         if never_pushed:
             return push(script, new_phase="scouting", reason="scout: initial push")
-        if fc_finished and long_enough:
+        if long_enough:
             return push(script, new_phase="scouting", reason="scout: loop re-push")
-        return noop(f"scout: airborne in phase={ctx.state.phase}")
+        return noop("scout: waiting for cooldown")
 
 
 register(ScoutRole())
