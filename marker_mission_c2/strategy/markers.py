@@ -1,20 +1,30 @@
-"""Marker observation tracker.
+"""Slot-based marker observation tracker.
 
-Aggregates per-FC ``visible_marker_ids`` from the C2 overview into a single
-table of marker status:
+The SDC26 arena has 6 physical target markers, each with two ArUco faces:
 
-    marker_id -> {
-        last_seen_unix_s: float,
-        last_seen_by: str,                  # which FC saw it most recently
-        seen_by_recent: list[str],          # FCs that saw it within freshness window
-        team: "red"|"blue"|"wall"|"other",
-        captured: bool,                     # toggled when no scout sees it for cooldown
-        last_captured_unix_s: float|None
-    }
+    slot 1 -> ids (31 blue / 41 red)
+    slot 2 -> ids (32 blue / 42 red)
+    ...
+    slot 6 -> ids (36 blue / 46 red)
 
-The tracker is intentionally lightweight: it doesn't read camera frames, it
-just trusts what the FCs report. The strategy runner ticks it once per loop
-with the latest overview.
+Whichever face a scout currently sees tells you which team is holding the
+slot. There is no "captured = not visible" — capture is about which side
+is up, full stop.
+
+Public surface:
+
+    tracker.ingest(fc_name, visible_marker_ids)
+        Called every tick by the runner with the FC's marker observations.
+        Updates the affected slot's holder + freshness.
+
+    tracker.slot_status(slot)
+        Returns the slot's current ``SlotStatus``.
+
+    tracker.snapshot()
+        All known slots.
+
+    tracker.to_dict()
+        JSON-friendly serialisation for the web UI.
 """
 from __future__ import annotations
 
@@ -22,72 +32,59 @@ import logging
 import threading
 import time
 from dataclasses import dataclass, field
-from typing import Dict, Iterable, List, Optional
+from typing import Dict, Iterable, List, Optional, Tuple
+
+from .settings import ALL_SLOTS, face_id, slot_for_face, team_for_face
 
 logger = logging.getLogger(__name__)
 
 # How long an observation stays "fresh" (visible) before we consider the
-# marker out of view for that FC.
+# slot's holder stale. Used purely for UI flagging — the holder itself
+# only changes when the *opposite* face becomes the more recent observation.
 FRESHNESS_S = 1.5
-
-# After we lose sight of a marker for this many seconds (and no scout has
-# reported it recently), we flag it as `captured` for UI purposes. The
-# attacker role uses this signal to decide it's safe to RTH.
-CAPTURE_COOLDOWN_S = 4.0
-
-
-def _classify(marker_id: int, red_ids: set[int], blue_ids: set[int]) -> str:
-    if marker_id in red_ids:
-        return "red"
-    if marker_id in blue_ids:
-        return "blue"
-    if 1 <= marker_id <= 30:
-        return "wall"
-    return "other"
 
 
 @dataclass
-class MarkerStatus:
-    marker_id: int
-    team: str = "other"
+class SlotStatus:
+    slot: int
+    holder: str = "unknown"                # "red" | "blue" | "unknown"
+    last_observed_face_id: Optional[int] = None
     last_seen_unix_s: float = 0.0
     last_seen_by: Optional[str] = None
+    # Per-face freshness (when did we last see each side?)
+    red_face_seen_unix_s: float = 0.0
+    blue_face_seen_unix_s: float = 0.0
     seen_by_recent: List[str] = field(default_factory=list)
-    captured: bool = False
-    last_captured_unix_s: Optional[float] = None
+    # Tracks the last time the holder actually flipped, for UI / events.
+    holder_changed_unix_s: Optional[float] = None
 
 
 class MarkerTracker:
-    """Thread-safe marker visibility + capture-state tracker."""
+    """Thread-safe per-slot capture-state tracker."""
 
-    def __init__(
-        self,
-        *,
-        red_live_ids: Iterable[int] = (44, 45, 46),
-        blue_live_ids: Iterable[int] = (31, 32, 33),
-    ) -> None:
+    def __init__(self, *, active_slots: Iterable[int] = ALL_SLOTS) -> None:
         self._lock = threading.RLock()
-        self._red = set(red_live_ids)
-        self._blue = set(blue_live_ids)
-        self._markers: Dict[int, MarkerStatus] = {}
-        # Per-FC last-seen for each marker; used to compute seen_by_recent.
-        self._per_fc_last_seen: Dict[tuple[str, int], float] = {}
+        self._slots: Dict[int, SlotStatus] = {}
+        self._per_fc_last_seen: Dict[Tuple[str, int], float] = {}
+        self._set_active_slots_locked(tuple(active_slots))
 
     # ------------------------------------------------------------------
     # Configuration
     # ------------------------------------------------------------------
 
-    def update_team_ids(
-        self,
-        *,
-        red_live_ids: Iterable[int],
-        blue_live_ids: Iterable[int],
-    ) -> None:
+    def set_active_slots(self, slots: Iterable[int]) -> None:
         with self._lock:
-            self._red = set(red_live_ids)
-            self._blue = set(blue_live_ids)
-            for status in self._markers.values():
-                status.team = _classify(status.marker_id, self._red, self._blue)
+            self._set_active_slots_locked(tuple(slots))
+
+    def _set_active_slots_locked(self, slots: Tuple[int, ...]) -> None:
+        wanted = {int(s) for s in slots if 1 <= int(s) <= 6}
+        # Drop slots no longer active.
+        for s in list(self._slots.keys()):
+            if s not in wanted:
+                del self._slots[s]
+        # Add new ones with unknown holder.
+        for s in wanted:
+            self._slots.setdefault(s, SlotStatus(slot=s))
 
     # ------------------------------------------------------------------
     # Ingest
@@ -98,98 +95,112 @@ class MarkerTracker:
         if not fc_name:
             return
         now = time.time()
-        ids = {int(x) for x in visible_ids}
         with self._lock:
-            for mid in ids:
-                self._per_fc_last_seen[(fc_name, mid)] = now
-                status = self._markers.get(mid)
-                if status is None:
-                    status = MarkerStatus(
-                        marker_id=mid,
-                        team=_classify(mid, self._red, self._blue),
-                    )
-                    self._markers[mid] = status
+            for raw in visible_ids:
+                try:
+                    mid = int(raw)
+                except (TypeError, ValueError):
+                    continue
+                slot = slot_for_face(mid)
+                team = team_for_face(mid)
+                if slot is None or team is None:
+                    continue  # not a target face — ignore (e.g. wall markers)
+                if slot not in self._slots:
+                    # Not in active_slots — ignore quietly.
+                    continue
+                status = self._slots[slot]
+                status.last_observed_face_id = mid
                 status.last_seen_unix_s = now
                 status.last_seen_by = fc_name
-                # Coming back into view => no longer captured.
-                if status.captured:
-                    status.captured = False
-                    status.last_captured_unix_s = None
-            # Recompute seen_by_recent and capture flag for every marker we know.
+                if team == "red":
+                    status.red_face_seen_unix_s = now
+                else:
+                    status.blue_face_seen_unix_s = now
+                if status.holder != team:
+                    status.holder = team
+                    status.holder_changed_unix_s = now
+                self._per_fc_last_seen[(fc_name, mid)] = now
+            # Recompute "seen_by_recent" for every active slot.
             self._recompute_locked(now)
 
     def _recompute_locked(self, now: float) -> None:
-        for status in self._markers.values():
-            mid = status.marker_id
+        for status in self._slots.values():
             recent: List[str] = []
             for (fc, m_id), ts in self._per_fc_last_seen.items():
-                if m_id == mid and (now - ts) <= FRESHNESS_S:
+                if slot_for_face(m_id) == status.slot and (now - ts) <= FRESHNESS_S:
                     recent.append(fc)
-            status.seen_by_recent = sorted(recent)
-            # Capture rule: only meaningful for live target markers. A marker
-            # is "captured" if nobody has seen it for at least CAPTURE_COOLDOWN_S
-            # AND it was seen at some point (last_seen_unix_s > 0). We don't
-            # flag wall markers — they stay visible by definition.
-            if status.team in ("red", "blue") and status.last_seen_unix_s > 0:
-                staleness = now - status.last_seen_unix_s
-                if not recent and staleness >= CAPTURE_COOLDOWN_S:
-                    if not status.captured:
-                        status.captured = True
-                        status.last_captured_unix_s = now
+            status.seen_by_recent = sorted(set(recent))
 
     # ------------------------------------------------------------------
     # Read API
     # ------------------------------------------------------------------
 
-    def snapshot(self) -> Dict[int, MarkerStatus]:
+    def slot_status(self, slot: int) -> Optional[SlotStatus]:
         with self._lock:
-            # Return copies so callers don't mutate our state.
-            return {
-                mid: MarkerStatus(
-                    marker_id=s.marker_id,
-                    team=s.team,
-                    last_seen_unix_s=s.last_seen_unix_s,
-                    last_seen_by=s.last_seen_by,
-                    seen_by_recent=list(s.seen_by_recent),
-                    captured=s.captured,
-                    last_captured_unix_s=s.last_captured_unix_s,
-                )
-                for mid, s in self._markers.items()
-            }
-
-    def status_for(self, marker_id: int) -> Optional[MarkerStatus]:
-        with self._lock:
-            s = self._markers.get(int(marker_id))
+            s = self._slots.get(int(slot))
             if s is None:
                 return None
-            return MarkerStatus(
-                marker_id=s.marker_id,
-                team=s.team,
-                last_seen_unix_s=s.last_seen_unix_s,
-                last_seen_by=s.last_seen_by,
-                seen_by_recent=list(s.seen_by_recent),
-                captured=s.captured,
-                last_captured_unix_s=s.last_captured_unix_s,
-            )
+            return _copy(s)
 
-    def to_dict(self) -> Dict[str, dict]:
-        """JSON-friendly view of all known markers, keyed by id (string)."""
+    def snapshot(self) -> Dict[int, SlotStatus]:
+        with self._lock:
+            return {k: _copy(v) for k, v in self._slots.items()}
+
+    def to_dict(self, *, our_team: str = "red") -> Dict[str, dict]:
+        """JSON-friendly view, keyed by slot id.
+
+        ``our_team`` is supplied so the UI can compute a "captured_by_us"
+        flag without re-deriving holder semantics on the client side.
+        """
         with self._lock:
             now = time.time()
             self._recompute_locked(now)
+            enemy = "blue" if our_team == "red" else "red"
             out: Dict[str, dict] = {}
-            for mid, s in self._markers.items():
+            for slot, s in self._slots.items():
                 age = (
                     now - s.last_seen_unix_s if s.last_seen_unix_s > 0 else None
                 )
-                out[str(mid)] = {
-                    "id": s.marker_id,
-                    "team": s.team,
+                captured_by_us = s.holder == our_team
+                captured_by_enemy = s.holder == enemy
+                out[str(slot)] = {
+                    "slot": s.slot,
+                    "red_face_id": face_id(s.slot, "red"),
+                    "blue_face_id": face_id(s.slot, "blue"),
+                    "holder": s.holder,
+                    "captured_by_us": captured_by_us,
+                    "captured_by_enemy": captured_by_enemy,
+                    "last_observed_face_id": s.last_observed_face_id,
                     "last_seen_unix_s": s.last_seen_unix_s,
                     "last_seen_age_s": age,
                     "last_seen_by": s.last_seen_by,
+                    "red_face_seen_unix_s": s.red_face_seen_unix_s,
+                    "blue_face_seen_unix_s": s.blue_face_seen_unix_s,
                     "seen_by_recent": list(s.seen_by_recent),
-                    "captured": s.captured,
-                    "last_captured_unix_s": s.last_captured_unix_s,
+                    "holder_changed_unix_s": s.holder_changed_unix_s,
                 }
             return out
+
+    # ------------------------------------------------------------------
+    # Convenience for roles
+    # ------------------------------------------------------------------
+
+    def slot_holder(self, slot: int) -> str:
+        """Return the slot's current holder ("red"|"blue"|"unknown")."""
+        with self._lock:
+            s = self._slots.get(int(slot))
+            return s.holder if s else "unknown"
+
+
+def _copy(s: SlotStatus) -> SlotStatus:
+    return SlotStatus(
+        slot=s.slot,
+        holder=s.holder,
+        last_observed_face_id=s.last_observed_face_id,
+        last_seen_unix_s=s.last_seen_unix_s,
+        last_seen_by=s.last_seen_by,
+        red_face_seen_unix_s=s.red_face_seen_unix_s,
+        blue_face_seen_unix_s=s.blue_face_seen_unix_s,
+        seen_by_recent=list(s.seen_by_recent),
+        holder_changed_unix_s=s.holder_changed_unix_s,
+    )

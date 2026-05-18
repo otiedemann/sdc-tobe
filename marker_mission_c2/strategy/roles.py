@@ -91,8 +91,9 @@ class RoleState:
     fc_name: str
     role: str = "idle"
     phase: str = "idle"
-    target_marker_id: Optional[int] = None
+    target_slot: Optional[int] = None              # 1..6, set by operator
     target_assigned_unix_s: Optional[float] = None
+    last_attack_marker_id: Optional[int] = None    # face id we last APPROACHed
     last_pushed_script: str = ""
     last_pushed_unix_s: float = 0.0
     last_decision_reason: str = ""
@@ -102,8 +103,9 @@ class RoleState:
     def reset_for_role(self, new_role: str) -> None:
         self.role = new_role
         self.phase = "idle"
-        self.target_marker_id = None
+        self.target_slot = None
         self.target_assigned_unix_s = None
+        self.last_attack_marker_id = None
         self.last_pushed_script = ""
         self.last_pushed_unix_s = 0.0
         self.last_decision_reason = "role changed"
@@ -130,8 +132,9 @@ class RoleState:
             "fc_name": self.fc_name,
             "role": self.role,
             "phase": self.phase,
-            "target_marker_id": self.target_marker_id,
+            "target_slot": self.target_slot,
             "target_assigned_unix_s": self.target_assigned_unix_s,
+            "last_attack_marker_id": self.last_attack_marker_id,
             "last_pushed_script": self.last_pushed_script,
             "last_pushed_unix_s": self.last_pushed_unix_s,
             "last_pushed_age_s": (
@@ -182,9 +185,8 @@ class RoleContext:
     state: DroneState
     markers: MarkerTracker
     role_state: RoleState
-    # ID lists for the drone's team and the enemy team (live markers only).
-    own_target_ids: tuple[int, ...]
-    enemy_target_ids: tuple[int, ...]
+    our_team: str                     # "red" | "blue"
+    active_slots: tuple[int, ...]     # which slots are in play (1..6)
 
 
 class Role(abc.ABC):

@@ -11,28 +11,12 @@
     "scout_hover_s": 12.0
   },
   "markers": {
-    "red_live_ids": [44, 45, 46],
-    "blue_live_ids": [31, 32, 33]
+    "our_team": "red",
+    "active_slots": [1, 2, 3, 4, 5, 6]
   },
   "drones": {
-    "flightctrl1": {
+    "Sphinx3": {
       "team": "red",
-      "role": "idle",
-      "enabled": true,
-      "scout_alt_m": 1.8,
-      "attack_alt_m": 1.0,
-      "home_alt_m": 0.8
-    },
-    "flightctrl2": {
-      "team": "red",
-      "role": "idle",
-      "enabled": true,
-      "scout_alt_m": 1.8,
-      "attack_alt_m": 1.0,
-      "home_alt_m": 0.8
-    },
-    "flightctrl3": {
-      "team": "blue",
       "role": "idle",
       "enabled": true,
       "scout_alt_m": 1.8,

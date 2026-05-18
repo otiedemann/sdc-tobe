@@ -163,8 +163,7 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     settings = SettingsStore(path=args.settings, fc_names=fc_names)
     markers = MarkerTracker(
-        red_live_ids=settings.snapshot().markers.red_live_ids,
-        blue_live_ids=settings.snapshot().markers.blue_live_ids,
+        active_slots=settings.snapshot().markers.active_slots,
     )
 
     # Start the async loop on a background thread; build runner + client on it.

@@ -23,8 +23,8 @@ Settings shape::
         "scout_hover_s":        12.0
       },
       "markers": {
-        "red_live_ids":  [44, 45, 46],
-        "blue_live_ids": [31, 32, 33]
+        "our_team":     "red"|"blue",
+        "active_slots": [1, 2, 3, 4, 5, 6]
       },
       "drones": {
         "<fc-name>": {
@@ -38,6 +38,11 @@ Settings shape::
       }
     }
 
+Each physical target marker has two ArUco faces: ``3<slot>`` (blue holder)
+and ``4<slot>`` (red holder). Whichever face a scout sees is the side
+currently "up", i.e. that team's score. There are 6 slots in play
+(numbered 1..6), so live IDs are 31..36 and 41..46.
+
 The store is thread-safe (mutations go through a single ``RLock``) and writes
 atomically to avoid half-written files on crash.
 """
@@ -48,7 +53,7 @@ import logging
 import os
 import tempfile
 import threading
-from dataclasses import asdict, dataclass, field, replace
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
 
@@ -60,12 +65,50 @@ _EXAMPLE_PATH = _HERE / "settings.example.json"
 
 
 # ---------------------------------------------------------------------------
-# Dataclasses
+# Constants / helpers about the target marker scheme
 # ---------------------------------------------------------------------------
 
 
 VALID_TEAMS = ("red", "blue")
 VALID_ROLES = ("idle", "scout", "attacker")
+
+# All slots ever used in the SDC26 layout (1..6).
+ALL_SLOTS: tuple[int, ...] = (1, 2, 3, 4, 5, 6)
+
+# Helpers: face id <-> (slot, team).
+
+
+def slot_for_face(marker_id: int) -> Optional[int]:
+    """Return slot 1..6 for a target-face id, or None if not a target."""
+    if 31 <= marker_id <= 36:
+        return marker_id - 30
+    if 41 <= marker_id <= 46:
+        return marker_id - 40
+    return None
+
+
+def team_for_face(marker_id: int) -> Optional[str]:
+    """Return "red"|"blue" for a target-face id, or None if not a target."""
+    if 31 <= marker_id <= 36:
+        return "blue"
+    if 41 <= marker_id <= 46:
+        return "red"
+    return None
+
+
+def face_id(slot: int, team: str) -> int:
+    """Return the marker id shown when ``team`` holds ``slot``."""
+    base = 40 if team == "red" else 30
+    return base + int(slot)
+
+
+def enemy_team(our_team: str) -> str:
+    return "blue" if our_team == "red" else "red"
+
+
+# ---------------------------------------------------------------------------
+# Dataclasses
+# ---------------------------------------------------------------------------
 
 
 @dataclass(frozen=True)
@@ -96,8 +139,24 @@ class MatchSettings:
 
 @dataclass(frozen=True)
 class MarkerSettings:
-    red_live_ids: tuple[int, ...] = (44, 45, 46)
-    blue_live_ids: tuple[int, ...] = (31, 32, 33)
+    our_team: str = "red"                     # "red" | "blue"
+    active_slots: tuple[int, ...] = ALL_SLOTS
+
+    def enemy_team(self) -> str:
+        return enemy_team(self.our_team)
+
+    def our_face_id(self, slot: int) -> int:
+        return face_id(slot, self.our_team)
+
+    def enemy_face_id(self, slot: int) -> int:
+        return face_id(slot, self.enemy_team())
+
+    def all_face_ids(self) -> tuple[int, ...]:
+        out: List[int] = []
+        for s in self.active_slots:
+            out.append(face_id(s, "red"))
+            out.append(face_id(s, "blue"))
+        return tuple(out)
 
 
 @dataclass(frozen=True)
@@ -156,18 +215,6 @@ def _point3d_from(raw: Any, default: Point3D) -> Point3D:
         return default
 
 
-def _coerce_int_list(raw: Any, default: tuple[int, ...]) -> tuple[int, ...]:
-    if not isinstance(raw, (list, tuple)):
-        return default
-    out: List[int] = []
-    for x in raw:
-        try:
-            out.append(int(x))
-        except (TypeError, ValueError):
-            continue
-    return tuple(out) if out else default
-
-
 def _coerce_team(raw: Any) -> Optional[str]:
     if raw in VALID_TEAMS:
         return raw
@@ -178,6 +225,22 @@ def _coerce_role(raw: Any) -> str:
     if raw in VALID_ROLES:
         return raw
     return "idle"
+
+
+def _coerce_slot_list(raw: Any, default: tuple[int, ...]) -> tuple[int, ...]:
+    if not isinstance(raw, (list, tuple)):
+        return default
+    out: List[int] = []
+    seen: set[int] = set()
+    for x in raw:
+        try:
+            v = int(x)
+        except (TypeError, ValueError):
+            continue
+        if 1 <= v <= 6 and v not in seen:
+            out.append(v)
+            seen.add(v)
+    return tuple(out) if out else default
 
 
 def _drone_to_dict(d: DroneSettings) -> Dict[str, Any]:
@@ -219,8 +282,8 @@ def _settings_to_dict(s: StrategySettings) -> Dict[str, Any]:
             "scout_hover_s": float(s.match.scout_hover_s),
         },
         "markers": {
-            "red_live_ids": list(s.markers.red_live_ids),
-            "blue_live_ids": list(s.markers.blue_live_ids),
+            "our_team": s.markers.our_team,
+            "active_slots": list(s.markers.active_slots),
         },
         "drones": {d.fc_name: _drone_to_dict(d) for d in s.drones},
     }
@@ -252,12 +315,12 @@ def _settings_from_dict(raw: Any, *, known_fc_names: Iterable[str]) -> StrategyS
 
     markers_raw = raw.get("markers") or {}
     m_defaults_marker = MarkerSettings()
+    our_team_raw = markers_raw.get("our_team")
+    our_team = our_team_raw if our_team_raw in VALID_TEAMS else m_defaults_marker.our_team
     markers = MarkerSettings(
-        red_live_ids=_coerce_int_list(
-            markers_raw.get("red_live_ids"), m_defaults_marker.red_live_ids
-        ),
-        blue_live_ids=_coerce_int_list(
-            markers_raw.get("blue_live_ids"), m_defaults_marker.blue_live_ids
+        our_team=our_team,
+        active_slots=_coerce_slot_list(
+            markers_raw.get("active_slots"), m_defaults_marker.active_slots
         ),
     )
 
@@ -284,11 +347,7 @@ def _settings_from_dict(raw: Any, *, known_fc_names: Iterable[str]) -> StrategyS
 
 
 class SettingsStore:
-    """Thread-safe JSON-backed strategy settings.
-
-    Construct once at app startup; share the instance across the runner and
-    the Flask app.
-    """
+    """Thread-safe JSON-backed strategy settings."""
 
     def __init__(
         self,
@@ -312,7 +371,6 @@ class SettingsStore:
                     return _settings_from_dict(raw, known_fc_names=self._fc_names)
                 except (OSError, json.JSONDecodeError) as e:
                     logger.warning("strategy: failed to load %s: %s", candidate, e)
-        # Nothing on disk — bootstrap from FC list.
         bootstrap = _settings_from_dict({}, known_fc_names=self._fc_names)
         try:
             self._write_atomic(_settings_to_dict(bootstrap))
@@ -322,7 +380,6 @@ class SettingsStore:
 
     def _write_atomic(self, data: Dict[str, Any]) -> None:
         self._path.parent.mkdir(parents=True, exist_ok=True)
-        # NamedTemporaryFile in the same dir => same filesystem => atomic rename.
         fd, tmp = tempfile.mkstemp(
             prefix=".settings.", suffix=".json.tmp", dir=str(self._path.parent)
         )
@@ -358,7 +415,6 @@ class SettingsStore:
     # ----- write API ----------------------------------------------------------
 
     def update_drone(self, fc_name: str, **changes: Any) -> DroneSettings:
-        """Patch a single drone's settings. Unknown keys are ignored."""
         with self._lock:
             existing = self.drone(fc_name) or DroneSettings(fc_name=fc_name)
             allowed: Dict[str, Any] = {}
@@ -390,7 +446,6 @@ class SettingsStore:
             return patched
 
     def update_match(self, **changes: Any) -> MatchSettings:
-        """Patch match-level fields. Points accept dict {x, y[, alt]}."""
         with self._lock:
             m = self._settings.match
             allowed: Dict[str, Any] = {}
@@ -423,13 +478,13 @@ class SettingsStore:
         with self._lock:
             cur = self._settings.markers
             allowed: Dict[str, Any] = {}
-            if "red_live_ids" in changes:
-                allowed["red_live_ids"] = _coerce_int_list(
-                    changes["red_live_ids"], cur.red_live_ids
-                )
-            if "blue_live_ids" in changes:
-                allowed["blue_live_ids"] = _coerce_int_list(
-                    changes["blue_live_ids"], cur.blue_live_ids
+            if "our_team" in changes:
+                t = _coerce_team(changes["our_team"])
+                if t is not None:
+                    allowed["our_team"] = t
+            if "active_slots" in changes:
+                allowed["active_slots"] = _coerce_slot_list(
+                    changes["active_slots"], cur.active_slots
                 )
             patched = replace(cur, **allowed)
             self._settings = replace(self._settings, markers=patched)

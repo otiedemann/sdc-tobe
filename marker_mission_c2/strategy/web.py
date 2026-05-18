@@ -4,14 +4,14 @@ Endpoints
 ---------
 GET  /                                — HTML dashboard
 GET  /api/state                       — combined snapshot (settings + runner
-                                        state + markers + recent events)
+                                        state + slot statuses + recent events)
 GET  /api/settings                    — current settings JSON
 POST /api/settings/drone/<fc>         — patch a drone (team/role/altitudes)
 POST /api/settings/match              — patch match-level fields
-POST /api/settings/markers            — patch live-marker IDs
+POST /api/settings/markers            — patch our_team / active_slots
 POST /api/strategy/arm                — arm the runner (allow pushes)
 POST /api/strategy/disarm             — disarm
-POST /api/strategy/target/<fc>        — body {marker_id: int|null} → set/clear
+POST /api/strategy/target/<fc>        — body {slot: int|null} → set/clear slot
 POST /api/strategy/emergency-land     — emergency-land everyone
 """
 from __future__ import annotations
@@ -47,27 +47,20 @@ def build_app(
     app = Flask(__name__)
 
     def _run_coro(coro):
-        """Submit a coroutine to the runner's event loop from a Flask thread."""
         return asyncio.run_coroutine_threadsafe(coro, loop).result()
-
-    # ------------------------------------------------------------------
-    # Pages
-    # ------------------------------------------------------------------
 
     @app.route("/")
     def index():
         return _no_cache(app.response_class(_INDEX_HTML, mimetype="text/html"))
 
-    # ------------------------------------------------------------------
-    # State
-    # ------------------------------------------------------------------
-
     @app.route("/api/state")
     def api_state():
+        s = settings.to_dict()
+        our_team = s["markers"]["our_team"]
         return _no_cache(jsonify({
-            "settings": settings.to_dict(),
+            "settings": s,
             "runner": runner.snapshot(),
-            "markers": markers.to_dict(),
+            "slots": markers.to_dict(our_team=our_team),
             "events": runner.events.to_list()[-50:],
             "roles": sorted(all_roles().keys()),
             "valid_teams": list(VALID_TEAMS),
@@ -101,10 +94,6 @@ def build_app(
         runner.events.add("settings", f"markers updated: {list(body.keys())}")
         return _no_cache(jsonify({"ok": True, "markers": settings.to_dict()["markers"]}))
 
-    # ------------------------------------------------------------------
-    # Strategy control
-    # ------------------------------------------------------------------
-
     @app.route("/api/strategy/arm", methods=["POST"])
     def api_arm():
         runner.arm("web")
@@ -118,25 +107,25 @@ def build_app(
     @app.route("/api/strategy/target/<fc_name>", methods=["POST"])
     def api_target(fc_name: str):
         body = request.get_json(silent=True) or {}
-        raw = body.get("marker_id")
-        marker_id: Optional[int]
+        raw = body.get("slot", body.get("marker_id"))   # legacy marker_id accepted
+        slot: Optional[int]
         if raw is None or raw == "" or raw == "null":
-            marker_id = None
+            slot = None
         else:
             try:
-                marker_id = int(raw)
+                slot = int(raw)
             except (TypeError, ValueError):
-                return _no_cache(jsonify({"ok": False, "error": "invalid marker_id"})), 400
-        runner.assign_target(fc_name, marker_id)
-        return _no_cache(jsonify({"ok": True, "target": marker_id}))
+                return _no_cache(jsonify({"ok": False, "error": "invalid slot"})), 400
+            if not (1 <= slot <= 6):
+                return _no_cache(jsonify(
+                    {"ok": False, "error": "slot out of range 1..6"})), 400
+        runner.assign_target(fc_name, slot)
+        return _no_cache(jsonify({"ok": True, "slot": slot}))
 
     @app.route("/api/strategy/emergency-land", methods=["POST"])
     def api_emergency():
-        from .c2_client import C2Client  # local import to avoid cycle
-        # We don't have a direct handle here, but the runner uses one; talk
-        # via the runner's loop-bound coroutine call so we share the client.
-        # Simpler: open a one-shot client.
-        # (Strategy server lives next to C2 on localhost.)
+        from .c2_client import C2Client
+
         async def _land():
             c = C2Client()
             try:
@@ -165,7 +154,7 @@ def _drone_dict(d) -> Dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
-# HTML (single-page, vanilla JS, no build step)
+# HTML
 # ---------------------------------------------------------------------------
 
 
@@ -192,7 +181,7 @@ _INDEX_HTML = r"""<!doctype html>
          font: 14px/1.4 system-ui, sans-serif; }
   header { padding: 12px 16px; background: var(--panel);
            border-bottom: 1px solid var(--border);
-           display: flex; gap: 12px; align-items: center; }
+           display: flex; gap: 12px; align-items: center; flex-wrap: wrap; }
   header h1 { font-size: 16px; margin: 0; }
   header .spacer { flex: 1; }
   header .pill { padding: 4px 10px; border-radius: 999px;
@@ -200,6 +189,11 @@ _INDEX_HTML = r"""<!doctype html>
                  font-size: 12px; }
   header .pill.armed { background: var(--green); color: #000; }
   header .pill.disarmed { background: #444; }
+  header .pill.red { background: var(--red); color: #fff; }
+  header .pill.blue { background: var(--blue); color: #fff; }
+  header select { background: #16181d; color: var(--text);
+                  border: 1px solid var(--border); padding: 4px 8px;
+                  border-radius: 4px; }
   button { background: var(--panel2); color: var(--text);
            border: 1px solid var(--border);
            padding: 6px 12px; border-radius: 6px; cursor: pointer; }
@@ -235,18 +229,35 @@ _INDEX_HTML = r"""<!doctype html>
         color: var(--text); border: 1px solid var(--border);
         border-radius: 4px; }
   .drone .phase { font-size: 12px; color: var(--muted);
-                  font-family: ui-monospace, monospace; }
-  .marker-grid { display: grid;
-                 grid-template-columns: repeat(auto-fill, minmax(64px, 1fr));
-                 gap: 8px; }
-  .marker { padding: 8px; border-radius: 6px; background: var(--panel2);
-            text-align: center; font-family: ui-monospace, monospace;
-            border: 1px solid var(--border); }
-  .marker.red { border-color: var(--red); }
-  .marker.blue { border-color: var(--blue); }
-  .marker.captured { background: #1a3a25; border-color: var(--green); }
-  .marker .id { font-size: 16px; font-weight: 600; }
-  .marker .sub { font-size: 10px; color: var(--muted); margin-top: 2px; }
+                  font-family: ui-monospace, monospace; margin-top: 6px; }
+  .target-row { display: flex; gap: 4px; margin-top: 8px; align-items: center; }
+  .target-row select { flex: 1; padding: 4px 6px; background: #16181d;
+                       color: var(--text); border: 1px solid var(--border);
+                       border-radius: 4px; }
+  .slot-grid { display: grid;
+               grid-template-columns: repeat(auto-fill, minmax(120px, 1fr));
+               gap: 8px; }
+  .slot { padding: 10px; border-radius: 6px; background: var(--panel2);
+          border: 2px solid var(--border); font-family: ui-monospace, monospace;
+          position: relative; }
+  .slot.red    { border-color: var(--red); }
+  .slot.blue   { border-color: var(--blue); }
+  .slot.unknown { border-color: var(--border); opacity: 0.7; }
+  .slot.ours   { box-shadow: 0 0 0 2px var(--green) inset; }
+  .slot .title { display: flex; justify-content: space-between;
+                 align-items: baseline; margin-bottom: 4px; }
+  .slot .num { font-size: 14px; font-weight: 700; }
+  .slot .pair { font-size: 10px; color: var(--muted); }
+  .slot .holder { font-size: 13px; font-weight: 600; text-transform: uppercase;
+                  letter-spacing: 0.04em; }
+  .slot.red .holder { color: var(--red); }
+  .slot.blue .holder { color: var(--blue); }
+  .slot.unknown .holder { color: var(--muted); }
+  .slot .info { font-size: 10px; color: var(--muted); margin-top: 4px;
+                line-height: 1.3; }
+  .slot .ours-tag { position: absolute; top: 4px; right: 6px;
+                    font-size: 10px; padding: 1px 6px; border-radius: 999px;
+                    background: var(--green); color: #000; font-weight: 700; }
   .events { max-height: 320px; overflow-y: auto;
             font-family: ui-monospace, monospace; font-size: 12px; }
   .events .ev { padding: 3px 0; border-bottom: 1px solid var(--border);
@@ -258,10 +269,6 @@ _INDEX_HTML = r"""<!doctype html>
   .events .ev.role .k, .events .ev.target .k { color: var(--yellow); }
   .events .ev.emergency .k, .events .ev.stop .k { color: var(--red); }
   .small { font-size: 11px; color: var(--muted); }
-  .target-row { display: flex; gap: 4px; margin-top: 6px; align-items: center; }
-  .target-row input { flex: 1; padding: 4px 6px; background: #16181d;
-                       color: var(--text); border: 1px solid var(--border);
-                       border-radius: 4px; }
 </style>
 </head>
 <body>
@@ -269,6 +276,11 @@ _INDEX_HTML = r"""<!doctype html>
   <h1>SDC26 Strategy</h1>
   <span id="armed-pill" class="pill disarmed">disarmed</span>
   <span class="pill">tick <span id="tick">–</span></span>
+  <span class="small">our team:</span>
+  <select id="our-team">
+    <option value="red">red</option>
+    <option value="blue">blue</option>
+  </select>
   <span class="spacer"></span>
   <button id="arm-btn" class="primary">Arm</button>
   <button id="disarm-btn">Disarm</button>
@@ -282,8 +294,8 @@ _INDEX_HTML = r"""<!doctype html>
   </section>
 
   <section>
-    <h2>Markers</h2>
-    <div id="markers" class="marker-grid"></div>
+    <h2>Target Slots</h2>
+    <div id="slots" class="slot-grid"></div>
     <h2 style="margin-top:16px">Events</h2>
     <div id="events" class="events"></div>
   </section>
@@ -298,19 +310,29 @@ async function patchDrone(fc, patch) {
   return api(`/api/settings/drone/${encodeURIComponent(fc)}`, {
     method:"POST", body: JSON.stringify(patch)});
 }
-async function assignTarget(fc, mid) {
+async function patchMarkers(patch) {
+  return api(`/api/settings/markers`, {method:"POST", body: JSON.stringify(patch)});
+}
+async function assignTarget(fc, slot) {
   return api(`/api/strategy/target/${encodeURIComponent(fc)}`, {
-    method:"POST", body: JSON.stringify({marker_id: mid})});
+    method:"POST", body: JSON.stringify({slot: slot})});
+}
+
+function ageStr(s) {
+  if (s == null) return "never";
+  if (s < 1) return s.toFixed(1) + "s";
+  if (s < 60) return Math.round(s) + "s";
+  return Math.round(s/60) + "m";
 }
 
 function renderDrones(state) {
   const root = document.getElementById("drones");
   const drones = (state.settings.drones || {});
   const role_states = (state.runner && state.runner.drones) || {};
+  const activeSlots = (state.settings.markers && state.settings.markers.active_slots) || [1,2,3,4,5,6];
   const names = Object.keys(drones).sort();
   if (!names.length) {
-    root.innerHTML = '<div class="small">No drones configured. '
-      + 'Edit <code>settings.json</code> or wait for C2 sync.</div>';
+    root.innerHTML = '<div class="small">No drones configured.</div>';
     return;
   }
   root.innerHTML = "";
@@ -321,9 +343,13 @@ function renderDrones(state) {
     const role = d.role || "idle";
     const teamBadge = team === "red" ? "red" : team === "blue" ? "blue" : "";
     const roleBadge = role === "idle" ? "" : "green";
-    const targetVal = rs.target_marker_id == null ? "" : rs.target_marker_id;
+    const targetVal = rs.target_slot == null ? "" : rs.target_slot;
     const phase = rs.phase || "idle";
-    const reason = rs.last_decision_reason || "";
+    const reason = (rs.last_decision_reason || "").replace(/"/g, '&quot;');
+    const attackId = rs.last_attack_marker_id;
+    const slotOpts = ['<option value="">— no target —</option>']
+      .concat(activeSlots.map(s => `<option value="${s}" ${targetVal===s?"selected":""}>slot ${s}</option>`))
+      .join("");
     const html = `
       <div class="drone">
         <div class="head">
@@ -374,14 +400,12 @@ function renderDrones(state) {
           </div>
         </div>
         <div class="target-row" ${role!=="attacker"?'style="display:none"':''}>
-          <input type="number" min="1" max="60"
-                 placeholder="target marker id"
-                 value="${targetVal}" data-target="${fc}">
-          <button data-assign="${fc}">Assign</button>
+          <label class="small">Target slot:</label>
+          <select data-target="${fc}">${slotOpts}</select>
           <button data-clear="${fc}">Clear</button>
         </div>
         <div class="phase" title="${reason}">
-          phase=${phase}${rs.target_marker_id!=null?` target=${rs.target_marker_id}`:''}
+          phase=${phase}${rs.target_slot!=null?` slot=${rs.target_slot}`:''}${attackId?` last_aim=${attackId}`:''}
           ${reason?` · ${reason}`:''}
         </div>
       </div>
@@ -390,36 +414,40 @@ function renderDrones(state) {
   }
 }
 
-function renderMarkers(state) {
-  const root = document.getElementById("markers");
-  const items = state.markers || {};
-  const ids = Object.keys(items).map(x=>parseInt(x,10)).sort((a,b)=>a-b);
-  const liveIds = new Set([
-    ...(state.settings.markers.red_live_ids || []),
-    ...(state.settings.markers.blue_live_ids || []),
-  ]);
-  // Always render the live markers even if never seen yet.
-  for (const lid of liveIds) {
-    if (!ids.includes(lid)) ids.push(lid);
-  }
-  ids.sort((a,b)=>a-b);
-  if (!ids.length) {
-    root.innerHTML = '<div class="small">No marker observations yet. '
-      + 'Scout some drones to populate.</div>';
+function renderSlots(state) {
+  const root = document.getElementById("slots");
+  const slots = state.slots || {};
+  const our = state.settings.markers.our_team || "red";
+  const enemy = our === "red" ? "blue" : "red";
+  const activeSlots = state.settings.markers.active_slots || [1,2,3,4,5,6];
+  if (!activeSlots.length) {
+    root.innerHTML = '<div class="small">No active slots.</div>';
     return;
   }
   root.innerHTML = "";
-  for (const id of ids) {
-    const s = items[id] || {team: liveIds.has(id) ? (state.settings.markers.red_live_ids.includes(id) ? "red" : "blue") : "other", captured: false};
-    const cls = [s.team, s.captured ? "captured" : ""].join(" ");
-    const age = s.last_seen_age_s == null ? "never" : `${s.last_seen_age_s.toFixed(1)}s`;
+  for (const slotNum of activeSlots) {
+    const s = slots[String(slotNum)] || {
+      slot: slotNum, holder: "unknown",
+      red_face_id: 40 + slotNum, blue_face_id: 30 + slotNum,
+      last_seen_age_s: null, last_seen_by: null,
+      seen_by_recent: [], last_observed_face_id: null,
+    };
+    const holder = s.holder || "unknown";
+    const ours = holder === our;
+    const cls = [holder, ours ? "ours" : ""].join(" ").trim();
+    const age = ageStr(s.last_seen_age_s);
     const by = s.last_seen_by || "—";
-    const status = s.captured ? "CAPTURED" : (s.seen_by_recent && s.seen_by_recent.length ? "visible" : "stale");
+    const recent = (s.seen_by_recent || []).join(", ") || "none";
+    const lastFace = s.last_observed_face_id ? `id ${s.last_observed_face_id}` : "—";
     root.insertAdjacentHTML("beforeend", `
-      <div class="marker ${cls}" title="seen by: ${(s.seen_by_recent||[]).join(", ")||"none"}">
-        <div class="id">${id}</div>
-        <div class="sub">${status}</div>
-        <div class="sub">${age}</div>
+      <div class="slot ${cls}" title="seen by recent: ${recent}">
+        ${ours ? '<span class="ours-tag">OURS</span>' : ''}
+        <div class="title">
+          <span class="num">Slot ${slotNum}</span>
+          <span class="pair">${s.blue_face_id}/${s.red_face_id}</span>
+        </div>
+        <div class="holder">${holder}</div>
+        <div class="info">last face: ${lastFace}<br>seen: ${age}${by !== "—" ? " · " + by : ""}</div>
       </div>
     `);
   }
@@ -444,6 +472,11 @@ function renderHeader(state) {
   pill.className = "pill " + (armed ? "armed" : "disarmed");
   pill.textContent = armed ? "ARMED" : "disarmed";
   document.getElementById("tick").textContent = state.runner ? state.runner.tick_count : "–";
+  const teamSel = document.getElementById("our-team");
+  // Only update if user isn't currently interacting with it.
+  if (document.activeElement !== teamSel) {
+    teamSel.value = state.settings.markers.our_team || "red";
+  }
 }
 
 let last = null;
@@ -453,37 +486,43 @@ async function refresh() {
     last = state;
     renderHeader(state);
     renderDrones(state);
-    renderMarkers(state);
+    renderSlots(state);
     renderEvents(state);
   } catch (e) {
     console.error("refresh failed", e);
   }
 }
 
-// Field editing
 document.addEventListener("change", async (ev) => {
   const t = ev.target;
-  if (!t.matches("[data-fc][data-field]")) return;
-  const fc = t.getAttribute("data-fc");
-  const field = t.getAttribute("data-field");
-  let val = t.value;
-  if (field === "enabled") val = (val === "true");
-  if (["scout_alt_m","attack_alt_m","home_alt_m"].includes(field)) val = parseFloat(val);
-  await patchDrone(fc, {[field]: val});
-  refresh();
+  if (t.id === "our-team") {
+    await patchMarkers({our_team: t.value});
+    refresh();
+    return;
+  }
+  if (t.matches("[data-fc][data-field]")) {
+    const fc = t.getAttribute("data-fc");
+    const field = t.getAttribute("data-field");
+    let val = t.value;
+    if (field === "enabled") val = (val === "true");
+    if (["scout_alt_m","attack_alt_m","home_alt_m"].includes(field)) val = parseFloat(val);
+    await patchDrone(fc, {[field]: val});
+    refresh();
+    return;
+  }
+  if (t.matches("[data-target]")) {
+    const fc = t.getAttribute("data-target");
+    const raw = t.value;
+    const slot = raw === "" ? null : parseInt(raw, 10);
+    await assignTarget(fc, slot);
+    refresh();
+    return;
+  }
 });
 
-// Target assignment
 document.addEventListener("click", async (ev) => {
   const t = ev.target;
-  if (t.matches("[data-assign]")) {
-    const fc = t.getAttribute("data-assign");
-    const input = document.querySelector(`[data-target="${fc}"]`);
-    const v = input.value.trim();
-    if (!v) return;
-    await assignTarget(fc, parseInt(v, 10));
-    refresh();
-  } else if (t.matches("[data-clear]")) {
+  if (t.matches("[data-clear]")) {
     const fc = t.getAttribute("data-clear");
     await assignTarget(fc, null);
     refresh();

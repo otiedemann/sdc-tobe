@@ -32,7 +32,7 @@ from .roles import (
     RoleState,
     get as get_role,
 )
-from .settings import DroneSettings, MatchSettings, SettingsStore
+from .settings import SettingsStore
 
 # Pull SCOUT/ATTACKER side-effect imports so they register themselves.
 from . import scout as _scout  # noqa: F401
@@ -162,26 +162,25 @@ class SwarmRunner:
         with self._states_lock:
             return {fc: rs for fc, rs in self._role_states.items()}
 
-    def assign_target(self, fc_name: str, marker_id: Optional[int]) -> None:
-        """Assign (or clear) an attacker's target."""
+    def assign_target(self, fc_name: str, slot: Optional[int]) -> None:
+        """Assign (or clear) an attacker's target slot (1..6)."""
         with self._states_lock:
             rs = self._role_states.setdefault(
                 fc_name, RoleState(fc_name=fc_name)
             )
-            rs.target_marker_id = (
-                int(marker_id) if marker_id is not None else None
-            )
-            rs.target_assigned_unix_s = time.time() if marker_id is not None else None
+            rs.target_slot = int(slot) if slot is not None else None
+            rs.target_assigned_unix_s = time.time() if slot is not None else None
+            rs.last_attack_marker_id = None
             rs.advance_phase(
-                "idle" if marker_id is None else "idle",
+                "idle",
                 reason=(
-                    "target cleared" if marker_id is None
-                    else f"target {marker_id} assigned"
+                    "target cleared" if slot is None
+                    else f"slot {slot} assigned"
                 ),
             )
         self._events.add(
             "target",
-            f"{'cleared' if marker_id is None else f'assigned marker {marker_id}'}",
+            f"{'cleared' if slot is None else f'assigned slot {slot}'}",
             drone=fc_name,
         )
 
@@ -240,11 +239,8 @@ class SwarmRunner:
     async def _tick_once(self) -> None:
         # 1) Pull settings snapshot once per tick (fresh each loop).
         s = self._settings.snapshot()
-        # Keep the marker tracker's team IDs in sync with the live config.
-        self._markers.update_team_ids(
-            red_live_ids=s.markers.red_live_ids,
-            blue_live_ids=s.markers.blue_live_ids,
-        )
+        # Keep the marker tracker's active slots in sync with config.
+        self._markers.set_active_slots(s.markers.active_slots)
 
         # 2) Read C2 overview.
         ok, overview = await self._c2.overview()
@@ -284,15 +280,14 @@ class SwarmRunner:
             if role is None:
                 continue
 
-            own_ids, enemy_ids = self._team_target_ids(drone, s)
             ctx = RoleContext(
                 drone=drone,
                 match=s.match,
                 state=ds,
                 markers=self._markers,
                 role_state=rs,
-                own_target_ids=own_ids,
-                enemy_target_ids=enemy_ids,
+                our_team=s.markers.our_team,
+                active_slots=tuple(s.markers.active_slots),
             )
 
             try:
@@ -308,15 +303,6 @@ class SwarmRunner:
     # ------------------------------------------------------------------
     # Decision dispatch
     # ------------------------------------------------------------------
-
-    def _team_target_ids(
-        self, drone: DroneSettings, s
-    ) -> tuple[tuple[int, ...], tuple[int, ...]]:
-        if drone.team == "red":
-            return tuple(s.markers.red_live_ids), tuple(s.markers.blue_live_ids)
-        if drone.team == "blue":
-            return tuple(s.markers.blue_live_ids), tuple(s.markers.red_live_ids)
-        return (), ()
 
     async def _apply_decision(self, fc_name: str, decision: Decision) -> None:
         rs = self.role_state(fc_name)
