@@ -132,6 +132,13 @@ class MissionConfig:
     # Dead-bands -- inside these, the controller commands zero ----------------
     yaw_deadband_deg: float = 1.5          # TUNE
     distance_deadband_m: float = 0.05      # TUNE
+    # Looser deadband used only by the TO (arena-frame waypoint) step.
+    # APPROACH / ALIGN / HOLD keep distance_deadband_m (5cm) because
+    # they track a marker and the precision matters; for "go to a
+    # rough point in the arena" 5cm is impractical from far-wall
+    # ArUco alone and produces TO steps that never advance. 30cm is
+    # plenty for "be in the home zone".
+    goto_deadband_m: float = 0.30          # TUNE
     heading_deadband_deg: float = 2.0      # TUNE
     lateral_deadband_m: float = 0.05       # TUNE
 
@@ -592,6 +599,10 @@ TUNING_FIELDS = {
         "label": "yaw deadband", "kind": "float", "unit": "deg", "step": 0.01,
         "desc": "|yaw_to_marker| below this → rc_yaw=0. Prevents twitchy yaw command when the marker is essentially centred.",
     },
+    "goto_deadband_m": {
+        "label": "goto deadband", "kind": "float", "unit": "m", "step": 0.01,
+        "desc": "Deadband used by the TO (arena-frame waypoint) step. Loose by design — APPROACH / ALIGN / HOLD use the tight distance_deadband_m because they track a marker, but TO is a 'rough waypoint' command and 5cm precision from far-wall ArUco is impractical. 0.3m is a good default for 'be in the home zone'.",
+    },
     "distance_deadband_m": {
         "label": "distance deadband", "kind": "float", "unit": "m", "step": 0.01,
         "desc": "|distance - target| below this → rc_fb=0. Defines what 'at target distance' means for phase-settle and PD.",
@@ -733,7 +744,7 @@ TUNING_GROUPS = [
     ("Mission script defaults",
         ["default_dance_seconds_s", "dance_radius_m"]),
     ("Deadbands",
-        ["yaw_deadband_deg", "distance_deadband_m",
+        ["yaw_deadband_deg", "distance_deadband_m", "goto_deadband_m",
          "heading_deadband_deg", "approach_heading_deadband_deg",
          "align_heading_deadband_deg"]),
     ("Phase timing",

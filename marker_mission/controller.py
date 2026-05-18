@@ -1903,10 +1903,14 @@ class MissionController:
         # Reuse the marker-relative PD gains. Both legs operate on
         # metres of error and are clipped to *_rc_max, so they're a
         # reasonable fit; the integrators were reset on entry by
-        # _set_phase.
-        u_fwd = (0.0 if abs(err_fwd) < cfg.distance_deadband_m
+        # _set_phase. The deadband is the GOTO-specific
+        # ``goto_deadband_m`` (default 0.3m) rather than the tight
+        # marker-relative ``distance_deadband_m`` (0.05m), because
+        # TO targets an arena-frame point reached from far-wall
+        # ArUco, where 5cm is not realistically achievable.
+        u_fwd = (0.0 if abs(err_fwd) < cfg.goto_deadband_m
                  else self.pd_fwd.step(err_fwd, now))
-        u_lat = (0.0 if abs(err_right) < cfg.distance_deadband_m
+        u_lat = (0.0 if abs(err_right) < cfg.goto_deadband_m
                  else self.pd_lat.step(err_right, now))
 
         # Optional altitude leg.
@@ -1946,7 +1950,7 @@ class MissionController:
         self._send_rc(int(u_lat), int(u_fwd), int(u_ud), int(u_yaw))
 
         e_xy = math.hypot(ex, ey)
-        in_band = e_xy < cfg.distance_deadband_m and height_ok and yaw_ok
+        in_band = e_xy < cfg.goto_deadband_m and height_ok and yaw_ok
         settled = False
         with self.state.lock:
             z_txt = (f"  z_e={e_h:+.2f}m" if tz is not None else "")
