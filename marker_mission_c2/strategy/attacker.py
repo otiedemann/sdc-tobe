@@ -73,7 +73,10 @@ def _full_attack_script(ctx: RoleContext, attack_marker_id: int) -> str:
     approach_d = max(0.2, float(m.approach_distance_m))
     ascend = max(0.6, float(m.capture_ascend_m))
     forward = max(0.1, float(m.capture_forward_m))
-    hover_s = max(2.0, float(m.capture_hover_s))
+    # Lower floor than the previous 2.0 — the operator wants race-pace
+    # captures (the capture window is mostly "give the scout a chance
+    # to register the new face"; 1 s is enough at 5 Hz vision).
+    hover_s = max(1.0, float(m.capture_hover_s))
     home = (
         ctx.match.home_red if ctx.drone.team == "red" else ctx.match.home_blue
     )
@@ -84,7 +87,7 @@ def _full_attack_script(ctx: RoleContext, attack_marker_id: int) -> str:
         f"HEIGHT {ascend:.2f}",
         f"FB_IMU {forward:.2f}",
         "YAW_IMU 180",
-        f"HOOVER {hover_s:.0f}",
+        f"HOOVER {hover_s:.1f}",
         f"TO {home.x:.2f} {home.y:.2f} {home_alt:.2f}",
         "LAND",
     )
