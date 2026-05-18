@@ -12,11 +12,11 @@ User=ubuntu
 Group=ubuntu
 WorkingDirectory=/opt/sdc-tobe
 # .venv-c2 is the dedicated C2 venv (flask + httpx + requests).
-# --c2 points at the marker_mission_c2 server (same host, port 8090).
-# --config reads the FC name list to pre-populate per-drone settings
-# before the C2 overview is reachable.
+# --config seeds (a) the FC name list for per-drone settings and (b)
+# the C2 base URL (read from the config's bind block — C2 may listen
+# on a Tailscale IP, not 0.0.0.0, so a hard-coded 127.0.0.1 would
+# never connect).
 ExecStart=/opt/sdc-tobe/.venv-c2/bin/python -m marker_mission_c2.strategy \
-          --c2 http://127.0.0.1:8090 \
           --config /opt/sdc-tobe/marker_mission_c2/config.json \
           --host 0.0.0.0 --port 8091
 Restart=on-failure
