@@ -2,19 +2,24 @@
 
 Flight pattern:
     TAKEOFF
-    TO  <neutral.x> <neutral.y> <scout_alt_m>
+    HEIGHT <scout_alt_m>
     SCOUT
     HOOVER <scout_hover_s>
 
-The ``SCOUT`` DSL verb performs a slow 360° yaw rotation in place — fast
-enough to finish in seconds, slow enough that the ArUco detector can lock
-onto each marker as it sweeps past. We then hover briefly so the marker
-tracker has time to capture a fresh observation before the script ends and
-we re-push.
+We deliberately skip a precision ``TO`` step here. The marker_mission
+``TO`` step requires sub-5cm horizontal positioning and 1s of settling
+before it'll advance, which is unrealistic when the only visible markers
+are far-wall ones. The drone would then hang at step 2/4 forever and
+never reach SCOUT.
 
-The runner is responsible for harvesting ``visible_marker_ids`` from the C2
-state stream and feeding it to :class:`MarkerTracker`; the role itself just
-keeps the drone airborne and rotating.
+Instead we use ``HEIGHT`` (uses the on-board altimeter, not ArUco) to
+get the drone up to scout altitude, then ``SCOUT`` to do the slow 360°
+yaw rotation in place. After takeoff the Anafi already auto-stabilises
+in place, so this is plenty good for "rotate and observe."
+
+The runner harvests ``visible_marker_ids`` from the C2 state stream and
+feeds it to :class:`MarkerTracker`; the role just keeps the drone
+airborne and rotating.
 """
 from __future__ import annotations
 
@@ -34,14 +39,11 @@ def _compose_scout_script(ctx: RoleContext) -> Optional[str]:
     drone = ctx.drone
     if not drone.team:
         return None
-    neutral = (
-        ctx.match.neutral_red if drone.team == "red" else ctx.match.neutral_blue
-    )
     alt = max(0.6, float(drone.scout_alt_m))
     hover_s = max(2.0, float(ctx.match.scout_hover_s))
     return _format_script(
         "TAKEOFF",
-        f"TO {neutral.x:.2f} {neutral.y:.2f} {alt:.2f}",
+        f"HEIGHT {alt:.2f}",
         "SCOUT",
         f"HOOVER {hover_s:.0f}",
     )
