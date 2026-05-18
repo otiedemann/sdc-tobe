@@ -78,6 +78,10 @@ def build_app(
         runner.events.add("settings",
                           f"drone updated: {body}",
                           drone=fc_name)
+        # Apply role change immediately so a follow-up target assignment
+        # isn't wiped by the runner's lazy reset on the next tick.
+        if "role" in body:
+            runner.sync_role_state(fc_name)
         return _no_cache(jsonify({"ok": True, "drone": _drone_dict(patched)}))
 
     @app.route("/api/settings/match", methods=["POST"])

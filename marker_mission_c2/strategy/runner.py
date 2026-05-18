@@ -162,6 +162,28 @@ class SwarmRunner:
         with self._states_lock:
             return {fc: rs for fc, rs in self._role_states.items()}
 
+    def sync_role_state(self, fc_name: str) -> None:
+        """Pull the drone's role from settings into RoleState immediately.
+
+        Called by the web layer after a settings change so a follow-up
+        :meth:`assign_target` doesn't get wiped by the runner's lazy reset
+        on the next tick.
+        """
+        d = self._settings.drone(fc_name)
+        if d is None:
+            return
+        with self._states_lock:
+            rs = self._role_states.setdefault(
+                fc_name, RoleState(fc_name=fc_name)
+            )
+            if rs.role != d.role:
+                self._events.add(
+                    "role",
+                    f"{rs.role!r} -> {d.role!r} (sync)",
+                    drone=fc_name,
+                )
+                rs.reset_for_role(d.role)
+
     def assign_target(self, fc_name: str, slot: Optional[int]) -> None:
         """Assign (or clear) an attacker's target slot (1..6)."""
         with self._states_lock:
