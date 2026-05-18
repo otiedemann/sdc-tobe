@@ -88,14 +88,25 @@ class ScoutRole(Role):
 
         # Re-push when:
         #   (a) we've never pushed for this role, or
-        #   (b) the FC reports phase=init (script finished) and enough time
-        #       has passed since the last push to avoid hammering.
+        #   (b) the FC's mission script is exhausted (DONE/INIT after a
+        #       full run, OR explicit script_idx >= len(script)).
+        #
+        # Carefully exclude phase=IDLE: marker_mission uses Phase.IDLE
+        # for HOOVER-without-prior-APPROACH, which is what we sit in
+        # between SCOUT cycles inside our long chained script. Treating
+        # IDLE as "finished" used to fire spurious re-pushes that the
+        # C2 (correctly) rejected because the previous mission was still
+        # running. We now only re-push when the FC has truly exhausted
+        # the script and dropped back to INIT/DONE.
         import time
 
         now = time.time()
         rs = ctx.role_state
         never_pushed = not rs.last_pushed_script
-        fc_finished = ctx.state.phase in ("init", "idle", "landed")
+        # "Truly finished" = back to INIT (FC's resting state between
+        # missions) or DONE. LAND is mid-shutdown and we shouldn't
+        # interrupt it. IDLE is mid-script HOOVER and must not trigger.
+        fc_finished = ctx.state.phase in ("init", "done", "")
         long_enough = (now - rs.last_pushed_unix_s) >= 2.0
 
         if never_pushed:

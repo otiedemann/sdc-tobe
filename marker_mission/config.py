@@ -224,6 +224,12 @@ class MissionConfig:
                                               # before declaring the marker
                                               # lost (handles brief occlusions)
 
+    # --- SCOUT step (operator-facing slow 360° look-around) -----------------
+    # Yaw stick value held during the SCOUT step. Default 15 is gentle
+    # enough for the ArUco detector to lock onto markers as the camera
+    # sweeps past them; raise it for faster but rougher scans.
+    scout_yaw_stick: int = 15              # TUNE  RC counts (-100..+100)
+
     # --- Phase transition criteria -------------------------------------------
     approach_settle_time_s: float = 1.0    # how long all errors must be inside
                                               # dead-bands before we consider
@@ -605,6 +611,10 @@ TUNING_FIELDS = {
         "label": "search yaw RC", "kind": "int", "step": 1,
         "desc": "rc_yaw value used during SEARCH while sweeping for the marker. ≈ degrees-per-second yaw rate.",
     },
+    "scout_yaw_stick": {
+        "label": "scout yaw RC", "kind": "int", "step": 1,
+        "desc": "rc_yaw value held during the SCOUT step (slow 360° look-around). Default 15 gives a gentle ~22°/s spin — slow enough for the ArUco detector to lock onto markers. Crank up for faster sweeps at the cost of detection reliability.",
+    },
     "ud_rc_max": {
         "label": "ud RC max", "kind": "int", "step": 1,
         "desc": "Cap on rc_ud (altitude). The mission doesn't actively command altitude (Anafi self-stabilises), but the cap protects the channel from accidental large values.",
@@ -703,7 +713,7 @@ TUNING_GROUPS = [
         ["approach_settle_time_s", "align_settle_time_s",
          "search_marker_lost_grace_s"]),
     ("Safety / search",
-        ["distance_floor_factor", "search_yaw_rc"]),
+        ["distance_floor_factor", "search_yaw_rc", "scout_yaw_stick"]),
     ("Pose smoothing",
         ["pose_smoothing_alpha", "pose_max_age_s"]),
     ("Operator UX",

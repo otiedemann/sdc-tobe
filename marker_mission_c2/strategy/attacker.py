@@ -1,72 +1,72 @@
 """ATTACKER role.
 
-Operator assigns a target *slot* (1..6). The role decides which ArUco
-face to approach based on the slot's current holder, then runs the
-canonical capture script:
+Operator assigns a target *slot* (1..6). The role pushes ONE complete
+mission script that does everything end-to-end:
 
     TAKEOFF
     APPROACH <enemy-face-id> <approach_distance_m>
     HEIGHT <capture_ascend_m>
     FB_IMU <capture_forward_m>
     HOOVER <capture_hover_s>
+    TO <home.x> <home.y> <home_alt>
+    LAND
 
-After the script ends, we wait for a scout to confirm the slot now shows
-*our* face (i.e. ``markers.slot_holder(slot) == our_team``). Falls
-through to RTH after ``VERIFY_TIMEOUT_S`` so we never sit forever.
+The drone approaches the enemy face, ascends, drifts over the marker,
+hovers briefly, returns to home, and lands. After the script is fully
+done (FC drops back to Phase.INIT), the role marks itself done and the
+target is cleared.
 
-Phase machine:
+We deliberately keep it as a single push (rather than separate attack +
+RTH scripts) because pushing a second script while the first is still
+running is rejected by marker_mission_c2's start endpoint. Mid-script
+phase==IDLE (during HOOVER) is *not* "script finished" — it's just
+station-keeping within the current mission.
 
+Phases:
     idle    → no target assigned, or target already captured by us
-    attack  → script pushed, waiting for FC to finish
-    verify  → script done, waiting for scout confirmation
-    rth     → returning to home
-    done    → mission complete; reset to idle
+    running → attack script pushed, drone executing the whole sequence
+    done    → script ended (FC back to INIT); reset to idle
 
 If the operator assigns a slot we already hold (holder == our_team) the
-role skips straight to ``done`` — no need to attack.
+role short-circuits straight to ``done``.
+
+Verify-by-scout (i.e. abort RTH if the capture is not confirmed) is a
+future enhancement; for now the script always commits to the full
+approach-capture-RTH-land sequence.
 """
 from __future__ import annotations
 
 import logging
-import time
-from typing import Optional
 
-from .roles import Decision, Role, RoleContext, noop, push, register, stop_cmd
+from .roles import Decision, Role, RoleContext, noop, push, register
 from .settings import face_id
 
 logger = logging.getLogger(__name__)
-
-
-VERIFY_TIMEOUT_S = 30.0
 
 
 def _format_script(*lines: str) -> str:
     return "\n".join(line for line in lines if line) + "\n"
 
 
-def _attack_script(ctx: RoleContext, attack_marker_id: int) -> str:
-    """Approach the *visible enemy face*, ascend, drift over, hover."""
+def _full_attack_script(ctx: RoleContext, attack_marker_id: int) -> str:
+    """Approach the enemy face, ascend over it, RTH, land. One push."""
     m = ctx.match
     approach_d = max(0.2, float(m.approach_distance_m))
     ascend = max(0.6, float(m.capture_ascend_m))
     forward = max(0.1, float(m.capture_forward_m))
     hover_s = max(2.0, float(m.capture_hover_s))
+    home = (
+        ctx.match.home_red if ctx.drone.team == "red" else ctx.match.home_blue
+    )
+    home_alt = max(0.6, float(home.alt))
     return _format_script(
         "TAKEOFF",
         f"APPROACH {int(attack_marker_id)} {approach_d:.2f}",
         f"HEIGHT {ascend:.2f}",
         f"FB_IMU {forward:.2f}",
         f"HOOVER {hover_s:.0f}",
-    )
-
-
-def _rth_script(ctx: RoleContext) -> str:
-    drone = ctx.drone
-    home = ctx.match.home_red if drone.team == "red" else ctx.match.home_blue
-    alt = max(0.6, float(home.alt))
-    return _format_script(
-        f"TO {home.x:.2f} {home.y:.2f} {alt:.2f}",
-        "HOOVER 1",
+        f"TO {home.x:.2f} {home.y:.2f} {home_alt:.2f}",
+        "LAND",
     )
 
 
@@ -107,49 +107,33 @@ class AttackerRole(Role):
             attack_id = _enemy_face_for(slot, ctx.our_team)
             rs.last_attack_marker_id = attack_id
             return push(
-                _attack_script(ctx, attack_id),
-                new_phase="attack",
-                reason=f"attacker: attack slot {slot} (id={attack_id})",
+                _full_attack_script(ctx, attack_id),
+                new_phase="running",
+                reason=f"attacker: full attack on slot {slot} (id={attack_id})",
             )
 
-        # ---- attack: waiting for script to finish -------------------------
-        if rs.phase == "attack":
+        # ---- running: waiting for the entire script to finish -------------
+        if rs.phase == "running":
             if slot is None:
-                return stop_cmd("attacker: target cleared mid-attack")
-            if ctx.state.phase in ("init", "idle", "landed"):
-                rs.advance_phase("verify", "attack script finished")
-                return noop("attacker: awaiting scout verification")
-            return noop(f"attacker: attacking (fc phase={ctx.state.phase})")
-
-        # ---- verify: scout confirms our face is up ------------------------
-        if rs.phase == "verify":
-            if slot is None:
-                return stop_cmd("attacker: target cleared during verify")
-            if _slot_is_ours(ctx, slot):
-                return push(
-                    _rth_script(ctx),
-                    new_phase="rth",
-                    reason=f"attacker: slot {slot} captured (our face up), RTH",
-                )
-            elapsed = time.time() - rs.phase_started_unix_s
-            if elapsed > VERIFY_TIMEOUT_S:
-                return push(
-                    _rth_script(ctx),
-                    new_phase="rth",
-                    reason=f"attacker: verify timeout on slot {slot}, RTH anyway",
-                )
-            return noop(
-                f"attacker: verify slot {slot} (waiting for scout, t+{elapsed:.0f}s)"
-            )
-
-        # ---- rth: returning to home ---------------------------------------
-        if rs.phase == "rth":
-            if ctx.state.phase in ("init", "idle", "landed"):
+                # Target cleared while in flight — let the script finish on
+                # its own (it ends with LAND); we just reset our state.
+                rs.advance_phase("idle", "target cleared mid-flight")
+                return noop("attacker: target cleared mid-flight")
+            # Only "init" reliably means the script has fully ended (FC has
+            # landed and gone back to its resting state). Phase=IDLE
+            # during the HOOVER step is mid-script and must not be
+            # treated as completion.
+            if ctx.state.phase in ("init", "done", ""):
                 rs.target_slot = None
                 rs.target_assigned_unix_s = None
-                rs.advance_phase("done", "rth complete, target cleared")
-                return noop("attacker: home, target cleared")
-            return noop(f"attacker: RTH (fc phase={ctx.state.phase})")
+                rs.advance_phase(
+                    "done",
+                    f"attack on slot {slot} complete (FC back to init)",
+                )
+                return noop("attacker: attack complete, target cleared")
+            return noop(
+                f"attacker: running (fc phase={ctx.state.phase})"
+            )
 
         # Unknown phase — reset to idle.
         rs.advance_phase("idle", f"unknown phase {rs.phase}")

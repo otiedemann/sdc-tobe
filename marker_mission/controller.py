@@ -282,13 +282,10 @@ RC_BRAKE_SPEED_THRESHOLD_CMS: float = 8.0
 RC_BRAKE_MAX_SETTLE_S: float = 1.5
 
 # SCOUT step — operator-facing "slow 360° look-around" command. Yaw
-# stick is set to ``SCOUT_YAW_STICK`` and held until cumulative yaw
-# telemetry has rotated by SCOUT_TARGET_DEG, then we enter the
-# standard brake phase. SCOUT_MAX_DRIVE_S is a safety cap that
-# defeats a stuck-telemetry hang. The stick value of 15 was the
-# operator's spec — gentle enough to actually let the camera observe
-# the surroundings during the spin.
-SCOUT_YAW_STICK: int = 15
+# stick is held at ``cfg.scout_yaw_stick`` (tunable, default 15) until
+# cumulative yaw telemetry has rotated by SCOUT_TARGET_DEG, then we
+# enter the standard brake phase. SCOUT_MAX_DRIVE_S is a safety cap
+# that defeats a stuck-telemetry hang.
 SCOUT_TARGET_DEG: float = 360.0
 SCOUT_MAX_DRIVE_S: float = 30.0
 
@@ -1591,7 +1588,7 @@ class MissionController:
         if not braking:
             # DRIVE phase ─ keep the yaw stick at SCOUT_YAW_STICK and
             # accumulate rotation from telemetry.
-            self._send_rc(0, 0, 0, SCOUT_YAW_STICK,
+            self._send_rc(0, 0, 0, int(self.cfg.scout_yaw_stick),
                           enforce_cfg_caps=False)
             cur_yaw = tel.yaw_deg if tel is not None else None
             if cur_yaw is not None:
@@ -2218,7 +2215,7 @@ class MissionController:
                 self.state.rc_step_brake_started = None
             self._set_phase(
                 Phase.SCOUT,
-                note + f" yaw_stick={SCOUT_YAW_STICK} "
+                note + f" yaw_stick={int(self.cfg.scout_yaw_stick)} "
                        f"target=±{SCOUT_TARGET_DEG:g}°"
             )
             return
