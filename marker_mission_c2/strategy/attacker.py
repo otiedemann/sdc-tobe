@@ -49,7 +49,26 @@ def _format_script(*lines: str) -> str:
 
 
 def _full_attack_script(ctx: RoleContext, attack_marker_id: int) -> str:
-    """Approach the enemy face, ascend over it, RTH, land. One push."""
+    """Approach the enemy face, fly over, turn around, RTH, land.
+
+    Script shape:
+        TAKEOFF
+        APPROACH <id> <approach_distance_m>
+        HEIGHT <capture_ascend_m>
+        FB_IMU <capture_forward_m>     # drift forward to be *over* the box
+        YAW_IMU 180                     # turn to face home
+        HOOVER <capture_hover_s>        # capture window (already facing home)
+        TO <home.x> <home.y> <home_alt> # forward cruise back to home
+        LAND
+
+    The YAW_IMU 180 step is the key to a fast return: by the time the
+    HOOVER capture window ends, the drone is already pointed at home,
+    so the subsequent TO step drives the drone forward (not backward
+    or sideways), which gives the fwd PD channel — already the
+    fastest-tuned — the full control range. Tested before this change,
+    the drone had to swing 180° during TO, sliding sideways while
+    yawing; with this change it's a clean straight-line cruise.
+    """
     m = ctx.match
     approach_d = max(0.2, float(m.approach_distance_m))
     ascend = max(0.6, float(m.capture_ascend_m))
@@ -64,6 +83,7 @@ def _full_attack_script(ctx: RoleContext, attack_marker_id: int) -> str:
         f"APPROACH {int(attack_marker_id)} {approach_d:.2f}",
         f"HEIGHT {ascend:.2f}",
         f"FB_IMU {forward:.2f}",
+        "YAW_IMU 180",
         f"HOOVER {hover_s:.0f}",
         f"TO {home.x:.2f} {home.y:.2f} {home_alt:.2f}",
         "LAND",
