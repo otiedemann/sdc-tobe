@@ -1,473 +1,233 @@
-"""Role assignment + role-specific task factories.
+"""Role definitions: the per-drone behaviour contract.
 
-The strategy decides each drone's role dynamically every tick based on
-:class:`SwarmState` + :class:`StrategySettings`. An operator can pin a
-role per drone in settings (``drones.<fc>.role``); ``None`` (the
-default) means "let the strategy choose".
+A *role* is a small state machine that, given the current world view, decides
+whether to push a fresh mission script to the FC. The runner ticks every
+known drone once per loop and asks its role to ``decide``.
 
-Three scoring functions, one per role. Each returns a float — higher
-is better. Returning ``-inf`` means "do NOT pick this drone for this
-role" (battery too low, drone not flying-capable, etc.).
-:class:`marker_mission_c2.strategy.planner.RoleAssignmentPlanner` runs
-all three scorers and greedy-assigns each drone to the highest-scoring
-role under per-role caps.
+Roles supported in this iteration:
+- ``idle``     — no script, drone stays put on the ground.
+- ``scout``    — fly to the neutral zone, rotate 360°, push marker
+                 observations to the tracker (handled by the runner via the
+                 C2 ``visible_marker_ids`` stream).
+- ``attacker`` — given a target marker assigned by the operator, fly toward
+                 it, capture it, and return home once a scout confirms the
+                 marker has been knocked over.
 
-For each role we also expose a factory that builds the right
-:class:`DroneTask` given the drone's current observation and the
-settings — e.g. "attacker on Sphinx3 should be SyncAttackPair against
-target 41 with Sphinx5 as partner".
+Concrete role classes live in :mod:`.scout` and :mod:`.attacker`; this module
+is the registry and shared dataclasses.
 """
 from __future__ import annotations
 
+import abc
 import logging
-from dataclasses import dataclass
-from typing import Dict, Mapping, Optional, Tuple
+import time
+from dataclasses import dataclass, field
+from typing import Any, Dict, Optional
 
-from .settings import MissionMode, Role, StrategySettings
-from .tasks import (
-    DroneTask,
-    HoldAboveTarget,
-    Idle,
-    ReclaimOnIntrusion,
-    ScoreAndCaptureLoop,
-    SyncAttackPair,
-    WaitInNeutral,
-)
-from .world_model import SwarmState
+from .markers import MarkerTracker
+from .settings import DroneSettings, MatchSettings
 
-log = logging.getLogger("c2.strategy.roles")
+logger = logging.getLogger(__name__)
+
+
+# Minimum interval between re-pushes of the same script (avoids hammering FC
+# while it's transitioning between phases).
+MIN_PUSH_INTERVAL_S = 2.0
 
 
 # ---------------------------------------------------------------------------
-# Default target layout — used to translate marker ID → arena (x, y) so
-# tasks can fly to a target without each module re-loading
-# ``default_target_layout.json``. Kept here so the strategy doesn't
-# couple to the tools/sphinx-arena/ build path.
-#
-# Coordinates mirror tools/sphinx-arena/default_target_layout.json
-# (commit-tracked, won't drift in practice — that file is the layout
-# of the physical arena). If you ever move the targets, edit both.
+# Plain-data view of a drone's C2 state (one item from /api/c2/overview).
 # ---------------------------------------------------------------------------
 
-TARGET_POSITIONS: Dict[int, Tuple[float, float, float]] = {
-    # Red team
-    41: (-5.0,  8.0, 1.0),
-    42: (-8.0,  5.4, 1.0),
-    43: (-5.0,  3.0, 1.0),
-    44: ( 0.0,  0.0, 1.0),   # spare, normally disabled
-    45: ( 0.0,  0.0, 1.0),
-    46: ( 0.0,  0.0, 1.0),
-    # Blue team
-    31: ( 5.0,  8.0, 1.0),
-    32: ( 8.0,  5.4, 1.0),
-    33: ( 5.0,  3.0, 1.0),
-    34: ( 0.0,  0.0, 1.0),
-    35: ( 0.0,  0.0, 1.0),
-    36: ( 0.0,  0.0, 1.0),
-}
-
-
-def target_pos(target_id: int) -> Optional[Tuple[float, float, float]]:
-    return TARGET_POSITIONS.get(int(target_id))
-
-
-# ---------------------------------------------------------------------------
-# Scoring
-# ---------------------------------------------------------------------------
 
 @dataclass(frozen=True)
-class _ScoreCtx:
-    """Bundled context passed to every score fn — keeps the signatures
-    short and makes adding new inputs (e.g. recent kills, enemy
-    positions) painless."""
-    state: SwarmState
-    settings: StrategySettings
+class DroneState:
+    fc_name: str
+    connection_ok: bool = False
+    drone_connected: bool = False
+    phase: str = "unknown"
+    visible_marker_ids: tuple[int, ...] = ()
+    active_marker_id: Optional[int] = None
+    mission_running: bool = False
+    raw: Dict[str, Any] = field(default_factory=dict)
 
-
-# Per-role minimum battery — under this, the role is disqualified.
-# Higher than safety.battery_critical_pct because we want to retire
-# drones *before* safety has to STOP them mid-attack.
-_MIN_BATTERY_ATTACKER = 30.0
-_MIN_BATTERY_DEFENDER = 25.0
-_MIN_BATTERY_SCOUT    = 20.0
-
-
-def score_attacker(ctx: _ScoreCtx, fc: str) -> float:
-    """Higher = better attacker candidate. Returns ``-inf`` if the
-    drone simply isn't fit to attack (offline, low battery, etc.)."""
-    obs = ctx.state.drones.get(fc)
-    if obs is None or not obs.online or not obs.drone_connected:
-        return float("-inf")
-    if obs.battery_pct is None or obs.battery_pct < _MIN_BATTERY_ATTACKER:
-        return float("-inf")
-    # Pinned attacker → priority over everything.
-    if ctx.settings.role_for(fc) == Role.ATTACKER:
-        return 1000.0
-    # Pinned to a *different* role → score very low so the planner
-    # doesn't accidentally promote them.
-    pinned = ctx.settings.drones.get(fc)
-    if pinned is not None and pinned.role != Role.IDLE:
-        return -100.0
-    score = 10.0
-    # Higher battery = stronger preference. 100 % adds +5, 30 % adds 0.
-    score += (obs.battery_pct - 30.0) / 14.0
-    # Drones already in our home zone are pre-staged (closer to the
-    # target staging point) — prefer them so the attack starts faster.
-    if obs.pose is not None and ctx.settings.is_in_home_zone(obs.pose[0]):
-        score += 3.0
-    return score
-
-
-def score_defender(ctx: _ScoreCtx, fc: str) -> float:
-    obs = ctx.state.drones.get(fc)
-    if obs is None or not obs.online or not obs.drone_connected:
-        return float("-inf")
-    if obs.battery_pct is None or obs.battery_pct < _MIN_BATTERY_DEFENDER:
-        return float("-inf")
-    if ctx.settings.role_for(fc) == Role.DEFENDER:
-        return 1000.0
-    pinned = ctx.settings.drones.get(fc)
-    if pinned is not None and pinned.role != Role.IDLE:
-        return -100.0
-    score = 5.0
-    # Battery contribution lighter than attacker's — defenders don't
-    # have to commit a full strike.
-    score += (obs.battery_pct - 25.0) / 25.0
-    # Bonus if an enemy is currently within intercept_radius of one of
-    # our targets — there's actual work for the defender to do.
-    if _intrusion_detected(ctx):
-        score += 7.0
-    return score
-
-
-def score_scout(ctx: _ScoreCtx, fc: str) -> float:
-    obs = ctx.state.drones.get(fc)
-    if obs is None or not obs.online or not obs.drone_connected:
-        return float("-inf")
-    if obs.battery_pct is None or obs.battery_pct < _MIN_BATTERY_SCOUT:
-        return float("-inf")
-    if ctx.settings.role_for(fc) == Role.SCOUT:
-        return 1000.0
-    pinned = ctx.settings.drones.get(fc)
-    if pinned is not None and pinned.role != Role.IDLE:
-        return -100.0
-    # Scout is a fallback role — lower default score than attacker /
-    # defender so the planner only picks scouts after attacker and
-    # defender slots are filled.
-    return 2.0
-
-
-def _intrusion_detected(ctx: _ScoreCtx) -> bool:
-    """Best-effort intrusion check: any drone reported in this snapshot
-    that isn't ours, within intercept_radius of one of our targets.
-
-    Currently a stub — we don't have a friend/foe channel in
-    :class:`SwarmState`, so this always returns False until we wire
-    enemy positions (e.g. via the drone-detector YOLO output).
-    Returning False just makes the defender's score the same as the
-    scout's baseline, so behaviour stays sane."""
-    return False
-
-
-# ---------------------------------------------------------------------------
-# Task factories
-# ---------------------------------------------------------------------------
-
-def _safe_hover_xy(s: StrategySettings, marker_xy: Tuple[float, float],
-                   inset_m: float = 1.5) -> Tuple[float, float]:
-    """Compute a safe (x, y) for the drone to hover at, given a wall-
-    mounted marker's position. We do TWO transforms:
-
-    1. **Pull toward arena centre by ``inset_m``** so the drone is
-       ~1.5 m clear of the wall the marker is mounted on. Without this,
-       the drone would be commanded TO the wall coordinate (e.g.
-       target 31 sits at (5, 8) which is the +X wall itself) and
-       overshoot it.
-    2. **Clamp to the arena's safe inner box** (half-extent minus
-       ``arena.safety_margin_m``). Belt-and-braces — if the marker
-       position drifts past the wall (sometimes happens with the SDC
-       arena tooling) we still don't generate an OOB script.
-    """
-    mx, my = float(marker_xy[0]), float(marker_xy[1])
-    half_w = s.arena.width_m / 2.0 - s.arena.safety_margin_m
-    half_d = s.arena.depth_m / 2.0 - s.arena.safety_margin_m
-    # Step 1: pull toward origin.  unit-vector from marker→(0,0)
-    import math
-    r = math.hypot(mx, my)
-    if r > 1e-6:
-        ux, uy = -mx / r, -my / r
-        sx = mx + ux * inset_m
-        sy = my + uy * inset_m
-    else:
-        sx, sy = mx, my
-    # Step 2: clamp to safe arena box.
-    sx = max(-half_w, min(half_w, sx))
-    sy = max(-half_d, min(half_d, sy))
-    return (sx, sy)
-
-
-def build_attacker_task(
-    fc: str,
-    ctx: _ScoreCtx,
-    target_marker_id: int,
-    partner_fc: Optional[str] = None,
-    partner_target_marker_id: Optional[int] = None,
-) -> DroneTask:
-    """Pre-strike: stage above the assigned target. If a partner is
-    also an attacker, build a :class:`SyncAttackPair` that will flip
-    into the dive script once both are in position.
-
-    Falls back to a plain :class:`HoldAboveTarget` if no partner is
-    available (solo attacker — never executes the 10-pt move, just
-    holds).
-
-    The hover position is **not** the marker's coordinate (which sits
-    on the wall) — it's pulled inward by :func:`_safe_hover_xy` so the
-    drone stages safely inside the arena.
-    """
-    s = ctx.settings
-    pos = target_pos(target_marker_id)
-    if pos is None:
-        log.warning("attacker on %s: target_id %s has no known position",
-                    fc, target_marker_id)
-        return Idle(fc)
-    safe_xy = _safe_hover_xy(s, (pos[0], pos[1]))
-    partner_pos = (target_pos(partner_target_marker_id)
-                   if partner_target_marker_id is not None else None)
-    partner_safe = (_safe_hover_xy(s, (partner_pos[0], partner_pos[1]))
-                    if partner_pos is not None else None)
-
-    if partner_fc is not None and partner_safe is not None:
-        return SyncAttackPair(
-            target=fc,
-            target_marker_id=target_marker_id,
-            target_pos=safe_xy,
-            hover_alt_m=s.attack.hover_alt_m,
-            strike_alt_m=s.attack.strike_alt_m,
-            partner_fc=partner_fc,
-            partner_target_pos=partner_safe,
-            sync_window_s=s.attack.sync_window_s,
-            ready_radius_m=1.5,
+    @classmethod
+    def from_overview(cls, fc_name: str, item: Dict[str, Any]) -> "DroneState":
+        if not isinstance(item, dict):
+            return cls(fc_name=fc_name, raw={})
+        state = item.get("state") or {}
+        if not isinstance(state, dict):
+            state = {}
+        vmids_raw = state.get("visible_marker_ids") or []
+        try:
+            vmids = tuple(int(x) for x in vmids_raw)
+        except (TypeError, ValueError):
+            vmids = ()
+        phase = str(state.get("phase") or "unknown")
+        active = state.get("active_marker_id")
+        try:
+            active_id = int(active) if active is not None else None
+        except (TypeError, ValueError):
+            active_id = None
+        return cls(
+            fc_name=fc_name,
+            connection_ok=bool(item.get("connection_ok", False)),
+            drone_connected=bool(item.get("drone_connected", False)),
+            phase=phase,
+            visible_marker_ids=vmids,
+            active_marker_id=active_id,
+            mission_running=phase not in ("", "unknown", "init", "idle", "landed"),
+            raw=item,
         )
-    return HoldAboveTarget(
-        target=fc, target_marker_id=target_marker_id,
-        hover_alt_m=s.attack.hover_alt_m, target_pos=safe_xy,
-    )
-
-
-def build_defender_task(
-    fc: str,
-    ctx: _ScoreCtx,
-) -> DroneTask:
-    """Defender: wait in the neutral zone unless intrusion detected,
-    in which case fly toward the threatened own-target.
-
-    Intrusion detection is a placeholder until we wire enemy
-    positions; meanwhile the defender just parks like a scout.
-    """
-    s = ctx.settings
-    if _intrusion_detected(ctx):
-        # Pick our nearest own-target as the reclaim point.
-        own_ids = sorted(s.own_target_ids)
-        if own_ids:
-            return ReclaimOnIntrusion(fc, target_marker_id=own_ids[0])
-    x, y, z = _neutral_slot(fc, ctx)
-    return WaitInNeutral(fc, x=x, y=y, alt_m=z)
-
-
-def build_scout_task(
-    fc: str,
-    ctx: _ScoreCtx,
-) -> DroneTask:
-    """Scout: park in neutral zone at the drone's cruise altitude."""
-    x, y, z = _neutral_slot(fc, ctx)
-    return WaitInNeutral(fc, x=x, y=y, alt_m=z)
-
-
-def build_idle_task(fc: str, ctx: _ScoreCtx) -> DroneTask:
-    return Idle(fc)
-
-
-def _neutral_slot(fc: str, ctx: _ScoreCtx) -> Tuple[float, float, float]:
-    """Per-drone parking slot inside the neutral band. Deterministic
-    spread along Y so two drones with the same cruise altitude don't
-    sit on top of each other (XY separation as a fallback to altitude
-    layering).
-
-    Strategy: lay slots along the depth (Y) axis, evenly spaced, in
-    insertion order of the drones in settings.drones. Each slot sits
-    at the centre of the neutral X band, at the drone's cruise
-    altitude.
-    """
-    s = ctx.settings
-    fcs = list(s.drones.keys())
-    n = max(1, len(fcs))
-    try:
-        idx = fcs.index(fc)
-    except ValueError:
-        idx = 0
-    lo, hi = s.arena.neutral_zone_x_m
-    x_mid = (lo + hi) / 2.0
-    # Slot the drones along arena Y inside the neutral band — keep a
-    # 1.5 m margin from each end of the depth axis so they don't
-    # bracket the front/back walls.
-    half_d = s.arena.depth_m / 2.0
-    span = max(0.0, 2.0 * half_d - 3.0)
-    y_step = span / max(1, n - 1) if n > 1 else 0.0
-    y_slot = -half_d + 1.5 + idx * y_step if n > 1 else 0.0
-    z_slot = s.cruise_altitude_for(fc)
-    return (x_mid, y_slot, z_slot)
 
 
 # ---------------------------------------------------------------------------
-# Top-level decision: which role for each drone, then build the task
+# Per-drone role-runtime state, kept in memory by the runner.
 # ---------------------------------------------------------------------------
+
 
 @dataclass
-class RoleDecision:
-    fc: str
-    role: Role
-    score: float
-    task: DroneTask
+class RoleState:
+    fc_name: str
+    role: str = "idle"
+    phase: str = "idle"
+    target_marker_id: Optional[int] = None
+    target_assigned_unix_s: Optional[float] = None
+    last_pushed_script: str = ""
+    last_pushed_unix_s: float = 0.0
+    last_decision_reason: str = ""
+    phase_started_unix_s: float = field(default_factory=time.time)
+    history: list[dict] = field(default_factory=list)
 
+    def reset_for_role(self, new_role: str) -> None:
+        self.role = new_role
+        self.phase = "idle"
+        self.target_marker_id = None
+        self.target_assigned_unix_s = None
+        self.last_pushed_script = ""
+        self.last_pushed_unix_s = 0.0
+        self.last_decision_reason = "role changed"
+        self.phase_started_unix_s = time.time()
+        self.history.clear()
 
-def decide_roles(
-    state: SwarmState,
-    settings: StrategySettings,
-    *,
-    max_attackers: int = 2,
-    max_defenders: int = 1,
-) -> Mapping[str, RoleDecision]:
-    """Greedy role assignment.
-
-    Algorithm:
-      1. Score each (fc, role) tuple with the three score fns.
-      2. Walk roles in priority order: attacker → defender → scout →
-         idle. For each role, assign up to ``max_<role>`` drones with
-         the highest score for that role (and score > -inf).
-      3. Remaining drones get :class:`Role.IDLE`.
-
-    Caps are operator-tunable parameters; the default ``2 attackers /
-    1 defender`` matches the 10-pt sync-strike doctrine + one
-    home-zone watcher.
-
-    Returns ``{fc → RoleDecision}`` containing the assigned role, its
-    score, and the concrete :class:`DroneTask` to run this tick.
-    """
-    ctx = _ScoreCtx(state=state, settings=settings)
-    fcs = list(state.drones.keys())
-
-    # Mission mode = SCORE_CAPTURE short-circuits the role / utility
-    # machinery. Every healthy drone runs the same score-and-capture
-    # loop in parallel. Role is reported as "attacker" so the UI's
-    # colour coding still works; the actual task is
-    # ScoreAndCaptureLoop.
-    if settings.match.mode == MissionMode.SCORE_CAPTURE:
-        out: Dict[str, RoleDecision] = {}
-        for fc in fcs:
-            obs = state.drones.get(fc)
-            if (obs is None or not obs.online or not obs.drone_connected
-                    or obs.battery_pct is None
-                    or obs.battery_pct < _MIN_BATTERY_ATTACKER):
-                out[fc] = RoleDecision(
-                    fc=fc, role=Role.IDLE, score=0.0, task=Idle(fc))
-                continue
-            out[fc] = RoleDecision(
-                fc=fc, role=Role.ATTACKER, score=1.0,
-                task=ScoreAndCaptureLoop(
-                    target=fc, settings=settings,
-                    hover_alt_m=settings.match.score_hover_alt_m,
-                    hover_s=settings.match.score_hover_s,
-                ),
-            )
-        return out
-
-    # Score table: roles[fc][role] = score
-    scores: Dict[str, Dict[Role, float]] = {fc: {} for fc in fcs}
-    for fc in fcs:
-        scores[fc][Role.ATTACKER] = score_attacker(ctx, fc)
-        scores[fc][Role.DEFENDER] = score_defender(ctx, fc)
-        scores[fc][Role.SCOUT] = score_scout(ctx, fc)
-        scores[fc][Role.IDLE] = 0.1  # Universal fallback
-
-    assigned: Dict[str, Role] = {}
-    caps = {Role.ATTACKER: max_attackers, Role.DEFENDER: max_defenders,
-            Role.SCOUT: 999, Role.IDLE: 999}
-
-    for role in (Role.ATTACKER, Role.DEFENDER, Role.SCOUT, Role.IDLE):
-        cap = caps[role]
-        # Candidates not yet assigned, sorted by score desc.
-        candidates = sorted(
-            ((fc, scores[fc][role]) for fc in fcs if fc not in assigned),
-            key=lambda x: x[1],
-            reverse=True,
+    def advance_phase(self, new_phase: str, reason: str = "") -> None:
+        if new_phase == self.phase:
+            return
+        self.history.append(
+            {
+                "from": self.phase,
+                "to": new_phase,
+                "reason": reason,
+                "unix_s": time.time(),
+            }
         )
-        for fc, sc in candidates:
-            if cap <= 0:
-                break
-            if sc == float("-inf"):
-                continue
-            assigned[fc] = role
-            cap -= 1
-        if cap == 0 and role == Role.IDLE:
-            break
+        self.phase = new_phase
+        self.phase_started_unix_s = time.time()
+        self.last_decision_reason = reason or self.last_decision_reason
 
-    # Build attacker pairs so SyncAttackPair gets a partner reference.
-    attackers = [fc for fc, r in assigned.items() if r == Role.ATTACKER]
-    own_targets = sorted(settings.own_target_ids)
-    pairs_cfg = settings.attack_pair_targets()
-    # Default: assign the first qualifying pair to the first two
-    # attackers in alphabetical order. More attackers than slots → the
-    # rest fall through to plain HoldAboveTarget (no partner).
-    attacker_assignments: Dict[str, Tuple[Optional[int], Optional[str], Optional[int]]] = {}
-    if len(attackers) >= 2 and pairs_cfg:
-        a1, a2 = sorted(attackers)[:2]
-        t1, t2 = pairs_cfg[0]
-        attacker_assignments[a1] = (t1, a2, t2)
-        attacker_assignments[a2] = (t2, a1, t1)
-        # remaining attackers (if any) get solo HoldAboveTarget on the
-        # rest of our targets, cycling through
-        rest = [a for a in sorted(attackers) if a not in (a1, a2)]
-        spare_targets = [t for t in own_targets if t not in (t1, t2)] or own_targets
-        for i, a in enumerate(rest):
-            attacker_assignments[a] = (
-                spare_targets[i % len(spare_targets)],
-                None, None,
-            )
-    elif len(attackers) >= 1:
-        # Solo attacker (or no pairs defined): everyone gets a target
-        # in round-robin, no partner.
-        targets = own_targets or [None]
-        for i, a in enumerate(sorted(attackers)):
-            attacker_assignments[a] = (
-                (int(targets[i % len(targets)])
-                 if targets and targets[i % len(targets)] is not None
-                 else None),
-                None, None,
-            )
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "fc_name": self.fc_name,
+            "role": self.role,
+            "phase": self.phase,
+            "target_marker_id": self.target_marker_id,
+            "target_assigned_unix_s": self.target_assigned_unix_s,
+            "last_pushed_script": self.last_pushed_script,
+            "last_pushed_unix_s": self.last_pushed_unix_s,
+            "last_pushed_age_s": (
+                time.time() - self.last_pushed_unix_s
+                if self.last_pushed_unix_s
+                else None
+            ),
+            "last_decision_reason": self.last_decision_reason,
+            "phase_age_s": time.time() - self.phase_started_unix_s,
+            "history_tail": self.history[-5:],
+        }
 
-    # Now build tasks per drone.
-    out: Dict[str, RoleDecision] = {}
-    for fc in fcs:
-        role = assigned.get(fc, Role.IDLE)
-        score = scores[fc][role]
-        if role == Role.ATTACKER:
-            tgt, partner, partner_tgt = attacker_assignments.get(
-                fc, (None, None, None))
-            if tgt is None:
-                task: DroneTask = Idle(fc)
-            else:
-                task = build_attacker_task(
-                    fc, ctx,
-                    target_marker_id=tgt,
-                    partner_fc=partner,
-                    partner_target_marker_id=partner_tgt,
-                )
-        elif role == Role.DEFENDER:
-            task = build_defender_task(fc, ctx)
-        elif role == Role.SCOUT:
-            task = build_scout_task(fc, ctx)
-        else:
-            task = build_idle_task(fc, ctx)
-        out[fc] = RoleDecision(fc=fc, role=role, score=score, task=task)
-    return out
+
+# ---------------------------------------------------------------------------
+# Decision: what the runner should do for this drone right now.
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class Decision:
+    kind: str          # "push" | "stop" | "noop"
+    script: str = ""
+    new_phase: str = ""
+    reason: str = ""
+
+
+def noop(reason: str = "") -> Decision:
+    return Decision(kind="noop", reason=reason)
+
+
+def push(script: str, *, new_phase: str = "", reason: str = "") -> Decision:
+    return Decision(kind="push", script=script, new_phase=new_phase, reason=reason)
+
+
+def stop_cmd(reason: str = "") -> Decision:
+    return Decision(kind="stop", reason=reason)
+
+
+# ---------------------------------------------------------------------------
+# Role context (everything a role needs to decide).
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class RoleContext:
+    drone: DroneSettings
+    match: MatchSettings
+    state: DroneState
+    markers: MarkerTracker
+    role_state: RoleState
+    # ID lists for the drone's team and the enemy team (live markers only).
+    own_target_ids: tuple[int, ...]
+    enemy_target_ids: tuple[int, ...]
+
+
+class Role(abc.ABC):
+    """Base class for a role. Stateless — all state lives in ``RoleState``."""
+
+    name: str = "abstract"
+
+    @abc.abstractmethod
+    def decide(self, ctx: RoleContext) -> Decision:
+        """Return the action the runner should take for this drone now."""
+
+
+# ---------------------------------------------------------------------------
+# Registry. Concrete roles register themselves at module-import time.
+# ---------------------------------------------------------------------------
+
+
+_REGISTRY: Dict[str, Role] = {}
+
+
+def register(role: Role) -> Role:
+    _REGISTRY[role.name] = role
+    return role
+
+
+def get(name: str) -> Optional[Role]:
+    return _REGISTRY.get(name)
+
+
+def all_roles() -> Dict[str, Role]:
+    return dict(_REGISTRY)
+
+
+# Idle role: never pushes anything. Used as the default safe state.
+
+
+class _IdleRole(Role):
+    name = "idle"
+
+    def decide(self, ctx: RoleContext) -> Decision:
+        if ctx.role_state.phase != "idle":
+            ctx.role_state.advance_phase("idle", "role=idle")
+        return noop("idle")
+
+
+register(_IdleRole())

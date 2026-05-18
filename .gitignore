@@ -241,3 +241,6 @@ __marimo__/
 /controller/mission_presets.json
 /controller/position_presets.json
 
+# Strategy runtime settings (operator-local; example template is committed)
+/marker_mission_c2/strategy/settings.json
+

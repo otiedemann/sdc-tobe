@@ -1,284 +1,377 @@
-"""SwarmRunner: the tick loop that wires every other strategy module
-together and applies the resulting :class:`FCCommand` via FCPool.
+"""Strategy main loop.
 
-Runs on the same asyncio event loop as :mod:`marker_mission_c2.server`
-so it can re-use the pool's :class:`httpx.AsyncClient`. Pull-pattern:
+Runs an asyncio task that ticks every ``TICK_INTERVAL_S`` and, for each
+known drone:
+  1. Reads the latest C2 overview.
+  2. Updates the marker tracker with the drone's ``visible_marker_ids``.
+  3. Dispatches the drone's active role -> :class:`Decision`.
+  4. Acts on the decision (push script / stop mission / no-op) via the
+     :class:`C2Client`.
 
-    while running:
-        state = world_model.observe()              # sync
-        tasks = planner.decide(state)              # sync
-        for fc, task in tasks.items():
-            cmd  = task.tick(state)                 # sync
-            verd = safety.gate(cmd, state)          # sync
-            await self._dispatch(verd.cmd)          # async — single FC call
-
-Default tick rate is 1 Hz; the C2's per-FC ``/api/state`` poll already
-runs at ``state_poll_hz`` (default 5 Hz), so 1 Hz strategy decisions
-are about as fast as the inputs change. Tune via ``tick_hz=``.
-
-This module owns no policy. Plug your own planner/safety in if you need
-something exotic.
+The runner is "armed" by the operator before it actually sends any
+commands; before that it observes only. This is the safety gate that
+prevents drones taking off at boot.
 """
 from __future__ import annotations
 
 import asyncio
+import collections
 import logging
+import threading
 import time
-from dataclasses import dataclass
-from typing import Awaitable, Callable, Mapping, Optional
+from dataclasses import dataclass, field
+from typing import Any, Deque, Dict, Iterable, List, Optional
 
-from .safety import SafetyGate, SafetyVerdict
-from .tasks import CmdKind, DroneTask, FCCommand
-from .world_model import SwarmState, SwarmWorldModel
+from .c2_client import C2Client
+from .markers import MarkerTracker
+from .roles import (
+    Decision,
+    DroneState,
+    Role,
+    RoleContext,
+    RoleState,
+    get as get_role,
+)
+from .settings import DroneSettings, MatchSettings, SettingsStore
 
-log = logging.getLogger("c2.strategy.runner")
+# Pull SCOUT/ATTACKER side-effect imports so they register themselves.
+from . import scout as _scout  # noqa: F401
+from . import attacker as _attacker  # noqa: F401
+
+logger = logging.getLogger(__name__)
+
+TICK_INTERVAL_S = 1.0
+EVENT_LOG_MAX = 200
+
+
+# ---------------------------------------------------------------------------
+# Event log
+# ---------------------------------------------------------------------------
 
 
 @dataclass
-class TickRecord:
-    """One iteration of the loop, exposed via the optional ``on_tick``
-    callback. Cheap to log or push to a SSE channel.
-    """
-    t: float
-    state: SwarmState
-    decisions: Mapping[str, str]             # fc_name -> task.name
-    dispatched: Mapping[str, FCCommand]      # fc_name -> command actually sent
-    safety_overrides: Mapping[str, str]      # fc_name -> reason
+class Event:
+    unix_s: float
+    kind: str
+    drone: Optional[str]
+    text: str
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "unix_s": self.unix_s,
+            "kind": self.kind,
+            "drone": self.drone,
+            "text": self.text,
+        }
+
+
+class EventLog:
+    """Thread-safe ring buffer of events. Keep small; mostly UI fodder."""
+
+    def __init__(self, maxlen: int = EVENT_LOG_MAX) -> None:
+        self._lock = threading.RLock()
+        self._buf: Deque[Event] = collections.deque(maxlen=maxlen)
+
+    def add(self, kind: str, text: str, drone: Optional[str] = None) -> None:
+        ev = Event(unix_s=time.time(), kind=kind, drone=drone, text=text)
+        with self._lock:
+            self._buf.append(ev)
+        logger.info("strategy event [%s] %s%s", kind,
+                    f"{drone}: " if drone else "", text)
+
+    def snapshot(self) -> List[Event]:
+        with self._lock:
+            return list(self._buf)
+
+    def to_list(self) -> List[Dict[str, Any]]:
+        return [e.to_dict() for e in self.snapshot()]
+
+
+# ---------------------------------------------------------------------------
+# Runner
+# ---------------------------------------------------------------------------
 
 
 class SwarmRunner:
-    """The strategy event loop. Construct once, ``await start()``; call
-    ``await stop()`` to wind down.
-
-    Wired to live FCPool but doesn't import the pool's classes — keeps
-    the strategy testable with a duck-typed fake (anything with
-    ``snapshot()`` for the world_model and ``client(name)`` for
-    dispatch).
-
-    Optional ``on_tick`` is fired with a :class:`TickRecord` after each
-    iteration completes; useful for SSE-streaming the latest strategy
-    decisions into the C2 dashboard, or for offline replay.
-    """
+    """Owns per-drone role state and pushes scripts on tick."""
 
     def __init__(
         self,
-        pool,
-        world_model: Optional[SwarmWorldModel] = None,
-        planner=None,
-        safety: Optional[SafetyGate] = None,
-        tick_hz: float = 1.0,
-        on_tick: Optional[Callable[[TickRecord], Awaitable[None] | None]] = None,
-        match_state=None,
-        event_log=None,
-    ):
-        self._pool = pool
-        self._world = world_model or SwarmWorldModel(pool)
-        if planner is None:
-            raise ValueError("SwarmRunner needs a planner")
-        self._planner = planner
-        if safety is None:
-            from .safety import SafetyConfig
-            safety = SafetyGate(SafetyConfig())
-        self._safety = safety
-        self._dt = 1.0 / max(0.1, float(tick_hz))
-        self._on_tick = on_tick
-        self._match_state = match_state
-        self._event_log = event_log
-        # Per-drone observability: latest assigned task name, latest
-        # dispatched FCCommand, latest pushed script content. Exposed
-        # via current_task_for() / current_script_for() so the web
-        # layer can surface them on /api/state without reaching into
-        # the runner's internals.
-        self._last_task_name: dict = {}
-        self._last_script: dict = {}
-        self._last_dispatched: dict = {}
-        self._last_role: dict = {}
-        self._stop = asyncio.Event()
-        self._task: Optional[asyncio.Task] = None
+        *,
+        settings: SettingsStore,
+        c2: C2Client,
+        markers: MarkerTracker,
+        events: Optional[EventLog] = None,
+        tick_interval_s: float = TICK_INTERVAL_S,
+    ) -> None:
+        self._settings = settings
+        self._c2 = c2
+        self._markers = markers
+        self._events = events or EventLog()
+        self._tick_interval_s = tick_interval_s
 
-    # ---------- lifecycle ----------
+        self._role_states: Dict[str, RoleState] = {}
+        self._states_lock = threading.RLock()
+
+        # Armed = strategy may push/stop scripts. When disarmed the runner
+        # still observes (overview + marker tracker) but never commands.
+        self._armed = False
+        self._armed_lock = threading.RLock()
+
+        # Loop bookkeeping.
+        self._loop: Optional[asyncio.AbstractEventLoop] = None
+        self._task: Optional[asyncio.Task] = None
+        self._tick_count = 0
+        self._last_tick_unix_s = 0.0
+        self._last_overview: Dict[str, Any] = {}
+
+    # ------------------------------------------------------------------
+    # Public read API (called from Flask handlers, so must be thread-safe)
+    # ------------------------------------------------------------------
+
+    @property
+    def events(self) -> EventLog:
+        return self._events
+
+    def is_armed(self) -> bool:
+        with self._armed_lock:
+            return self._armed
+
+    def arm(self, source: str = "operator") -> None:
+        with self._armed_lock:
+            if self._armed:
+                return
+            self._armed = True
+        self._events.add("arm", f"runner armed by {source}")
+
+    def disarm(self, source: str = "operator") -> None:
+        with self._armed_lock:
+            if not self._armed:
+                return
+            self._armed = False
+        self._events.add("disarm", f"runner disarmed by {source}")
+
+    def tick_count(self) -> int:
+        return self._tick_count
+
+    def role_state(self, fc_name: str) -> Optional[RoleState]:
+        with self._states_lock:
+            return self._role_states.get(fc_name)
+
+    def role_states(self) -> Dict[str, RoleState]:
+        with self._states_lock:
+            return {fc: rs for fc, rs in self._role_states.items()}
+
+    def assign_target(self, fc_name: str, marker_id: Optional[int]) -> None:
+        """Assign (or clear) an attacker's target."""
+        with self._states_lock:
+            rs = self._role_states.setdefault(
+                fc_name, RoleState(fc_name=fc_name)
+            )
+            rs.target_marker_id = (
+                int(marker_id) if marker_id is not None else None
+            )
+            rs.target_assigned_unix_s = time.time() if marker_id is not None else None
+            rs.advance_phase(
+                "idle" if marker_id is None else "idle",
+                reason=(
+                    "target cleared" if marker_id is None
+                    else f"target {marker_id} assigned"
+                ),
+            )
+        self._events.add(
+            "target",
+            f"{'cleared' if marker_id is None else f'assigned marker {marker_id}'}",
+            drone=fc_name,
+        )
+
+    def snapshot(self) -> Dict[str, Any]:
+        return {
+            "armed": self.is_armed(),
+            "tick_count": self._tick_count,
+            "last_tick_unix_s": self._last_tick_unix_s,
+            "tick_interval_s": self._tick_interval_s,
+            "drones": {
+                fc: rs.to_dict() for fc, rs in self.role_states().items()
+            },
+        }
+
+    # ------------------------------------------------------------------
+    # Lifecycle
+    # ------------------------------------------------------------------
 
     async def start(self) -> None:
-        if self._task and not self._task.done():
+        if self._task is not None:
             return
-        self._stop.clear()
-        self._task = asyncio.create_task(self._run(), name="c2-strategy-runner")
+        self._loop = asyncio.get_running_loop()
+        self._task = asyncio.create_task(self._loop_body(), name="strategy-runner")
+        self._events.add("runner", "loop started (disarmed)")
 
     async def stop(self) -> None:
-        self._stop.set()
-        if self._task:
-            try:
-                await asyncio.wait_for(self._task, timeout=2.0)
-            except (asyncio.TimeoutError, asyncio.CancelledError):
-                self._task.cancel()
-
-    # ---------- the loop ----------
-
-    async def _run(self) -> None:
-        log.info("strategy runner started @ %.1f Hz", 1.0 / self._dt)
-        try:
-            while not self._stop.is_set():
-                t0 = time.monotonic()
-                if self._match_state is not None:
-                    # Record the tick first thing so even a tick that
-                    # explodes inside observe()/decide() still bumps
-                    # the counter — operator sees "still alive" in
-                    # the UI even during a transient failure.
-                    self._match_state.record_tick()
-                try:
-                    state = self._world.observe()
-                    assignments = self._planner.decide(state)
-                    decisions = {fc: t.name for fc, t in assignments.items()}
-                    dispatched: dict[str, FCCommand] = {}
-                    overrides: dict[str, str] = {}
-
-                    # Dispatch all FCs in parallel; one failing call must
-                    # not delay the others.
-                    coros = []
-                    for fc, task in assignments.items():
-                        self._last_task_name[fc] = task.name
-                        # Role-change event (planner re-decides each
-                        # tick; the planner has already cached and
-                        # only flips when the role really changes,
-                        # but we double-check here for the log).
-                        live_role = None
-                        if hasattr(self._planner, "current_role_for"):
-                            live_role = self._planner.current_role_for(fc)
-                        if (self._event_log is not None
-                                and live_role is not None
-                                and self._last_role.get(fc) != live_role):
-                            self._event_log.add(
-                                "role_change",
-                                f"{self._last_role.get(fc, '—')} → {live_role}",
-                                drone=fc,
-                            )
-                            self._last_role[fc] = live_role
-                        try:
-                            cmd = task.tick(state)
-                        except Exception:
-                            log.exception("task.tick crashed on %s — IDLE", fc)
-                            cmd = FCCommand.idle(fc)
-                        verd = self._safety.gate(cmd, state)
-                        if verd.overridden:
-                            overrides[fc] = verd.reason
-                            if self._event_log is not None:
-                                # script_push that got muted to idle by
-                                # safety is also a safety event the
-                                # operator wants to see.
-                                self._event_log.add(
-                                    "safety",
-                                    verd.reason,
-                                    drone=fc,
-                                    payload={
-                                        "original_kind": cmd.kind.value,
-                                        "result_kind": verd.cmd.kind.value,
-                                    },
-                                )
-                            # Circuit breaker: any STOP_MISSION from
-                            # safety also auto-disarms the strategy.
-                            # Otherwise we thrash — the FC ends the
-                            # mission, the task re-pushes on the next
-                            # phase=init tick, the drone takes off,
-                            # safety fires again, repeat. Auto-disarm
-                            # breaks the loop and forces the operator
-                            # to inspect before re-arming.
-                            if (verd.cmd.kind == CmdKind.STOP_MISSION
-                                    and self._safety.is_armed()):
-                                self._safety.disarm()
-                                if self._event_log is not None:
-                                    self._event_log.add(
-                                        "disarm",
-                                        f"auto-disarm: safety fired STOP_MISSION ({verd.reason})",
-                                        drone=fc,
-                                    )
-                        dispatched[fc] = verd.cmd
-                        if verd.cmd.kind != CmdKind.IDLE:
-                            # New script push or stop — log it for the
-                            # operator. Skip if the dispatched payload
-                            # is identical to last time (the task may
-                            # re-push the same script if FC goes idle).
-                            self._last_dispatched[fc] = verd.cmd
-                            if (verd.cmd.kind == CmdKind.START_MISSION
-                                    and self._event_log is not None):
-                                script = verd.cmd.payload.get("script", "")
-                                # Compact one-liner for the event msg
-                                # (the full script lives in payload).
-                                pretty = script.strip().replace("\n", " / ")
-                                self._last_script[fc] = script
-                                self._event_log.add(
-                                    "script_push", pretty[:160],
-                                    drone=fc,
-                                    payload={"script": script},
-                                )
-                            elif (verd.cmd.kind == CmdKind.STOP_MISSION
-                                    and self._event_log is not None):
-                                self._event_log.add(
-                                    "script_push", "STOP_MISSION",
-                                    drone=fc,
-                                )
-                            coros.append(self._dispatch(verd.cmd))
-
-                    if coros:
-                        await asyncio.gather(*coros, return_exceptions=True)
-
-                    if self._on_tick is not None:
-                        rec = TickRecord(
-                            t=t0, state=state, decisions=decisions,
-                            dispatched=dispatched, safety_overrides=overrides,
-                        )
-                        try:
-                            result = self._on_tick(rec)
-                            if asyncio.iscoroutine(result):
-                                await result
-                        except Exception:
-                            log.exception("on_tick callback failed")
-                except Exception:
-                    log.exception("strategy tick failed — continuing")
-
-                # Sleep the remainder of the tick budget.
-                slack = self._dt - (time.monotonic() - t0)
-                if slack > 0:
-                    try:
-                        await asyncio.wait_for(self._stop.wait(), timeout=slack)
-                    except asyncio.TimeoutError:
-                        pass
-        finally:
-            log.info("strategy runner stopped")
-
-    # ---------- dispatch ----------
-
-    # ---------- public introspection (web reads these) ----------
-
-    def current_task_for(self, fc: str) -> Optional[str]:
-        return self._last_task_name.get(fc)
-
-    def current_script_for(self, fc: str) -> Optional[str]:
-        return self._last_script.get(fc)
-
-    def last_dispatched_for(self, fc: str):
-        return self._last_dispatched.get(fc)
-
-    async def _dispatch(self, cmd: FCCommand) -> None:
-        """Apply one command to one FC via the existing
-        :class:`AsyncFCClient` surface. Logs and swallows errors so a
-        single dead FC never crashes the loop.
-        """
-        client = self._pool.client(cmd.target)
-        if client is None:
-            log.warning("dispatch: unknown target %s", cmd.target)
+        if self._task is None:
             return
+        self._task.cancel()
         try:
-            if cmd.kind == CmdKind.START_MISSION:
-                await client.start_mission(script=cmd.payload.get("script"))
-            elif cmd.kind == CmdKind.STOP_MISSION:
-                await client.stop_mission()
-            elif cmd.kind == CmdKind.APPLY_TUNE:
-                await client.apply_tune(cmd.payload.get("updates") or {})
-            elif cmd.kind == CmdKind.SET_ARENA:
-                await client.set_active_arena(cmd.payload.get("arena") or {})
-            elif cmd.kind == CmdKind.IDLE:
-                pass
+            await self._task
+        except asyncio.CancelledError:
+            pass
+        self._task = None
+        self._events.add("runner", "loop stopped")
+
+    # ------------------------------------------------------------------
+    # Loop body
+    # ------------------------------------------------------------------
+
+    async def _loop_body(self) -> None:
+        try:
+            while True:
+                t0 = time.time()
+                try:
+                    await self._tick_once()
+                except Exception:
+                    logger.exception("strategy: tick crashed (continuing)")
+                self._tick_count += 1
+                self._last_tick_unix_s = time.time()
+                elapsed = time.time() - t0
+                await asyncio.sleep(max(0.05, self._tick_interval_s - elapsed))
+        except asyncio.CancelledError:
+            raise
+
+    async def _tick_once(self) -> None:
+        # 1) Pull settings snapshot once per tick (fresh each loop).
+        s = self._settings.snapshot()
+        # Keep the marker tracker's team IDs in sync with the live config.
+        self._markers.update_team_ids(
+            red_live_ids=s.markers.red_live_ids,
+            blue_live_ids=s.markers.blue_live_ids,
+        )
+
+        # 2) Read C2 overview.
+        ok, overview = await self._c2.overview()
+        if not ok:
+            return
+        self._last_overview = overview
+
+        # 3) Ingest visible markers from every connected drone.
+        for fc_name, item in overview.items():
+            state = (item or {}).get("state") or {}
+            vmids = state.get("visible_marker_ids") or []
+            try:
+                ids = [int(x) for x in vmids]
+            except (TypeError, ValueError):
+                continue
+            if ids:
+                self._markers.ingest(fc_name, ids)
+
+        # 4) Dispatch each known drone (drones from settings, not C2 — the
+        # operator decides who plays; the C2 overview tells us if they're
+        # online).
+        for drone in s.drones:
+            ds = DroneState.from_overview(drone.fc_name, overview.get(drone.fc_name) or {})
+            with self._states_lock:
+                rs = self._role_states.setdefault(
+                    drone.fc_name, RoleState(fc_name=drone.fc_name)
+                )
+                if rs.role != drone.role:
+                    self._events.add(
+                        "role",
+                        f"{rs.role!r} -> {drone.role!r}",
+                        drone=drone.fc_name,
+                    )
+                    rs.reset_for_role(drone.role)
+
+            role = get_role(drone.role) or get_role("idle")
+            if role is None:
+                continue
+
+            own_ids, enemy_ids = self._team_target_ids(drone, s)
+            ctx = RoleContext(
+                drone=drone,
+                match=s.match,
+                state=ds,
+                markers=self._markers,
+                role_state=rs,
+                own_target_ids=own_ids,
+                enemy_target_ids=enemy_ids,
+            )
+
+            try:
+                decision = role.decide(ctx)
+            except Exception:
+                logger.exception(
+                    "strategy: role %s for %s raised", role.name, drone.fc_name
+                )
+                continue
+
+            await self._apply_decision(drone.fc_name, decision)
+
+    # ------------------------------------------------------------------
+    # Decision dispatch
+    # ------------------------------------------------------------------
+
+    def _team_target_ids(
+        self, drone: DroneSettings, s
+    ) -> tuple[tuple[int, ...], tuple[int, ...]]:
+        if drone.team == "red":
+            return tuple(s.markers.red_live_ids), tuple(s.markers.blue_live_ids)
+        if drone.team == "blue":
+            return tuple(s.markers.blue_live_ids), tuple(s.markers.red_live_ids)
+        return (), ()
+
+    async def _apply_decision(self, fc_name: str, decision: Decision) -> None:
+        rs = self.role_state(fc_name)
+        if rs is None:
+            return
+
+        rs.last_decision_reason = decision.reason or rs.last_decision_reason
+
+        if decision.kind == "noop":
+            return
+
+        # Honour arming gate: never command FCs while disarmed. Always log
+        # what we would have done, so the operator can see decisions are
+        # being made even before arming.
+        if not self.is_armed():
+            self._events.add(
+                "disarmed_skip",
+                f"{decision.kind} suppressed (disarmed): {decision.reason}",
+                drone=fc_name,
+            )
+            return
+
+        if decision.kind == "push":
+            # Throttle: same script within MIN_PUSH_INTERVAL_S is suppressed.
+            now = time.time()
+            same_script = decision.script == rs.last_pushed_script
+            recently = (now - rs.last_pushed_unix_s) < 2.0
+            if same_script and recently:
+                return
+            ok, _ = await self._c2.start(fc_name, script=decision.script)
+            if ok:
+                rs.last_pushed_script = decision.script
+                rs.last_pushed_unix_s = now
+                if decision.new_phase:
+                    rs.advance_phase(decision.new_phase, decision.reason)
+                self._events.add(
+                    "script_push",
+                    f"pushed script ({len(decision.script.splitlines())} lines): "
+                    f"{decision.reason}",
+                    drone=fc_name,
+                )
             else:
-                log.warning("dispatch: unknown CmdKind %s", cmd.kind)
-        except Exception:
-            log.exception("dispatch %s to %s failed", cmd.kind.value, cmd.target)
+                self._events.add(
+                    "script_push_failed",
+                    f"C2 rejected push: {decision.reason}",
+                    drone=fc_name,
+                )
+            return
+
+        if decision.kind == "stop":
+            ok, _ = await self._c2.stop(fc_name)
+            self._events.add(
+                "stop" if ok else "stop_failed",
+                decision.reason,
+                drone=fc_name,
+            )
+            rs.advance_phase("idle", decision.reason)
+            return

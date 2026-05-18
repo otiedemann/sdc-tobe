@@ -1,9 +1,9 @@
 [Unit]
-Description=marker_mission_c2 strategy runner + operator UI on :8091
+Description=SDC26 strategy runner + operator UI on :8091
 After=network-online.target marker-mission.service marker-mission-c2.service
-# Soft deps: the strategy still boots if the FC is down — its world
-# model just reports the FC offline. STOP_MISSION safety overrides
-# fire correctly in that state, so this matches the design intent.
+# Soft deps: the strategy still boots if the FC or C2 is down. It only
+# observes via /api/c2/overview, and never commands until the operator
+# arms it from the UI.
 Wants=marker-mission.service marker-mission-c2.service
 
 [Service]
@@ -12,12 +12,13 @@ User=ubuntu
 Group=ubuntu
 WorkingDirectory=/opt/sdc-tobe
 # .venv-c2 is the dedicated C2 venv (flask + httpx + requests).
-# --config picks the canonical C2 config (same FC list the main
-# dashboard uses); --strategy-settings is omitted so the strategy
-# resolves marker_mission_c2/strategy/settings.json → settings.example.json
-# → defaults, exactly the documented order.
-ExecStart=/opt/sdc-tobe/.venv-c2/bin/python -m marker_mission_c2.strategy.app \
-          --config /opt/sdc-tobe/marker_mission_c2/config.json
+# --c2 points at the marker_mission_c2 server (same host, port 8090).
+# --config reads the FC name list to pre-populate per-drone settings
+# before the C2 overview is reachable.
+ExecStart=/opt/sdc-tobe/.venv-c2/bin/python -m marker_mission_c2.strategy \
+          --c2 http://127.0.0.1:8090 \
+          --config /opt/sdc-tobe/marker_mission_c2/config.json \
+          --host 0.0.0.0 --port 8091
 Restart=on-failure
 RestartSec=10s
 StandardOutput=journal

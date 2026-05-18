@@ -1,91 +1,14 @@
-"""marker_mission_c2.strategy — reactive strategy layer for the fleet C2.
+"""Swarm strategy for SDC26.
 
-Sits on top of :mod:`marker_mission_c2` (which already polls each FC's
-``/api/state`` and exposes :class:`marker_mission_c2.fc_pool.FCPool`)
-and chooses what each drone should do *next*. Five modules, narrow
-contracts between them, nothing in ``marker_mission_c2/`` proper is
-modified — strategy is opt-in.
+A lightweight orchestration layer that sits next to marker_mission_c2 (the
+main C2 server) and drives multiple drones into role-based behaviours
+(SCOUT, ATTACKER, ...).
 
-Pipeline (one iteration per tick, default 1 Hz):
+The C2 server (marker_mission_c2.server) remains the single source of truth
+for FC connections, mission scripts and per-drone state. The strategy
+layer talks to it via plain HTTP (see ``c2_client``).
 
-    world_model.SwarmWorldModel.observe()    -> SwarmState (read-only)
-    planner.SwarmPlanner.decide(state)       -> dict[fc_name -> DroneTask]
-    DroneTask.tick(state)                    -> FCCommand
-    safety.SafetyGate.gate(cmd, state)       -> FCCommand (possibly modified)
-    runner.SwarmRunner._dispatch(cmd)        -> applies via FCPool
-
-See ``README.md`` in this directory for the design rationale and
-extension points.
+Public entry-point: ``python -m marker_mission_c2.strategy``.
 """
-from __future__ import annotations
 
-from .world_model import (
-    DroneObservation,
-    SwarmState,
-    SwarmWorldModel,
-)
-from .tasks import (
-    FCCommand,
-    CmdKind,
-    DroneTask,
-    Idle,
-    StartMission,
-    StopMission,
-    ApplyTune,
-    SetArena,
-    Goto,
-    HoldAboveTarget,
-    WaitInNeutral,
-    ReclaimOnIntrusion,
-    SyncAttackPair,
-)
-from .planner import (
-    SwarmPlanner,
-    StaticAssignmentPlanner,
-    UtilityPlanner,
-    RoleAssignmentPlanner,
-)
-from . import roles
-from .safety import (
-    SafetyConfig,
-    SafetyGate,
-    SafetyVerdict,
-)
-from .runner import (
-    SwarmRunner,
-    TickRecord,
-)
-from .settings import (
-    TeamColor,
-    Role,
-    StrategySettings,
-    ArenaSettings,
-    DroneAssignment,
-    AttackSettings,
-    DefenderSettings,
-    RED_TARGET_IDS,
-    BLUE_TARGET_IDS,
-    RED_LIVE_IDS,
-    BLUE_LIVE_IDS,
-    WALL_MARKER_IDS,
-)
-from . import settings  # exposed so callers can do `settings.load(...)`
-
-__all__ = [
-    "DroneObservation", "SwarmState", "SwarmWorldModel",
-    "FCCommand", "CmdKind", "DroneTask",
-    "Idle", "StartMission", "StopMission", "ApplyTune", "SetArena",
-    "Goto", "HoldAboveTarget", "WaitInNeutral",
-    "ReclaimOnIntrusion", "SyncAttackPair",
-    "SwarmPlanner", "StaticAssignmentPlanner", "UtilityPlanner",
-    "RoleAssignmentPlanner",
-    "roles",
-    "SafetyConfig", "SafetyGate", "SafetyVerdict",
-    "SwarmRunner", "TickRecord",
-    "TeamColor", "Role", "StrategySettings",
-    "ArenaSettings", "DroneAssignment",
-    "AttackSettings", "DefenderSettings",
-    "RED_TARGET_IDS", "BLUE_TARGET_IDS",
-    "RED_LIVE_IDS", "BLUE_LIVE_IDS", "WALL_MARKER_IDS",
-    "settings",
-]
+__all__ = ["app", "settings", "c2_client", "markers", "roles", "runner"]
