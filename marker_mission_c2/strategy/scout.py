@@ -1,74 +1,65 @@
 """SCOUT role.
 
-Flight pattern (one long script per push, avoids the land/takeoff yo-yo):
+Flight pattern (one continuous yaw drive, no breaks between rotations):
 
     TAKEOFF
     HEIGHT <scout_alt_m>
-    SCOUT
-    HOOVER <inter_scout_hover_s>
-    SCOUT
-    HOOVER <inter_scout_hover_s>
-    ...  (repeated SCOUT_CYCLES times)
+    RC 0 0 0 <scout_yaw_stick> <scout_drive_duration_s>
 
-Why a single long script instead of TAKEOFF + SCOUT + HOOVER repeated?
-marker_mission auto-lands at end-of-script (see controller._advance_script
-"safety LAND"), so re-pushing a short script after every rotation makes
-the drone land + takeoff between scans. Instead we push one ~10 minute
-mission of continuous SCOUT/HOOVER cycles. The Anafi battery dies before
-the script does, and the strategy re-pushes a fresh script after the
-drone is back on the ground.
+We deliberately pick the ``RC`` verb over chained ``SCOUT`` verbs. Each
+``SCOUT`` step in marker_mission auto-brakes when 360° accumulates,
+then we'd HOOVER, then the next SCOUT starts from a hover — that's the
+visible "stop and restart" between rotations the operator was seeing.
+``RC`` pins the yaw stick for the full duration with no intermediate
+braking, so the drone yaws continuously until the timer expires.
 
-We also intentionally drop the precision ``TO`` step. marker_mission's
-``TO`` requires sub-5cm horizontal precision + 1s settle, which is
-unrealistic from far-wall ArUco only. The drone would hang at step 2/N
-forever and never reach SCOUT. ``HEIGHT`` uses the on-board altimeter
-(no ArUco needed) so it always settles.
+The drone keeps rotating for ``scout_drive_duration_s`` seconds per
+push (default 600 s ≈ 10 minutes), then the script ends and the FC
+safety-lands. The strategy then re-pushes a fresh script after the
+drone has truly returned to Phase.INIT (handled by the
+``fc_finished`` gate below).
 
-Per-FC config dependency: the FC's ``default_height_m`` tune (climb-to
-altitude after TAKEOFF) should be set LOWER than ``scout_alt_m`` —
-otherwise the drone climbs to that altitude first, then descends to
-``scout_alt_m`` via the HEIGHT step (visible as an up-then-down). Set
-default_height_m ≈ 1.0 m on each FC via /api/tune/apply +
-/api/tune/save (or directly edit ``~/.marker_mission/config.json``).
+Two precision steps are deliberately skipped:
 
-The runner harvests ``visible_marker_ids`` from the C2 state stream and
-feeds it to :class:`MarkerTracker`; the role just keeps the drone
-airborne and rotating.
+* ``TO`` (precision arena-frame goto). Requires sub-5cm horizontal +
+  1s settle — unrealistic from far-wall ArUco only; the drone would
+  hang at step 2/N. We just stay at the takeoff position.
+* The ``SCOUT`` verb itself — see above.
+
+``HEIGHT`` uses the on-board altimeter (no ArUco needed) so it always
+settles. The FC's ``default_height_m`` tune should be set LOWER than
+``scout_alt_m`` (e.g. 1.0 m) so the drone climbs cleanly through it
+on takeoff rather than overshooting and descending.
 """
 from __future__ import annotations
 
 import logging
-from typing import Optional
+import time
 
 from .roles import Decision, Role, RoleContext, noop, push, register
 
 logger = logging.getLogger(__name__)
 
 
-# Number of SCOUT/HOOVER pairs to chain in a single push. Each SCOUT
-# step is roughly SCOUT_MAX_DRIVE_S (~30s) of slow yaw, then we
-# HOOVER scout_hover_s seconds between rotations so the marker tracker
-# can settle and the position estimator can re-acquire if it briefly
-# lost the active marker. 30 cycles × (30 + 2) s = ~16 minutes;
-# battery dies first.
-SCOUT_CYCLES = 30
-
-
 def _format_script(*lines: str) -> str:
     return "\n".join(line for line in lines if line) + "\n"
 
 
-def _compose_scout_script(ctx: RoleContext) -> Optional[str]:
+def _compose_scout_script(ctx: RoleContext) -> str | None:
     drone = ctx.drone
     if not drone.team:
         return None
     alt = max(0.6, float(drone.scout_alt_m))
-    inter_s = max(1.0, float(ctx.match.scout_hover_s))
-    lines = ["TAKEOFF", f"HEIGHT {alt:.2f}"]
-    for _ in range(SCOUT_CYCLES):
-        lines.append("SCOUT")
-        lines.append(f"HOOVER {inter_s:.0f}")
-    return _format_script(*lines)
+    yaw_stick = int(ctx.match.scout_yaw_stick)
+    # Clamp to RC channel range; the FC bypasses cfg caps for the RC
+    # verb so we are the only limit on operator-typed values.
+    yaw_stick = max(-100, min(100, yaw_stick))
+    duration_s = max(10.0, float(ctx.match.scout_drive_duration_s))
+    return _format_script(
+        "TAKEOFF",
+        f"HEIGHT {alt:.2f}",
+        f"RC 0 0 0 {yaw_stick} {duration_s:.0f}",
+    )
 
 
 class ScoutRole(Role):
@@ -86,26 +77,12 @@ class ScoutRole(Role):
         if script is None:
             return noop("scout: cannot compose script")
 
-        # Re-push when:
-        #   (a) we've never pushed for this role, or
-        #   (b) the FC's mission script is exhausted (DONE/INIT after a
-        #       full run, OR explicit script_idx >= len(script)).
-        #
-        # Carefully exclude phase=IDLE: marker_mission uses Phase.IDLE
-        # for HOOVER-without-prior-APPROACH, which is what we sit in
-        # between SCOUT cycles inside our long chained script. Treating
-        # IDLE as "finished" used to fire spurious re-pushes that the
-        # C2 (correctly) rejected because the previous mission was still
-        # running. We now only re-push when the FC has truly exhausted
-        # the script and dropped back to INIT/DONE.
-        import time
-
+        # Re-push only when the FC has *truly* exhausted the previous
+        # script. Phase.IDLE is mid-script HOOVER and must not trigger.
+        # Phase.RC is our continuous yaw drive — also not "finished".
         now = time.time()
         rs = ctx.role_state
         never_pushed = not rs.last_pushed_script
-        # "Truly finished" = back to INIT (FC's resting state between
-        # missions) or DONE. LAND is mid-shutdown and we shouldn't
-        # interrupt it. IDLE is mid-script HOOVER and must not trigger.
         fc_finished = ctx.state.phase in ("init", "done", "")
         long_enough = (now - rs.last_pushed_unix_s) >= 2.0
 

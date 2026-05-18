@@ -137,7 +137,20 @@ class MatchSettings:
     # Hover seconds between consecutive SCOUT rotations within a single
     # scout script. Short = fast cadence; long = more time for the
     # marker tracker to register the latest rotation's observations.
+    # NOTE: scout.py currently uses one continuous RC drive instead of
+    # chained SCOUT verbs, so this knob is unused — kept for backwards
+    # compat with persisted settings.
     scout_hover_s: float = 2.0
+    # Yaw stick value (RC counts; -100..+100) for the scout role's
+    # continuous yaw drive. Bypasses cfg.scout_yaw_stick on the FC —
+    # the strategy uses an RC step rather than the SCOUT verb so the
+    # drone rotates without the per-cycle brake.
+    scout_yaw_stick: int = 45
+    # How long one scout push drives the yaw stick for. Drone keeps
+    # rotating for this many seconds, then the script ends and the
+    # FC safety-lands. The strategy then re-pushes (TAKEOFF + RC ...).
+    # Default 600s = ~10 minutes per push; battery dies around 25 min.
+    scout_drive_duration_s: float = 600.0
 
 
 @dataclass(frozen=True)
@@ -283,6 +296,8 @@ def _settings_to_dict(s: StrategySettings) -> Dict[str, Any]:
             "capture_forward_m": float(s.match.capture_forward_m),
             "capture_hover_s": float(s.match.capture_hover_s),
             "scout_hover_s": float(s.match.scout_hover_s),
+            "scout_yaw_stick": int(s.match.scout_yaw_stick),
+            "scout_drive_duration_s": float(s.match.scout_drive_duration_s),
         },
         "markers": {
             "our_team": s.markers.our_team,
@@ -314,6 +329,12 @@ def _settings_from_dict(raw: Any, *, known_fc_names: Iterable[str]) -> StrategyS
             m_raw.get("capture_hover_s", m_defaults.capture_hover_s)
         ),
         scout_hover_s=float(m_raw.get("scout_hover_s", m_defaults.scout_hover_s)),
+        scout_yaw_stick=max(-100, min(100, int(
+            m_raw.get("scout_yaw_stick", m_defaults.scout_yaw_stick)
+        ))),
+        scout_drive_duration_s=float(
+            m_raw.get("scout_drive_duration_s", m_defaults.scout_drive_duration_s)
+        ),
     )
 
     markers_raw = raw.get("markers") or {}
@@ -466,12 +487,21 @@ class SettingsStore:
                 "capture_forward_m",
                 "capture_hover_s",
                 "scout_hover_s",
+                "scout_drive_duration_s",
             ):
                 if key in changes:
                     try:
                         allowed[key] = float(changes[key])
                     except (TypeError, ValueError):
                         continue
+            if "scout_yaw_stick" in changes:
+                try:
+                    val = int(changes["scout_yaw_stick"])
+                except (TypeError, ValueError):
+                    val = None
+                if val is not None:
+                    # Clamp to the RC channel range.
+                    allowed["scout_yaw_stick"] = max(-100, min(100, val))
             patched = replace(m, **allowed)
             self._settings = replace(self._settings, match=patched)
             self._write_atomic(_settings_to_dict(self._settings))
