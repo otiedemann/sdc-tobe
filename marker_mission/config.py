@@ -105,6 +105,17 @@ class MissionConfig:
     target_marker_id: int = 4              # ArUco ID of the central marker
     marker_size_m: float = 0.18            # physical side length [m]
     aruco_dict: str = "DICT_4X4_50"        # OpenCV dict name
+    # --- Per-id size override fallback ---------------------------------------
+    # When the arena config doesn't carry a per-marker ``size_m`` override
+    # (legacy arena.json files don't), the detector falls back to this:
+    # any detected marker whose id sits in ``target_marker_id_min``..
+    # ``target_marker_id_max`` (inclusive) uses ``target_marker_size_m``
+    # instead of the arena/cfg default. SDC26 default: ids 31..46 are
+    # 18cm target boxes; everything else (1..16 wall markers, etc.) uses
+    # the global size. Set min > max to disable the fallback entirely.
+    target_marker_size_m: float = 0.18
+    target_marker_id_min: int = 31
+    target_marker_id_max: int = 46
 
     # --- Mission goals -------------------------------------------------------
     target_distance_m: float = 1.0         # final standoff distance from marker [m]
@@ -223,6 +234,14 @@ class MissionConfig:
     search_marker_lost_grace_s: float = 1.5  # TUNE  hold last command this long
                                               # before declaring the marker
                                               # lost (handles brief occlusions)
+    # When SEARCH is entered after an APPROACH-class phase (the drone
+    # was actively tracking the marker and lost it), retreat briefly
+    # before yawing. This brings the marker back into view if the
+    # reason we lost it was "too close + tilted / FB_IMU passed over
+    # the target". Set search_retreat_s = 0 to disable.
+    search_retreat_s: int = 2              # TUNE  seconds of backward drive
+    search_retreat_rc: int = 25            # TUNE  RC magnitude during retreat
+                                            # (always applied as -fb stick)
 
     # --- SCOUT step (operator-facing slow 360° look-around) -----------------
     # Yaw stick value held during the SCOUT step. Default 15 is gentle
@@ -615,6 +634,14 @@ TUNING_FIELDS = {
         "label": "scout yaw RC", "kind": "int", "step": 1,
         "desc": "rc_yaw value held during the SCOUT step (slow 360° look-around). Default 15 gives a gentle ~22°/s spin — slow enough for the ArUco detector to lock onto markers. Crank up for faster sweeps at the cost of detection reliability.",
     },
+    "search_retreat_s": {
+        "label": "SEARCH retreat duration", "kind": "int", "unit": "s", "step": 1,
+        "desc": "When SEARCH is entered after APPROACH / HOLD / HEIGHT_ALIGN / ALIGN (drone was actively tracking the marker and lost it), retreat backward for this many seconds before yawing. Helps small-marker scenarios where FB_IMU pushed past the target and the marker is now behind the drone. 0 disables.",
+    },
+    "search_retreat_rc": {
+        "label": "SEARCH retreat RC", "kind": "int", "step": 1,
+        "desc": "Magnitude of the backward FB stick used during the SEARCH retreat phase. Always applied as -fb (backward); only the magnitude is configured here. Typical 20–30 for a gentle reverse.",
+    },
     "ud_rc_max": {
         "label": "ud RC max", "kind": "int", "step": 1,
         "desc": "Cap on rc_ud (altitude). The mission doesn't actively command altitude (Anafi self-stabilises), but the cap protects the channel from accidental large values.",
@@ -713,7 +740,8 @@ TUNING_GROUPS = [
         ["approach_settle_time_s", "align_settle_time_s",
          "search_marker_lost_grace_s"]),
     ("Safety / search",
-        ["distance_floor_factor", "search_yaw_rc", "scout_yaw_stick"]),
+        ["distance_floor_factor", "search_yaw_rc", "scout_yaw_stick",
+         "search_retreat_s", "search_retreat_rc"]),
     ("Pose smoothing",
         ["pose_smoothing_alpha", "pose_max_age_s"]),
     ("Operator UX",

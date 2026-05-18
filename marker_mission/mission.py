@@ -580,6 +580,28 @@ def cmd_fly(args: argparse.Namespace) -> int:
                 detector.set_marker_size(
                     _arena_now.marker_size_m if _arena_now is not None
                     else cfg.marker_size_m)
+                # Per-marker size resolver. Targets (ids 31..46 by
+                # default) are 18cm boxes while wall markers are 50cm;
+                # without this the detector would assume the arena
+                # default for both and inflate distance estimates by
+                # ~2.8× for whichever family doesn't match. Arena
+                # JSON can also carry a per-marker ``size_m`` override
+                # that wins over the cfg fallback below.
+                def _size_for(mid: int,
+                              _arena=_arena_now,
+                              _min=int(cfg.target_marker_id_min),
+                              _max=int(cfg.target_marker_id_max),
+                              _tsize=float(cfg.target_marker_size_m)) -> float:
+                    if _arena is not None:
+                        m = _arena.markers.get(int(mid))
+                        if m is not None and m.size_m is not None:
+                            return float(m.size_m)
+                    if _min <= int(mid) <= _max:
+                        return _tsize
+                    if _arena is not None:
+                        return float(_arena.marker_size_m)
+                    return float(cfg.marker_size_m)
+                detector.set_size_resolver(_size_for)
                 # Detect every visible marker so the operator sees them
                 # all in the video overlay -- the script can target any
                 # marker, and even non-target markers in frame are

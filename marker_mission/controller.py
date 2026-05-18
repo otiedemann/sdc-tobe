@@ -369,6 +369,11 @@ class MissionState:
     hold_began_at: Optional[float] = None
     search_began_at: Optional[float] = None
     search_yaw_swept_deg: float = 0.0
+    # When SEARCH was entered after an APPROACH-class phase, this is
+    # the monotonic timestamp at which the retreat-then-yaw transition
+    # should switch to plain yaw-in-place. None disables the retreat
+    # for this entry (e.g. SEARCH at script start).
+    search_retreat_until: Optional[float] = None
     last_marker_seen_at: float = 0.0
     # Captured on entry to Phase.ALIGN so the forward channel can hold the
     # current radius (we don't want to close distance until heading is
@@ -506,6 +511,7 @@ class MissionState:
             self.hold_began_at = None
             self.search_began_at = None
             self.search_yaw_swept_deg = 0.0
+            self.search_retreat_until = None
             self.last_marker_seen_at = 0.0
             self.align_distance_m = None
             self.mission_script = []
@@ -824,6 +830,25 @@ class MissionController:
             self._search_start_yaw = None
             self._search_swept = 0.0
             self._search_prev_yaw = None
+            # Retreat-then-search: if we entered SEARCH from a phase
+            # where the drone was actively tracking the marker (and
+            # therefore had a real reason to look "behind" itself),
+            # back up a bit before yawing in place. Skips the retreat
+            # when entering SEARCH at the start of the script (from
+            # TAKEOFF / INIT) — there's no prior viewpoint to retreat
+            # toward.
+            tracking_phases = (
+                Phase.APPROACH, Phase.HOLD, Phase.HEIGHT_ALIGN, Phase.ALIGN,
+            )
+            retreat_s = int(getattr(self.cfg, "search_retreat_s", 0))
+            if old in tracking_phases and retreat_s > 0:
+                with self.state.lock:
+                    self.state.search_retreat_until = (
+                        time.monotonic() + retreat_s
+                    )
+            else:
+                with self.state.lock:
+                    self.state.search_retreat_until = None
         # Latch the HOLD timer on entry, not on the first marker-visible
         # tick. Otherwise a marker loss right at the start of HOLD never
         # starts the timer, and the phase can run forever (eventually
@@ -1084,6 +1109,26 @@ class MissionController:
             self._set_phase(Phase.HEIGHT_ALIGN,
                             "marker acquired -- aligning altitude to marker")
             return
+
+        # Retreat-then-yaw: when we entered SEARCH after losing a
+        # marker the controller was actively tracking, _set_phase
+        # stamps state.search_retreat_until. While that timer hasn't
+        # expired, fly straight back instead of yawing — bringing the
+        # marker back into view if we just overshot it (small-target
+        # case where FB_IMU drove past the box). After the timer the
+        # standard yaw-in-place sweep takes over.
+        with self.state.lock:
+            retreat_until = self.state.search_retreat_until
+        if retreat_until is not None and now < retreat_until:
+            retreat_rc = int(getattr(cfg, "search_retreat_rc", 25))
+            self._send_rc(0, -abs(retreat_rc), 0, 0)
+            with self.state.lock:
+                self.state.note = (
+                    f"SEARCH retreat: fb={-abs(retreat_rc)} "
+                    f"{retreat_until - now:.1f}s left"
+                )
+            return
+
         # Otherwise, yaw in place. Direction is arbitrary; we pick CW (+ yaw).
         self._send_rc(0, 0, 0, cfg.search_yaw_rc)
         # Track how far we've yawed from telemetry to decide when to give up.

@@ -47,7 +47,7 @@ from __future__ import annotations
 import math
 import time
 from dataclasses import dataclass
-from typing import Optional
+from typing import Callable, Dict, Optional
 
 import cv2
 import numpy as np
@@ -189,6 +189,12 @@ class ArucoDetector:
         self.mirror_collapse_sum_hdg_deg = 5.0
         self.mirror_collapse_max_hdg_deg = 10.0
 
+        # Per-marker-id physical-size resolver. None = use self.marker_size
+        # for every marker (legacy single-size behaviour). vision_worker
+        # installs an arena-aware resolver via set_size_resolver().
+        self._size_resolver: Optional[Callable[[int], float]] = None
+        # Cache of obj_pts keyed by size [m] so we don't realloc per frame.
+        self._obj_pts_cache: Dict[float, np.ndarray] = {}
         # 3D marker corners in marker frame, OpenCV ArUco order TL-TR-BR-BL,
         # marker plane is z=0. With z pointing AWAY from the marker face,
         # the camera sits at z>0 when looking at the marker face-on.
@@ -201,17 +207,65 @@ class ArucoDetector:
                                   [ s,  s, 0.0],
                                   [ s, -s, 0.0],
                                   [-s, -s, 0.0]], dtype=np.float64)
+        # Drop any cached per-size obj_pts so they get rebuilt against
+        # the new default size on next demand. Per-id overrides remain
+        # valid (they're keyed by size, not by default).
+        self._obj_pts_cache = {self.marker_size: self._obj_pts}
 
     def set_marker_size(self, marker_size_m: float) -> None:
-        """Live update of the physical marker side length. Cheap when
-        unchanged (no-op); rebuilds the solvePnP object points when
-        it actually changes. Called every tick from ``vision_worker``
-        so a Save in the Arena tab propagates without a restart."""
+        """Live update of the *default* physical marker side length.
+        Per-marker overrides (set via :meth:`set_size_resolver`) are
+        unaffected. Cheap when unchanged (no-op); rebuilds the solvePnP
+        object points when it actually changes. Called every tick from
+        ``vision_worker`` so a Save in the Arena tab propagates without
+        a restart."""
         new = float(marker_size_m)
         if abs(new - self.marker_size) <= 1e-6:
             return
         self.marker_size = new
         self._rebuild_obj_pts()
+
+    def set_size_resolver(
+        self, resolver: Optional[Callable[[int], float]],
+    ) -> None:
+        """Install a per-marker-id size lookup.
+
+        Called per detected marker; returns the physical side length
+        [m] for that marker. When ``resolver`` is None (the default)
+        the detector uses ``self.marker_size`` for every marker — the
+        legacy single-size behaviour.
+
+        The detector caches obj_pts per size value so the per-frame
+        cost is one ``dict.get`` per marker, not a numpy allocation.
+        """
+        self._size_resolver = resolver
+
+    def _obj_pts_for(self, marker_id: int) -> np.ndarray:
+        """Return the (4, 3) marker-frame corners for ``marker_id``.
+
+        Uses the size resolver if installed, falling back to
+        ``self.marker_size``. Results are cached by size so the
+        per-frame numpy allocation is one-time per unique size.
+        """
+        if self._size_resolver is not None:
+            try:
+                size = float(self._size_resolver(int(marker_id)))
+            except Exception:
+                size = self.marker_size
+        else:
+            size = self.marker_size
+        if size <= 0.0 or not math.isfinite(size):
+            size = self.marker_size
+        cached = self._obj_pts_cache.get(size)
+        if cached is not None:
+            return cached
+        s = size / 2.0
+        pts = np.array([[-s,  s, 0.0],
+                        [ s,  s, 0.0],
+                        [ s, -s, 0.0],
+                        [-s, -s, 0.0]], dtype=np.float64)
+        self._obj_pts_cache[size] = pts
+        return pts
 
     # ------------------------------------------------------------------ scan
     def detect(self, frame_bgr: np.ndarray,
@@ -235,6 +289,10 @@ class ArucoDetector:
             if wanted_id is not None and mid != wanted_id:
                 continue
             img_pts = c[0].astype(np.float64)
+            # Per-marker physical size: 18cm targets vs 50cm wall
+            # markers must use different objectPoints in solvePnP, or
+            # the inferred distance is off by the size ratio (~2.8×).
+            obj_pts = self._obj_pts_for(mid)
 
             # SOLVEPNP_IPPE_SQUARE returns BOTH planar-ambiguity solutions
             # (sorted by reprojection error). We pick between them using
@@ -242,7 +300,7 @@ class ArucoDetector:
             # one -- at low tilt the two are within numerical noise of each
             # other and which one wins flips between frames.
             ok, rvecs, tvecs, errs = cv2.solvePnPGeneric(
-                self._obj_pts, img_pts, K, D,
+                obj_pts, img_pts, K, D,
                 flags=cv2.SOLVEPNP_IPPE_SQUARE)
             candidates: list[tuple[np.ndarray, np.ndarray, float]] = []
             if ok:
@@ -389,7 +447,7 @@ class ArucoDetector:
 
                 # Reproj-err sanity gate: a winning IPPE candidate that still
                 # mis-projects badly is suspect -- fall back to ITERATIVE.
-                proj, _ = cv2.projectPoints(self._obj_pts,
+                proj, _ = cv2.projectPoints(obj_pts,
                                             chosen_rvec, chosen_tvec, K, D)
                 reproj_err = float(np.linalg.norm(
                     proj.reshape(-1, 2) - img_pts, axis=1).mean())
@@ -398,7 +456,7 @@ class ArucoDetector:
                     chosen_pose = None
 
             if chosen_rvec is None:
-                ok2, rvec, tvec = cv2.solvePnP(self._obj_pts, img_pts, K, D,
+                ok2, rvec, tvec = cv2.solvePnP(obj_pts, img_pts, K, D,
                                                flags=cv2.SOLVEPNP_ITERATIVE)
                 if (not ok2
                         or not np.all(np.isfinite(rvec))

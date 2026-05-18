@@ -115,6 +115,13 @@ class ArenaMarker:
     label: str
     position_m: np.ndarray   # shape (3,), arena coordinates [m]
     wall: str                # one of VALID_WALLS
+    # Optional per-marker physical side length. When None the arena's
+    # global ``marker_size_m`` is used. Use this for target markers
+    # whose physical size differs from the wall markers (SDC26: walls
+    # 50cm, targets 18cm); the aruco detector picks the right
+    # objectPoints per detected id, so distance estimates stay correct
+    # for mixed sizes in the same frame.
+    size_m: Optional[float] = None
 
 
 @dataclass
@@ -192,8 +199,22 @@ class ArenaConfig:
             pos = np.array([float(m["x"]), float(m["y"]), float(m["z"])],
                            dtype=float)
             label = str(m.get("label", ""))
+            size_raw = m.get("size_m")
+            size_override: Optional[float] = None
+            if size_raw is not None:
+                try:
+                    size_override = float(size_raw)
+                except (TypeError, ValueError):
+                    raise ValueError(
+                        f"arena_config {source}: marker {mid}.size_m must "
+                        f"be a number, got {size_raw!r}")
+                if not (0.01 <= size_override <= 5.0):
+                    raise ValueError(
+                        f"arena_config {source}: marker {mid}.size_m out "
+                        f"of [0.01, 5.0]: {size_override}")
             markers[mid] = ArenaMarker(id=mid, label=label,
-                                       position_m=pos, wall=wall)
+                                       position_m=pos, wall=wall,
+                                       size_m=size_override)
         if not markers:
             raise ValueError(f"arena_config {source}: empty marker list")
         return cls(marker_size_m=marker_size_m, markers=markers,
@@ -211,10 +232,15 @@ class ArenaConfig:
             "top_z_m": float(self.top_z_m),
             "bottom_z_m": float(self.bottom_z_m),
             "markers": [
-                {"id": int(m.id), "label": m.label, "wall": m.wall,
-                 "x": float(m.position_m[0]),
-                 "y": float(m.position_m[1]),
-                 "z": float(m.position_m[2])}
+                {
+                    "id": int(m.id), "label": m.label, "wall": m.wall,
+                    "x": float(m.position_m[0]),
+                    "y": float(m.position_m[1]),
+                    "z": float(m.position_m[2]),
+                    # size_m is optional — only emitted when overridden.
+                    **({"size_m": float(m.size_m)}
+                       if m.size_m is not None else {}),
+                }
                 for m in sorted(self.markers.values(), key=lambda x: x.id)
             ],
         }
@@ -227,6 +253,18 @@ class ArenaConfig:
 
     def __contains__(self, marker_id: int) -> bool:
         return marker_id in self.markers
+
+    def size_for(self, marker_id: int) -> float:
+        """Per-marker physical side length [m].
+
+        Returns the marker's own ``size_m`` if it's overridden in the
+        arena config, otherwise the arena's default ``marker_size_m``.
+        Markers not in the arena fall back to the default too.
+        """
+        m = self.markers.get(int(marker_id))
+        if m is not None and m.size_m is not None:
+            return float(m.size_m)
+        return float(self.marker_size_m)
 
 
 # ---------------------------------------------------------------------------
