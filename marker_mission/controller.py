@@ -1355,6 +1355,19 @@ class MissionController:
         u_fwd = self._velocity_damp_fwd(u_fwd_raw, tel)
         if floor_active:
             u_fwd = min(0.0, u_fwd)
+        # Two-stage approach speed: hard-cap the forward channel when
+        # we're within ``approach_slow_zone_m`` of the target distance.
+        # This produces a "cruise then slow capture" profile — fwd_rc_max
+        # can stay high for fast closing from far away, and the cap
+        # below takes over near the marker so the drone doesn't barrel
+        # in and overshoot. Capping AFTER velocity damping so the
+        # damping can still pull u_fwd negative for braking and not
+        # be clipped to a small positive.
+        slow_zone = float(getattr(cfg, "approach_slow_zone_m", 0.0))
+        slow_cap = int(getattr(cfg, "approach_slow_rc_max", cfg.fwd_rc_max))
+        if slow_zone > 0.0 and abs(e_fwd) < slow_zone:
+            cap = max(1, slow_cap)
+            u_fwd = max(-cap, min(cap, u_fwd))
 
         # Lateral: same tangential-slide PD as ALIGN but pinned to
         # heading 0 for the whole approach. We use approach_heading_deadband_deg
