@@ -484,14 +484,45 @@ function renderHeader(state) {
 }
 
 let last = null;
+// Suppress the full re-render of the drones panel while the user is
+// interacting with it — otherwise an open <select> dropdown gets ripped
+// out from under them by the 1Hz refresh. Triggered on mousedown (works
+// even before focus settles, and across Safari/Chrome). Cleared on
+// `change` (selection committed) and a few seconds later as a safety net.
+let dronesEditingUntil = 0;
+function markEditingDrones(extra_ms = 8000) {
+  dronesEditingUntil = Date.now() + extra_ms;
+}
+const dronesEl = document.getElementById("drones");
+dronesEl.addEventListener("mousedown", (e) => {
+  if (e.target.matches("select, input")) markEditingDrones();
+});
+dronesEl.addEventListener("focusin", (e) => {
+  if (e.target.matches("select, input")) markEditingDrones();
+});
+dronesEl.addEventListener("change", () => {
+  // Once the user has committed a change, let the refresh resume.
+  dronesEditingUntil = 0;
+});
+
+function dronesIsEditing() {
+  if (Date.now() < dronesEditingUntil) return true;
+  const ae = document.activeElement;
+  if (!ae) return false;
+  if (!dronesEl.contains(ae)) return false;
+  return ae.tagName === "SELECT" || ae.tagName === "INPUT";
+}
+
 async function refresh() {
   try {
     const state = await api("/api/state");
     last = state;
     renderHeader(state);
-    renderDrones(state);
     renderSlots(state);
     renderEvents(state);
+    if (!dronesIsEditing()) {
+      renderDrones(state);
+    }
   } catch (e) {
     console.error("refresh failed", e);
   }
