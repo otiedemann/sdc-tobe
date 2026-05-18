@@ -134,7 +134,10 @@ class MatchSettings:
     capture_ascend_m: float = 1.5
     capture_forward_m: float = 0.5
     capture_hover_s: float = 3.0
-    scout_hover_s: float = 12.0
+    # Hover seconds between consecutive SCOUT rotations within a single
+    # scout script. Short = fast cadence; long = more time for the
+    # marker tracker to register the latest rotation's observations.
+    scout_hover_s: float = 2.0
 
 
 @dataclass(frozen=True)

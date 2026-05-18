@@ -1,21 +1,28 @@
 """SCOUT role.
 
-Flight pattern:
+Flight pattern (one long script per push, avoids the land/takeoff yo-yo):
+
     TAKEOFF
     HEIGHT <scout_alt_m>
     SCOUT
-    HOOVER <scout_hover_s>
+    HOOVER <inter_scout_hover_s>
+    SCOUT
+    HOOVER <inter_scout_hover_s>
+    ...  (repeated SCOUT_CYCLES times)
 
-We deliberately skip a precision ``TO`` step here. The marker_mission
-``TO`` step requires sub-5cm horizontal positioning and 1s of settling
-before it'll advance, which is unrealistic when the only visible markers
-are far-wall ones. The drone would then hang at step 2/4 forever and
-never reach SCOUT.
+Why a single long script instead of TAKEOFF + SCOUT + HOOVER repeated?
+marker_mission auto-lands at end-of-script (see controller._advance_script
+"safety LAND"), so re-pushing a short script after every rotation makes
+the drone land + takeoff between scans. Instead we push one ~10 minute
+mission of continuous SCOUT/HOOVER cycles. The Anafi battery dies before
+the script does, and the strategy re-pushes a fresh script after the
+drone is back on the ground.
 
-Instead we use ``HEIGHT`` (uses the on-board altimeter, not ArUco) to
-get the drone up to scout altitude, then ``SCOUT`` to do the slow 360°
-yaw rotation in place. After takeoff the Anafi already auto-stabilises
-in place, so this is plenty good for "rotate and observe."
+We also intentionally drop the precision ``TO`` step. marker_mission's
+``TO`` requires sub-5cm horizontal precision + 1s settle, which is
+unrealistic from far-wall ArUco only. The drone would hang at step 2/N
+forever and never reach SCOUT. ``HEIGHT`` uses the on-board altimeter
+(no ArUco needed) so it always settles.
 
 The runner harvests ``visible_marker_ids`` from the C2 state stream and
 feeds it to :class:`MarkerTracker`; the role just keeps the drone
@@ -31,6 +38,15 @@ from .roles import Decision, Role, RoleContext, noop, push, register
 logger = logging.getLogger(__name__)
 
 
+# Number of SCOUT/HOOVER pairs to chain in a single push. Each SCOUT
+# step is roughly SCOUT_MAX_DRIVE_S (~30s) of slow yaw, then we
+# HOOVER scout_hover_s seconds between rotations so the marker tracker
+# can settle and the position estimator can re-acquire if it briefly
+# lost the active marker. 30 cycles × (30 + 2) s = ~16 minutes;
+# battery dies first.
+SCOUT_CYCLES = 30
+
+
 def _format_script(*lines: str) -> str:
     return "\n".join(line for line in lines if line) + "\n"
 
@@ -40,13 +56,12 @@ def _compose_scout_script(ctx: RoleContext) -> Optional[str]:
     if not drone.team:
         return None
     alt = max(0.6, float(drone.scout_alt_m))
-    hover_s = max(2.0, float(ctx.match.scout_hover_s))
-    return _format_script(
-        "TAKEOFF",
-        f"HEIGHT {alt:.2f}",
-        "SCOUT",
-        f"HOOVER {hover_s:.0f}",
-    )
+    inter_s = max(1.0, float(ctx.match.scout_hover_s))
+    lines = ["TAKEOFF", f"HEIGHT {alt:.2f}"]
+    for _ in range(SCOUT_CYCLES):
+        lines.append("SCOUT")
+        lines.append(f"HOOVER {inter_s:.0f}")
+    return _format_script(*lines)
 
 
 class ScoutRole(Role):
