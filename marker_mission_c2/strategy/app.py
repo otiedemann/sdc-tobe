@@ -15,7 +15,7 @@ import os
 import signal
 import sys
 import threading
-from typing import Optional
+from typing import Any, Dict, Optional
 
 from .c2_client import C2Client
 from .markers import MarkerTracker
@@ -32,8 +32,10 @@ def _parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
                    help="Flask bind host (default 0.0.0.0)")
     p.add_argument("--port", type=int, default=8091,
                    help="Flask bind port (default 8091)")
-    p.add_argument("--c2", default=os.environ.get("STRATEGY_C2", "http://127.0.0.1:8090"),
-                   help="C2 server base URL (default http://127.0.0.1:8090)")
+    p.add_argument("--c2", default=os.environ.get("STRATEGY_C2"),
+                   help="C2 server base URL. If omitted, derived from "
+                        "the --config bind block (falls back to "
+                        "http://127.0.0.1:8090)")
     p.add_argument("--settings", default=None,
                    help="Path to settings.json (default: alongside this package)")
     p.add_argument("--fc-names", default=None,
@@ -46,25 +48,51 @@ def _parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     return p.parse_args(argv)
 
 
-def _fc_names_from_config(path: str) -> list[str]:
-    """Extract the list of fc names from a marker_mission_c2 config JSON.
-
-    Quiet on error: the strategy can still bootstrap once the C2 overview is
-    reachable; this is just a nice-to-have for fresh installs.
-    """
+def _read_c2_config(path: str) -> Dict[str, Any]:
+    """Load the marker_mission_c2 config JSON. Quiet on error."""
     import json
     try:
         with open(path, "r") as f:
             raw = json.load(f)
-        out: list[str] = []
-        for spec in raw.get("fcs") or []:
-            name = (spec or {}).get("name")
-            if name:
-                out.append(str(name))
-        return out
+        return raw if isinstance(raw, dict) else {}
     except (OSError, ValueError) as e:
-        logger.warning("strategy: could not read FC names from %s: %s", path, e)
-        return []
+        logger.warning("strategy: could not read C2 config %s: %s", path, e)
+        return {}
+
+
+def _fc_names_from_config(path: str) -> list[str]:
+    """Extract the list of fc names from a marker_mission_c2 config JSON."""
+    raw = _read_c2_config(path)
+    out: list[str] = []
+    for spec in raw.get("fcs") or []:
+        name = (spec or {}).get("name")
+        if name:
+            out.append(str(name))
+    return out
+
+
+def _c2_url_from_config(path: str) -> Optional[str]:
+    """Compose the C2 base URL from its config's ``bind`` block.
+
+    The C2 server may bind to a specific IP (e.g. the Tailscale address)
+    rather than 0.0.0.0/127.0.0.1, so naive defaults like ``--c2 http://127.0.0.1``
+    can fail in production. Pull the host:port the C2 actually listens on
+    and use that.
+    """
+    raw = _read_c2_config(path)
+    bind = raw.get("bind") or {}
+    host = bind.get("host")
+    port = bind.get("port")
+    if not host or not port:
+        return None
+    # If the C2 is bound to 0.0.0.0 we still want to talk to ourselves —
+    # rewrite to loopback so we don't depend on the public route.
+    if str(host) == "0.0.0.0":
+        host = "127.0.0.1"
+    try:
+        return f"http://{host}:{int(port)}"
+    except (TypeError, ValueError):
+        return None
 
 
 def _setup_logging(level: str) -> None:
@@ -120,6 +148,19 @@ def main(argv: Optional[list[str]] = None) -> int:
             logger.info("strategy: bootstrapped FC names from %s: %s",
                         args.config, fc_names)
 
+    # Resolve --c2: explicit flag wins, otherwise derive from --config,
+    # otherwise fall back to localhost. This matters because the C2 may
+    # bind to a specific IP (e.g. its Tailscale address) rather than
+    # 0.0.0.0, in which case 127.0.0.1 would never connect.
+    c2_url = args.c2
+    if not c2_url and args.config:
+        c2_url = _c2_url_from_config(args.config)
+        if c2_url:
+            logger.info("strategy: C2 URL bootstrapped from %s: %s",
+                        args.config, c2_url)
+    if not c2_url:
+        c2_url = "http://127.0.0.1:8090"
+
     settings = SettingsStore(path=args.settings, fc_names=fc_names)
     markers = MarkerTracker(
         red_live_ids=settings.snapshot().markers.red_live_ids,
@@ -133,7 +174,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     assert th.loop is not None
 
     async def _bootstrap():
-        c2 = C2Client(base_url=args.c2)
+        c2 = C2Client(base_url=c2_url)
         runner = SwarmRunner(settings=settings, c2=c2, markers=markers)
         await runner.start()
         return c2, runner
@@ -165,7 +206,7 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     logger.info(
         "strategy: serving on http://%s:%d  (C2: %s)",
-        args.host, args.port, args.c2,
+        args.host, args.port, c2_url,
     )
     flask_app.run(host=args.host, port=args.port,
                   threaded=True, use_reloader=False, debug=False)
