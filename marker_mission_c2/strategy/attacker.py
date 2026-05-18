@@ -77,8 +77,13 @@ def _full_attack_script(ctx: RoleContext, attack_marker_id: int) -> str:
     # captures (the capture window is mostly "give the scout a chance
     # to register the new face"; 1 s is enough at 5 Hz vision).
     hover_s = max(1.0, float(m.capture_hover_s))
+    # Home zone follows OUR team (the operator-level "our_team" field),
+    # not the per-drone team. The drone.team dropdown can drift out of
+    # sync — e.g. the operator flips us from blue to red but a single
+    # drone still shows team=blue. The right semantic is "every drone
+    # of our swarm flies back to OUR base", so use ctx.our_team.
     home = (
-        ctx.match.home_red if ctx.drone.team == "red" else ctx.match.home_blue
+        ctx.match.home_red if ctx.our_team == "red" else ctx.match.home_blue
     )
     # RTH cruise altitude. Per-drone home_alt_m (exposed in the dashboard)
     # wins over match.home_red.alt / match.home_blue.alt — the operator's

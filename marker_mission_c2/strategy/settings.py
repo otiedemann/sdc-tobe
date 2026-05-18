@@ -128,8 +128,11 @@ class Point3D:
 class MatchSettings:
     neutral_red: Point2D = field(default_factory=lambda: Point2D(-1.5, 0.0))
     neutral_blue: Point2D = field(default_factory=lambda: Point2D(1.5, 0.0))
-    home_red: Point3D = field(default_factory=lambda: Point3D(-4.0, 0.0, 0.8))
-    home_blue: Point3D = field(default_factory=lambda: Point3D(4.0, 0.0, 0.8))
+    # Home zones live at the back walls (depth-axis ends), not the side
+    # walls — SDC26 arena puts red at -y, blue at +y. Cruise altitude
+    # 3 m so the drone clears all 1 m-tall target boxes during RTH.
+    home_red: Point3D = field(default_factory=lambda: Point3D(0.0, -8.0, 3.0))
+    home_blue: Point3D = field(default_factory=lambda: Point3D(0.0, 8.0, 3.0))
     approach_distance_m: float = 0.5
     capture_ascend_m: float = 1.5
     capture_forward_m: float = 0.5

@@ -2,8 +2,8 @@
   "match": {
     "neutral_red": {"x": -1.5, "y": 0.0},
     "neutral_blue": {"x": 1.5, "y": 0.0},
-    "home_red": {"x": -4.0, "y": 0.0, "alt": 0.8},
-    "home_blue": {"x": 4.0, "y": 0.0, "alt": 0.8},
+    "home_red": {"x": 0.0, "y": -8.0, "alt": 3.0},
+    "home_blue": {"x": 0.0, "y": 8.0, "alt": 3.0},
     "approach_distance_m": 0.5,
     "capture_ascend_m": 1.5,
     "capture_forward_m": 0.5,
