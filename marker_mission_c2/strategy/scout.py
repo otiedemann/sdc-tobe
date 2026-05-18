@@ -24,6 +24,13 @@ unrealistic from far-wall ArUco only. The drone would hang at step 2/N
 forever and never reach SCOUT. ``HEIGHT`` uses the on-board altimeter
 (no ArUco needed) so it always settles.
 
+Per-FC config dependency: the FC's ``default_height_m`` tune (climb-to
+altitude after TAKEOFF) should be set LOWER than ``scout_alt_m`` —
+otherwise the drone climbs to that altitude first, then descends to
+``scout_alt_m`` via the HEIGHT step (visible as an up-then-down). Set
+default_height_m ≈ 1.0 m on each FC via /api/tune/apply +
+/api/tune/save (or directly edit ``~/.marker_mission/config.json``).
+
 The runner harvests ``visible_marker_ids`` from the C2 state stream and
 feeds it to :class:`MarkerTracker`; the role just keeps the drone
 airborne and rotating.
