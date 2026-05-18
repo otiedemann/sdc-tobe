@@ -80,7 +80,12 @@ def _full_attack_script(ctx: RoleContext, attack_marker_id: int) -> str:
     home = (
         ctx.match.home_red if ctx.drone.team == "red" else ctx.match.home_blue
     )
-    home_alt = max(0.6, float(home.alt))
+    # RTH cruise altitude. Per-drone home_alt_m (exposed in the dashboard)
+    # wins over match.home_red.alt / match.home_blue.alt — the operator's
+    # mental model is "I set the slider for THIS drone." The match-level
+    # value is kept as a fallback so a fresh deploy still produces a
+    # working TO step. Floor at 0.6 m so a typo can't fly into the floor.
+    home_alt = max(0.6, float(ctx.drone.home_alt_m or home.alt))
     return _format_script(
         "TAKEOFF",
         f"APPROACH {int(attack_marker_id)} {approach_d:.2f}",
