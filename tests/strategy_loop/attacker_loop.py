@@ -307,7 +307,8 @@ def run_cycle(
         float(home_block.get("y", 0.0)),
         float(home_alt),
     )
-    enemy_face = (40 if our_team == "red" else 30) + target_slot
+    # Enemy face id: when WE are red, enemy is blue → face id 3X.
+    enemy_face = (30 if our_team == "red" else 40) + target_slot
 
     print(f"\n========== iteration {iteration} — slot {target_slot} (expect APPROACH {enemy_face}) ==========")
     print(f"  our_team={our_team}  home={home_pos}")
@@ -368,12 +369,13 @@ def run_cycle(
         s = _sample(strategy, fc, fc_name, started)
         trace.append(s)
         if s.fc_phase != last_fc_phase or s.rs_phase != last_rs_phase:
+            h = f"{s.height_m:.2f}m" if isinstance(s.height_m, (int, float)) else "?"
+            if isinstance(s.world_x, (int, float)) and isinstance(s.world_y, (int, float)):
+                pos = f"({s.world_x:+.2f},{s.world_y:+.2f},{(s.world_z or 0):+.2f})"
+            else:
+                pos = "(?,?,?)"
             print(f"  t={s.t:5.1f}s  fc={s.fc_phase:10s} rs={s.rs_phase:10s}"
-                  f" h={s.height_m if s.height_m is not None else '?'}"
-                  f" pos=({s.world_x:.2f if s.world_x is not None else '?' },"
-                  f" {s.world_y:.2f if s.world_y is not None else '?' })"
-                  if isinstance(s.world_x, (int, float)) and isinstance(s.world_y, (int, float))
-                  else f"  t={s.t:5.1f}s  fc={s.fc_phase} rs={s.rs_phase}")
+                  f"  h={h:>7s}  pos={pos}")
             last_fc_phase = s.fc_phase
             last_rs_phase = s.rs_phase
         # Early exit: strategy reports done AND drone landed.
