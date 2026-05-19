@@ -276,6 +276,24 @@ def parse(text: str, defaults: dict) -> List[Step]:
                             world_x=wx, world_y=wy, height=wz,
                             yaw=yaw_arg,
                             line_no=raw_line_no))
+        elif cmd == "TO_HOME":
+            # TO_HOME [<height>] — navigate back to the world position
+            # snapshotted at TAKEOFF completion. Sidesteps absolute-
+            # offset errors in the ArUco solution: as long as motion
+            # deltas are correct (verified vs GPS), the drone returns
+            # to its actual physical takeoff spot in the arena.
+            #
+            # Optional height arg overrides the snapshotted Z (useful
+            # for "cruise back at 3m, then LAND descends").
+            if len(args) > 1:
+                raise ScriptError(raw_line_no,
+                                  f"TO_HOME takes 0-1 arguments "
+                                  f"([<height>]), got {len(args)}")
+            wz = (_parse_float(args[0], raw_line_no, "TO_HOME z")
+                  if len(args) == 1 else None)
+            out.append(Step(kind="TO_HOME",
+                            height=wz,
+                            line_no=raw_line_no))
         elif cmd in ("LR_RC", "FB_RC", "UD_RC", "YAW_RC"):
             # Raw RC stick for ``seconds``. ``rc`` is the protocol
             # value [-100, +100]; the FC ceiling, arena guard and

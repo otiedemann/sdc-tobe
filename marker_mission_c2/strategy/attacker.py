@@ -91,6 +91,14 @@ def _full_attack_script(ctx: RoleContext, attack_marker_id: int) -> str:
     # value is kept as a fallback so a fresh deploy still produces a
     # working TO step. Floor at 0.6 m so a typo can't fly into the floor.
     home_alt = max(0.6, float(ctx.drone.home_alt_m or home.alt))
+    # RTH uses TO_HOME (drone returns to its takeoff snapshot in
+    # ArUco frame) rather than TO with absolute arena coords. The
+    # ArUco solution currently has an unsolved absolute offset error;
+    # navigating relative to "where I took off from" sidesteps it
+    # because motion deltas are reliable even when absolute is not.
+    # home_alt is passed as the cruise altitude override so the
+    # drone climbs above target boxes during RTH, then LAND
+    # descends at home.
     return _format_script(
         "TAKEOFF",
         f"APPROACH {int(attack_marker_id)} {approach_d:.2f}",
@@ -98,7 +106,7 @@ def _full_attack_script(ctx: RoleContext, attack_marker_id: int) -> str:
         f"FB_IMU {forward:.2f}",
         "YAW_IMU 180",
         f"HOOVER {hover_s:.1f}",
-        f"TO {home.x:.2f} {home.y:.2f} {home_alt:.2f}",
+        f"TO_HOME {home_alt:.2f}",
         "LAND",
     )
 

@@ -467,6 +467,13 @@ class MissionState:
     # every subsequent measurement. vision_worker clears the flag
     # after honouring it.
     reset_position_estimator: bool = False
+    # Arena-frame world position snapshotted at the moment TAKEOFF
+    # completes. Used by the ``TO_HOME`` script step to navigate back
+    # to where the drone took off — independent of any absolute
+    # offset error in the wall-marker ArUco solution. As long as the
+    # ArUco motion deltas are correct (verified vs GPS), the drone
+    # returns to its actual takeoff spot in the sim/arena.
+    takeoff_world_position_m: Optional[tuple[float, float, float]] = None
     # Markers / methods / per-marker votes from the LAST fresh fix
     # (kept in sync with ``world_position_m``). They describe how the
     # currently-displayed position was computed, so they go stale
@@ -1106,6 +1113,13 @@ class MissionController:
         drone_h = height_cm / 100.0
         e_h = cfg.default_height_m - drone_h
         if abs(e_h) < cfg.height_deadband_m:
+            # Snapshot world position at takeoff completion so subsequent
+            # TO_HOME steps can fly back here regardless of absolute
+            # offset errors in the ArUco solution.
+            with self.state.lock:
+                wp = self.state.world_position_m
+                if wp is not None:
+                    self.state.takeoff_world_position_m = tuple(float(v) for v in wp)
             self._advance_script(f"takeoff complete (h={drone_h:.2f}m)")
             return
         u_ud = self.pd_height.step(e_h, now)
@@ -2397,6 +2411,32 @@ class MissionController:
             self._set_phase(Phase.GOTO,
                             note + f" -> ({tx:.2f},{ty:.2f}){z_txt}m"
                                    f"{yaw_txt}")
+            return
+        if step.kind == "TO_HOME":
+            # TO_HOME: fly back to the world position snapshotted at
+            # TAKEOFF completion. Uses ArUco-frame coordinates so
+            # absolute offset errors cancel — drone returns to its
+            # physical takeoff spot regardless of the absolute error
+            # in the wall-marker solution. Optional height override
+            # overrides the snapshotted Z (cruise high then LAND).
+            with self.state.lock:
+                home = self.state.takeoff_world_position_m
+            if home is None:
+                self._abort("TO_HOME: no takeoff snapshot — never took off this mission")
+                return
+            tx, ty, snapshot_z = (float(home[0]), float(home[1]),
+                                  float(home[2]))
+            tz = (max(cfg.min_height_m,
+                      min(cfg.max_height_m, float(step.height)))
+                  if step.height is not None else snapshot_z)
+            with self.state.lock:
+                self.state.goto_target_x_m = tx
+                self.state.goto_target_y_m = ty
+                self.state.goto_target_z_m = tz
+                self.state.goto_target_yaw_deg = None  # keep current
+                self.state.goto_hold_until = None
+            self._set_phase(Phase.GOTO,
+                            note + f" -> HOME ({tx:.2f},{ty:.2f},{tz:.2f})m")
             return
         if step.kind == "DANCE":
             now = time.monotonic()
