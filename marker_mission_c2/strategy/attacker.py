@@ -77,9 +77,30 @@ SLOT_POSITIONS_M: dict[int, tuple[float, float]] = {
 # range for 18 cm markers (~6-7 m worst case at the sim's 70° FOV).
 CLOSE_IN_STANDOFF_M: float = 4.0
 
+# marker_mission.mission_script enforces a |FB_IMU| <= 5.0 safety cap
+# per step (anti-typo: prevents a stray "FB_IMU 50" flying into a wall).
+# Our close-in is typically ~12 m, so we chain N steps of <= this size.
+FB_IMU_CAP_M: float = 5.0
+
 
 def _format_script(*lines: str) -> str:
     return "\n".join(line for line in lines if line) + "\n"
+
+
+def _chunk_close_in(total_m: float) -> list[float]:
+    """Split a total forward-cruise distance into <= FB_IMU_CAP_M chunks.
+
+    Drops chunks below 0.1 m (parser min is 0.01 m but tiny steps add
+    latency for no useful motion). Returns [] for non-positive totals.
+    """
+    out: list[float] = []
+    remaining = float(total_m)
+    while remaining > FB_IMU_CAP_M:
+        out.append(FB_IMU_CAP_M)
+        remaining -= FB_IMU_CAP_M
+    if remaining >= 0.1:
+        out.append(remaining)
+    return out
 
 
 def _close_in_distance_m(home_xy: tuple[float, float], slot: int) -> float:
@@ -149,9 +170,11 @@ def _full_attack_script(
     # working TO step. Floor at 0.6 m so a typo can't fly into the floor.
     home_alt = max(0.6, float(ctx.drone.home_alt_m or home.alt))
     close_in = _close_in_distance_m((home.x, home.y), slot)
-    # Emit the FB_IMU close-in only when it actually moves forward.
-    # _format_script drops empty strings, so we conditionally pass "".
-    close_in_step = f"FB_IMU {close_in:.2f}" if close_in > 0.1 else ""
+    # Chain multiple FB_IMU steps to respect the script parser's 5 m
+    # safety cap (anti-typo). e.g. 11.5 m → 5 + 5 + 1.5.
+    close_in_steps = "\n".join(
+        f"FB_IMU {chunk:.2f}" for chunk in _chunk_close_in(close_in)
+    )
     # RTH uses TO_HOME (drone returns to its takeoff snapshot in
     # ArUco frame) rather than TO with absolute arena coords. The
     # ArUco solution currently has an unsolved absolute offset error;
@@ -163,7 +186,7 @@ def _full_attack_script(
     return _format_script(
         "TAKEOFF",
         f"HEIGHT {ascend:.2f}",
-        close_in_step,
+        close_in_steps,
         f"APPROACH {int(attack_marker_id)} {approach_d:.2f}",
         f"HEIGHT {ascend:.2f}",
         f"FB_IMU {forward:.2f}",
