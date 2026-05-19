@@ -4,21 +4,21 @@ Operator assigns a target *slot* (1..6). The role pushes ONE complete
 mission script that does everything end-to-end:
 
     TAKEOFF
-    HEIGHT <capture_ascend_m>      # ascend BEFORE closing in so the
-                                   # camera has line-of-sight to the
-                                   # distant marker
-    FB_IMU <close_in_m>            # cruise forward in IMU frame until
-                                   # within ArUco range (~3-4 m)
+    HEIGHT <capture_ascend_m>      # ascend for camera line-of-sight
+    FB_IMU <close_in_m>            # cruise within ArUco range
     APPROACH <enemy-face-id> <approach_distance_m>
-    HEIGHT <capture_ascend_m>      # re-assert in case approach drifted
+    HEIGHT <capture_ascend_m>      # re-assert post-approach
     FB_IMU <capture_forward_m>     # drift over the box
     YAW_IMU 180
     HOOVER <capture_hover_s>
-    TO_HOME <home_alt>
+    HEIGHT <home_alt>              # cruise altitude above boxes
+    FB_IMU <rth_close_in_m>        # high-speed cruise toward home
+    APPROACH <wall_marker> <2.0>   # brake on home-wall marker
     LAND
 
 The drone closes in toward the enemy side, ascends, locks onto the
-marker via APPROACH, drifts over it, hovers, then RTHs and lands. After
+marker via APPROACH, drifts over it, hovers, then cruises home at full
+speed and brakes on a 0.5 m wall marker via a second APPROACH. After
 the script fully ends (FC drops back to Phase.INIT), the role marks
 itself done and the target is cleared.
 
@@ -84,6 +84,16 @@ CLOSE_IN_STANDOFF_M: float = 7.0
 # to stay well clear of that regime while respecting the parser cap.
 FB_IMU_CHUNK_M: float = 4.0
 
+# Home-wall markers for RTH braking. 0.5 m markers on each team's
+# home wall, LOW position (2.0 m altitude) — close to cruise altitude
+# for stable APPROACH lock. Maps team → (marker_id, (arena_x, arena_y)).
+HOME_WALL_MARKER: dict[str, tuple[int, tuple[float, float]]] = {
+    "red": (13, (0.0, -10.0)),
+    "blue": (9, (0.0, 10.0)),
+}
+
+RTH_APPROACH_DISTANCE_M: float = 2.0
+
 
 def _format_script(*lines: str) -> str:
     return "\n".join(line for line in lines if line) + "\n"
@@ -120,71 +130,76 @@ def _close_in_distance_m(home_xy: tuple[float, float], slot: int) -> float:
     return max(0.0, raw - CLOSE_IN_STANDOFF_M)
 
 
+def _rth_close_in_distance_m(slot: int, our_team: str) -> float:
+    """Distance from target slot to home-wall marker, minus standoff."""
+    target = SLOT_POSITIONS_M.get(int(slot))
+    if target is None:
+        return 0.0
+    entry = HOME_WALL_MARKER.get(our_team)
+    if entry is None:
+        return 0.0
+    _, wall_xy = entry
+    dx = wall_xy[0] - target[0]
+    dy = wall_xy[1] - target[1]
+    raw = math.hypot(dx, dy)
+    return max(0.0, raw - CLOSE_IN_STANDOFF_M)
+
+
 def _full_attack_script(
     ctx: RoleContext, attack_marker_id: int, slot: int
 ) -> str:
-    """Close in toward the enemy side, capture, RTH, land.
+    """Close in toward the enemy side, capture, RTH via wall marker, land.
 
     Script shape:
         TAKEOFF
-        HEIGHT <capture_ascend_m>      # ascend before closing in so
-                                       # the camera has line-of-sight
+        HEIGHT <capture_ascend_m>      # ascend for camera line-of-sight
         FB_IMU <close_in_m>            # cruise within ArUco range
         APPROACH <id> <approach_d>     # precision lock + slow advance
         HEIGHT <capture_ascend_m>      # re-assert post-approach
         FB_IMU <capture_forward_m>     # drift over the box
         YAW_IMU 180                    # turn to face home
         HOOVER <capture_hover_s>       # capture window
-        TO_HOME <home_alt>             # straight-line cruise to home
+        HEIGHT <home_alt>              # cruise altitude above boxes
+        FB_IMU <rth_close_in_m>        # high-speed cruise toward home
+        APPROACH <wall_marker> <2.0>   # brake on home-wall marker
         LAND
 
-    The close-in step (FB_IMU before APPROACH) is what lets APPROACH
-    actually see the target — 18 cm markers at 15 m are below the
-    detector's reliable range. By ascending to capture_ascend_m first
-    and then cruising forward in IMU frame, we arrive at standoff
-    distance with the marker centred in the front cam.
-
-    The YAW_IMU 180 after capture is the key to a fast RTH: the
-    subsequent TO_HOME step drives the drone forward (not backward),
-    giving the fwd PD channel — already the fastest-tuned — the full
-    control range.
+    RTH uses APPROACH on the home-wall marker instead of TO_HOME.
+    The position estimator drifts ~5 m at cruise speeds, making
+    TO_HOME overshoot into the back wall. Per-marker IPPE distance
+    is reliable — APPROACH on a 0.5 m wall marker brakes precisely.
     """
     m = ctx.match
     approach_d = max(0.2, float(m.approach_distance_m))
     ascend = max(0.6, float(m.capture_ascend_m))
     forward = max(0.1, float(m.capture_forward_m))
-    # Lower floor than the previous 2.0 — the operator wants race-pace
-    # captures (the capture window is mostly "give the scout a chance
-    # to register the new face"; 1 s is enough at 5 Hz vision).
     hover_s = max(1.0, float(m.capture_hover_s))
-    # Home zone follows OUR team (the operator-level "our_team" field),
-    # not the per-drone team. The drone.team dropdown can drift out of
-    # sync — e.g. the operator flips us from blue to red but a single
-    # drone still shows team=blue. The right semantic is "every drone
-    # of our swarm flies back to OUR base", so use ctx.our_team.
     home = (
         ctx.match.home_red if ctx.our_team == "red" else ctx.match.home_blue
     )
-    # RTH cruise altitude. Per-drone home_alt_m (exposed in the dashboard)
-    # wins over match.home_red.alt / match.home_blue.alt — the operator's
-    # mental model is "I set the slider for THIS drone." The match-level
-    # value is kept as a fallback so a fresh deploy still produces a
-    # working TO step. Floor at 0.6 m so a typo can't fly into the floor.
     home_alt = max(0.6, float(ctx.drone.home_alt_m or home.alt))
     close_in = _close_in_distance_m((home.x, home.y), slot)
-    # Chain multiple FB_IMU steps to respect the script parser's 5 m
-    # safety cap (anti-typo). e.g. 11.5 m → 5 + 5 + 1.5.
     close_in_steps = "\n".join(
         f"FB_IMU {chunk:.2f}" for chunk in _chunk_close_in(close_in)
     )
-    # RTH uses TO_HOME (drone returns to its takeoff snapshot in
-    # ArUco frame) rather than TO with absolute arena coords. The
-    # ArUco solution currently has an unsolved absolute offset error;
-    # navigating relative to "where I took off from" sidesteps it
-    # because motion deltas are reliable even when absolute is not.
-    # home_alt is passed as the cruise altitude override so the
-    # drone climbs above target boxes during RTH, then LAND
-    # descends at home.
+    wall_entry = HOME_WALL_MARKER.get(ctx.our_team)
+    if wall_entry:
+        wall_marker_id, _ = wall_entry
+        rth_close_in = _rth_close_in_distance_m(slot, ctx.our_team)
+        rth_steps = "\n".join(
+            f"FB_IMU {chunk:.2f}" for chunk in _chunk_close_in(rth_close_in)
+        )
+        rth_lines = (
+            f"HEIGHT {home_alt:.2f}",
+            rth_steps,
+            f"APPROACH {wall_marker_id} {RTH_APPROACH_DISTANCE_M:.2f}",
+            "LAND",
+        )
+    else:
+        rth_lines = (
+            f"TO_HOME {home_alt:.2f}",
+            "LAND",
+        )
     return _format_script(
         "TAKEOFF",
         f"HEIGHT {ascend:.2f}",
@@ -194,8 +209,7 @@ def _full_attack_script(
         f"FB_IMU {forward:.2f}",
         "YAW_IMU 180",
         f"HOOVER {hover_s:.1f}",
-        f"TO_HOME {home_alt:.2f}",
-        "LAND",
+        *rth_lines,
     )
 
 
