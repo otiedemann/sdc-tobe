@@ -4,17 +4,16 @@ Operator assigns a target *slot* (1..6). The role pushes ONE complete
 mission script that does everything end-to-end:
 
     TAKEOFF
-    HEIGHT <capture_ascend_m>      # ascend for camera line-of-sight
-    FB_IMU <close_in_m>            # cruise within ArUco range
-    APPROACH <enemy-face-id> <approach_distance_m>
-    HEIGHT <capture_ascend_m>      # re-assert post-approach
-    FB_IMU <capture_forward_m>     # drift over the box
+    HEIGHT <capture_ascend_m>           # ascend for camera line-of-sight
+    FB_RC 100 <close_in_dur_s>          # FAST cruise within ArUco range
+    FB_BRAKE <enemy-face-id> 2.0 100 5  # vision-tripped brake on target
+    FB_RC <drift_rc> <drift_dur_s>      # short drift over the box
     YAW_IMU 180
     HOOVER <capture_hover_s>
-    HEIGHT <home_alt>              # cruise altitude above boxes
-    FB_IMU <rth_close_in_m>        # high-speed cruise toward home
-    APPROACH <wall_marker> <2.0>   # brake on home-wall marker
-    YAW_IMU 180                    # face enemy again so next attack starts correct
+    HEIGHT <home_alt>                   # cruise altitude above boxes
+    FB_RC 100 <rth_dur_s>               # FAST cruise toward home
+    FB_BRAKE <wall_marker> 2.5 100 5    # vision-tripped brake on home wall
+    YAW_IMU 180                         # face enemy again so next attack starts correct
     LAND
 
 The drone closes in toward the enemy side, ascends, locks onto the
@@ -79,11 +78,35 @@ SLOT_POSITIONS_M: dict[int, tuple[float, float]] = {
 # the sim's 70° FOV / 1280×720 cam.
 CLOSE_IN_STANDOFF_M: float = 7.0
 
-# mission_script enforces |FB_IMU| <= 5 m per step (anti-typo safety
-# cap). But empirically chained 5m moveBy steps stall short (one round
-# of 3×5+1.5 commanded → only ~7 m actual). Cap our chunk size at 4 m
-# to stay well clear of that regime while respecting the parser cap.
-FB_IMU_CHUNK_M: float = 4.0
+# Long cruises use FB_RC (raw forward stick) instead of FB_IMU (Olympe
+# moveBy). FB_IMU is firmware-internal closed-loop and caps around
+# 0.5 m/s in the sim — fine for short fine-positioning, terrible for
+# a 15+ m cruise. FB_RC at stick=100 pins the forward channel to
+# ±100 (the same units as the operator joystick: each unit ≈ 4 cm/s
+# of commanded ground speed at level flight, so 100 ≈ 4 m/s) and the
+# DSL auto-brakes after the requested duration. We follow it with
+# APPROACH which uses per-marker IPPE distance for the precision
+# stop — so even if cruise overshoots a metre, APPROACH catches it.
+CRUISE_RC_STICK: int = 100
+
+# Calibrated cruise speed for converting "distance to cover" → FB_RC
+# duration. Empirically ~4 m/s at stick=100 on the sim's Anafi; will
+# need re-calibration if RC->m/s ratio differs on hardware. Set
+# slightly conservative so the FB_RC ends short of the target and
+# APPROACH does the final close-in without backing up.
+CRUISE_SPEED_M_PER_S: float = 4.0
+
+# Don't emit FB_RC for trivial distances. Sub-half-second sticks add
+# latency without meaningful motion (FC takes longer to switch from
+# stick=0 → stick=100 → stick=0 than the move itself).
+MIN_CRUISE_DURATION_S: float = 0.4
+
+# Short raw-stick drift after APPROACH to settle over the box without
+# waiting for another full PD cycle. ~25 cm at stick=60 (≈2.4 m/s)
+# for 0.3 s = 0.7 m forward — same intent as the old FB_IMU 0.70 but
+# 5x faster.
+DRIFT_OVER_BOX_RC: int = 60
+DRIFT_OVER_BOX_DURATION_S: float = 0.3
 
 # Home-wall markers for RTH braking. 0.5 m markers on each team's
 # home wall, LOW position (2.0 m altitude) — close to cruise altitude
@@ -95,25 +118,42 @@ HOME_WALL_MARKER: dict[str, tuple[int, tuple[float, float]]] = {
 
 RTH_APPROACH_DISTANCE_M: float = 2.0
 
+# FB_BRAKE tunings. The DSL primitive cruises at full stick and brakes
+# as soon as the named marker's IPPE distance < stop_m. We pick the
+# stop distances to leave room for the auto-brake to settle without
+# overshooting into the target box / wall:
+#   - target slot face: 0.19 m marker, drone closes at ~4 m/s, brake
+#     settles in ~1 m → 2.0 m stop leaves the drone hovering ~1 m
+#     short of the box (FB_RC drift then puts us over it).
+#   - home-wall marker: 0.5 m marker, same brake distance → 2.5 m
+#     stop leaves the drone safely in the home zone.
+# Timeout is a hard upper bound that flips into brake even if the
+# marker is never seen (vision dropout → don't open-loop into a wall).
+FB_BRAKE_TARGET_STOP_M: float = 2.0
+FB_BRAKE_WALL_STOP_M: float = 2.5
+FB_BRAKE_STICK: int = 100
+FB_BRAKE_TIMEOUT_S: float = 5.0
+
 
 def _format_script(*lines: str) -> str:
     return "\n".join(line for line in lines if line) + "\n"
 
 
-def _chunk_close_in(total_m: float) -> list[float]:
-    """Split a total forward-cruise distance into <= FB_IMU_CHUNK_M chunks.
+def _cruise_duration_s(distance_m: float) -> float:
+    """Convert a cruise distance to FB_RC stick-pin duration.
 
-    Drops chunks below 0.1 m (parser min is 0.01 m but tiny steps add
-    latency for no useful motion). Returns [] for non-positive totals.
+    Uses CRUISE_SPEED_M_PER_S as the calibrated stick=100 ground
+    speed. Returns 0.0 for distances below MIN_CRUISE_DURATION_S
+    worth of motion (so we skip the FB_RC step entirely and let
+    APPROACH cover the whole remainder). The DSL auto-brake adds
+    ~1 s to whatever we emit here.
     """
-    out: list[float] = []
-    remaining = float(total_m)
-    while remaining > FB_IMU_CHUNK_M:
-        out.append(FB_IMU_CHUNK_M)
-        remaining -= FB_IMU_CHUNK_M
-    if remaining >= 0.1:
-        out.append(remaining)
-    return out
+    if distance_m <= 0.0:
+        return 0.0
+    raw_dur = float(distance_m) / CRUISE_SPEED_M_PER_S
+    if raw_dur < MIN_CRUISE_DURATION_S:
+        return 0.0
+    return raw_dur
 
 
 def _close_in_distance_m(home_xy: tuple[float, float], slot: int) -> float:
@@ -153,62 +193,92 @@ def _full_attack_script(
 
     Script shape:
         TAKEOFF
-        HEIGHT <capture_ascend_m>      # ascend for camera line-of-sight
-        FB_IMU <close_in_m>            # cruise within ArUco range
-        APPROACH <id> <approach_d>     # precision lock + slow advance
-        HEIGHT <capture_ascend_m>      # re-assert post-approach
-        FB_IMU <capture_forward_m>     # drift over the box
-        YAW_IMU 180                    # turn to face home
-        HOOVER <capture_hover_s>       # capture window
-        HEIGHT <home_alt>              # cruise altitude above boxes
-        FB_IMU <rth_close_in_m>        # high-speed cruise toward home
-        APPROACH <wall_marker> <2.0>   # brake on home-wall marker
-        YAW_IMU 180                    # face enemy before landing
+        HEIGHT <capture_ascend_m>           # ascend for camera line-of-sight
+        FB_RC 100 <close_in_dur_s>          # FAST cruise within ArUco range
+        FB_BRAKE <id> 2.0 100 5             # vision-tripped brake on target
+        FB_RC <drift_rc> <drift_dur_s>      # short drift over the box
+        YAW_IMU 180                         # turn to face home
+        HOOVER <capture_hover_s>            # capture window (~0.3-1 s)
+        HEIGHT <home_alt>                   # cruise altitude above boxes
+        FB_RC 100 <rth_dur_s>               # FAST cruise toward home
+        FB_BRAKE <wall_marker> 2.5 100 5    # vision-tripped brake on home wall
+        YAW_IMU 180                         # face enemy before landing
         LAND
 
-    RTH uses APPROACH on the home-wall marker instead of TO_HOME.
+    Speed-optimised design notes:
+
+    Two-stage closing on every target / wall:
+
+      1. FB_RC at full stick for the bulk of the distance (~4 m/s
+         in sim — 8x the closed-loop moveBy speed). Open-loop, so
+         it can overshoot/undershoot by a metre or two.
+      2. FB_BRAKE on the relevant marker. The DSL primitive cruises
+         at full stick AND watches the marker's IPPE distance; the
+         moment d < stop_m the FC zeros sticks and enters its
+         standard IMU-velocity brake. Replaces APPROACH (which was
+         60-75 s of slow-zone PD per leg → 5 s of vision-tripped
+         brake instead).
+
+    RTH uses FB_BRAKE on the home-wall marker instead of TO_HOME.
     The position estimator drifts ~5 m at cruise speeds, making
     TO_HOME overshoot into the back wall. Per-marker IPPE distance
-    is reliable — APPROACH on a 0.5 m wall marker brakes precisely.
+    is reliable — braking on a 0.5 m wall marker stops the drone
+    precisely in the home zone regardless of estimator state.
 
     The final YAW_IMU 180 (after the wall-marker APPROACH) is the
     key to a repeatable multi-attack sequence: without it, the
     drone lands facing the home wall (the natural result of the
     APPROACH on a back-wall marker), and the NEXT attack's TAKEOFF
-    inherits that heading — FB_IMU then drives backward into the
-    home wall. Two YAW_IMUs per attack keeps the spawn-orientation
-    convention (drone faces enemy) consistent across runs.
+    inherits that heading — the next FB_RC would drive backward
+    into the home wall. Two YAW_IMUs per attack keeps the
+    spawn-orientation convention (drone faces enemy) consistent
+    across runs.
+
+    The post-APPROACH HEIGHT re-assert was removed because APPROACH
+    already holds altitude via its own PD; the short FB_RC drift
+    over the box is what actually puts us on top of the target.
     """
     m = ctx.match
     approach_d = max(0.2, float(m.approach_distance_m))
     ascend = max(0.6, float(m.capture_ascend_m))
-    forward = max(0.1, float(m.capture_forward_m))
-    hover_s = max(1.0, float(m.capture_hover_s))
+    # Capture hover floor lowered to 0.3 s. The intent of the hover is
+    # "give the scout a chance to register the new face" — at 5 Hz
+    # vision that's 1-2 frames, plenty. Long hovers just burn budget.
+    hover_s = max(0.3, float(m.capture_hover_s))
     home = (
         ctx.match.home_red if ctx.our_team == "red" else ctx.match.home_blue
     )
     home_alt = max(0.6, float(ctx.drone.home_alt_m or home.alt))
+
+    # Attack-leg cruise: distance from home to target slot, minus a
+    # standoff so APPROACH starts from inside its reliable detection
+    # range. Emitted as ONE FB_RC step at full forward stick — much
+    # faster than chained moveBy chunks.
     close_in = _close_in_distance_m((home.x, home.y), slot)
-    close_in_steps = "\n".join(
-        f"FB_IMU {chunk:.2f}" for chunk in _chunk_close_in(close_in)
+    close_in_dur = _cruise_duration_s(close_in)
+    close_in_step = (
+        f"FB_RC {CRUISE_RC_STICK} {close_in_dur:.2f}" if close_in_dur > 0 else ""
     )
+
     wall_entry = HOME_WALL_MARKER.get(ctx.our_team)
     if wall_entry:
         wall_marker_id, _ = wall_entry
         rth_close_in = _rth_close_in_distance_m(slot, ctx.our_team)
-        rth_steps = "\n".join(
-            f"FB_IMU {chunk:.2f}" for chunk in _chunk_close_in(rth_close_in)
+        rth_dur = _cruise_duration_s(rth_close_in)
+        rth_cruise_step = (
+            f"FB_RC {CRUISE_RC_STICK} {rth_dur:.2f}" if rth_dur > 0 else ""
         )
         rth_lines = (
             f"HEIGHT {home_alt:.2f}",
-            rth_steps,
-            f"APPROACH {wall_marker_id} {RTH_APPROACH_DISTANCE_M:.2f}",
+            rth_cruise_step,
+            f"FB_BRAKE {wall_marker_id} {FB_BRAKE_WALL_STOP_M:.2f} "
+            f"{FB_BRAKE_STICK} {FB_BRAKE_TIMEOUT_S:.1f}",
             # YAW_IMU 180 so the drone lands facing the ENEMY (not home).
             # Without this, after one full attack the drone is facing the
             # home wall (because of the mid-script YAW_IMU 180 + RTH);
-            # the next takeoff would then drive FB_IMU straight into the
-            # home wall. Net is two YAW_IMU 180s per attack — one to
-            # face home for RTH, one to face the enemy again before
+            # the next takeoff would then drive forward straight into
+            # the home wall. Net is two YAW_IMU 180s per attack — one
+            # to face home for RTH, one to face the enemy again before
             # landing — which keeps every subsequent attack consistent
             # with the operator's spawn convention (drone faces enemy).
             "YAW_IMU 180",
@@ -222,10 +292,17 @@ def _full_attack_script(
     return _format_script(
         "TAKEOFF",
         f"HEIGHT {ascend:.2f}",
-        close_in_steps,
-        f"APPROACH {int(attack_marker_id)} {approach_d:.2f}",
-        f"HEIGHT {ascend:.2f}",
-        f"FB_IMU {forward:.2f}",
+        close_in_step,
+        # FB_BRAKE on the target's face marker. Replaces the old
+        # APPROACH — closed-loop PD with slow-zone settle was the
+        # single biggest time-sink in the script (~60-75 s vs 5 s
+        # for FB_BRAKE). FB_BRAKE just pins the stick and snaps to
+        # brake the moment vision sees the marker within
+        # FB_BRAKE_TARGET_STOP_M; the drone ends roughly 1 m short
+        # of the box and the FB_RC drift below puts us on top of it.
+        f"FB_BRAKE {int(attack_marker_id)} {FB_BRAKE_TARGET_STOP_M:.2f} "
+        f"{FB_BRAKE_STICK} {FB_BRAKE_TIMEOUT_S:.1f}",
+        f"FB_RC {DRIFT_OVER_BOX_RC} {DRIFT_OVER_BOX_DURATION_S:.2f}",
         "YAW_IMU 180",
         f"HOOVER {hover_s:.1f}",
         *rth_lines,

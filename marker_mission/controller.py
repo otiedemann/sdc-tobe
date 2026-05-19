@@ -74,6 +74,7 @@ class Phase(enum.Enum):
     GOTO      = "goto"      # mission-script TO step (drive to arena-frame point)
     DANCE     = "dance"     # mission-script DANCE step (programmed RC routine)
     RC        = "rc"        # mission-script LR / FB / UD / RC (raw stick + timer)
+    FB_BRAKE  = "fb_brake"  # mission-script FB_BRAKE (open-loop fwd + vision brake)
     ROTATE    = "rotate"    # mission-script YAW_IMU (discrete rotation by N deg)
     SCOUT     = "scout"     # mission-script SCOUT (slow 360° yaw spin)
     MOVE_IMU  = "move_imu"  # mission-script FB_IMU / LR_IMU / UD_IMU
@@ -1008,6 +1009,8 @@ class MissionController:
                     self._step_dance(tel, now)
                 elif phase == Phase.RC:
                     self._step_rc(tel, now)
+                elif phase == Phase.FB_BRAKE:
+                    self._step_fb_brake(tel, now)
                 elif phase == Phase.SCOUT:
                     self._step_scout(tel, now)
                 elif phase == Phase.ROTATE:
@@ -1652,6 +1655,105 @@ class MissionController:
                 f"rc step complete (brake {elapsed:.2f}s, {reason})"
             )
 
+    # ----------------------------------------------------------- fb_brake
+    def _step_fb_brake(self, tel: Optional[TelemetrySnapshot],
+                       now: float) -> None:
+        """FB_BRAKE step: pin forward stick, brake when marker close.
+
+        Two-phase like _step_rc:
+
+        1. DRIVE — pin ``rc_step_fb`` until ONE OF:
+              (a) the active marker is visible AND its measured
+                  ``distance_m`` < ``target_distance_m`` (vision trip), OR
+              (b) ``rc_step_until`` elapses (hard timeout — vision
+                  never came back; keeps the script from hanging if
+                  the marker is blocked / out of frame).
+        2. BRAKE — identical to _step_rc's brake: zero sticks, wait
+           for IMU body-speed < RC_BRAKE_SPEED_THRESHOLD_CMS or
+           RC_BRAKE_MAX_SETTLE_S, then advance.
+
+        Pose freshness: ``last_pose`` is cleared on step entry so a
+        stale pose from a previous APPROACH (which may be on a
+        DIFFERENT marker) can't false-trip the brake. We additionally
+        gate on ``pose.marker_id == active_marker_id`` so that even
+        if the smoother hands us a foreign pose mid-step, we ignore
+        it. Both checks together mean the brake only ever trips on a
+        FRESH pose of the requested marker.
+        """
+        with self.state.lock:
+            fb = int(self.state.rc_step_fb)
+            until = self.state.rc_step_until
+            braking = bool(self.state.rc_step_braking)
+            brake_started = self.state.rc_step_brake_started
+            active = self.state.active_marker_id
+            stop_m = float(self.state.target_distance_m)
+            pose = self.state.last_pose
+
+        if not braking:
+            # ── DRIVE phase ─────────────────────────────────────────
+            self._send_rc(0, fb, 0, 0, enforce_cfg_caps=False)
+            # Vision trip? Pose must be present AND for the active
+            # marker AND under threshold.
+            trip_vision = False
+            if (pose is not None
+                    and active is not None
+                    and int(pose.marker_id) == int(active)
+                    and float(pose.distance_m) < stop_m):
+                trip_vision = True
+            trip_timeout = (until is not None and now >= until)
+            if trip_vision or trip_timeout:
+                with self.state.lock:
+                    self.state.rc_step_braking = True
+                    self.state.rc_step_brake_started = now
+                    if trip_vision:
+                        self.state.note = (
+                            f"FB_BRAKE: marker {active} at "
+                            f"{pose.distance_m:.2f}m < {stop_m:.2f}m — "
+                            f"vision trip, braking"
+                        )
+                    else:
+                        self.state.note = (
+                            f"FB_BRAKE: timeout (marker {active} not "
+                            f"seen at < {stop_m:.2f}m) — braking"
+                        )
+                return
+            # Still cruising.
+            with self.state.lock:
+                d_str = (f"{pose.distance_m:.2f}m"
+                         if pose is not None
+                         and active is not None
+                         and int(pose.marker_id) == int(active)
+                         else "—")
+                remain = (until - now) if until is not None else None
+                self.state.note = (
+                    f"FB_BRAKE drive: fb={fb} marker={active} d={d_str} "
+                    f"stop<{stop_m:.2f}m"
+                    + (f" ({remain:.1f}s deadline)" if remain is not None
+                       else "")
+                )
+            return
+
+        # ── BRAKE phase ─────────────────────────────────────────────
+        self._send_rc(0, 0, 0, 0, enforce_cfg_caps=False)
+        speed = self._body_speed_cms(tel)
+        elapsed = (now - brake_started) if brake_started is not None else 0.0
+        with self.state.lock:
+            self.state.note = (
+                f"FB_BRAKE brake: speed={speed:.0f}cm/s elapsed={elapsed:.2f}s"
+                if speed is not None
+                else f"FB_BRAKE brake: speed=? elapsed={elapsed:.2f}s"
+            )
+        settled = (
+            speed is not None and speed < RC_BRAKE_SPEED_THRESHOLD_CMS
+        ) or elapsed >= RC_BRAKE_MAX_SETTLE_S
+        if settled:
+            reason = (f"speed={speed:.0f}cm/s < {RC_BRAKE_SPEED_THRESHOLD_CMS:g}"
+                      if speed is not None and speed < RC_BRAKE_SPEED_THRESHOLD_CMS
+                      else f"timeout {elapsed:.2f}s")
+            self._advance_script(
+                f"fb_brake complete (brake {elapsed:.2f}s, {reason})"
+            )
+
     # ------------------------------------------------------------- scout
     def _step_scout(self, tel: Optional[TelemetrySnapshot],
                     now: float) -> None:
@@ -2293,6 +2395,39 @@ class MissionController:
                    f"lr={step.rc_lr}")
             self._set_phase(Phase.RC,
                             note + f" {tag} {step.seconds:g}s")
+            return
+        if step.kind == "FB_BRAKE":
+            # Open-loop forward stick + vision-triggered brake.
+            # Reuses the RC step's brake-phase machinery: when the
+            # vision threshold trips OR the timeout expires, we flip
+            # rc_step_braking=True and the next tick zeros the sticks
+            # + waits for IMU velocity to settle.
+            with self.state.lock:
+                self.state.active_marker_id = int(step.marker_id)
+                self.state.target_distance_m = float(step.distance)
+                self.state.rc_step_lr = 0
+                self.state.rc_step_fb = int(step.rc_fb)
+                self.state.rc_step_ud = 0
+                self.state.rc_step_yaw = 0
+                # rc_step_until is the HARD TIMEOUT (not the drive
+                # duration). Vision normally trips the brake long
+                # before this; the deadline only fires if the marker
+                # never becomes visible.
+                self.state.rc_step_until = (time.monotonic()
+                                             + float(step.seconds))
+                self.state.rc_step_braking = False
+                self.state.rc_step_brake_started = None
+                # Clear last_pose so a stale pose from the previous
+                # APPROACH (e.g. on the target marker) can't trip
+                # this brake instantly. The vision loop populates
+                # last_pose with the new active marker on its next
+                # frame; until then _step_fb_brake just drives.
+                self.state.last_pose = None
+            self._set_phase(
+                Phase.FB_BRAKE,
+                note + f" marker={step.marker_id} stop={step.distance:g}m "
+                       f"fb={step.rc_fb} timeout={step.seconds:g}s"
+            )
             return
         if step.kind == "SCOUT":
             # Slow 360° yaw spin for visual situational awareness.

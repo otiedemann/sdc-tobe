@@ -31,6 +31,7 @@ Eighteen commands. Suffix convention:
     FB_RC    <rc> [<seconds>]                      +forward / -back, rc in [-100, +100]
     UD_RC    <rc> [<seconds>]                      +up / -down,      rc in [-100, +100]
     YAW_RC   <rc> [<seconds>]                      +cw / -ccw,       rc in [-100, +100]
+    FB_BRAKE <marker-id> <stop_m> [<rc>] [<timeout_s>]   open-loop fwd then vision brake
     LR_IMU   <meters>                              +right / -left,   |m| in [0.01, 5.0]
     FB_IMU   <meters>                              +forward / -back, |m| in [0.01, 5.0]
     UD_IMU   <meters>                              +up / -down,      |m| in [0.01, 5.0]
@@ -48,6 +49,19 @@ LR_IMU / FB_IMU / UD_IMU / YAW_IMU are closed-loop moves: the firmware
 flies the drone exactly the requested distance / angle and stops.
 Symmetric in both directions (no Anafi velocity-controller asymmetry).
 The step blocks until the move completes.
+
+FB_BRAKE is the speed-tuned cousin of APPROACH: pin the forward
+stick at ``rc`` (default 100) and watch the named marker's measured
+distance. As soon as ``MarkerPose.distance_m < stop_m``, the FC zeros
+the stick and enters the same IMU-velocity brake phase as the other
+*_RC steps. Useful for *fast* arrivals where APPROACH's slow-zone
+PD is too conservative — e.g. cruising back to home base and braking
+on a 0.5 m wall marker. The ``timeout_s`` (default 10) is a hard
+upper bound that flips into brake even if the marker is never seen
+(prevents an open-loop crash if vision drops). Unlike APPROACH there
+is no settle / heading-alignment / slow-zone refinement — once the
+distance threshold trips, the controller commits to the brake and
+the next step takes over.
 
 LR / FB / UD / RC are raw-RC steps: pin the listed stick(s) to the
 given value(s) for the given duration (default 1 second; fractional
@@ -323,6 +337,41 @@ def parse(text: str, defaults: dict) -> List[Step]:
             else:  # YAW_RC
                 step.rc_yaw = rc
             out.append(step)
+        elif cmd == "FB_BRAKE":
+            # Open-loop forward stick with vision-triggered brake.
+            # Args: <marker-id> <stop-distance-m> [<stick>] [<timeout-s>]
+            # See module docstring for full semantics.
+            if not (2 <= len(args) <= 4):
+                raise ScriptError(raw_line_no,
+                                  f"FB_BRAKE takes 2-4 arguments "
+                                  f"(<marker-id> <stop_m> [<rc>] "
+                                  f"[<timeout_s>]), got {len(args)}")
+            mid = _parse_int(args[0], raw_line_no, "FB_BRAKE marker-id")
+            stop_m = _parse_float(args[1], raw_line_no,
+                                  "FB_BRAKE stop distance")
+            if stop_m <= 0:
+                raise ScriptError(raw_line_no,
+                                  f"FB_BRAKE stop distance must be > 0, "
+                                  f"got {stop_m}")
+            rc = (_parse_int(args[2], raw_line_no, "FB_BRAKE rc")
+                  if len(args) >= 3 else 100)
+            if not (-100 <= rc <= 100):
+                raise ScriptError(raw_line_no,
+                                  f"FB_BRAKE rc must be in [-100, +100], "
+                                  f"got {rc}")
+            timeout_s = (_parse_float(args[3], raw_line_no,
+                                      "FB_BRAKE timeout-seconds")
+                         if len(args) >= 4 else 10.0)
+            if timeout_s <= 0:
+                raise ScriptError(raw_line_no,
+                                  f"FB_BRAKE timeout must be > 0, "
+                                  f"got {timeout_s}")
+            out.append(Step(kind="FB_BRAKE",
+                            marker_id=mid,
+                            distance=stop_m,
+                            rc_fb=rc,
+                            seconds=timeout_s,
+                            line_no=raw_line_no))
         elif cmd == "YAW_IMU":
             # Discrete rotation by N degrees, range [-180, +180].
             # Positive = CW (looking down). Synchronous on the FC
@@ -496,6 +545,14 @@ def format(steps: List[Step]) -> str:
                     f"RC {s.rc_lr} {s.rc_fb} {s.rc_ud} {s.rc_yaw} "
                     f"{s.seconds:g}"
                 )
+        elif s.kind == "FB_BRAKE":
+            # Round-trip canonical form. Always emit the optional
+            # rc + timeout so the parser sees identical text on
+            # re-parse (no implicit defaults floating in).
+            lines.append(
+                f"FB_BRAKE {s.marker_id} {s.distance:g} "
+                f"{s.rc_fb} {s.seconds:g}"
+            )
         elif s.kind == "YAW":
             lines.append(f"YAW_IMU {int(s.rotation_deg or 0)}")
         elif s.kind == "MOVE_IMU":
