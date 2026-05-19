@@ -4,17 +4,34 @@ Operator assigns a target *slot* (1..6). The role pushes ONE complete
 mission script that does everything end-to-end:
 
     TAKEOFF
+    HEIGHT <capture_ascend_m>      # ascend BEFORE closing in so the
+                                   # camera has line-of-sight to the
+                                   # distant marker
+    FB_IMU <close_in_m>            # cruise forward in IMU frame until
+                                   # within ArUco range (~3-4 m)
     APPROACH <enemy-face-id> <approach_distance_m>
-    HEIGHT <capture_ascend_m>
-    FB_IMU <capture_forward_m>
+    HEIGHT <capture_ascend_m>      # re-assert in case approach drifted
+    FB_IMU <capture_forward_m>     # drift over the box
+    YAW_IMU 180
     HOOVER <capture_hover_s>
-    TO <home.x> <home.y> <home_alt>
+    TO_HOME <home_alt>
     LAND
 
-The drone approaches the enemy face, ascends, drifts over the marker,
-hovers briefly, returns to home, and lands. After the script is fully
-done (FC drops back to Phase.INIT), the role marks itself done and the
-target is cleared.
+The drone closes in toward the enemy side, ascends, locks onto the
+marker via APPROACH, drifts over it, hovers, then RTHs and lands. After
+the script fully ends (FC drops back to Phase.INIT), the role marks
+itself done and the target is cleared.
+
+OPERATOR CONVENTION
+-------------------
+The FB_IMU close-in assumes the drone is placed at takeoff with its
+front camera pointing toward the enemy side (i.e. red drones face arena
++y, blue drones face -y). FB_IMU is forward-in-drone-frame, not arena
+frame — without the right takeoff orientation the drone would fly off
+into a wall. We don't try to align via YAW_IMU because the absolute
+IMU↔arena yaw transform is unreliable (no compass calibration in sim,
+magnetic_north_arena_yaw_deg drifts). Operator-set takeoff orientation
+is simple and reliable.
 
 We deliberately keep it as a single push (rather than separate attack +
 RTH scripts) because pushing a second script while the first is still
@@ -37,6 +54,7 @@ approach-capture-RTH-land sequence.
 from __future__ import annotations
 
 import logging
+import math
 
 from .roles import Decision, Role, RoleContext, noop, push, register
 from .settings import face_id
@@ -44,30 +62,69 @@ from .settings import face_id
 logger = logging.getLogger(__name__)
 
 
+# Physical target slot positions in arena frame (x, y) — z is fixed at
+# 1.0 m by the box pedestals and isn't needed for the close-in distance.
+# Pulled from tools/sphinx-arena/default_target_layout.json and the
+# §1.1 regs: red slots 4-6 at y=-7.5, blue slots 1-3 at y=+7.5, all
+# spread across x ∈ {-3, 0, +3}.
+SLOT_POSITIONS_M: dict[int, tuple[float, float]] = {
+    1: (-3.0, 7.5),  2: (0.0, 7.5),  3: (3.0, 7.5),
+    4: (-3.0, -7.5), 5: (0.0, -7.5), 6: (3.0, -7.5),
+}
+
+# Stop the FB_IMU close-in this far short of the target so APPROACH has
+# room to do its precision dance. 4 m is well within reliable ArUco
+# range for 18 cm markers (~6-7 m worst case at the sim's 70° FOV).
+CLOSE_IN_STANDOFF_M: float = 4.0
+
+
 def _format_script(*lines: str) -> str:
     return "\n".join(line for line in lines if line) + "\n"
 
 
-def _full_attack_script(ctx: RoleContext, attack_marker_id: int) -> str:
-    """Approach the enemy face, fly over, turn around, RTH, land.
+def _close_in_distance_m(home_xy: tuple[float, float], slot: int) -> float:
+    """Straight-line distance from home to target slot, minus standoff.
+
+    Returns 0.0 if the slot is unknown or if home is already inside the
+    standoff (don't emit a degenerate FB_IMU that drives backward).
+    """
+    target = SLOT_POSITIONS_M.get(int(slot))
+    if target is None:
+        return 0.0
+    dx = target[0] - home_xy[0]
+    dy = target[1] - home_xy[1]
+    raw = math.hypot(dx, dy)
+    return max(0.0, raw - CLOSE_IN_STANDOFF_M)
+
+
+def _full_attack_script(
+    ctx: RoleContext, attack_marker_id: int, slot: int
+) -> str:
+    """Close in toward the enemy side, capture, RTH, land.
 
     Script shape:
         TAKEOFF
-        APPROACH <id> <approach_distance_m>
-        HEIGHT <capture_ascend_m>
-        FB_IMU <capture_forward_m>     # drift forward to be *over* the box
-        YAW_IMU 180                     # turn to face home
-        HOOVER <capture_hover_s>        # capture window (already facing home)
-        TO <home.x> <home.y> <home_alt> # forward cruise back to home
+        HEIGHT <capture_ascend_m>      # ascend before closing in so
+                                       # the camera has line-of-sight
+        FB_IMU <close_in_m>            # cruise within ArUco range
+        APPROACH <id> <approach_d>     # precision lock + slow advance
+        HEIGHT <capture_ascend_m>      # re-assert post-approach
+        FB_IMU <capture_forward_m>     # drift over the box
+        YAW_IMU 180                    # turn to face home
+        HOOVER <capture_hover_s>       # capture window
+        TO_HOME <home_alt>             # straight-line cruise to home
         LAND
 
-    The YAW_IMU 180 step is the key to a fast return: by the time the
-    HOOVER capture window ends, the drone is already pointed at home,
-    so the subsequent TO step drives the drone forward (not backward
-    or sideways), which gives the fwd PD channel — already the
-    fastest-tuned — the full control range. Tested before this change,
-    the drone had to swing 180° during TO, sliding sideways while
-    yawing; with this change it's a clean straight-line cruise.
+    The close-in step (FB_IMU before APPROACH) is what lets APPROACH
+    actually see the target — 18 cm markers at 15 m are below the
+    detector's reliable range. By ascending to capture_ascend_m first
+    and then cruising forward in IMU frame, we arrive at standoff
+    distance with the marker centred in the front cam.
+
+    The YAW_IMU 180 after capture is the key to a fast RTH: the
+    subsequent TO_HOME step drives the drone forward (not backward),
+    giving the fwd PD channel — already the fastest-tuned — the full
+    control range.
     """
     m = ctx.match
     approach_d = max(0.2, float(m.approach_distance_m))
@@ -91,6 +148,10 @@ def _full_attack_script(ctx: RoleContext, attack_marker_id: int) -> str:
     # value is kept as a fallback so a fresh deploy still produces a
     # working TO step. Floor at 0.6 m so a typo can't fly into the floor.
     home_alt = max(0.6, float(ctx.drone.home_alt_m or home.alt))
+    close_in = _close_in_distance_m((home.x, home.y), slot)
+    # Emit the FB_IMU close-in only when it actually moves forward.
+    # _format_script drops empty strings, so we conditionally pass "".
+    close_in_step = f"FB_IMU {close_in:.2f}" if close_in > 0.1 else ""
     # RTH uses TO_HOME (drone returns to its takeoff snapshot in
     # ArUco frame) rather than TO with absolute arena coords. The
     # ArUco solution currently has an unsolved absolute offset error;
@@ -101,6 +162,8 @@ def _full_attack_script(ctx: RoleContext, attack_marker_id: int) -> str:
     # descends at home.
     return _format_script(
         "TAKEOFF",
+        f"HEIGHT {ascend:.2f}",
+        close_in_step,
         f"APPROACH {int(attack_marker_id)} {approach_d:.2f}",
         f"HEIGHT {ascend:.2f}",
         f"FB_IMU {forward:.2f}",
@@ -148,7 +211,7 @@ class AttackerRole(Role):
             attack_id = _enemy_face_for(slot, ctx.our_team)
             rs.last_attack_marker_id = attack_id
             return push(
-                _full_attack_script(ctx, attack_id),
+                _full_attack_script(ctx, attack_id, slot),
                 new_phase="running",
                 reason=f"attacker: full attack on slot {slot} (id={attack_id})",
             )
