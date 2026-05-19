@@ -144,6 +144,13 @@ wait_for() {
 
 log "starting recovery / bootstrap"
 
+# spc_up has to be defined before the HARD block below — restart_firmwared_full
+# calls wait_for spc_up internally, and bash function lookup is at call time
+# from the current scope. Earlier versions defined spc_up only here (just
+# above the normal wait_for), and the HARD branch failed with
+# "spc_up: command not found".
+spc_up() { curl -sf --max-time 2 "$SPC_API/api/environment" >/dev/null 2>&1; }
+
 # Operator can request a HARD recover via the dashboard. Two triggers,
 # whichever exists at start wins (then we consume both):
 #   /tmp/sphinx-bootstrap-hard.flag   — created by /api/recover?hard=1
@@ -163,7 +170,6 @@ if [ -f "$HARD_FLAG" ] || [ "${SPHINX_BOOTSTRAP_HARD:-0}" = "1" ]; then
     fi
 fi
 
-spc_up() { curl -sf --max-time 2 "$SPC_API/api/environment" >/dev/null 2>&1; }
 if ! wait_for "sphinx-control API on :9090" spc_up 60; then
     log "abort: sphinx-control not answering"; exit 1
 fi
