@@ -593,27 +593,46 @@ def estimate_position(arena: ArenaConfig,
 
         # Layer -1: altimeter-aware Z disambiguator. The barometer-derived
         # ``tel.height_cm`` is the most reliable single source we have for
-        # the drone's actual altitude. When both IPPE branches give very
-        # different Z components (planar-mirror flip), the branch whose
-        # camera Z matches the altimeter is the right one regardless of
-        # what magnetometer/anchor say. Runs first so subsequent layers
-        # can trust the per-marker pick. Tolerance 0.5 m absorbs the
-        # ~10–20 cm altimeter drift typical on the Anafi.
-        if (tel_height_m is not None and alt_pos is not None
+        # the drone's actual altitude. Three cases:
+        #
+        #   (a) both IPPE branches exist, only one Z matches altimeter →
+        #       pick the matching one (clear winner)
+        #   (b) only chosen branch exists, Z matches altimeter → trust
+        #       chosen, mark alt_validated (lets it through the
+        #       cold-start quorum gate)
+        #   (c) chosen exists, Z doesn't match → no validation, fall
+        #       through to mag/anchor/OOB layers
+        #
+        # ALT_TOL_M=0.5 absorbs the ~10–20 cm Anafi altimeter drift while
+        # still rejecting metre-scale mirror flips.
+        if (tel_height_m is not None
                 and p.collapsed_camera_position_m is None
                 and tel_height_m > 0.05):
             ALT_TOL_M = 0.5
             chosen_z_err = abs(float(chosen_pos[2]) - float(tel_height_m))
-            alt_z_err = abs(float(alt_pos[2]) - float(tel_height_m))
-            # Need a clear winner: one within tolerance, the other not.
-            if chosen_z_err <= ALT_TOL_M and alt_z_err > ALT_TOL_M:
-                pos_w = chosen_pos
-                method = "ippe_alt_z"
-                alt_validated = True
-            elif alt_z_err <= ALT_TOL_M and chosen_z_err > ALT_TOL_M:
-                pos_w = alt_pos
-                method = "ippe_alt_z_swap"
-                alt_validated = True
+            if alt_pos is not None:
+                alt_z_err = abs(float(alt_pos[2]) - float(tel_height_m))
+                if chosen_z_err <= ALT_TOL_M and alt_z_err > ALT_TOL_M:
+                    pos_w = chosen_pos
+                    method = "ippe_alt_z"
+                    alt_validated = True
+                elif alt_z_err <= ALT_TOL_M and chosen_z_err > ALT_TOL_M:
+                    pos_w = alt_pos
+                    method = "ippe_alt_z_swap"
+                    alt_validated = True
+                elif chosen_z_err <= ALT_TOL_M and alt_z_err <= ALT_TOL_M:
+                    # both match — chosen wins by default, no flag
+                    pos_w = chosen_pos
+                    method = chosen_method
+            else:
+                # Single-branch IPPE result (mirror was back-facing or
+                # numerically degenerate). Trust the chosen branch IFF
+                # it matches the altimeter. If it doesn't, leave pos_w
+                # None so the cold-start quorum rejects it.
+                if chosen_z_err <= ALT_TOL_M:
+                    pos_w = chosen_pos
+                    method = "ippe_alt_z_single"
+                    alt_validated = True
 
         # Layer 0: magnetometer pick. Only fires when both branches
         # exist (otherwise there's nothing to disambiguate against)
