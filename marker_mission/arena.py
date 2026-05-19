@@ -626,12 +626,25 @@ def estimate_position(arena: ArenaConfig,
                     method = chosen_method
             else:
                 # Single-branch IPPE result (mirror was back-facing or
-                # numerically degenerate). Trust the chosen branch IFF
-                # it matches the altimeter. If it doesn't, leave pos_w
-                # None so the cold-start quorum rejects it.
-                if chosen_z_err <= ALT_TOL_M:
+                # numerically degenerate). Altimeter alone isn't enough
+                # to validate — measured 2026-05-19: chosen Z=1.4
+                # matched altimeter=1.5 but XY was off by ~7 m because
+                # IPPE picked the wrong planar branch (sign-flipped X).
+                # Require BOTH altimeter Z agreement AND magnetometer-
+                # yaw agreement (when calibrated). Yaw check catches
+                # the X-axis-mirror case the altimeter cannot.
+                z_ok = chosen_z_err <= ALT_TOL_M
+                yaw_ok = True  # default — only fails if mag available
+                if use_mag:
+                    yaw_ok = False
+                    chosen_yaw_branch = _arena_yaw_for_branch(p, marker, "chosen")
+                    if chosen_yaw_branch is not None:
+                        d = _yaw_diff(chosen_yaw_branch, expected_arena_yaw)
+                        yaw_ok = d <= ARENA_MAG_SLACK_DEG
+                if z_ok and yaw_ok:
                     pos_w = chosen_pos
-                    method = "ippe_alt_z_single"
+                    method = ("ippe_alt_z_single" if not use_mag
+                              else "ippe_alt_mag_single")
                     alt_validated = True
 
         # Layer 0: magnetometer pick. Only fires when both branches
