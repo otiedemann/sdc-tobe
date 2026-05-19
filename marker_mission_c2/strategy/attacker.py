@@ -107,6 +107,27 @@ MIN_CRUISE_DURATION_S: float = 0.4
 # 5x faster.
 DRIFT_OVER_BOX_RC: int = 60
 DRIFT_OVER_BOX_DURATION_S: float = 0.3
+# Slight upward stick during the drift to keep the drone above the
+# box top during the brief sideways momentum-bleed.
+DRIFT_OVER_BOX_UD_RC: int = 20
+
+# Combined-motion sticks for the "climb + cruise" RC step that
+# replaces dedicated HEIGHT + FB_RC sequences. Anafi accepts all four
+# sticks on a single PCMD frame — sending fb + ud simultaneously
+# saves a full HEIGHT step (~10-20 s) per leg by parallelising the
+# vertical and horizontal motion. The ud value is chosen so the
+# drone climbs the configured ascend distance over roughly the same
+# duration the fb stick covers the cruise distance:
+#
+#   capture ascend (TAKEOFF → camera-level): ~0.6 m at ~0.3 m/s = 2 s
+#   RTH ascend (camera-level → above boxes): ~1.5 m at ~0.4 m/s = 4 s
+#
+# The cruise itself is faster (~4 m/s) so the ud stick is sized to
+# *finish climbing by the time we're in marker-detection range* —
+# any residual climb after FB_BRAKE trips would just lift us off
+# the box.
+CRUISE_UP_UD_RC: int = 80      # combined fb + climb for attack leg
+RTH_CRUISE_UP_UD_RC: int = 60  # combined fb + climb for RTH leg
 
 # Home-wall markers for RTH braking. 0.5 m markers on each team's
 # home wall, LOW position (2.0 m altitude) — close to cruise altitude
@@ -193,14 +214,12 @@ def _full_attack_script(
 
     Script shape:
         TAKEOFF
-        HEIGHT <capture_ascend_m>           # ascend for camera line-of-sight
-        FB_RC 100 <close_in_dur_s>          # FAST cruise within ArUco range
+        RC 0 100 80 0 <close_in_dur>        # COMBINED climb + cruise (no HEIGHT)
         FB_BRAKE <id> 2.0 100 5             # vision-tripped brake on target
-        FB_RC <drift_rc> <drift_dur_s>      # short drift over the box
+        RC 0 60 20 0 0.3                    # drift over box (fwd + slight up)
         YAW_IMU 180                         # turn to face home
-        HOOVER <capture_hover_s>            # capture window (~0.3-1 s)
-        HEIGHT <home_alt>                   # cruise altitude above boxes
-        FB_RC 100 <rth_dur_s>               # FAST cruise toward home
+        RC 0 100 60 0 <rth_dur>             # COMBINED climb + RTH cruise (no HEIGHT,
+                                            # no HOOVER — starts immediately)
         FB_BRAKE <wall_marker> 2.5 100 5    # vision-tripped brake on home wall
         YAW_IMU 180                         # face enemy before landing
         LAND
@@ -240,71 +259,86 @@ def _full_attack_script(
     """
     m = ctx.match
     approach_d = max(0.2, float(m.approach_distance_m))
-    ascend = max(0.6, float(m.capture_ascend_m))
-    # Capture hover floor lowered to 0.3 s. The intent of the hover is
-    # "give the scout a chance to register the new face" — at 5 Hz
-    # vision that's 1-2 frames, plenty. Long hovers just burn budget.
-    hover_s = max(0.3, float(m.capture_hover_s))
+    # capture_ascend_m and capture_hover_s are still read for compat
+    # but no longer drive separate HEIGHT / HOOVER steps — combined
+    # RC handles both. Kept here so config writes don't crash if the
+    # operator still flips these in the dashboard.
+    _ = max(0.6, float(m.capture_ascend_m))
+    _ = max(0.0, float(m.capture_hover_s))
     home = (
         ctx.match.home_red if ctx.our_team == "red" else ctx.match.home_blue
     )
-    home_alt = max(0.6, float(ctx.drone.home_alt_m or home.alt))
+    _ = max(0.6, float(ctx.drone.home_alt_m or home.alt))
 
-    # Attack-leg cruise: distance from home to target slot, minus a
-    # standoff so APPROACH starts from inside its reliable detection
-    # range. Emitted as ONE FB_RC step at full forward stick — much
-    # faster than chained moveBy chunks.
+    # Attack-leg cruise duration (distance ÷ calibrated cruise speed).
+    # Emitted as a combined RC step — pinning fb=100 AND ud=80 means
+    # the drone climbs AND moves forward in the same step. Saves
+    # ~10-20 s vs the old "HEIGHT 1.5 then FB_RC 100" sequence (the
+    # HEIGHT PD waits for settle BEFORE the cruise even starts).
     close_in = _close_in_distance_m((home.x, home.y), slot)
     close_in_dur = _cruise_duration_s(close_in)
     close_in_step = (
-        f"FB_RC {CRUISE_RC_STICK} {close_in_dur:.2f}" if close_in_dur > 0 else ""
+        f"RC 0 {CRUISE_RC_STICK} {CRUISE_UP_UD_RC} 0 {close_in_dur:.2f}"
+        if close_in_dur > 0 else ""
     )
 
     wall_entry = HOME_WALL_MARKER.get(ctx.our_team)
     if wall_entry:
-        wall_marker_id, _ = wall_entry
+        wall_marker_id, _w_xy = wall_entry
         rth_close_in = _rth_close_in_distance_m(slot, ctx.our_team)
         rth_dur = _cruise_duration_s(rth_close_in)
+        # Combined RC for RTH: fb=100 cruises home, ud=60 climbs above
+        # any target boxes we'd cross over. (Drone is yawed away from
+        # the targets after the mid-script YAW_IMU 180, so up-stick
+        # while cruising is safe — no targets in fwd cam view.)
         rth_cruise_step = (
-            f"FB_RC {CRUISE_RC_STICK} {rth_dur:.2f}" if rth_dur > 0 else ""
+            f"RC 0 {CRUISE_RC_STICK} {RTH_CRUISE_UP_UD_RC} 0 {rth_dur:.2f}"
+            if rth_dur > 0 else ""
         )
         rth_lines = (
-            f"HEIGHT {home_alt:.2f}",
+            # NO separate HEIGHT step — the combined RC handles climb.
+            # NO HOOVER between YAW_IMU and RTH cruise — the user's
+            # explicit requirement was "must start immediately after
+            # capture with much faster flight".
             rth_cruise_step,
             f"FB_BRAKE {wall_marker_id} {FB_BRAKE_WALL_STOP_M:.2f} "
             f"{FB_BRAKE_STICK} {FB_BRAKE_TIMEOUT_S:.1f}",
             # YAW_IMU 180 so the drone lands facing the ENEMY (not home).
-            # Without this, after one full attack the drone is facing the
-            # home wall (because of the mid-script YAW_IMU 180 + RTH);
-            # the next takeoff would then drive forward straight into
-            # the home wall. Net is two YAW_IMU 180s per attack — one
-            # to face home for RTH, one to face the enemy again before
-            # landing — which keeps every subsequent attack consistent
-            # with the operator's spawn convention (drone faces enemy).
+            # Without this, the next attack's TAKEOFF inherits the
+            # home-facing heading and the first forward push would
+            # drive straight into the home wall.
             "YAW_IMU 180",
             "LAND",
         )
     else:
+        # Fallback if team has no wall marker mapping — use TO_HOME.
+        # Kept for safety; in practice both teams have wall markers.
         rth_lines = (
-            f"TO_HOME {home_alt:.2f}",
+            f"TO_HOME {ctx.drone.home_alt_m or 3.0:.2f}",
             "LAND",
         )
     return _format_script(
         "TAKEOFF",
-        f"HEIGHT {ascend:.2f}",
+        # No separate HEIGHT — the combined RC below climbs and
+        # cruises simultaneously. Anafi takeoff naturally settles at
+        # ~1 m altitude; the up-stick during cruise lifts to camera
+        # level *while we're already moving forward*.
         close_in_step,
         # FB_BRAKE on the target's face marker. Replaces the old
         # APPROACH — closed-loop PD with slow-zone settle was the
         # single biggest time-sink in the script (~60-75 s vs 5 s
-        # for FB_BRAKE). FB_BRAKE just pins the stick and snaps to
-        # brake the moment vision sees the marker within
-        # FB_BRAKE_TARGET_STOP_M; the drone ends roughly 1 m short
-        # of the box and the FB_RC drift below puts us on top of it.
+        # for FB_BRAKE). FB_BRAKE pins the stick and snaps to brake
+        # the moment vision sees the marker within
+        # FB_BRAKE_TARGET_STOP_M.
         f"FB_BRAKE {int(attack_marker_id)} {FB_BRAKE_TARGET_STOP_M:.2f} "
         f"{FB_BRAKE_STICK} {FB_BRAKE_TIMEOUT_S:.1f}",
-        f"FB_RC {DRIFT_OVER_BOX_RC} {DRIFT_OVER_BOX_DURATION_S:.2f}",
+        # Drift over the box (brief forward push + slight up-stick
+        # to stay above the box top during momentum bleed).
+        f"RC 0 {DRIFT_OVER_BOX_RC} {DRIFT_OVER_BOX_UD_RC} 0 "
+        f"{DRIFT_OVER_BOX_DURATION_S:.2f}",
         "YAW_IMU 180",
-        f"HOOVER {hover_s:.1f}",
+        # No HOOVER — RTH starts immediately. Capture detection is
+        # the scout role's job; the attacker just commits and runs.
         *rth_lines,
     )
 
