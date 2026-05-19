@@ -684,9 +684,25 @@ def cmd_fly(args: argparse.Namespace) -> int:
                     # selection to it: a chosen IPPE pose that's
                     # metres from the last good fix is the wrong
                     # branch on a noisy frame, not a real teleport.
+                    # Also honour reset_position_estimator: the
+                    # controller raises it on TAKEOFF entry so we
+                    # don't carry a poisoned anchor across missions.
                     with state.lock:
+                        reset_req = state.reset_position_estimator
+                        if reset_req:
+                            state.world_position_m = None
+                            state.world_position_updated_at = 0.0
+                            state.reset_position_estimator = False
                         prev_wp = state.world_position_m
                         prev_at = state.world_position_updated_at
+                    if reset_req:
+                        # Clear the Kalman state too so the next fresh
+                        # measurement initialises it cleanly instead
+                        # of being pulled toward the stale mean.
+                        position_kf.reset()
+                        kf_last_t = 0.0
+                        kf_enabled_prev = False
+                        print("[vision] position estimator reset (TAKEOFF)")
                     prev_age_s = ((time.monotonic() - prev_at)
                                    if prev_at > 0.0 else None)
                     est = estimate_position(

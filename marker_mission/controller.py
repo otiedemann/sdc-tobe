@@ -458,6 +458,15 @@ class MissionState:
     # computed yet" -- snapshot exposes None as the age in that
     # case. Set every time vision_worker writes a non-None estimate.
     world_position_updated_at: float = 0.0
+    # When True, ``vision_worker`` clears ``world_position_m`` AND
+    # resets the position Kalman filter on its next iteration. The
+    # controller raises this on entry to ``Phase.TAKEOFF`` so each
+    # mission starts cold — otherwise a stale or wrong-anchor fix
+    # from the previous mission (worst case: a 7+ m IPPE branch error
+    # that latched into anchor) survives across the cycle and gates
+    # every subsequent measurement. vision_worker clears the flag
+    # after honouring it.
+    reset_position_estimator: bool = False
     # Markers / methods / per-marker votes from the LAST fresh fix
     # (kept in sync with ``world_position_m``). They describe how the
     # currently-displayed position was computed, so they go stale
@@ -856,6 +865,14 @@ class MissionController:
         if phase == Phase.HOLD:
             with self.state.lock:
                 self.state.hold_began_at = time.monotonic()
+        # Reset the position estimator on every TAKEOFF so a stale or
+        # wrong-anchor world_position_m from the previous mission
+        # (worst case: a 7+ m IPPE branch error that latched into
+        # anchor) doesn't poison the new mission's branch selection.
+        # vision_worker clears the flag after honouring it.
+        if phase == Phase.TAKEOFF:
+            with self.state.lock:
+                self.state.reset_position_estimator = True
         # LAND can be re-entered (script with multiple LAND steps, or
         # LAND followed by TAKEOFF). Reset the per-LAND scratch state
         # so the second entry actually issues api.land() instead of
