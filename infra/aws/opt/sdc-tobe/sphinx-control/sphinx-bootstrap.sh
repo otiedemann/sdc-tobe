@@ -115,7 +115,7 @@ restart_sphinx_control() {
 # in.
 restart_firmwared_full() {
     log "  HARD RESET: stop sphinx-control + firmwared restart"
-    sudo -n systemctl stop sphinx-control marker-mission c2-controller 2>/dev/null
+    sudo -n systemctl stop sphinx-control marker-mission marker-mission-c2 strategy 2>/dev/null
     kill_orphans
     sleep 3
     sudo -n systemctl restart firmwared \
@@ -123,7 +123,10 @@ restart_firmwared_full() {
     sleep 3
     sudo -n systemctl start sphinx-control
     wait_for "sphinx-control back online" spc_up 30 || return 1
-    sudo -n systemctl start c2-controller marker-mission 2>/dev/null || true
+    # Use --no-block so a missing or hung unit can't make the bootstrap
+    # itself time out (systemd's TimeoutStartSec on this service is 5 min).
+    # We started these on the way down; their async restart is fine.
+    sudo -n systemctl start --no-block marker-mission marker-mission-c2 strategy 2>/dev/null || true
 }
 
 wait_for() {
