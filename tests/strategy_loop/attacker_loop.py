@@ -223,13 +223,17 @@ def _classify(result: CycleResult, trace: List[TraceSample]) -> None:
             abrupt_land = True
             break
 
-    # Success criteria: ended at phase=init/done with drone landed within
-    # 1.5 m of home and strategy role-state = done.
+    # Success criteria: strategy role-state == "done" (mission completed
+    # cleanly), FC dropped back to init/done, drone landed, final pos
+    # close to home. rs_phase=="idle" alone is NOT success — that's the
+    # state before the mission ran.
     landed = last.flying is False
     near_home = (result.home_distance_m is not None
-                 and result.home_distance_m < 1.5)
-    rs_done = last.rs_phase in ("done", "idle")
+                 and result.home_distance_m < 2.0)
+    rs_done = last.rs_phase == "done"
     fc_done = last.fc_phase in ("init", "done", "")
+    saw_running = any(s.rs_phase == "running" for s in trace)
+    saw_flying = any(s.flying is True for s in trace)
 
     if emergency:
         result.outcome = "crash"
@@ -249,20 +253,31 @@ def _classify(result: CycleResult, trace: List[TraceSample]) -> None:
         result.classification_reason = (
             f"position stuck under {SAME_POS_TOL_M}m for {SAME_POS_HANG_THRESHOLD_S}s+"
         )
+    elif not saw_flying:
+        # Drone never took off at all → strategy didn't push or FC ignored.
+        result.outcome = "error"
+        result.classification_reason = (
+            "drone never reported flying=True during the cycle"
+        )
+    elif not saw_running:
+        result.outcome = "error"
+        result.classification_reason = (
+            "strategy role-state never entered 'running'"
+        )
     elif rs_done and fc_done and landed and near_home:
         result.outcome = "success"
         result.classification_reason = (
             f"landed at home (d={result.home_distance_m:.2f}m)"
         )
+    elif rs_done and fc_done and landed:
+        result.outcome = "success_off_home"
+        result.classification_reason = (
+            f"landed but far from home (d={result.home_distance_m:.2f}m)"
+        )
     elif result.duration_s >= MISSION_TIMEOUT_S - 1.0:
         result.outcome = "timeout"
         result.classification_reason = (
             f"hit timeout {MISSION_TIMEOUT_S}s before reaching done state"
-        )
-    elif rs_done and fc_done:
-        result.outcome = "success"
-        result.classification_reason = (
-            f"role-state + fc done (home_dist={result.home_distance_m}, flying={last.flying})"
         )
     else:
         result.outcome = "aborted"
@@ -365,6 +380,7 @@ def run_cycle(
     deadline = started + MISSION_TIMEOUT_S
     last_fc_phase = None
     last_rs_phase = None
+    mission_started = False        # True once we've seen rs_phase != idle
     while time.time() < deadline:
         s = _sample(strategy, fc, fc_name, started)
         trace.append(s)
@@ -378,13 +394,18 @@ def run_cycle(
                   f"  h={h:>7s}  pos={pos}")
             last_fc_phase = s.fc_phase
             last_rs_phase = s.rs_phase
-        # Early exit: strategy reports done AND drone landed.
-        if s.rs_phase in ("done", "idle") and s.flying is False and s.fc_phase in ("init", "done"):
-            # confirm with a follow-up sample
+        if s.rs_phase not in ("idle", "", "?"):
+            mission_started = True
+        # Early exit only after the mission has clearly STARTED, and only
+        # when the strategy reports "done" (not idle — idle is the
+        # pre-push state). FC back to init AND drone landed completes
+        # the check.
+        if (mission_started and s.rs_phase == "done"
+                and s.flying is False and s.fc_phase in ("init", "done")):
             time.sleep(POLL_INTERVAL_S)
             s2 = _sample(strategy, fc, fc_name, started)
             trace.append(s2)
-            if s2.rs_phase in ("done", "idle") and s2.flying is False:
+            if s2.rs_phase == "done" and s2.flying is False:
                 break
         time.sleep(POLL_INTERVAL_S)
 
