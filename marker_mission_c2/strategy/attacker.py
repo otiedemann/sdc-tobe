@@ -14,6 +14,7 @@ mission script that does everything end-to-end:
     HEIGHT <home_alt>              # cruise altitude above boxes
     FB_IMU <rth_close_in_m>        # high-speed cruise toward home
     APPROACH <wall_marker> <2.0>   # brake on home-wall marker
+    YAW_IMU 180                    # face enemy again so next attack starts correct
     LAND
 
 The drone closes in toward the enemy side, ascends, locks onto the
@@ -162,12 +163,21 @@ def _full_attack_script(
         HEIGHT <home_alt>              # cruise altitude above boxes
         FB_IMU <rth_close_in_m>        # high-speed cruise toward home
         APPROACH <wall_marker> <2.0>   # brake on home-wall marker
+        YAW_IMU 180                    # face enemy before landing
         LAND
 
     RTH uses APPROACH on the home-wall marker instead of TO_HOME.
     The position estimator drifts ~5 m at cruise speeds, making
     TO_HOME overshoot into the back wall. Per-marker IPPE distance
     is reliable — APPROACH on a 0.5 m wall marker brakes precisely.
+
+    The final YAW_IMU 180 (after the wall-marker APPROACH) is the
+    key to a repeatable multi-attack sequence: without it, the
+    drone lands facing the home wall (the natural result of the
+    APPROACH on a back-wall marker), and the NEXT attack's TAKEOFF
+    inherits that heading — FB_IMU then drives backward into the
+    home wall. Two YAW_IMUs per attack keeps the spawn-orientation
+    convention (drone faces enemy) consistent across runs.
     """
     m = ctx.match
     approach_d = max(0.2, float(m.approach_distance_m))
@@ -193,6 +203,15 @@ def _full_attack_script(
             f"HEIGHT {home_alt:.2f}",
             rth_steps,
             f"APPROACH {wall_marker_id} {RTH_APPROACH_DISTANCE_M:.2f}",
+            # YAW_IMU 180 so the drone lands facing the ENEMY (not home).
+            # Without this, after one full attack the drone is facing the
+            # home wall (because of the mid-script YAW_IMU 180 + RTH);
+            # the next takeoff would then drive FB_IMU straight into the
+            # home wall. Net is two YAW_IMU 180s per attack — one to
+            # face home for RTH, one to face the enemy again before
+            # landing — which keeps every subsequent attack consistent
+            # with the operator's spawn convention (drone faces enemy).
+            "YAW_IMU 180",
             "LAND",
         )
     else:
