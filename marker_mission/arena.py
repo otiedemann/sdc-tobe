@@ -732,9 +732,9 @@ def estimate_position(arena: ArenaConfig,
             and not any(av for _, _, _, _, av in contributions)):
         return None
 
-    total_w = sum(w for _, _, w, _ in contributions)
+    total_w = sum(w for _, _, w, _, _ in contributions)
     weighted_sum = np.zeros(3, dtype=float)
-    for _, pos_w, w, _ in contributions:
+    for _, pos_w, w, _, _ in contributions:
         weighted_sum += pos_w * w
     avg = weighted_sum / total_w
 
