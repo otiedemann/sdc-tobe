@@ -670,6 +670,19 @@ def estimate_position(arena: ArenaConfig,
     if not contributions:
         return None
 
+    # Cold-start single-marker reject. With only one wall marker visible
+    # and no fresh anchor to disambiguate against, the IPPE planar-pose
+    # mirror branch can be confidently inside the arena AND wrong —
+    # measured today: drone at sim spawn (0,-1.7,2) reported as
+    # (4.7,5.8,4.1) using marker 9 alone with mag-swap "help". Two
+    # markers cross-check naturally because their wrong branches
+    # disagree by ≥1 m while their right branches agree. Require a
+    # multi-marker quorum before publishing a cold-start fix. Once the
+    # anchor is fresh (use_anchor==True), single-marker updates are
+    # safe — the anchor itself does the disambiguation per-marker.
+    if (not use_anchor) and len(contributions) < 2:
+        return None
+
     total_w = sum(w for _, _, w, _ in contributions)
     weighted_sum = np.zeros(3, dtype=float)
     for _, pos_w, w, _ in contributions:
