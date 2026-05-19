@@ -510,6 +510,7 @@ def estimate_position(arena: ArenaConfig,
                       prev_position_m: Optional[np.ndarray] = None,
                       prev_age_s: Optional[float] = None,
                       tel_yaw_deg: Optional[float] = None,
+                      tel_height_m: Optional[float] = None,
                       enable_arena_oob_filter: bool = True,
                       enable_alt_branch_swap: bool = True,
                       enable_prev_anchor: bool = False,
@@ -588,12 +589,40 @@ def estimate_position(arena: ArenaConfig,
 
         pos_w = None
         method = chosen_method
+        alt_validated = False  # set when altimeter agreed within tolerance
+
+        # Layer -1: altimeter-aware Z disambiguator. The barometer-derived
+        # ``tel.height_cm`` is the most reliable single source we have for
+        # the drone's actual altitude. When both IPPE branches give very
+        # different Z components (planar-mirror flip), the branch whose
+        # camera Z matches the altimeter is the right one regardless of
+        # what magnetometer/anchor say. Runs first so subsequent layers
+        # can trust the per-marker pick. Tolerance 0.5 m absorbs the
+        # ~10–20 cm altimeter drift typical on the Anafi.
+        if (tel_height_m is not None and alt_pos is not None
+                and p.collapsed_camera_position_m is None
+                and tel_height_m > 0.05):
+            ALT_TOL_M = 0.5
+            chosen_z_err = abs(float(chosen_pos[2]) - float(tel_height_m))
+            alt_z_err = abs(float(alt_pos[2]) - float(tel_height_m))
+            # Need a clear winner: one within tolerance, the other not.
+            if chosen_z_err <= ALT_TOL_M and alt_z_err > ALT_TOL_M:
+                pos_w = chosen_pos
+                method = "ippe_alt_z"
+                alt_validated = True
+            elif alt_z_err <= ALT_TOL_M and chosen_z_err > ALT_TOL_M:
+                pos_w = alt_pos
+                method = "ippe_alt_z_swap"
+                alt_validated = True
 
         # Layer 0: magnetometer pick. Only fires when both branches
         # exist (otherwise there's nothing to disambiguate against)
         # and at least one of them lands within ARENA_MAG_SLACK_DEG
-        # of the magnetometer-expected arena yaw.
-        if (use_mag and alt_pos is not None
+        # of the magnetometer-expected arena yaw. Skipped when the
+        # altimeter layer already picked — it's the more reliable
+        # signal when available.
+        if (pos_w is None
+                and use_mag and alt_pos is not None
                 and p.collapsed_camera_position_m is None):
             chosen_yaw = _arena_yaw_for_branch(p, marker, "chosen")
             alt_yaw    = _arena_yaw_for_branch(p, marker, "alt")
@@ -613,9 +642,11 @@ def estimate_position(arena: ArenaConfig,
                 # branch.
 
         if pos_w is not None:
-            # Magnetometer made the call -- skip the anchor / OOB
-            # gates. Final aggregate OOB check still applies below.
-            contributions.append((int(p.marker_id), pos_w, weight, method))
+            # Magnetometer (or altimeter) made the call -- skip the
+            # anchor / OOB gates. Final aggregate OOB check still
+            # applies below.
+            contributions.append((int(p.marker_id), pos_w, weight, method,
+                                  alt_validated))
             continue
 
         if use_anchor:
@@ -665,22 +696,21 @@ def estimate_position(arena: ArenaConfig,
                 pos_w = None
 
         if pos_w is not None:
-            contributions.append((int(p.marker_id), pos_w, weight, method))
+            contributions.append((int(p.marker_id), pos_w, weight, method,
+                                  alt_validated))
 
     if not contributions:
         return None
 
     # Cold-start single-marker reject. With only one wall marker visible
     # and no fresh anchor to disambiguate against, the IPPE planar-pose
-    # mirror branch can be confidently inside the arena AND wrong —
-    # measured today: drone at sim spawn (0,-1.7,2) reported as
-    # (4.7,5.8,4.1) using marker 9 alone with mag-swap "help". Two
-    # markers cross-check naturally because their wrong branches
-    # disagree by ≥1 m while their right branches agree. Require a
-    # multi-marker quorum before publishing a cold-start fix. Once the
-    # anchor is fresh (use_anchor==True), single-marker updates are
-    # safe — the anchor itself does the disambiguation per-marker.
-    if (not use_anchor) and len(contributions) < 2:
+    # mirror branch can be confidently inside the arena AND wrong. EXCEPT
+    # when the altimeter layer (above) disambiguated the branch from the
+    # drone's barometric height — that's a robust independent signal
+    # that lets single-marker fixes through safely.
+    if ((not use_anchor)
+            and len(contributions) < 2
+            and not any(av for _, _, _, _, av in contributions)):
         return None
 
     total_w = sum(w for _, _, w, _ in contributions)
@@ -701,8 +731,8 @@ def estimate_position(arena: ArenaConfig,
 
     return PositionEstimate(
         position_m=avg,
-        used_markers=[mid for mid, _, _, _ in contributions],
-        per_marker_position_m={mid: pos for mid, pos, _, _ in contributions},
-        weights={mid: w / total_w for mid, _, w, _ in contributions},
-        per_marker_method={mid: meth for mid, _, _, meth in contributions},
+        used_markers=[mid for mid, _, _, _, _ in contributions],
+        per_marker_position_m={mid: pos for mid, pos, _, _, _ in contributions},
+        weights={mid: w / total_w for mid, _, w, _, _ in contributions},
+        per_marker_method={mid: meth for mid, _, _, meth, _ in contributions},
     )

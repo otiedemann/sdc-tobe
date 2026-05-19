@@ -705,11 +705,23 @@ def cmd_fly(args: argparse.Namespace) -> int:
                         print("[vision] position estimator reset (TAKEOFF)")
                     prev_age_s = ((time.monotonic() - prev_at)
                                    if prev_at > 0.0 else None)
+                    # Drone altimeter (barometer) reading for the
+                    # altitude-aware IPPE branch picker. Optional: None
+                    # disables that layer.
+                    tel_height_m: Optional[float] = None
+                    if tel_for_swap is not None:
+                        h_cm = tel_for_swap.raw.get("height_cm")
+                        if h_cm is not None:
+                            try:
+                                tel_height_m = float(h_cm) / 100.0
+                            except (TypeError, ValueError):
+                                tel_height_m = None
                     est = estimate_position(
                         arena, poses,
                         prev_position_m=prev_wp,
                         prev_age_s=prev_age_s,
                         tel_yaw_deg=tel_yaw_for_swap,
+                        tel_height_m=tel_height_m,
                         enable_arena_oob_filter=cfg.enable_ippe_arena_oob_filter,
                         enable_alt_branch_swap=cfg.enable_ippe_alt_branch_swap,
                         enable_prev_anchor=cfg.enable_ippe_prev_anchor,
