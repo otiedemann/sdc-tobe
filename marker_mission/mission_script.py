@@ -471,6 +471,11 @@ def format(steps: List[Step]) -> str:
             if numeric_yaw:
                 parts.append(f"{float(s.yaw):g}")
             lines.append(" ".join(parts))
+        elif s.kind == "TO_HOME":
+            if s.height is not None:
+                lines.append(f"TO_HOME {s.height:g}")
+            else:
+                lines.append("TO_HOME")
         elif s.kind == "RC":
             # Round-trip rule:
             #   - exactly one of lr/fb/ud/yaw non-zero → the matching
