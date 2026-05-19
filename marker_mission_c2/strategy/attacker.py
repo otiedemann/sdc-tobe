@@ -73,14 +73,16 @@ SLOT_POSITIONS_M: dict[int, tuple[float, float]] = {
 }
 
 # Stop the FB_IMU close-in this far short of the target so APPROACH has
-# room to do its precision dance. 4 m is well within reliable ArUco
-# range for 18 cm markers (~6-7 m worst case at the sim's 70° FOV).
-CLOSE_IN_STANDOFF_M: float = 4.0
+# room to do its precision dance. 7 m gives 18 cm markers comfortable
+# headroom for detection — empirically ArUco picks them up at <8 m on
+# the sim's 70° FOV / 1280×720 cam.
+CLOSE_IN_STANDOFF_M: float = 7.0
 
-# marker_mission.mission_script enforces a |FB_IMU| <= 5.0 safety cap
-# per step (anti-typo: prevents a stray "FB_IMU 50" flying into a wall).
-# Our close-in is typically ~12 m, so we chain N steps of <= this size.
-FB_IMU_CAP_M: float = 5.0
+# mission_script enforces |FB_IMU| <= 5 m per step (anti-typo safety
+# cap). But empirically chained 5m moveBy steps stall short (one round
+# of 3×5+1.5 commanded → only ~7 m actual). Cap our chunk size at 4 m
+# to stay well clear of that regime while respecting the parser cap.
+FB_IMU_CHUNK_M: float = 4.0
 
 
 def _format_script(*lines: str) -> str:
@@ -88,16 +90,16 @@ def _format_script(*lines: str) -> str:
 
 
 def _chunk_close_in(total_m: float) -> list[float]:
-    """Split a total forward-cruise distance into <= FB_IMU_CAP_M chunks.
+    """Split a total forward-cruise distance into <= FB_IMU_CHUNK_M chunks.
 
     Drops chunks below 0.1 m (parser min is 0.01 m but tiny steps add
     latency for no useful motion). Returns [] for non-positive totals.
     """
     out: list[float] = []
     remaining = float(total_m)
-    while remaining > FB_IMU_CAP_M:
-        out.append(FB_IMU_CAP_M)
-        remaining -= FB_IMU_CAP_M
+    while remaining > FB_IMU_CHUNK_M:
+        out.append(FB_IMU_CHUNK_M)
+        remaining -= FB_IMU_CHUNK_M
     if remaining >= 0.1:
         out.append(remaining)
     return out
