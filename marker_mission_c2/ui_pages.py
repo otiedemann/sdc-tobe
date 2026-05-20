@@ -82,6 +82,29 @@ PAGE_OVERVIEW = """
         <span data-role="msg" style="font-size:.78rem; color:#aab;
                                       align-self:center;"></span>
       </div>
+      <div class="atk-row" style="display:flex; gap:.4rem; flex-wrap:wrap;
+                  margin-top:.4rem; align-items:center;">
+        <span style="font-size:.78rem; color:#aab;">Attack</span>
+        <select data-role="atk-team" title="our team"
+                style="font-size:.8rem; padding:2px 4px;">
+          <option value="red">red</option>
+          <option value="blue">blue</option>
+        </select>
+        <select data-role="atk-slot" title="target slot"
+                style="font-size:.8rem; padding:2px 4px;">
+          <option value="1">slot 1</option>
+          <option value="2">slot 2</option>
+          <option value="3">slot 3</option>
+          <option value="4">slot 4</option>
+          <option value="5">slot 5</option>
+          <option value="6">slot 6</option>
+        </select>
+        <button type="button" class="btn btn-good" data-role="attack">
+          Run attack
+        </button>
+        <span data-role="atk-msg" style="font-size:.78rem; color:#aab;
+                                          align-self:center;"></span>
+      </div>
       <details data-role="script-details" style="margin-top:.45rem;">
         <summary>Inline script editor</summary>
         <textarea data-role="script-text" rows="6" spellcheck="false"
@@ -553,6 +576,28 @@ PAGE_OVERVIEW = """
         if (j.ok) setMsg(msg, j.noop ? 'already idle' : 'stop sent', 'good');
         else setMsg(msg, 'stop failed: ' + (j.error || ''), 'bad');
       } catch (e) { setMsg(msg, 'stop error: ' + e, 'bad'); }
+    } else if (role === 'attack') {
+      const atkMsg = card.querySelector('[data-role=atk-msg]');
+      const team = card.querySelector('[data-role=atk-team]').value;
+      const slot = parseInt(
+        card.querySelector('[data-role=atk-slot]').value, 10);
+      setMsg(atkMsg, 'launching attack…');
+      try {
+        const r = await fetch('/api/c2/' + fc + '/attack',
+                              {method:'POST',
+                               headers:{'Content-Type':'application/json'},
+                               body: JSON.stringify({team, slot})});
+        const j = await r.json();
+        if (j.ok) {
+          setMsg(atkMsg, 'slot ' + slot + ' attack launched', 'good');
+          // Reflect the generated script in the inline editor so the
+          // operator can see exactly what's running / tune + re-run it.
+          const ta = card.querySelector('[data-role=script-text]');
+          if (ta && j.script) ta.value = j.script;
+        } else {
+          setMsg(atkMsg, 'attack failed: ' + (j.error || ''), 'bad');
+        }
+      } catch (e) { setMsg(atkMsg, 'attack error: ' + e, 'bad'); }
     } else if (role === 'script-load') {
       setMsg(scriptMsg, 'loading…');
       try {

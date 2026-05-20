@@ -25,6 +25,7 @@ from flask import Flask, jsonify, render_template_string, request, send_file
 from .calibration_sync import CalibrationLibrary, is_valid_calibration_name
 from .config import C2Config
 from .fc_pool import FCPool
+from .maneuvers import build_attack_script, params_from_dict
 from .settings import SettingsStore
 from .ui_pages import (
     PAGE_ARENA,
@@ -356,6 +357,33 @@ def _build_app(cfg: C2Config, pool: FCPool, library: CalibrationLibrary,
         text = str(body.get("text") or "")
         ok, payload = _await(client.set_mission_script(text), timeout=5.0)
         return jsonify({"ok": ok, "payload": payload,
+                        "error": None if ok else _err(payload)})
+
+    # ------------------------------------------------- manual attack maneuver
+    # Build an attack run from EXISTING mission-script commands (no special
+    # AUTO_ATTACK phase) and push it to the FC. Operator-triggered from the
+    # dashboard's per-FC manual selector: body {slot, team, params?}.
+    # Positioning is assistance only — APPROACH (vision) drives the precise
+    # stops; TO is coarse pre-positioning.
+    @app.post("/api/c2/<fc>/attack")
+    def api_fc_attack(fc: str):
+        client, err = _fc_or_404(fc)
+        if err:
+            return err
+        body = request.get_json(silent=True) or {}
+        try:
+            slot = int(body.get("slot"))
+        except (TypeError, ValueError):
+            return jsonify({"ok": False,
+                            "error": "slot must be an integer 1..6"}), 400
+        team = str(body.get("team") or "red").lower()
+        try:
+            script = build_attack_script(
+                slot, team, params_from_dict(body.get("params")))
+        except ValueError as exc:
+            return jsonify({"ok": False, "error": str(exc)}), 400
+        ok, payload = _await(client.start_mission(script), timeout=10.0)
+        return jsonify({"ok": ok, "script": script, "payload": payload,
                         "error": None if ok else _err(payload)})
 
     # ------------------------------------------------------------- arena
