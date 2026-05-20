@@ -668,10 +668,36 @@ def estimate_position(arena: ArenaConfig,
                     else:
                         pos_w = chosen_pos
                         method = chosen_method
+                    # Magnetometer made a confident branch pick. Mark
+                    # the vote VALIDATED so the cold-start single-marker
+                    # reject (below) lets it through: the magnetometer
+                    # is a robust independent disambiguator just like the
+                    # altimeter, and crucially it works ON THE GROUND
+                    # (height≈0) where the altimeter Z-layer is skipped.
+                    # Without this flag a stationary, grounded drone that
+                    # can see exactly one wall marker gets NO world fix
+                    # (regression vs the pre-mag behaviour).
+                    alt_validated = True
                 # else: both > slack -- magnetic field disturbance
                 # or stale offset; fall through to the anchor / OOB
                 # blocks rather than picking a confidently-wrong
                 # branch.
+
+        # Layer 0.5: magnetometer-only SINGLE-branch validation. Fires
+        # when IPPE produced just one branch (alt_pos is None) and the
+        # altimeter layer didn't validate (e.g. drone on the ground,
+        # height≈0). The magnetometer alone confirms the single branch's
+        # arena yaw is plausible; if so accept + mark validated so the
+        # cold-start single-marker gate lets it through.
+        if (pos_w is None and use_mag and alt_pos is None
+                and p.collapsed_camera_position_m is None):
+            chosen_yaw_branch = _arena_yaw_for_branch(p, marker, "chosen")
+            if chosen_yaw_branch is not None:
+                d = _yaw_diff(chosen_yaw_branch, expected_arena_yaw)
+                if d <= ARENA_MAG_SLACK_DEG:
+                    pos_w = chosen_pos
+                    method = "ippe_mag_single"
+                    alt_validated = True
 
         if pos_w is not None:
             # Magnetometer (or altimeter) made the call -- skip the
