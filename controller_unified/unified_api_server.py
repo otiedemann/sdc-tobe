@@ -479,7 +479,18 @@ _arena_margin_m: float = float(os.getenv("ARENA_SAFETY_MARGIN_M", "1.5"))
 # Toggle: applies to BOTH manual and autonomous flight. Default ON.
 # When OFF the Pi's RC tick makes no XY boundary decisions — operator
 # takes full responsibility. The altitude ceiling remains on regardless.
-_arena_guard_enabled: bool = os.getenv("ARENA_GUARD_ENABLED", "1") not in {"0", "false", "False"}
+# Arena XY boundary guard. DISABLED by default — the bounds the
+# guard uses come from a stale non-centered arena (``y∈[0, 10.8]``)
+# while the unified positioning subsystem now publishes positions in
+# the centered marker_mission frame (``y∈[-10, +10]``). The two
+# clocks disagree, so the guard either clamps too aggressively
+# (legitimate PD corrections refused, drone stuck in front of a
+# marker it can't centre) or not at all. Until the bounds are
+# regenerated from the active arena config, default off.
+#
+# Re-enable per-host via env: ``ARENA_GUARD_ENABLED=1`` in a systemd
+# drop-in, or live via ``POST /api/config/arena_safety {"enabled": true}``.
+_arena_guard_enabled: bool = os.getenv("ARENA_GUARD_ENABLED", "0") not in {"0", "false", "False"}
 _arena_engaged: bool = False
 _arena_last_reason: str = ""
 MAX_VERTICAL_SPEED = float(os.getenv("MAX_VERTICAL_SPEED", "0.5"))

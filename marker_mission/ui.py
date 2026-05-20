@@ -2785,7 +2785,13 @@ _PAGE_ARENA = _PAGE_BASE_CSS + _PAGE_HEADER + _COMMON_SCRIPT + _PAGE_GRID_OPEN +
                       style="margin-left:.4rem; padding:.2rem .55rem;
                              border:1px solid #2a3038; border-radius:4px;
                              background:#1f2937; color:#e6edf3;
-                             cursor:pointer; font-size:.8rem;">Capture</button>
+                             cursor:pointer; font-size:.8rem;">Capture (from markers)</button>
+              <button id="btn-ar-magcap-front" type="button"
+                      title="Use this when you've physically aligned the drone to face the front wall (arena_yaw = 0 by definition). Reads tel.yaw and stores -tel.yaw. No markers needed."
+                      style="margin-left:.3rem; padding:.2rem .55rem;
+                             border:1px solid #2a3038; border-radius:4px;
+                             background:#1f2937; color:#e6edf3;
+                             cursor:pointer; font-size:.8rem;">Capture (facing front wall)</button>
               <span id="ar-magcap-msg" style="margin-left:.4rem;
                     font-size:.78rem; color:#aab;"></span>
             </td></tr>
@@ -2930,6 +2936,41 @@ async function captureMagNorth() {
     msg.textContent =
       'captured ' + offset.toFixed(2) + ' deg from '
       + used + ' markers (press Save active to persist)';
+  } catch (e) {
+    msg.style.color = 'var(--bad)';
+    msg.textContent = 'capture failed: ' + e;
+  }
+}
+// Alternate capture: operator has physically pointed the drone at
+// the front wall, so arena_yaw is 0 by definition. We only need
+// tel.yaw to derive the offset. No markers required — works on the
+// ground, in any phase, as long as telemetry is alive.
+async function captureMagNorthFromFront() {
+  const msg = $('ar-magcap-msg');
+  msg.style.color = '#aab'; msg.textContent = 'reading state...';
+  try {
+    const r = await fetch('/api/state', {cache:'no-store'});
+    const s = await r.json();
+    const tyaw = (s.telemetry || {}).yaw;
+    if (typeof tyaw !== 'number') {
+      msg.style.color = 'var(--bad)';
+      msg.textContent = 'no tel.yaw available — is the drone connected?';
+      return;
+    }
+    if (!confirm('Confirm the drone is physically pointed AT THE FRONT WALL '
+               + '(arena_yaw = 0 by definition).\\n\\ntel.yaw = '
+               + tyaw.toFixed(2) + ' deg → magnetic offset = '
+               + _wrap180(-tyaw).toFixed(2) + ' deg')) {
+      msg.style.color = '#aab'; msg.textContent = '';
+      return;
+    }
+    // arena_yaw = 0 (operator-asserted) → offset = 0 - tel.yaw = -tel.yaw
+    const offset = _wrap180(-tyaw);
+    $('ar-magnorth').value = offset.toFixed(2);
+    msg.style.color = 'var(--good)';
+    msg.textContent =
+      'captured ' + offset.toFixed(2) + ' deg from tel.yaw=' + tyaw.toFixed(2)
+      + ' (drone facing front wall — press Save active to persist)';
   } catch (e) {
     msg.style.color = 'var(--bad)';
     msg.textContent = 'capture failed: ' + e;
@@ -3298,6 +3339,7 @@ async function refreshList() {
 $('btn-ar-reset').addEventListener('click', resetToDefault);
 $('btn-ar-save').addEventListener('click', saveActive);
 $('btn-ar-magcap').addEventListener('click', captureMagNorth);
+$('btn-ar-magcap-front').addEventListener('click', captureMagNorthFromFront);
 $('btn-ar-add').addEventListener('click', () => {
   const meta = metaFromInputs();
   arena.markers.push({id: (Math.max(0, ...arena.markers.map(m=>m.id))+1),
