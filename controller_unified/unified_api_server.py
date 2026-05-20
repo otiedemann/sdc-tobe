@@ -3916,23 +3916,38 @@ def rc_loop():
             wdx = lr * rx + fb * dx
             wdy = lr * ry + fb * dy
 
+            # ACTIVE BRAKING. Inside the margin, clamping RC to 0 is
+            # not enough — Anafi inertia keeps the drone coasting
+            # forward another 1-3 m depending on speed. To actually
+            # hold the drone OUTSIDE the wall, push REVERSE RC
+            # proportional to how deep we are past the margin (and
+            # capped at 100). This decelerates the drone aggressively
+            # and pushes it back into the safe zone.
+            #
+            # Gain is empirical: 50 RC per metre of penetration. So
+            # 0.5 m inside margin → 25 RC reverse; 2 m inside → 100
+            # RC reverse (saturated). At cruise speed 2-4 m/s this
+            # gives enough deceleration to come to a stop before
+            # the actual wall.
+            BRAKE_GAIN_RC_PER_M = 50.0
             actions = []
-            # x max (right wall)
+            # x max (right wall) — clearance neg = past margin
             if clearance["x_max"] <= 0 and wdx > 0:
-                wdx = 0
-                actions.append("clamp-x_max")
-            # x min (left wall)
+                wdx = max(-100.0,
+                          min(0.0, wdx + clearance["x_max"] * BRAKE_GAIN_RC_PER_M))
+                actions.append(f"brake-x_max({wdx:.0f})")
             if clearance["x_min"] <= 0 and wdx < 0:
-                wdx = 0
-                actions.append("clamp-x_min")
-            # y max (back wall / net)
+                wdx = min(100.0,
+                          max(0.0, wdx - clearance["x_min"] * BRAKE_GAIN_RC_PER_M))
+                actions.append(f"brake-x_min({wdx:.0f})")
             if clearance["y_max"] <= 0 and wdy > 0:
-                wdy = 0
-                actions.append("clamp-y_max")
-            # y min (front wall)
+                wdy = max(-100.0,
+                          min(0.0, wdy + clearance["y_max"] * BRAKE_GAIN_RC_PER_M))
+                actions.append(f"brake-y_max({wdy:.0f})")
             if clearance["y_min"] <= 0 and wdy < 0:
-                wdy = 0
-                actions.append("clamp-y_min")
+                wdy = min(100.0,
+                          max(0.0, wdy - clearance["y_min"] * BRAKE_GAIN_RC_PER_M))
+                actions.append(f"brake-y_min({wdy:.0f})")
 
             if actions:
                 # Convert world-frame intent back to body-frame RC.

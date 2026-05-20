@@ -339,13 +339,20 @@ def parse(text: str, defaults: dict) -> List[Step]:
             out.append(step)
         elif cmd == "FB_BRAKE":
             # Open-loop forward stick with vision-triggered brake.
-            # Args: <marker-id> <stop-distance-m> [<stick>] [<timeout-s>]
-            # See module docstring for full semantics.
-            if not (2 <= len(args) <= 4):
+            # Args: <marker-id> <stop-distance-m>
+            #       [<stick>] [<timeout-s>]
+            #       [<world_x> <world_y>]
+            # World coords are an optional explicit hint for markers
+            # the FC doesn't know about (e.g. slot face markers not
+            # present in arena_config). If supplied, the controller's
+            # world-fallback brake uses these coords; without them it
+            # falls back to arena_config and timeout only.
+            if not (2 <= len(args) <= 6):
                 raise ScriptError(raw_line_no,
-                                  f"FB_BRAKE takes 2-4 arguments "
+                                  f"FB_BRAKE takes 2-6 arguments "
                                   f"(<marker-id> <stop_m> [<rc>] "
-                                  f"[<timeout_s>]), got {len(args)}")
+                                  f"[<timeout_s>] [<world_x> <world_y>]), "
+                                  f"got {len(args)}")
             mid = _parse_int(args[0], raw_line_no, "FB_BRAKE marker-id")
             stop_m = _parse_float(args[1], raw_line_no,
                                   "FB_BRAKE stop distance")
@@ -366,11 +373,25 @@ def parse(text: str, defaults: dict) -> List[Step]:
                 raise ScriptError(raw_line_no,
                                   f"FB_BRAKE timeout must be > 0, "
                                   f"got {timeout_s}")
+            # Optional world coords: must come as a PAIR (x, y).
+            world_x = None
+            world_y = None
+            if len(args) == 5:
+                raise ScriptError(raw_line_no,
+                                  f"FB_BRAKE world coords must be "
+                                  f"<world_x> <world_y> (pair), got 1 extra arg")
+            if len(args) == 6:
+                world_x = _parse_float(args[4], raw_line_no,
+                                       "FB_BRAKE world_x")
+                world_y = _parse_float(args[5], raw_line_no,
+                                       "FB_BRAKE world_y")
             out.append(Step(kind="FB_BRAKE",
                             marker_id=mid,
                             distance=stop_m,
                             rc_fb=rc,
                             seconds=timeout_s,
+                            world_x=world_x,
+                            world_y=world_y,
                             line_no=raw_line_no))
         elif cmd == "YAW_IMU":
             # Discrete rotation by N degrees, range [-180, +180].
@@ -546,13 +567,18 @@ def format(steps: List[Step]) -> str:
                     f"{s.seconds:g}"
                 )
         elif s.kind == "FB_BRAKE":
-            # Round-trip canonical form. Always emit the optional
-            # rc + timeout so the parser sees identical text on
-            # re-parse (no implicit defaults floating in).
-            lines.append(
-                f"FB_BRAKE {s.marker_id} {s.distance:g} "
-                f"{s.rc_fb} {s.seconds:g}"
-            )
+            # Round-trip canonical form. Always emit rc + timeout
+            # so the parser sees identical text on re-parse (no
+            # implicit defaults floating in). World coords are
+            # emitted only when set.
+            parts = [
+                f"FB_BRAKE {s.marker_id} {s.distance:g}",
+                f"{s.rc_fb}",
+                f"{s.seconds:g}",
+            ]
+            if s.world_x is not None and s.world_y is not None:
+                parts.append(f"{s.world_x:g} {s.world_y:g}")
+            lines.append(" ".join(parts))
         elif s.kind == "YAW":
             lines.append(f"YAW_IMU {int(s.rotation_deg or 0)}")
         elif s.kind == "MOVE_IMU":

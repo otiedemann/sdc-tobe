@@ -282,6 +282,25 @@ class PoseSmoother:
 RC_BRAKE_SPEED_THRESHOLD_CMS: float = 8.0
 RC_BRAKE_MAX_SETTLE_S: float = 1.5
 
+# FB_BRAKE world-position fallback parameters. When vision can't see
+# the target marker (yaw drift, occlusion, marker outside FOV), the
+# brake uses the drone's positioning-subsystem estimate of its own
+# arena-frame position vs the marker's KNOWN arena-frame position
+# from the arena config. The estimator drifts ~3-5 m at cruise
+# speeds, so the brake threshold gets a generous extra margin so we
+# brake EARLY (safe distance from wall) rather than risk crashing
+# through it by trusting a stale estimate.
+# Bumped from 2.0 → 3.0 after observing the position estimator can
+# be 2-3 m off even at spawn (drone stationary, multiple wall markers
+# visible). 3 m margin keeps us safely short of any wall behind the
+# target marker.
+WORLD_FALLBACK_MARGIN_M: float = 3.0
+# Don't trust position estimates older than this. If positioning
+# has been silent (no marker observations) for longer, the estimate
+# is too unreliable for a fast-flight brake decision; we fall back
+# to the hard timeout instead.
+WORLD_POSITION_MAX_AGE_S: float = 1.5
+
 # SCOUT step — operator-facing "slow 360° look-around" command. Yaw
 # stick is held at ``cfg.scout_yaw_stick`` (tunable, default 15) until
 # cumulative yaw telemetry has rotated by SCOUT_TARGET_DEG, then we
@@ -421,6 +440,12 @@ class MissionState:
     rc_step_ud: int = 0
     rc_step_yaw: int = 0
     rc_step_until: Optional[float] = None
+    # FB_BRAKE world-position hint. When the script supplies world
+    # coords (e.g. for slot face markers not present in arena_config),
+    # the controller falls back to these when vision can't see the
+    # marker AND arena.markers doesn't have it.
+    fb_brake_world_x: Optional[float] = None
+    fb_brake_world_y: Optional[float] = None
     # Two-phase RC step: once the drive timer expires we enter a
     # brake phase that holds zero sticks until the IMU reports near-
     # zero body-frame velocity (or a max-settle timeout fires).
@@ -1665,20 +1690,31 @@ class MissionController:
         1. DRIVE — pin ``rc_step_fb`` until ONE OF:
               (a) the active marker is visible AND its measured
                   ``distance_m`` < ``target_distance_m`` (vision trip), OR
-              (b) ``rc_step_until`` elapses (hard timeout — vision
-                  never came back; keeps the script from hanging if
-                  the marker is blocked / out of frame).
+              (b) the active marker is NOT currently visible BUT we
+                  know its arena-frame position from the arena config
+                  AND the drone's world-position estimate is fresh,
+                  AND the horizontal distance from drone to marker
+                  (in arena frame) is < ``target_distance_m + WORLD_FALLBACK_MARGIN_M``
+                  (world fallback — keeps the drone from crashing
+                  through a wall when vision blacks out / yaw drift
+                  pushes the marker out of FOV), OR
+              (c) ``rc_step_until`` elapses (hard timeout — neither
+                  vision nor world-position estimate said brake;
+                  prevents an infinite cruise).
         2. BRAKE — identical to _step_rc's brake: zero sticks, wait
            for IMU body-speed < RC_BRAKE_SPEED_THRESHOLD_CMS or
            RC_BRAKE_MAX_SETTLE_S, then advance.
 
+        Vision trip is preferred (sub-decimetre precision via IPPE).
+        World trip is the safety net — the world-position estimator
+        drifts a few metres at cruise speeds, so the margin is
+        generous (we err on braking too EARLY rather than crashing).
+        Timeout is the last-resort guard.
+
         Pose freshness: ``last_pose`` is cleared on step entry so a
         stale pose from a previous APPROACH (which may be on a
         DIFFERENT marker) can't false-trip the brake. We additionally
-        gate on ``pose.marker_id == active_marker_id`` so that even
-        if the smoother hands us a foreign pose mid-step, we ignore
-        it. Both checks together mean the brake only ever trips on a
-        FRESH pose of the requested marker.
+        gate on ``pose.marker_id == active_marker_id``.
         """
         with self.state.lock:
             fb = int(self.state.rc_step_fb)
@@ -1688,46 +1724,120 @@ class MissionController:
             active = self.state.active_marker_id
             stop_m = float(self.state.target_distance_m)
             pose = self.state.last_pose
+            drone_pos = self.state.world_position_m
+            drone_pos_at = self.state.world_position_updated_at
+            hint_x = self.state.fb_brake_world_x
+            hint_y = self.state.fb_brake_world_y
 
         if not braking:
             # ── DRIVE phase ─────────────────────────────────────────
             self._send_rc(0, fb, 0, 0, enforce_cfg_caps=False)
-            # Vision trip? Pose must be present AND for the active
-            # marker AND under threshold.
-            trip_vision = False
-            if (pose is not None
-                    and active is not None
-                    and int(pose.marker_id) == int(active)
-                    and float(pose.distance_m) < stop_m):
-                trip_vision = True
+
+            # Trip 1: vision. Pose must be present, for the active
+            # marker, and below the stop threshold.
+            trip_vision = (
+                pose is not None
+                and active is not None
+                and int(pose.marker_id) == int(active)
+                and float(pose.distance_m) < stop_m
+            )
+
+            # Trip 2: world-position fallback. Prefer the explicit
+            # script hint (slot face markers, etc. — not in arena
+            # config); fall back to arena.markers lookup (wall
+            # markers). Either way, the brake fires when the drone's
+            # *estimated* world position is close to the marker's
+            # *known* world position — the safety net for vision
+            # blackouts (yaw drift, box occlusion, marker out of FOV).
+            trip_world = False
+            world_dist = None
+            world_src = None
+            if (drone_pos is not None
+                    and drone_pos_at > 0.0
+                    and (now - drone_pos_at) < WORLD_POSITION_MAX_AGE_S):
+                marker_xy = None
+                if hint_x is not None and hint_y is not None:
+                    marker_xy = (float(hint_x), float(hint_y))
+                    world_src = "hint"
+                elif (active is not None
+                        and self.get_arena is not None):
+                    arena = self.get_arena()
+                    if (arena is not None and arena.markers
+                            and int(active) in arena.markers):
+                        m_pos = arena.markers[int(active)].position_m
+                        marker_xy = (float(m_pos[0]), float(m_pos[1]))
+                        world_src = "arena"
+                if marker_xy is not None:
+                    dx = marker_xy[0] - float(drone_pos[0])
+                    dy = marker_xy[1] - float(drone_pos[1])
+                    world_dist = math.hypot(dx, dy)
+                    if world_dist < stop_m + WORLD_FALLBACK_MARGIN_M:
+                        trip_world = True
+
             trip_timeout = (until is not None and now >= until)
-            if trip_vision or trip_timeout:
+
+            if trip_vision or trip_world or trip_timeout:
                 with self.state.lock:
                     self.state.rc_step_braking = True
                     self.state.rc_step_brake_started = now
                     if trip_vision:
-                        self.state.note = (
-                            f"FB_BRAKE: marker {active} at "
-                            f"{pose.distance_m:.2f}m < {stop_m:.2f}m — "
-                            f"vision trip, braking"
-                        )
+                        msg = (f"FB_BRAKE: marker {active} at "
+                               f"{pose.distance_m:.2f}m < {stop_m:.2f}m "
+                               f"(vision) — braking")
+                    elif trip_world:
+                        msg = (f"FB_BRAKE: marker {active} world-dist "
+                               f"{world_dist:.2f}m < "
+                               f"{stop_m + WORLD_FALLBACK_MARGIN_M:.2f}m "
+                               f"(world fallback via {world_src}, vision "
+                               f"missing) — braking")
                     else:
-                        self.state.note = (
-                            f"FB_BRAKE: timeout (marker {active} not "
-                            f"seen at < {stop_m:.2f}m) — braking"
-                        )
+                        msg = (f"FB_BRAKE: timeout (marker {active} not "
+                               f"reached by vision OR world) — braking")
+                    self.state.note = msg
+                print(f"[FB_BRAKE] {msg}", flush=True)
                 return
-            # Still cruising.
-            with self.state.lock:
-                d_str = (f"{pose.distance_m:.2f}m"
+
+            # Periodic drive-phase log so we can see WHY brake didn't
+            # trip when it should have. Log once per second.
+            if not hasattr(self, "_fb_brake_last_log") or (
+                    now - self._fb_brake_last_log >= 1.0):
+                self._fb_brake_last_log = now
+                d_vis = (f"{pose.distance_m:.2f}m"
                          if pose is not None
                          and active is not None
                          and int(pose.marker_id) == int(active)
                          else "—")
+                d_world = (f"{world_dist:.2f}m"
+                           if world_dist is not None else "—")
+                pos_age = ((now - drone_pos_at)
+                           if drone_pos_at > 0.0 else None)
+                print(
+                    f"[FB_BRAKE] DRIVE marker={active} d_vis={d_vis} "
+                    f"d_world={d_world} ({world_src or 'no-src'}) "
+                    f"pos={drone_pos} pos_age={pos_age:.1f}s "
+                    f"hint=({hint_x},{hint_y}) stop<{stop_m:.2f}m"
+                    if pos_age is not None
+                    else
+                    f"[FB_BRAKE] DRIVE marker={active} d_vis={d_vis} "
+                    f"d_world={d_world} ({world_src or 'no-src'}) "
+                    f"pos={drone_pos} pos_age=NO_POS "
+                    f"hint=({hint_x},{hint_y}) stop<{stop_m:.2f}m",
+                    flush=True,
+                )
+
+            # Still cruising — diagnostic note for the UI.
+            with self.state.lock:
+                d_vis = (f"{pose.distance_m:.2f}m"
+                         if pose is not None
+                         and active is not None
+                         and int(pose.marker_id) == int(active)
+                         else "—")
+                d_world = (f"{world_dist:.2f}m"
+                           if world_dist is not None else "—")
                 remain = (until - now) if until is not None else None
                 self.state.note = (
-                    f"FB_BRAKE drive: fb={fb} marker={active} d={d_str} "
-                    f"stop<{stop_m:.2f}m"
+                    f"FB_BRAKE drive: fb={fb} marker={active} "
+                    f"d_vis={d_vis} d_world={d_world} stop<{stop_m:.2f}m"
                     + (f" ({remain:.1f}s deadline)" if remain is not None
                        else "")
                 )
@@ -2410,13 +2520,22 @@ class MissionController:
                 self.state.rc_step_ud = 0
                 self.state.rc_step_yaw = 0
                 # rc_step_until is the HARD TIMEOUT (not the drive
-                # duration). Vision normally trips the brake long
-                # before this; the deadline only fires if the marker
-                # never becomes visible.
+                # duration). Vision / world-pos normally trip the
+                # brake long before this; the deadline only fires
+                # if neither pipeline says we've arrived.
                 self.state.rc_step_until = (time.monotonic()
                                              + float(step.seconds))
                 self.state.rc_step_braking = False
                 self.state.rc_step_brake_started = None
+                # Stash optional world-pos hint from the script.
+                # _step_fb_brake will prefer arena.markers[id] when
+                # available, then fall back to these, then to timeout.
+                self.state.fb_brake_world_x = (float(step.world_x)
+                                                if step.world_x is not None
+                                                else None)
+                self.state.fb_brake_world_y = (float(step.world_y)
+                                                if step.world_y is not None
+                                                else None)
                 # Clear last_pose so a stale pose from the previous
                 # APPROACH (e.g. on the target marker) can't trip
                 # this brake instantly. The vision loop populates

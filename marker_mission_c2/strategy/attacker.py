@@ -81,20 +81,21 @@ CLOSE_IN_STANDOFF_M: float = 7.0
 # Long cruises use FB_RC (raw forward stick) instead of FB_IMU (Olympe
 # moveBy). FB_IMU is firmware-internal closed-loop and caps around
 # 0.5 m/s in the sim — fine for short fine-positioning, terrible for
-# a 15+ m cruise. FB_RC at stick=100 pins the forward channel to
-# ±100 (the same units as the operator joystick: each unit ≈ 4 cm/s
-# of commanded ground speed at level flight, so 100 ≈ 4 m/s) and the
-# DSL auto-brakes after the requested duration. We follow it with
-# APPROACH which uses per-marker IPPE distance for the precision
-# stop — so even if cruise overshoots a metre, APPROACH catches it.
-CRUISE_RC_STICK: int = 100
+# a 15+ m cruise. FB_RC pins the forward channel to a stick value;
+# the DSL auto-brakes after the requested duration. We follow it
+# with APPROACH or FB_BRAKE for the precision stop.
+#
+# Stick=100 (~4 m/s) crashed the drone into walls repeatedly because
+# (a) full forward pitch tilts the camera DOWN, hiding markers, and
+# (b) Anafi can't decelerate from 4 m/s in less than ~3 m → the
+# brake step overshoots into whatever's in front. Stick=50 (~2 m/s)
+# is the conservative default; brake distance is ~1 m, marker
+# detection works even with pitch.
+CRUISE_RC_STICK: int = 50
 
 # Calibrated cruise speed for converting "distance to cover" → FB_RC
-# duration. Empirically ~4 m/s at stick=100 on the sim's Anafi; will
-# need re-calibration if RC->m/s ratio differs on hardware. Set
-# slightly conservative so the FB_RC ends short of the target and
-# APPROACH does the final close-in without backing up.
-CRUISE_SPEED_M_PER_S: float = 4.0
+# duration. ~2 m/s at stick=50 on the sim's Anafi.
+CRUISE_SPEED_M_PER_S: float = 2.0
 
 # Don't emit FB_RC for trivial distances. Sub-half-second sticks add
 # latency without meaningful motion (FC takes longer to switch from
@@ -129,6 +130,32 @@ DRIFT_OVER_BOX_UD_RC: int = 20
 CRUISE_UP_UD_RC: int = 80      # combined fb + climb for attack leg
 RTH_CRUISE_UP_UD_RC: int = 60  # combined fb + climb for RTH leg
 
+# Initial fast-climb step before any forward motion. Anafi takeoff
+# settles at ~0.9 m; slot box tops are at 1.4 m. If we start cruising
+# forward immediately, the drone tilts pitch-forward (which also
+# pitches the camera DOWN), and even if it survives the dip, the
+# camera can lose the target marker because it's looking at the
+# ground instead of ahead. The brief dedicated climb fixes both:
+# safe altitude clearance AND a level camera for vision.
+INITIAL_CLIMB_UD_RC: int = 100   # full up-stick
+INITIAL_CLIMB_DURATION_S: float = 1.2  # ~0.5m climb → ~1.4m total alt
+
+# Open-loop yaw turn for the post-capture and pre-landing 180° flips.
+# YAW_IMU is firmware-internal api.rotate and takes ~5 s (it ramps
+# up + ramps down + waits for "rotation complete" confirm). YAW_RC
+# at stick=100 hits Anafi's ~200°/s yaw rate cap, so 180° finishes
+# in <1 s; the DSL auto-brake adds another ~1 s. Net ~2 s vs 5 s.
+#
+# Overshoot risk: YAW_RC is open-loop, so the drone might land at
+# 170°-200° instead of exactly 180°. That's fine here — the FB_BRAKE
+# immediately following uses vision tracking, which tolerates a few
+# degrees of heading error. The mid-script (post-capture) YAW that
+# precedes the RTH cruise is more sensitive, but vision will still
+# detect the wall marker as long as the front cam roughly points at
+# the home wall.
+YAW_180_RC: int = 100          # CW = positive yaw stick (+100 = full CW)
+YAW_180_DURATION_S: float = 1.0   # ~180° at Anafi's max yaw rate
+
 # Home-wall markers for RTH braking. 0.5 m markers on each team's
 # home wall, LOW position (2.0 m altitude) — close to cruise altitude
 # for stable APPROACH lock. Maps team → (marker_id, (arena_x, arena_y)).
@@ -150,10 +177,19 @@ RTH_APPROACH_DISTANCE_M: float = 2.0
 #     stop leaves the drone safely in the home zone.
 # Timeout is a hard upper bound that flips into brake even if the
 # marker is never seen (vision dropout → don't open-loop into a wall).
-FB_BRAKE_TARGET_STOP_M: float = 2.0
-FB_BRAKE_WALL_STOP_M: float = 2.5
-FB_BRAKE_STICK: int = 100
-FB_BRAKE_TIMEOUT_S: float = 5.0
+# FB_BRAKE stops the drone roughly stop_m from the marker BY VISION,
+# or (stop_m + WORLD_FALLBACK_MARGIN_M) from the world-known position
+# as a safety net. We pick stop_m larger than strictly needed so the
+# brake-settle distance (~1 m at fb=50) plus position-estimator drift
+# (~2 m) doesn't push the drone into the wall behind the marker.
+FB_BRAKE_TARGET_STOP_M: float = 3.0
+FB_BRAKE_WALL_STOP_M: float = 3.0
+# FB_BRAKE drives at the SAME stick as cruise (so we don't accelerate
+# back to full speed during the brake-search phase, which then has
+# more momentum to bleed off). Sticking to ~2 m/s throughout keeps
+# the system in a regime where the auto-brake actually works.
+FB_BRAKE_STICK: int = 50
+FB_BRAKE_TIMEOUT_S: float = 4.0
 
 
 def _format_script(*lines: str) -> str:
@@ -217,11 +253,11 @@ def _full_attack_script(
         RC 0 100 80 0 <close_in_dur>        # COMBINED climb + cruise (no HEIGHT)
         FB_BRAKE <id> 2.0 100 5             # vision-tripped brake on target
         RC 0 60 20 0 0.3                    # drift over box (fwd + slight up)
-        YAW_IMU 180                         # turn to face home
+        YAW_RC 100 1.0                      # fast 180° turn (~2 s vs YAW_IMU 5 s)
         RC 0 100 60 0 <rth_dur>             # COMBINED climb + RTH cruise (no HEIGHT,
                                             # no HOOVER — starts immediately)
         FB_BRAKE <wall_marker> 2.5 100 5    # vision-tripped brake on home wall
-        YAW_IMU 180                         # face enemy before landing
+        YAW_RC 100 1.0                      # fast 180° turn back to enemy-facing
         LAND
 
     Speed-optimised design notes:
@@ -271,15 +307,24 @@ def _full_attack_script(
     _ = max(0.6, float(ctx.drone.home_alt_m or home.alt))
 
     # Attack-leg cruise duration (distance ÷ calibrated cruise speed).
-    # Emitted as a combined RC step — pinning fb=100 AND ud=80 means
-    # the drone climbs AND moves forward in the same step. Saves
-    # ~10-20 s vs the old "HEIGHT 1.5 then FB_RC 100" sequence (the
-    # HEIGHT PD waits for settle BEFORE the cruise even starts).
+    # Pure FB_RC (no simultaneous up-stick) — the dedicated UD_RC
+    # climb step before this puts us at safe altitude; adding ud
+    # here would force the drone to keep pitching forward AND up,
+    # which destabilises camera pointing and the velocity controller.
     close_in = _close_in_distance_m((home.x, home.y), slot)
     close_in_dur = _cruise_duration_s(close_in)
     close_in_step = (
-        f"RC 0 {CRUISE_RC_STICK} {CRUISE_UP_UD_RC} 0 {close_in_dur:.2f}"
+        f"FB_RC {CRUISE_RC_STICK} {close_in_dur:.2f}"
         if close_in_dur > 0 else ""
+    )
+
+    # Slot box position in arena frame — used by FB_BRAKE's
+    # world-position fallback so the drone can brake even when vision
+    # can't see the target face marker (slot faces aren't in
+    # arena_config; the FC wouldn't otherwise know where they are).
+    target_xy = SLOT_POSITIONS_M.get(int(slot))
+    target_world_hint = (
+        f" {target_xy[0]:g} {target_xy[1]:g}" if target_xy else ""
     )
 
     wall_entry = HOME_WALL_MARKER.get(ctx.our_team)
@@ -287,56 +332,47 @@ def _full_attack_script(
         wall_marker_id, _w_xy = wall_entry
         rth_close_in = _rth_close_in_distance_m(slot, ctx.our_team)
         rth_dur = _cruise_duration_s(rth_close_in)
-        # Combined RC for RTH: fb=100 cruises home, ud=60 climbs above
-        # any target boxes we'd cross over. (Drone is yawed away from
-        # the targets after the mid-script YAW_IMU 180, so up-stick
-        # while cruising is safe — no targets in fwd cam view.)
+        # Pure FB_RC for RTH at the same conservative cruise stick.
         rth_cruise_step = (
-            f"RC 0 {CRUISE_RC_STICK} {RTH_CRUISE_UP_UD_RC} 0 {rth_dur:.2f}"
+            f"FB_RC {CRUISE_RC_STICK} {rth_dur:.2f}"
             if rth_dur > 0 else ""
         )
         rth_lines = (
-            # NO separate HEIGHT step — the combined RC handles climb.
-            # NO HOOVER between YAW_IMU and RTH cruise — the user's
-            # explicit requirement was "must start immediately after
-            # capture with much faster flight".
+            # NO HOOVER between YAW and RTH cruise — start the run
+            # back immediately per user's "much faster flight" req.
             rth_cruise_step,
             f"FB_BRAKE {wall_marker_id} {FB_BRAKE_WALL_STOP_M:.2f} "
             f"{FB_BRAKE_STICK} {FB_BRAKE_TIMEOUT_S:.1f}",
-            # YAW_IMU 180 so the drone lands facing the ENEMY (not home).
-            # Without this, the next attack's TAKEOFF inherits the
-            # home-facing heading and the first forward push would
-            # drive straight into the home wall.
-            "YAW_IMU 180",
+            f"YAW_RC {YAW_180_RC} {YAW_180_DURATION_S:g}",
             "LAND",
         )
     else:
-        # Fallback if team has no wall marker mapping — use TO_HOME.
-        # Kept for safety; in practice both teams have wall markers.
         rth_lines = (
             f"TO_HOME {ctx.drone.home_alt_m or 3.0:.2f}",
             "LAND",
         )
     return _format_script(
         "TAKEOFF",
-        # No separate HEIGHT — the combined RC below climbs and
-        # cruises simultaneously. Anafi takeoff naturally settles at
-        # ~1 m altitude; the up-stick during cruise lifts to camera
-        # level *while we're already moving forward*.
+        # CLIMB FIRST — Anafi settles at ~0.9m post-takeoff; slot
+        # boxes top out at 1.4m. Forward motion BEFORE we clear that
+        # height pitches the drone (and its camera) down, with two
+        # consequences: (a) drone risks clipping its own home-side
+        # slot boxes on the way out, (b) the camera looks at the
+        # ground instead of forward → vision misses the target.
+        # 1.2 s of up-stick + auto-brake gets us safely to ~1.4 m.
+        f"UD_RC {INITIAL_CLIMB_UD_RC} {INITIAL_CLIMB_DURATION_S:g}",
+        # Combined RC for the long cruise.
         close_in_step,
-        # FB_BRAKE on the target's face marker. Replaces the old
-        # APPROACH — closed-loop PD with slow-zone settle was the
-        # single biggest time-sink in the script (~60-75 s vs 5 s
-        # for FB_BRAKE). FB_BRAKE pins the stick and snaps to brake
-        # the moment vision sees the marker within
-        # FB_BRAKE_TARGET_STOP_M.
+        # FB_BRAKE on the target's face marker, with explicit world
+        # coords passed in so the controller's world-fallback brake
+        # works (slot face markers aren't in arena_config).
         f"FB_BRAKE {int(attack_marker_id)} {FB_BRAKE_TARGET_STOP_M:.2f} "
-        f"{FB_BRAKE_STICK} {FB_BRAKE_TIMEOUT_S:.1f}",
+        f"{FB_BRAKE_STICK} {FB_BRAKE_TIMEOUT_S:.1f}{target_world_hint}",
         # Drift over the box (brief forward push + slight up-stick
         # to stay above the box top during momentum bleed).
         f"RC 0 {DRIFT_OVER_BOX_RC} {DRIFT_OVER_BOX_UD_RC} 0 "
         f"{DRIFT_OVER_BOX_DURATION_S:.2f}",
-        "YAW_IMU 180",
+        f"YAW_RC {YAW_180_RC} {YAW_180_DURATION_S:g}",
         # No HOOVER — RTH starts immediately. Capture detection is
         # the scout role's job; the attacker just commits and runs.
         *rth_lines,
