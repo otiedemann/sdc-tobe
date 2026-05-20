@@ -161,6 +161,13 @@ HOME_WALL_MARKER: dict[str, tuple[int, tuple[float, float]]] = {
 
 RTH_APPROACH_DISTANCE_M: float = 2.0
 
+# Default approach speed (forward RC stick, 1-100) the strategy passes
+# to AUTO_ATTACK. ~4 cm/s per unit, so 55 ≈ 2.2 m/s — a conservative
+# cruise that keeps the camera level enough for vision and lets the
+# brake settle within the arena guard's margin. Raise for a faster
+# run in an open arena.
+AUTO_ATTACK_APPROACH_SPEED: int = 55
+
 # FB_BRAKE tunings. The DSL primitive cruises at full stick and brakes
 # as soon as the named marker's IPPE distance < stop_m. We pick the
 # stop distances to leave room for the auto-brake to settle without
@@ -403,9 +410,14 @@ def _auto_attack_script(
 
     Script shape:
         TAKEOFF
-        AUTO_ATTACK <tgt_id> <tx> <ty> <home_id> <hx> <hy>
+        AUTO_ATTACK <tgt_id> <tx> <ty> <home_id> <hx> <hy> <alt_m> <speed>
 
     (AUTO_ATTACK ends with LAND internally, so no trailing LAND.)
+
+    Altitude comes from the per-drone ``attack_alt_m`` (floored above
+    the box tops); approach speed is AUTO_ATTACK_APPROACH_SPEED. Both
+    are tunable so the operator can fly higher/slower in a tight arena
+    or lower/faster in an open one.
     """
     target_xy = SLOT_POSITIONS_M.get(int(slot)) or (0.0, 0.0)
     wall_entry = HOME_WALL_MARKER.get(ctx.our_team)
@@ -413,11 +425,17 @@ def _auto_attack_script(
         # Shouldn't happen (both teams mapped); fall back to old script.
         return _full_attack_script(ctx, attack_marker_id, slot)
     home_marker_id, home_xy = wall_entry
+    # Cruise altitude: per-drone attack_alt_m, floored at 1.4 m so we
+    # always clear the slot boxes. Approach speed: a conservative
+    # forward-stick default (operator can raise for a faster run).
+    altitude_m = max(1.4, float(ctx.drone.attack_alt_m or 1.6))
+    approach_speed = AUTO_ATTACK_APPROACH_SPEED
     return _format_script(
         "TAKEOFF",
         f"AUTO_ATTACK {int(attack_marker_id)} "
         f"{target_xy[0]:g} {target_xy[1]:g} "
-        f"{int(home_marker_id)} {home_xy[0]:g} {home_xy[1]:g}",
+        f"{int(home_marker_id)} {home_xy[0]:g} {home_xy[1]:g} "
+        f"{altitude_m:g} {approach_speed}",
     )
 
 

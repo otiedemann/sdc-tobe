@@ -502,6 +502,12 @@ class MissionState:
     aa_target_xy: Optional[tuple] = None
     aa_home_marker: Optional[int] = None
     aa_home_xy: Optional[tuple] = None
+    # Per-mission AUTO_ATTACK tuning (set from the step; default to the
+    # module constants). aa_altitude_m = cruise/hover altitude;
+    # aa_approach_speed = forward RC stick ceiling (cruise/approach
+    # speed). Read by _aa_alt_hold / _aa_steer / _aa_vision_home.
+    aa_altitude_m: float = AA_CRUISE_ALT_M
+    aa_approach_speed: int = AA_FB_MAX
     # Last monotonic time the *current goal* marker was vision-live.
     # Used to keep approaching by vision across momentary dropouts
     # instead of prematurely capturing by world position.
@@ -1959,15 +1965,18 @@ class MissionController:
         return (h_cm / 100.0) if h_cm is not None else None
 
     def _aa_alt_hold(self, h: Optional[float]) -> int:
-        """UD stick to hold AA_CRUISE_ALT_M. 0 if altitude unknown."""
+        """UD stick to hold the per-mission cruise altitude. 0 if
+        altitude unknown."""
         if h is None:
             return 0
-        err = AA_CRUISE_ALT_M - h
+        err = float(self.state.aa_altitude_m) - h
         return int(max(-AA_UD_MAX, min(AA_UD_MAX, AA_UD_KP * err)))
 
     def _aa_steer(self, goal_xy, drone_xy, drone_yaw_deg):
         """Arena-frame position steering. Turn to face the goal, then
-        drive forward. Returns (fb, yaw, dist)."""
+        drive forward (capped at the per-mission approach speed).
+        Returns (fb, yaw, dist)."""
+        fb_max = int(self.state.aa_approach_speed)
         dx = goal_xy[0] - drone_xy[0]
         dy = goal_xy[1] - drone_xy[1]
         dist = math.hypot(dx, dy)
@@ -1975,21 +1984,22 @@ class MissionController:
         err = self._aa_wrap180(desired_heading - drone_yaw_deg)
         yaw = int(max(-AA_YAW_MAX, min(AA_YAW_MAX, AA_YAW_KP * err)))
         if abs(err) < AA_FACING_TOLERANCE_DEG:
-            fb = int(max(AA_FB_MIN, min(AA_FB_MAX, AA_FB_KP * dist)))
+            fb = int(max(AA_FB_MIN, min(fb_max, AA_FB_KP * dist)))
         else:
             fb = 0   # turn in place first to avoid curving into a wall
         return fb, yaw, dist
 
     def _aa_vision_home(self, pose, stop_m):
         """Vision-relative homing — drift-free. Centre the marker by its
-        camera bearing and approach by its measured distance. Returns
-        (fb, yaw)."""
+        camera bearing and approach by its measured distance, capped at
+        the per-mission approach speed. Returns (fb, yaw)."""
+        fb_max = int(self.state.aa_approach_speed)
         bearing = float(pose.yaw_deg)            # marker bearing off centre
         yaw = int(max(-AA_YAW_MAX,
                       min(AA_YAW_MAX, AA_VISION_YAW_KP * bearing)))
         err = float(pose.distance_m) - stop_m
         if abs(bearing) < AA_FACING_TOLERANCE_DEG:
-            fb = int(max(0, min(AA_FB_MAX, AA_FB_KP * max(0.0, err))))
+            fb = int(max(0, min(fb_max, AA_FB_KP * max(0.0, err))))
         else:
             fb = 0
         return fb, yaw
@@ -2043,7 +2053,8 @@ class MissionController:
 
         # ── CLIMB ───────────────────────────────────────────────────
         if sub == "climb":
-            if h is not None and h >= AA_CRUISE_ALT_M - AA_ALT_TOLERANCE_M:
+            target_alt = float(self.state.aa_altitude_m)
+            if h is not None and h >= target_alt - AA_ALT_TOLERANCE_M:
                 advance("go_target", f"reached alt {h:.2f}m",
                         set_active=tgt_marker)
                 self._send_rc(0, 0, 0, 0, enforce_cfg_caps=False)
@@ -2854,6 +2865,13 @@ class MissionController:
                 self.state.aa_home_marker = int(step.aa_home_marker_id)
                 self.state.aa_home_xy = (float(step.aa_home_x),
                                           float(step.aa_home_y))
+                # Optional per-mission tuning (fall back to defaults).
+                self.state.aa_altitude_m = (
+                    float(step.aa_altitude_m)
+                    if step.aa_altitude_m is not None else AA_CRUISE_ALT_M)
+                self.state.aa_approach_speed = (
+                    int(step.aa_approach_speed)
+                    if step.aa_approach_speed is not None else AA_FB_MAX)
                 self.state.aa_substate = "climb"
                 self.state.aa_substate_started = time.monotonic()
                 # Start with the target marker active so vision homing

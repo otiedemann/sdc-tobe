@@ -38,7 +38,7 @@ Eighteen commands. Suffix convention:
     YAW_IMU  <deg>                                 +cw / -ccw,       deg in [-180, +180]
     RC       <lr> <fb> <ud> <yaw> [<seconds>]      all four sticks at once
     SCOUT                                          slow 360° yaw spin (cw, stick=15)
-    AUTO_ATTACK <tgt_id> <tx> <ty> <home_id> <hx> <hy>   reactive end-to-end attack
+    AUTO_ATTACK <tgt_id> <tx> <ty> <home_id> <hx> <hy> [<alt_m>] [<speed>]   reactive attack
 
 LR_RC / FB_RC / UD_RC / YAW_RC / RC are raw-RC steps: pin the listed
 stick(s) to the given value(s) for the given duration (default 1 s;
@@ -172,6 +172,11 @@ class Step:
     aa_home_marker_id: Optional[int] = None
     aa_home_x: Optional[float] = None
     aa_home_y: Optional[float] = None
+    # AUTO_ATTACK optional tuning: per-mission cruise altitude (m) and
+    # approach speed (forward RC stick 0-100). None = use the
+    # controller's AA_CRUISE_ALT_M / AA_FB_MAX defaults.
+    aa_altitude_m: Optional[float] = None
+    aa_approach_speed: Optional[int] = None
     line_no: int = 0                    # 1-based source line, for diagnostics
 
 
@@ -407,23 +412,44 @@ def parse(text: str, defaults: dict) -> List[Step]:
         elif cmd == "AUTO_ATTACK":
             # Reactive end-to-end attack.
             # Args: <target_marker> <tx> <ty> <home_marker> <hx> <hy>
+            #       [<altitude_m>] [<approach_speed>]
             # Target = enemy slot face marker + its arena (x,y).
             # Home   = own home-wall marker + its arena (x,y).
-            if len(args) != 6:
+            # altitude_m   = cruise/hover altitude in metres (optional).
+            # approach_speed = forward RC stick 1-100, the cruise/approach
+            #                  speed cap (optional; ~4 cm/s per unit).
+            if not (6 <= len(args) <= 8):
                 raise ScriptError(raw_line_no,
-                                  f"AUTO_ATTACK takes exactly 6 arguments "
+                                  f"AUTO_ATTACK takes 6-8 arguments "
                                   f"(<target_marker> <tx> <ty> "
-                                  f"<home_marker> <hx> <hy>), got {len(args)}")
+                                  f"<home_marker> <hx> <hy> "
+                                  f"[<altitude_m>] [<approach_speed>]), "
+                                  f"got {len(args)}")
             tmid = _parse_int(args[0], raw_line_no, "AUTO_ATTACK target marker")
             tx = _parse_float(args[1], raw_line_no, "AUTO_ATTACK tx")
             ty = _parse_float(args[2], raw_line_no, "AUTO_ATTACK ty")
             hmid = _parse_int(args[3], raw_line_no, "AUTO_ATTACK home marker")
             hx = _parse_float(args[4], raw_line_no, "AUTO_ATTACK hx")
             hy = _parse_float(args[5], raw_line_no, "AUTO_ATTACK hy")
+            alt = None
+            spd = None
+            if len(args) >= 7:
+                alt = _parse_float(args[6], raw_line_no, "AUTO_ATTACK altitude_m")
+                if alt <= 0.0:
+                    raise ScriptError(raw_line_no,
+                                      f"AUTO_ATTACK altitude_m must be > 0, "
+                                      f"got {alt}")
+            if len(args) >= 8:
+                spd = _parse_int(args[7], raw_line_no, "AUTO_ATTACK approach_speed")
+                if not (1 <= spd <= 100):
+                    raise ScriptError(raw_line_no,
+                                      f"AUTO_ATTACK approach_speed must be "
+                                      f"1-100, got {spd}")
             out.append(Step(kind="AUTO_ATTACK",
                             marker_id=tmid, world_x=tx, world_y=ty,
                             aa_home_marker_id=hmid,
                             aa_home_x=hx, aa_home_y=hy,
+                            aa_altitude_m=alt, aa_approach_speed=spd,
                             line_no=raw_line_no))
         elif cmd == "YAW_IMU":
             # Discrete rotation by N degrees, range [-180, +180].
@@ -612,10 +638,17 @@ def format(steps: List[Step]) -> str:
                 parts.append(f"{s.world_x:g} {s.world_y:g}")
             lines.append(" ".join(parts))
         elif s.kind == "AUTO_ATTACK":
-            lines.append(
+            parts = [
                 f"AUTO_ATTACK {s.marker_id} {s.world_x:g} {s.world_y:g} "
                 f"{s.aa_home_marker_id} {s.aa_home_x:g} {s.aa_home_y:g}"
-            )
+            ]
+            # Optional altitude + approach speed are positional, so
+            # speed can only be emitted alongside altitude.
+            if s.aa_altitude_m is not None:
+                parts.append(f"{s.aa_altitude_m:g}")
+                if s.aa_approach_speed is not None:
+                    parts.append(f"{s.aa_approach_speed}")
+            lines.append(" ".join(parts))
         elif s.kind == "YAW":
             lines.append(f"YAW_IMU {int(s.rotation_deg or 0)}")
         elif s.kind == "MOVE_IMU":
