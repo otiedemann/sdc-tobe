@@ -78,6 +78,7 @@ class Phase(enum.Enum):
     ROTATE    = "rotate"    # mission-script YAW_IMU (discrete rotation by N deg)
     SCOUT     = "scout"     # mission-script SCOUT (slow 360° yaw spin)
     MOVE_IMU  = "move_imu"  # mission-script FB_IMU / LR_IMU / UD_IMU
+    AUTO_ATTACK = "auto_attack"  # reactive end-to-end attack (own state machine)
     LAND      = "land"
     DONE      = "done"
     ABORT     = "abort"
@@ -300,6 +301,52 @@ WORLD_FALLBACK_MARGIN_M: float = 3.0
 # is too unreliable for a fast-flight brake decision; we fall back
 # to the hard timeout instead.
 WORLD_POSITION_MAX_AGE_S: float = 1.5
+# A marker pose newer than this counts as "vision live" — recent
+# enough to trust for closed-loop braking. While vision is live the
+# world-position fallback is suppressed so it can't preempt a clean
+# visual approach (the fallback is for when the marker is LOST).
+VISION_LIVE_MAX_AGE_S: float = 0.5
+
+# ── AUTO_ATTACK reactive controller tunables ────────────────────────
+# Safe cruise altitude (above the 1.4 m slot boxes). The CLIMB
+# sub-state drives ud until the drone reaches this.
+AA_CRUISE_ALT_M: float = 1.6
+AA_ALT_TOLERANCE_M: float = 0.2
+# Forward/yaw control gains. fb is RC per metre of remaining distance;
+# yaw is RC per degree of heading error. Both saturate at the caps.
+AA_FB_KP: float = 18.0          # RC per metre
+AA_FB_MAX: int = 55             # cruise stick ceiling (~2.2 m/s)
+AA_FB_MIN: int = 12             # creep stick when very close
+AA_YAW_KP: float = 2.2          # RC per degree
+AA_YAW_MAX: int = 40
+AA_UD_KP: float = 60.0          # RC per metre of altitude error
+AA_UD_MAX: int = 80
+# Only drive forward when roughly facing the goal; otherwise turn
+# in place first (prevents wide curving arcs into walls).
+AA_FACING_TOLERANCE_DEG: float = 35.0
+# Vision homing: when the goal marker is visible, steer to centre it
+# (drift-free) and brake on its measured distance.
+AA_VISION_YAW_KP: float = 1.4   # RC per degree of camera bearing
+AA_TARGET_STOP_M: float = 1.2   # capture standoff from the slot marker
+AA_HOME_STOP_M: float = 2.0     # landing standoff from the home wall
+# World-position capture trigger: only commit to capture-by-world
+# when this close to the goal AND vision hasn't been live recently.
+# Tight (vs the old 3.0 "arrive radius") so it can't preempt a vision
+# approach that's still closing in.
+AA_WORLD_CAPTURE_M: float = 1.5
+# Grace window: if the goal marker was visible within this many
+# seconds, keep approaching by vision even on a momentary dropout —
+# do NOT fall back to a premature world-capture. (This was the bug
+# that made the drone "capture" 6 m short and skip the hover.)
+AA_VISION_GRACE_S: float = 1.2
+# Sub-state timeouts (safety — never hang forever).
+AA_CLIMB_TIMEOUT_S: float = 8.0
+AA_GO_TIMEOUT_S: float = 30.0
+# Capture = brake to a stop, then hover ON the marker (vision-hold)
+# for this long so the drone is demonstrably parked over the target.
+AA_CAPTURE_HOLD_S: float = 2.0
+AA_BRAKE_SPEED_CMS: float = 15.0   # consider "stopped" below this
+AA_BRAKE_MAX_S: float = 2.0        # cap the brake phase
 
 # SCOUT step — operator-facing "slow 360° look-around" command. Yaw
 # stick is held at ``cfg.scout_yaw_stick`` (tunable, default 15) until
@@ -446,6 +493,22 @@ class MissionState:
     # marker AND arena.markers doesn't have it.
     fb_brake_world_x: Optional[float] = None
     fb_brake_world_y: Optional[float] = None
+    # AUTO_ATTACK reactive state machine. substate ∈ {climb, go_target,
+    # capture, go_home, land}. The target/home marker IDs + their known
+    # arena positions come from the AUTO_ATTACK step.
+    aa_substate: str = ""
+    aa_substate_started: float = 0.0
+    aa_target_marker: Optional[int] = None
+    aa_target_xy: Optional[tuple] = None
+    aa_home_marker: Optional[int] = None
+    aa_home_xy: Optional[tuple] = None
+    # Last monotonic time the *current goal* marker was vision-live.
+    # Used to keep approaching by vision across momentary dropouts
+    # instead of prematurely capturing by world position.
+    aa_last_vision_at: float = 0.0
+    # Whether the capture brake has settled (drone stopped) — once true
+    # the capture sub-state switches from braking to vision-hold hover.
+    aa_capture_braked: bool = False
     # Two-phase RC step: once the drive timer expires we enter a
     # brake phase that holds zero sticks until the IMU reports near-
     # zero body-frame velocity (or a max-settle timeout fires).
@@ -1036,6 +1099,8 @@ class MissionController:
                     self._step_rc(tel, now)
                 elif phase == Phase.FB_BRAKE:
                     self._step_fb_brake(tel, now)
+                elif phase == Phase.AUTO_ATTACK:
+                    self._step_auto_attack(tel, now)
                 elif phase == Phase.SCOUT:
                     self._step_scout(tel, now)
                 elif phase == Phase.ROTATE:
@@ -1733,26 +1798,40 @@ class MissionController:
             # ── DRIVE phase ─────────────────────────────────────────
             self._send_rc(0, fb, 0, 0, enforce_cfg_caps=False)
 
-            # Trip 1: vision. Pose must be present, for the active
-            # marker, and below the stop threshold.
-            trip_vision = (
+            # Is vision LIVE for the active marker? Fresh pose, right
+            # marker. When vision is live we let it drive the brake
+            # (precise IPPE distance) and SUPPRESS the world fallback
+            # — otherwise the conservative world margin trips first and
+            # the drone brakes metres short of a marker it can clearly
+            # see. This is the "approach the marker you can see;
+            # fall back to its remembered position only when you've
+            # lost sight of it" behaviour.
+            vision_live = (
                 pose is not None
                 and active is not None
                 and int(pose.marker_id) == int(active)
-                and float(pose.distance_m) < stop_m
+                and (now - float(pose.timestamp)) < VISION_LIVE_MAX_AGE_S
             )
 
-            # Trip 2: world-position fallback. Prefer the explicit
-            # script hint (slot face markers, etc. — not in arena
-            # config); fall back to arena.markers lookup (wall
-            # markers). Either way, the brake fires when the drone's
-            # *estimated* world position is close to the marker's
-            # *known* world position — the safety net for vision
-            # blackouts (yaw drift, box occlusion, marker out of FOV).
+            # Trip 1: vision. Live pose below the stop threshold.
+            trip_vision = (
+                vision_live and float(pose.distance_m) < stop_m
+            )
+
+            # Trip 2: world-position fallback — ONLY when vision is not
+            # live. Prefer the explicit script hint (slot face markers,
+            # not in arena config); else arena.markers (wall markers).
+            # The brake fires when the drone's *estimated* world
+            # position is close to the marker's *known* world position
+            # — the safety net for when vision can't see the marker
+            # (yaw drift, occlusion, out of FOV, too far for the small
+            # slot markers). Suppressed while vision_live so it never
+            # preempts a clean visual approach.
             trip_world = False
             world_dist = None
             world_src = None
-            if (drone_pos is not None
+            if (not vision_live
+                    and drone_pos is not None
                     and drone_pos_at > 0.0
                     and (now - drone_pos_at) < WORLD_POSITION_MAX_AGE_S):
                 marker_xy = None
@@ -1863,6 +1942,263 @@ class MissionController:
             self._advance_script(
                 f"fb_brake complete (brake {elapsed:.2f}s, {reason})"
             )
+
+    # --------------------------------------------------------- auto_attack
+    @staticmethod
+    def _aa_wrap180(deg: float) -> float:
+        return ((float(deg) + 180.0) % 360.0) - 180.0
+
+    @staticmethod
+    def _aa_height_m(tel: Optional[TelemetrySnapshot]) -> Optional[float]:
+        try:
+            h_cm = (float(tel.raw.get("height_cm"))
+                    if tel and tel.raw.get("height_cm") is not None
+                    else None)
+        except (TypeError, ValueError):
+            h_cm = None
+        return (h_cm / 100.0) if h_cm is not None else None
+
+    def _aa_alt_hold(self, h: Optional[float]) -> int:
+        """UD stick to hold AA_CRUISE_ALT_M. 0 if altitude unknown."""
+        if h is None:
+            return 0
+        err = AA_CRUISE_ALT_M - h
+        return int(max(-AA_UD_MAX, min(AA_UD_MAX, AA_UD_KP * err)))
+
+    def _aa_steer(self, goal_xy, drone_xy, drone_yaw_deg):
+        """Arena-frame position steering. Turn to face the goal, then
+        drive forward. Returns (fb, yaw, dist)."""
+        dx = goal_xy[0] - drone_xy[0]
+        dy = goal_xy[1] - drone_xy[1]
+        dist = math.hypot(dx, dy)
+        desired_heading = math.degrees(math.atan2(dx, dy))   # CW from +y
+        err = self._aa_wrap180(desired_heading - drone_yaw_deg)
+        yaw = int(max(-AA_YAW_MAX, min(AA_YAW_MAX, AA_YAW_KP * err)))
+        if abs(err) < AA_FACING_TOLERANCE_DEG:
+            fb = int(max(AA_FB_MIN, min(AA_FB_MAX, AA_FB_KP * dist)))
+        else:
+            fb = 0   # turn in place first to avoid curving into a wall
+        return fb, yaw, dist
+
+    def _aa_vision_home(self, pose, stop_m):
+        """Vision-relative homing — drift-free. Centre the marker by its
+        camera bearing and approach by its measured distance. Returns
+        (fb, yaw)."""
+        bearing = float(pose.yaw_deg)            # marker bearing off centre
+        yaw = int(max(-AA_YAW_MAX,
+                      min(AA_YAW_MAX, AA_VISION_YAW_KP * bearing)))
+        err = float(pose.distance_m) - stop_m
+        if abs(bearing) < AA_FACING_TOLERANCE_DEG:
+            fb = int(max(0, min(AA_FB_MAX, AA_FB_KP * max(0.0, err))))
+        else:
+            fb = 0
+        return fb, yaw
+
+    def _step_auto_attack(self, tel: Optional[TelemetrySnapshot],
+                          now: float) -> None:
+        """Reactive end-to-end attack. Internal sub-state machine:
+
+            climb     → ud until safe cruise altitude
+            go_target → steer to the enemy slot; vision-home when the
+                        target marker is visible; → capture when close
+            capture   → brief hold over the box
+            go_home   → steer to the home-wall marker; vision-home when
+                        visible; → land when close
+            land      → descend + finish the step
+
+        Steering uses the ArUco arena position when the marker is out of
+        view, and drift-free vision bearing/distance when it's visible.
+        Wall safety is the rc_loop arena guard (active reverse-brake),
+        which clamps every RC we send here.
+        """
+        with self.state.lock:
+            sub = self.state.aa_substate
+            sub_started = self.state.aa_substate_started
+            tgt_marker = self.state.aa_target_marker
+            tgt_xy = self.state.aa_target_xy
+            home_marker = self.state.aa_home_marker
+            home_xy = self.state.aa_home_xy
+            drone_pos = self.state.world_position_m
+            drone_yaw = self.state.arena_yaw_deg
+            pose = self.state.last_pose
+            active = self.state.active_marker_id
+
+        h = self._aa_height_m(tel)
+        elapsed = now - sub_started
+
+        def advance(new_sub: str, reason: str, set_active=None):
+            with self.state.lock:
+                self.state.aa_substate = new_sub
+                self.state.aa_substate_started = now
+                if set_active is not None:
+                    self.state.active_marker_id = int(set_active)
+                self.state.note = f"AUTO_ATTACK {new_sub}: {reason}"
+            print(f"[AUTO_ATTACK] {sub} -> {new_sub}: {reason}", flush=True)
+
+        def vision_live(marker):
+            return (pose is not None and active is not None
+                    and marker is not None
+                    and int(pose.marker_id) == int(marker)
+                    and (now - float(pose.timestamp)) < VISION_LIVE_MAX_AGE_S)
+
+        # ── CLIMB ───────────────────────────────────────────────────
+        if sub == "climb":
+            if h is not None and h >= AA_CRUISE_ALT_M - AA_ALT_TOLERANCE_M:
+                advance("go_target", f"reached alt {h:.2f}m",
+                        set_active=tgt_marker)
+                self._send_rc(0, 0, 0, 0, enforce_cfg_caps=False)
+                return
+            if elapsed > AA_CLIMB_TIMEOUT_S:
+                advance("go_target",
+                        f"climb timeout (alt {h if h is None else round(h,2)})",
+                        set_active=tgt_marker)
+                return
+            self._send_rc(0, 0, AA_UD_MAX, 0, enforce_cfg_caps=False)
+            return
+
+        # ── GO_TARGET ───────────────────────────────────────────────
+        if sub == "go_target":
+            if vision_live(tgt_marker):
+                with self.state.lock:
+                    self.state.aa_last_vision_at = now
+                    self.state.aa_capture_braked = False
+                if float(pose.distance_m) < AA_TARGET_STOP_M:
+                    advance("capture",
+                            f"vision dist {pose.distance_m:.2f}m → brake+hover")
+                    self._send_rc(0, 0, self._aa_alt_hold(h), 0,
+                                  enforce_cfg_caps=False)
+                    return
+                fb, yaw = self._aa_vision_home(pose, AA_TARGET_STOP_M)
+                self._send_rc(0, fb, self._aa_alt_hold(h), yaw,
+                              enforce_cfg_caps=False)
+                with self.state.lock:
+                    self.state.note = (
+                        f"AUTO_ATTACK go_target VISION d={pose.distance_m:.1f}m "
+                        f"brg={pose.yaw_deg:.0f} fb={fb} yaw={yaw}")
+                return
+            # Vision not live THIS tick. If it was live very recently,
+            # keep approaching by world (vision will re-acquire) — do
+            # NOT capture yet.
+            recent_vision = (now - self.state.aa_last_vision_at) < AA_VISION_GRACE_S
+            if drone_pos is not None and drone_yaw is not None:
+                fb, yaw, dist = self._aa_steer(tgt_xy, drone_pos, drone_yaw)
+                if dist < AA_WORLD_CAPTURE_M and not recent_vision:
+                    advance("capture",
+                            f"world-arrived {dist:.2f}m (no recent vision)")
+                    return
+                self._send_rc(0, fb, self._aa_alt_hold(h), yaw,
+                              enforce_cfg_caps=False)
+                with self.state.lock:
+                    self.state.note = (
+                        f"AUTO_ATTACK go_target WORLD d={dist:.1f}m "
+                        f"fb={fb} yaw={yaw} {'(vision grace)' if recent_vision else ''}")
+                return
+            self._send_rc(0, AA_FB_MIN, self._aa_alt_hold(h), 0,
+                          enforce_cfg_caps=False)
+            if elapsed > AA_GO_TIMEOUT_S:
+                advance("capture", "go_target timeout (no pos)")
+            return
+
+        # ── CAPTURE ── brake to a stop, then hover ON the marker ─────
+        if sub == "capture":
+            speed = self._body_speed_cms(tel)
+            with self.state.lock:
+                braked = self.state.aa_capture_braked
+            if not braked:
+                # BRAKE phase: kill forward momentum. Push reverse fb
+                # proportional to body speed until the drone is nearly
+                # stopped (or the brake cap elapses).
+                stopped = (speed is not None and speed < AA_BRAKE_SPEED_CMS)
+                if stopped or elapsed > AA_BRAKE_MAX_S:
+                    with self.state.lock:
+                        self.state.aa_capture_braked = True
+                        self.state.aa_substate_started = now  # reset for hover
+                    self._send_rc(0, 0, self._aa_alt_hold(h), 0,
+                                  enforce_cfg_caps=False)
+                    print(f"[AUTO_ATTACK] capture braked "
+                          f"(speed={speed}) — hovering on target", flush=True)
+                    return
+                # Active reverse brake.
+                self._send_rc(0, -40, self._aa_alt_hold(h), 0,
+                              enforce_cfg_caps=False)
+                with self.state.lock:
+                    self.state.note = (
+                        f"AUTO_ATTACK capture BRAKE speed="
+                        f"{speed if speed is None else round(speed)}cm/s")
+                return
+            # HOVER phase: hold ON the target marker via vision. Keep it
+            # centred (yaw) and at the capture standoff (fb both ways),
+            # so the drone parks directly in front of / over the box.
+            if vision_live(tgt_marker):
+                bearing = float(pose.yaw_deg)
+                yaw = int(max(-AA_YAW_MAX,
+                              min(AA_YAW_MAX, AA_VISION_YAW_KP * bearing)))
+                err = float(pose.distance_m) - AA_TARGET_STOP_M
+                fb = int(max(-AA_FB_MAX, min(AA_FB_MAX, AA_FB_KP * err)))
+                self._send_rc(0, fb, self._aa_alt_hold(h), yaw,
+                              enforce_cfg_caps=False)
+                with self.state.lock:
+                    self.state.note = (
+                        f"AUTO_ATTACK capture HOVER d={pose.distance_m:.2f}m "
+                        f"brg={bearing:.0f} (hold {elapsed:.1f}/"
+                        f"{AA_CAPTURE_HOLD_S:.0f}s)")
+            else:
+                # Lost the marker mid-hover — just hold position.
+                self._send_rc(0, 0, self._aa_alt_hold(h), 0,
+                              enforce_cfg_caps=False)
+            if elapsed > AA_CAPTURE_HOLD_S:
+                advance("go_home", "capture+hover done",
+                        set_active=home_marker)
+                with self.state.lock:
+                    self.state.aa_last_vision_at = 0.0
+                    self.state.aa_capture_braked = False
+            return
+
+        # ── GO_HOME ─────────────────────────────────────────────────
+        if sub == "go_home":
+            if vision_live(home_marker):
+                with self.state.lock:
+                    self.state.aa_last_vision_at = now
+                if float(pose.distance_m) < AA_HOME_STOP_M:
+                    advance("land", f"home vision dist {pose.distance_m:.2f}m")
+                    self._send_rc(0, 0, self._aa_alt_hold(h), 0,
+                                  enforce_cfg_caps=False)
+                    return
+                fb, yaw = self._aa_vision_home(pose, AA_HOME_STOP_M)
+                self._send_rc(0, fb, self._aa_alt_hold(h), yaw,
+                              enforce_cfg_caps=False)
+                return
+            recent_vision = (now - self.state.aa_last_vision_at) < AA_VISION_GRACE_S
+            if drone_pos is not None and drone_yaw is not None:
+                fb, yaw, dist = self._aa_steer(home_xy, drone_pos, drone_yaw)
+                if dist < AA_HOME_STOP_M + WORLD_FALLBACK_MARGIN_M and not recent_vision:
+                    advance("land", f"world-arrived home {dist:.2f}m")
+                    return
+                self._send_rc(0, fb, self._aa_alt_hold(h), yaw,
+                              enforce_cfg_caps=False)
+                with self.state.lock:
+                    self.state.note = (
+                        f"AUTO_ATTACK go_home WORLD d={dist:.1f}m "
+                        f"fb={fb} yaw={yaw}")
+                return
+            self._send_rc(0, AA_FB_MIN, self._aa_alt_hold(h), 0,
+                          enforce_cfg_caps=False)
+            if elapsed > AA_GO_TIMEOUT_S:
+                advance("land", "go_home timeout (no pos)")
+            return
+
+        # ── LAND ────────────────────────────────────────────────────
+        if sub == "land":
+            self._send_rc(0, 0, 0, 0, enforce_cfg_caps=False)
+            try:
+                self.api.land()
+            except DroneApiError as e:
+                print(f"[AUTO_ATTACK] land error: {e}", flush=True)
+            self._advance_script("auto_attack complete")
+            return
+
+        # Unknown sub-state — fail safe to land.
+        advance("land", f"unknown substate {sub!r}")
 
     # ------------------------------------------------------------- scout
     def _step_scout(self, tel: Optional[TelemetrySnapshot],
@@ -2505,6 +2841,31 @@ class MissionController:
                    f"lr={step.rc_lr}")
             self._set_phase(Phase.RC,
                             note + f" {tag} {step.seconds:g}s")
+            return
+        if step.kind == "AUTO_ATTACK":
+            # Reactive end-to-end attack. Seed the state machine and
+            # hand control to _step_auto_attack, which runs its own
+            # sub-state machine every tick (climb → go_target →
+            # capture → go_home → land).
+            with self.state.lock:
+                self.state.aa_target_marker = int(step.marker_id)
+                self.state.aa_target_xy = (float(step.world_x),
+                                            float(step.world_y))
+                self.state.aa_home_marker = int(step.aa_home_marker_id)
+                self.state.aa_home_xy = (float(step.aa_home_x),
+                                          float(step.aa_home_y))
+                self.state.aa_substate = "climb"
+                self.state.aa_substate_started = time.monotonic()
+                # Start with the target marker active so vision homing
+                # has the right pose as soon as it comes into view.
+                self.state.active_marker_id = int(step.marker_id)
+                self.state.last_pose = None
+            self._set_phase(
+                Phase.AUTO_ATTACK,
+                note + f" target={step.marker_id}@({step.world_x:g},"
+                       f"{step.world_y:g}) home={step.aa_home_marker_id}@"
+                       f"({step.aa_home_x:g},{step.aa_home_y:g})"
+            )
             return
         if step.kind == "FB_BRAKE":
             # Open-loop forward stick + vision-triggered brake.

@@ -38,6 +38,7 @@ Eighteen commands. Suffix convention:
     YAW_IMU  <deg>                                 +cw / -ccw,       deg in [-180, +180]
     RC       <lr> <fb> <ud> <yaw> [<seconds>]      all four sticks at once
     SCOUT                                          slow 360° yaw spin (cw, stick=15)
+    AUTO_ATTACK <tgt_id> <tx> <ty> <home_id> <hx> <hy>   reactive end-to-end attack
 
 LR_RC / FB_RC / UD_RC / YAW_RC / RC are raw-RC steps: pin the listed
 stick(s) to the given value(s) for the given duration (default 1 s;
@@ -161,6 +162,16 @@ class Step:
     # api.move which wraps Olympe's moveBy.
     move_direction: Optional[str] = None
     move_distance_m: Optional[float] = None
+    # AUTO_ATTACK: the reactive end-to-end attack. marker_id / world_x /
+    # world_y carry the TARGET (slot face marker + its known arena
+    # position); these three carry the HOME-wall marker + its position.
+    # The controller runs an internal state machine (climb → go-target
+    # → capture → go-home → land) steering by arena position when the
+    # marker is out of view and by drift-free vision bearing/distance
+    # when it's visible.
+    aa_home_marker_id: Optional[int] = None
+    aa_home_x: Optional[float] = None
+    aa_home_y: Optional[float] = None
     line_no: int = 0                    # 1-based source line, for diagnostics
 
 
@@ -393,6 +404,27 @@ def parse(text: str, defaults: dict) -> List[Step]:
                             world_x=world_x,
                             world_y=world_y,
                             line_no=raw_line_no))
+        elif cmd == "AUTO_ATTACK":
+            # Reactive end-to-end attack.
+            # Args: <target_marker> <tx> <ty> <home_marker> <hx> <hy>
+            # Target = enemy slot face marker + its arena (x,y).
+            # Home   = own home-wall marker + its arena (x,y).
+            if len(args) != 6:
+                raise ScriptError(raw_line_no,
+                                  f"AUTO_ATTACK takes exactly 6 arguments "
+                                  f"(<target_marker> <tx> <ty> "
+                                  f"<home_marker> <hx> <hy>), got {len(args)}")
+            tmid = _parse_int(args[0], raw_line_no, "AUTO_ATTACK target marker")
+            tx = _parse_float(args[1], raw_line_no, "AUTO_ATTACK tx")
+            ty = _parse_float(args[2], raw_line_no, "AUTO_ATTACK ty")
+            hmid = _parse_int(args[3], raw_line_no, "AUTO_ATTACK home marker")
+            hx = _parse_float(args[4], raw_line_no, "AUTO_ATTACK hx")
+            hy = _parse_float(args[5], raw_line_no, "AUTO_ATTACK hy")
+            out.append(Step(kind="AUTO_ATTACK",
+                            marker_id=tmid, world_x=tx, world_y=ty,
+                            aa_home_marker_id=hmid,
+                            aa_home_x=hx, aa_home_y=hy,
+                            line_no=raw_line_no))
         elif cmd == "YAW_IMU":
             # Discrete rotation by N degrees, range [-180, +180].
             # Positive = CW (looking down). Synchronous on the FC
@@ -579,6 +611,11 @@ def format(steps: List[Step]) -> str:
             if s.world_x is not None and s.world_y is not None:
                 parts.append(f"{s.world_x:g} {s.world_y:g}")
             lines.append(" ".join(parts))
+        elif s.kind == "AUTO_ATTACK":
+            lines.append(
+                f"AUTO_ATTACK {s.marker_id} {s.world_x:g} {s.world_y:g} "
+                f"{s.aa_home_marker_id} {s.aa_home_x:g} {s.aa_home_y:g}"
+            )
         elif s.kind == "YAW":
             lines.append(f"YAW_IMU {int(s.rotation_deg or 0)}")
         elif s.kind == "MOVE_IMU":

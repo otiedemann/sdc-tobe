@@ -140,21 +140,16 @@ RTH_CRUISE_UP_UD_RC: int = 60  # combined fb + climb for RTH leg
 INITIAL_CLIMB_UD_RC: int = 100   # full up-stick
 INITIAL_CLIMB_DURATION_S: float = 1.2  # ~0.5m climb → ~1.4m total alt
 
-# Open-loop yaw turn for the post-capture and pre-landing 180° flips.
-# YAW_IMU is firmware-internal api.rotate and takes ~5 s (it ramps
-# up + ramps down + waits for "rotation complete" confirm). YAW_RC
-# at stick=100 hits Anafi's ~200°/s yaw rate cap, so 180° finishes
-# in <1 s; the DSL auto-brake adds another ~1 s. Net ~2 s vs 5 s.
-#
-# Overshoot risk: YAW_RC is open-loop, so the drone might land at
-# 170°-200° instead of exactly 180°. That's fine here — the FB_BRAKE
-# immediately following uses vision tracking, which tolerates a few
-# degrees of heading error. The mid-script (post-capture) YAW that
-# precedes the RTH cruise is more sensitive, but vision will still
-# detect the wall marker as long as the front cam roughly points at
-# the home wall.
-YAW_180_RC: int = 100          # CW = positive yaw stick (+100 = full CW)
-YAW_180_DURATION_S: float = 1.0   # ~180° at Anafi's max yaw rate
+# 180° turns use the firmware-internal YAW_IMU (api.rotate), NOT
+# open-loop YAW_RC. We tried YAW_RC for speed (~2 s vs 5 s) but it's
+# too imprecise: YAW_RC 100 for 1.0 s only rotated ~95° in testing
+# (the firmware ramps the yaw rate up over the first ~0.5 s and the
+# auto-brake eats the tail), AND the fast spin destabilised altitude
+# hold (drone lost ~1.4 m and sank to the floor on the RTH leg).
+# A wrong heading sends the whole RTH cruise sideways into open
+# arena. YAW_IMU's closed-loop "rotate exactly N degrees and confirm"
+# is worth the extra ~3 s per turn — heading accuracy is critical
+# because the cruise that follows is open-loop.
 
 # Home-wall markers for RTH braking. 0.5 m markers on each team's
 # home wall, LOW position (2.0 m altitude) — close to cruise altitude
@@ -182,14 +177,25 @@ RTH_APPROACH_DISTANCE_M: float = 2.0
 # as a safety net. We pick stop_m larger than strictly needed so the
 # brake-settle distance (~1 m at fb=50) plus position-estimator drift
 # (~2 m) doesn't push the drone into the wall behind the marker.
-FB_BRAKE_TARGET_STOP_M: float = 3.0
+# Target stop is tighter (1.5 m) — vision drives the final approach
+# now (world fallback is suppressed while vision is live), so we can
+# safely close in. Wall stop stays conservative (3.0 m) since the
+# wall brake leans on the world fallback (vision of the wall marker
+# is less reliable at cruise pitch) and we must not clip the wall.
+FB_BRAKE_TARGET_STOP_M: float = 1.5
 FB_BRAKE_WALL_STOP_M: float = 3.0
 # FB_BRAKE drives at the SAME stick as cruise (so we don't accelerate
 # back to full speed during the brake-search phase, which then has
 # more momentum to bleed off). Sticking to ~2 m/s throughout keeps
 # the system in a regime where the auto-brake actually works.
 FB_BRAKE_STICK: int = 50
-FB_BRAKE_TIMEOUT_S: float = 4.0
+# Timeout is now generous (was 4.0). The drone cruises slower than
+# the nominal calibration (~1 m/s effective), so a tight timeout
+# fired BEFORE the vision/world trip and the drone braked short of
+# the target. With the arena guard as the hard wall backstop, a long
+# FB_BRAKE timeout is safe: vision/world will trip well within it,
+# and if both somehow fail the guard stops the drone at the wall.
+FB_BRAKE_TIMEOUT_S: float = 10.0
 
 
 def _format_script(*lines: str) -> str:
@@ -343,7 +349,7 @@ def _full_attack_script(
             rth_cruise_step,
             f"FB_BRAKE {wall_marker_id} {FB_BRAKE_WALL_STOP_M:.2f} "
             f"{FB_BRAKE_STICK} {FB_BRAKE_TIMEOUT_S:.1f}",
-            f"YAW_RC {YAW_180_RC} {YAW_180_DURATION_S:g}",
+            "YAW_IMU 180",
             "LAND",
         )
     else:
@@ -372,10 +378,46 @@ def _full_attack_script(
         # to stay above the box top during momentum bleed).
         f"RC 0 {DRIFT_OVER_BOX_RC} {DRIFT_OVER_BOX_UD_RC} 0 "
         f"{DRIFT_OVER_BOX_DURATION_S:.2f}",
-        f"YAW_RC {YAW_180_RC} {YAW_180_DURATION_S:g}",
+        "YAW_IMU 180",
         # No HOOVER — RTH starts immediately. Capture detection is
         # the scout role's job; the attacker just commits and runs.
         *rth_lines,
+    )
+
+
+def _auto_attack_script(
+    ctx: RoleContext, attack_marker_id: int, slot: int
+) -> str:
+    """Reactive end-to-end attack via the FC's AUTO_ATTACK phase.
+
+    Instead of a fixed choreography (climb N s, cruise M s, brake, …),
+    we hand the FC a single AUTO_ATTACK step carrying the target slot
+    marker + its arena position and the home-wall marker + its arena
+    position. The FC then runs a closed-loop state machine (climb →
+    go-target → capture → go-home → land) that steers continuously,
+    homing on vision (drift-free) when the marker is in view and on
+    the ArUco arena position when it isn't, with the always-on arena
+    guard preventing wall contact. This adapts every tick instead of
+    committing to pre-computed timings — the architecture the operator
+    asked for after the fixed-choreography runs proved unreliable.
+
+    Script shape:
+        TAKEOFF
+        AUTO_ATTACK <tgt_id> <tx> <ty> <home_id> <hx> <hy>
+
+    (AUTO_ATTACK ends with LAND internally, so no trailing LAND.)
+    """
+    target_xy = SLOT_POSITIONS_M.get(int(slot)) or (0.0, 0.0)
+    wall_entry = HOME_WALL_MARKER.get(ctx.our_team)
+    if wall_entry is None:
+        # Shouldn't happen (both teams mapped); fall back to old script.
+        return _full_attack_script(ctx, attack_marker_id, slot)
+    home_marker_id, home_xy = wall_entry
+    return _format_script(
+        "TAKEOFF",
+        f"AUTO_ATTACK {int(attack_marker_id)} "
+        f"{target_xy[0]:g} {target_xy[1]:g} "
+        f"{int(home_marker_id)} {home_xy[0]:g} {home_xy[1]:g}",
     )
 
 
@@ -416,9 +458,9 @@ class AttackerRole(Role):
             attack_id = _enemy_face_for(slot, ctx.our_team)
             rs.last_attack_marker_id = attack_id
             return push(
-                _full_attack_script(ctx, attack_id, slot),
+                _auto_attack_script(ctx, attack_id, slot),
                 new_phase="running",
-                reason=f"attacker: full attack on slot {slot} (id={attack_id})",
+                reason=f"attacker: AUTO_ATTACK on slot {slot} (id={attack_id})",
             )
 
         # ---- running: waiting for the entire script to finish -------------
