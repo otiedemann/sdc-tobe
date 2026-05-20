@@ -573,7 +573,8 @@ document.getElementById("disarm-btn").addEventListener("click", async () => {
   refresh();
 });
 document.getElementById("land-btn").addEventListener("click", async () => {
-  if (!confirm("Emergency-land all drones?")) return;
+  // No confirmation — emergency-land must be IMMEDIATE. Fire the
+  // request before anything else so a click always lands the swarm.
   await api("/api/strategy/emergency-land", {method:"POST"});
   refresh();
 });
