@@ -2117,8 +2117,11 @@ class MissionController:
             # No vision THIS tick — steer toward the target's known arena
             # position to bring the marker into the camera's view. Keep
             # going (the marker should appear); only the safety timeout
-            # ends this without ever seeing the marker.
-            if drone_pos is not None and drone_yaw is not None:
+            # ends this without ever seeing the marker. If the target has
+            # no known position (vision-only target not in the arena
+            # config), just hold + wait for the marker to appear.
+            if (tgt_xy is not None and drone_pos is not None
+                    and drone_yaw is not None):
                 fb, yaw, dist = self._aa_steer(tgt_xy, drone_pos, drone_yaw)
                 self._send_rc(0, fb, self._aa_alt_hold(h), yaw,
                               enforce_cfg_caps=False)
@@ -2127,8 +2130,14 @@ class MissionController:
                         f"AUTO_ATTACK go_target WORLD-seek d={dist:.1f}m "
                         f"fb={fb} yaw={yaw} (waiting for marker)")
             else:
-                self._send_rc(0, AA_FB_MIN, self._aa_alt_hold(h), 0,
+                # No target position to steer to — hold and wait for
+                # vision to pick up the marker.
+                self._send_rc(0, 0, self._aa_alt_hold(h), 0,
                               enforce_cfg_caps=False)
+                with self.state.lock:
+                    self.state.note = (
+                        "AUTO_ATTACK go_target: waiting for target marker "
+                        "(vision-only, no world position)")
             if elapsed > AA_GO_TIMEOUT_S:
                 # Safety: never saw the marker close. Do the over-marker
                 # move anyway using the trigger distance as a best guess.
@@ -2875,17 +2884,45 @@ class MissionController:
             return
         if step.kind == "AUTO_ATTACK":
             # Reactive end-to-end attack. Seed the state machine and
-            # hand control to _step_auto_attack, which runs its own
-            # sub-state machine every tick (climb → go_target →
-            # capture → go_home → land).
+            # hand control to _step_auto_attack (climb → go_target →
+            # over_rise → over_forward → go_home → land).
+            #
+            # Resolve each marker's arena (x,y) from the ACTIVE arena
+            # config (loaded from ~/.marker_mission/active_arena_config.json
+            # via get_arena()). The explicit coords in the step are only
+            # a fallback for markers NOT present in that config — this is
+            # what lets a bare `AUTO_ATTACK <tid> <hid>` work in any
+            # arena: the FC looks the positions up itself.
+            arena = self.get_arena() if self.get_arena is not None else None
+
+            def _resolve_xy(mid, fx, fy):
+                if (arena is not None and arena.markers
+                        and int(mid) in arena.markers):
+                    p = arena.markers[int(mid)].position_m
+                    return (float(p[0]), float(p[1]), "config")
+                if fx is not None and fy is not None:
+                    return (float(fx), float(fy), "coords")
+                return (None, None, "UNRESOLVED")
+
+            tgt_x, tgt_y, tgt_src = _resolve_xy(
+                step.marker_id, step.world_x, step.world_y)
+            home_x, home_y, home_src = _resolve_xy(
+                step.aa_home_marker_id, step.aa_home_x, step.aa_home_y)
+
+            if home_x is None:
+                # Can't navigate home without a home position — abort
+                # rather than fly blind.
+                self._advance_script(
+                    f"auto_attack: home marker {step.aa_home_marker_id} "
+                    f"not in arena config and no coords given — aborting")
+                return
+
             with self.state.lock:
                 self.state.aa_target_marker = int(step.marker_id)
-                self.state.aa_target_xy = (float(step.world_x),
-                                            float(step.world_y))
+                self.state.aa_target_xy = (
+                    (tgt_x, tgt_y) if tgt_x is not None else None)
                 self.state.aa_home_marker = int(step.aa_home_marker_id)
-                self.state.aa_home_xy = (float(step.aa_home_x),
-                                          float(step.aa_home_y))
-                # Optional per-mission tuning (fall back to defaults).
+                self.state.aa_home_xy = (home_x, home_y)
                 self.state.aa_altitude_m = (
                     float(step.aa_altitude_m)
                     if step.aa_altitude_m is not None else AA_CRUISE_ALT_M)
@@ -2894,16 +2931,21 @@ class MissionController:
                     if step.aa_approach_speed is not None else AA_FB_MAX)
                 self.state.aa_substate = "climb"
                 self.state.aa_substate_started = time.monotonic()
-                # Start with the target marker active so vision homing
-                # has the right pose as soon as it comes into view.
                 self.state.active_marker_id = int(step.marker_id)
                 self.state.last_pose = None
+            tgt_pos_str = (f"({tgt_x:g},{tgt_y:g})" if tgt_x is not None
+                           else "vision-only")
             self._set_phase(
                 Phase.AUTO_ATTACK,
-                note + f" target={step.marker_id}@({step.world_x:g},"
-                       f"{step.world_y:g}) home={step.aa_home_marker_id}@"
-                       f"({step.aa_home_x:g},{step.aa_home_y:g})"
+                note + f" target={step.marker_id}@{tgt_pos_str}/{tgt_src} "
+                       f"home={step.aa_home_marker_id}@"
+                       f"({home_x:g},{home_y:g})/{home_src} "
+                       f"alt={self.state.aa_altitude_m:g} "
+                       f"spd={self.state.aa_approach_speed}"
             )
+            print(f"[AUTO_ATTACK] resolved target={step.marker_id} "
+                  f"{tgt_pos_str} ({tgt_src}), home={step.aa_home_marker_id} "
+                  f"({home_x:g},{home_y:g}) ({home_src})", flush=True)
             return
         if step.kind == "FB_BRAKE":
             # Open-loop forward stick + vision-triggered brake.

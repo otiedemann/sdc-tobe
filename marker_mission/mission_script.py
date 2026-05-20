@@ -38,7 +38,8 @@ Eighteen commands. Suffix convention:
     YAW_IMU  <deg>                                 +cw / -ccw,       deg in [-180, +180]
     RC       <lr> <fb> <ud> <yaw> [<seconds>]      all four sticks at once
     SCOUT                                          slow 360° yaw spin (cw, stick=15)
-    AUTO_ATTACK <tgt_id> <tx> <ty> <home_id> <hx> <hy> [<alt_m>] [<speed>]   reactive attack
+    AUTO_ATTACK <tgt_id> <home_id> [<alt_m>] [<speed>]   reactive attack (ids→arena config)
+    AUTO_ATTACK <tgt_id> <tx> <ty> <home_id> <hx> <hy> [<alt_m>] [<speed>]   (explicit coords)
 
 LR_RC / FB_RC / UD_RC / YAW_RC / RC are raw-RC steps: pin the listed
 stick(s) to the given value(s) for the given duration (default 1 s;
@@ -410,37 +411,54 @@ def parse(text: str, defaults: dict) -> List[Step]:
                             world_y=world_y,
                             line_no=raw_line_no))
         elif cmd == "AUTO_ATTACK":
-            # Reactive end-to-end attack.
-            # Args: <target_marker> <tx> <ty> <home_marker> <hx> <hy>
-            #       [<altitude_m>] [<approach_speed>]
-            # Target = enemy slot face marker + its arena (x,y).
-            # Home   = own home-wall marker + its arena (x,y).
-            # altitude_m   = cruise/hover altitude in metres (optional).
-            # approach_speed = forward RC stick 1-100, the cruise/approach
-            #                  speed cap (optional; ~4 cm/s per unit).
-            if not (6 <= len(args) <= 8):
+            # Reactive end-to-end attack. Two forms:
+            #
+            #   SHORT (id-only — positions read from the arena config):
+            #     AUTO_ATTACK <target_id> <home_id> [<alt_m>] [<speed>]
+            #
+            #   FULL (explicit coords — for markers not in the config):
+            #     AUTO_ATTACK <target_id> <tx> <ty> <home_id> <hx> <hy>
+            #                 [<alt_m>] [<speed>]
+            #
+            # In the SHORT form the controller looks up both markers'
+            # arena (x,y) from the active arena config
+            # (~/.marker_mission/active_arena_config.json). In the FULL
+            # form the coords are a fallback used only when a marker is
+            # NOT present in that config. This makes AUTO_ATTACK work in
+            # any arena by ID alone.
+            n = len(args)
+            tx = ty = hx = hy = None
+            if n in (2, 3, 4):
+                tmid = _parse_int(args[0], raw_line_no, "AUTO_ATTACK target id")
+                hmid = _parse_int(args[1], raw_line_no, "AUTO_ATTACK home id")
+                alt_idx, spd_idx = 2, 3
+            elif n in (6, 7, 8):
+                tmid = _parse_int(args[0], raw_line_no, "AUTO_ATTACK target id")
+                tx = _parse_float(args[1], raw_line_no, "AUTO_ATTACK tx")
+                ty = _parse_float(args[2], raw_line_no, "AUTO_ATTACK ty")
+                hmid = _parse_int(args[3], raw_line_no, "AUTO_ATTACK home id")
+                hx = _parse_float(args[4], raw_line_no, "AUTO_ATTACK hx")
+                hy = _parse_float(args[5], raw_line_no, "AUTO_ATTACK hy")
+                alt_idx, spd_idx = 6, 7
+            else:
                 raise ScriptError(raw_line_no,
-                                  f"AUTO_ATTACK takes 6-8 arguments "
-                                  f"(<target_marker> <tx> <ty> "
-                                  f"<home_marker> <hx> <hy> "
-                                  f"[<altitude_m>] [<approach_speed>]), "
-                                  f"got {len(args)}")
-            tmid = _parse_int(args[0], raw_line_no, "AUTO_ATTACK target marker")
-            tx = _parse_float(args[1], raw_line_no, "AUTO_ATTACK tx")
-            ty = _parse_float(args[2], raw_line_no, "AUTO_ATTACK ty")
-            hmid = _parse_int(args[3], raw_line_no, "AUTO_ATTACK home marker")
-            hx = _parse_float(args[4], raw_line_no, "AUTO_ATTACK hx")
-            hy = _parse_float(args[5], raw_line_no, "AUTO_ATTACK hy")
+                                  f"AUTO_ATTACK takes 2-4 args (id-only: "
+                                  f"<target_id> <home_id> [<alt>] [<speed>]) "
+                                  f"or 6-8 (with coords: <target_id> <tx> "
+                                  f"<ty> <home_id> <hx> <hy> [<alt>] "
+                                  f"[<speed>]), got {n}")
             alt = None
             spd = None
-            if len(args) >= 7:
-                alt = _parse_float(args[6], raw_line_no, "AUTO_ATTACK altitude_m")
+            if n > alt_idx:
+                alt = _parse_float(args[alt_idx], raw_line_no,
+                                   "AUTO_ATTACK altitude_m")
                 if alt <= 0.0:
                     raise ScriptError(raw_line_no,
                                       f"AUTO_ATTACK altitude_m must be > 0, "
                                       f"got {alt}")
-            if len(args) >= 8:
-                spd = _parse_int(args[7], raw_line_no, "AUTO_ATTACK approach_speed")
+            if n > spd_idx:
+                spd = _parse_int(args[spd_idx], raw_line_no,
+                                 "AUTO_ATTACK approach_speed")
                 if not (1 <= spd <= 100):
                     raise ScriptError(raw_line_no,
                                       f"AUTO_ATTACK approach_speed must be "
@@ -638,12 +656,16 @@ def format(steps: List[Step]) -> str:
                 parts.append(f"{s.world_x:g} {s.world_y:g}")
             lines.append(" ".join(parts))
         elif s.kind == "AUTO_ATTACK":
-            parts = [
-                f"AUTO_ATTACK {s.marker_id} {s.world_x:g} {s.world_y:g} "
-                f"{s.aa_home_marker_id} {s.aa_home_x:g} {s.aa_home_y:g}"
-            ]
-            # Optional altitude + approach speed are positional, so
-            # speed can only be emitted alongside altitude.
+            # SHORT (id-only) form when no explicit coords were given,
+            # else FULL form. Optional altitude + approach speed are
+            # positional, so speed only emits alongside altitude.
+            if s.world_x is None:
+                parts = [f"AUTO_ATTACK {s.marker_id} {s.aa_home_marker_id}"]
+            else:
+                parts = [
+                    f"AUTO_ATTACK {s.marker_id} {s.world_x:g} {s.world_y:g} "
+                    f"{s.aa_home_marker_id} {s.aa_home_x:g} {s.aa_home_y:g}"
+                ]
             if s.aa_altitude_m is not None:
                 parts.append(f"{s.aa_altitude_m:g}")
                 if s.aa_approach_speed is not None:
