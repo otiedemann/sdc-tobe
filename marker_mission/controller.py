@@ -342,9 +342,15 @@ AA_VISION_GRACE_S: float = 1.2
 # Sub-state timeouts (safety — never hang forever).
 AA_CLIMB_TIMEOUT_S: float = 8.0
 AA_GO_TIMEOUT_S: float = 30.0
-# Capture = brake to a stop, then hover ON the marker (vision-hold)
-# for this long so the drone is demonstrably parked over the target.
-AA_CAPTURE_HOLD_S: float = 2.0
+# Capture maneuver. When the drone gets within AA_CAPTURE_TRIGGER_M of
+# the target marker (by vision), it records that distance D, RISES to
+# AA_CAPTURE_RISE_ALT_M (above the box top), then moves FORWARD by D so
+# it ends up directly OVER the marker/box (the "drop on top" position).
+AA_CAPTURE_TRIGGER_M: float = 2.0      # start the over-marker move here
+AA_CAPTURE_RISE_ALT_M: float = 1.5     # rise to this before going over
+AA_OVER_FORWARD_RC: int = 40           # forward stick for the over-move
+AA_OVER_FORWARD_SPEED_MPS: float = 1.6 # ~stick 40 → 1.6 m/s (duration calc)
+AA_OVER_FORWARD_MAX_S: float = 6.0     # safety cap on the forward move
 AA_BRAKE_SPEED_CMS: float = 15.0   # consider "stopped" below this
 AA_BRAKE_MAX_S: float = 2.0        # cap the brake phase
 
@@ -515,6 +521,11 @@ class MissionState:
     # Whether the capture brake has settled (drone stopped) — once true
     # the capture sub-state switches from braking to vision-hold hover.
     aa_capture_braked: bool = False
+    # Capture "over-marker" maneuver: distance recorded when the drone
+    # was in front of the target (so it can move forward by exactly
+    # that much to end up over it), and the deadline for the forward move.
+    aa_capture_distance_m: float = 0.0
+    aa_over_forward_until: float = 0.0
     # Two-phase RC step: once the drive timer expires we enter a
     # brake phase that holds zero sticks until the IMU reports near-
     # zero body-frame velocity (or a max-settle timeout fires).
@@ -1964,12 +1975,15 @@ class MissionController:
             h_cm = None
         return (h_cm / 100.0) if h_cm is not None else None
 
-    def _aa_alt_hold(self, h: Optional[float]) -> int:
-        """UD stick to hold the per-mission cruise altitude. 0 if
-        altitude unknown."""
+    def _aa_alt_hold(self, h: Optional[float],
+                     target: Optional[float] = None) -> int:
+        """UD stick to hold an altitude. Defaults to the per-mission
+        cruise altitude; pass ``target`` to hold a different one (e.g.
+        the over-marker rise altitude). 0 if altitude unknown."""
         if h is None:
             return 0
-        err = float(self.state.aa_altitude_m) - h
+        tgt = float(self.state.aa_altitude_m) if target is None else float(target)
+        err = tgt - h
         return int(max(-AA_UD_MAX, min(AA_UD_MAX, AA_UD_KP * err)))
 
     def _aa_steer(self, goal_xy, drone_xy, drone_yaw_deg):
@@ -2008,13 +2022,18 @@ class MissionController:
                           now: float) -> None:
         """Reactive end-to-end attack. Internal sub-state machine:
 
-            climb     → ud until safe cruise altitude
-            go_target → steer to the enemy slot; vision-home when the
-                        target marker is visible; → capture when close
-            capture   → brief hold over the box
-            go_home   → steer to the home-wall marker; vision-home when
-                        visible; → land when close
-            land      → descend + finish the step
+            climb        → ud until safe cruise altitude
+            go_target    → approach the enemy slot. Vision-home when the
+                           target marker is visible; when within
+                           AA_CAPTURE_TRIGGER_M record that distance D.
+                           (No world-distance capture — that drifts and
+                           caused premature turn-arounds.)
+            over_rise    → rise to the rise altitude (≥1.5 m), above box
+            over_forward → move forward by D so the drone ends up
+                           directly OVER the marker/box ("drop" position)
+            go_home      → steer to the home-wall marker; vision-home
+                           when visible; → land when close
+            land         → descend + finish the step
 
         Steering uses the ArUco arena position when the marker is out of
         view, and drift-free vision bearing/distance when it's visible.
@@ -2069,100 +2088,101 @@ class MissionController:
 
         # ── GO_TARGET ───────────────────────────────────────────────
         if sub == "go_target":
+            # APPROACH the target by vision until we're "in front of it"
+            # (within AA_CAPTURE_TRIGGER_M). Record that distance D and
+            # hand off to the over-marker maneuver. We do NOT capture by
+            # world-position estimate — that drifts and was triggering a
+            # premature turn-around before the drone actually reached the
+            # target. Vision distance is the only capture trigger.
             if vision_live(tgt_marker):
                 with self.state.lock:
                     self.state.aa_last_vision_at = now
-                    self.state.aa_capture_braked = False
-                if float(pose.distance_m) < AA_TARGET_STOP_M:
-                    advance("capture",
-                            f"vision dist {pose.distance_m:.2f}m → brake+hover")
+                d = float(pose.distance_m)
+                if d < AA_CAPTURE_TRIGGER_M:
+                    with self.state.lock:
+                        self.state.aa_capture_distance_m = d
+                    advance("over_rise",
+                            f"in front of target at {d:.2f}m → rise+over")
                     self._send_rc(0, 0, self._aa_alt_hold(h), 0,
                                   enforce_cfg_caps=False)
                     return
-                fb, yaw = self._aa_vision_home(pose, AA_TARGET_STOP_M)
+                fb, yaw = self._aa_vision_home(pose, AA_CAPTURE_TRIGGER_M)
                 self._send_rc(0, fb, self._aa_alt_hold(h), yaw,
                               enforce_cfg_caps=False)
                 with self.state.lock:
                     self.state.note = (
-                        f"AUTO_ATTACK go_target VISION d={pose.distance_m:.1f}m "
+                        f"AUTO_ATTACK go_target VISION d={d:.1f}m "
                         f"brg={pose.yaw_deg:.0f} fb={fb} yaw={yaw}")
                 return
-            # Vision not live THIS tick. If it was live very recently,
-            # keep approaching by world (vision will re-acquire) — do
-            # NOT capture yet.
-            recent_vision = (now - self.state.aa_last_vision_at) < AA_VISION_GRACE_S
+            # No vision THIS tick — steer toward the target's known arena
+            # position to bring the marker into the camera's view. Keep
+            # going (the marker should appear); only the safety timeout
+            # ends this without ever seeing the marker.
             if drone_pos is not None and drone_yaw is not None:
                 fb, yaw, dist = self._aa_steer(tgt_xy, drone_pos, drone_yaw)
-                if dist < AA_WORLD_CAPTURE_M and not recent_vision:
-                    advance("capture",
-                            f"world-arrived {dist:.2f}m (no recent vision)")
-                    return
                 self._send_rc(0, fb, self._aa_alt_hold(h), yaw,
                               enforce_cfg_caps=False)
                 with self.state.lock:
                     self.state.note = (
-                        f"AUTO_ATTACK go_target WORLD d={dist:.1f}m "
-                        f"fb={fb} yaw={yaw} {'(vision grace)' if recent_vision else ''}")
-                return
-            self._send_rc(0, AA_FB_MIN, self._aa_alt_hold(h), 0,
-                          enforce_cfg_caps=False)
+                        f"AUTO_ATTACK go_target WORLD-seek d={dist:.1f}m "
+                        f"fb={fb} yaw={yaw} (waiting for marker)")
+            else:
+                self._send_rc(0, AA_FB_MIN, self._aa_alt_hold(h), 0,
+                              enforce_cfg_caps=False)
             if elapsed > AA_GO_TIMEOUT_S:
-                advance("capture", "go_target timeout (no pos)")
+                # Safety: never saw the marker close. Do the over-marker
+                # move anyway using the trigger distance as a best guess.
+                with self.state.lock:
+                    self.state.aa_capture_distance_m = AA_CAPTURE_TRIGGER_M
+                advance("over_rise", "go_target timeout — over anyway")
             return
 
-        # ── CAPTURE ── brake to a stop, then hover ON the marker ─────
-        if sub == "capture":
-            speed = self._body_speed_cms(tel)
-            with self.state.lock:
-                braked = self.state.aa_capture_braked
-            if not braked:
-                # BRAKE phase: kill forward momentum. Push reverse fb
-                # proportional to body speed until the drone is nearly
-                # stopped (or the brake cap elapses).
-                stopped = (speed is not None and speed < AA_BRAKE_SPEED_CMS)
-                if stopped or elapsed > AA_BRAKE_MAX_S:
-                    with self.state.lock:
-                        self.state.aa_capture_braked = True
-                        self.state.aa_substate_started = now  # reset for hover
-                    self._send_rc(0, 0, self._aa_alt_hold(h), 0,
-                                  enforce_cfg_caps=False)
-                    print(f"[AUTO_ATTACK] capture braked "
-                          f"(speed={speed}) — hovering on target", flush=True)
-                    return
-                # Active reverse brake.
-                self._send_rc(0, -40, self._aa_alt_hold(h), 0,
-                              enforce_cfg_caps=False)
+        # ── OVER_RISE ── climb to the rise altitude above the box ────
+        # Rise target is max(cruise, 1.5 m) so we never descend here and
+        # always clear the box top before moving over it.
+        rise_target = max(float(self.state.aa_altitude_m),
+                          AA_CAPTURE_RISE_ALT_M)
+        if sub == "over_rise":
+            if h is not None and h >= rise_target - AA_ALT_TOLERANCE_M:
+                # At rise altitude — start the forward-over move. Forward
+                # duration = recorded distance D ÷ over-move speed.
                 with self.state.lock:
-                    self.state.note = (
-                        f"AUTO_ATTACK capture BRAKE speed="
-                        f"{speed if speed is None else round(speed)}cm/s")
+                    d = float(self.state.aa_capture_distance_m)
+                    dur = max(0.0, d / AA_OVER_FORWARD_SPEED_MPS)
+                    dur = min(dur, AA_OVER_FORWARD_MAX_S)
+                    self.state.aa_over_forward_until = now + dur
+                advance("over_forward",
+                        f"risen to {h:.2f}m → forward {d:.2f}m ({dur:.1f}s)")
                 return
-            # HOVER phase: hold ON the target marker via vision. Keep it
-            # centred (yaw) and at the capture standoff (fb both ways),
-            # so the drone parks directly in front of / over the box.
-            if vision_live(tgt_marker):
-                bearing = float(pose.yaw_deg)
-                yaw = int(max(-AA_YAW_MAX,
-                              min(AA_YAW_MAX, AA_VISION_YAW_KP * bearing)))
-                err = float(pose.distance_m) - AA_TARGET_STOP_M
-                fb = int(max(-AA_FB_MAX, min(AA_FB_MAX, AA_FB_KP * err)))
-                self._send_rc(0, fb, self._aa_alt_hold(h), yaw,
+            # Rise straight up, hold horizontal position.
+            self._send_rc(0, 0, AA_UD_MAX, 0, enforce_cfg_caps=False)
+            with self.state.lock:
+                self.state.note = (
+                    f"AUTO_ATTACK over_rise h={h if h is None else round(h,2)}m "
+                    f"→ {rise_target:.1f}m")
+            return
+
+        # ── OVER_FORWARD ── move forward by D to sit over the marker ──
+        if sub == "over_forward":
+            with self.state.lock:
+                until = self.state.aa_over_forward_until
+            if now >= until:
+                self._send_rc(0, 0, self._aa_alt_hold(h, rise_target), 0,
                               enforce_cfg_caps=False)
-                with self.state.lock:
-                    self.state.note = (
-                        f"AUTO_ATTACK capture HOVER d={pose.distance_m:.2f}m "
-                        f"brg={bearing:.0f} (hold {elapsed:.1f}/"
-                        f"{AA_CAPTURE_HOLD_S:.0f}s)")
-            else:
-                # Lost the marker mid-hover — just hold position.
-                self._send_rc(0, 0, self._aa_alt_hold(h), 0,
-                              enforce_cfg_caps=False)
-            if elapsed > AA_CAPTURE_HOLD_S:
-                advance("go_home", "capture+hover done",
+                advance("go_home", "over the marker → return home",
                         set_active=home_marker)
                 with self.state.lock:
                     self.state.aa_last_vision_at = 0.0
-                    self.state.aa_capture_braked = False
+                return
+            # Drive forward at the over-move speed, holding the rise
+            # altitude (NOT cruise — we must stay above the box).
+            self._send_rc(0, AA_OVER_FORWARD_RC,
+                          self._aa_alt_hold(h, rise_target), 0,
+                          enforce_cfg_caps=False)
+            with self.state.lock:
+                self.state.note = (
+                    f"AUTO_ATTACK over_forward (moving over marker, "
+                    f"{until - now:.1f}s left)")
             return
 
         # ── GO_HOME ─────────────────────────────────────────────────
