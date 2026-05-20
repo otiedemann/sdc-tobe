@@ -354,6 +354,14 @@ AA_OVER_FORWARD_MAX_S: float = 6.0     # safety cap on the forward move
 AA_BRAKE_SPEED_CMS: float = 15.0   # consider "stopped" below this
 AA_BRAKE_MAX_S: float = 2.0        # cap the brake phase
 
+# After the over-marker "drop" the drone does NOT land. It dwells over
+# the box (rotating to face our home zone and acquiring the home marker),
+# flies back home, turns to face the enemy home zone, and then HOVERS —
+# ready for the next attack run.
+AA_DWELL_S: float = 5.0            # hover over the box (face home + find home marker)
+AA_FACE_DONE_DEG: float = 12.0     # "now facing the enemy" tolerance at home
+AA_FACE_TIMEOUT_S: float = 6.0     # stop rotating to face enemy after this
+
 # SCOUT step — operator-facing "slow 360° look-around" command. Yaw
 # stick is held at ``cfg.scout_yaw_stick`` (tunable, default 15) until
 # cumulative yaw telemetry has rotated by SCOUT_TARGET_DEG, then we
@@ -526,6 +534,9 @@ class MissionState:
     # that much to end up over it), and the deadline for the forward move.
     aa_capture_distance_m: float = 0.0
     aa_over_forward_until: float = 0.0
+    # Deadline for the post-drop dwell over the box (face home + acquire
+    # the home marker) before flying back to the home zone.
+    aa_dwell_until: float = 0.0
     # Two-phase RC step: once the drive timer expires we enter a
     # brake phase that holds zero sticks until the IMU reports near-
     # zero body-frame velocity (or a max-settle timeout fires).
@@ -2031,9 +2042,19 @@ class MissionController:
             over_rise    → rise to the rise altitude (≥1.5 m), above box
             over_forward → move forward by D so the drone ends up
                            directly OVER the marker/box ("drop" position)
-            go_home      → steer to the home-wall marker; vision-home
-                           when visible; → land when close
-            land         → descend + finish the step
+            over_dwell   → hover over the box for AA_DWELL_S, rotating to
+                           face our home zone and acquiring the home
+                           marker ("score" dwell — does NOT land)
+            go_home      → fly back to the home-wall marker; vision-home
+                           when visible; → face_enemy when close
+            face_enemy   → at home, rotate to face the enemy home zone
+                           (so the next run starts already oriented)
+            ready        → terminal hover at home, NOT landed — waits
+                           airborne for the next attack run
+
+        The drone never lands on the normal path: after the drop it
+        returns home and holds station, ready to attack again. (LAND
+        remains only as a failsafe for lost-positioning timeouts.)
 
         Steering uses the ArUco arena position when the marker is out of
         view, and drift-free vision bearing/distance when it's visible.
@@ -2178,10 +2199,13 @@ class MissionController:
             if now >= until:
                 self._send_rc(0, 0, self._aa_alt_hold(h, rise_target), 0,
                               enforce_cfg_caps=False)
-                advance("go_home", "over the marker → return home",
-                        set_active=home_marker)
+                # Don't fly home yet — dwell over the box (face home +
+                # acquire the home marker) for AA_DWELL_S first.
                 with self.state.lock:
+                    self.state.aa_dwell_until = now + AA_DWELL_S
                     self.state.aa_last_vision_at = 0.0
+                advance("over_dwell", "over the marker → dwell + face home",
+                        set_active=home_marker)
                 return
             # Drive forward at the over-move speed, holding the rise
             # altitude (NOT cruise — we must stay above the box).
@@ -2194,13 +2218,52 @@ class MissionController:
                     f"{until - now:.1f}s left)")
             return
 
+        # ── OVER_DWELL ── hover over the box: face home + find home marker ──
+        if sub == "over_dwell":
+            with self.state.lock:
+                until = self.state.aa_dwell_until
+            # Yaw toward home: prefer centering the home marker if it's
+            # already in view ("focus on the home marker"); otherwise
+            # turn toward the home position in the arena frame.
+            yaw = 0
+            facing = "?"
+            if vision_live(home_marker):
+                with self.state.lock:
+                    self.state.aa_last_vision_at = now
+                yaw = int(max(-AA_YAW_MAX, min(AA_YAW_MAX,
+                              AA_VISION_YAW_KP * float(pose.yaw_deg))))
+                facing = f"home-marker brg={pose.yaw_deg:.0f}"
+            elif (drone_pos is not None and drone_yaw is not None
+                  and home_xy is not None):
+                dx = home_xy[0] - drone_pos[0]
+                dy = home_xy[1] - drone_pos[1]
+                desired = math.degrees(math.atan2(dx, dy))   # CW from +y
+                err = self._aa_wrap180(desired - drone_yaw)
+                yaw = int(max(-AA_YAW_MAX, min(AA_YAW_MAX, AA_YAW_KP * err)))
+                facing = f"world err={err:.0f}"
+            # Stay put over the box at the rise altitude — only rotate.
+            self._send_rc(0, 0, self._aa_alt_hold(h, rise_target), yaw,
+                          enforce_cfg_caps=False)
+            if now >= until:
+                advance("go_home", "dwell done → fly home",
+                        set_active=home_marker)
+                with self.state.lock:
+                    self.state.aa_last_vision_at = 0.0
+                return
+            with self.state.lock:
+                self.state.note = (
+                    f"AUTO_ATTACK over_dwell ({until - now:.1f}s left) "
+                    f"facing home [{facing}]")
+            return
+
         # ── GO_HOME ─────────────────────────────────────────────────
         if sub == "go_home":
             if vision_live(home_marker):
                 with self.state.lock:
                     self.state.aa_last_vision_at = now
                 if float(pose.distance_m) < AA_HOME_STOP_M:
-                    advance("land", f"home vision dist {pose.distance_m:.2f}m")
+                    advance("face_enemy",
+                            f"home vision dist {pose.distance_m:.2f}m")
                     self._send_rc(0, 0, self._aa_alt_hold(h), 0,
                                   enforce_cfg_caps=False)
                     return
@@ -2212,7 +2275,7 @@ class MissionController:
             if drone_pos is not None and drone_yaw is not None:
                 fb, yaw, dist = self._aa_steer(home_xy, drone_pos, drone_yaw)
                 if dist < AA_HOME_STOP_M + WORLD_FALLBACK_MARGIN_M and not recent_vision:
-                    advance("land", f"world-arrived home {dist:.2f}m")
+                    advance("face_enemy", f"world-arrived home {dist:.2f}m")
                     return
                 self._send_rc(0, fb, self._aa_alt_hold(h), yaw,
                               enforce_cfg_caps=False)
@@ -2224,7 +2287,62 @@ class MissionController:
             self._send_rc(0, AA_FB_MIN, self._aa_alt_hold(h), 0,
                           enforce_cfg_caps=False)
             if elapsed > AA_GO_TIMEOUT_S:
+                # Lost positioning the whole way home — land as a failsafe
+                # (can't navigate to hold station blind).
                 advance("land", "go_home timeout (no pos)")
+            return
+
+        # ── FACE_ENEMY ── back home: turn to face the enemy home zone ──
+        if sub == "face_enemy":
+            # Enemy direction in the arena frame: from our home toward the
+            # target we just attacked (the enemy side). Fall back to the
+            # arena centre when the target had no world position.
+            enemy_heading = None
+            if home_xy is not None and tgt_xy is not None:
+                enemy_heading = math.degrees(math.atan2(
+                    tgt_xy[0] - home_xy[0], tgt_xy[1] - home_xy[1]))
+            elif home_xy is not None:
+                enemy_heading = math.degrees(math.atan2(
+                    -home_xy[0], -home_xy[1]))
+            if enemy_heading is None or drone_yaw is None:
+                # No facing reference — just hold, ready for the next run.
+                self._send_rc(0, 0, self._aa_alt_hold(h), 0,
+                              enforce_cfg_caps=False)
+                advance("ready", "home (no facing reference)")
+                return
+            err = self._aa_wrap180(enemy_heading - drone_yaw)
+            if abs(err) < AA_FACE_DONE_DEG or elapsed > AA_FACE_TIMEOUT_S:
+                self._send_rc(0, 0, self._aa_alt_hold(h), 0,
+                              enforce_cfg_caps=False)
+                advance("ready", f"facing enemy (err {err:.0f}°)")
+                return
+            yaw = int(max(-AA_YAW_MAX, min(AA_YAW_MAX, AA_YAW_KP * err)))
+            self._send_rc(0, 0, self._aa_alt_hold(h), yaw,
+                          enforce_cfg_caps=False)
+            with self.state.lock:
+                self.state.note = (
+                    f"AUTO_ATTACK face_enemy err={err:.0f}° yaw={yaw}")
+            return
+
+        # ── READY ── terminal hover: run complete, NOT landed ────────
+        if sub == "ready":
+            # Hold station at home, hovering, facing the enemy. We do NOT
+            # advance the script here: the end-of-script path triggers a
+            # safety LAND, and the whole point is to stay airborne and
+            # ready for the next attack run. If the operator's script has
+            # an explicit step AFTER this AUTO_ATTACK, run it instead.
+            self._send_rc(0, 0, self._aa_alt_hold(h), 0,
+                          enforce_cfg_caps=False)
+            with self.state.lock:
+                idx = self.state.mission_step_idx
+                n_steps = len(self.state.mission_script)
+            if idx + 1 < n_steps:
+                self._advance_script("auto_attack complete → next step")
+                return
+            with self.state.lock:
+                self.state.note = (
+                    "AUTO_ATTACK ready — hovering at home facing enemy "
+                    "(no land, awaiting next run)")
             return
 
         # ── LAND ────────────────────────────────────────────────────
