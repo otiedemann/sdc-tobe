@@ -20,8 +20,13 @@
     "type": "anafi"
   },
   "5": {
+    "base": "http://flightctrl5:8080",
     "name": "Anafi 5",
+    "type": "anafi"
+  },
+  "6": {
+    "name": "Drone 6",
     "type": "anafi",
-    "base": "http://flightctrl5:8080"
+    "base": "http://sphinx3.otconsulting.de:8080"
   }
 }
