@@ -476,10 +476,16 @@ _ARENA_BOUNDS_DEFAULT = {
 }
 _arena_bounds: dict = dict(_ARENA_BOUNDS_DEFAULT)
 _arena_margin_m: float = float(os.getenv("ARENA_SAFETY_MARGIN_M", "1.5"))
-# Toggle: applies to BOTH manual and autonomous flight. Default ON.
+# Toggle: applies to BOTH manual and autonomous flight. DEFAULT OFF.
+# Disabled by default because the active reverse-brake acts on the ArUco
+# ``_pos_st`` fix, which mirrors / goes wrong near walls in the real
+# (metal) arena. On a plain forward command the guard then injected
+# full-RC roll and shot the drone sideways into the wall (flight
+# 2026-05-23, marker 12; reproduced on manual W). Re-enable with
+# ARENA_GUARD_ENABLED=1 only once it's gated on a trusted, fresh fix.
 # When OFF the Pi's RC tick makes no XY boundary decisions — operator
 # takes full responsibility. The altitude ceiling remains on regardless.
-_arena_guard_enabled: bool = os.getenv("ARENA_GUARD_ENABLED", "1") not in {"0", "false", "False"}
+_arena_guard_enabled: bool = os.getenv("ARENA_GUARD_ENABLED", "0") not in {"0", "false", "False"}
 _arena_engaged: bool = False
 _arena_last_reason: str = ""
 MAX_VERTICAL_SPEED = float(os.getenv("MAX_VERTICAL_SPEED", "0.5"))
