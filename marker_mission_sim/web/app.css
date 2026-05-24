@@ -1,0 +1,180 @@
+:root {
+  --bg: #0c0f14;
+  --panel: rgba(18, 22, 30, 0.86);
+  --panel-border: rgba(120, 140, 170, 0.22);
+  --fg: #d7dde6;
+  --muted: #8b95a5;
+  --red: #ff5a5a;
+  --blue: #4d9bff;
+  --neutral: #707a8a;
+  --ok: #4ad07a;
+}
+
+* { box-sizing: border-box; }
+
+html, body {
+  margin: 0;
+  height: 100%;
+  overflow: hidden;
+  background: var(--bg);
+  color: var(--fg);
+  font: 13px/1.4 ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+}
+
+#view {
+  position: fixed;
+  inset: 0;
+  width: 100vw;
+  height: 100vh;
+  display: block;
+}
+
+/* ---- HUD panel ---- */
+.hud {
+  position: fixed;
+  top: 12px;
+  left: 12px;
+  width: 290px;
+  max-height: calc(100vh - 24px);
+  overflow-y: auto;
+  padding: 12px 14px;
+  background: var(--panel);
+  border: 1px solid var(--panel-border);
+  border-radius: 10px;
+  backdrop-filter: blur(6px);
+  box-shadow: 0 6px 24px rgba(0, 0, 0, 0.4);
+}
+
+.hud-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 10px;
+}
+.hud-head .title {
+  font-weight: 700;
+  letter-spacing: 0.3px;
+  color: #fff;
+}
+.clock {
+  color: var(--ok);
+  font-variant-numeric: tabular-nums;
+}
+
+.hud-section { margin-top: 12px; }
+.hud-label {
+  text-transform: uppercase;
+  font-size: 10px;
+  letter-spacing: 1px;
+  color: var(--muted);
+  margin-bottom: 6px;
+}
+.hud-list { display: flex; flex-direction: column; gap: 6px; }
+.hud-empty { color: var(--muted); font-style: italic; }
+
+/* ---- drone rows ---- */
+.drone {
+  border: 1px solid var(--panel-border);
+  border-left-width: 3px;
+  border-radius: 6px;
+  padding: 6px 8px;
+  background: rgba(255, 255, 255, 0.02);
+}
+.drone.red { border-left-color: var(--red); }
+.drone.blue { border-left-color: var(--blue); }
+.drone .row1 {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+}
+.drone .id { font-weight: 700; }
+.drone .phase {
+  font-size: 11px;
+  color: var(--muted);
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+.drone .meta {
+  margin-top: 3px;
+  font-size: 11px;
+  color: var(--muted);
+  display: flex;
+  gap: 10px;
+  flex-wrap: wrap;
+  font-variant-numeric: tabular-nums;
+}
+
+/* ---- slots ---- */
+.slots-grid {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 6px;
+}
+.slot {
+  border-radius: 6px;
+  padding: 5px 4px;
+  text-align: center;
+  border: 1px solid var(--panel-border);
+  font-variant-numeric: tabular-nums;
+}
+.slot.red { background: rgba(255, 90, 90, 0.16); border-color: rgba(255, 90, 90, 0.5); }
+.slot.blue { background: rgba(77, 155, 255, 0.16); border-color: rgba(77, 155, 255, 0.5); }
+.slot .n { font-weight: 700; }
+.slot .face { display: block; font-size: 10px; color: var(--muted); }
+
+.conn {
+  margin-top: 12px;
+  font-size: 11px;
+  color: var(--muted);
+}
+.conn.live { color: var(--ok); }
+.conn.err { color: var(--red); }
+
+/* ---- legend ---- */
+.legend {
+  position: fixed;
+  bottom: 12px;
+  left: 12px;
+  display: flex;
+  gap: 14px;
+  align-items: center;
+  padding: 7px 12px;
+  background: var(--panel);
+  border: 1px solid var(--panel-border);
+  border-radius: 8px;
+  font-size: 11px;
+  color: var(--muted);
+}
+.legend .swatch {
+  display: inline-block;
+  width: 10px;
+  height: 10px;
+  border-radius: 2px;
+  margin-right: 5px;
+  vertical-align: middle;
+}
+.swatch.red { background: var(--red); }
+.swatch.blue { background: var(--blue); }
+.swatch.neutral { background: var(--neutral); }
+.legend .hint { margin-left: 6px; opacity: 0.7; }
+
+/* ---- 3D text sprites (drone / box labels) ---- */
+.tag {
+  position: fixed;
+  transform: translate(-50%, -50%);
+  padding: 1px 6px;
+  border-radius: 5px;
+  font-size: 11px;
+  font-weight: 700;
+  white-space: nowrap;
+  pointer-events: none;
+  background: rgba(8, 10, 14, 0.7);
+  border: 1px solid var(--panel-border);
+  color: #fff;
+  will-change: transform;
+}
+.tag.hidden { display: none; }
+.tag.red { border-color: var(--red); }
+.tag.blue { border-color: var(--blue); }
+.tag.box { font-weight: 600; font-size: 10px; }

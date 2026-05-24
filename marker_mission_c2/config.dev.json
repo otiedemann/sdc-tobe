@@ -1,0 +1,16 @@
+{
+  "bind": {"host": "127.0.0.1", "port": 8090},
+  "fcs": [
+    {"name": "red1",  "host": "127.0.0.1", "port": 9101},
+    {"name": "red2",  "host": "127.0.0.1", "port": 9102},
+    {"name": "blue1", "host": "127.0.0.1", "port": 9103},
+    {"name": "blue2", "host": "127.0.0.1", "port": 9104}
+  ],
+  "emergency_land_key": "?",
+  "state_poll_hz": 5.0,
+  "ui_refresh_hz": 2.0,
+  "calibration_sync_seconds": 30.0,
+  "fc_request_timeout_s": 2.0,
+  "library_dir": "marker_mission_c2/calibrations",
+  "log_level": "INFO"
+}

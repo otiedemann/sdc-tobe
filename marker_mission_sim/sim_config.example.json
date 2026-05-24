@@ -1,0 +1,35 @@
+{
+  "_comment": "Local marker_mission drone+arena simulator. Each drone exposes the marker_mission FC API on its fc_port, so the C2 lists them like real flight controllers (see the C2 fcs block below). Red home is the -Y end of the arena, blue the +Y end; drones spawn facing the enemy side.",
+  "ui_host": "127.0.0.1",
+  "ui_port": 9100,
+  "fc_host": "127.0.0.1",
+  "sim_hz": 30.0,
+  "seed": 1,
+
+  "arena_config_path": null,
+  "target_layout_path": null,
+
+  "noise": {
+    "pos_noise_m": 0.05,
+    "marker_dropout_prob": 0.10,
+    "cmd_latency_s": 0.20,
+    "vision_range_m": 8.0,
+    "vision_fov_deg": 70.0
+  },
+  "capture": {
+    "radius_m": 0.8,
+    "z_min_m": 1.0,
+    "z_max_m": 2.0,
+    "hold_s": 2.0,
+    "max_speed_mps": 0.5
+  },
+
+  "drones": [
+    {"id": "red1",  "team": "red",  "fc_port": 9101, "spawn_x": -2.5, "spawn_y": -9.0, "spawn_heading_deg": 0},
+    {"id": "red2",  "team": "red",  "fc_port": 9102, "spawn_x":  2.5, "spawn_y": -9.0, "spawn_heading_deg": 0},
+    {"id": "blue1", "team": "blue", "fc_port": 9103, "spawn_x": -2.5, "spawn_y":  9.0, "spawn_heading_deg": 180},
+    {"id": "blue2", "team": "blue", "fc_port": 9104, "spawn_x":  2.5, "spawn_y":  9.0, "spawn_heading_deg": 180}
+  ],
+
+  "_c2_hint": "In marker_mission_c2/config.dev.json set fcs to: [{\"name\":\"red1\",\"host\":\"127.0.0.1\",\"port\":9101},{\"name\":\"red2\",\"host\":\"127.0.0.1\",\"port\":9102},{\"name\":\"blue1\",\"host\":\"127.0.0.1\",\"port\":9103},{\"name\":\"blue2\",\"host\":\"127.0.0.1\",\"port\":9104}]  — then run the C2 server + strategy and add the drones."
+}
