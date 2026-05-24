@@ -1,0 +1,65 @@
+# SDC26 C2 strategy server — copy to config.yaml and edit.
+# Loaded via C2Config.load(path); missing keys fall back to defaults.
+
+# Which team are we? Decides which target slots are "ours" (defend) vs
+# "enemy" (attack). Red home zone is the -Y end of the arena, blue the +Y.
+our_team: "red"
+
+# Start in MANUAL (operator drives everything) or AUTO (event reactions).
+mode_start_auto: false
+
+# Where the C2 web UI / API binds.
+host: "0.0.0.0"
+port: 8095
+
+# Optional: explicit marker_mission arena JSON. Omit to use
+# marker_mission.arena.default_arena() (the same source the simulator
+# build and the position estimator use).
+arena_config_path: null
+
+# The fleet. Each drone is fronted by its own unified_api_server
+# (controller_unified). In the SDC sim there's currently one drone, so
+# one entry; add more (2-5) for a real swarm, each on its own FC port/host.
+drones:
+  - drone_id: "sim1"
+    fc_base_url: "http://sphinx3.otconsulting.de:8080"
+    initial_role: "scout"
+    base_altitude_m: 4.0
+  # Example additional drones (distinct base altitudes = collision
+  # deconfliction). Uncomment + point at their FCs when available.
+  # - drone_id: "att1"
+  #   fc_base_url: "http://sphinx3.otconsulting.de:8081"
+  #   initial_role: "attacker"
+  #   base_altitude_m: 2.5
+  # - drone_id: "att2"
+  #   fc_base_url: "http://sphinx3.otconsulting.de:8082"
+  #   initial_role: "attacker"
+  #   base_altitude_m: 3.0
+  # - drone_id: "def1"
+  #   fc_base_url: "http://sphinx3.otconsulting.de:8083"
+  #   initial_role: "defender"
+  #   base_altitude_m: 2.2
+
+# Target marker <-> slot mapping. Defaults match the SDC26 layout:
+#   blue-state ID = 30 + slot (slots 1-3 = blue home boxes)
+#   red-state  ID = 40 + slot (slots 4-6 = red home boxes)
+# A captured box flips its ID into the other range.
+slot_map:
+  blue_base: 30
+  red_base: 40
+  n_slots: 6
+  blue_zone_slots: [1, 2, 3]
+  red_zone_slots: [4, 5, 6]
+
+# Strategy tuning. See c2/config.py StrategyConfig for the full list.
+strategy:
+  tick_hz: 4.0
+  capture_altitude_m: 1.5        # inside the box's 1-2 m detect band
+  capture_hover_s: 2.0
+  capture_validate_home_s: 5.0
+  arrival_tol_m: 0.6
+  defender_patrol_altitude_m: 2.2
+  scout_altitude_m: 4.0
+  scout_orbit_radius_m: 2.5
+  scout_yaw_rate_dps: 30.0
+  rc_max: 50
