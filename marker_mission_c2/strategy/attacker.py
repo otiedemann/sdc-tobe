@@ -364,6 +364,13 @@ def _full_attack_script(
             f"TO_HOME {ctx.drone.home_alt_m or 3.0:.2f}",
             "LAND",
         )
+    # Height deconfliction: settle at this drone's DISTINCT cruise
+    # altitude (assigned by the runner, floored above the 1.4 m box
+    # tops) using the existing HEIGHT verb, so two attackers never
+    # transit the neutral zone at the same height. Falls back to the
+    # bare UD_RC climb when no deconflicted altitude is supplied.
+    cruise_alt = max(1.4, float(ctx.cruise_alt_m)) if ctx.cruise_alt_m else 0.0
+    height_step = f"HEIGHT {cruise_alt:.2f}" if cruise_alt else ""
     return _format_script(
         "TAKEOFF",
         # CLIMB FIRST — Anafi settles at ~0.9m post-takeoff; slot
@@ -374,6 +381,8 @@ def _full_attack_script(
         # ground instead of forward → vision misses the target.
         # 1.2 s of up-stick + auto-brake gets us safely to ~1.4 m.
         f"UD_RC {INITIAL_CLIMB_UD_RC} {INITIAL_CLIMB_DURATION_S:g}",
+        # Rise to this drone's distinct cruise altitude (deconfliction).
+        height_step,
         # Combined RC for the long cruise.
         close_in_step,
         # FB_BRAKE on the target's face marker, with explicit world
@@ -395,7 +404,16 @@ def _full_attack_script(
 def _auto_attack_script(
     ctx: RoleContext, attack_marker_id: int, slot: int
 ) -> str:
-    """Reactive end-to-end attack via the FC's AUTO_ATTACK phase.
+    """DEPRECATED / UNUSED — retained for reference only.
+
+    The C2 no longer emits the FC's monolithic ``AUTO_ATTACK`` maneuver:
+    per the "build strictly the C2, compose from existing FC primitives"
+    rule, the attacker now uses :func:`_full_attack_script` (TAKEOFF /
+    UD_RC / HEIGHT / FB_RC / FB_BRAKE / RC / YAW_IMU / LAND). This
+    function is kept only so the AUTO_ATTACK choreography notes aren't
+    lost; nothing calls it.
+
+    Reactive end-to-end attack via the FC's AUTO_ATTACK phase.
 
     Instead of a fixed choreography (climb N s, cruise M s, brake, …),
     we hand the FC a single AUTO_ATTACK step carrying the target slot
@@ -478,10 +496,15 @@ class AttackerRole(Role):
                 return noop(f"attacker: slot {slot} already ours")
             attack_id = _enemy_face_for(slot, ctx.our_team)
             rs.last_attack_marker_id = attack_id
+            # Compose the attack from EXISTING basic FC verbs (TAKEOFF /
+            # UD_RC / HEIGHT / FB_RC / FB_BRAKE / RC / YAW_IMU / LAND).
+            # We intentionally do NOT use the FC's monolithic AUTO_ATTACK
+            # state machine: the C2 owns the choreography and only orders
+            # the FC around with primitives it already provides.
             return push(
-                _auto_attack_script(ctx, attack_id, slot),
+                _full_attack_script(ctx, attack_id, slot),
                 new_phase="running",
-                reason=f"attacker: AUTO_ATTACK on slot {slot} (id={attack_id})",
+                reason=f"attacker: capture slot {slot} (id={attack_id})",
             )
 
         # ---- running: waiting for the entire script to finish -------------
