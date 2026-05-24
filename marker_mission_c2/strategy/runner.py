@@ -310,6 +310,19 @@ class SwarmRunner:
             if ids:
                 self._markers.ingest(fc_name, ids)
 
+        # 3a) Auto-adopt: any FC the C2 reports that isn't in our roster
+        # yet is added automatically (idle + no team until the operator
+        # assigns it), so drones added to the C2 config just appear in the
+        # strategy without a restart or --fc-names. The operator still
+        # decides team + role, so nothing flies on adoption.
+        known = {d.fc_name for d in s.drones}
+        new_fcs = [fc for fc in overview.keys() if fc and fc not in known]
+        if new_fcs:
+            for fc in sorted(new_fcs):
+                self._settings.update_drone(fc)   # defaults: team=None, role=idle
+                self._events.add("adopt", "discovered from C2; set team + role", drone=fc)
+            s = self._settings.snapshot()          # refresh so they dispatch this tick
+
         # 3b) AUTO mode: auto-assign target slots within operator-set roles
         # based on the live slot states. This is the event-reaction layer
         # (enemy captures our slot -> dispatch a free defender, etc.). It
