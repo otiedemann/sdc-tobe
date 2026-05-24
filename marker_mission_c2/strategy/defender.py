@@ -1,0 +1,99 @@
+"""DEFENDER role.
+
+A defender protects OUR target slots. It sits idle (on the ground, no
+script) until one of our slots is flipped to the enemy's colour, then it
+launches a re-capture run on that slot and returns home.
+
+Design choices:
+
+* **No new FC maneuvers.** Re-capturing our own slot is mechanically
+  identical to attacking an enemy slot — fly to the box, brake on the
+  *currently-showing* face (which is the enemy's face, since the enemy
+  holds it), drift over it, hover to flip it back to our colour, then
+  RTH + land. So the defender reuses the attacker's primitive-composed
+  script builder (``TAKEOFF / UD_RC / FB_RC / FB_BRAKE / RC / YAW_IMU /
+  LAND``) verbatim — just pointed at one of *our* slots.
+
+* **Never camps.** When no slot is threatened the defender returns a
+  noop (stays grounded / holds), so it never "sits" over a box — which
+  the regs penalise (DQ for a stationary "dead duck" over a target).
+
+* **Target selection.** The operator (MANUAL) or the AUTO planner sets
+  ``role_state.target_slot`` to the threatened own-slot. The defender
+  only acts while that slot is held by the enemy; once it flips back to
+  us (or the script finishes), it resets to idle and the target clears.
+
+Phases mirror the attacker:
+    idle    → no threat assigned, or assigned slot already ours
+    running → re-capture script pushed; drone executing the sequence
+    done    → script ended (FC back to init); reset to idle
+"""
+from __future__ import annotations
+
+import logging
+
+from .roles import Decision, Role, RoleContext, noop, push, register
+# Reuse the attacker's primitive-composed capture script + helpers so the
+# defender adds NO new flight maneuvers of its own.
+from .attacker import _full_attack_script, _enemy_face_for, _slot_is_ours
+
+logger = logging.getLogger(__name__)
+
+
+class DefenderRole(Role):
+    name = "defender"
+
+    def decide(self, ctx: RoleContext) -> Decision:
+        rs = ctx.role_state
+        drone = ctx.drone
+
+        if not drone.enabled:
+            return noop("drone disabled")
+        if not drone.team:
+            return noop("defender: no team assigned")
+        if not ctx.state.drone_connected:
+            return noop("defender: drone not connected")
+
+        slot = rs.target_slot
+
+        # ---- idle: waiting for a threatened own slot ----------------------
+        if rs.phase in ("", "idle", "done"):
+            if slot is None:
+                return noop("defender: holding (no threatened slot)")
+            # Only defend OUR slots; ignore a mis-assigned enemy slot.
+            if slot not in ctx.active_slots:
+                return noop(f"defender: slot {slot} not active")
+            if _slot_is_ours(ctx, slot):
+                rs.advance_phase("done", f"slot {slot} already ours — no action")
+                return noop(f"defender: slot {slot} already ours")
+            # Enemy holds our slot -> re-capture its currently-showing
+            # (enemy) face with the attacker's primitive script.
+            recap_id = _enemy_face_for(slot, ctx.our_team)
+            rs.last_attack_marker_id = recap_id
+            return push(
+                _full_attack_script(ctx, recap_id, slot),
+                new_phase="running",
+                reason=f"defender: re-capture slot {slot} (id={recap_id})",
+            )
+
+        # ---- running: wait for the script to fully finish -----------------
+        if rs.phase == "running":
+            if slot is not None and _slot_is_ours(ctx, slot):
+                # Re-captured (a scout confirmed our face) — let the script
+                # finish its RTH/LAND on its own; reset our intent.
+                rs.target_slot = None
+                rs.target_assigned_unix_s = None
+                rs.advance_phase("done", f"slot {slot} re-captured")
+                return noop("defender: slot re-captured, returning")
+            if ctx.state.phase in ("init", "done", ""):
+                rs.target_slot = None
+                rs.target_assigned_unix_s = None
+                rs.advance_phase("done", "re-capture run complete (FC back to init)")
+                return noop("defender: run complete")
+            return noop(f"defender: running (fc phase={ctx.state.phase})")
+
+        rs.advance_phase("idle", f"unknown phase {rs.phase}")
+        return noop("defender: reset to idle")
+
+
+register(DefenderRole())

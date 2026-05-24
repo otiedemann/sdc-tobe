@@ -49,15 +49,25 @@ def _compose_scout_script(ctx: RoleContext) -> str | None:
     drone = ctx.drone
     if not drone.team:
         return None
-    alt = max(0.6, float(drone.scout_alt_m))
+    # Prefer the deconflicted cruise altitude (distinct per drone) so two
+    # scouts/loiterers never share a height; fall back to the drone's own
+    # scout_alt_m when deconfliction isn't available.
+    alt = max(0.6, float(ctx.cruise_alt_m if ctx.cruise_alt_m else drone.scout_alt_m))
     yaw_stick = int(ctx.match.scout_yaw_stick)
     # Clamp to RC channel range; the FC bypasses cfg caps for the RC
     # verb so we are the only limit on operator-typed values.
     yaw_stick = max(-100, min(100, yaw_stick))
     duration_s = max(10.0, float(ctx.match.scout_drive_duration_s))
+    # Optionally fly to the arena centre (0,0) first, via the FC's
+    # existing TO verb, so the scout watches all six slots from the
+    # middle. The operator can disable this (match.scout_center=False)
+    # if TO is flaky on their FC — in the sim the drone spawns at 0,0
+    # so it's already centred without TO.
+    center_step = "TO 0 0" if bool(getattr(ctx.match, "scout_center", True)) else ""
     return _format_script(
         "TAKEOFF",
         f"HEIGHT {alt:.2f}",
+        center_step,
         f"RC 0 0 0 {yaw_stick} {duration_s:.0f}",
     )
 

@@ -428,7 +428,10 @@ def _auto_attack_script(
     # Cruise altitude: per-drone attack_alt_m, floored at 1.4 m so we
     # always clear the slot boxes. Approach speed: a conservative
     # forward-stick default (operator can raise for a faster run).
-    altitude_m = max(1.4, float(ctx.drone.attack_alt_m or 1.6))
+    # Prefer the deconflicted cruise altitude (distinct per drone) so two
+    # attackers transit at different heights; floor at 1.4 m to always
+    # clear the slot boxes. Fall back to the per-drone attack_alt_m.
+    altitude_m = max(1.4, float(ctx.cruise_alt_m or ctx.drone.attack_alt_m or 1.6))
     approach_speed = AUTO_ATTACK_APPROACH_SPEED
     return _format_script(
         "TAKEOFF",

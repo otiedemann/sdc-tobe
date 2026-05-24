@@ -108,6 +108,21 @@ def build_app(
         runner.disarm("web")
         return _no_cache(jsonify({"ok": True, "armed": runner.is_armed()}))
 
+    @app.route("/api/strategy/mode", methods=["POST"])
+    def api_mode():
+        """Switch MANUAL <-> AUTO. Body: {"mode":"auto"|"manual"} or {"auto":bool}."""
+        body = request.get_json(silent=True) or {}
+        if "auto" in body:
+            auto = bool(body["auto"])
+        else:
+            auto = str(body.get("mode", "")).lower() == "auto"
+        runner.set_mode(auto, "web")
+        return _no_cache(jsonify({
+            "ok": True,
+            "auto": runner.is_auto(),
+            "mode": "auto" if runner.is_auto() else "manual",
+        }))
+
     @app.route("/api/strategy/target/<fc_name>", methods=["POST"])
     def api_target(fc_name: str):
         body = request.get_json(silent=True) or {}
@@ -193,6 +208,8 @@ _INDEX_HTML = r"""<!doctype html>
                  font-size: 12px; }
   header .pill.armed { background: var(--green); color: #000; }
   header .pill.disarmed { background: #444; }
+  header .pill.auto { background: var(--yellow); color: #000; }
+  header .pill.manual { background: var(--panel2); color: var(--muted); }
   header .pill.red { background: var(--red); color: #fff; }
   header .pill.blue { background: var(--blue); color: #fff; }
   header select { background: #16181d; color: var(--text);
@@ -279,6 +296,7 @@ _INDEX_HTML = r"""<!doctype html>
 <header>
   <h1>SDC26 Strategy</h1>
   <span id="armed-pill" class="pill disarmed">disarmed</span>
+  <span id="mode-pill" class="pill" title="MANUAL: you assign targets. AUTO: C2 reacts to slot changes.">MANUAL</span>
   <span class="pill">tick <span id="tick">–</span></span>
   <span class="small">our team:</span>
   <select id="our-team">
@@ -286,6 +304,7 @@ _INDEX_HTML = r"""<!doctype html>
     <option value="blue">blue</option>
   </select>
   <span class="spacer"></span>
+  <button id="mode-btn" class="warn" title="Toggle MANUAL / AUTO">Go AUTO</button>
   <button id="arm-btn" class="primary">Arm</button>
   <button id="disarm-btn">Disarm</button>
   <button id="land-btn" class="danger">Emergency Land</button>
@@ -351,6 +370,8 @@ function renderDrones(state) {
     const phase = rs.phase || "idle";
     const reason = (rs.last_decision_reason || "").replace(/"/g, '&quot;');
     const attackId = rs.last_attack_marker_id;
+    const cruiseAlts = (state.runner && state.runner.cruise_alts) || {};
+    const cruiseAlt = cruiseAlts[fc] != null ? cruiseAlts[fc] : null;
     const slotOpts = ['<option value="">— no target —</option>']
       .concat(activeSlots.map(s => `<option value="${s}" ${targetVal===s?"selected":""}>slot ${s}</option>`))
       .join("");
@@ -376,6 +397,7 @@ function renderDrones(state) {
               <option value="idle" ${role==="idle"?"selected":""}>idle</option>
               <option value="scout" ${role==="scout"?"selected":""}>scout</option>
               <option value="attacker" ${role==="attacker"?"selected":""}>attacker</option>
+              <option value="defender" ${role==="defender"?"selected":""}>defender</option>
             </select>
           </div>
           <div>
@@ -403,13 +425,13 @@ function renderDrones(state) {
                    value="${d.home_alt_m}" data-fc="${fc}" data-field="home_alt_m">
           </div>
         </div>
-        <div class="target-row" ${role!=="attacker"?'style="display:none"':''}>
-          <label class="small">Target slot:</label>
+        <div class="target-row" ${(role!=="attacker"&&role!=="defender")?'style="display:none"':''}>
+          <label class="small">${role==="defender"?"Defend slot:":"Target slot:"}</label>
           <select data-target="${fc}">${slotOpts}</select>
           <button data-clear="${fc}">Clear</button>
         </div>
         <div class="phase" title="${reason}">
-          phase=${phase}${rs.target_slot!=null?` slot=${rs.target_slot}`:''}${attackId?` last_aim=${attackId}`:''}
+          phase=${phase}${rs.target_slot!=null?` slot=${rs.target_slot}`:''}${attackId?` last_aim=${attackId}`:''}${cruiseAlt!=null?` · cruise ${cruiseAlt}m`:''}
           ${reason?` · ${reason}`:''}
         </div>
       </div>
@@ -475,6 +497,12 @@ function renderHeader(state) {
   const pill = document.getElementById("armed-pill");
   pill.className = "pill " + (armed ? "armed" : "disarmed");
   pill.textContent = armed ? "ARMED" : "disarmed";
+  const auto = !!(state.runner && state.runner.auto);
+  const modePill = document.getElementById("mode-pill");
+  modePill.className = "pill " + (auto ? "auto" : "manual");
+  modePill.textContent = auto ? "AUTO" : "MANUAL";
+  const modeBtn = document.getElementById("mode-btn");
+  modeBtn.textContent = auto ? "Go MANUAL" : "Go AUTO";
   document.getElementById("tick").textContent = state.runner ? state.runner.tick_count : "–";
   const teamSel = document.getElementById("our-team");
   // Only update if user isn't currently interacting with it.
@@ -564,6 +592,12 @@ document.addEventListener("click", async (ev) => {
   }
 });
 
+document.getElementById("mode-btn").addEventListener("click", async () => {
+  // Toggle based on the last known mode.
+  const auto = !!(last && last.runner && last.runner.auto);
+  await api("/api/strategy/mode", {method:"POST", body: JSON.stringify({auto: !auto})});
+  refresh();
+});
 document.getElementById("arm-btn").addEventListener("click", async () => {
   await api("/api/strategy/arm", {method:"POST"});
   refresh();

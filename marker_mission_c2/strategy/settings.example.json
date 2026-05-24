@@ -8,7 +8,10 @@
     "capture_ascend_m": 1.5,
     "capture_forward_m": 0.5,
     "capture_hover_s": 3.0,
-    "scout_hover_s": 2.0
+    "scout_hover_s": 2.0,
+    "scout_yaw_stick": 45,
+    "scout_drive_duration_s": 600.0,
+    "scout_center": true
   },
   "markers": {
     "our_team": "red",

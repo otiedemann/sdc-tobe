@@ -34,9 +34,10 @@ from .roles import (
 )
 from .settings import SettingsStore
 
-# Pull SCOUT/ATTACKER side-effect imports so they register themselves.
+# Pull role side-effect imports so they register themselves.
 from . import scout as _scout  # noqa: F401
 from . import attacker as _attacker  # noqa: F401
+from . import defender as _defender  # noqa: F401
 
 logger = logging.getLogger(__name__)
 
@@ -118,12 +119,23 @@ class SwarmRunner:
         self._armed = False
         self._armed_lock = threading.RLock()
 
+        # Mode: MANUAL (operator assigns every role+target) vs AUTO (the
+        # runner auto-assigns TARGETS within the operator-set roles, and
+        # reacts to events — e.g. an enemy capturing one of our slots
+        # dispatches a free defender to re-capture it). AUTO only assigns
+        # intent; the ``_armed`` gate still controls whether anything is
+        # actually pushed to the FCs, so AUTO+disarmed is a safe preview.
+        self._auto_mode = False
+        self._auto_lock = threading.RLock()
+
         # Loop bookkeeping.
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._task: Optional[asyncio.Task] = None
         self._tick_count = 0
         self._last_tick_unix_s = 0.0
         self._last_overview: Dict[str, Any] = {}
+        # Last computed per-drone deconflicted cruise altitudes (for UI).
+        self._last_cruise_alts: Dict[str, float] = {}
 
     # ------------------------------------------------------------------
     # Public read API (called from Flask handlers, so must be thread-safe)
@@ -150,6 +162,20 @@ class SwarmRunner:
                 return
             self._armed = False
         self._events.add("disarm", f"runner disarmed by {source}")
+
+    def is_auto(self) -> bool:
+        with self._auto_lock:
+            return self._auto_mode
+
+    def set_mode(self, auto: bool, source: str = "operator") -> None:
+        auto = bool(auto)
+        with self._auto_lock:
+            if self._auto_mode == auto:
+                return
+            self._auto_mode = auto
+        self._events.add(
+            "mode", f"{'AUTO' if auto else 'MANUAL'} (by {source})"
+        )
 
     def tick_count(self) -> int:
         return self._tick_count
@@ -209,9 +235,12 @@ class SwarmRunner:
     def snapshot(self) -> Dict[str, Any]:
         return {
             "armed": self.is_armed(),
+            "auto": self.is_auto(),
+            "mode": "auto" if self.is_auto() else "manual",
             "tick_count": self._tick_count,
             "last_tick_unix_s": self._last_tick_unix_s,
             "tick_interval_s": self._tick_interval_s,
+            "cruise_alts": dict(self._last_cruise_alts),
             "drones": {
                 fc: rs.to_dict() for fc, rs in self.role_states().items()
             },
@@ -281,6 +310,22 @@ class SwarmRunner:
             if ids:
                 self._markers.ingest(fc_name, ids)
 
+        # 3b) AUTO mode: auto-assign target slots within operator-set roles
+        # based on the live slot states. This is the event-reaction layer
+        # (enemy captures our slot -> dispatch a free defender, etc.). It
+        # only sets intent; the arming gate still controls actual pushes.
+        if self.is_auto():
+            try:
+                self._auto_plan(s)
+            except Exception:
+                logger.exception("strategy: auto-plan crashed (continuing)")
+
+        # 3c) Height deconfliction: assign each enabled drone a DISTINCT
+        # cruise altitude so two drones never loiter/transit at the same
+        # height. Roles read this via RoleContext.cruise_alt_m.
+        cruise_alts = self._deconflicted_cruise_alts(s)
+        self._last_cruise_alts = cruise_alts
+
         # 4) Dispatch each known drone (drones from settings, not C2 — the
         # operator decides who plays; the C2 overview tells us if they're
         # online).
@@ -310,6 +355,7 @@ class SwarmRunner:
                 role_state=rs,
                 our_team=s.markers.our_team,
                 active_slots=tuple(s.markers.active_slots),
+                cruise_alt_m=cruise_alts.get(drone.fc_name),
             )
 
             try:
@@ -321,6 +367,109 @@ class SwarmRunner:
                 continue
 
             await self._apply_decision(drone.fc_name, decision)
+
+    # ------------------------------------------------------------------
+    # AUTO mode planner
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _slot_home_team(slot: int) -> str:
+        """Which team's zone a physical slot sits in (1-3 blue, 4-6 red)."""
+        return "blue" if 1 <= slot <= 3 else "red"
+
+    def _auto_plan(self, s) -> None:
+        """Assign target slots to FREE attackers/defenders from slot state.
+
+        Roles stay operator-set; AUTO only fills in each drone's
+        ``target_slot``. A drone is "free" when it has no target and is
+        idle/done (not mid-run), so once assigned it won't be re-tasked
+        until it finishes. Reactions:
+          * an OWN slot held by the enemy  -> a free DEFENDER re-captures it
+          * an ENEMY slot not yet ours     -> a free ATTACKER captures it
+        """
+        our = s.markers.our_team
+        enemy = "blue" if our == "red" else "red"
+        active = [int(x) for x in s.markers.active_slots]
+        our_slots = sorted(x for x in active if self._slot_home_team(x) == our)
+        enemy_slots = sorted(x for x in active if self._slot_home_team(x) == enemy)
+        holder = {sl: self._markers.slot_holder(sl) for sl in active}
+
+        # Gather free drones + already-targeted slots under the lock; do the
+        # actual assign_target() calls outside it (assign_target re-locks).
+        with self._states_lock:
+            taken: set[int] = set()
+            free_def: List[str] = []
+            free_att: List[str] = []
+            for d in s.drones:
+                if not d.enabled or not d.team:
+                    continue
+                rs = self._role_states.get(d.fc_name)
+                if rs is None:
+                    continue
+                if rs.target_slot is not None:
+                    taken.add(int(rs.target_slot))
+                    continue
+                if rs.phase not in ("", "idle", "done"):
+                    continue  # mid-run; leave it be
+                if d.role == "defender":
+                    free_def.append(d.fc_name)
+                elif d.role == "attacker":
+                    free_att.append(d.fc_name)
+
+        assignments: list[tuple[str, int, str]] = []
+        # Priority 1: defend our threatened slots (enemy holds them).
+        for sl in our_slots:
+            if not free_def:
+                break
+            if holder.get(sl) == enemy and sl not in taken:
+                fc = free_def.pop(0)
+                taken.add(sl)
+                assignments.append((fc, sl, f"AUTO: defend slot {sl} (enemy holds it)"))
+        # Priority 2: attack enemy slots we don't already hold.
+        for sl in enemy_slots:
+            if not free_att:
+                break
+            if holder.get(sl) != our and sl not in taken:
+                fc = free_att.pop(0)
+                taken.add(sl)
+                assignments.append((fc, sl, f"AUTO: attack slot {sl} (holder={holder.get(sl)})"))
+
+        for fc, sl, reason in assignments:
+            self.assign_target(fc, sl)
+            self._events.add("auto", reason, drone=fc)
+
+    # ------------------------------------------------------------------
+    # Height deconfliction
+    # ------------------------------------------------------------------
+
+    def _deconflicted_cruise_alts(self, s) -> Dict[str, float]:
+        """Return {fc_name: cruise_altitude_m}, each DISTINCT.
+
+        Start from each drone's preferred altitude (scout_alt_m for
+        scouts, else attack_alt_m) and nudge upward in MIN_GAP steps so
+        no two enabled drones share a cruise height — avoids mid-air
+        collisions during loiter/transit. Deterministic by ascending
+        preference then fc_name.
+        """
+        MIN_GAP = 0.4
+        prefs: list[tuple[float, str]] = []
+        for d in s.drones:
+            if not d.enabled:
+                continue
+            pref = float(d.scout_alt_m if d.role == "scout" else d.attack_alt_m)
+            prefs.append((pref, d.fc_name))
+        prefs.sort()  # ascending altitude, then name
+        out: Dict[str, float] = {}
+        used: list[float] = []
+        for pref, fc in prefs:
+            a = pref
+            # bump up until clear of every already-placed altitude
+            while any(abs(a - u) < MIN_GAP for u in used):
+                a += MIN_GAP
+            a = round(a, 2)
+            out[fc] = a
+            used.append(a)
+        return out
 
     # ------------------------------------------------------------------
     # Decision dispatch

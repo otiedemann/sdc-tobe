@@ -70,7 +70,7 @@ _EXAMPLE_PATH = _HERE / "settings.example.json"
 
 
 VALID_TEAMS = ("red", "blue")
-VALID_ROLES = ("idle", "scout", "attacker")
+VALID_ROLES = ("idle", "scout", "attacker", "defender")
 
 # All slots ever used in the SDC26 layout (1..6).
 ALL_SLOTS: tuple[int, ...] = (1, 2, 3, 4, 5, 6)
@@ -154,6 +154,12 @@ class MatchSettings:
     # FC safety-lands. The strategy then re-pushes (TAKEOFF + RC ...).
     # Default 600s = ~10 minutes per push; battery dies around 25 min.
     scout_drive_duration_s: float = 600.0
+    # When true the scout flies to the arena centre (0,0) via the FC's
+    # existing TO verb before starting its yaw drive, so it watches all
+    # six slots from the middle. Disable if TO is unreliable on your FC
+    # (the scout then just rotates wherever it took off — which is the
+    # arena centre in the sim, where the drone spawns at 0,0).
+    scout_center: bool = True
 
 
 @dataclass(frozen=True)
@@ -301,6 +307,7 @@ def _settings_to_dict(s: StrategySettings) -> Dict[str, Any]:
             "scout_hover_s": float(s.match.scout_hover_s),
             "scout_yaw_stick": int(s.match.scout_yaw_stick),
             "scout_drive_duration_s": float(s.match.scout_drive_duration_s),
+            "scout_center": bool(s.match.scout_center),
         },
         "markers": {
             "our_team": s.markers.our_team,
@@ -338,6 +345,7 @@ def _settings_from_dict(raw: Any, *, known_fc_names: Iterable[str]) -> StrategyS
         scout_drive_duration_s=float(
             m_raw.get("scout_drive_duration_s", m_defaults.scout_drive_duration_s)
         ),
+        scout_center=bool(m_raw.get("scout_center", m_defaults.scout_center)),
     )
 
     markers_raw = raw.get("markers") or {}
@@ -505,6 +513,8 @@ class SettingsStore:
                 if val is not None:
                     # Clamp to the RC channel range.
                     allowed["scout_yaw_stick"] = max(-100, min(100, val))
+            if "scout_center" in changes:
+                allowed["scout_center"] = bool(changes["scout_center"])
             patched = replace(m, **allowed)
             self._settings = replace(self._settings, match=patched)
             self._write_atomic(_settings_to_dict(self._settings))

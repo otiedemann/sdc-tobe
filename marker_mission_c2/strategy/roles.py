@@ -187,6 +187,12 @@ class RoleContext:
     role_state: RoleState
     our_team: str                     # "red" | "blue"
     active_slots: tuple[int, ...]     # which slots are in play (1..6)
+    # Per-drone CRUISE altitude after height-deconfliction (distinct per
+    # drone so two drones never share a cruise height — see runner's
+    # deconflict step). None means "use the drone's own *_alt_m setting".
+    # Roles should prefer this for their cruise/loiter HEIGHT; the final
+    # capture descent still drops to the box-detect band regardless.
+    cruise_alt_m: Optional[float] = None
 
 
 class Role(abc.ABC):
