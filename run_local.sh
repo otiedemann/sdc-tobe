@@ -17,10 +17,16 @@
 #   3. marker_mission_c2.strategy-> the SDC26 strategy dashboard.
 #
 # Usage:
-#   ./run_local.sh                 # sim + C2 + ONE strategy (red)
+#   ./run_local.sh                 # sim + C2 + ONE strategy (red), 4 drones
+#   ./run_local.sh --drones 6      # spawn 6 drones (3 red + 3 blue), available in C2
+#   ./run_local.sh --red 3 --blue 2  # explicit per-team counts
 #   ./run_local.sh --match         # + a SECOND strategy (blue): red-vs-blue
 #   ./run_local.sh --no-strategy   # just sim + C2 (drive via the 3D UI / curl)
-#   ./run_local.sh --open          # also open the 3D view + dashboard in a browser
+#   ./run_local.sh --open          # also open the control hub in a browser
+#
+# --drones / --red / --blue regenerate matching sim + C2 configs so the
+# chosen number of drones flows through to the sim, C2, strategy and hub.
+# Without them the committed example config (4 drones) is used.
 #
 # Env overrides:
 #   PY=...          python to use (default ./.venv/bin/python, else python3)
@@ -39,21 +45,50 @@ SIM_CONFIG="${SIM_CONFIG:-marker_mission_sim/sim_config.example.json}"
 C2_CONFIG="${C2_CONFIG:-marker_mission_c2/config.dev.json}"
 
 MATCH=0; NO_STRATEGY=0; OPEN=0
-for a in "$@"; do
-  case "$a" in
-    --match)       MATCH=1 ;;
-    --no-strategy) NO_STRATEGY=1 ;;
-    --open)        OPEN=1 ;;
-    -h|--help)     sed -n '2,33p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;;
-    *) echo "unknown arg: $a (try --help)"; exit 2 ;;
+DRONES=""; RED=""; BLUE=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --match)        MATCH=1 ;;
+    --no-strategy)  NO_STRATEGY=1 ;;
+    --open)         OPEN=1 ;;
+    --drones)       shift; DRONES="${1:-}" ;;
+    --drones=*)     DRONES="${1#*=}" ;;
+    --red)          shift; RED="${1:-}" ;;
+    --red=*)        RED="${1#*=}" ;;
+    --blue)         shift; BLUE="${1:-}" ;;
+    --blue=*)       BLUE="${1#*=}" ;;
+    -h|--help)      sed -n '2,40p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    *) echo "unknown arg: $1 (try --help)"; exit 2 ;;
   esac
+  shift
 done
+
+# Resolve drone counts: explicit --red/--blue win; else split --drones
+# evenly (red gets the extra one); else 0/0 => use the example config as-is.
+GEN=0
+if [ -n "$RED" ] || [ -n "$BLUE" ]; then
+  RED="${RED:-0}"; BLUE="${BLUE:-0}"; GEN=1
+elif [ -n "$DRONES" ]; then
+  RED=$(( (DRONES + 1) / 2 )); BLUE=$(( DRONES / 2 )); GEN=1
+fi
 
 LOGDIR="${LOGDIR:-/tmp/sdc_local}"
 mkdir -p "$LOGDIR"
 
-# Ports: sim UI + 4 FC ports (example config) + C2 + up to two dashboards.
-PORTS=(8090 8091 8092 9100 9101 9102 9103 9104)
+# If a drone count was requested, regenerate matching sim + C2 configs so
+# the chosen number of drones is available everywhere (sim/C2/strategy/hub).
+if [ "$GEN" = 1 ]; then
+  SIM_CONFIG="$LOGDIR/sim_config.json"
+  C2_CONFIG="$LOGDIR/c2_config.json"
+  echo "[run_local] generating configs for ${RED} red + ${BLUE} blue drone(s)"
+  "$PY" -m marker_mission_sim.gen_config --red "$RED" --blue "$BLUE" \
+        --out-sim "$SIM_CONFIG" --out-c2 "$C2_CONFIG" \
+    || { echo "  ! config generation failed"; exit 1; }
+fi
+
+# Ports: control ports + a generous FC port range (covers up to 20 drones).
+PORTS=(8090 8091 8092 9100)
+for _p in $(seq 9101 9120); do PORTS+=("$_p"); done
 PIDS=()
 
 free_ports() {
@@ -136,6 +171,11 @@ fi
 # ---- summary -------------------------------------------------------------
 N_FC="$(curl -s --max-time 2 http://127.0.0.1:8090/api/c2/overview \
         | "$PY" -c 'import json,sys;print(len(json.load(sys.stdin)))' 2>/dev/null || echo '?')"
+if [[ "$N_FC" =~ ^[0-9]+$ ]] && [ "$N_FC" -gt 0 ]; then
+  VIDEO_RANGE="http://127.0.0.1:9101..$((9100 + N_FC))/video.mjpg"
+else
+  VIDEO_RANGE="http://127.0.0.1:9101+/video.mjpg"
+fi
 URL_3D="http://127.0.0.1:9100"
 URL_C2="http://127.0.0.1:8090"
 URL_RED="http://127.0.0.1:8091"
@@ -155,11 +195,11 @@ EOF
 [ "$NO_STRATEGY" = 0 ] && echo "  Strategy (red)      : $URL_RED"
 [ "$MATCH" = 1 ]       && echo "  Strategy (blue)     : $URL_BLUE"
 cat <<EOF
-  Per-drone video     : http://127.0.0.1:9101..9104/video.mjpg  (also in C2 overview)
+  Per-drone video     : $VIDEO_RANGE  (also in C2 overview / the hub)
 
 The hub page links to everything + shows live status and per-drone video.
-In each strategy dashboard the sim drones (red1/red2/blue1/blue2) auto-appear:
-set each drone's team + role, Arm, then drive MANUAL or AUTO.
+In each strategy dashboard the sim drones auto-appear: set each drone's
+team + role, Arm, then drive MANUAL or AUTO.
 
 Logs: $LOGDIR/   ·   Ctrl-C to stop everything.
 EOF
