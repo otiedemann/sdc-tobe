@@ -340,6 +340,14 @@ def _full_attack_script(
         f" {target_xy[0]:g} {target_xy[1]:g}" if target_xy else ""
     )
 
+    # End-of-run = return to OUR home zone and HOVER — never LAND during a
+    # match (SDC26 regs: the drone must return to the home zone and remain
+    # inside to validate the capture; landing is not required and wastes the
+    # rest of the match). We hold with a long HOOVER (the FC only
+    # safety-lands once a script ends, i.e. after this hover, which we size
+    # to ~a full match). The FC's arena guard keeps the hover inside bounds.
+    home_hold_s = max(30.0, float(getattr(ctx.match, "home_hover_s", 600.0)))
+    home_hold = f"HOOVER {home_hold_s:.0f}"
     wall_entry = HOME_WALL_MARKER.get(ctx.our_team)
     if wall_entry:
         wall_marker_id, _w_xy = wall_entry
@@ -357,12 +365,14 @@ def _full_attack_script(
             f"FB_BRAKE {wall_marker_id} {FB_BRAKE_WALL_STOP_M:.2f} "
             f"{FB_BRAKE_STICK} {FB_BRAKE_TIMEOUT_S:.1f}",
             "YAW_IMU 180",
-            "LAND",
+            # Hold in the home zone (validates the capture) — do NOT land.
+            home_hold,
         )
     else:
         rth_lines = (
             f"TO_HOME {ctx.drone.home_alt_m or 3.0:.2f}",
-            "LAND",
+            # Hold in the home zone — do NOT land.
+            home_hold,
         )
     # Height deconfliction: settle at this drone's DISTINCT cruise
     # altitude (assigned by the runner, floored above the 1.4 m box
@@ -494,6 +504,16 @@ class AttackerRole(Role):
                     "done", f"slot {slot} already captured by us — no action"
                 )
                 return noop(f"attacker: slot {slot} already ours")
+            # The FC can only START a mission from INIT (on the ground). Since
+            # runs now end with a home HOVER (we never land mid-match), a drone
+            # that already flew a run is still airborne and CANNOT begin a new
+            # mission — pushing would just be rejected. Hold instead. (Doing
+            # several no-land runs needs them chained into one mission.)
+            if ctx.state.phase not in ("init", "done", ""):
+                return noop(
+                    f"attacker: airborne (fc phase={ctx.state.phase}); "
+                    f"holding — FC must be INIT to start a new run"
+                )
             attack_id = _enemy_face_for(slot, ctx.our_team)
             rs.last_attack_marker_id = attack_id
             # Compose the attack from EXISTING basic FC verbs (TAKEOFF /

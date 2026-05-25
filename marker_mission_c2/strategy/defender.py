@@ -66,6 +66,14 @@ class DefenderRole(Role):
             if _slot_is_ours(ctx, slot):
                 rs.advance_phase("done", f"slot {slot} already ours — no action")
                 return noop(f"defender: slot {slot} already ours")
+            # The FC starts a mission only from INIT (on the ground). Runs end
+            # with a home HOVER (never land mid-match), so an airborne drone
+            # can't begin a new re-capture run — hold until it's back at INIT.
+            if ctx.state.phase not in ("init", "done", ""):
+                return noop(
+                    f"defender: airborne (fc phase={ctx.state.phase}); "
+                    f"holding — FC must be INIT to start a re-capture"
+                )
             # Enemy holds our slot -> re-capture its currently-showing
             # (enemy) face with the attacker's primitive script.
             recap_id = _enemy_face_for(slot, ctx.our_team)

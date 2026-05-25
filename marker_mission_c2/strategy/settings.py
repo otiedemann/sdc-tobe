@@ -137,6 +137,14 @@ class MatchSettings:
     capture_ascend_m: float = 1.5
     capture_forward_m: float = 0.5
     capture_hover_s: float = 3.0
+    # Sustained hover (s) the drone holds in its OWN home zone at the end
+    # of every attack/defend run. Per SDC26 regs the drone must return to
+    # the home zone and remain inside to validate the capture (>=5 s) and
+    # the drone must NEVER land during a match. We end runs with this hover
+    # instead of LAND. Default ~ a full 10-min match so the drone keeps
+    # holding at home (the FC only safety-lands once the script ends, i.e.
+    # after the match). The FC's own arena guard keeps it inside the zone.
+    home_hover_s: float = 600.0
     # Hover seconds between consecutive SCOUT rotations within a single
     # scout script. Short = fast cadence; long = more time for the
     # marker tracker to register the latest rotation's observations.
@@ -304,6 +312,7 @@ def _settings_to_dict(s: StrategySettings) -> Dict[str, Any]:
             "capture_ascend_m": float(s.match.capture_ascend_m),
             "capture_forward_m": float(s.match.capture_forward_m),
             "capture_hover_s": float(s.match.capture_hover_s),
+            "home_hover_s": float(s.match.home_hover_s),
             "scout_hover_s": float(s.match.scout_hover_s),
             "scout_yaw_stick": int(s.match.scout_yaw_stick),
             "scout_drive_duration_s": float(s.match.scout_drive_duration_s),
@@ -338,6 +347,7 @@ def _settings_from_dict(raw: Any, *, known_fc_names: Iterable[str]) -> StrategyS
         capture_hover_s=float(
             m_raw.get("capture_hover_s", m_defaults.capture_hover_s)
         ),
+        home_hover_s=float(m_raw.get("home_hover_s", m_defaults.home_hover_s)),
         scout_hover_s=float(m_raw.get("scout_hover_s", m_defaults.scout_hover_s)),
         scout_yaw_stick=max(-100, min(100, int(
             m_raw.get("scout_yaw_stick", m_defaults.scout_yaw_stick)
@@ -497,6 +507,7 @@ class SettingsStore:
                 "capture_ascend_m",
                 "capture_forward_m",
                 "capture_hover_s",
+                "home_hover_s",
                 "scout_hover_s",
                 "scout_drive_duration_s",
             ):
