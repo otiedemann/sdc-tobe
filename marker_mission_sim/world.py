@@ -106,6 +106,7 @@ class SimDrone:
         return {
             "id": self.id,
             "team": self.team,
+            "fc_port": self.fc_port,
             "pos": self.pos.to_list(),
             "heading_deg": round(self.heading_deg, 1),
             "phase": self.phase,

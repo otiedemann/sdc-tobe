@@ -141,9 +141,13 @@ URL_C2="http://127.0.0.1:8090"
 URL_RED="http://127.0.0.1:8091"
 URL_BLUE="http://127.0.0.1:8092"
 
+URL_HUB="http://127.0.0.1:9100/hub"
+
 cat <<EOF
 
 [run_local] UP — the whole local stack is running ($N_FC simulated FC drones).
+
+  ➜ CONTROL HUB (all links): $URL_HUB
 
   3D arena view (sim) : $URL_3D
   C2 server           : $URL_C2
@@ -153,6 +157,7 @@ EOF
 cat <<EOF
   Per-drone video     : http://127.0.0.1:9101..9104/video.mjpg  (also in C2 overview)
 
+The hub page links to everything + shows live status and per-drone video.
 In each strategy dashboard the sim drones (red1/red2/blue1/blue2) auto-appear:
 set each drone's team + role, Arm, then drive MANUAL or AUTO.
 
@@ -160,9 +165,7 @@ Logs: $LOGDIR/   ·   Ctrl-C to stop everything.
 EOF
 
 if [ "$OPEN" = 1 ] && command -v open >/dev/null 2>&1; then
-  open "$URL_3D" 2>/dev/null || true
-  [ "$NO_STRATEGY" = 0 ] && open "$URL_RED" 2>/dev/null || true
-  [ "$MATCH" = 1 ]       && open "$URL_BLUE" 2>/dev/null || true
+  open "$URL_HUB" 2>/dev/null || true   # the hub links to all the rest
 fi
 
 wait
