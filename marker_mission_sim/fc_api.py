@@ -263,16 +263,31 @@ def make_fc_app(world: World, drone_id: str, cfg: SimConfig) -> Flask:
         except Exception as e:
             return _fail(e)
 
-    # ---- video stub ------------------------------------------------------
+    # ---- synthetic camera feed ------------------------------------------
     @app.get("/video.mjpg")
     def video_mjpg():
-        # Single-frame multipart stream of a 1x1 white JPEG. One frame only so
-        # the generator finishes immediately and never blocks the worker.
+        # Live MJPEG of the drone's synthetic camera view (visible markers
+        # projected + HUD). ~10 fps. werkzeug serves each request on its own
+        # thread, so the loop blocks only this connection and ends when the
+        # client disconnects.
+        import time as _time
+        from . import video as _video
+
         def gen():
-            yield (b"--frame\r\nContent-Type: image/jpeg\r\n\r\n"
-                   + _WHITE_JPEG + b"\r\n")
+            try:
+                while True:
+                    try:
+                        frame = _video.render_frame_jpeg(world, drone_id)
+                    except Exception:
+                        frame = _WHITE_JPEG
+                    yield (b"--frame\r\nContent-Type: image/jpeg\r\n\r\n"
+                           + frame + b"\r\n")
+                    _time.sleep(0.1)
+            except (GeneratorExit, BrokenPipeError, ConnectionResetError):
+                return
         return Response(
-            gen(), mimetype="multipart/x-mixed-replace; boundary=frame")
+            gen(), mimetype="multipart/x-mixed-replace; boundary=frame",
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
     return app
 
