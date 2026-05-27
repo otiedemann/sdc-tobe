@@ -29,13 +29,17 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Optional
 
-# Arena slot layout — mirrors the SDC26 regs / tools/sphinx-arena layout.
+# Arena slot layout — per SDC26 v7 regs §1.4.2 Table 1 + Figure 1.
 # Each physical target carries two ArUco faces: blue = 30 + slot,
-# red = 40 + slot. x ∈ {-3, 0, +3}; blue slots 1-3 at y = +7.5,
-# red slots 4-6 at y = -7.5 (z fixed at the box pedestal height).
+# red = 40 + slot. Long axis is Y (20 m), width is X (10 m).
+# Boxes 1-3 sit in the RED home zone at y = -7.5 (default markers
+# 41/42/43); boxes 4-6 in the BLUE home zone at y = +7.5 (default
+# markers 34/35/36); spread across x in {-3, 0, +3}. Mirrors the
+# canonical layout used by strategy/attacker.py + regs §1.1 home-zone
+# bounds (in_home_zone in strategy/roles.py).
 SLOT_POSITIONS_M: dict[int, tuple[float, float]] = {
-    1: (-3.0, 7.5), 2: (0.0, 7.5), 3: (3.0, 7.5),
-    4: (-3.0, -7.5), 5: (0.0, -7.5), 6: (3.0, -7.5),
+    1: (-3.0, -7.5), 2: (0.0, -7.5), 3: (3.0, -7.5),   # RED zone
+    4: (-3.0,  7.5), 5: (0.0,  7.5), 6: (3.0,  7.5),   # BLUE zone
 }
 
 # Our home-wall marker — the marker the drone APPROACHes on the way back —
