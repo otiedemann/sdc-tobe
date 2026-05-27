@@ -298,6 +298,8 @@ _INDEX_HTML = r"""<!doctype html>
   </section>
 
   <section>
+    <h2>Match State</h2>
+    <div id="match-state-panel" style="font-family:ui-monospace,monospace;font-size:12px;background:var(--panel2);border:1px solid var(--border);border-radius:6px;padding:10px;margin-bottom:12px;"></div>
     <h2>Target Slots</h2>
     <div id="slots" class="slot-grid"></div>
     <h2 style="margin-top:16px">Events</h2>
@@ -327,6 +329,88 @@ function ageStr(s) {
   if (s < 1) return s.toFixed(1) + "s";
   if (s < 60) return Math.round(s) + "s";
   return Math.round(s/60) + "m";
+}
+
+function renderMatchState(state) {
+  const root = document.getElementById("match-state-panel");
+  const ms = (state.runner && state.runner.match_state) || null;
+  if (!ms) {
+    root.innerHTML = '<span style="color:var(--muted)">no match state</span>';
+    return;
+  }
+  const phase = ms.phase || "pre_match";
+  const elapsed = ms.match_elapsed_s != null ? Math.round(ms.match_elapsed_s) + "s" : "–";
+  const remaining = ms.match_elapsed_s != null
+    ? Math.max(0, 600 - Math.round(ms.match_elapsed_s)) + "s left"
+    : "";
+  const waves = ms.wave_count != null ? ms.wave_count : "–";
+  const pts = ms.points_estimated != null ? ms.points_estimated : "–";
+  const ours = (ms.slots_ours || []).join(", ") || "—";
+  const enemy = (ms.slots_enemy || []).join(", ") || "—";
+  const unknown = (ms.slots_unknown || []).join(", ") || "—";
+  const idle = (ms.idle_attackers || []).join(", ") || "—";
+  const running = (ms.running_attackers || []).join(", ") || "—";
+
+  // Special Maneuver hold timer (§1.4.1: hold all 6 for 5 s → instant win).
+  const holdS = ms.all_slots_hold_s;
+  const smAchieved = ms.special_maneuver_achieved || false;
+  const SPECIAL_HOLD = 5.0;
+  let smRow = "";
+  if (smAchieved) {
+    smRow = `
+      <span style="color:var(--muted)">special maneuver</span>
+      <span style="color:#ff9800;font-weight:700">⭐ INSTANT WIN!</span>`;
+  } else if (holdS != null) {
+    const pct = Math.min(100, (holdS / SPECIAL_HOLD) * 100);
+    const remaining_sm = Math.max(0, SPECIAL_HOLD - holdS).toFixed(1);
+    smRow = `
+      <span style="color:var(--muted)">special maneuver</span>
+      <span>
+        <span style="color:#ff9800;font-weight:600">
+          ⚡ holding all — ${holdS.toFixed(1)}/${SPECIAL_HOLD}s
+          (${remaining_sm}s left)
+        </span>
+        <div style="margin-top:2px;height:4px;background:#333;border-radius:2px;">
+          <div style="width:${pct}%;height:4px;background:#ff9800;border-radius:2px;"></div>
+        </div>
+      </span>`;
+  }
+
+  // Colour-code the phase label.
+  const phaseColours = {
+    pre_match: "var(--muted)",
+    scouting: "var(--yellow)",
+    wave_attack: "var(--green)",
+    instant_win_push: "#ff9800",
+    holding_all: "#ff9800",
+    recovery_wait: "var(--yellow)",
+    end_land: "var(--red)",
+  };
+  const phaseCol = phaseColours[phase] || "var(--text)";
+
+  root.innerHTML = `
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:4px 16px;line-height:1.8;">
+      <span style="color:var(--muted)">phase</span>
+      <span style="color:${phaseCol};font-weight:600">${phase}</span>
+      <span style="color:var(--muted)">elapsed</span>
+      <span>${elapsed} ${remaining ? '· ' + remaining : ''}</span>
+      <span style="color:var(--muted)">waves fired</span>
+      <span>${waves}</span>
+      <span style="color:var(--muted)">pts estimate</span>
+      <span style="color:var(--green);font-weight:600">${pts}</span>
+      <span style="color:var(--muted)">slots ours</span>
+      <span style="color:var(--green)">${ours}</span>
+      <span style="color:var(--muted)">slots enemy</span>
+      <span style="color:var(--red)">${enemy}</span>
+      <span style="color:var(--muted)">slots unknown</span>
+      <span>${unknown}</span>
+      <span style="color:var(--muted)">idle attackers</span>
+      <span>${idle}</span>
+      <span style="color:var(--muted)">active attackers</span>
+      <span>${running}</span>
+      ${smRow}
+    </div>
+  `;
 }
 
 function renderDrones(state) {
@@ -376,6 +460,7 @@ function renderDrones(state) {
               <option value="idle" ${role==="idle"?"selected":""}>idle</option>
               <option value="scout" ${role==="scout"?"selected":""}>scout</option>
               <option value="attacker" ${role==="attacker"?"selected":""}>attacker</option>
+              <option value="anchor" ${role==="anchor"?"selected":""}>anchor</option>
             </select>
           </div>
           <div>
@@ -518,6 +603,7 @@ async function refresh() {
     const state = await api("/api/state");
     last = state;
     renderHeader(state);
+    renderMatchState(state);
     renderSlots(state);
     renderEvents(state);
     if (!dronesIsEditing()) {

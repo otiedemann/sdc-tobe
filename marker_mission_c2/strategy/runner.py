@@ -34,9 +34,11 @@ from .roles import (
 )
 from .settings import SettingsStore
 
-# Pull SCOUT/ATTACKER side-effect imports so they register themselves.
+# Pull SCOUT/ATTACKER/ANCHOR side-effect imports so they register themselves.
 from . import scout as _scout  # noqa: F401
 from . import attacker as _attacker  # noqa: F401
+from . import anchor as _anchor  # noqa: F401
+from .match_state import MatchStateMachine
 
 logger = logging.getLogger(__name__)
 
@@ -125,6 +127,9 @@ class SwarmRunner:
         self._last_tick_unix_s = 0.0
         self._last_overview: Dict[str, Any] = {}
 
+        # Match-level state machine (auto-coordinator).
+        self._match_state = MatchStateMachine()
+
     # ------------------------------------------------------------------
     # Public read API (called from Flask handlers, so must be thread-safe)
     # ------------------------------------------------------------------
@@ -143,6 +148,7 @@ class SwarmRunner:
                 return
             self._armed = True
         self._events.add("arm", f"runner armed by {source}")
+        self._match_state.on_armed()
 
     def disarm(self, source: str = "operator") -> None:
         with self._armed_lock:
@@ -150,6 +156,7 @@ class SwarmRunner:
                 return
             self._armed = False
         self._events.add("disarm", f"runner disarmed by {source}")
+        self._match_state.on_disarmed()
 
     def tick_count(self) -> int:
         return self._tick_count
@@ -207,11 +214,31 @@ class SwarmRunner:
         )
 
     def snapshot(self) -> Dict[str, Any]:
+        s = self._settings.snapshot()
+        ms = self._match_state.snapshot(
+            markers=self._markers,
+            settings=s,
+            runner=self,
+        )
         return {
             "armed": self.is_armed(),
             "tick_count": self._tick_count,
             "last_tick_unix_s": self._last_tick_unix_s,
             "tick_interval_s": self._tick_interval_s,
+            "match_state": {
+                "phase": ms.phase,
+                "match_elapsed_s": ms.match_elapsed_s,
+                "wave_count": ms.wave_count,
+                "points_estimated": ms.points_estimated,
+                "slots_ours": ms.slots_ours,
+                "slots_enemy": ms.slots_enemy,
+                "slots_unknown": ms.slots_unknown,
+                "idle_attackers": ms.idle_attackers,
+                "running_attackers": ms.running_attackers,
+                # §1.4.1 Special Maneuver tracking
+                "all_slots_hold_s": ms.all_slots_hold_s,
+                "special_maneuver_achieved": ms.special_maneuver_achieved,
+            },
             "drones": {
                 fc: rs.to_dict() for fc, rs in self.role_states().items()
             },
@@ -281,7 +308,18 @@ class SwarmRunner:
             if ids:
                 self._markers.ingest(fc_name, ids)
 
-        # 4) Dispatch each known drone (drones from settings, not C2 — the
+        # 4) Run match-level coordinator (auto-assigns targets to idle attackers,
+        #    transitions macro phases, manages time).
+        try:
+            self._match_state.tick(
+                runner=self,
+                markers=self._markers,
+                settings=s,
+            )
+        except Exception:
+            logger.exception("strategy: match_state.tick crashed (continuing)")
+
+        # 5) Dispatch each known drone (drones from settings, not C2 — the
         # operator decides who plays; the C2 overview tells us if they're
         # online).
         for drone in s.drones:

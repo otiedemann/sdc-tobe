@@ -38,10 +38,33 @@ Settings shape::
       }
     }
 
-Each physical target marker has two ArUco faces: ``3<slot>`` (blue holder)
-and ``4<slot>`` (red holder). Whichever face a scout sees is the side
-currently "up", i.e. that team's score. There are 6 slots in play
-(numbered 1..6), so live IDs are 31..36 and 41..46.
+ArUco marker scheme (§1.4.2, Table 1 — DICT_4X4_50):
+  ``4<slot>`` (IDs 41-46) — box is currently held by **red** team.
+  ``3<slot>`` (IDs 31-36) — box is currently held by **blue** team.
+  Slot IDs 1-3 are in the **red** team zone (default red at match start).
+  Slot IDs 4-6 are in the **blue** team zone (default blue at match start).
+
+Capture mechanics (§1.4.3, SDC Regulations v7):
+  - Drone must hover ≥ 2 s over box (RFID detected at ~1-2 m height).
+  - No defending drone may be present at that box.
+  - Box is **locked** for 5 s after a successful capture (cannot be
+    immediately recaptured by the opposing team).
+  - Home-zone recapture reverts colour immediately but scores **0 pts**.
+  - ``capture_hover_s`` must be ≥ 2.0 s (default 3.0 s gives a margin).
+
+Key rule changes from sdc_regulations_v50.pdf → SDC_Regulations_v7.pdf:
+  - Target box positions are now **fixed** across matches (v50 required
+    positions to vary per match to prevent pre-programmed routes).
+  - Detection tag: "NFT tag" (v50) → "RFID tag" (v7). Code uses RFID.
+  - Capture stability (v50: box must stay ≥5 s to validate) replaced by
+    box lock (v7: capture is instant; box locked for 5 s afterwards).
+  - Home zone validation (v50: drone must stay ≥5 s in home zone) is
+    **removed** in v7 — returning home is sufficient, no dwell required.
+  - 5-pt rule changed: v50 = single drone + whole team RTH together;
+    v7 = all drones outside home zone at moment of capture, then all RTH.
+  - Challenge scoring: max 25 pts = 15 match wins + (5 jury?) + 5 report.
+    v7 Table 2 shows jury = 10 which conflicts with the stated total of 25;
+    this appears to be a typo in v7 — jury is likely 5 pts.
 
 The store is thread-safe (mutations go through a single ``RLock``) and writes
 atomically to avoid half-written files on crash.
@@ -70,7 +93,7 @@ _EXAMPLE_PATH = _HERE / "settings.example.json"
 
 
 VALID_TEAMS = ("red", "blue")
-VALID_ROLES = ("idle", "scout", "attacker")
+VALID_ROLES = ("idle", "scout", "attacker", "anchor")
 
 # All slots ever used in the SDC26 layout (1..6).
 ALL_SLOTS: tuple[int, ...] = (1, 2, 3, 4, 5, 6)
@@ -136,7 +159,12 @@ class MatchSettings:
     approach_distance_m: float = 0.5
     capture_ascend_m: float = 1.5
     capture_forward_m: float = 0.5
+    # §1.4.3: minimum 2.0 s hover required for RFID detection and capture.
+    # Default 3.0 s gives a generous margin above the 2 s minimum.
     capture_hover_s: float = 3.0
+    # §1.4.3: box locked for this many seconds after a successful capture.
+    # Attempting to re-attack a just-captured box within this window is wasteful.
+    box_lock_s: float = 5.0
     # Hover seconds between consecutive SCOUT rotations within a single
     # scout script. Short = fast cadence; long = more time for the
     # marker tracker to register the latest rotation's observations.
@@ -298,6 +326,7 @@ def _settings_to_dict(s: StrategySettings) -> Dict[str, Any]:
             "capture_ascend_m": float(s.match.capture_ascend_m),
             "capture_forward_m": float(s.match.capture_forward_m),
             "capture_hover_s": float(s.match.capture_hover_s),
+            "box_lock_s": float(s.match.box_lock_s),
             "scout_hover_s": float(s.match.scout_hover_s),
             "scout_yaw_stick": int(s.match.scout_yaw_stick),
             "scout_drive_duration_s": float(s.match.scout_drive_duration_s),
@@ -328,9 +357,11 @@ def _settings_from_dict(raw: Any, *, known_fc_names: Iterable[str]) -> StrategyS
         capture_forward_m=float(
             m_raw.get("capture_forward_m", m_defaults.capture_forward_m)
         ),
-        capture_hover_s=float(
+        # §1.4.3: enforce ≥ 2.0 s minimum hover required for capture.
+        capture_hover_s=max(2.0, float(
             m_raw.get("capture_hover_s", m_defaults.capture_hover_s)
-        ),
+        )),
+        box_lock_s=float(m_raw.get("box_lock_s", m_defaults.box_lock_s)),
         scout_hover_s=float(m_raw.get("scout_hover_s", m_defaults.scout_hover_s)),
         scout_yaw_stick=max(-100, min(100, int(
             m_raw.get("scout_yaw_stick", m_defaults.scout_yaw_stick)
