@@ -64,12 +64,12 @@ logger = logging.getLogger(__name__)
 
 # Physical target slot positions in arena frame (x, y) — z is fixed at
 # 1.0 m by the box pedestals and isn't needed for the close-in distance.
-# Pulled from tools/sphinx-arena/default_target_layout.json and the
-# §1.1 regs: red slots 4-6 at y=-7.5, blue slots 1-3 at y=+7.5, all
-# spread across x ∈ {-3, 0, +3}.
+# Per SDC26 v7 regs §1.4.2 Table 1: boxes 1-3 live in the RED home zone
+# (-Y end, default markers 41/42/43), boxes 4-6 in the BLUE home zone
+# (+Y end, default markers 34/35/36), all spread across x in {-3, 0, +3}.
 SLOT_POSITIONS_M: dict[int, tuple[float, float]] = {
-    1: (-3.0, 7.5),  2: (0.0, 7.5),  3: (3.0, 7.5),
-    4: (-3.0, -7.5), 5: (0.0, -7.5), 6: (3.0, -7.5),
+    1: (-3.0, -7.5), 2: (0.0, -7.5), 3: (3.0, -7.5),
+    4: (-3.0,  7.5), 5: (0.0,  7.5), 6: (3.0,  7.5),
 }
 
 # Stop the FB_IMU close-in this far short of the target so APPROACH has

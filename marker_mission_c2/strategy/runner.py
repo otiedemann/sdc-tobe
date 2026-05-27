@@ -387,8 +387,13 @@ class SwarmRunner:
 
     @staticmethod
     def _slot_home_team(slot: int) -> str:
-        """Which team's zone a physical slot sits in (1-3 blue, 4-6 red)."""
-        return "blue" if 1 <= slot <= 3 else "red"
+        """Which team's zone a physical slot sits in.
+
+        Per SDC26 v7 regs §1.4.2 Table 1: boxes 1-3 sit in the RED home
+        zone (default markers 41/42/43), boxes 4-6 in the BLUE home zone
+        (default markers 34/35/36).
+        """
+        return "red" if 1 <= slot <= 3 else "blue"
 
     def _auto_plan(self, s) -> None:
         """Assign target slots to FREE attackers/defenders from slot state.
