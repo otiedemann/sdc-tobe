@@ -271,6 +271,7 @@ _VIDEO_AND_STATUS_HTML = """
     <h2>{{ 'Replayed flight' if mode == 'replay' else 'Mission status' }}</h2>
     <table id="status">
       <tr><th>Phase</th><td id="s-phase">—</td></tr>
+      <tr><th>Last flight</th><td id="s-last-dur">—</td></tr>
       <tr><th>Phase age</th><td id="s-pa">—</td></tr>
       <tr><th>Distance</th><td id="s-d">—</td></tr>
       <tr><th>Yaw to marker</th><td id="s-y">—</td></tr>
@@ -345,6 +346,7 @@ _COMPACT_SIDEBAR_HTML = """
   <h2>Mission status</h2>
   <table id="status">
     <tr><th>Phase</th><td id="s-phase">—</td></tr>
+    <tr><th>Last flight</th><td id="s-last-dur">—</td></tr>
     <tr><th>Phase age</th><td id="s-pa">—</td></tr>
     <tr><th>Distance</th><td id="s-d">—</td></tr>
     <tr><th>Yaw to marker</th><td id="s-y">—</td></tr>
@@ -1472,6 +1474,27 @@ if (typeof setMissionButtons === 'function') {
   try { setMissionButtons(INITIAL_PHASE); } catch (e) {}
 }
 refresh();
+
+// Populate "Last flight" duration from the most recent replay entry.
+// Fetched once on page load; static data, no polling needed.
+(async function loadLastFlightDur() {
+  try {
+    const r = await fetch('/api/flights', {cache: 'no-store'});
+    if (!r.ok) return;
+    const flights = await r.json();
+    const last = flights.find(f => f.final_phase === 'done' && typeof f.duration_s === 'number');
+    const el = $('s-last-dur');
+    if (!el) return;
+    if (last) {
+      const d = last.duration_s;
+      const mm = Math.floor(d / 60), ss = Math.round(d % 60);
+      el.textContent = mm > 0 ? `${mm}m ${ss}s` : `${ss}s`;
+      el.title = last.flight_id;
+    } else {
+      el.textContent = 'no data';
+    }
+  } catch (e) {}
+})();
 </script>
 """
 
