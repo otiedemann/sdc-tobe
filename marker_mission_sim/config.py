@@ -105,11 +105,15 @@ class NoiseConfig:
 
 @dataclass
 class CaptureConfig:
+    # v7 §1.4.3 capture mechanics — sim mirrors the official rules.
     radius_m: float = 0.8        # xy distance to a box to count as "over" it
-    z_min_m: float = 1.0         # capture altitude band (box detect band)
+    z_min_m: float = 1.0         # capture altitude band (box detect band, 1-2 m)
     z_max_m: float = 2.0
-    hold_s: float = 2.0          # dwell needed to flip a box
-    max_speed_mps: float = 0.5   # must be slower than this to capture
+    hold_s: float = 2.0          # >=2 s hover required to flip an enemy box
+    max_speed_mps: float = 0.5   # must be slow enough to count as hovering
+    # After a successful capture the box is locked for this long — no further
+    # captures (in either direction) until the lock expires (v7 §1.4.3).
+    post_capture_lock_s: float = 5.0
 
     @classmethod
     def from_dict(cls, d: dict) -> "CaptureConfig":
@@ -120,6 +124,7 @@ class CaptureConfig:
             z_max_m=float(d.get("z_max_m", 2.0)),
             hold_s=float(d.get("hold_s", 2.0)),
             max_speed_mps=float(d.get("max_speed_mps", 0.5)),
+            post_capture_lock_s=float(d.get("post_capture_lock_s", 5.0)),
         )
 
 

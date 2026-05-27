@@ -43,6 +43,13 @@ logger = logging.getLogger(__name__)
 # only changes when the *opposite* face becomes the more recent observation.
 FRESHNESS_S = 1.5
 
+# v7 §1.4.3 — after any capture (in either direction) the box is locked for
+# 5 s; no further capture can register until the lock expires. The C2 cannot
+# observe the lock directly, so we conservatively start the timer the moment
+# the marker tracker SEES a holder change (which is at-or-after the FC-side
+# flip), arming this many seconds of "skip me" for the planner.
+CAPTURE_LOCK_S = 5.0
+
 
 @dataclass
 class SlotStatus:
@@ -57,6 +64,9 @@ class SlotStatus:
     seen_by_recent: List[str] = field(default_factory=list)
     # Tracks the last time the holder actually flipped, for UI / events.
     holder_changed_unix_s: Optional[float] = None
+    # v7 capture lock: wall-clock until which this box is locked (no further
+    # captures register). 0 means "not locked".
+    lock_until_unix_s: float = 0.0
 
 
 class MarkerTracker:
@@ -119,6 +129,11 @@ class MarkerTracker:
                 if status.holder != team:
                     status.holder = team
                     status.holder_changed_unix_s = now
+                    # v7: arm the 5-s capture lock the moment we observe a
+                    # holder change. Slightly conservative (we observe a few
+                    # frames after the actual flip), which is fine — it just
+                    # tells the planner to skip this slot for the lock window.
+                    status.lock_until_unix_s = now + CAPTURE_LOCK_S
                 self._per_fc_last_seen[(fc_name, mid)] = now
             # Recompute "seen_by_recent" for every active slot.
             self._recompute_locked(now)
@@ -178,12 +193,23 @@ class MarkerTracker:
                     "blue_face_seen_unix_s": s.blue_face_seen_unix_s,
                     "seen_by_recent": list(s.seen_by_recent),
                     "holder_changed_unix_s": s.holder_changed_unix_s,
+                    "lock_until_unix_s": s.lock_until_unix_s,
+                    "locked": s.lock_until_unix_s > now,
+                    "lock_remaining_s": (max(0.0, s.lock_until_unix_s - now)
+                                         if s.lock_until_unix_s > 0 else 0.0),
                 }
             return out
 
     # ------------------------------------------------------------------
     # Convenience for roles
     # ------------------------------------------------------------------
+
+    def slot_locked(self, slot: int, now: Optional[float] = None) -> bool:
+        """True while the slot is inside the 5-s post-capture lock window."""
+        t = time.time() if now is None else now
+        with self._lock:
+            s = self._slots.get(int(slot))
+            return bool(s and s.lock_until_unix_s > t)
 
     def slot_holder(self, slot: int) -> str:
         """Return the slot's current holder ("red"|"blue"|"unknown")."""
@@ -203,4 +229,5 @@ def _copy(s: SlotStatus) -> SlotStatus:
         blue_face_seen_unix_s=s.blue_face_seen_unix_s,
         seen_by_recent=list(s.seen_by_recent),
         holder_changed_unix_s=s.holder_changed_unix_s,
+        lock_until_unix_s=s.lock_until_unix_s,
     )

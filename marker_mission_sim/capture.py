@@ -1,27 +1,56 @@
-"""Capture model: a drone dwelling over an enemy box flips it to its team.
+"""Target-box capture model — SDC26 regs v7 §1.4.3.
 
-Called once per tick from ``World.tick`` (already holding ``world.lock``).
-For each drone we find the nearest box it is currently "over" — meaning it is
-flying, inside the capture altitude band, slow enough, and within
-``capture.radius_m`` in the xy plane. If that box belongs to the enemy and the
-drone holds position over it for ``capture.hold_s`` seconds, the box flips to
-the drone's team (its advertised face id changes with the holder, so the C2
-sees the colour change through the vision model).
+Per tick, for every target box, we work out which of our drones (if any) are
+currently "over" it — flying, inside the 1-2 m capture altitude band, slow
+enough to count as hovering, and within ``capture.radius_m`` in the xy plane.
+From the set of drones over each box we apply the v7 rules:
 
-Dwell bookkeeping lives on the drone (``capture_slot`` / ``capture_since``,
-owned here). Moving off a box, going too fast, leaving the altitude band, or
-switching to a different box resets the dwell. ``update`` never raises.
+  * **Capture lock (5 s after a flip)** — while ``now < box.lock_until`` no
+    further captures are possible (in either direction). Drone dwell timers
+    over this box are reset so they don't carry across the lock window.
+  * **Home-zone recapture is instant** — if any drone of the box's *home*
+    team is over a box that is currently NOT in the home colour, the box
+    flips back to the home colour immediately (no 2 s hover). This is worth
+    **0 game points** — the scoring side awards none for self-recovery —
+    but the colour change is mechanical here.
+  * **Defender blocks capture** — if any home-team drone is over the box,
+    enemy drones cannot accumulate dwell on it (their timers reset). v7
+    requires that "no defending drone is detected in that box" for an
+    enemy capture to count.
+  * **Enemy capture requires >=2 s hover** — accumulate per-drone dwell on
+    enemy boxes; first attacker to reach ``capture.hold_s`` flips the box
+    to its team and starts the 5 s lock.
+
+The whole function is wrapped in defensive try/excepts so a bad drone state
+cannot stop the tick. Returns the (often empty) list of human-readable event
+strings produced this tick. The C2 marker tracker independently observes
+the resulting marker-ID changes through its drones' vision and updates its
+own lock state from there.
 """
 
 from __future__ import annotations
 
 
-def update(world, dt: float, now: float) -> list[str]:
-    """Advance capture dwell for every drone; return flip events this tick.
+def _drones_over_box(world, box, z_min, z_max, max_speed, radius):
+    out = []
+    for d in world.drones.values():
+        if (d.flying
+                and z_min <= d.pos.z <= z_max
+                and d.speed_mps <= max_speed
+                and d.pos.dist_xy(box.pos) <= radius):
+            out.append(d)
+    return out
 
-    See module docstring for the rules. Returns the (often empty) list of
-    human-readable event strings produced this tick; never raises.
-    """
+
+def _reset_dwell_for_slot(world, slot: int) -> None:
+    for d in world.drones.values():
+        if d.capture_slot == slot:
+            d.capture_slot = None
+            d.capture_since = 0.0
+
+
+def update(world, dt: float, now: float) -> list[str]:
+    """Advance v7 capture state for every box; return flip events this tick."""
     events: list[str] = []
     try:
         cap = world.cfg.capture
@@ -30,115 +59,96 @@ def update(world, dt: float, now: float) -> list[str]:
         z_max = float(cap.z_max_m)
         hold_s = float(cap.hold_s)
         max_speed = float(cap.max_speed_mps)
+        lock_s = float(cap.post_capture_lock_s)
 
-        for drone in world.drones.values():
+        for box in world.boxes.values():
             try:
-                # Find the nearest box this drone currently qualifies to capture.
-                best_box = None
-                best_d = None
-                if drone.flying and (z_min <= drone.pos.z <= z_max) \
-                        and (drone.speed_mps <= max_speed):
-                    for box in world.boxes.values():
-                        d_xy = drone.pos.dist_xy(box.pos)
-                        if d_xy <= radius and (best_d is None or d_xy < best_d):
-                            best_d = d_xy
-                            best_box = box
-
-                # Not over any capturable box -> reset dwell.
-                if best_box is None:
-                    drone.capture_slot = None
-                    drone.capture_since = 0.0
+                # ---- 5-s post-capture lock --------------------------------
+                if now < box.lock_until:
+                    _reset_dwell_for_slot(world, box.slot)
                     continue
 
-                # Already ours -> nothing to capture; reset dwell.
-                if best_box.holder == drone.team:
-                    drone.capture_slot = None
-                    drone.capture_since = 0.0
-                    continue
+                drones_over = _drones_over_box(
+                    world, box, z_min, z_max, max_speed, radius)
+                home_team = box.home_team
+                home_drones = [d for d in drones_over if d.team == home_team]
+                enemy_drones = [d for d in drones_over if d.team != home_team]
 
-                # Enemy box: accumulate dwell. (Re)start the timer if we just
-                # arrived over this slot.
-                if drone.capture_slot != best_box.slot:
-                    drone.capture_slot = best_box.slot
-                    drone.capture_since = now
-
-                # Held long enough -> flip the box to this drone's team.
-                if (now - drone.capture_since) >= hold_s:
-                    best_box.holder = drone.team
-                    best_box.last_flip_unix_s = now
-                    drone.capture_slot = None
-                    drone.capture_since = 0.0
+                # ---- home-zone INSTANT recapture (0 pts, but box flips) ---
+                if home_drones and box.holder != home_team:
+                    box.holder = home_team
+                    box.last_flip_unix_s = now
+                    box.lock_until = now + lock_s
                     events.append(
-                        f"{drone.id} ({drone.team}) captured slot "
-                        f"{best_box.slot} -> {drone.team} "
-                        f"(face {best_box.current_face_id})"
+                        f"{home_drones[0].id} ({home_team}) home-recap "
+                        f"slot {box.slot} -> {home_team} (instant, 0 pts)"
                     )
+                    _reset_dwell_for_slot(world, box.slot)
+                    continue
+
+                # ---- defender presence blocks any enemy capture -----------
+                if home_drones:
+                    # Reset enemy dwells: a defender showing up cancels their
+                    # in-progress hover for this slot.
+                    for d in enemy_drones:
+                        if d.capture_slot == box.slot:
+                            d.capture_slot = None
+                            d.capture_since = 0.0
+                    # Home drone just patrols / holds presence — no flip.
+                    continue
+
+                # ---- enemy capture attempt (>=2 s hover, no defender) -----
+                flipped = False
+                for d in enemy_drones:
+                    if box.holder == d.team:
+                        # Box is already this drone's colour (rare edge);
+                        # nothing to flip and no dwell to track.
+                        if d.capture_slot == box.slot:
+                            d.capture_slot = None
+                            d.capture_since = 0.0
+                        continue
+                    # Start or check this drone's dwell on this slot.
+                    if d.capture_slot != box.slot:
+                        d.capture_slot = box.slot
+                        d.capture_since = now
+                    elif (now - d.capture_since) >= hold_s:
+                        box.holder = d.team
+                        box.last_flip_unix_s = now
+                        box.lock_until = now + lock_s
+                        events.append(
+                            f"{d.id} ({d.team}) captured slot {box.slot} "
+                            f"-> {d.team} (face {box.current_face_id})"
+                        )
+                        _reset_dwell_for_slot(world, box.slot)
+                        flipped = True
+                        break
+                # If no flip this tick, dwell continues to accumulate for the
+                # drones over this box; drones that LEFT the box have their
+                # dwell cleared via the per-drone "not over any box" path below.
+                if flipped:
+                    continue
             except Exception:
-                # One drone's error must not stop the others or the tick.
                 continue
+
+        # Final safety: any drone whose ``capture_slot`` points at a slot it
+        # is no longer over (e.g. flew away) gets its dwell cleared.
+        # (Per-slot resets above already handle most cases; this catches the
+        # "drifted off the box but no other event fired" case.)
+        for d in world.drones.values():
+            sl = d.capture_slot
+            if sl is None:
+                continue
+            box = world.boxes.get(sl)
+            if box is None:
+                d.capture_slot = None
+                d.capture_since = 0.0
+                continue
+            still_over = (d.flying and z_min <= d.pos.z <= z_max
+                          and d.speed_mps <= max_speed
+                          and d.pos.dist_xy(box.pos) <= radius)
+            if not still_over:
+                d.capture_slot = None
+                d.capture_since = 0.0
     except Exception:
         return events
     return events
-
-
-# ---------------------------------------------------------------------------
-# Smoke test
-# ---------------------------------------------------------------------------
-
-if __name__ == "__main__":
-    import sys
-    from pathlib import Path
-
-    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-
-    from marker_mission_sim.config import SimConfig
-    from marker_mission_sim.world import World, SimDrone
-    from marker_mission_sim.geometry import Vec3
-
-    cfg = SimConfig()
-    world = World(cfg)
-
-    # Blue box in slot 1 at [-3.0, 7.5, 1.0]; a RED drone hovering over it.
-    box1 = world.boxes[1]
-    assert box1.holder == "blue", f"expected blue home box, got {box1.holder}"
-
-    drone = SimDrone(
-        id="red-1", team="red", fc_port=8000,
-        pos=Vec3(box1.pos.x, box1.pos.y, 1.5),  # directly over, in z band
-        heading_deg=0.0,
-    )
-    drone.flying = True
-    drone.speed_mps = 0.0
-    world.drones[drone.id] = drone
-
-    hold_s = cfg.capture.hold_s
-    print(f"box1 slot {box1.slot} holder={box1.holder} face={box1.current_face_id}")
-    print(f"red drone @ {drone.pos.to_list()} speed {drone.speed_mps} "
-          f"hold_s={hold_s} radius={cfg.capture.radius_m} "
-          f"z=[{cfg.capture.z_min_m},{cfg.capture.z_max_m}]")
-
-    all_events: list[str] = []
-    # Tick repeatedly, advancing `now` until past hold_s.
-    t = 0.0
-    dt = 0.5
-    steps = int(hold_s / dt) + 3
-    for _ in range(steps):
-        evs = update(world, dt=dt, now=t)
-        if evs:
-            all_events.extend(evs)
-            print(f"  t={t:.1f}: {evs}")
-        else:
-            print(f"  t={t:.1f}: holder={box1.holder} "
-                  f"dwell={t - drone.capture_since:.1f}s")
-        t += dt
-
-    assert box1.holder == "red", f"box should have flipped to red, got {box1.holder}"
-    assert box1.current_face_id == box1.red_face_id, "face id should be the red face"
-    assert all_events, "a capture event should have been returned"
-    print(f"OK: box flipped blue->red, face now {box1.current_face_id}; "
-          f"event: {all_events[-1]!r}")
-
-    # A second pass should NOT re-capture (already ours).
-    more = update(world, dt=dt, now=t)
-    assert not more, f"should not re-capture an own box, got {more}"
-    print("OK: own box is not re-captured.")

@@ -28,9 +28,13 @@ class SimBox:
     slot: int
     pos: Vec3
     holder: str                 # "red" | "blue"
+    home_team: str              # immutable: which team's home zone this box sits in
     blue_face_id: int
     red_face_id: int
     last_flip_unix_s: float = 0.0
+    # v7 §1.4.3: after a successful capture the box is locked for 5 s — no
+    # further captures (in either direction) until this clock-time is reached.
+    lock_until: float = 0.0
 
     @property
     def current_face_id(self) -> int:
@@ -39,6 +43,7 @@ class SimBox:
     @classmethod
     def from_def(cls, b: BoxDef) -> "SimBox":
         return cls(slot=b.slot, pos=b.pos.copy(), holder=b.home_team,
+                   home_team=b.home_team,
                    blue_face_id=b.blue_face_id, red_face_id=b.red_face_id)
 
     def to_dict(self) -> dict:
@@ -46,9 +51,12 @@ class SimBox:
             "slot": self.slot,
             "pos": self.pos.to_list(),
             "holder": self.holder,
+            "home_team": self.home_team,
             "current_face_id": self.current_face_id,
             "blue_face_id": self.blue_face_id,
             "red_face_id": self.red_face_id,
+            "lock_until": round(self.lock_until, 2),
+            "last_flip_unix_s": round(self.last_flip_unix_s, 2),
         }
 
 

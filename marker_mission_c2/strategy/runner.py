@@ -411,6 +411,11 @@ class SwarmRunner:
         our_slots = sorted(x for x in active if self._slot_home_team(x) == our)
         enemy_slots = sorted(x for x in active if self._slot_home_team(x) == enemy)
         holder = {sl: self._markers.slot_holder(sl) for sl in active}
+        # v7 §1.4.3: skip slots in their 5-s post-capture lock window — the
+        # FC won't register any new capture during that period, so dispatching
+        # would just waste a sortie.
+        now = time.time()
+        locked = {sl for sl in active if self._markers.slot_locked(sl, now)}
 
         # Gather free drones + already-targeted slots under the lock; do the
         # actual assign_target() calls outside it (assign_target re-locks).
@@ -435,18 +440,22 @@ class SwarmRunner:
                     free_att.append(d.fc_name)
 
         assignments: list[tuple[str, int, str]] = []
-        # Priority 1: defend our threatened slots (enemy holds them).
+        # Priority 1: defend our threatened slots (enemy holds them; skip locked).
         for sl in our_slots:
             if not free_def:
                 break
+            if sl in locked:
+                continue
             if holder.get(sl) == enemy and sl not in taken:
                 fc = free_def.pop(0)
                 taken.add(sl)
                 assignments.append((fc, sl, f"AUTO: defend slot {sl} (enemy holds it)"))
-        # Priority 2: attack enemy slots we don't already hold.
+        # Priority 2: attack enemy slots we don't already hold (skip locked).
         for sl in enemy_slots:
             if not free_att:
                 break
+            if sl in locked:
+                continue
             if holder.get(sl) != our and sl not in taken:
                 fc = free_att.pop(0)
                 taken.add(sl)
