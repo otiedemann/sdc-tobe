@@ -49,6 +49,11 @@ class DroneState:
     visible_marker_ids: tuple[int, ...] = ()
     active_marker_id: Optional[int] = None
     mission_running: bool = False
+    # v7 §1.4.4 needs to know whether the drone is currently inside its
+    # own home zone before allowing a new scoring attempt. We pull the
+    # arena-frame position straight from /api/state (sim + real FC both
+    # publish it) and the runner derives in_home_now from drone.team.
+    world_position_m: Optional[tuple[float, float, float]] = None
     raw: Dict[str, Any] = field(default_factory=dict)
 
     @classmethod
@@ -69,6 +74,13 @@ class DroneState:
             active_id = int(active) if active is not None else None
         except (TypeError, ValueError):
             active_id = None
+        pos_raw = state.get("world_position_m")
+        pos_t: Optional[tuple[float, float, float]] = None
+        if isinstance(pos_raw, (list, tuple)) and len(pos_raw) >= 3:
+            try:
+                pos_t = (float(pos_raw[0]), float(pos_raw[1]), float(pos_raw[2]))
+            except (TypeError, ValueError):
+                pos_t = None
         return cls(
             fc_name=fc_name,
             connection_ok=bool(item.get("connection_ok", False)),
@@ -77,8 +89,25 @@ class DroneState:
             visible_marker_ids=vmids,
             active_marker_id=active_id,
             mission_running=phase not in ("", "unknown", "init", "idle", "landed"),
+            world_position_m=pos_t,
             raw=item,
         )
+
+
+# v7 §1.1 home-zone bounds (regs-fixed): the playing field is 20 m along
+# the long (Y) axis split into red (5 m) + neutral (10 m) + blue (5 m), with
+# the 10 m width spanning x in [-5, +5]. Used by the runner to decide whether
+# a drone is currently INSIDE its own home zone for the §1.4.4 gate
+# ("a drone may only start a new attempt after it has been detected back in
+# its own home zone").
+def in_home_zone(team: str, x: float, y: float) -> bool:
+    if abs(x) > 5.0:
+        return False
+    if team == "red":
+        return -10.0 <= y <= -5.0
+    if team == "blue":
+        return 5.0 <= y <= 10.0
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -193,6 +222,12 @@ class RoleContext:
     # Roles should prefer this for their cruise/loiter HEIGHT; the final
     # capture descent still drops to the box-detect band regardless.
     cruise_alt_m: Optional[float] = None
+    # v7 §1.4.4 gate: True iff drone.world_position_m is currently inside
+    # this drone's TEAM home zone (red y in [-10,-5] / blue y in [5,10],
+    # x in [-5,+5]). Computed by the runner from drone.team + state.world_
+    # position_m. Roles must refuse to start a NEW scoring attempt while
+    # this is False (the regs require the drone be detected back home).
+    in_home_now: bool = False
 
 
 class Role(abc.ABC):

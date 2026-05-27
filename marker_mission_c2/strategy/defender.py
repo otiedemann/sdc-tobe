@@ -74,6 +74,13 @@ class DefenderRole(Role):
                     f"defender: airborne (fc phase={ctx.state.phase}); "
                     f"holding — FC must be INIT to start a re-capture"
                 )
+            # v7 §1.4.4 home-presence: drone must be detected in its own home
+            # zone before starting a new scoring attempt.
+            if not ctx.in_home_now:
+                return noop(
+                    "defender: not yet detected back in home zone "
+                    "(v7 §1.4.4 requires home-zone presence before re-attempt)"
+                )
             # Enemy holds our slot -> re-capture its currently-showing
             # (enemy) face with the attacker's primitive script.
             recap_id = _enemy_face_for(slot, ctx.our_team)

@@ -31,6 +31,7 @@ from .roles import (
     RoleContext,
     RoleState,
     get as get_role,
+    in_home_zone,
 )
 from .settings import SettingsStore
 
@@ -360,6 +361,13 @@ class SwarmRunner:
             if role is None:
                 continue
 
+            # v7 §1.4.4 home-presence: True iff the drone is currently inside
+            # its own home zone. False if we don't have a position yet (be
+            # conservative — better to hold than push from an unknown spot).
+            in_home_now = False
+            if drone.team and ds.world_position_m is not None:
+                x, y, _z = ds.world_position_m
+                in_home_now = in_home_zone(drone.team, x, y)
             ctx = RoleContext(
                 drone=drone,
                 match=s.match,
@@ -369,6 +377,7 @@ class SwarmRunner:
                 our_team=s.markers.our_team,
                 active_slots=tuple(s.markers.active_slots),
                 cruise_alt_m=cruise_alts.get(drone.fc_name),
+                in_home_now=in_home_now,
             )
 
             try:

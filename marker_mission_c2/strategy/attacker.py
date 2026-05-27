@@ -514,6 +514,14 @@ class AttackerRole(Role):
                     f"attacker: airborne (fc phase={ctx.state.phase}); "
                     f"holding — FC must be INIT to start a new run"
                 )
+            # v7 §1.4.4: a drone may only start a new scoring attempt after it
+            # has been detected back in its own home zone. Refuse to push until
+            # in_home_now flips True (computed from world_position_m + team).
+            if not ctx.in_home_now:
+                return noop(
+                    "attacker: not yet detected back in home zone "
+                    "(v7 §1.4.4 requires home-zone presence before re-attempt)"
+                )
             attack_id = _enemy_face_for(slot, ctx.our_team)
             rs.last_attack_marker_id = attack_id
             # Compose the attack from EXISTING basic FC verbs (TAKEOFF /
