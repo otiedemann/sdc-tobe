@@ -234,6 +234,11 @@ class SwarmRunner:
         )
 
     def snapshot(self) -> Dict[str, Any]:
+        # Expose the last C2 overview (per-FC live telemetry: drone_connected,
+        # battery, height, world_position, visible_marker_ids, FC phase, …)
+        # so the strategy dashboard can render a *detailed* per-drone status
+        # without a separate fetch. The overview is refreshed every tick by
+        # ``_tick_once``; here we just pass through the latest snapshot.
         return {
             "armed": self.is_armed(),
             "auto": self.is_auto(),
@@ -245,6 +250,7 @@ class SwarmRunner:
             "drones": {
                 fc: rs.to_dict() for fc, rs in self.role_states().items()
             },
+            "overview": dict(self._last_overview),
         }
 
     # ------------------------------------------------------------------

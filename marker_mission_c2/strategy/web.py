@@ -249,6 +249,25 @@ _INDEX_HTML = r"""<!doctype html>
         width: 100%; padding: 4px 6px; background: #16181d;
         color: var(--text); border: 1px solid var(--border);
         border-radius: 4px; }
+  /* Live per-drone status: link dots + compact field grid. */
+  .drone .head .status-dot { display: inline-block; width: 8px; height: 8px;
+                             border-radius: 50%; background: var(--muted);
+                             margin-left: 2px; }
+  .drone .head .status-dot.good { background: #4ade80; }
+  .drone .head .status-dot.warn { background: #facc15; }
+  .drone .head .status-dot.bad  { background: var(--red); }
+  .drone .status-grid { display: grid; grid-template-columns: repeat(3, 1fr);
+                        gap: 3px 10px; margin: 6px 0 4px; font-size: 12px; }
+  .drone .status-grid > div { display: flex; gap: 6px; align-items: baseline;
+                              white-space: nowrap; overflow: hidden;
+                              text-overflow: ellipsis; }
+  .drone .status-grid .k { color: var(--muted); }
+  .drone .status-grid .v { color: var(--text); }
+  .drone .status-grid .v.good { color: #4ade80; }
+  .drone .status-grid .v.warn { color: #facc15; }
+  .drone .status-grid .v.bad  { color: var(--red); }
+  .drone .status-grid .v.mono { font-family: ui-monospace,Menlo,monospace;
+                                font-size: 11px; }
   .drone .phase { font-size: 12px; color: var(--muted);
                   font-family: ui-monospace, monospace; margin-top: 6px; }
   .target-row { display: flex; gap: 4px; margin-top: 8px; align-items: center; }
@@ -352,6 +371,7 @@ function renderDrones(state) {
   const root = document.getElementById("drones");
   const drones = (state.settings.drones || {});
   const role_states = (state.runner && state.runner.drones) || {};
+  const overview = (state.runner && state.runner.overview) || {};
   const activeSlots = (state.settings.markers && state.settings.markers.active_slots) || [1,2,3,4,5,6];
   const names = Object.keys(drones).sort();
   if (!names.length) {
@@ -375,12 +395,62 @@ function renderDrones(state) {
     const slotOpts = ['<option value="">— no target —</option>']
       .concat(activeSlots.map(s => `<option value="${s}" ${targetVal===s?"selected":""}>slot ${s}</option>`))
       .join("");
+
+    // ── Live status from the C2 overview (per-FC live telemetry). ──
+    // overview shape: { fc: {connection_ok, drone_connected, state:{...}} }.
+    // Be defensive — fields may be missing while a drone is offline.
+    const ov = overview[fc] || {};
+    const ovState = (ov && ov.state) || {};
+    const tel = (ovState && ovState.telemetry) || {};
+    const c2Ok = !!ov.connection_ok;
+    const droneOk = !!ov.drone_connected;
+    const c2DotCls = c2Ok ? "good" : "bad";
+    const droneDotCls = droneOk ? "good" : (c2Ok ? "warn" : "bad");
+    const fcPhase = ovState.phase || "—";
+    const heightCm = (tel.height_cm != null) ? Number(tel.height_cm)
+                     : (ovState.height_cm != null ? Number(ovState.height_cm) : null);
+    const heightStr = heightCm != null ? (heightCm/100).toFixed(2) + "m" : "—";
+    const batteryRaw = (tel.battery_percent != null) ? tel.battery_percent
+                     : (tel.battery != null ? tel.battery
+                     : (ovState.battery_percent != null ? ovState.battery_percent : null));
+    const battery = batteryRaw != null ? Math.round(Number(batteryRaw)) : null;
+    const battStr = battery != null ? battery + "%" : "—";
+    const battCls = battery == null ? "" : (battery < 30 ? "bad" : battery < 58 ? "warn" : "good");
+    const wpos = ovState.world_position_m;
+    const posStr = (Array.isArray(wpos) && wpos.length >= 2 && wpos[0] != null && wpos[1] != null)
+      ? `(${Number(wpos[0]).toFixed(1)}, ${Number(wpos[1]).toFixed(1)})` : "—";
+    // in-home computed client-side (mirrors strategy/roles.in_home_zone).
+    let inHome = "?", inHomeCls = "";
+    if (Array.isArray(wpos) && wpos.length >= 2 && team && wpos[0] != null && wpos[1] != null) {
+      const x = Number(wpos[0]), y = Number(wpos[1]);
+      const inX = Math.abs(x) <= 5.0;
+      if (team === "red")  inHome = (inX && y >= -10 && y <= -5) ? "yes" : "no";
+      if (team === "blue") inHome = (inX && y >= 5 && y <= 10) ? "yes" : "no";
+      inHomeCls = inHome === "yes" ? "good" : (inHome === "no" ? "warn" : "");
+    }
+    const visible = ovState.visible_marker_ids;
+    const visStr = (Array.isArray(visible) && visible.length) ? visible.join(",") : "—";
+    const missionRun = fcPhase && !["init", "idle", "done", "", "—"].includes(String(fcPhase).toLowerCase());
+    const c2DotTitle = c2Ok ? `C2 link to ${fc}: ok` : `C2 link to ${fc}: DOWN`;
+    const droneDotTitle = droneOk ? `drone link: connected` : `drone link: not connected`;
+    const lastPush = rs.last_pushed_age_s != null ? `pushed ${ageStr(rs.last_pushed_age_s)} ago` : "";
+
     const html = `
       <div class="drone">
         <div class="head">
           <span class="name">${fc}</span>
           <span class="badge ${teamBadge}">${team || "no team"}</span>
           <span class="badge ${roleBadge}">${role}</span>
+          <span class="status-dot ${c2DotCls}" title="${c2DotTitle}"></span>
+          <span class="status-dot ${droneDotCls}" title="${droneDotTitle}"></span>
+        </div>
+        <div class="status-grid">
+          <div><span class="k">battery</span><span class="v ${battCls}">${battStr}</span></div>
+          <div><span class="k">height</span><span class="v">${heightStr}</span></div>
+          <div><span class="k">FC phase</span><span class="v">${fcPhase}${missionRun?" ●":""}</span></div>
+          <div><span class="k">in home</span><span class="v ${inHomeCls}">${inHome}</span></div>
+          <div><span class="k">world pos</span><span class="v mono">${posStr}</span></div>
+          <div><span class="k">sees</span><span class="v mono" title="visible ArUco IDs">${visStr}</span></div>
         </div>
         <div class="row">
           <div>
@@ -431,7 +501,7 @@ function renderDrones(state) {
           <button data-clear="${fc}">Clear</button>
         </div>
         <div class="phase" title="${reason}">
-          phase=${phase}${rs.target_slot!=null?` slot=${rs.target_slot}`:''}${attackId?` last_aim=${attackId}`:''}${cruiseAlt!=null?` · cruise ${cruiseAlt}m`:''}
+          phase=${phase}${rs.target_slot!=null?` slot=${rs.target_slot}`:''}${attackId?` last_aim=${attackId}`:''}${cruiseAlt!=null?` · cruise ${cruiseAlt}m`:''}${lastPush?` · ${lastPush}`:''}
           ${reason?` · ${reason}`:''}
         </div>
       </div>
