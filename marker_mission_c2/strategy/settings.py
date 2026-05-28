@@ -31,7 +31,7 @@ Settings shape::
           "team":          "red"|"blue"|null,
           "role":          "idle"|"scout"|"attacker",
           "enabled":       true,
-          "scout_alt_m":   1.8,
+          "scout_alt_m":   3.0,
           "attack_alt_m":  1.0,
           "home_alt_m":    0.8
         }
@@ -198,7 +198,13 @@ class DroneSettings:
     team: Optional[str] = None      # "red" | "blue" | None (unassigned)
     role: str = "idle"              # one of VALID_ROLES
     enabled: bool = True
-    scout_alt_m: float = 1.8
+    # Default cruise altitude for the scout role (m). 3.0 puts the drone
+    # comfortably above the 2 m lower wall markers, well below the 4 m
+    # upper wall markers, and clear of the 1.4 m box tops — so the camera
+    # can see all six target faces from arena centre. The runner's
+    # deconfliction may nudge this up in 0.4 m steps for additional drones,
+    # capped at 5 m to stay below the 6 m arena ceiling.
+    scout_alt_m: float = 3.0
     attack_alt_m: float = 1.0
     home_alt_m: float = 0.8
 
@@ -295,7 +301,7 @@ def _drone_from(fc_name: str, raw: Any) -> DroneSettings:
         team=_coerce_team(raw.get("team")),
         role=_coerce_role(raw.get("role")),
         enabled=bool(raw.get("enabled", True)),
-        scout_alt_m=float(raw.get("scout_alt_m", 1.8)),
+        scout_alt_m=float(raw.get("scout_alt_m", 3.0)),
         attack_alt_m=float(raw.get("attack_alt_m", 1.0)),
         home_alt_m=float(raw.get("home_alt_m", 0.8)),
     )

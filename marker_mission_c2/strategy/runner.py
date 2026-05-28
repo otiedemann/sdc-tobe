@@ -411,74 +411,23 @@ class SwarmRunner:
         return "red" if 1 <= slot <= 3 else "blue"
 
     def _auto_plan(self, s) -> None:
-        """Assign target slots to FREE attackers/defenders from slot state.
+        """Pick the highest-EV v7 play available this tick and apply it.
 
-        Roles stay operator-set; AUTO only fills in each drone's
-        ``target_slot``. A drone is "free" when it has no target and is
-        idle/done (not mid-run), so once assigned it won't be re-tasked
-        until it finishes. Reactions:
-          * an OWN slot held by the enemy  -> a free DEFENDER re-captures it
-          * an ENEMY slot not yet ours     -> a free ATTACKER captures it
+        Delegates the play selection to :mod:`strategy.planner` which ranks
+        feasibility-checked plays (defensive recap > 10-pt double-strike >
+        1-pt singleton) and returns the assignments to apply. We pass the
+        latest C2 overview through so the planner can honour the v7
+        §1.4.4 home-presence gate + FC-INIT readiness check per drone.
         """
-        our = s.markers.our_team
-        enemy = "blue" if our == "red" else "red"
-        active = [int(x) for x in s.markers.active_slots]
-        our_slots = sorted(x for x in active if self._slot_home_team(x) == our)
-        enemy_slots = sorted(x for x in active if self._slot_home_team(x) == enemy)
-        holder = {sl: self._markers.slot_holder(sl) for sl in active}
-        # v7 §1.4.3: skip slots in their 5-s post-capture lock window — the
-        # FC won't register any new capture during that period, so dispatching
-        # would just waste a sortie.
+        from . import planner as _planner
         now = time.time()
-        locked = {sl for sl in active if self._markers.slot_locked(sl, now)}
-
-        # Gather free drones + already-targeted slots under the lock; do the
-        # actual assign_target() calls outside it (assign_target re-locks).
         with self._states_lock:
-            taken: set[int] = set()
-            free_def: List[str] = []
-            free_att: List[str] = []
-            for d in s.drones:
-                if not d.enabled or not d.team:
-                    continue
-                rs = self._role_states.get(d.fc_name)
-                if rs is None:
-                    continue
-                if rs.target_slot is not None:
-                    taken.add(int(rs.target_slot))
-                    continue
-                if rs.phase not in ("", "idle", "done"):
-                    continue  # mid-run; leave it be
-                if d.role == "defender":
-                    free_def.append(d.fc_name)
-                elif d.role == "attacker":
-                    free_att.append(d.fc_name)
-
-        assignments: list[tuple[str, int, str]] = []
-        # Priority 1: defend our threatened slots (enemy holds them; skip locked).
-        for sl in our_slots:
-            if not free_def:
-                break
-            if sl in locked:
-                continue
-            if holder.get(sl) == enemy and sl not in taken:
-                fc = free_def.pop(0)
-                taken.add(sl)
-                assignments.append((fc, sl, f"AUTO: defend slot {sl} (enemy holds it)"))
-        # Priority 2: attack enemy slots we don't already hold (skip locked).
-        for sl in enemy_slots:
-            if not free_att:
-                break
-            if sl in locked:
-                continue
-            if holder.get(sl) != our and sl not in taken:
-                fc = free_att.pop(0)
-                taken.add(sl)
-                assignments.append((fc, sl, f"AUTO: attack slot {sl} (holder={holder.get(sl)})"))
-
-        for fc, sl, reason in assignments:
-            self.assign_target(fc, sl)
-            self._events.add("auto", reason, drone=fc)
+            role_states_snap = dict(self._role_states)
+        plays = _planner.plan(s, self._markers, self._last_overview,
+                              role_states_snap, now)
+        for p in plays:
+            self.assign_target(p.fc_name, p.slot)
+            self._events.add(p.play_kind, p.reason, drone=p.fc_name)
 
     # ------------------------------------------------------------------
     # Height deconfliction
@@ -492,8 +441,15 @@ class SwarmRunner:
         no two enabled drones share a cruise height — avoids mid-air
         collisions during loiter/transit. Deterministic by ascending
         preference then fc_name.
+
+        Capped at MAX_ALT_M so a ghost-laden roster (drones lingering in
+        settings.json from earlier runs) can't push the stack into the
+        ceiling. Once the stack hits the cap we share the cap altitude
+        among any overflow drones — operator should clean stale drones
+        instead of stacking into the ceiling.
         """
         MIN_GAP = 0.4
+        MAX_ALT_M = 5.0     # 1 m below the 6 m arena ceiling
         prefs: list[tuple[float, str]] = []
         for d in s.drones:
             if not d.enabled:
@@ -503,12 +459,18 @@ class SwarmRunner:
         prefs.sort()  # ascending altitude, then name
         out: Dict[str, float] = {}
         used: list[float] = []
+        # Tiny epsilon protects against float-accumulation in the loop
+        # (e.g. 1.0 + 0.4 yields 1.3999999... so the bare ``< MIN_GAP``
+        # test trips on the next iteration and we'd over-bump by 0.4).
+        EPS = 1e-6
         for pref, fc in prefs:
-            a = pref
+            a = round(pref, 2)
             # bump up until clear of every already-placed altitude
-            while any(abs(a - u) < MIN_GAP for u in used):
-                a += MIN_GAP
-            a = round(a, 2)
+            while any(abs(a - u) < (MIN_GAP - EPS) for u in used) \
+                    and a < MAX_ALT_M:
+                a = round(a + MIN_GAP, 2)
+            if a > MAX_ALT_M:
+                a = MAX_ALT_M
             out[fc] = a
             used.append(a)
         return out

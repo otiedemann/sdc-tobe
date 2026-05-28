@@ -481,7 +481,7 @@ function renderDrones(state) {
         <div class="row">
           <div>
             <label>Scout alt (m)</label>
-            <input type="number" step="0.1" min="0.4" max="3.0"
+            <input type="number" step="0.1" min="0.4" max="5.0"
                    value="${d.scout_alt_m}" data-fc="${fc}" data-field="scout_alt_m">
           </div>
           <div>
