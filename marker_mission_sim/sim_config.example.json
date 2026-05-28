@@ -1,5 +1,5 @@
 {
-  "_comment": "Local marker_mission drone+arena simulator. Each drone exposes the marker_mission FC API on its fc_port, so the C2 lists them like real flight controllers (see the C2 fcs block below). Red home is the -Y end of the arena, blue the +Y end; drones spawn facing the enemy side.",
+  "_comment": "Local marker_mission drone+arena simulator. Default roster matches SDC26 §1.3 max (5 drones per team). Each drone exposes the marker_mission FC API on its fc_port, so the C2 lists them like real flight controllers (see the C2 fcs block below). Red home is the -Y end of the arena, blue the +Y end; drones spawn facing the enemy side. To launch with fewer drones, use ./run_local.sh --drones N (or --red R --blue B) which regenerates this file.",
   "ui_host": "127.0.0.1",
   "ui_port": 9100,
   "fc_host": "127.0.0.1",
@@ -21,15 +21,22 @@
     "z_min_m": 1.0,
     "z_max_m": 2.0,
     "hold_s": 2.0,
-    "max_speed_mps": 0.5
+    "max_speed_mps": 0.5,
+    "post_capture_lock_s": 5.0
   },
 
   "drones": [
-    {"id": "red1",  "team": "red",  "fc_port": 9101, "spawn_x": -2.5, "spawn_y": -9.0, "spawn_heading_deg": 0},
-    {"id": "red2",  "team": "red",  "fc_port": 9102, "spawn_x":  2.5, "spawn_y": -9.0, "spawn_heading_deg": 0},
-    {"id": "blue1", "team": "blue", "fc_port": 9103, "spawn_x": -2.5, "spawn_y":  9.0, "spawn_heading_deg": 180},
-    {"id": "blue2", "team": "blue", "fc_port": 9104, "spawn_x":  2.5, "spawn_y":  9.0, "spawn_heading_deg": 180}
+    {"id": "red1", "team": "red",  "fc_port": 9101, "spawn_x": -4.0, "spawn_y": -9.0, "spawn_heading_deg": 0},
+    {"id": "red2", "team": "red",  "fc_port": 9102, "spawn_x": -2.0, "spawn_y": -9.0, "spawn_heading_deg": 0},
+    {"id": "red3", "team": "red",  "fc_port": 9103, "spawn_x":  0.0, "spawn_y": -9.0, "spawn_heading_deg": 0},
+    {"id": "red4", "team": "red",  "fc_port": 9104, "spawn_x":  2.0, "spawn_y": -9.0, "spawn_heading_deg": 0},
+    {"id": "red5", "team": "red",  "fc_port": 9105, "spawn_x":  4.0, "spawn_y": -9.0, "spawn_heading_deg": 0},
+    {"id": "blue1","team": "blue", "fc_port": 9106, "spawn_x": -4.0, "spawn_y":  9.0, "spawn_heading_deg": 180},
+    {"id": "blue2","team": "blue", "fc_port": 9107, "spawn_x": -2.0, "spawn_y":  9.0, "spawn_heading_deg": 180},
+    {"id": "blue3","team": "blue", "fc_port": 9108, "spawn_x":  0.0, "spawn_y":  9.0, "spawn_heading_deg": 180},
+    {"id": "blue4","team": "blue", "fc_port": 9109, "spawn_x":  2.0, "spawn_y":  9.0, "spawn_heading_deg": 180},
+    {"id": "blue5","team": "blue", "fc_port": 9110, "spawn_x":  4.0, "spawn_y":  9.0, "spawn_heading_deg": 180}
   ],
 
-  "_c2_hint": "In marker_mission_c2/config.dev.json set fcs to: [{\"name\":\"red1\",\"host\":\"127.0.0.1\",\"port\":9101},{\"name\":\"red2\",\"host\":\"127.0.0.1\",\"port\":9102},{\"name\":\"blue1\",\"host\":\"127.0.0.1\",\"port\":9103},{\"name\":\"blue2\",\"host\":\"127.0.0.1\",\"port\":9104}]  — then run the C2 server + strategy and add the drones."
+  "_c2_hint": "marker_mission_c2/config.dev.json's fcs block must list these 10 drones on ports 9101..9110. The launcher generates a matching file when you pass --drones N or --red R --blue B."
 }

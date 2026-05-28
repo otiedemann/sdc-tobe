@@ -80,8 +80,10 @@ def generate(red: int, blue: int, out_sim: Path, out_c2: Path,
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(prog="marker_mission_sim.gen_config",
                                  description=__doc__)
-    ap.add_argument("--red", type=int, default=2, help="red drones (default 2)")
-    ap.add_argument("--blue", type=int, default=2, help="blue drones (default 2)")
+    ap.add_argument("--red", type=int, default=5,
+                    help="red drones (default 5 — SDC26 §1.3 max)")
+    ap.add_argument("--blue", type=int, default=5,
+                    help="blue drones (default 5 — SDC26 §1.3 max)")
     ap.add_argument("--base-port", type=int, default=9101)
     ap.add_argument("--fc-host", default="127.0.0.1")
     ap.add_argument("--out-sim", required=True, type=Path)

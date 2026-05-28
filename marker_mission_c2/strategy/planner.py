@@ -1,0 +1,226 @@
+"""SDC26 v7 play planner — picks the highest-EV play available each tick.
+
+The planner is a pure function:
+
+    PlayAssignment[] = plan(settings, markers, overview, role_states, now)
+
+It enumerates the FEASIBLE v7 plays given the live world (slot holders, lock
+windows, drone in-home presence, FC INIT state, etc.) and returns the list
+of (drone, slot) assignments the runner should apply. The runner then calls
+``assign_target`` and the per-drone role builds the actual FC mission script
+(attacker: 1-pt / 10-pt; defender: re-capture).
+
+v7 scoring (regs §1.4.3):
+    1 pt   one drone captures + returns home
+    5 pts  ALL of our drones outside home at capture moment, then all return
+   10 pts  two drones flip two different enemy boxes within <1 s
+   instant special: all six boxes our colour for >=5 s -> match won
+
+Priority (highest first):
+   defensive recap  > 10-pt double-strike > 1-pt singleton > idle
+
+5-pt full sortie is not scheduled here yet (it needs whole-team timed
+choreography; flagged for follow-up). 10-pt sync uses the "push both at the
+same tick" approximation — adequate when both attackers' flight profiles
+are similar (they spawn at symmetric home positions). A tighter ETA-based
+dispatcher can replace this without changing the planner's public API.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Any, Optional
+
+from .roles import in_home_zone
+
+
+def slot_home_team(slot: int) -> str:
+    """v7 §1.4.2: boxes 1-3 in RED home, 4-6 in BLUE home."""
+    return "red" if 1 <= slot <= 3 else "blue"
+
+
+@dataclass(frozen=True)
+class PlayAssignment:
+    fc_name: str
+    slot: Optional[int]      # target slot to attack/defend; None clears
+    play_kind: str           # "defend_uncap" | "double_strike_10" | "single_strike_1"
+    reason: str              # human-readable, surfaces in the event log
+
+
+# ---------------------------------------------------------------------------
+# helpers
+# ---------------------------------------------------------------------------
+
+def _drone_state(overview: dict, fc: str) -> dict:
+    item = overview.get(fc) or {}
+    return (item.get("state") or {}) if isinstance(item, dict) else {}
+
+
+def _fc_ready_to_start(overview: dict, fc: str) -> bool:
+    """FC must be back in INIT to accept a new mission start."""
+    phase = _drone_state(overview, fc).get("phase") or "unknown"
+    return phase in ("init", "done", "")
+
+
+def _drone_in_home(overview: dict, fc: str, team: str) -> bool:
+    pos = _drone_state(overview, fc).get("world_position_m")
+    if not isinstance(pos, (list, tuple)) or len(pos) < 2:
+        return False
+    try:
+        return in_home_zone(team, float(pos[0]), float(pos[1]))
+    except (TypeError, ValueError):
+        return False
+
+
+def _is_free(rs: Any) -> bool:
+    """Drone has no current target and isn't mid-run."""
+    if rs is None:
+        return False
+    if rs.target_slot is not None:
+        return False
+    return rs.phase in ("", "idle", "done")
+
+
+# ---------------------------------------------------------------------------
+# planner
+# ---------------------------------------------------------------------------
+
+def plan(settings, markers, overview: dict, role_states: dict, now: float
+         ) -> list[PlayAssignment]:
+    """Pick the v7 plays to schedule this tick.
+
+    Parameters
+    ----------
+    settings : StrategySettings
+        The snapshot of operator-set drones/teams/roles + match settings.
+    markers : MarkerTracker
+        Live slot holders + lock windows.
+    overview : dict[fc, {connection_ok, drone_connected, state: {phase,
+        world_position_m, visible_marker_ids, ...}}]
+        Latest C2 overview (one entry per FC).
+    role_states : dict[fc, RoleState]
+        Per-drone role/phase/target.
+    now : float
+        Wall-clock seconds (``time.time()``).
+
+    Returns
+    -------
+    A list of PlayAssignment instances the runner should apply via
+    ``assign_target``. Empty if there's nothing useful to schedule.
+    """
+    our = settings.markers.our_team
+    enemy = "blue" if our == "red" else "red"
+    active = [int(x) for x in settings.markers.active_slots]
+
+    holder = {sl: markers.slot_holder(sl) for sl in active}
+    locked = {sl for sl in active if markers.slot_locked(sl, now)}
+
+    our_slots = sorted(sl for sl in active if slot_home_team(sl) == our)
+    enemy_slots = sorted(sl for sl in active if slot_home_team(sl) == enemy)
+
+    # Free drones, partitioned by operator-set role. A drone is "free" only
+    # when it has no target, isn't mid-run, AND can actually start a new
+    # mission right now (FC INIT + in own home zone per v7 §1.4.4).
+    free_attackers: list[str] = []
+    free_defenders: list[str] = []
+    for d in settings.drones:
+        if not d.enabled or not d.team:
+            continue
+        rs = role_states.get(d.fc_name)
+        if not _is_free(rs):
+            continue
+        if not _fc_ready_to_start(overview, d.fc_name):
+            continue
+        if not _drone_in_home(overview, d.fc_name, d.team):
+            continue
+        if d.role == "attacker":
+            free_attackers.append(d.fc_name)
+        elif d.role == "defender":
+            free_defenders.append(d.fc_name)
+        # scouts/idle: never participate in scoring plays
+
+    assignments: list[PlayAssignment] = []
+    taken: set[int] = set()
+
+    # ----- (1) Defensive re-capture — highest priority -----------------
+    # An own slot held by the enemy is BLEEDING points; recap it instantly
+    # (v7 home recap is 0 pts for us, but it prevents them from scoring
+    # later and resets the lock). Skip locked slots (recap also blocked
+    # during the 5-s window).
+    threatened = [sl for sl in our_slots if holder.get(sl) == enemy and sl not in locked]
+    for sl in threatened:
+        if not free_defenders:
+            break
+        fc = free_defenders.pop(0)
+        assignments.append(PlayAssignment(
+            fc_name=fc, slot=sl, play_kind="defend_uncap",
+            reason=f"v7 defend: slot {sl} held by {enemy}",
+        ))
+        taken.add(sl)
+
+    # ----- (2) 10-pt double-strike — sync two strikers ------------------
+    # Two free attackers + two unlocked enemy slots we don't already hold.
+    # For sub-second sync we want the pairing whose two flight times match
+    # as closely as possible — i.e. minimise MAX(distance) across the pair.
+    # With <= 3 enemy slots and 2 drones it's a tiny brute-force search.
+    attackable = [sl for sl in enemy_slots
+                  if holder.get(sl) != our and sl not in locked and sl not in taken]
+    if len(free_attackers) >= 2 and len(attackable) >= 2:
+        from .attacker import SLOT_POSITIONS_M
+        import math
+        def _dist(pos, slot):
+            sx, sy = SLOT_POSITIONS_M.get(slot, (0.0, 0.0))
+            return math.hypot(float(pos[0]) - sx, float(pos[1]) - sy)
+        # Cache positions for every free attacker.
+        attacker_pos = {fc: _drone_state(overview, fc).get("world_position_m")
+                        or [0.0, 0.0, 0.0]
+                        for fc in free_attackers}
+        # Search over every (fc1, fc2) pair (any two from free attackers) and
+        # every (sl_a, sl_b) ordered slot pair; pick the (drone->slot,
+        # drone->slot) assignment that minimises MAX(flight time delta).
+        # Symmetric pairings (e.g. drone-at-x=-2 -> slot-at-x=-3 paired with
+        # drone-at-x=+2 -> slot-at-x=+3) score best.
+        best = None  # (max_flight, fc1, sl1, fc2, sl2)
+        for i in range(len(free_attackers)):
+            for j in range(i + 1, len(free_attackers)):
+                fa, fb = free_attackers[i], free_attackers[j]
+                pa, pb = attacker_pos[fa], attacker_pos[fb]
+                for sa in attackable:
+                    for sb in attackable:
+                        if sa == sb:
+                            continue
+                        m1 = max(_dist(pa, sa), _dist(pb, sb))
+                        if best is None or m1 < best[0]:
+                            best = (m1, fa, sa, fb, sb)
+        if best:
+            _, fc1, sl1, fc2, sl2 = best
+            # Drop the two chosen drones from free_attackers so the
+            # 1-pt singleton path doesn't reuse them.
+            free_attackers = [fc for fc in free_attackers
+                              if fc != fc1 and fc != fc2]
+            reason = (f"v7 10-pt sync: {fc1}->{sl1} + {fc2}->{sl2} "
+                      f"(max flight {best[0]:.1f} m)")
+            assignments.append(PlayAssignment(
+                fc_name=fc1, slot=sl1, play_kind="double_strike_10",
+                reason=reason,
+            ))
+            assignments.append(PlayAssignment(
+                fc_name=fc2, slot=sl2, play_kind="double_strike_10",
+                reason=reason,
+            ))
+            taken.add(sl1); taken.add(sl2)
+
+    # ----- (3) 1-pt singletons — any remaining free attackers -----------
+    for sl in attackable:
+        if sl in taken:
+            continue
+        if not free_attackers:
+            break
+        fc = free_attackers.pop(0)
+        assignments.append(PlayAssignment(
+            fc_name=fc, slot=sl, play_kind="single_strike_1",
+            reason=f"v7 1-pt singleton: {fc}->{sl}",
+        ))
+        taken.add(sl)
+
+    return assignments

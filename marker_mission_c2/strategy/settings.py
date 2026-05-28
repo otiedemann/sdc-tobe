@@ -463,6 +463,20 @@ class SettingsStore:
                     return d
             return None
 
+    def reset_drones(self) -> int:
+        """Drop every drone from the roster and persist the empty state.
+
+        Returns the number of drones removed. The runner's auto-adopt path
+        will re-populate the roster from the C2 overview on the next tick,
+        with fresh DroneSettings defaults (so e.g. an out-of-date persisted
+        ``scout_alt_m`` reverts to the current code default).
+        """
+        with self._lock:
+            removed = len(self._settings.drones)
+            self._settings = replace(self._settings, drones=())
+            self._write_atomic(_settings_to_dict(self._settings))
+            return removed
+
     # ----- write API ----------------------------------------------------------
 
     def update_drone(self, fc_name: str, **changes: Any) -> DroneSettings:

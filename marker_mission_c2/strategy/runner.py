@@ -189,6 +189,24 @@ class SwarmRunner:
         with self._states_lock:
             return {fc: rs for fc, rs in self._role_states.items()}
 
+    def reset_roster(self, source: str = "operator") -> int:
+        """Drop every drone from the strategy roster and clear all per-drone
+        role memory. Auto-adopt will re-fill from the C2 overview on the
+        next tick with FRESH DroneSettings (current code defaults), which
+        is the easiest way to flush stale persisted values (e.g. an old
+        scout_alt_m of 1.8 m) and any ghost drones lingering from earlier
+        runs. Returns the number of drones removed."""
+        removed = self._settings.reset_drones()
+        with self._states_lock:
+            self._role_states.clear()
+        self._last_cruise_alts = {}
+        self._events.add(
+            "roster_reset",
+            f"roster cleared ({removed} drone(s)) by {source}; "
+            f"auto-adopt will refill from C2 overview",
+        )
+        return removed
+
     def sync_role_state(self, fc_name: str) -> None:
         """Pull the drone's role from settings into RoleState immediately.
 

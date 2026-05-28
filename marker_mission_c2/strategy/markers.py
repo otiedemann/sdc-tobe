@@ -69,13 +69,26 @@ class SlotStatus:
     lock_until_unix_s: float = 0.0
 
 
+def _slot_home_team(slot: int) -> str:
+    """v7 §1.4.2 Table 1 — boxes 1-3 RED home, 4-6 BLUE home."""
+    return "red" if 1 <= int(slot) <= 3 else "blue"
+
+
 class MarkerTracker:
-    """Thread-safe per-slot capture-state tracker."""
+    """Thread-safe per-slot capture-state tracker + capture scoreboard."""
 
     def __init__(self, *, active_slots: Iterable[int] = ALL_SLOTS) -> None:
         self._lock = threading.RLock()
         self._slots: Dict[int, SlotStatus] = {}
         self._per_fc_last_seen: Dict[Tuple[str, int], float] = {}
+        # v7 scoreboard (estimator — see _score_capture). Each entry counts
+        # how many enemy-captures we've observed by that team. This is an
+        # upper-bound estimate: it does not yet validate the "drone reached
+        # home before recapture" rule, nor does it apply the 5/10-pt
+        # bonuses (the 1-pt baseline is the conservative floor).
+        self._caps: Dict[str, int] = {"red": 0, "blue": 0}
+        # Last few capture events for the UI / future 10-pt detection.
+        self._cap_events: List[dict] = []
         self._set_active_slots_locked(tuple(active_slots))
 
     # ------------------------------------------------------------------
@@ -127,6 +140,7 @@ class MarkerTracker:
                 else:
                     status.blue_face_seen_unix_s = now
                 if status.holder != team:
+                    prev = status.holder
                     status.holder = team
                     status.holder_changed_unix_s = now
                     # v7: arm the 5-s capture lock the moment we observe a
@@ -134,9 +148,44 @@ class MarkerTracker:
                     # frames after the actual flip), which is fine — it just
                     # tells the planner to skip this slot for the lock window.
                     status.lock_until_unix_s = now + CAPTURE_LOCK_S
+                    # Score-keeping: an enemy capture (away from the slot's
+                    # home colour) earns the attacking team 1 pt baseline.
+                    # A home recapture earns 0 (regs §1.4.3) but we still
+                    # log the event for the UI / future 10-pt detection.
+                    self._record_capture(status.slot, prev, team, now, fc_name)
                 self._per_fc_last_seen[(fc_name, mid)] = now
             # Recompute "seen_by_recent" for every active slot.
             self._recompute_locked(now)
+
+    def _record_capture(self, slot: int, prev: str, new: str,
+                        now: float, observed_by: Optional[str]) -> None:
+        """v7 scoring: record an observed holder change.
+
+        Awards +1 to ``new`` if this is a capture AWAY from the slot's home
+        team (i.e. the attacking team scored). A flip BACK to the home team
+        is a home recap (0 pts per regs §1.4.3) — we still log the event so
+        the UI can show recent action.
+        """
+        home = _slot_home_team(slot)
+        is_home_recap = (new == home)
+        if not is_home_recap and new in self._caps:
+            self._caps[new] += 1
+        ev = {
+            "unix_s": now, "slot": int(slot), "prev": prev, "new": new,
+            "home_recap": is_home_recap, "observed_by": observed_by,
+        }
+        self._cap_events.append(ev)
+        # Keep only the most recent ~50 events.
+        if len(self._cap_events) > 50:
+            del self._cap_events[: len(self._cap_events) - 50]
+
+    def score(self) -> Dict[str, int]:
+        with self._lock:
+            return dict(self._caps)
+
+    def capture_events(self, limit: int = 20) -> List[dict]:
+        with self._lock:
+            return list(self._cap_events[-limit:])
 
     def _recompute_locked(self, now: float) -> None:
         for status in self._slots.values():

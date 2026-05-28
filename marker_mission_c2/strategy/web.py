@@ -65,6 +65,11 @@ def build_app(
             "roles": sorted(all_roles().keys()),
             "valid_teams": list(VALID_TEAMS),
             "valid_roles": list(VALID_ROLES),
+            # v7 scoring estimator: 1-pt baseline per observed enemy capture,
+            # 0 for home recapture. Conservative upper bound (no validation
+            # for now; see markers._record_capture).
+            "score": markers.score(),
+            "capture_events": markers.capture_events(limit=15),
         }))
 
     @app.route("/api/settings", methods=["GET"])
@@ -107,6 +112,15 @@ def build_app(
     def api_disarm():
         runner.disarm("web")
         return _no_cache(jsonify({"ok": True, "armed": runner.is_armed()}))
+
+    @app.route("/api/strategy/roster/reset", methods=["POST"])
+    def api_roster_reset():
+        """Drop every drone from this strategy's roster (and per-drone role
+        memory). Auto-adopt fills it back in from the C2 overview on the
+        next tick with fresh defaults (e.g. the current scout_alt_m, not a
+        stale persisted value)."""
+        removed = runner.reset_roster("web")
+        return _no_cache(jsonify({"ok": True, "removed": int(removed)}))
 
     @app.route("/api/strategy/mode", methods=["POST"])
     def api_mode():
@@ -316,6 +330,10 @@ _INDEX_HTML = r"""<!doctype html>
   <h1>SDC26 Strategy</h1>
   <span id="armed-pill" class="pill disarmed">disarmed</span>
   <span id="mode-pill" class="pill" title="MANUAL: you assign targets. AUTO: C2 reacts to slot changes.">MANUAL</span>
+  <span class="pill" title="v7 scoring estimator — observed enemy captures per team (1-pt baseline; 10/5-pt bonuses not yet detected)">
+    score: <span id="score-red" style="color:var(--red)">0</span>
+         · <span id="score-blue" style="color:var(--blue)">0</span>
+  </span>
   <span class="pill">tick <span id="tick">–</span></span>
   <span class="small">our team:</span>
   <select id="our-team">
@@ -326,6 +344,7 @@ _INDEX_HTML = r"""<!doctype html>
   <button id="mode-btn" class="warn" title="Toggle MANUAL / AUTO">Go AUTO</button>
   <button id="arm-btn" class="primary">Arm</button>
   <button id="disarm-btn">Disarm</button>
+  <button id="reset-btn" title="Drop every drone from the roster — auto-adopt then re-fills it from the C2 with fresh defaults. Useful for clearing ghost drones / stale per-drone settings.">Reset roster</button>
   <button id="land-btn" class="danger">Emergency Land</button>
 </header>
 
@@ -535,6 +554,9 @@ function renderSlots(state) {
     const by = s.last_seen_by || "—";
     const recent = (s.seen_by_recent || []).join(", ") || "none";
     const lastFace = s.last_observed_face_id ? `id ${s.last_observed_face_id}` : "—";
+    const lockHtml = s.locked
+        ? `<br><span style="color:var(--yellow)">🔒 lock ${(s.lock_remaining_s||0).toFixed(1)}s</span>`
+        : "";
     root.insertAdjacentHTML("beforeend", `
       <div class="slot ${cls}" title="seen by recent: ${recent}">
         ${ours ? '<span class="ours-tag">OURS</span>' : ''}
@@ -543,7 +565,7 @@ function renderSlots(state) {
           <span class="pair">${s.blue_face_id}/${s.red_face_id}</span>
         </div>
         <div class="holder">${holder}</div>
-        <div class="info">last face: ${lastFace}<br>seen: ${age}${by !== "—" ? " · " + by : ""}</div>
+        <div class="info">last face: ${lastFace}<br>seen: ${age}${by !== "—" ? " · " + by : ""}${lockHtml}</div>
       </div>
     `);
   }
@@ -574,6 +596,9 @@ function renderHeader(state) {
   const modeBtn = document.getElementById("mode-btn");
   modeBtn.textContent = auto ? "Go MANUAL" : "Go AUTO";
   document.getElementById("tick").textContent = state.runner ? state.runner.tick_count : "–";
+  const sc = state.score || {};
+  document.getElementById("score-red").textContent  = sc.red  ?? 0;
+  document.getElementById("score-blue").textContent = sc.blue ?? 0;
   const teamSel = document.getElementById("our-team");
   // Only update if user isn't currently interacting with it.
   if (document.activeElement !== teamSel) {
@@ -674,6 +699,12 @@ document.getElementById("arm-btn").addEventListener("click", async () => {
 });
 document.getElementById("disarm-btn").addEventListener("click", async () => {
   await api("/api/strategy/disarm", {method:"POST"});
+  refresh();
+});
+document.getElementById("reset-btn").addEventListener("click", async () => {
+  if (!confirm("Reset the roster? Every drone will be dropped; auto-adopt then refills it from the C2 with fresh defaults.")) return;
+  const r = await api("/api/strategy/roster/reset", {method:"POST"});
+  console.log("roster reset:", r);
   refresh();
 });
 document.getElementById("land-btn").addEventListener("click", async () => {

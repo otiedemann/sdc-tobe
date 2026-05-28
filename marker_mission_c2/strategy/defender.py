@@ -35,9 +35,65 @@ import logging
 from .roles import Decision, Role, RoleContext, noop, push, register
 # Reuse the attacker's primitive-composed capture script + helpers so the
 # defender adds NO new flight maneuvers of its own.
-from .attacker import _full_attack_script, _enemy_face_for, _slot_is_ours
+from .attacker import (
+    _full_attack_script, _enemy_face_for, _slot_is_ours, SLOT_POSITIONS_M,
+)
 
 logger = logging.getLogger(__name__)
+
+
+def _slot_home_team(slot: int) -> str:
+    """v7 §1.4.2 Table 1: boxes 1-3 RED home, 4-6 BLUE home."""
+    return "red" if 1 <= slot <= 3 else "blue"
+
+
+# Anti dead-duck patrol: regs §1.3 forbid "passive sitting or hovering
+# directly above the boxes". The defender pass-through dwell stays well
+# below the regs' anti-camp threshold (which the org doesn't quantify but
+# which we interpret as ~2 s). 0.5 s is enough for the box's RFID system
+# to register a defender presence (1-2 m altitude band) and interrupt any
+# in-progress enemy hover (per v7 §1.4.3 "no defending drone is detected").
+_PATROL_PASS_HOLD_S: float = 0.5
+
+# How many full triangle cycles per pushed patrol script. The match is
+# 10 minutes (600 s); each cycle takes roughly (3 boxes * (transit ~2 s
+# + 0.5 s pass-through)) ~= 7.5 s. 8 cycles ~ 1 min per push.
+_PATROL_CYCLES: int = 8
+
+
+def _patrol_script(ctx: RoleContext) -> str:
+    """Generate a continuous-triangle patrol script for the home boxes.
+
+    Uses only existing FC verbs (TAKEOFF / HEIGHT / TO / HOOVER) — the
+    drone climbs, then loops the 3 own-side boxes, dipping to the capture
+    altitude band briefly at each one (deliberately short so it never
+    counts as parking), then ends at home with a sustained hover so the
+    script never lands during the match (regs §1.3 + our own no-land rule).
+    """
+    our = ctx.our_team
+    home_slots = [sl for sl in ctx.active_slots if _slot_home_team(sl) == our]
+    # Sort so the drone always visits in the same x order — easier to
+    # eyeball in the 3D view and gives a predictable cycle time.
+    home_slots.sort(key=lambda sl: SLOT_POSITIONS_M.get(sl, (0.0, 0.0))[0])
+
+    cruise_alt = max(2.0, float(ctx.cruise_alt_m or ctx.drone.attack_alt_m or 2.2))
+    detect_alt = 1.5   # middle of the 1-2 m RFID detection band
+
+    lines: list[str] = ["TAKEOFF", f"HEIGHT {cruise_alt:.2f}"]
+    for _ in range(max(1, _PATROL_CYCLES)):
+        for sl in home_slots:
+            x, y = SLOT_POSITIONS_M[sl]
+            lines.append(f"TO {x:g} {y:g}")
+            lines.append(f"HEIGHT {detect_alt:.2f}")
+            lines.append(f"HOOVER {_PATROL_PASS_HOLD_S:.1f}")
+            lines.append(f"HEIGHT {cruise_alt:.2f}")
+    # End at home centre with a long hover (we never LAND mid-match).
+    home_y = -8.0 if our == "red" else 8.0
+    lines.append(f"TO 0 {home_y:g}")
+    lines.append(f"HEIGHT {cruise_alt:.2f}")
+    home_hold = max(30.0, float(getattr(ctx.match, "home_hover_s", 600.0)))
+    lines.append(f"HOOVER {home_hold:.0f}")
+    return "\n".join(lines) + "\n"
 
 
 class DefenderRole(Role):
@@ -59,7 +115,24 @@ class DefenderRole(Role):
         # ---- idle: waiting for a threatened own slot ----------------------
         if rs.phase in ("", "idle", "done"):
             if slot is None:
-                return noop("defender: holding (no threatened slot)")
+                # No assigned threat — run an anti dead-duck patrol that
+                # passes through every own-slot RFID zone briefly, then
+                # ends at home with a sustained hover. Same FC INIT +
+                # home-presence gates as the re-capture path.
+                if ctx.state.phase not in ("init", "done", ""):
+                    return noop(
+                        f"defender: airborne (fc phase={ctx.state.phase}); "
+                        f"holding — FC must be INIT to start a patrol"
+                    )
+                if not ctx.in_home_now:
+                    return noop(
+                        "defender: not in home zone yet; cannot start patrol"
+                    )
+                return push(
+                    _patrol_script(ctx),
+                    new_phase="patrolling",
+                    reason="defender: anti-camp patrol of own slots",
+                )
             # Only defend OUR slots; ignore a mis-assigned enemy slot.
             if slot not in ctx.active_slots:
                 return noop(f"defender: slot {slot} not active")
