@@ -50,6 +50,10 @@ FRESHNESS_S = 1.5
 # flip), arming this many seconds of "skip me" for the planner.
 CAPTURE_LOCK_S = 5.0
 
+# v7 §1.4.3 Special Maneuver ("sudden-death" / instant-win): holding ALL six
+# boxes in our colour continuously for this many seconds ends the match.
+SPECIAL_MANEUVER_HOLD_S = 5.0
+
 
 @dataclass
 class SlotStatus:
@@ -89,6 +93,17 @@ class MarkerTracker:
         self._caps: Dict[str, int] = {"red": 0, "blue": 0}
         # Last few capture events for the UI / future 10-pt detection.
         self._cap_events: List[dict] = []
+        # v7 §1.4.3 Special Maneuver: holding ALL six boxes our colour for
+        # ≥ 5 s ends the match (= "sudden-death" / instant win). We track
+        # the timestamp the all-ours state first became true (per team);
+        # cleared the instant any slot is not that team's colour. The
+        # runner polls match_status(our_team, now) on every tick and emits
+        # the "match_won" event once the dwell crosses the threshold.
+        self._all_ours_since: Dict[str, float] = {"red": 0.0, "blue": 0.0}
+        # True once we've emitted match_won for a given team this match —
+        # we only emit it once so the event log doesn't fill up with
+        # duplicates while the win condition continues to hold.
+        self._won_emitted: Dict[str, bool] = {"red": False, "blue": False}
         self._set_active_slots_locked(tuple(active_slots))
 
     # ------------------------------------------------------------------
@@ -157,22 +172,66 @@ class MarkerTracker:
             # Recompute "seen_by_recent" for every active slot.
             self._recompute_locked(now)
 
+    # v7 §1.4.3 sync window for double-strike detection. Two captures by
+    # the same team on DIFFERENT slots within this window count as a
+    # 10-pt event (5 pts each); both flips get retro-upgraded the moment
+    # the second one lands.
+    SYNC_WINDOW_S: float = 1.0
+
     def _record_capture(self, slot: int, prev: str, new: str,
                         now: float, observed_by: Optional[str]) -> None:
         """v7 scoring: record an observed holder change.
 
-        Awards +1 to ``new`` if this is a capture AWAY from the slot's home
-        team (i.e. the attacking team scored). A flip BACK to the home team
-        is a home recap (0 pts per regs §1.4.3) — we still log the event so
-        the UI can show recent action.
+        v7 §1.4.3 awards points by play kind, not per flip:
+
+            * **1 pt**   single drone captures an enemy box and returns home
+            * **5 pts**  capture moment + return with all our drones outside
+                         home (= "full sortie")
+            * **10 pts** two different enemy boxes flipped by the same team
+                         within ≤ 1 s (= "double-strike")
+
+        The C2 doesn't see the drone-return condition directly, so 1-pt
+        is the conservative floor. 10-pt is detectable here: when a new
+        flip lands, scan the last SYNC_WINDOW_S of capture events; if
+        the same team already flipped a DIFFERENT slot in that window,
+        upgrade BOTH flips to 5 pts (= 10 pts total for the pair).
+
+        Home recaptures (flip back to the slot's home team) are 0 pts.
         """
         home = _slot_home_team(slot)
         is_home_recap = (new == home)
+        # Baseline: 1 pt for an enemy capture, 0 pts for a home recap.
+        pts = 0 if is_home_recap else 1
+        sync_pair_slot: Optional[int] = None
         if not is_home_recap and new in self._caps:
-            self._caps[new] += 1
+            # Look for a sync-pair partner — a flip by the same team, on
+            # a DIFFERENT slot, inside the 1-s window.
+            for prev_ev in reversed(self._cap_events):
+                if now - prev_ev.get("unix_s", 0.0) > self.SYNC_WINDOW_S:
+                    break
+                if (prev_ev.get("new") == new
+                        and prev_ev.get("slot") != int(slot)
+                        and not prev_ev.get("home_recap")
+                        and prev_ev.get("play_kind") != "double_strike_10"):
+                    sync_pair_slot = int(prev_ev["slot"])
+                    # Retro-upgrade the prior flip: was 1 pt, becomes 5.
+                    bump = 5 - int(prev_ev.get("pts", 1))
+                    if bump > 0:
+                        self._caps[new] += bump
+                    prev_ev["pts"] = 5
+                    prev_ev["play_kind"] = "double_strike_10"
+                    prev_ev["sync_pair_slot"] = int(slot)
+                    pts = 5  # this flip also counts as the 5-pt half
+                    break
+            self._caps[new] += pts
         ev = {
             "unix_s": now, "slot": int(slot), "prev": prev, "new": new,
             "home_recap": is_home_recap, "observed_by": observed_by,
+            "pts": pts,
+            "play_kind": ("home_recap_0" if is_home_recap
+                          else "double_strike_10" if sync_pair_slot is not None
+                          else "single_strike_1"),
+            "sync_pair_slot": sync_pair_slot,
         }
         self._cap_events.append(ev)
         # Keep only the most recent ~50 events.
@@ -182,6 +241,60 @@ class MarkerTracker:
     def score(self) -> Dict[str, int]:
         with self._lock:
             return dict(self._caps)
+
+    # ------------------------------------------------------------------
+    # Special Maneuver / instant-win detection
+    # ------------------------------------------------------------------
+
+    def match_status(self, our_team: str, now: float) -> dict:
+        """Return the v7 Special-Maneuver dwell state for ``our_team``.
+
+        Returns a dict with::
+
+            all_ours        bool     — all 6 slots are currently our colour
+            since           float|0  — unix ts the all-ours state started
+            dwell_s         float    — seconds the all-ours state has held
+            threshold_s     float    — regs §1.4.3 = 5 s
+            won             bool     — dwell_s >= threshold (instant win)
+            just_won        bool     — first tick where ``won`` is True
+                                       (use to emit a one-shot event)
+
+        Mutates internal state: if the all-ours condition just became
+        true we start the timer here; if it just became false we clear
+        it. Idempotent within a tick (re-calling for the same team and
+        the same world view returns the same answer).
+        """
+        with self._lock:
+            our_team = (our_team or "").lower()
+            if our_team not in ("red", "blue"):
+                return {"all_ours": False, "since": 0.0, "dwell_s": 0.0,
+                        "threshold_s": SPECIAL_MANEUVER_HOLD_S,
+                        "won": False, "just_won": False}
+            holders = [s.holder for s in self._slots.values()]
+            all_ours = bool(holders) and all(h == our_team for h in holders)
+            since = self._all_ours_since.get(our_team, 0.0)
+            if all_ours and since <= 0.0:
+                # First tick of all-ours — start the dwell timer.
+                self._all_ours_since[our_team] = now
+                since = now
+            elif not all_ours and since > 0.0:
+                # Lost the all-ours condition — reset both timer + won flag.
+                self._all_ours_since[our_team] = 0.0
+                self._won_emitted[our_team] = False
+                since = 0.0
+            dwell = (now - since) if (all_ours and since > 0.0) else 0.0
+            won = bool(all_ours and dwell >= SPECIAL_MANEUVER_HOLD_S)
+            just_won = bool(won and not self._won_emitted.get(our_team, False))
+            if just_won:
+                self._won_emitted[our_team] = True
+            return {
+                "all_ours": all_ours,
+                "since": float(since),
+                "dwell_s": float(dwell),
+                "threshold_s": float(SPECIAL_MANEUVER_HOLD_S),
+                "won": won,
+                "just_won": just_won,
+            }
 
     def capture_events(self, limit: int = 20) -> List[dict]:
         with self._lock:

@@ -55,6 +55,7 @@ def build_app(
 
     @app.route("/api/state")
     def api_state():
+        import time as _time
         s = settings.to_dict()
         our_team = s["markers"]["our_team"]
         return _no_cache(jsonify({
@@ -65,11 +66,17 @@ def build_app(
             "roles": sorted(all_roles().keys()),
             "valid_teams": list(VALID_TEAMS),
             "valid_roles": list(VALID_ROLES),
-            # v7 scoring estimator: 1-pt baseline per observed enemy capture,
-            # 0 for home recapture. Conservative upper bound (no validation
-            # for now; see markers._record_capture).
+            # v7 scoring (regs §1.4.3):
+            #   1 pt   single drone enemy capture
+            #   5 pts  full-sortie (all our drones outside home) ← future
+            #  10 pts  double-strike (2 enemy slots within 1 s, same team)
+            #          → split as 5 pts × 2 in the per-flip events
+            # ``score`` is the running per-team total of points awarded so
+            # far. ``match_status`` reflects v7 Special Maneuver state for
+            # OUR team: dwell timer + instant-win flag.
             "score": markers.score(),
             "capture_events": markers.capture_events(limit=15),
+            "match_status": markers.match_status(our_team, _time.time()),
         }))
 
     @app.route("/api/settings", methods=["GET"])
@@ -330,9 +337,12 @@ _INDEX_HTML = r"""<!doctype html>
   <h1>SDC26 Strategy</h1>
   <span id="armed-pill" class="pill disarmed">disarmed</span>
   <span id="mode-pill" class="pill" title="MANUAL: you assign targets. AUTO: C2 reacts to slot changes.">MANUAL</span>
-  <span class="pill" title="v7 scoring estimator — observed enemy captures per team (1-pt baseline; 10/5-pt bonuses not yet detected)">
+  <span class="pill" title="v7 scoring (regs §1.4.3): 1 pt singleton, 10 pt double-strike sync (auto-detected within 1 s window). 5 pt full-sortie bonus pending.">
     score: <span id="score-red" style="color:var(--red)">0</span>
          · <span id="score-blue" style="color:var(--blue)">0</span>
+  </span>
+  <span id="special-pill" class="pill" style="display:none" title="v7 §1.4.3 Special Maneuver: holding all 6 slots in our colour for ≥ 5 s ends the match — INSTANT WIN">
+    Special: <span id="special-text">–</span>
   </span>
   <span class="pill">tick <span id="tick">–</span></span>
   <span class="small">our team:</span>
@@ -599,6 +609,26 @@ function renderHeader(state) {
   const sc = state.score || {};
   document.getElementById("score-red").textContent  = sc.red  ?? 0;
   document.getElementById("score-blue").textContent = sc.blue ?? 0;
+  // v7 §1.4.3 Special Maneuver banner. Three states the operator cares about:
+  //   - hidden:          no all-ours dwell yet (nothing imminent)
+  //   - "5/6 → X.Xs/5s": all-ours running, win imminent (count up to 5 s)
+  //   - "WON!":          dwell crossed the threshold; instant-win triggered
+  const ms = state.match_status || {};
+  const specialPill = document.getElementById("special-pill");
+  const specialText = document.getElementById("special-text");
+  if (ms.won) {
+    specialPill.style.display = "";
+    specialPill.style.background = "var(--green, #1b6e2c)";
+    specialPill.style.color = "#fff";
+    specialText.textContent = "MATCH WON!";
+  } else if (ms.all_ours && ms.dwell_s != null) {
+    specialPill.style.display = "";
+    specialPill.style.background = "";  // default pill bg
+    specialPill.style.color = "";
+    specialText.textContent = `holding 6/6 — ${ms.dwell_s.toFixed(1)}/${ms.threshold_s.toFixed(1)}s`;
+  } else {
+    specialPill.style.display = "none";
+  }
   const teamSel = document.getElementById("our-team");
   // Only update if user isn't currently interacting with it.
   if (document.activeElement !== teamSel) {

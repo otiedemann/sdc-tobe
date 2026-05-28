@@ -336,16 +336,27 @@ class SwarmRunner:
                 self._markers.ingest(fc_name, ids)
 
         # 3a) Auto-adopt: any FC the C2 reports that isn't in our roster
-        # yet is added automatically (idle + no team until the operator
-        # assigns it), so drones added to the C2 config just appear in the
-        # strategy without a restart or --fc-names. The operator still
-        # decides team + role, so nothing flies on adoption.
+        # yet is added automatically — and we PRE-FILL the team + role so
+        # the operator only has to Arm + AUTO instead of clicking through
+        # every drone. Team is sniffed from the FC name prefix ("red*" →
+        # red, "blue*" → blue); anything else stays unassigned. The default
+        # role is "attacker" — the planner will only act on attackers that
+        # share our_team, and the dashboard lets the operator flip an
+        # individual drone to "defender" / "scout" / "idle" if they want.
         known = {d.fc_name for d in s.drones}
         new_fcs = [fc for fc in overview.keys() if fc and fc not in known]
         if new_fcs:
             for fc in sorted(new_fcs):
-                self._settings.update_drone(fc)   # defaults: team=None, role=idle
-                self._events.add("adopt", "discovered from C2; set team + role", drone=fc)
+                name = fc.lower()
+                team = ("red" if name.startswith("red")
+                        else "blue" if name.startswith("blue")
+                        else None)
+                self._settings.update_drone(fc, team=team, role="attacker")
+                self._events.add(
+                    "adopt",
+                    f"discovered from C2; pre-set team={team or '?'} role=attacker",
+                    drone=fc,
+                )
             s = self._settings.snapshot()          # refresh so they dispatch this tick
 
         # 3b) AUTO mode: auto-assign target slots within operator-set roles
@@ -357,6 +368,22 @@ class SwarmRunner:
                 self._auto_plan(s)
             except Exception:
                 logger.exception("strategy: auto-plan crashed (continuing)")
+
+        # 3b.5) v7 §1.4.3 Special-Maneuver detection. If our team holds all
+        # six slots continuously for ≥ 5 s the match ends with an instant
+        # win. We poll the marker tracker each tick and emit a one-shot
+        # ``match_won`` event the moment the dwell crosses the threshold.
+        try:
+            our_team = (s.markers.our_team or "").lower()
+            ms = self._markers.match_status(our_team, time.time())
+            if ms.get("just_won"):
+                self._events.add(
+                    "match_won",
+                    f"Special Maneuver: {our_team} held all 6 slots for "
+                    f"{ms['dwell_s']:.1f}s — INSTANT WIN",
+                )
+        except Exception:
+            logger.exception("strategy: match_status check crashed (continuing)")
 
         # 3c) Height deconfliction: assign each enabled drone a DISTINCT
         # cruise altitude so two drones never loiter/transit at the same

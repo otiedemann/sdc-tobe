@@ -121,11 +121,16 @@ def plan(settings, markers, overview: dict, role_states: dict, now: float
     # Free drones, partitioned by operator-set role. A drone is "free" only
     # when it has no target, isn't mid-run, AND can actually start a new
     # mission right now (FC INIT + in own home zone per v7 §1.4.4).
+    # MUST also be on OUR team — both strategies (red + blue) auto-adopt
+    # every FC, so without this filter the red planner would happily
+    # dispatch blue drones (and vice-versa).
     free_attackers: list[str] = []
     free_defenders: list[str] = []
     for d in settings.drones:
         if not d.enabled or not d.team:
             continue
+        if d.team != our:
+            continue   # other team's drone — not ours to command
         rs = role_states.get(d.fc_name)
         if not _is_free(rs):
             continue
@@ -141,6 +146,19 @@ def plan(settings, markers, overview: dict, role_states: dict, now: float
 
     assignments: list[PlayAssignment] = []
     taken: set[int] = set()
+
+    # ----- (0) Special-Maneuver hold — don't break our own all-ours -----
+    # When we already hold all 6 slots, the v7 §1.4.3 Special Maneuver
+    # ("sudden-death") win is just 5 s of dwell away. Pushing new attack
+    # scripts during this window would (a) waste battery, (b) leave home
+    # under-defended, (c) risk a flip-back race if the enemy ALSO arrives.
+    # Best behaviour: emit no new assignments and let the marker tracker's
+    # all-ours timer expire into a match_won event. The defender role's
+    # existing patrol script keeps drones present in the RFID zones,
+    # blocking any in-flight enemy capture during the 5-s window.
+    all_ours = bool(active) and all(holder.get(sl) == our for sl in active)
+    if all_ours:
+        return []  # let the win timer expire — no further dispatch
 
     # ----- (1) Defensive re-capture — highest priority -----------------
     # An own slot held by the enemy is BLEEDING points; recap it instantly
@@ -158,13 +176,60 @@ def plan(settings, markers, overview: dict, role_states: dict, now: float
         ))
         taken.add(sl)
 
-    # ----- (2) 10-pt double-strike — sync two strikers ------------------
+    # Enemy slots we can actually attack right now (not already ours,
+    # not in 5-s post-capture lock, not already taken by a defend assignment).
+    attackable = [sl for sl in enemy_slots
+                  if holder.get(sl) != our and sl not in locked and sl not in taken]
+
+    # ----- (2) 5-pt full-sortie — preferred when we can cover EVERYTHING --
+    # v7 §1.4.3 awards 5 pts per capture when ALL our drones are outside
+    # home at the moment of capture. The easiest way to set that up is to
+    # send every free attacker out on the same planner tick AND have them
+    # cover every attackable slot — so no drone is left parked at home
+    # waiting for a target. We prefer this over a 10-pt double-strike
+    # when feasible: a 10-pt sync nets 10 (one event); a 3-slot full
+    # sortie can net 5+5+5 = 15 (three captures, all 5-pt) AND the first
+    # two captures may also land within 1 s of each other, retro-upgraded
+    # to 5+5 of double-strike anyway.
+    if (len(free_attackers) >= len(attackable) >= 2):
+        from .attacker import SLOT_POSITIONS_M as _SP
+        import math as _m
+
+        def _d2(pos, slot):
+            sx, sy = _SP.get(slot, (0.0, 0.0))
+            return _m.hypot(float(pos[0]) - sx, float(pos[1]) - sy)
+
+        positions = {fc: _drone_state(overview, fc).get("world_position_m")
+                     or [0.0, 0.0, 0.0]
+                     for fc in free_attackers}
+        # Greedy nearest-slot assignment over the full attackable set.
+        sortie: list[tuple[str, int]] = []
+        used_fcs: set[str] = set()
+        for sl in attackable:
+            cand = [fc for fc in free_attackers if fc not in used_fcs]
+            if not cand:
+                break
+            fc = min(cand, key=lambda f: _d2(positions[f], sl))
+            sortie.append((fc, sl))
+            used_fcs.add(fc)
+        if len(sortie) >= 2:
+            reason = ("v7 5-pt full-sortie: "
+                      + " + ".join(f"{fc}->{sl}" for fc, sl in sortie))
+            for fc, sl in sortie:
+                assignments.append(PlayAssignment(
+                    fc_name=fc, slot=sl, play_kind="full_sortie_5",
+                    reason=reason,
+                ))
+                taken.add(sl)
+            free_attackers = [fc for fc in free_attackers if fc not in used_fcs]
+            # Refresh attackable for the next stages.
+            attackable = [sl for sl in attackable if sl not in taken]
+
+    # ----- (3) 10-pt double-strike — sync two strikers ------------------
     # Two free attackers + two unlocked enemy slots we don't already hold.
     # For sub-second sync we want the pairing whose two flight times match
     # as closely as possible — i.e. minimise MAX(distance) across the pair.
     # With <= 3 enemy slots and 2 drones it's a tiny brute-force search.
-    attackable = [sl for sl in enemy_slots
-                  if holder.get(sl) != our and sl not in locked and sl not in taken]
     if len(free_attackers) >= 2 and len(attackable) >= 2:
         from .attacker import SLOT_POSITIONS_M
         import math
@@ -210,7 +275,7 @@ def plan(settings, markers, overview: dict, role_states: dict, now: float
             ))
             taken.add(sl1); taken.add(sl2)
 
-    # ----- (3) 1-pt singletons — any remaining free attackers -----------
+    # ----- (4) 1-pt singletons — any remaining free attackers -----------
     for sl in attackable:
         if sl in taken:
             continue
