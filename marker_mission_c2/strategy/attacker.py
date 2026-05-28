@@ -112,6 +112,15 @@ DRIFT_OVER_BOX_DURATION_S: float = 0.3
 # box top during the brief sideways momentum-bleed.
 DRIFT_OVER_BOX_UD_RC: int = 20
 
+# v7 §1.4.3 capture rule: the attacker must hover over the target box
+# for ≥ 2 s within the 1-2 m RFID detection band for the flip to
+# register. 2.5 s gives a 25 % safety margin over the regulation floor
+# (sim tick rounding + brief drift outside capture radius can both eat
+# 100-300 ms of the dwell window). Emitted as a HOOVER step right after
+# the drift, before YAW_IMU 180 / RTH — uses only the existing FC verb
+# (per the "no new FC functions, build strictly the C2" constraint).
+CAPTURE_HOLD_HOVER_S: float = 2.5
+
 # Combined-motion sticks for the "climb + cruise" RC step that
 # replaces dedicated HEIGHT + FB_RC sequences. Anafi accepts all four
 # sticks on a single PCMD frame — sending fb + ud simultaneously
@@ -381,6 +390,12 @@ def _full_attack_script(
     # bare UD_RC climb when no deconflicted altitude is supplied.
     cruise_alt = max(1.4, float(ctx.cruise_alt_m)) if ctx.cruise_alt_m else 0.0
     height_step = f"HEIGHT {cruise_alt:.2f}" if cruise_alt else ""
+    # v7 §1.4.3 capture needs the drone in the 1-2 m RFID detection band.
+    # If the deconflicted cruise altitude is above that band (large rosters
+    # push scouts/attackers up to ~3 m+), we MUST descend just before the
+    # target brake or the capture never registers. Aim for the middle of
+    # the band (1.5 m) — well inside z_min/z_max and clear of box tops.
+    CAPTURE_DESCENT_ALT_M = 1.5
     return _format_script(
         "TAKEOFF",
         # CLIMB FIRST — Anafi settles at ~0.9m post-takeoff; slot
@@ -395,6 +410,11 @@ def _full_attack_script(
         height_step,
         # Combined RC for the long cruise.
         close_in_step,
+        # Descend into the 1-2 m capture band BEFORE braking on the
+        # target. Without this, an attacker deconflicted to >2 m cruise
+        # arrives above the RFID detection band and the capture rule
+        # (z in [1, 2] m) never triggers.
+        f"HEIGHT {CAPTURE_DESCENT_ALT_M:.2f}",
         # FB_BRAKE on the target's face marker, with explicit world
         # coords passed in so the controller's world-fallback brake
         # works (slot face markers aren't in arena_config).
@@ -404,9 +424,23 @@ def _full_attack_script(
         # to stay above the box top during momentum bleed).
         f"RC 0 {DRIFT_OVER_BOX_RC} {DRIFT_OVER_BOX_UD_RC} 0 "
         f"{DRIFT_OVER_BOX_DURATION_S:.2f}",
+        # Settle precisely over the box centre. FB_BRAKE stops at
+        # FB_BRAKE_TARGET_STOP_M (~1.5 m) from the box; the drift above
+        # pushes us forward but momentum + position noise can leave the
+        # drone outside the capture radius (sim: 0.8 m; the RFID detector
+        # zone in real life is similarly tight). TO is precise xy goto
+        # (existing FC verb) with ARRIVE_XY=0.25 m — well inside the
+        # capture radius. Without this the next HOOVER can dwell *next
+        # to* the box instead of *over* it, and the flip never registers.
+        f"TO {target_xy[0]:g} {target_xy[1]:g}" if target_xy else "",
+        # v7 §1.4.3 capture rule: the drone must hover ≥ 2 s within the
+        # 1-2 m RFID band over the box for the flip to register. Without
+        # this step the brief drift above isn't enough dwell — the box
+        # never changes colour. Uses the existing HOOVER FC verb (no new
+        # FC functions); 2.5 s = 2 s requirement + safety margin against
+        # tick rounding / brief drift outside the capture radius.
+        f"HOOVER {CAPTURE_HOLD_HOVER_S:.1f}",
         "YAW_IMU 180",
-        # No HOOVER — RTH starts immediately. Capture detection is
-        # the scout role's job; the attacker just commits and runs.
         *rth_lines,
     )
 
