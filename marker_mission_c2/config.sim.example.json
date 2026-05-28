@@ -1,0 +1,19 @@
+{
+  "_comment": "Sample C2 config for connecting the strategy stack to the SIMULATOR. Each FC entry is a marker_mission.app instance (sim drone OR real drone — the C2 doesn't distinguish; it only sees the marker_mission HTTP API: /api/state, /api/start, /api/rc, /api/mission). Run: .venv-c2/bin/python -m marker_mission_c2 --config marker_mission_c2/config.sim.example.json (then strategy: .venv-c2/bin/python -m marker_mission_c2.strategy --config marker_mission_c2/config.sim.example.json --host 127.0.0.1). For the real venue, switch the fcs[].host entries to flightctrlN.tail131b64.ts.net (or the LAN hostname).",
+  "bind": {"host": "127.0.0.1", "port": 8090},
+  "fcs": [
+    {"name": "sim-1", "host": "127.0.0.1", "port": 8080,
+     "_note": "single-host sim with multiple FC processes on different ports"},
+    {"name": "sim-2", "host": "127.0.0.1", "port": 8081},
+    {"name": "sim-3", "host": "127.0.0.1", "port": 8082},
+    {"name": "sim-4", "host": "127.0.0.1", "port": 8083},
+    {"name": "sim-5", "host": "127.0.0.1", "port": 8084}
+  ],
+  "_fcs_alt_remote_sim": "ALTERNATIVE: a single shared sim host with many FCs all on :8080 (different hostnames). Example: [{\"name\":\"sim-1\",\"host\":\"sim1.tail131b64.ts.net\",\"port\":8080}, ...]",
+  "emergency_land_key": "?",
+  "state_poll_hz": 5.0,
+  "ui_refresh_hz": 2.0,
+  "fc_request_timeout_s": 2.0,
+  "library_dir": "marker_mission_c2/calibrations",
+  "log_level": "INFO"
+}

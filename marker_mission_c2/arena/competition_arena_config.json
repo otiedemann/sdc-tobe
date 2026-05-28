@@ -1,0 +1,28 @@
+{
+  "_comment": "SDC26 v7 OFFICIAL competition arena (ILA Berlin, 11 Jun 2026). Drop into ~/.marker_mission/active_arena_config.json on each FC. Coordinate convention matches strategy/roles.in_home_zone + strategy/attacker.py: long axis = Y (20 m, red home y in [-10,-5], blue home y in [5,10]); width = X (10 m, x in [-5,+5]); origin at field centre. Marker placement per regs §4.4 Fig 3: 8 pillars x 2 markers (upper z=4 m IDs 1-8, lower z=2 m IDs 9-16), DICT_4X4_50, 0.5 m square markers.",
+  "marker_size_m": 0.5,
+  "width_m": 10.0,
+  "depth_m": 20.0,
+  "top_z_m": 4.0,
+  "bottom_z_m": 2.0,
+  "magnetic_north_arena_yaw_deg": 0.0,
+  "_magnetic_north_note": "PLACEHOLDER 0.0 — MUST be measured on-site at ILA Berlin and patched in before flight (POST /api/arena/active on each FC, or edit the file and restart marker-mission). The single-marker positioning branch picker (magnetometer-validated IPPE) needs this; with a wrong value it can land on the wrong (mirrored) branch and the wall guard / world-seek will drive the drone the wrong way.",
+  "markers": [
+    {"id":  1, "label": "blue-end upper",      "wall": "+y", "x":  0.0, "y":  10.0, "z": 4.0},
+    {"id":  2, "label": "+x near-blue upper",  "wall": "+x", "x":  5.0, "y":   5.0, "z": 4.0},
+    {"id":  3, "label": "+x middle upper",     "wall": "+x", "x":  5.0, "y":   0.0, "z": 4.0},
+    {"id":  4, "label": "+x near-red upper",   "wall": "+x", "x":  5.0, "y":  -5.0, "z": 4.0},
+    {"id":  5, "label": "red-end upper",       "wall": "-y", "x":  0.0, "y": -10.0, "z": 4.0},
+    {"id":  6, "label": "-x near-red upper",   "wall": "-x", "x": -5.0, "y":  -5.0, "z": 4.0},
+    {"id":  7, "label": "-x middle upper",     "wall": "-x", "x": -5.0, "y":   0.0, "z": 4.0},
+    {"id":  8, "label": "-x near-blue upper",  "wall": "-x", "x": -5.0, "y":   5.0, "z": 4.0},
+    {"id":  9, "label": "blue-end lower",      "wall": "+y", "x":  0.0, "y":  10.0, "z": 2.0},
+    {"id": 10, "label": "+x near-blue lower", "wall": "+x", "x":  5.0, "y":   5.0, "z": 2.0},
+    {"id": 11, "label": "+x middle lower",    "wall": "+x", "x":  5.0, "y":   0.0, "z": 2.0},
+    {"id": 12, "label": "+x near-red lower",  "wall": "+x", "x":  5.0, "y":  -5.0, "z": 2.0},
+    {"id": 13, "label": "red-end lower",      "wall": "-y", "x":  0.0, "y": -10.0, "z": 2.0},
+    {"id": 14, "label": "-x near-red lower",  "wall": "-x", "x": -5.0, "y":  -5.0, "z": 2.0},
+    {"id": 15, "label": "-x middle lower",    "wall": "-x", "x": -5.0, "y":   0.0, "z": 2.0},
+    {"id": 16, "label": "-x near-blue lower", "wall": "-x", "x": -5.0, "y":   5.0, "z": 2.0}
+  ]
+}
