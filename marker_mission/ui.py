@@ -22,10 +22,24 @@ from __future__ import annotations
 
 import datetime as _dt
 import json
+import subprocess as _sp
 import threading
 import time
 from pathlib import Path
 from typing import Callable, Optional
+
+
+def _git_sha() -> str:
+    try:
+        return _sp.check_output(
+            ["git", "-C", str(Path(__file__).parent), "rev-parse", "--short", "HEAD"],
+            stderr=_sp.DEVNULL, text=True,
+        ).strip()
+    except Exception:
+        return "unknown"
+
+
+_GIT_SHA = _git_sha()
 
 import cv2
 import numpy as np
@@ -122,6 +136,8 @@ _PAGE_HEADER = """
   </nav>
   <span style="margin-left:auto; font-size:.85rem; color:#aab;"
         id="phase">{{ header_label or 'phase: …' }}</span>
+  <span style="font-size:.75rem; color:#555; font-family:monospace;"
+        title="software version">{{ git_sha }}</span>
 </header>
 """
 
@@ -3826,6 +3842,7 @@ class UiServer:
                 drone_connected=self.drone_connected,
                 killswitch_key=killswitch_key(),
                 initial_phase=current_phase,
+                git_sha=_GIT_SHA,
             )
             base.update(overrides)
             return base
