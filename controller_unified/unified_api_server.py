@@ -3287,13 +3287,22 @@ class OlympeBackend(DroneBackend):
                     pass
                 time.sleep(0.3)   # let Olympe tear down before we re-start
 
-            # Detect API — still inside the mutex so no concurrent caller
-            # can race between detection and start.
+            # Detect API — retry up to 3 times with a short delay.
+            # After a _media_removed_impl callback Olympe rebuilds its
+            # streaming object internally; set_callbacks briefly disappears
+            # during that window, causing a spurious "no streaming API" error.
             api = "none"
-            if hasattr(d, "streaming") and hasattr(d.streaming, "set_callbacks"):
-                api = "modern"
-            elif hasattr(d, "set_streaming_callbacks"):
-                api = "legacy"
+            for _attempt in range(4):
+                if hasattr(d, "streaming") and hasattr(d.streaming, "set_callbacks"):
+                    api = "modern"
+                    break
+                elif hasattr(d, "set_streaming_callbacks"):
+                    api = "legacy"
+                    break
+                if _attempt < 3:
+                    print(f"[ANAFI] streaming API not ready yet, retrying in 1 s "
+                          f"(attempt {_attempt + 1}/3)…")
+                    time.sleep(1.0)
             print(f"[ANAFI] Olympe streaming API: {api}")
 
             _video_mode = "mjpeg"
