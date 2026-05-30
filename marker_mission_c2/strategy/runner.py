@@ -526,50 +526,55 @@ class SwarmRunner:
     def _deconflicted_cruise_alts(self, s) -> Dict[str, float]:
         """Return {fc_name: cruise_altitude_m}, distinct across BOTH teams.
 
-        Every drone gets its own cruise height so no two ever share a transit
-        altitude — the requirement is >= MIN_GAP (0.30 m) between ANY two
-        drones, INCLUDING enemy drones crossing the neutral zone.
+        Every drone gets its own height so no two ever share one — the rule is
+        >= MIN_GAP (0.30 m) between ANY two drones, including enemy drones. We
+        can't see enemy drones (regs §1.3), so both teams follow one fixed
+        shared CONVENTION keyed off team colour: RED takes EVEN rungs, BLUE the
+        ODD ones, so the two ladders interleave to >= MIN_GAP without either
+        side reading the other's altitudes. Two bands:
 
-        We can't see enemy drones (regs §1.3), so we can't read their
-        altitudes. Instead both teams follow one fixed, shared CONVENTION
-        keyed off team colour: a single global altitude grid in MIN_GAP rungs,
-        with RED taking the EVEN rungs and BLUE the ODD ones. Each side only
-        ever computes its own rungs (no enemy access), yet the two ladders
-        interleave to a guaranteed >= MIN_GAP global separation:
+        SCOUTS fly LOW — level with the ~1 m box faces — so they actually SEE
+        the slot markers and keep the slot-state belief fresh. A high scout is
+        useless for this: the box face sits at ~1 m, so from 3.9 m the line to
+        a centre slot is sqrt(7.5^2 + 2.9^2) ~ 8.0 m — past the 8 m vision
+        range — AND hits the marker at a steep angle. Dropping to ~1 m brings
+        it to 7.5 m (in range) and head-on.
+            red scout  -> SCOUT_BASE + 0*GAP = 1.0 m
+            blue scout -> SCOUT_BASE + 1*GAP = 1.3 m
 
-            rung k -> BASE + k*MIN_GAP        BASE = 1.50 m (clears 1.4 m boxes)
-            red  (even k) -> 1.50, 2.10, 2.70, 3.30, 3.90, ...
-            blue (odd  k) -> 1.80, 2.40, 3.00, 3.60, 4.20, ...
+        MOVERS (attackers + defenders) fly the CRUISE band, above the 1.4 m box
+        tops for collision-free transit and >= MIN_GAP above the highest scout:
+            red  -> 1.6, 2.2, 2.8, 3.4   blue -> 1.9, 2.5, 3.1, 3.7
 
-        Within a team that's 0.60 m apart; across teams 0.30 m — so even the
-        two scouts, which both loiter at the arena centre (0,0), sit at
-        different heights instead of the same point in space. Drones are
-        ordered by preferred altitude (scouts highest) then fc_name, so the
-        mapping is stable across ticks. Capped at MAX_ALT_M; overflow drones
-        (a ghost-laden roster) share the cap — clean stale drones instead.
+        All 10: 1.0 1.3 1.6 1.9 2.2 2.5 2.8 3.1 3.4 3.7 — uniform 0.30 m apart.
+        Capped at MAX_ALT_M; ordered by fc_name for a stable mapping.
         """
-        MIN_GAP = 0.30      # >= 30 cm between ANY two drones (both teams)
-        BASE_ALT_M = 1.50   # lowest rung — clears the 1.4 m box tops
-        MAX_ALT_M = 5.0     # 1 m below the 6 m arena ceiling
+        MIN_GAP = 0.30        # >= 30 cm between ANY two drones (both teams)
+        SCOUT_BASE_M = 1.00   # scouts loiter low, level with the box faces
+        CRUISE_BASE_M = 1.60  # movers: >= MIN_GAP above the top scout (1.3 m)
+                              # AND clear of the 1.4 m box tops for transit
+        MAX_ALT_M = 5.0       # 1 m below the 6 m arena ceiling
         # Team isolation (regs §1.3): only assign rungs to OUR-team drones.
-        # The team parity is what keeps us off the enemy's rungs without ever
-        # looking at an enemy drone.
         our_team = (s.markers.our_team or "").lower()
-        parity = 1 if our_team == "blue" else 0   # red / unknown -> even rungs
-        prefs: list[tuple[float, str]] = []
+        parity = 1 if our_team == "blue" else 0   # red/unknown -> even rungs
+        scouts: list[str] = []
+        movers: list[str] = []
         for d in s.drones:
             if not d.enabled:
                 continue
             if our_team and d.team and d.team.lower() != our_team:
                 continue
-            pref = float(d.scout_alt_m if d.role == "scout" else d.attack_alt_m)
-            prefs.append((pref, d.fc_name))
-        prefs.sort()  # ascending preference, then name -> stable order
+            (scouts if d.role == "scout" else movers).append(d.fc_name)
         out: Dict[str, float] = {}
-        for i, (_pref, fc) in enumerate(prefs):
-            k = 2 * i + parity           # our team's rungs, interleaved
-            alt = round(BASE_ALT_M + k * MIN_GAP, 2)
-            out[fc] = min(alt, MAX_ALT_M)
+        # Scouts: low band, interleaved by team so the two centre-loitering
+        # scouts never share a height.
+        for i, fc in enumerate(sorted(scouts)):
+            k = 2 * i + parity
+            out[fc] = round(SCOUT_BASE_M + k * MIN_GAP, 2)
+        # Movers: cruise band above the scouts, interleaved by team.
+        for i, fc in enumerate(sorted(movers)):
+            k = 2 * i + parity
+            out[fc] = min(round(CRUISE_BASE_M + k * MIN_GAP, 2), MAX_ALT_M)
         return out
 
     # ------------------------------------------------------------------

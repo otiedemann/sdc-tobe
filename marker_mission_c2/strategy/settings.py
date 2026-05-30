@@ -31,7 +31,7 @@ Settings shape::
           "team":          "red"|"blue"|null,
           "role":          "idle"|"scout"|"attacker",
           "enabled":       true,
-          "scout_alt_m":   3.0,
+          "scout_alt_m":   1.0,
           "attack_alt_m":  1.0,
           "home_alt_m":    0.8
         }
@@ -201,10 +201,12 @@ class DroneSettings:
     # Default cruise altitude for the scout role (m). 3.0 puts the drone
     # comfortably above the 2 m lower wall markers, well below the 4 m
     # upper wall markers, and clear of the 1.4 m box tops — so the camera
-    # can see all six target faces from arena centre. The runner's
-    # deconfliction may nudge this up in 0.4 m steps for additional drones,
-    # capped at 5 m to stay below the 6 m arena ceiling.
-    scout_alt_m: float = 3.0
+    # is LOW (~1 m) on purpose: the box faces sit at ~1 m, so the scout must
+    # fly level with them to read the slot status (from 3-4 m the faces are
+    # past the 8 m vision range once you add the vertical offset, and seen at
+    # a steep angle). The runner's deconfliction places scouts in a dedicated
+    # low band (red 1.0 m / blue 1.3 m) below the movers' cruise band.
+    scout_alt_m: float = 1.0
     attack_alt_m: float = 1.0
     home_alt_m: float = 0.8
 
@@ -301,7 +303,7 @@ def _drone_from(fc_name: str, raw: Any) -> DroneSettings:
         team=_coerce_team(raw.get("team")),
         role=_coerce_role(raw.get("role")),
         enabled=bool(raw.get("enabled", True)),
-        scout_alt_m=float(raw.get("scout_alt_m", 3.0)),
+        scout_alt_m=float(raw.get("scout_alt_m", 1.0)),
         attack_alt_m=float(raw.get("attack_alt_m", 1.0)),
         home_alt_m=float(raw.get("home_alt_m", 0.8)),
     )
