@@ -514,26 +514,38 @@ class SwarmRunner:
     # ------------------------------------------------------------------
 
     def _deconflicted_cruise_alts(self, s) -> Dict[str, float]:
-        """Return {fc_name: cruise_altitude_m}, each DISTINCT.
+        """Return {fc_name: cruise_altitude_m}, distinct across BOTH teams.
 
-        Start from each drone's preferred altitude (scout_alt_m for
-        scouts, else attack_alt_m) and nudge upward in MIN_GAP steps so
-        no two enabled drones share a cruise height — avoids mid-air
-        collisions during loiter/transit. Deterministic by ascending
-        preference then fc_name.
+        Every drone gets its own cruise height so no two ever share a transit
+        altitude — the requirement is >= MIN_GAP (0.30 m) between ANY two
+        drones, INCLUDING enemy drones crossing the neutral zone.
 
-        Capped at MAX_ALT_M so a ghost-laden roster (drones lingering in
-        settings.json from earlier runs) can't push the stack into the
-        ceiling. Once the stack hits the cap we share the cap altitude
-        among any overflow drones — operator should clean stale drones
-        instead of stacking into the ceiling.
+        We can't see enemy drones (regs §1.3), so we can't read their
+        altitudes. Instead both teams follow one fixed, shared CONVENTION
+        keyed off team colour: a single global altitude grid in MIN_GAP rungs,
+        with RED taking the EVEN rungs and BLUE the ODD ones. Each side only
+        ever computes its own rungs (no enemy access), yet the two ladders
+        interleave to a guaranteed >= MIN_GAP global separation:
+
+            rung k -> BASE + k*MIN_GAP        BASE = 1.50 m (clears 1.4 m boxes)
+            red  (even k) -> 1.50, 2.10, 2.70, 3.30, 3.90, ...
+            blue (odd  k) -> 1.80, 2.40, 3.00, 3.60, 4.20, ...
+
+        Within a team that's 0.60 m apart; across teams 0.30 m — so even the
+        two scouts, which both loiter at the arena centre (0,0), sit at
+        different heights instead of the same point in space. Drones are
+        ordered by preferred altitude (scouts highest) then fc_name, so the
+        mapping is stable across ticks. Capped at MAX_ALT_M; overflow drones
+        (a ghost-laden roster) share the cap — clean stale drones instead.
         """
-        MIN_GAP = 0.4
+        MIN_GAP = 0.30      # >= 30 cm between ANY two drones (both teams)
+        BASE_ALT_M = 1.50   # lowest rung — clears the 1.4 m box tops
         MAX_ALT_M = 5.0     # 1 m below the 6 m arena ceiling
-        # Team isolation (req 3 + regs §1.3): only deconflict among OUR-team
-        # drones. We have no access to enemy drones, so we cannot — and
-        # must not — reason about their altitudes.
+        # Team isolation (regs §1.3): only assign rungs to OUR-team drones.
+        # The team parity is what keeps us off the enemy's rungs without ever
+        # looking at an enemy drone.
         our_team = (s.markers.our_team or "").lower()
+        parity = 1 if our_team == "blue" else 0   # red / unknown -> even rungs
         prefs: list[tuple[float, str]] = []
         for d in s.drones:
             if not d.enabled:
@@ -542,23 +554,12 @@ class SwarmRunner:
                 continue
             pref = float(d.scout_alt_m if d.role == "scout" else d.attack_alt_m)
             prefs.append((pref, d.fc_name))
-        prefs.sort()  # ascending altitude, then name
+        prefs.sort()  # ascending preference, then name -> stable order
         out: Dict[str, float] = {}
-        used: list[float] = []
-        # Tiny epsilon protects against float-accumulation in the loop
-        # (e.g. 1.0 + 0.4 yields 1.3999999... so the bare ``< MIN_GAP``
-        # test trips on the next iteration and we'd over-bump by 0.4).
-        EPS = 1e-6
-        for pref, fc in prefs:
-            a = round(pref, 2)
-            # bump up until clear of every already-placed altitude
-            while any(abs(a - u) < (MIN_GAP - EPS) for u in used) \
-                    and a < MAX_ALT_M:
-                a = round(a + MIN_GAP, 2)
-            if a > MAX_ALT_M:
-                a = MAX_ALT_M
-            out[fc] = a
-            used.append(a)
+        for i, (_pref, fc) in enumerate(prefs):
+            k = 2 * i + parity           # our team's rungs, interleaved
+            alt = round(BASE_ALT_M + k * MIN_GAP, 2)
+            out[fc] = min(alt, MAX_ALT_M)
         return out
 
     # ------------------------------------------------------------------

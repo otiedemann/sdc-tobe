@@ -77,7 +77,11 @@ def _patrol_script(ctx: RoleContext) -> str:
     # eyeball in the 3D view and gives a predictable cycle time.
     home_slots.sort(key=lambda sl: SLOT_POSITIONS_M.get(sl, (0.0, 0.0))[0])
 
-    cruise_alt = max(2.0, float(ctx.cruise_alt_m or ctx.drone.attack_alt_m or 2.2))
+    # Use this drone's DISTINCT deconflicted altitude (team-keyed grid, >=
+    # 0.30 m from every other drone). Floor at 1.5 m so we clear the 1.4 m
+    # box tops — NOT 2.0 m, which would pull low-rung defenders up onto a
+    # shared 2.0 m band and defeat the deconfliction.
+    cruise_alt = max(1.5, float(ctx.cruise_alt_m or ctx.drone.attack_alt_m or 2.2))
     detect_alt = 1.5   # middle of the 1-2 m RFID detection band
 
     lines: list[str] = ["TAKEOFF", f"HEIGHT {cruise_alt:.2f}"]

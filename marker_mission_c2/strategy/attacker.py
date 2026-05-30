@@ -360,6 +360,15 @@ def _full_attack_script(
         f" {target_xy[0]:g} {target_xy[1]:g}" if target_xy else ""
     )
 
+    # This drone's DISTINCT cruise altitude (from the runner's team-keyed
+    # altitude grid — >= 0.30 m from every other drone of BOTH teams). Used
+    # for the outbound HEIGHT climb AND the RTH climb so the drone holds its
+    # own height across the neutral zone in EACH direction and never shares a
+    # transit altitude with another drone. Floored above the 1.4 m box tops;
+    # falls back to the bare UD_RC climb when no deconflicted altitude is set.
+    cruise_alt = max(1.4, float(ctx.cruise_alt_m)) if ctx.cruise_alt_m else 0.0
+    height_step = f"HEIGHT {cruise_alt:.2f}" if cruise_alt else ""
+
     # End-of-run = return to OUR home zone, confirm home-zone presence
     # (v7 §1.4.4) with a brief hover, then LAND so the FC returns to INIT
     # and the strategy can RE-DISPATCH this drone the instant the enemy
@@ -371,7 +380,7 @@ def _full_attack_script(
     home_rearm = f"HOOVER {HOME_REARM_HOVER_S:.1f}\nLAND"
     wall_entry = HOME_WALL_MARKER.get(ctx.our_team)
     if wall_entry:
-        wall_marker_id, _w_xy = wall_entry
+        wall_marker_id, w_xy = wall_entry
         rth_close_in = _rth_close_in_distance_m(slot, ctx.our_team)
         rth_dur = _cruise_duration_s(rth_close_in)
         # Pure FB_RC for RTH at the same conservative cruise stick.
@@ -380,11 +389,19 @@ def _full_attack_script(
             if rth_dur > 0 else ""
         )
         rth_lines = (
+            # Climb back to our DISTINCT cruise altitude BEFORE crossing the
+            # neutral zone home. Without this the drone returns at the flat
+            # 1.5 m capture height, so every returning drone (ours AND the
+            # enemy's, heading the opposite way) shares 1.5 m — a head-on
+            # collision band. The wall brake below carries an explicit world
+            # hint, so it still stops us correctly at any altitude.
+            height_step,
             # NO HOOVER between YAW and RTH cruise — start the run
             # back immediately per user's "much faster flight" req.
             rth_cruise_step,
             f"FB_BRAKE {wall_marker_id} {FB_BRAKE_WALL_STOP_M:.2f} "
-            f"{FB_BRAKE_STICK} {FB_BRAKE_TIMEOUT_S:.1f}",
+            f"{FB_BRAKE_STICK} {FB_BRAKE_TIMEOUT_S:.1f} "
+            f"{w_xy[0]:g} {w_xy[1]:g}",
             "YAW_IMU 180",
             # Confirm home presence, then LAND so we can re-arm + re-attack.
             home_rearm,
@@ -395,13 +412,6 @@ def _full_attack_script(
             # Confirm home presence, then LAND so we can re-arm + re-attack.
             home_rearm,
         )
-    # Height deconfliction: settle at this drone's DISTINCT cruise
-    # altitude (assigned by the runner, floored above the 1.4 m box
-    # tops) using the existing HEIGHT verb, so two attackers never
-    # transit the neutral zone at the same height. Falls back to the
-    # bare UD_RC climb when no deconflicted altitude is supplied.
-    cruise_alt = max(1.4, float(ctx.cruise_alt_m)) if ctx.cruise_alt_m else 0.0
-    height_step = f"HEIGHT {cruise_alt:.2f}" if cruise_alt else ""
     # v7 §1.4.3 capture needs the drone in the 1-2 m RFID detection band.
     # If the deconflicted cruise altitude is above that band (large rosters
     # push scouts/attackers up to ~3 m+), we MUST descend just before the
