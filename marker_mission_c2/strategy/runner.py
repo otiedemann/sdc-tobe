@@ -23,6 +23,7 @@ from dataclasses import dataclass, field
 from typing import Any, Deque, Dict, Iterable, List, Optional
 
 from .c2_client import C2Client
+from .collision import CollisionAvoider, Track
 from .markers import MarkerTracker
 from .missions import MissionLog
 from .roles import (
@@ -33,6 +34,7 @@ from .roles import (
     RoleState,
     get as get_role,
     in_home_zone,
+    push,
 )
 from .settings import SettingsStore
 
@@ -146,6 +148,11 @@ class SwarmRunner:
         self._last_overview: Dict[str, Any] = {}
         # Last computed per-drone deconflicted cruise altitudes (for UI).
         self._last_cruise_alts: Dict[str, float] = {}
+        # Runtime collision avoidance (our-team drones): predicts path/speed
+        # conflicts each tick and dodges by altitude. ``_avoiding`` dedups the
+        # collision_avoid event so it logs on a NEW conflict, not every tick.
+        self._collision = CollisionAvoider()
+        self._avoiding: Dict[str, float] = {}
 
     # ------------------------------------------------------------------
     # Public read API (called from Flask handlers, so must be thread-safe)
@@ -436,6 +443,14 @@ class SwarmRunner:
         cruise_alts = self._deconflicted_cruise_alts(s)
         self._last_cruise_alts = cruise_alts
 
+        # 3d) Collision avoidance: predict our drones' paths from live position
+        # + speed and, where two are on course to come within SAFETY_RADIUS,
+        # tell the lower-priority one to change altitude. Computed once per tick
+        # over OUR enabled drones with a known position (regs §1.3: we can't see
+        # enemy drones, so they're out of scope — cross-team separation is
+        # handled by the static red/blue altitude convention).
+        avoid = self._collision_overrides(s, overview)
+
         # 4) Dispatch each known drone (drones from settings, not C2 — the
         # operator decides who plays; the C2 overview tells us if they're
         # online).
@@ -452,6 +467,20 @@ class SwarmRunner:
                         drone=drone.fc_name,
                     )
                     rs.reset_for_role(drone.role)
+
+            # Collision avoidance OVERRIDES the role this tick: if this drone is
+            # predicted to conflict, change its altitude (hold xy, climb/descend
+            # to the cleared height) instead of running its mission. Safety wins
+            # over the current capture; once the conflict clears the role
+            # re-dispatches it normally. _apply_decision throttles the repeated
+            # push, so re-asserting the same hold each tick is cheap.
+            if drone.fc_name in avoid:
+                target, reason = avoid[drone.fc_name]
+                await self._apply_decision(drone.fc_name, push(
+                    f"HEIGHT {target:.2f}\nHOOVER 3.0",
+                    reason=f"collision avoidance: {reason}",
+                ))
+                continue
 
             role = get_role(drone.role) or get_role("idle")
             if role is None:
@@ -576,6 +605,49 @@ class SwarmRunner:
             k = 2 * i + parity
             out[fc] = min(round(CRUISE_BASE_M + k * MIN_GAP, 2), MAX_ALT_M)
         return out
+
+    # ------------------------------------------------------------------
+    # Collision avoidance
+    # ------------------------------------------------------------------
+
+    def _collision_overrides(self, s, overview: Dict[str, Any]
+                             ) -> Dict[str, tuple]:
+        """Predict path conflicts among OUR drones; return altitude dodges.
+
+        Returns ``{fc: (target_alt_m, reason)}`` for drones that must change
+        altitude this tick to avoid a predicted collision. Emits a one-shot
+        ``collision_avoid`` event per new conflict (deduped via ``_avoiding``).
+        """
+        our_team = (s.markers.our_team or "").lower()
+        positions: Dict[str, tuple] = {}
+        roles: Dict[str, str] = {}
+        for d in s.drones:
+            if not d.enabled:
+                continue
+            if our_team and d.team and d.team.lower() != our_team:
+                continue
+            ds = DroneState.from_overview(d.fc_name, overview.get(d.fc_name) or {})
+            pos = ds.world_position_m
+            if not pos or len(pos) < 3:
+                continue
+            positions[d.fc_name] = (float(pos[0]), float(pos[1]), float(pos[2]))
+            roles[d.fc_name] = d.role
+
+        now = time.time()
+        vel = self._collision.update_velocities(positions, now)
+        tracks = [Track(fc, positions[fc], vel[fc], roles.get(fc, "idle"))
+                  for fc in positions]
+        overrides = self._collision.resolve(tracks)
+
+        # One-shot event per new/changed conflict; clear when resolved.
+        for fc, (target, reason) in overrides.items():
+            if abs(self._avoiding.get(fc, -99.0) - target) > 0.05:
+                self._events.add("collision_avoid", reason, drone=fc)
+            self._avoiding[fc] = target
+        for fc in list(self._avoiding):
+            if fc not in overrides:
+                del self._avoiding[fc]
+        return overrides
 
     # ------------------------------------------------------------------
     # Decision dispatch
