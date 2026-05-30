@@ -1236,6 +1236,13 @@ class MissionController:
             self._abort("timed out climbing to default height")
 
     # ---------------------------------------------------------------- search
+    # Minimum yaw RC stick value for the escalating search (≈5°/s at
+    # typical indoor Anafi yaw-rate settings). Below this the drone barely
+    # rotates and detection becomes unreliable — we stop escalating.
+    _SEARCH_MIN_YAW_RC: int = 3
+    # Maximum digital zoom (Anafi hardware cap).
+    _SEARCH_MAX_ZOOM: float = 3.0
+
     def _step_search(self, now: float) -> None:
         cfg = self.cfg
         # If we already see the marker, switch immediately. ALIGN orbits
@@ -1244,9 +1251,27 @@ class MissionController:
         # -- this keeps the marker out of the oblique-angle range where
         # the ArUco detector starts to fail.
         if self.smoother.get(now) is not None:
+            # Reset zoom to 1.0 before approach so detection is not affected.
+            if getattr(self, "_search_zoom", 1.0) > 1.0:
+                try:
+                    self.api.camera_config_set(zoom=1.0)
+                except Exception:
+                    pass
             self._set_phase(Phase.HEIGHT_ALIGN,
                             "marker acquired -- aligning altitude to marker")
             return
+
+        # Detect new SEARCH phase entry via phase_started_at so escalation
+        # state (yaw speed, zoom) resets cleanly on every fresh SEARCH.
+        with self.state.lock:
+            phase_entry = self.state.phase_started_at
+        if getattr(self, "_search_phase_entry", None) != phase_entry:
+            self._search_phase_entry = phase_entry
+            self._search_start_yaw = None
+            self._search_swept = 0.0
+            self._search_prev_yaw = None
+            self._search_yaw_rc = float(cfg.search_yaw_rc)
+            self._search_zoom = 1.0
 
         # Retreat-then-yaw: when we entered SEARCH after losing a
         # marker the controller was actively tracking, _set_phase
@@ -1267,15 +1292,13 @@ class MissionController:
                 )
             return
 
-        # Otherwise, yaw in place. Direction is arbitrary; we pick CW (+ yaw).
-        self._send_rc(0, 0, 0, cfg.search_yaw_rc)
-        # Track how far we've yawed from telemetry to decide when to give up.
+        # Yaw in place using current (possibly escalation-reduced) speed.
+        self._send_rc(0, 0, 0, int(self._search_yaw_rc))
+        # Track how far we've yawed from telemetry to decide when to escalate.
         with self.state.lock:
             tel = self.state.last_telemetry
-        # We don't know exact start heading -- compare to whatever we had when
-        # the search began. The first time we have a telemetry yaw, latch it.
         if tel and tel.yaw_deg is not None:
-            if not hasattr(self, "_search_start_yaw") or self._search_start_yaw is None:
+            if self._search_start_yaw is None:
                 self._search_start_yaw = tel.yaw_deg
                 self._search_swept = 0.0
                 self._search_prev_yaw = tel.yaw_deg
@@ -1287,12 +1310,39 @@ class MissionController:
                 with self.state.lock:
                     self.state.search_yaw_swept_deg = self._search_swept
                 if self._search_swept >= cfg.search_total_deg:
+                    # Full revolution without sighting — escalate: 25% slower,
+                    # 25% more zoom, capped at _SEARCH_MIN_YAW_RC / _SEARCH_MAX_ZOOM.
+                    new_yaw_rc = max(self._SEARCH_MIN_YAW_RC,
+                                     self._search_yaw_rc * 0.75)
+                    new_zoom = min(self._SEARCH_MAX_ZOOM,
+                                   self._search_zoom * 1.25)
+                    at_speed_floor = new_yaw_rc <= self._SEARCH_MIN_YAW_RC
+                    at_zoom_max = new_zoom >= self._SEARCH_MAX_ZOOM
+                    print(f"[ctrl] SEARCH escalation: "
+                          f"yaw_rc {self._search_yaw_rc:.1f} → {new_yaw_rc:.1f}, "
+                          f"zoom {self._search_zoom:.2f}x → {new_zoom:.2f}x")
+                    self._search_yaw_rc = new_yaw_rc
+                    self._search_zoom = new_zoom
+                    try:
+                        self.api.camera_config_set(zoom=new_zoom)
+                    except Exception as e:
+                        print(f"[ctrl] SEARCH zoom set failed: {e}")
+                    # Reset sweep counter for the next revolution.
                     self._search_start_yaw = None
-                    self._terminate_script(
-                        "no marker found in full sweep -- landing")
+                    self._search_swept = 0.0
+                    with self.state.lock:
+                        self.state.note = (
+                            f"SEARCH escalated: yaw_rc={new_yaw_rc:.0f} "
+                            f"zoom={new_zoom:.2f}x"
+                            + (" [speed floor]" if at_speed_floor else "")
+                            + (" [max zoom]" if at_zoom_max else "")
+                        )
+                    if at_speed_floor and at_zoom_max:
+                        self._terminate_script(
+                            "no marker found after escalated sweep -- landing")
                     return
         # Fallback timeout if no telemetry yaw is ever reported.
-        elif now - self.state.phase_started_at > 30.0:
+        elif now - phase_entry > 30.0:
             self._terminate_script("search timed out (no telemetry yaw)")
             return
 
