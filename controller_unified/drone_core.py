@@ -251,6 +251,7 @@ def do_rotate(direction: Any = "", deg: Any = 45) -> tuple[dict, int]:
         _srv.start_discrete_window(
             1.0 if _srv.drone_type == "tello" else max(1.0, degrees / 90)
         )
+        import time as _time; _time.sleep(0.1)
         ok, msg = b.rotate(direction, degrees)
         if ok:
             return {"ok": True, "dir": direction, "deg": degrees}, 200
