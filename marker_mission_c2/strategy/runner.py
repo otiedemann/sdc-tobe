@@ -24,6 +24,7 @@ from typing import Any, Deque, Dict, Iterable, List, Optional
 
 from .c2_client import C2Client
 from .markers import MarkerTracker
+from .missions import MissionLog
 from .roles import (
     Decision,
     DroneState,
@@ -105,12 +106,17 @@ class SwarmRunner:
         markers: MarkerTracker,
         events: Optional[EventLog] = None,
         tick_interval_s: float = TICK_INTERVAL_S,
+        mission_log: Optional[MissionLog] = None,
     ) -> None:
         self._settings = settings
         self._c2 = c2
         self._markers = markers
         self._events = events or EventLog()
         self._tick_interval_s = tick_interval_s
+        # Records the exact mission scripts we push to the FCs (for the
+        # operator to read back / copy-paste onto live drones). Always present
+        # so callers don't have to null-check; file sink is optional.
+        self._mission_log = mission_log or MissionLog()
 
         self._role_states: Dict[str, RoleState] = {}
         self._states_lock = threading.RLock()
@@ -148,6 +154,10 @@ class SwarmRunner:
     @property
     def events(self) -> EventLog:
         return self._events
+
+    @property
+    def mission_log(self) -> MissionLog:
+        return self._mission_log
 
     def is_armed(self) -> bool:
         with self._armed_lock:
@@ -600,6 +610,9 @@ class SwarmRunner:
                 rs.last_pushed_unix_s = now
                 if decision.new_phase:
                     rs.advance_phase(decision.new_phase, decision.reason)
+                # Record the EXACT script we sent so the operator can read it
+                # back / copy-paste it onto a live drone (mission-step log).
+                self._mission_log.record(fc_name, decision.reason, decision.script)
                 self._events.add(
                     "script_push",
                     f"pushed script ({len(decision.script.splitlines())} lines): "

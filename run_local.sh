@@ -203,6 +203,16 @@ The hub page links to everything + shows live status and per-drone video.
 In each strategy dashboard the sim drones auto-appear: set each drone's
 team + role, Arm, then drive MANUAL or AUTO.
 
+Mission-step log (exact scripts the C2 sent — copy-paste onto live drones):
+  red  file : $LOGDIR/strat_red.missions.log
+EOF
+[ "$MATCH" = 1 ] && echo "  blue file : $LOGDIR/strat_blue.missions.log"
+cat <<EOF
+  red  live : $URL_RED/api/missions?format=text
+EOF
+[ "$MATCH" = 1 ] && echo "  blue live : $URL_BLUE/api/missions?format=text"
+cat <<EOF
+
 Logs: $LOGDIR/   ·   Ctrl-C to stop everything.
 EOF
 

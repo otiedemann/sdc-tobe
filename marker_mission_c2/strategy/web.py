@@ -100,6 +100,31 @@ def build_app(
             "match_status": markers.match_status(our_team, _time.time()),
         }))
 
+    @app.route("/api/missions")
+    def api_missions():
+        """The exact mission scripts the C2 has pushed to the FCs.
+
+        For copy-paste onto a live drone. ``?format=text`` returns the
+        same copy-paste layout as the on-disk log (``# header`` comment +
+        raw verbs); default is JSON. ``?fc=red3`` / ``?limit=20`` filter.
+        Only OUR-team drones are ever in the roster, so nothing here can
+        leak an enemy drone (regs §1.3).
+        """
+        limit = request.args.get("limit", type=int) or 50
+        fc = request.args.get("fc") or None
+        fmt = (request.args.get("format") or "json").lower()
+        ml = runner.mission_log
+        entries = ml.recent(limit=limit, fc=fc)
+        if fmt in ("text", "txt", "raw"):
+            blocks = [
+                f"# [#{e['seq']} {e['time']}] {e['fc']} · {e['reason']}\n"
+                f"{e['script']}"
+                for e in entries
+            ]
+            body = ("\n\n".join(blocks) + "\n") if blocks else "# (no missions yet)\n"
+            return _no_cache(app.response_class(body, mimetype="text/plain"))
+        return _no_cache(jsonify({"path": ml.path, "missions": entries}))
+
     @app.route("/api/settings", methods=["GET"])
     def api_settings():
         return _no_cache(jsonify(settings.to_dict()))
