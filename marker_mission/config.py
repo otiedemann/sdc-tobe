@@ -264,7 +264,7 @@ class MissionConfig:
     # Yaw stick value held during the SCOUT step. Default 15 is gentle
     # enough for the ArUco detector to lock onto markers as the camera
     # sweeps past them; raise it for faster but rougher scans.
-    scout_yaw_stick: int = 15              # TUNE  RC counts (-100..+100)
+    scout_yaw_stick: int = 25              # TUNE  RC counts (-100..+100)
 
     # --- Phase transition criteria -------------------------------------------
     approach_settle_time_s: float = 1.0    # how long all errors must be inside

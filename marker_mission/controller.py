@@ -1293,7 +1293,8 @@ class MissionController:
             return
 
         # Yaw in place using current (possibly escalation-reduced) speed.
-        self._send_rc(0, 0, 0, int(self._search_yaw_rc))
+        self._send_rc(0, 0, 0, int(self._search_yaw_rc),
+                      enforce_cfg_caps=False)
         # Track how far we've yawed from telemetry to decide when to escalate.
         with self.state.lock:
             tel = self.state.last_telemetry
@@ -2668,7 +2669,8 @@ class MissionController:
             # Position / yaw lost -- yaw in place to bring a marker
             # back into view. Reset settle timer so we don't latch a
             # spurious "arrived" while drifting unobserved.
-            self._send_rc(0, 0, 0, cfg.search_yaw_rc)
+            self._send_rc(0, 0, 0, cfg.search_yaw_rc,
+                          enforce_cfg_caps=False)
             with self.state.lock:
                 self.state.settle_began_at = None
                 age_txt = (f"{wp_age:.1f}s" if wp_age is not None
