@@ -534,7 +534,12 @@ def _enemy_face_for(slot: int, our_team: str) -> int:
 
 
 def _slot_is_ours(ctx: RoleContext, slot: int) -> bool:
-    return ctx.markers.slot_holder(slot) == ctx.our_team
+    # DECAYED belief (same as the planner): only treat the slot as ours if a
+    # drone has actually SEEN it ours recently. A stale "we hold it" must not
+    # cancel a capture run — the enemy can re-capture the instant we leave and
+    # we can't see the slot from home. Once the belief decays to "unknown" the
+    # attacker flies back out to re-check / re-capture it (continuous play).
+    return ctx.markers.effective_holder(slot) == ctx.our_team
 
 
 class AttackerRole(Role):

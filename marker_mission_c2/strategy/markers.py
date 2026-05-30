@@ -54,6 +54,18 @@ CAPTURE_LOCK_S = 5.0
 # boxes in our colour continuously for this many seconds ends the match.
 SPECIAL_MANEUVER_HOLD_S = 5.0
 
+# How long a slot-holder observation is TRUSTED for attack/plan decisions
+# before the slot is treated as "unknown" again. We have vision only (no GPS
+# in the live arena), so once no drone has seen a slot for this long we
+# genuinely don't know who holds it — the enemy may have (re)captured it the
+# instant our attacker left. So the planner must stop trusting a stale "we
+# hold it" and send an attacker back to re-check / re-capture. This is what
+# keeps the attackers flying CONTINUOUS capture runs for the whole match
+# instead of parking at home the moment they believe every enemy box is ours.
+# Shorter than one attack cycle (~30 s) so a slot a drone captured and left
+# always decays back to attackable before that drone is free again.
+HOLDER_TRUST_S = 8.0
+
 
 @dataclass
 class SlotStatus:
@@ -374,10 +386,36 @@ class MarkerTracker:
             return bool(s and s.lock_until_unix_s > t)
 
     def slot_holder(self, slot: int) -> str:
-        """Return the slot's current holder ("red"|"blue"|"unknown")."""
+        """Return the slot's last-observed holder ("red"|"blue"|"unknown").
+
+        Raw belief — never decays. Used for the UI / scoring / win-detect,
+        where we want the last thing we actually saw. Planning/attack logic
+        should use :meth:`effective_holder` so a stale belief doesn't stop
+        the attackers from re-checking the slot.
+        """
         with self._lock:
             s = self._slots.get(int(slot))
             return s.holder if s else "unknown"
+
+    def effective_holder(self, slot: int, max_age_s: float = HOLDER_TRUST_S,
+                         now: Optional[float] = None) -> str:
+        """Holder if seen within ``max_age_s``, else "unknown" (decayed).
+
+        Vision-only belief decay: a holder we haven't re-observed recently is
+        reported as "unknown" so the planner re-checks (re-captures) the slot
+        instead of trusting a stale "we hold it". This is the holder the
+        planner and the attacker role use for every attack decision, so the
+        attackers keep flying capture runs for the whole match even though
+        they can't see a slot once they've returned to their home zone.
+        """
+        t = time.time() if now is None else now
+        with self._lock:
+            s = self._slots.get(int(slot))
+            if s is None or s.last_seen_unix_s <= 0.0:
+                return "unknown"
+            if (t - s.last_seen_unix_s) > max_age_s:
+                return "unknown"
+            return s.holder
 
 
 def _copy(s: SlotStatus) -> SlotStatus:

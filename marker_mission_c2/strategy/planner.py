@@ -112,8 +112,20 @@ def plan(settings, markers, overview: dict, role_states: dict, now: float
     enemy = "blue" if our == "red" else "red"
     active = [int(x) for x in settings.markers.active_slots]
 
-    holder = {sl: markers.slot_holder(sl) for sl in active}
+    # DECAYED belief (not the raw last-seen holder): a slot we haven't
+    # observed in HOLDER_TRUST_S reads as "unknown", so the planner re-checks
+    # / re-captures it instead of trusting a stale "we hold it". This is what
+    # keeps attackers flying continuous capture runs all match — without it
+    # they park at home the moment every enemy box has *ever* been seen ours.
+    holder = {sl: markers.effective_holder(sl, now=now) for sl in active}
     locked = {sl for sl in active if markers.slot_locked(sl, now)}
+
+    # Slots an in-flight (non-free) drone of ours is already heading to. We
+    # must not assign these to a second drone — but the moment that drone
+    # finishes its run and clears its target, the slot is up for grabs again
+    # (which, with the decay above, is what re-launches the next capture run).
+    targeted = {rs.target_slot for rs in role_states.values()
+                if rs is not None and rs.target_slot is not None}
 
     our_slots = sorted(sl for sl in active if slot_home_team(sl) == our)
     enemy_slots = sorted(sl for sl in active if slot_home_team(sl) == enemy)
@@ -176,10 +188,15 @@ def plan(settings, markers, overview: dict, role_states: dict, now: float
         ))
         taken.add(sl)
 
-    # Enemy slots we can actually attack right now (not already ours,
-    # not in 5-s post-capture lock, not already taken by a defend assignment).
+    # Enemy slots we can actually attack right now: not (freshly) confirmed
+    # ours, not in the 5-s post-capture lock, not already taken by a defend
+    # assignment this tick, and not already being attacked by an in-flight
+    # drone. With the decay above, a slot we captured and left decays out of
+    # "ours" within HOLDER_TRUST_S, so it re-enters this list and the next
+    # free attacker is dispatched to re-capture it — continuous play.
     attackable = [sl for sl in enemy_slots
-                  if holder.get(sl) != our and sl not in locked and sl not in taken]
+                  if holder.get(sl) != our and sl not in locked
+                  and sl not in taken and sl not in targeted]
 
     # ----- (2) 5-pt full-sortie — preferred when we can cover EVERYTHING --
     # v7 §1.4.3 awards 5 pts per capture when ALL our drones are outside
