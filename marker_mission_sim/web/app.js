@@ -146,6 +146,16 @@ function buildArena(arena) {
   return { W, D, C };
 }
 
+// Inward-facing normal per wall (arena frame): the direction a marker glued
+// FLAT to that wall points — straight out into the play area, perpendicular
+// to the wall, regardless of where along the wall it sits.
+const WALL_INWARD = {
+  front: [0, -1, 0],   // +Y wall (y=+10) faces -Y
+  back:  [0,  1, 0],   // -Y wall (y=-10) faces +Y
+  right: [-1, 0, 0],   // +X wall (x=+5) faces -X
+  left:  [ 1, 0, 0],   // -X wall (x=-5) faces +X
+};
+
 function buildMarkers(markers) {
   const geo = new THREE.PlaneGeometry(0.35, 0.35);
   const mat = new THREE.MeshBasicMaterial({
@@ -155,8 +165,14 @@ function buildMarkers(markers) {
     const sq = new THREE.Mesh(geo, mat);
     const [x, y, z] = m.pos;
     sq.position.copy(toThree(x, y, z));
-    // face the square toward the arena interior (origin) about the vertical axis
-    sq.lookAt(toThree(0, 0, z));
+    // Orient the square FLAT against its own wall (perpendicular to the wall),
+    // not toward the arena centre. The old `lookAt(centre)` rotated side-wall
+    // markers (the ones not at y=0) by up to 45° toward the middle — visually
+    // wrong: a marker on a flat wall points straight out from that wall. (The
+    // vision sim ignores marker facing, so this is purely a view fix.)
+    const n = WALL_INWARD[m.wall];
+    if (n) sq.lookAt(toThree(x + n[0], y + n[1], z + n[2]));
+    else   sq.lookAt(toThree(0, 0, z));   // unknown wall -> fall back to centre
     scene.add(sq);
   }
 }
