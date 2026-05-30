@@ -101,14 +101,13 @@ def _patrol_script(ctx: RoleContext) -> str:
     home_y = -6.0 if our == "red" else 6.0
     lines.append(f"TO 0 {home_y:g}")
     lines.append(f"HEIGHT {cruise_alt:.2f}")
-    # Confirm home-zone presence (v7 §1.4.4) then LAND so the FC returns to
-    # INIT and the planner can dispatch this defender on a re-capture the
-    # instant the scout reports one of our slots flipped to the enemy. The
-    # old long home hover kept the FC in a never-ending mission, so the
-    # defender could never re-arm to recapture (and a free-defender was
-    # never available to the planner's defend_uncap play).
+    # Confirm home-zone presence (v7 §1.4.4) with a brief hover, then let the
+    # script END — but never LAND. The defender must stay airborne for the
+    # whole match (operator requirement): it hovers at phase=done in the home
+    # zone, ready for the planner to re-dispatch it on a re-capture the instant
+    # the scout reports one of our slots flipped to the enemy. Ending the
+    # script (vs the old ~10-min hover) is what frees it for re-dispatch.
     lines.append(f"HOOVER {HOME_REARM_HOVER_S:.1f}")
-    lines.append("LAND")
     return "\n".join(lines) + "\n"
 
 

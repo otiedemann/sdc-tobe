@@ -11,16 +11,18 @@ mission script that does everything end-to-end:
     YAW_IMU 180
     HOOVER <capture_hover_s>
     HEIGHT <home_alt>                   # cruise altitude above boxes
+    HEIGHT <cruise_alt>                 # climb back to distinct cruise alt
     FB_RC 100 <rth_dur_s>               # FAST cruise toward home
-    FB_BRAKE <wall_marker> 2.5 100 5    # vision-tripped brake on home wall
+    FB_BRAKE <wall_marker> 2.5 100 5 x y# vision/world brake on home wall
     YAW_IMU 180                         # face enemy again so next attack starts correct
-    LAND
+    HOOVER <rearm>                      # brief home hover — NO land
 
 The drone closes in toward the enemy side, ascends, locks onto the
 marker via APPROACH, drifts over it, hovers, then cruises home at full
-speed and brakes on a 0.5 m wall marker via a second APPROACH. After
-the script fully ends (FC drops back to Phase.INIT), the role marks
-itself done and the target is cleared.
+speed and brakes on a 0.5 m wall marker via a second APPROACH. The script
+ends with a brief home hover and NO land: the drone must stay airborne the
+whole match, so it hovers at phase=done in the home zone until re-dispatched.
+When the script ends the role marks itself done and the target is cleared.
 
 OPERATOR CONVENTION
 -------------------
@@ -213,15 +215,15 @@ FB_BRAKE_STICK: int = 50
 # and if both somehow fail the guard stops the drone at the wall.
 FB_BRAKE_TIMEOUT_S: float = 10.0
 
-# After returning home, hover briefly to register the v7 §1.4.4 home-zone
-# presence, then LAND so the FC returns to INIT and the strategy can
-# RE-DISPATCH this drone for the NEXT attack. This is the key to continuous
-# play: the enemy re-captures a box we flipped, the scout sees it flip back,
-# and an attacker that has re-armed (landed → INIT → free) is dispatched
-# again. The OLD behaviour ended every run with a ~10-minute home hover, so
-# the FC stayed in one never-ending mission, the drone never returned to
-# INIT, the planner never saw a free attacker, and each drone could fly
-# only ONE attack per match. 2 s ≈ 2 C2 ticks — enough to confirm presence.
+# After returning home, hover briefly (registers v7 §1.4.4 home-zone presence)
+# and then simply END the script — WITHOUT landing. The drones must stay in
+# the air for the WHOLE match (operator requirement), so we never emit LAND.
+# When the script ends the FC drops to phase=done while still hovering in the
+# home zone; the strategy then re-dispatches the drone for its NEXT attack and
+# the new mission's TAKEOFF is a no-op (already airborne). Ending the script
+# is what frees the drone for re-dispatch — landing was never needed for that;
+# the OLD ~10-minute home hover just never ended, so the drone got stuck in
+# one mission and could fly only ONE attack per match. 2 s ≈ 2 C2 ticks.
 HOME_REARM_HOVER_S: float = 2.0
 
 
@@ -291,7 +293,7 @@ def _full_attack_script(
                                             # no HOOVER — starts immediately)
         FB_BRAKE <wall_marker> 2.5 100 5    # vision-tripped brake on home wall
         YAW_RC 100 1.0                      # fast 180° turn back to enemy-facing
-        LAND
+        HOOVER <rearm>                      # brief home hover — NO land (stay airborne)
 
     Speed-optimised design notes:
 
@@ -369,15 +371,13 @@ def _full_attack_script(
     cruise_alt = max(1.4, float(ctx.cruise_alt_m)) if ctx.cruise_alt_m else 0.0
     height_step = f"HEIGHT {cruise_alt:.2f}" if cruise_alt else ""
 
-    # End-of-run = return to OUR home zone, confirm home-zone presence
-    # (v7 §1.4.4) with a brief hover, then LAND so the FC returns to INIT
-    # and the strategy can RE-DISPATCH this drone the instant the enemy
-    # flips one of our captured boxes back. The old design held a ~10-minute
-    # hover here ("never land during a match") — but that kept the FC in a
-    # single never-ending mission, so the drone never re-armed and could
-    # only ever fly ONE attack. Continuous capture/recapture play REQUIRES
-    # the drone to come home, land, and become a free attacker again.
-    home_rearm = f"HOOVER {HOME_REARM_HOVER_S:.1f}\nLAND"
+    # End-of-run = return to OUR home zone and confirm home-zone presence
+    # (v7 §1.4.4) with a brief hover — then the script just ENDS. No LAND:
+    # the drone must stay airborne the whole match, so it hovers at phase=done
+    # in the home zone until the strategy re-dispatches it for the next attack.
+    # The short hover (vs the old ~10-min one) is what lets the script end so
+    # the drone becomes a free attacker again — without ever touching down.
+    home_rearm = f"HOOVER {HOME_REARM_HOVER_S:.1f}"
     wall_entry = HOME_WALL_MARKER.get(ctx.our_team)
     if wall_entry:
         wall_marker_id, w_xy = wall_entry
@@ -403,13 +403,15 @@ def _full_attack_script(
             f"{FB_BRAKE_STICK} {FB_BRAKE_TIMEOUT_S:.1f} "
             f"{w_xy[0]:g} {w_xy[1]:g}",
             "YAW_IMU 180",
-            # Confirm home presence, then LAND so we can re-arm + re-attack.
+            # Confirm home presence, then end the script (NO land) — stay
+            # airborne, re-arm, and re-attack on the next dispatch.
             home_rearm,
         )
     else:
         rth_lines = (
             f"TO_HOME {ctx.drone.home_alt_m or 3.0:.2f}",
-            # Confirm home presence, then LAND so we can re-arm + re-attack.
+            # Confirm home presence, then end the script (NO land) — stay
+            # airborne, re-arm, and re-attack on the next dispatch.
             home_rearm,
         )
     # v7 §1.4.3 capture needs the drone in the 1-2 m RFID detection band.
@@ -595,7 +597,8 @@ class AttackerRole(Role):
         if rs.phase == "running":
             if slot is None:
                 # Target cleared while in flight — let the script finish on
-                # its own (it ends with LAND); we just reset our state.
+                # its own (it ends with a brief home hover, no land); we just
+                # reset our state.
                 rs.advance_phase("idle", "target cleared mid-flight")
                 return noop("attacker: target cleared mid-flight")
             # Only "init" reliably means the script has fully ended (FC has
