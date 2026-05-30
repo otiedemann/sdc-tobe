@@ -2249,14 +2249,11 @@ class OlympeBackend(DroneBackend):
                 except Exception:
                     if _attempt < 2:
                         time.sleep(0.15)
-        # Fallback: send a zero PCMD to neutralise any open stick input.
-        with self._pcmd_seq_lock:
-            self._pcmd_seq = (self._pcmd_seq + 1) & 0x7FFFFFFF
-            seq = self._pcmd_seq
-        try:
-            d(PCMD(0, 0, 0, 0, 0, seq))
-        except Exception:
-            pass
+        # If stop_piloting() failed on all retries we do NOT fall back to
+        # sending a PCMD(0) — that would re-activate the piloting interface
+        # and cause the firmware to ignore the subsequent moveBy command.
+        # The RC loop is already paused via start_discrete_window() before
+        # this is called, so no PCMD is being sent anyway.
 
     def _get_state(self, msg_type):
         d = self.drone
