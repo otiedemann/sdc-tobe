@@ -133,6 +133,7 @@ _PAGE_HEADER = """
     <a href="/arena" class="{{ 'active' if active=='arena' else '' }}">Arena</a>
     <a href="/calibrate" class="{{ 'active' if active=='calibrate' else '' }}">Calibrate</a>
     <a href="/settings" class="{{ 'active' if active=='settings' else '' }}">Settings</a>
+    <a href="/hardware" class="{{ 'active' if active=='hardware' else '' }}">Hardware</a>
   </nav>
   <span style="margin-left:auto; font-size:.85rem; color:#aab;"
         id="phase">{{ header_label or 'phase: …' }}</span>
@@ -3649,6 +3650,241 @@ _PAGE_SETTINGS = _PAGE_BASE_CSS + _PAGE_HEADER + _COMMON_SCRIPT + _PAGE_GRID_OPE
 
 
 # ---------------------------------------------------------------------------
+# Hardware check page
+# ---------------------------------------------------------------------------
+
+_PAGE_HARDWARE = _PAGE_BASE_CSS + _PAGE_HEADER + _COMMON_SCRIPT + _PAGE_GRID_OPEN + """
+<style>
+.hw-card { background:var(--panel); border-radius:8px; padding:1rem;
+           margin-bottom:1rem; }
+.hw-card h2 { margin:0 0 .6rem; font-size:.85rem; font-weight:500;
+              color:#aab; text-transform:uppercase; letter-spacing:.03em; }
+.hw-table { width:100%; border-collapse:collapse; font-size:.88rem; }
+.hw-table td, .hw-table th { padding:.28rem .5rem; text-align:left; }
+.hw-table th { color:#aab; font-weight:500; width:45%; }
+.hw-table tr + tr td, .hw-table tr + tr th { border-top:1px solid #2a3038; }
+.hw-val { font-variant-numeric:tabular-nums; }
+.hw-ok   { color:var(--good); font-weight:600; }
+.hw-warn { color:var(--warn); font-weight:600; }
+.hw-bad  { color:var(--bad);  font-weight:600; }
+.hw-na   { color:#555; }
+[title] { cursor:help; border-bottom:1px dotted #3a4550; }
+</style>
+
+<div style="padding:1rem;">
+  <div style="display:flex; align-items:center; gap:1rem; margin-bottom:1rem;">
+    <button id="btn-hw-check"
+            style="padding:.5rem 1.2rem; border:0; border-radius:6px;
+                   background:#2563eb; color:#fff; font-weight:700;
+                   font-size:.95rem; cursor:pointer;">
+      ▶ Run Hardware Check
+    </button>
+    <span id="hw-ts" style="font-size:.82rem; color:#555;"></span>
+  </div>
+  <div id="hw-results" style="display:none;">
+
+    <div class="hw-card">
+      <h2>Drone — flight readiness</h2>
+      <table class="hw-table">
+        <tr>
+          <th title="Alert state reported by the Anafi firmware. 'none' = no active alert. Any other value (low_battery, too_much_angle, motor_error, …) blocks takeoff.">Alert</th>
+          <td class="hw-val" id="h-alert">—</td>
+        </tr>
+        <tr>
+          <th title="Motor error code. 'noError' = all four motors healthy. Values like 'motorStalled', 'motorCutOut', or 'motorError' indicate a physical motor fault.">Motors</th>
+          <td class="hw-val" id="h-motor">—</td>
+        </tr>
+        <tr>
+          <th title="Sensor health (IMU, barometer, optical flow). 'all OK' = every sensor passes Parrot's self-test. A 'KO' suffix means that sensor is reporting a fault.">Sensors</th>
+          <td class="hw-val" id="h-sensors">—</td>
+        </tr>
+        <tr>
+          <th title="Magnetometer calibration state. 'REQUIRED' = figure-8 dance needed before the drone will arm. 'not-required' = calibrated and ready.">Magnetometer</th>
+          <td class="hw-val" id="h-magneto">—</td>
+        </tr>
+        <tr>
+          <th title="Per-axis magnetometer calibration bits (x/y/z). Green = axis calibrated. The figure-8 movement must cover all three axes for full calibration.">Magneto axes</th>
+          <td class="hw-val" id="h-mag-axes">—</td>
+        </tr>
+      </table>
+    </div>
+
+    <div class="hw-card">
+      <h2>Drone — telemetry</h2>
+      <table class="hw-table">
+        <tr>
+          <th title="Battery level in %. Warning below 30%, critical below 15%. Below ~58% this airframe loses climb authority.">Battery</th>
+          <td class="hw-val" id="h-bat">—</td>
+        </tr>
+        <tr>
+          <th title="Current barometric height in cm above takeoff point. 0 = on the ground.">Height</th>
+          <td class="hw-val" id="h-height">—</td>
+        </tr>
+        <tr>
+          <th title="Whether the Anafi firmware reports the drone as airborne.">Flying</th>
+          <td class="hw-val" id="h-flying">—</td>
+        </tr>
+        <tr>
+          <th title="Drone yaw (heading) in degrees, CW from magnetic north. Used by the arena positioning system.">Yaw</th>
+          <td class="hw-val" id="h-yaw">—</td>
+        </tr>
+        <tr>
+          <th title="Firmware-reported flying state machine: landed, takingoff, hovering, flying, landing, emergency.">State</th>
+          <td class="hw-val" id="h-fstate">—</td>
+        </tr>
+        <tr>
+          <th title="Time elapsed since the drone last sent a telemetry packet. Values above 1s indicate a connection problem.">Telemetry age</th>
+          <td class="hw-val" id="h-telage">—</td>
+        </tr>
+      </table>
+    </div>
+
+    <div class="hw-card">
+      <h2>Flight controller — system</h2>
+      <table class="hw-table">
+        <tr>
+          <th title="Hostname of this Raspberry Pi flight controller.">Hostname</th>
+          <td class="hw-val" id="h-host">—</td>
+        </tr>
+        <tr>
+          <th title="Serial number of the Anafi drone currently connected to this FC.">Drone serial</th>
+          <td class="hw-val" id="h-serial">—</td>
+        </tr>
+        <tr>
+          <th title="Total number of active Python threads. Should stay roughly stable across flights. A steadily growing count indicates a thread leak.">Threads</th>
+          <td class="hw-val" id="h-threads">—</td>
+        </tr>
+        <tr>
+          <th title="Video streaming mode and frame count since service start.">Video</th>
+          <td class="hw-val" id="h-video">—</td>
+        </tr>
+        <tr>
+          <th title="Soft altitude ceiling enforced by the FC's RC loop at 20 Hz, independent of the C2 connection. Prevents the drone from climbing above this height regardless of stick input.">Altitude ceiling</th>
+          <td class="hw-val" id="h-ceiling">—</td>
+        </tr>
+        <tr>
+          <th title="Number of active position SSE / WebSocket subscriber clients. 0 is fine when not using the C2 overview.">Position clients</th>
+          <td class="hw-val" id="h-posclients">—</td>
+        </tr>
+      </table>
+    </div>
+
+  </div>
+  <div id="hw-err" style="color:var(--bad); font-size:.85rem; margin-top:.5rem;"></div>
+</div>
+
+<script>
+async function runHwCheck() {
+  const btn = document.getElementById('btn-hw-check');
+  const ts  = document.getElementById('hw-ts');
+  const res = document.getElementById('hw-results');
+  const err = document.getElementById('hw-err');
+  btn.disabled = true; btn.textContent = '⏳ Checking…';
+  err.textContent = '';
+  try {
+    const r = await fetch('/api/hardware/check', {cache:'no-store'});
+    const d = await r.json();
+    if (!d.ok) { err.textContent = 'Check failed: ' + (d.error || r.status); return; }
+    res.style.display = '';
+    ts.textContent = 'Last run: ' + new Date().toLocaleTimeString('de-DE');
+
+    function set(id, text, cls) {
+      const el = document.getElementById(id);
+      if (!el) return;
+      el.textContent = text;
+      el.className = 'hw-val ' + (cls || '');
+    }
+    function cls_ok(v, bad_vals, warn_vals) {
+      if (v === null || v === undefined) return 'hw-na';
+      const s = String(v).toLowerCase();
+      if ((bad_vals  || []).some(b => s.includes(b))) return 'hw-bad';
+      if ((warn_vals || []).some(w => s.includes(w))) return 'hw-warn';
+      return 'hw-ok';
+    }
+
+    // ── Drone readiness ───────────────────────────────────────────────────
+    const dr = d.drone || {};
+    const alert = dr.alert ?? '—';
+    set('h-alert', alert === null ? 'n/a' : (alert || 'none'),
+        cls_ok(alert, ['error','stall','cutout','motor','battery','angle'],
+               ['low_battery','too_much_angle']));
+
+    const motor = dr.motor ?? null;
+    set('h-motor', motor === null ? 'no issue' : motor,
+        motor === null ? 'hw-ok' : 'hw-bad');
+
+    const sens = dr.sensors ?? null;
+    set('h-sensors', sens === null ? 'all OK' : sens,
+        sens === null ? 'hw-ok' : 'hw-bad');
+
+    const mag = dr.magneto ?? '—';
+    set('h-magneto', mag || '—',
+        cls_ok(mag, ['required'], ['in-progress']));
+
+    // Axes: colour x0y1z1 style
+    const axRaw = dr.magneto_axes || '—';
+    const axEl = document.getElementById('h-mag-axes');
+    if (axEl) {
+      if (axRaw === '—') { axEl.textContent = '—'; axEl.className = 'hw-val hw-na'; }
+      else {
+        axEl.innerHTML = axRaw.replace(/(x|y|z)([01])/g,
+          (_, a, v) => `${a}<span style="color:${v==='1'?'var(--good)':'var(--bad)'};">${v}</span>`);
+        axEl.className = 'hw-val';
+      }
+    }
+
+    // ── Telemetry ────────────────────────────────────────────────────────
+    const tel = d.telemetry || {};
+    const bat = tel.battery;
+    set('h-bat', bat !== undefined ? bat + ' %' : '—',
+        bat === undefined ? 'hw-na' : bat < 20 ? 'hw-bad' : bat < 35 ? 'hw-warn' : 'hw-ok');
+
+    const hcm = tel.height_cm;
+    set('h-height', hcm !== undefined && hcm !== null ? hcm + ' cm' : '—', '');
+
+    const fly = tel.flying;
+    set('h-flying', fly === undefined ? '—' : (fly ? 'yes' : 'no'),
+        fly ? 'hw-warn' : '');
+
+    set('h-yaw', tel.yaw !== undefined ? tel.yaw.toFixed(1) + '°' : '—', '');
+
+    set('h-fstate', tel.flying_state || '—', '');
+
+    const age = tel.state_age_s;
+    set('h-telage', age !== undefined ? age.toFixed(2) + ' s' : '—',
+        age === undefined ? 'hw-na' : age > 2 ? 'hw-bad' : age > 0.8 ? 'hw-warn' : 'hw-ok');
+
+    // ── System ───────────────────────────────────────────────────────────
+    const sys = d.system || {};
+    set('h-host', sys.hostname || '—', '');
+    set('h-serial', d.drone_serial || '—', '');
+    set('h-threads', sys.thread_count !== undefined ? sys.thread_count : '—',
+        sys.thread_count > 60 ? 'hw-warn' : '');
+    set('h-video', sys.video_mode
+        ? sys.video_mode + ' · ' + (sys.video_streaming ? 'streaming' : 'idle')
+          + ' · ' + (sys.video_frame_count || 0) + ' frames'
+        : '—', '');
+
+    const ceil = (d.ceiling || {});
+    set('h-ceiling', ceil.ceiling_m !== undefined
+        ? ceil.ceiling_m + ' m' + (ceil.engaged ? ' [ENGAGED]' : '') : '—',
+        ceil.engaged ? 'hw-warn' : '');
+
+    const pos = (sys.pos_sse_clients || 0) + (sys.pos_ws_clients || 0);
+    set('h-posclients', pos, '');
+
+  } catch(e) {
+    err.textContent = 'Request failed: ' + e;
+  } finally {
+    btn.disabled = false; btn.textContent = '▶ Run Hardware Check';
+  }
+}
+document.getElementById('btn-hw-check').addEventListener('click', runHwCheck);
+</script>
+""" + _PAGE_GRID_CLOSE + _SHARED_SCRIPT
+
+
+# ---------------------------------------------------------------------------
 # UI server
 # ---------------------------------------------------------------------------
 
@@ -5281,6 +5517,115 @@ class UiServer:
                         time.sleep(0.02)
             return Response(gen(),
                             mimetype="multipart/x-mixed-replace; boundary=frame")
+
+        # ── Hardware check page + API ──────────────────────────────────
+        @app.get("/hardware")
+        def hardware_page():
+            return render_template_string(_PAGE_HARDWARE,
+                                          **live_ctx(active="hardware"))
+
+        @app.get("/api/hardware/check")
+        def api_hardware_check():
+            import socket as _socket
+            import unified_api_server as _srv
+
+            result: dict = {"ok": True}
+
+            # ── Drone hardware state (Olympe) ────────────────────────────
+            drone_info: dict = {}
+            try:
+                b = _srv.backend
+                if b is not None:
+                    drone_info["alert"]   = getattr(b, "_read_alert_state",   lambda: None)()
+                    drone_info["motor"]   = getattr(b, "_read_motor_error_state", lambda: None)()
+                    drone_info["sensors"] = getattr(b, "_read_sensors_state", lambda: None)()
+                    drone_info["magneto"] = getattr(b, "_read_magnetometer_state", lambda: None)()
+            except Exception as e:
+                drone_info["read_error"] = str(e)
+
+            # Magneto axes from /api/magneto
+            try:
+                mag_r = _srv.backend
+                if mag_r is not None:
+                    from unified_api_server import (
+                        HAS_MAGNETO_CALIB,
+                        MagnetoCalibrationRequiredState,
+                        MagnetoCalibrationStateChanged,
+                    )
+                    if HAS_MAGNETO_CALIB:
+                        st = mag_r._get_state(MagnetoCalibrationStateChanged)
+                        if st is not None:
+                            x = st.get("xAxisCalibration", 0)
+                            y = st.get("yAxisCalibration", 0)
+                            z = st.get("zAxisCalibration", 0)
+                            drone_info["magneto_axes"] = f"x{x}y{y}z{z}"
+            except Exception:
+                pass
+
+            result["drone"] = drone_info
+
+            # ── Drone serial ─────────────────────────────────────────────
+            try:
+                snap = self.state.snapshot() if self.state else {}
+                tel  = snap.get("telemetry") or {}
+                result["drone_serial"] = (tel.get("serial_number")
+                                          or tel.get("serial") or None)
+            except Exception:
+                result["drone_serial"] = None
+
+            # ── Telemetry snapshot ───────────────────────────────────────
+            tel_snap: dict = {}
+            try:
+                with _srv.telemetry_lock:
+                    raw = dict(_srv.telemetry)
+                for key in ("battery", "height_cm", "flying", "yaw",
+                            "flying_state", "state_age_s"):
+                    if key in raw:
+                        tel_snap[key] = raw[key]
+                # friendly flying_state string
+                fs = raw.get("flying_state")
+                if fs is not None:
+                    tel_snap["flying_state"] = (getattr(fs, "name", None)
+                                                or str(fs))
+            except Exception as e:
+                tel_snap["read_error"] = str(e)
+            result["telemetry"] = tel_snap
+
+            # ── Pi / system diagnostics ──────────────────────────────────
+            import threading as _th
+            threads = _th.enumerate()
+            by_name: dict = {}
+            for t in threads:
+                name = t.name
+                for pfx in ("ThreadPoolExecutor-", "Thread-"):
+                    if name.startswith(pfx):
+                        name = pfx + "*"; break
+                by_name[name] = by_name.get(name, 0) + 1
+
+            sys_info: dict = {
+                "hostname":       _socket.gethostname(),
+                "thread_count":   len(threads),
+                "threads_by_name": by_name,
+                "video_mode":     _srv._video_mode,
+                "video_streaming": _srv._video_streaming,
+                "video_frame_count": _srv._video_frame_count,
+            }
+            try:
+                with _srv._pos_sse_lock:
+                    sys_info["pos_sse_clients"] = len(_srv._pos_sse_queues)
+                    sys_info["pos_ws_clients"]  = len(_srv._pos_ws_queues)
+            except Exception:
+                pass
+            result["system"] = sys_info
+
+            # ── Altitude ceiling ─────────────────────────────────────────
+            result["ceiling"] = {
+                "ceiling_m": round(float(_srv.MAX_ALTITUDE_M), 2),
+                "engaged":   bool(_srv._ceiling_engaged),
+                "reason":    _srv._ceiling_last_reason or "",
+            }
+
+            return jsonify(result)
 
         @app.get("/team_logo.png")
         def team_logo():
