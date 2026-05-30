@@ -126,7 +126,10 @@ class SwarmRunner:
         # dispatches a free defender to re-capture it). AUTO only assigns
         # intent; the ``_armed`` gate still controls whether anything is
         # actually pushed to the FCs, so AUTO+disarmed is a safe preview.
-        self._auto_mode = False
+        # Default ON so the moment the operator hits Arm the planner
+        # immediately dispatches the v7 game-launch sortie (3 attackers ->
+        # the 3 enemy slots) without an extra MANUAL->AUTO toggle.
+        self._auto_mode = True
         self._auto_lock = threading.RLock()
 
         # Loop bookkeeping.
@@ -335,26 +338,58 @@ class SwarmRunner:
             if ids:
                 self._markers.ingest(fc_name, ids)
 
-        # 3a) Auto-adopt: any FC the C2 reports that isn't in our roster
-        # yet is added automatically — and we PRE-FILL the team + role so
-        # the operator only has to Arm + AUTO instead of clicking through
-        # every drone. Team is sniffed from the FC name prefix ("red*" →
-        # red, "blue*" → blue); anything else stays unassigned. The default
-        # role is "attacker" — the planner will only act on attackers that
-        # share our_team, and the dashboard lets the operator flip an
-        # individual drone to "defender" / "scout" / "idle" if they want.
+        # 3a) Auto-adopt: every FC the C2 reports that isn't in our roster
+        # yet is added automatically — and we PRE-FILL team + role so the
+        # operator only has to Arm instead of clicking through every drone.
+        #
+        # TEAM ISOLATION (regs §1.3 — "no access to enemy drones"): a red
+        # strategy must never enrol blue drones (and vice versa). We sniff
+        # team from the FC name prefix ("red*" → red, "blue*" → blue) and
+        # SKIP drones whose prefix belongs to the other team. Anything
+        # without a team prefix gets tagged with OUR team by default
+        # (manual fleet — operator still controls the slot/role).
+        #
+        # ROLE SPREAD (req 6): the v7 launch plan is
+        #   1 scout (rotates at the arena centre to watch slot states)
+        # + 1 defender (anti-camp patrol of own slots, then home hover)
+        # + N-2 attackers (one per enemy slot via the planner).
+        # We hand out roles in that order across freshly-adopted OUR-team
+        # drones, counting existing ones first so adoption is idempotent
+        # across runner restarts.
         known = {d.fc_name for d in s.drones}
+        our_team = (s.markers.our_team or "").lower()
         new_fcs = [fc for fc in overview.keys() if fc and fc not in known]
         if new_fcs:
+            our_count = sum(1 for d in s.drones
+                            if d.team and d.team.lower() == our_team and d.enabled)
             for fc in sorted(new_fcs):
                 name = fc.lower()
-                team = ("red" if name.startswith("red")
-                        else "blue" if name.startswith("blue")
-                        else None)
-                self._settings.update_drone(fc, team=team, role="attacker")
+                sniffed = ("red" if name.startswith("red")
+                           else "blue" if name.startswith("blue")
+                           else None)
+                # Drop drones that explicitly belong to the OTHER team —
+                # the strategy must not know they exist.
+                if sniffed and our_team and sniffed != our_team:
+                    self._events.add(
+                        "adopt_skip",
+                        f"ignored (team {sniffed} != ours {our_team or '?'})",
+                        drone=fc,
+                    )
+                    continue
+                team = sniffed or our_team or None
+                # Role spread: 1st on our team -> scout, 2nd -> defender,
+                # then attackers. With 5 drones we land on 1+1+3.
+                if our_count == 0:
+                    role = "scout"
+                elif our_count == 1:
+                    role = "defender"
+                else:
+                    role = "attacker"
+                our_count += 1
+                self._settings.update_drone(fc, team=team, role=role)
                 self._events.add(
                     "adopt",
-                    f"discovered from C2; pre-set team={team or '?'} role=attacker",
+                    f"discovered from C2; pre-set team={team or '?'} role={role}",
                     drone=fc,
                 )
             s = self._settings.snapshot()          # refresh so they dispatch this tick
@@ -495,9 +530,15 @@ class SwarmRunner:
         """
         MIN_GAP = 0.4
         MAX_ALT_M = 5.0     # 1 m below the 6 m arena ceiling
+        # Team isolation (req 3 + regs §1.3): only deconflict among OUR-team
+        # drones. We have no access to enemy drones, so we cannot — and
+        # must not — reason about their altitudes.
+        our_team = (s.markers.our_team or "").lower()
         prefs: list[tuple[float, str]] = []
         for d in s.drones:
             if not d.enabled:
+                continue
+            if our_team and d.team and d.team.lower() != our_team:
                 continue
             pref = float(d.scout_alt_m if d.role == "scout" else d.attack_alt_m)
             prefs.append((pref, d.fc_name))

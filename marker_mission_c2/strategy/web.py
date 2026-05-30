@@ -58,9 +58,30 @@ def build_app(
         import time as _time
         s = settings.to_dict()
         our_team = s["markers"]["our_team"]
+
+        # Team isolation (req 2 + regs §1.3 — "no access to enemy drones"):
+        # filter every per-drone collection in the response to OUR-team
+        # FCs (+ any still-unassigned drones the operator can still label
+        # as ours). Enemy drones are stripped from settings, from the live
+        # C2 overview, from the per-drone role state and from the cruise-
+        # alt deconfliction map BEFORE they ever leave the server, so the
+        # UI / API consumers never see them at all.
+        def _is_ours_team(t):
+            return (t == our_team) or (t is None) or (t == "")
+        drones_dict = (s.get("drones") or {})
+        our_fcs = {fc for fc, dd in drones_dict.items()
+                   if _is_ours_team(dd.get("team"))}
+        s["drones"] = {fc: dd for fc, dd in drones_dict.items() if fc in our_fcs}
+        runner_snap = runner.snapshot()
+        for key in ("overview", "drones", "cruise_alts"):
+            sub = runner_snap.get(key)
+            if isinstance(sub, dict):
+                runner_snap[key] = {fc: v for fc, v in sub.items()
+                                    if fc in our_fcs}
+
         return _no_cache(jsonify({
             "settings": s,
-            "runner": runner.snapshot(),
+            "runner": runner_snap,
             "slots": markers.to_dict(our_team=our_team),
             "events": runner.events.to_list()[-50:],
             "roles": sorted(all_roles().keys()),
@@ -252,6 +273,25 @@ _INDEX_HTML = r"""<!doctype html>
                 text-transform: uppercase; color: var(--muted);
                 letter-spacing: 0.05em; }
   .grid { display: grid; gap: 10px; }
+  /* Persistent fleet-video strip — rendered ONCE per roster change so
+     the MJPEG streams survive the 1Hz state polling re-renders. */
+  .video-strip { display: grid; gap: 8px;
+                 grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
+                 margin-bottom: 12px; }
+  .video-tile { position: relative; background: #111; border-radius: 6px;
+                border: 1px solid var(--border); overflow: hidden;
+                aspect-ratio: 16 / 10; cursor: zoom-in; }
+  .video-tile img { width: 100%; height: 100%; object-fit: cover;
+                    display: block; background: #222; }
+  .video-tile .label { position: absolute; top: 4px; left: 6px;
+                       padding: 1px 6px; border-radius: 999px;
+                       background: rgba(0,0,0,.55); color: #fff;
+                       font-size: 11px; line-height: 1.4; font-weight: 600; }
+  .video-tile .label.red { background: var(--red); }
+  .video-tile .label.blue { background: var(--blue); }
+  .video-tile .nope { position: absolute; inset: 0; display: flex;
+                      align-items: center; justify-content: center;
+                      color: #666; font-size: 11px; }
   .drone { background: var(--panel2); border: 1px solid var(--border);
            border-radius: 6px; padding: 10px; }
   .drone .head { display: flex; align-items: center; gap: 8px;
@@ -360,6 +400,11 @@ _INDEX_HTML = r"""<!doctype html>
 
 <main>
   <section>
+    <h2>Fleet video</h2>
+    <div id="videos" class="video-strip"></div>
+  </section>
+
+  <section>
     <h2>Drones</h2>
     <div id="drones" class="grid"></div>
   </section>
@@ -396,6 +441,50 @@ function ageStr(s) {
   return Math.round(s/60) + "m";
 }
 
+// Build the fleet-video strip ONCE per roster change. Re-rendering on
+// every tick would tear down + re-establish every MJPEG connection,
+// which causes visible flicker AND quickly piles up dropped sockets on
+// the sim. So we cache the last-seen drone + URL set and only rebuild
+// the strip when something CHANGES.
+let _videoCache = "";  // signature: "fc1=url1|fc2=url2|…"
+function renderVideos(state) {
+  const root = document.getElementById("videos");
+  if (!root) return;
+  const drones = state.settings.drones || {};
+  const overview = (state.runner && state.runner.overview) || {};
+  const names = Object.keys(drones).sort();
+  // Build a signature of "fc=videoUrl,team" — when it changes we rebuild,
+  // otherwise the existing <img>s keep streaming.
+  const sig = names.map(fc => {
+    const ov = overview[fc] || {};
+    const url = ov.base_url ? `${ov.base_url}/video.mjpg` : "";
+    const team = (drones[fc] || {}).team || "";
+    return `${fc}=${url}=${team}`;
+  }).join("|");
+  if (sig === _videoCache) return;
+  _videoCache = sig;
+  if (!names.length) {
+    root.innerHTML = '<div class="small">No drones — strip will appear once the C2 reports any.</div>';
+    return;
+  }
+  root.innerHTML = names.map(fc => {
+    const ov = overview[fc] || {};
+    const url = ov.base_url ? `${ov.base_url}/video.mjpg` : "";
+    const team = (drones[fc] || {}).team || "";
+    const teamCls = team === "red" ? "red" : team === "blue" ? "blue" : "";
+    const click = url ? `onclick="window.open('${url}', '_blank')"` : "";
+    const content = url
+      ? `<img src="${url}" alt="${fc} live feed" onerror="this.style.display='none'; this.nextElementSibling && (this.nextElementSibling.style.display='flex');" />
+         <div class="nope" style="display:none">camera offline</div>`
+      : `<div class="nope">no video</div>`;
+    return `<div class="video-tile" ${click} title="${fc} live feed">
+              <span class="label ${teamCls}">${fc}</span>
+              ${content}
+            </div>`;
+  }).join("");
+}
+
+
 function renderDrones(state) {
   const root = document.getElementById("drones");
   const drones = (state.settings.drones || {});
@@ -426,11 +515,26 @@ function renderDrones(state) {
       .join("");
 
     // ── Live status from the C2 overview (per-FC live telemetry). ──
-    // overview shape: { fc: {connection_ok, drone_connected, state:{...}} }.
+    // overview shape: { fc: {base_url, connection_ok, drone_connected,
+    //                        state:{phase, mission_script, mission_step_idx, …}} }.
     // Be defensive — fields may be missing while a drone is offline.
     const ov = overview[fc] || {};
     const ovState = (ov && ov.state) || {};
     const tel = (ovState && ovState.telemetry) || {};
+    // Video URL: every FC (sim + real Olympe) serves an MJPEG stream at
+    // <base_url>/video.mjpg. base_url comes through the overview so it
+    // works for sim FCs (127.0.0.1:9101+) and remote ones (sphinx3:8080).
+    const videoUrl = ov.base_url ? `${ov.base_url}/video.mjpg` : null;
+    // Mission script progress (the script currently EXECUTING on the FC,
+    // distinct from rs.last_pushed_script which is what we last pushed).
+    const fcScript = ovState.mission_script || [];
+    const fcStepIdx = ovState.mission_step_idx;
+    const fcScriptLen = fcScript.length;
+    const fcStepStr = (fcScriptLen > 0 && fcStepIdx != null)
+      ? `${fcStepIdx + 1}/${fcScriptLen}` : "—";
+    const currentStep = (fcScriptLen > 0 && fcStepIdx != null
+                         && fcStepIdx >= 0 && fcStepIdx < fcScriptLen)
+      ? fcScript[fcStepIdx] : "";
     const c2Ok = !!ov.connection_ok;
     const droneOk = !!ov.drone_connected;
     const c2DotCls = c2Ok ? "good" : "bad";
@@ -480,6 +584,18 @@ function renderDrones(state) {
           <div><span class="k">in home</span><span class="v ${inHomeCls}">${inHome}</span></div>
           <div><span class="k">world pos</span><span class="v mono">${posStr}</span></div>
           <div><span class="k">sees</span><span class="v mono" title="visible ArUco IDs">${visStr}</span></div>
+        </div>
+        <div class="mission-row" style="margin-top:6px">
+          <div class="small" title="The mission script currently EXECUTING on the FC (from C2 overview), with the current step highlighted.">
+            <b>script ${fcStepStr}</b>
+            ${currentStep ? `<span class="mono" style="color:var(--green,#5a5)"> · ${currentStep.replace(/</g,'&lt;')}</span>` : ""}
+          </div>
+          ${rs.last_pushed_script ? `<details style="margin-top:4px">
+            <summary class="small" style="cursor:pointer">view full pushed script (${rs.last_pushed_script.split('\\n').filter(Boolean).length} lines)</summary>
+            <pre class="mono" style="font-size:11px;max-height:140px;overflow:auto;
+                                     background:#111;padding:6px;border-radius:4px;
+                                     margin:4px 0 0">${rs.last_pushed_script.replace(/</g,'&lt;')}</pre>
+          </details>` : ""}
         </div>
         <div class="row">
           <div>
@@ -671,6 +787,7 @@ async function refresh() {
     const state = await api("/api/state");
     last = state;
     renderHeader(state);
+    renderVideos(state);   // signature-cached → only rebuilds when roster changes
     renderSlots(state);
     renderEvents(state);
     if (!dronesIsEditing()) {

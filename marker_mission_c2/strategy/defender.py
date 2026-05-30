@@ -87,8 +87,13 @@ def _patrol_script(ctx: RoleContext) -> str:
             lines.append(f"HEIGHT {detect_alt:.2f}")
             lines.append(f"HOOVER {_PATROL_PASS_HOLD_S:.1f}")
             lines.append(f"HEIGHT {cruise_alt:.2f}")
-    # End at home centre with a long hover (we never LAND mid-match).
-    home_y = -8.0 if our == "red" else 8.0
+    # Forward-stage at the home/neutral boundary so the defender can react
+    # fast (req 6). We stay 1 m INSIDE our home zone (y = ±5 is the
+    # boundary; -6 / +6 keeps the regs §1.4.4 home-presence gate True so
+    # the re-capture mission can launch the instant a slot is flipped),
+    # while sitting as close as legally possible to the neutral zone for
+    # minimum dispatch latency.
+    home_y = -6.0 if our == "red" else 6.0
     lines.append(f"TO 0 {home_y:g}")
     lines.append(f"HEIGHT {cruise_alt:.2f}")
     home_hold = max(30.0, float(getattr(ctx.match, "home_hover_s", 600.0)))

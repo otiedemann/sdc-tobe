@@ -17,10 +17,11 @@
 #   3. marker_mission_c2.strategy-> the SDC26 strategy dashboard.
 #
 # Usage:
-#   ./run_local.sh                 # sim + C2 + ONE strategy (red), 4 drones
+#   ./run_local.sh                 # sim + C2 + BOTH strategies (red+blue), 4 drones
 #   ./run_local.sh --drones 6      # spawn 6 drones (3 red + 3 blue), available in C2
 #   ./run_local.sh --red 3 --blue 2  # explicit per-team counts
-#   ./run_local.sh --match         # + a SECOND strategy (blue): red-vs-blue
+#   ./run_local.sh --no-blue       # only spawn the RED strategy
+#   ./run_local.sh --match         # (back-compat alias: blue is now on by default)
 #   ./run_local.sh --no-strategy   # just sim + C2 (drive via the 3D UI / curl)
 #   ./run_local.sh --open          # also open the control hub in a browser
 #
@@ -44,11 +45,12 @@ PY="${PY:-$REPO_ROOT/.venv/bin/python}"
 SIM_CONFIG="${SIM_CONFIG:-marker_mission_sim/sim_config.example.json}"
 C2_CONFIG="${C2_CONFIG:-marker_mission_c2/config.dev.json}"
 
-MATCH=0; NO_STRATEGY=0; OPEN=0
+MATCH=1; NO_STRATEGY=0; OPEN=0   # blue strategy on by default (team-vs-team play)
 DRONES=""; RED=""; BLUE=""
 while [ $# -gt 0 ]; do
   case "$1" in
-    --match)        MATCH=1 ;;
+    --match)        MATCH=1 ;;                # back-compat: blue is on by default
+    --no-blue)      MATCH=0 ;;                # opt out of the blue strategy
     --no-strategy)  NO_STRATEGY=1 ;;
     --open)         OPEN=1 ;;
     --drones)       shift; DRONES="${1:-}" ;;
