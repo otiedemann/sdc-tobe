@@ -1,8 +1,9 @@
 """DEFENDER role.
 
-A defender protects OUR target slots. It sits idle (on the ground, no
-script) until one of our slots is flipped to the enemy's colour, then it
-launches a re-capture run on that slot and returns home.
+A defender protects OUR target slots. When it has no active duty it WAITS,
+airborne, in the neutral zone near our home boundary — poised to dash to any
+of our home slots — and the instant one of our slots is flipped to the enemy's
+colour it launches a re-capture run on that slot.
 
 Design choices:
 
@@ -10,23 +11,29 @@ Design choices:
   identical to attacking an enemy slot — fly to the box, brake on the
   *currently-showing* face (which is the enemy's face, since the enemy
   holds it), drift over it, hover to flip it back to our colour, then
-  RTH + land. So the defender reuses the attacker's primitive-composed
-  script builder (``TAKEOFF / UD_RC / FB_RC / FB_BRAKE / RC / YAW_IMU /
-  LAND``) verbatim — just pointed at one of *our* slots.
+  return. So the defender reuses the attacker's primitive-composed script
+  builder (``TAKEOFF / UD_RC / FB_RC / FB_BRAKE / RC / YAW_IMU``) verbatim —
+  just pointed at one of *our* slots.
 
-* **Never camps.** When no slot is threatened the defender returns a
-  noop (stays grounded / holds), so it never "sits" over a box — which
-  the regs penalise (DQ for a stationary "dead duck" over a target).
+* **Waits in the neutral zone (never camps).** With no threat it holds at a
+  fixed point just inside the neutral zone on our side (x=0, |y|=4.5), at its
+  deconflicted cruise altitude. The neutral zone is empty airspace — NOT above
+  any box — so this never trips the regs §1.3 "dead duck over a target" rule,
+  and it puts the defender as close as legally possible to our home slots for
+  minimum recapture latency. (The earlier design flew an anti-camp patrol over
+  our own boxes; waiting in neutral is both cleaner — no dead-duck risk — and
+  faster to respond.)
 
 * **Target selection.** The operator (MANUAL) or the AUTO planner sets
   ``role_state.target_slot`` to the threatened own-slot. The defender
   only acts while that slot is held by the enemy; once it flips back to
-  us (or the script finishes), it resets to idle and the target clears.
+  us (or the script finishes), it resets to idle and returns to its
+  neutral-zone waiting point.
 
-Phases mirror the attacker:
-    idle    → no threat assigned, or assigned slot already ours
-    running → re-capture script pushed; drone executing the sequence
-    done    → script ended (FC back to init); reset to idle
+Phases:
+    idle/waiting → no threat; holding at the neutral-zone waiting point
+    running      → re-capture script pushed; drone executing the sequence
+    done         → script ended; reset to idle (-> returns to neutral wait)
 """
 from __future__ import annotations
 
@@ -36,11 +43,19 @@ from .roles import Decision, Role, RoleContext, noop, push, register
 # Reuse the attacker's primitive-composed capture script + helpers so the
 # defender adds NO new flight maneuvers of its own.
 from .attacker import (
-    _full_attack_script, _enemy_face_for, _slot_is_ours, SLOT_POSITIONS_M,
-    HOME_REARM_HOVER_S,
+    _full_attack_script, _enemy_face_for, _slot_is_ours, HOME_REARM_HOVER_S,
 )
 
 logger = logging.getLogger(__name__)
+
+# Where an idle defender waits: x=0 (centred so the dash to any of our 3 home
+# slots is symmetric), |y| = 4.5 m. The neutral zone is y∈[-5, +5]; 4.5 m is
+# 0.5 m into the neutral zone from our home boundary (|y|=5) — the closest
+# legal neutral-zone point to home, for minimum recapture latency.
+NEUTRAL_WAIT_Y_M: float = 4.5
+# How close (m, horizontal) the defender must be to the waiting point to count
+# as "already waiting" (so we don't re-push the hold script every tick).
+_WAIT_ARRIVE_M: float = 1.5
 
 
 def _slot_home_team(slot: int) -> str:
@@ -48,66 +63,38 @@ def _slot_home_team(slot: int) -> str:
     return "red" if 1 <= slot <= 3 else "blue"
 
 
-# Anti dead-duck patrol: regs §1.3 forbid "passive sitting or hovering
-# directly above the boxes". The defender pass-through dwell stays well
-# below the regs' anti-camp threshold (which the org doesn't quantify but
-# which we interpret as ~2 s). 0.5 s is enough for the box's RFID system
-# to register a defender presence (1-2 m altitude band) and interrupt any
-# in-progress enemy hover (per v7 §1.4.3 "no defending drone is detected").
-_PATROL_PASS_HOLD_S: float = 0.5
-
-# How many full triangle cycles per pushed patrol script. The match is
-# 10 minutes (600 s); each cycle takes roughly (3 boxes * (transit ~2 s
-# + 0.5 s pass-through)) ~= 7.5 s. 8 cycles ~ 1 min per push.
-_PATROL_CYCLES: int = 8
+def _neutral_wait_xy(our_team: str) -> tuple[float, float]:
+    return (0.0, -NEUTRAL_WAIT_Y_M if our_team == "red" else NEUTRAL_WAIT_Y_M)
 
 
-def _patrol_script(ctx: RoleContext) -> str:
-    """Generate a continuous-triangle patrol script for the home boxes.
+def _at_neutral_wait(ctx: RoleContext) -> bool:
+    """True if the defender is already airborne at its neutral waiting point."""
+    pos = ctx.state.world_position_m
+    if not pos or len(pos) < 3:
+        return False
+    wx, wy = _neutral_wait_xy(ctx.our_team)
+    dx, dy = float(pos[0]) - wx, float(pos[1]) - wy
+    return (dx * dx + dy * dy) ** 0.5 <= _WAIT_ARRIVE_M and float(pos[2]) > 0.5
 
-    Uses only existing FC verbs (TAKEOFF / HEIGHT / TO / HOOVER) — the
-    drone climbs, then loops the 3 own-side boxes, dipping to the capture
-    altitude band briefly at each one (deliberately short so it never
-    counts as parking), then ends at home with a sustained hover so the
-    script never lands during the match (regs §1.3 + our own no-land rule).
+
+def _neutral_wait_script(ctx: RoleContext) -> str:
+    """Fly to the neutral-zone waiting point and hold there (no land).
+
+    Existing FC verbs only (TAKEOFF / HEIGHT / TO / HOOVER). TAKEOFF is a
+    no-op when already airborne. The script ends with a brief hover so it
+    reaches phase=done — at which the FC holds position (keeps hovering) AND
+    the drone is free for the planner to re-dispatch on a re-capture. We never
+    emit LAND: the defender stays airborne the whole match.
     """
-    our = ctx.our_team
-    home_slots = [sl for sl in ctx.active_slots if _slot_home_team(sl) == our]
-    # Sort so the drone always visits in the same x order — easier to
-    # eyeball in the 3D view and gives a predictable cycle time.
-    home_slots.sort(key=lambda sl: SLOT_POSITIONS_M.get(sl, (0.0, 0.0))[0])
-
-    # Use this drone's DISTINCT deconflicted altitude (team-keyed grid, >=
-    # 0.30 m from every other drone). Floor at 1.5 m so we clear the 1.4 m
-    # box tops — NOT 2.0 m, which would pull low-rung defenders up onto a
-    # shared 2.0 m band and defeat the deconfliction.
-    cruise_alt = max(1.5, float(ctx.cruise_alt_m or ctx.drone.attack_alt_m or 2.2))
-    detect_alt = 1.5   # middle of the 1-2 m RFID detection band
-
-    lines: list[str] = ["TAKEOFF", f"HEIGHT {cruise_alt:.2f}"]
-    for _ in range(max(1, _PATROL_CYCLES)):
-        for sl in home_slots:
-            x, y = SLOT_POSITIONS_M[sl]
-            lines.append(f"TO {x:g} {y:g}")
-            lines.append(f"HEIGHT {detect_alt:.2f}")
-            lines.append(f"HOOVER {_PATROL_PASS_HOLD_S:.1f}")
-            lines.append(f"HEIGHT {cruise_alt:.2f}")
-    # Forward-stage at the home/neutral boundary so the defender can react
-    # fast (req 6). We stay 1 m INSIDE our home zone (y = ±5 is the
-    # boundary; -6 / +6 keeps the regs §1.4.4 home-presence gate True so
-    # the re-capture mission can launch the instant a slot is flipped),
-    # while sitting as close as legally possible to the neutral zone for
-    # minimum dispatch latency.
-    home_y = -6.0 if our == "red" else 6.0
-    lines.append(f"TO 0 {home_y:g}")
-    lines.append(f"HEIGHT {cruise_alt:.2f}")
-    # Confirm home-zone presence (v7 §1.4.4) with a brief hover, then let the
-    # script END — but never LAND. The defender must stay airborne for the
-    # whole match (operator requirement): it hovers at phase=done in the home
-    # zone, ready for the planner to re-dispatch it on a re-capture the instant
-    # the scout reports one of our slots flipped to the enemy. Ending the
-    # script (vs the old ~10-min hover) is what frees it for re-dispatch.
-    lines.append(f"HOOVER {HOME_REARM_HOVER_S:.1f}")
+    cruise_alt = max(1.5, float(ctx.cruise_alt_m or ctx.drone.attack_alt_m or 1.6))
+    wx, wy = _neutral_wait_xy(ctx.our_team)
+    lines = [
+        "TAKEOFF",
+        f"HEIGHT {cruise_alt:.2f}",
+        f"TO {wx:g} {wy:g}",
+        f"HEIGHT {cruise_alt:.2f}",
+        f"HOOVER {HOME_REARM_HOVER_S:.1f}",
+    ]
     return "\n".join(lines) + "\n"
 
 
@@ -130,23 +117,23 @@ class DefenderRole(Role):
         # ---- idle: waiting for a threatened own slot ----------------------
         if rs.phase in ("", "idle", "done"):
             if slot is None:
-                # No assigned threat — run an anti dead-duck patrol that
-                # passes through every own-slot RFID zone briefly, then
-                # ends at home with a sustained hover. Same FC INIT +
-                # home-presence gates as the re-capture path.
+                # No assigned threat — WAIT, airborne, in the neutral zone
+                # near our home boundary, poised to recapture. If we're
+                # already parked there, do nothing (the FC keeps hovering at
+                # phase=done). The FC starts a script only from INIT/done, so
+                # only push the go-to-wait script when idle on the ground or
+                # finished a prior run — and only if not already on station.
+                if _at_neutral_wait(ctx):
+                    return noop("defender: waiting in neutral zone (ready)")
                 if ctx.state.phase not in ("init", "done", ""):
                     return noop(
                         f"defender: airborne (fc phase={ctx.state.phase}); "
-                        f"holding — FC must be INIT to start a patrol"
-                    )
-                if not ctx.in_home_now:
-                    return noop(
-                        "defender: not in home zone yet; cannot start patrol"
+                        f"holding — FC must be INIT/done to reposition to wait"
                     )
                 return push(
-                    _patrol_script(ctx),
-                    new_phase="patrolling",
-                    reason="defender: anti-camp patrol of own slots",
+                    _neutral_wait_script(ctx),
+                    new_phase="waiting",
+                    reason="defender: hold in neutral zone, ready to recapture",
                 )
             # Only defend OUR slots; ignore a mis-assigned enemy slot.
             if slot not in ctx.active_slots:
@@ -154,21 +141,22 @@ class DefenderRole(Role):
             if _slot_is_ours(ctx, slot):
                 rs.advance_phase("done", f"slot {slot} already ours — no action")
                 return noop(f"defender: slot {slot} already ours")
-            # The FC starts a mission only from INIT (on the ground). Runs end
-            # with a home HOVER (never land mid-match), so an airborne drone
-            # can't begin a new re-capture run — hold until it's back at INIT.
+            # The FC starts a script only when idle (phase init/done) — i.e.
+            # parked at the neutral waiting point (or mid-reposition having just
+            # finished). If it's mid-run (e.g. still flying to the wait point),
+            # hold until that ends, THEN launch the recapture.
             if ctx.state.phase not in ("init", "done", ""):
                 return noop(
-                    f"defender: airborne (fc phase={ctx.state.phase}); "
-                    f"holding — FC must be INIT to start a re-capture"
+                    f"defender: busy (fc phase={ctx.state.phase}); "
+                    f"will launch re-capture once idle"
                 )
-            # v7 §1.4.4 home-presence: drone must be detected in its own home
-            # zone before starting a new scoring attempt.
-            if not ctx.in_home_now:
-                return noop(
-                    "defender: not yet detected back in home zone "
-                    "(v7 §1.4.4 requires home-zone presence before re-attempt)"
-                )
+            # NOTE: unlike the attacker, we deliberately do NOT gate on
+            # in_home_now here. The defender waits in the NEUTRAL zone, and a
+            # recapture of one of OUR slots is a 0-pt home defence (not an
+            # enemy-zone scoring attempt that §1.4.4 guards against camping) —
+            # the drone flies INTO its home zone to do it. Gating on home
+            # presence would strand the neutral-waiting defender and it could
+            # never recapture, defeating the whole role.
             # Enemy holds our slot -> re-capture its currently-showing
             # (enemy) face with the attacker's primitive script.
             recap_id = _enemy_face_for(slot, ctx.our_team)
@@ -183,11 +171,13 @@ class DefenderRole(Role):
         if rs.phase == "running":
             if slot is not None and _slot_is_ours(ctx, slot):
                 # Re-captured (a scout confirmed our face) — let the script
-                # finish its RTH/LAND on its own; reset our intent.
+                # finish its RTH on its own (ends hovering in home, no land);
+                # reset intent so the idle branch returns us to the neutral
+                # waiting point.
                 rs.target_slot = None
                 rs.target_assigned_unix_s = None
                 rs.advance_phase("done", f"slot {slot} re-captured")
-                return noop("defender: slot re-captured, returning")
+                return noop("defender: slot re-captured, returning to wait")
             if ctx.state.phase in ("init", "done", ""):
                 rs.target_slot = None
                 rs.target_assigned_unix_s = None
