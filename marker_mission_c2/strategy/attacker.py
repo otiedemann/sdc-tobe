@@ -213,6 +213,17 @@ FB_BRAKE_STICK: int = 50
 # and if both somehow fail the guard stops the drone at the wall.
 FB_BRAKE_TIMEOUT_S: float = 10.0
 
+# After returning home, hover briefly to register the v7 §1.4.4 home-zone
+# presence, then LAND so the FC returns to INIT and the strategy can
+# RE-DISPATCH this drone for the NEXT attack. This is the key to continuous
+# play: the enemy re-captures a box we flipped, the scout sees it flip back,
+# and an attacker that has re-armed (landed → INIT → free) is dispatched
+# again. The OLD behaviour ended every run with a ~10-minute home hover, so
+# the FC stayed in one never-ending mission, the drone never returned to
+# INIT, the planner never saw a free attacker, and each drone could fly
+# only ONE attack per match. 2 s ≈ 2 C2 ticks — enough to confirm presence.
+HOME_REARM_HOVER_S: float = 2.0
+
 
 def _format_script(*lines: str) -> str:
     return "\n".join(line for line in lines if line) + "\n"
@@ -349,14 +360,15 @@ def _full_attack_script(
         f" {target_xy[0]:g} {target_xy[1]:g}" if target_xy else ""
     )
 
-    # End-of-run = return to OUR home zone and HOVER — never LAND during a
-    # match (SDC26 regs: the drone must return to the home zone and remain
-    # inside to validate the capture; landing is not required and wastes the
-    # rest of the match). We hold with a long HOOVER (the FC only
-    # safety-lands once a script ends, i.e. after this hover, which we size
-    # to ~a full match). The FC's arena guard keeps the hover inside bounds.
-    home_hold_s = max(30.0, float(getattr(ctx.match, "home_hover_s", 600.0)))
-    home_hold = f"HOOVER {home_hold_s:.0f}"
+    # End-of-run = return to OUR home zone, confirm home-zone presence
+    # (v7 §1.4.4) with a brief hover, then LAND so the FC returns to INIT
+    # and the strategy can RE-DISPATCH this drone the instant the enemy
+    # flips one of our captured boxes back. The old design held a ~10-minute
+    # hover here ("never land during a match") — but that kept the FC in a
+    # single never-ending mission, so the drone never re-armed and could
+    # only ever fly ONE attack. Continuous capture/recapture play REQUIRES
+    # the drone to come home, land, and become a free attacker again.
+    home_rearm = f"HOOVER {HOME_REARM_HOVER_S:.1f}\nLAND"
     wall_entry = HOME_WALL_MARKER.get(ctx.our_team)
     if wall_entry:
         wall_marker_id, _w_xy = wall_entry
@@ -374,14 +386,14 @@ def _full_attack_script(
             f"FB_BRAKE {wall_marker_id} {FB_BRAKE_WALL_STOP_M:.2f} "
             f"{FB_BRAKE_STICK} {FB_BRAKE_TIMEOUT_S:.1f}",
             "YAW_IMU 180",
-            # Hold in the home zone (validates the capture) — do NOT land.
-            home_hold,
+            # Confirm home presence, then LAND so we can re-arm + re-attack.
+            home_rearm,
         )
     else:
         rth_lines = (
             f"TO_HOME {ctx.drone.home_alt_m or 3.0:.2f}",
-            # Hold in the home zone — do NOT land.
-            home_hold,
+            # Confirm home presence, then LAND so we can re-arm + re-attack.
+            home_rearm,
         )
     # Height deconfliction: settle at this drone's DISTINCT cruise
     # altitude (assigned by the runner, floored above the 1.4 m box
