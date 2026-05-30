@@ -2242,11 +2242,14 @@ class OlympeBackend(DroneBackend):
         if d is None:
             return
         if self._detect_piloting_api():
-            try:
-                d.stop_piloting()
-                return
-            except Exception:
-                pass
+            for _attempt in range(3):
+                try:
+                    d.stop_piloting()
+                    return
+                except Exception:
+                    if _attempt < 2:
+                        time.sleep(0.15)
+        # Fallback: send a zero PCMD to neutralise any open stick input.
         with self._pcmd_seq_lock:
             self._pcmd_seq = (self._pcmd_seq + 1) & 0x7FFFFFFF
             seq = self._pcmd_seq
@@ -2658,7 +2661,7 @@ class OlympeBackend(DroneBackend):
         }[direction]
         print(f"[ANAFI] move({direction}, {cm}cm) -> moveBy{move_args}")
         self._stop_piloting()
-        time.sleep(0.1)
+        time.sleep(0.4)   # give firmware time to exit PCMD mode before moveBy
         with command_lock:
             result = d(moveBy(*move_args)).wait(_timeout=30)
         ok = False
