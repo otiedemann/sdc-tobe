@@ -19,14 +19,21 @@ from __future__ import annotations
 
 import json
 import time
+import urllib.request
 from pathlib import Path
 
-from flask import Flask, Response, jsonify, send_from_directory
+from flask import Flask, Response, jsonify, request, send_from_directory
 
 from .config import SimConfig
 from .world import World
 
 WEB_DIR = Path(__file__).resolve().parent / "web"
+
+# Well-known local strategy servers (must match run_local.sh + hub.html).
+# The hub's "Arm both teams" button proxies through the sim to these so the
+# browser makes a single same-origin call (no cross-origin/CORS to the
+# strategy ports). Override via the SDC_STRATEGY_PORTS env if you remap them.
+STRATEGY_PORTS = {"red": 8091, "blue": 8092}
 
 
 def make_ui_app(world: World, cfg: SimConfig) -> Flask:
@@ -72,6 +79,42 @@ def make_ui_app(world: World, cfg: SimConfig) -> Flask:
             "Connection": "keep-alive",
         }
         return Response(gen(), mimetype="text/event-stream", headers=headers)
+
+    @app.post("/api/match/<action>")
+    def api_match(action: str):
+        """Arm/disarm BOTH strategy servers in one click (hub convenience).
+
+        The hub is served from the sim, but the Arm/Disarm endpoints live on
+        the strategy servers (:8091 red, :8092 blue) — a different origin. To
+        avoid CORS in the browser we proxy here: the page POSTs same-origin to
+        the sim, and the sim relays to each strategy server-side and reports a
+        per-team result. Arming both at once kicks off a full simulated match
+        (both strategies default to AUTO, so Arm is the only step needed).
+        """
+        if action not in ("arm", "disarm"):
+            return jsonify({"ok": False, "error": f"unknown action {action!r}"}), 400
+
+        # Optional ?teams=red,blue to target a subset (defaults to both).
+        want = (request.args.get("teams") or "").strip()
+        teams = ([t for t in want.split(",") if t in STRATEGY_PORTS]
+                 if want else list(STRATEGY_PORTS))
+
+        results: dict[str, dict] = {}
+        ok_any = False
+        for team in teams:
+            port = STRATEGY_PORTS[team]
+            url = f"http://127.0.0.1:{port}/api/strategy/{action}"
+            try:
+                req = urllib.request.Request(url, data=b"", method="POST")
+                with urllib.request.urlopen(req, timeout=2.5) as resp:
+                    body = resp.read().decode("utf-8", "replace")
+                payload = json.loads(body) if body.strip() else {}
+                results[team] = {"ok": True, "armed": payload.get("armed")}
+                ok_any = True
+            except Exception as exc:  # unreachable / not started / error
+                results[team] = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+        status = 200 if ok_any else 502
+        return jsonify({"ok": ok_any, "action": action, "teams": results}), status
 
     return app
 

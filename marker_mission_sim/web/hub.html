@@ -55,6 +55,21 @@
   .foot{color:var(--muted);font-size:12px;margin-top:28px;
         border-top:1px solid var(--border);padding-top:14px}
   code{background:var(--panel2);padding:1px 5px;border-radius:4px}
+  /* Match control bar */
+  .matchbar{display:flex;align-items:center;gap:12px;flex-wrap:wrap;
+            background:var(--panel);border:1px solid var(--border);
+            border-radius:10px;padding:14px 16px}
+  .btn{font:600 14px system-ui,sans-serif;color:#fff;border:none;
+       border-radius:8px;padding:10px 16px;cursor:pointer;
+       transition:filter .12s,transform .05s}
+  .btn:hover{filter:brightness(1.1)} .btn:active{transform:translateY(1px)}
+  .btn:disabled{opacity:.5;cursor:default;filter:none}
+  .btn-go{background:var(--green);color:#08361b}
+  .btn-stop{background:var(--panel2);color:var(--text);
+            border:1px solid var(--border)}
+  .matchmsg{font-size:13px;color:var(--muted);font-family:ui-monospace,monospace}
+  .matchmsg.ok{color:var(--green)} .matchmsg.err{color:var(--red)}
+  .matchbar .hint{color:var(--muted);font-size:12px;margin-left:auto}
 </style>
 </head>
 <body>
@@ -66,6 +81,14 @@
 </header>
 
 <main>
+  <h2>Match control</h2>
+  <div class="matchbar">
+    <button id="armBoth" class="btn btn-go">▶ Arm both teams — start match</button>
+    <button id="disarmBoth" class="btn btn-stop">■ Disarm both</button>
+    <span id="matchMsg" class="matchmsg"></span>
+    <span class="hint">Both strategies default to AUTO, so Arm is all it takes.</span>
+  </div>
+
   <h2>Command &amp; Strategy</h2>
   <div id="services" class="cards"></div>
 
@@ -73,9 +96,9 @@
   <div id="drones" class="drones"></div>
 
   <div class="foot">
-    Status dots ping each service every few seconds. The blue strategy only
-    appears when the stack was started with <code>--match</code>. Started via
-    <code>./run_local.sh</code>.
+    Status dots ping each service every few seconds. Both strategies (red +
+    blue) run by default; start the stack with <code>--no-blue</code> for a
+    red-only run. Started via <code>./run_local.sh</code>.
   </div>
 </main>
 
@@ -170,6 +193,38 @@ async function refreshDrones(){
     renderDrones(w.drones || []);
   }catch(_){ /* sim not up yet */ }
 }
+
+// --- Match control: arm/disarm BOTH strategy servers in one click. ---
+// We POST same-origin to the sim, which proxies to each strategy server
+// (avoids cross-origin/CORS to the :8091/:8092 strategy ports).
+async function matchAction(action){
+  const msg = document.getElementById("matchMsg");
+  const armB = document.getElementById("armBoth");
+  const disB = document.getElementById("disarmBoth");
+  armB.disabled = disB.disabled = true;
+  msg.className = "matchmsg";
+  msg.textContent = (action === "arm" ? "Arming" : "Disarming") + " both teams…";
+  try{
+    const r = await fetch(url(SIM_PORT, "/api/match/" + action),
+                          {method:"POST", cache:"no-store"});
+    const j = await r.json();
+    const parts = Object.entries(j.teams || {}).map(([t, v]) =>
+      v.ok ? `${t}: ${v.armed === false ? "disarmed" : "ARMED ✓"}`
+           : `${t}: ✗ unreachable`);
+    msg.textContent = parts.join("    ·    ") || (j.ok ? "done" : "failed");
+    msg.className = "matchmsg " + (j.ok ? "ok" : "err");
+  }catch(e){
+    msg.textContent = "✗ " + e;
+    msg.className = "matchmsg err";
+  }finally{
+    armB.disabled = disB.disabled = false;
+    refreshStatus();
+  }
+}
+document.getElementById("armBoth")
+        .addEventListener("click", () => matchAction("arm"));
+document.getElementById("disarmBoth")
+        .addEventListener("click", () => matchAction("disarm"));
 
 renderServices();
 refreshStatus(); refreshDrones();
