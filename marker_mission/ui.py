@@ -1502,9 +1502,7 @@ refresh();
     const el = $('s-last-dur');
     if (!el) return;
     if (last) {
-      const d = last.duration_s;
-      const mm = Math.floor(d / 60), ss = Math.round(d % 60);
-      el.textContent = mm > 0 ? `${mm}m ${ss}s` : `${ss}s`;
+      el.textContent = Math.round(last.duration_s) + 's';
       el.title = last.flight_id;
     } else {
       el.textContent = 'no data';
