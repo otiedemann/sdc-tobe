@@ -591,6 +591,14 @@ class MissionState:
     # ArUco motion deltas are correct (verified vs GPS), the drone
     # returns to its actual takeoff spot in the sim/arena.
     takeoff_world_position_m: Optional[tuple[float, float, float]] = None
+    # IMU dead-reckoning: world-frame (x, y) displacement from the
+    # takeoff point, integrated from vgx/vgy/yaw telemetry at every
+    # control tick. Reset to (0,0) at TAKEOFF completion regardless of
+    # whether ArUco world position is available. Used by TO_HOME as a
+    # fallback when no ArUco takeoff snapshot was recorded.
+    # Drifts over time; reliable for short flights (< ~90 s).
+    imu_displacement_m: tuple[float, float] = (0.0, 0.0)
+    imu_displacement_updated_at: float = 0.0   # monotonic, 0 = never
     # Markers / methods / per-marker votes from the LAST fresh fix
     # (kept in sync with ``world_position_m``). They describe how the
     # currently-displayed position was computed, so they go stale
@@ -1045,6 +1053,34 @@ class MissionController:
                 self.position.update(vgx, vgy, now)
             except (TypeError, ValueError):
                 pass
+            # IMU displacement integrator: world-frame (x, y) from takeoff.
+            # Runs whenever flying so TO_HOME has a fallback if no ArUco
+            # world position was captured at takeoff.
+            try:
+                with self.state.lock:
+                    prev_t = self.state.imu_displacement_updated_at
+                    flying = (self.state.phase not in
+                              (Phase.INIT, Phase.DONE, Phase.ABORT))
+                if flying and prev_t > 0.0:
+                    dt = now - prev_t
+                    if 0.0 < dt < 0.5:
+                        _vgx = float(tel.raw.get("vgx") or 0.0) / 100.0
+                        _vgy = float(tel.raw.get("vgy") or 0.0) / 100.0
+                        _yaw = tel.raw.get("yaw")
+                        if _yaw is not None:
+                            _yr = math.radians(float(_yaw))
+                            # body→world: Anafi vgx=forward, vgy=right
+                            wx = _vgx * math.cos(_yr) - _vgy * math.sin(_yr)
+                            wy = _vgx * math.sin(_yr) + _vgy * math.cos(_yr)
+                            with self.state.lock:
+                                ox, oy = self.state.imu_displacement_m
+                                self.state.imu_displacement_m = (
+                                    ox + wx * dt, oy + wy * dt)
+                with self.state.lock:
+                    if flying:
+                        self.state.imu_displacement_updated_at = now
+            except (TypeError, ValueError, AttributeError):
+                pass
         pose = self.get_pose()
         self.smoother.update(pose, now)
         if pose is not None:
@@ -1241,6 +1277,10 @@ class MissionController:
                 wp = self.state.world_position_m
                 if wp is not None:
                     self.state.takeoff_world_position_m = tuple(float(v) for v in wp)
+                # Always reset IMU dead-reckoning origin at takeoff so
+                # TO_HOME has a fallback even without ArUco world position.
+                self.state.imu_displacement_m = (0.0, 0.0)
+                self.state.imu_displacement_updated_at = now
             self._advance_script(f"takeoff complete (h={drone_h:.2f}m)")
             return
         u_ud = self.pd_height.step(e_h, now)
@@ -3232,24 +3272,57 @@ class MissionController:
             # physical takeoff spot regardless of the absolute error
             # in the wall-marker solution. Optional height override
             # overrides the snapshotted Z (cruise high then LAND).
+            #
+            # Fallback: if no ArUco world position was available at
+            # takeoff, use IMU dead-reckoning (moveBy with negated
+            # displacement). Less precise but works without markers.
             with self.state.lock:
                 home = self.state.takeoff_world_position_m
-            if home is None:
-                self._abort("TO_HOME: no takeoff snapshot — never took off this mission")
-                return
-            tx, ty, snapshot_z = (float(home[0]), float(home[1]),
-                                  float(home[2]))
-            tz = (max(cfg.min_height_m,
-                      min(cfg.max_height_m, float(step.height)))
-                  if step.height is not None else snapshot_z)
-            with self.state.lock:
-                self.state.goto_target_x_m = tx
-                self.state.goto_target_y_m = ty
-                self.state.goto_target_z_m = tz
-                self.state.goto_target_yaw_deg = None  # keep current
-                self.state.goto_hold_until = None
-            self._set_phase(Phase.GOTO,
-                            note + f" -> HOME ({tx:.2f},{ty:.2f},{tz:.2f})m")
+                imu_disp = self.state.imu_displacement_m
+            if home is not None:
+                tx, ty, snapshot_z = (float(home[0]), float(home[1]),
+                                      float(home[2]))
+                tz = (max(cfg.min_height_m,
+                          min(cfg.max_height_m, float(step.height)))
+                      if step.height is not None else snapshot_z)
+                with self.state.lock:
+                    self.state.goto_target_x_m = tx
+                    self.state.goto_target_y_m = ty
+                    self.state.goto_target_z_m = tz
+                    self.state.goto_target_yaw_deg = None
+                    self.state.goto_hold_until = None
+                self._set_phase(Phase.GOTO,
+                                note + f" -> HOME ({tx:.2f},{ty:.2f},{tz:.2f})m")
+            else:
+                # IMU fallback: issue moveBy with negated displacement.
+                dx, dy = -imu_disp[0], -imu_disp[1]
+                dist_m = math.sqrt(dx**2 + dy**2)
+                print(f"[ctrl] TO_HOME IMU fallback: disp=({imu_disp[0]:.2f},{imu_disp[1]:.2f})m"
+                      f" -> moveBy({dx:.2f},{dy:.2f})")
+                self._set_phase(Phase.MOVE_IMU,
+                                note + f" IMU fallback dist={dist_m:.2f}m")
+                if dist_m > 0.05:
+                    try:
+                        # Rotate world (dx,dy) into body frame via current yaw,
+                        # then issue forward/back and left/right move() calls.
+                        with self.state.lock:
+                            tel = self.state.last_telemetry
+                        yaw_deg = (float(tel.raw.get("yaw") or 0.0)
+                                   if tel and tel.raw else 0.0)
+                        yr = math.radians(yaw_deg)
+                        bx = dx * math.cos(yr) + dy * math.sin(yr)
+                        by = -dx * math.sin(yr) + dy * math.cos(yr)
+                        fb_cm = int(round(bx * 100.0))
+                        lr_cm = int(round(by * 100.0))
+                        if abs(fb_cm) >= 10:
+                            d_fb = "forward" if fb_cm > 0 else "back"
+                            self.api.move(d_fb, abs(fb_cm))
+                        if abs(lr_cm) >= 10:
+                            d_lr = "right" if lr_cm > 0 else "left"
+                            self.api.move(d_lr, abs(lr_cm))
+                    except Exception as e:
+                        print(f"[ctrl] TO_HOME IMU move failed: {e}")
+                self._advance_script("TO_HOME IMU fallback complete")
             return
         if step.kind == "DANCE":
             now = time.monotonic()
