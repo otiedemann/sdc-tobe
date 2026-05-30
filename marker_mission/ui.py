@@ -2849,6 +2849,27 @@ _PAGE_ARENA = _PAGE_BASE_CSS + _PAGE_HEADER + _COMMON_SCRIPT + _PAGE_GRID_OPEN +
     </div>
 
     <div class="card">
+      <h2>Magnetometer hardware calibration</h2>
+      <div style="display:flex; align-items:center; gap:.75rem; flex-wrap:wrap; margin-bottom:.6rem;">
+        <div>
+          Status: <span id="mag-status" style="font-weight:600;">—</span>
+          &nbsp;·&nbsp; Axes: <span id="mag-axes" style="font-family:monospace;">—</span>
+        </div>
+        <button id="btn-mag-cal" type="button"
+                style="padding:.4rem .85rem; border:0; border-radius:5px;
+                       background:#2563eb; color:#fff; font-weight:600;
+                       cursor:pointer; font-size:.85rem;">
+          Start calibration
+        </button>
+        <span id="mag-cal-msg" style="font-size:.82rem; color:#aab;"></span>
+      </div>
+      <p style="margin:.3rem 0; font-size:.82rem; color:#aab;">
+        Nach dem Start die Drohne in einer <strong style="color:#e6e6e6;">liegenden Acht</strong>
+        bewegen (~20–30 s, alle Achsen abdecken) bis alle Achsen grün sind.
+      </p>
+    </div>
+
+    <div class="card">
       <h2>Top-down view (+y = front, +x = right)</h2>
       <canvas id="c-arena" width="700" height="700"
               style="background:#0c0f12; border-radius:6px;
@@ -3373,6 +3394,57 @@ async function refreshList() {
 ['ar-width','ar-depth','ar-topz','ar-botz','ar-msize'].forEach(id => {
   const el = $(id); if (el) el.addEventListener('input', drawArena);
 });
+// ── Magnetometer hardware calibration ────────────────────────────────────
+let _magPollTimer = null;
+function _stopMagPoll() { if (_magPollTimer) { clearInterval(_magPollTimer); _magPollTimer = null; } }
+
+async function _updateMagStatus() {
+  try {
+    const r = await fetch('/api/magneto', {cache:'no-store'});
+    if (!r.ok) return;
+    const d = await r.json();
+    const required = d.required;
+    const axes = d.axes || '—';
+    const status = $('mag-status');
+    const axEl = $('mag-axes');
+    if (status) {
+      status.textContent = required ? 'REQUIRED' : 'OK';
+      status.style.color = required ? 'var(--bad)' : 'var(--good)';
+    }
+    if (axEl) {
+      // axes like "x1y1z1" — colour each digit
+      axEl.innerHTML = (axes === '—') ? '—' : axes.replace(/(x|y|z)([01])/g,
+        (_, ax, v) => `${ax}<span style="color:${v==='1'?'var(--good)':'var(--bad)'};">${v}</span>`);
+    }
+    if (!required && _magPollTimer) {
+      _stopMagPoll();
+      const msg = $('mag-cal-msg');
+      if (msg) { msg.textContent = '✓ Calibration complete'; msg.style.color = 'var(--good)'; }
+    }
+  } catch(e) {}
+}
+
+async function startMagCal() {
+  const msg = $('mag-cal-msg');
+  if (msg) { msg.textContent = 'Starting…'; msg.style.color = 'var(--accent)'; }
+  try {
+    const r = await fetch('/api/magneto/calibrate', {method:'POST'});
+    const d = await r.json();
+    if (d.ok) {
+      if (msg) { msg.textContent = 'In progress — move drone in figure-8'; msg.style.color = 'var(--warn)'; }
+      _stopMagPoll();
+      _magPollTimer = setInterval(_updateMagStatus, 1000);
+    } else {
+      if (msg) { msg.textContent = 'Error: ' + (d.error || d.message || '?'); msg.style.color = 'var(--bad)'; }
+    }
+  } catch(e) {
+    if (msg) { msg.textContent = 'Request failed'; msg.style.color = 'var(--bad)'; }
+  }
+}
+
+_updateMagStatus();
+$('btn-mag-cal').addEventListener('click', startMagCal);
+
 $('btn-ar-reset').addEventListener('click', resetToDefault);
 $('btn-ar-save').addEventListener('click', saveActive);
 $('btn-ar-magcap').addEventListener('click', captureMagNorth);
