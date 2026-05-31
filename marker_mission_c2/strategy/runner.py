@@ -469,6 +469,12 @@ class SwarmRunner:
         cruise_alts = self._deconflicted_cruise_alts(s)
         self._last_cruise_alts = cruise_alts
 
+        # 3c.5) Per-drone home-park lanes: spread OUR team across the home
+        # zone's x so a bank recall doesn't converge everyone on one point
+        # (which made them cross altitude bands and storm the collision
+        # avoider). Stable order by fc_name -> stable lane assignment.
+        home_parks = self._home_park_lanes(s)
+
         # 3d) Collision avoidance: predict our drones' paths from live position
         # + speed and, where two are on course to come within SAFETY_RADIUS,
         # tell the lower-priority one to change altitude. Computed once per tick
@@ -530,6 +536,7 @@ class SwarmRunner:
                 cruise_alt_m=cruise_alts.get(drone.fc_name),
                 in_home_now=in_home_now,
                 team_phase=self._team_phase,
+                home_park_xy=home_parks.get(drone.fc_name),
             )
 
             try:
@@ -633,6 +640,21 @@ class SwarmRunner:
             out[fc] = min(round(CRUISE_BASE_M + k * MIN_GAP, 2), MAX_ALT_M)
         return out
 
+    def _home_park_lanes(self, s) -> Dict[str, tuple]:
+        """Return {fc: (x, y)} home-park points, x spread across the home zone.
+
+        Each OUR-team drone gets its own lane so a bank recall fans them out
+        instead of stacking everyone on x=0 (which crossed altitude bands and
+        triggered the collision-avoidance storm that stalled re-attacks).
+        """
+        from .roles import home_park_xy as _hp
+        our = (s.markers.our_team or "").lower()
+        ours = sorted(d.fc_name for d in s.drones
+                      if d.enabled and d.team and d.team.lower() == our)
+        n = len(ours)
+        team = our or "red"
+        return {fc: _hp(team, i, n) for i, fc in enumerate(ours)}
+
     # ------------------------------------------------------------------
     # Collision avoidance
     # ------------------------------------------------------------------
@@ -680,13 +702,18 @@ class SwarmRunner:
     # Team scoring coordinator (v7 5-pt play)
     # ------------------------------------------------------------------
 
-    # How long a bank may run before we give up and sortie again, so a drone
-    # that can't get home (lost position, stuck) never deadlocks the team.
-    BANK_TIMEOUT_S = 30.0
+    # How long a bank may run before we give up and sortie again. This is the
+    # MAX time the team will sit at home waiting for a straggler before going
+    # back on the attack — keep it short so a single slow/stuck drone can't
+    # park the whole team in the home zone (the "massive delay" the operator
+    # saw). At the timeout we sortie anyway: the capturer is normally home by
+    # then (>=1 pt secured) and re-attacking immediately beats idling.
+    BANK_TIMEOUT_S = 14.0
     # Grace window after the FIRST enemy capture before we actually bank, so a
     # near-simultaneous SECOND capture (the 10-pt double-strike, < 1 s apart)
-    # can complete first. > 1 s (the double-strike window) + detection lag.
-    BANK_GRACE_S = 1.5
+    # can complete first. > 1 s (the double-strike window) + a margin for
+    # capture-detection lag (the scout has to SEE the second flip).
+    BANK_GRACE_S = 2.5
 
     def _update_team_phase(self, s, overview: Dict[str, Any]) -> None:
         """Flip team phase sortie<->bank to maximise 5-pt scoring plays.

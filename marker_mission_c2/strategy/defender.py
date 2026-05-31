@@ -75,7 +75,7 @@ def _wait_xy(ctx: RoleContext) -> tuple[float, float]:
     bank   -> our home zone, returning with the team to secure the 5-pt attempt.
     """
     if ctx.team_phase == "bank":
-        return home_park_xy(ctx.our_team)
+        return ctx.home_park_xy or home_park_xy(ctx.our_team)
     y = -NEUTRAL_WAIT_Y_M if ctx.our_team == "red" else NEUTRAL_WAIT_Y_M
     return (0.0, y)
 

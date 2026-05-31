@@ -110,14 +110,35 @@ def in_home_zone(team: str, x: float, y: float) -> bool:
     return False
 
 
-def home_park_xy(team: str) -> tuple[float, float]:
+def home_park_xy(team: str, lane: int = 0, n_lanes: int = 1) -> tuple[float, float]:
     """Where a drone parks when recalled home to BANK a scoring attempt.
 
-    x=0 (centred), |y|=6 m — comfortably inside the home zone (y in ±[5,10])
-    yet ~1.5 m clear of the boxes at |y|=7.5 so a parked/rotating drone is
-    never a "dead duck" directly over a target (regs §1.3).
+    |y|=6 m — comfortably inside the home zone (y in ±[5,10]) yet ~1.5 m clear
+    of the boxes at |y|=7.5 so a parked/rotating drone is never a "dead duck"
+    over a target (regs §1.3). The x is SPREAD across the 10 m-wide home zone
+    by ``lane`` (this drone's index) of ``n_lanes`` so the whole team doesn't
+    converge on a single point during bank — stacking everyone on x=0 made
+    them cross each other's altitude bands and triggered a collision-avoidance
+    storm that stalled the next attack. Lanes span x in [-3.5, +3.5].
     """
-    return (0.0, -6.0 if team == "red" else 6.0)
+    y = -6.0 if team == "red" else 6.0
+    if n_lanes <= 1:
+        return (0.0, y)
+    span = 7.0   # -3.5 .. +3.5
+    x = -span / 2.0 + span * (lane / (n_lanes - 1))
+    return (round(x, 2), y)
+
+
+def enemy_heading_deg(team: str) -> float:
+    """Absolute arena heading (for the FC ``YAW`` verb) that faces the ENEMY.
+
+    The arena long axis is Y; red's home is -Y and its targets are +Y, blue is
+    the mirror. heading 0 deg = facing +Y, 180 deg = facing -Y. So red attacks
+    facing 0, blue facing 180. Used to orient an attacker before its body-frame
+    cruise so it never drives the wrong way (e.g. into the home wall) because
+    of an inherited heading from a previous run / interrupted mission.
+    """
+    return 0.0 if team == "red" else 180.0
 
 
 # ---------------------------------------------------------------------------
@@ -248,6 +269,10 @@ class RoleContext:
     #              before the box is recaptured). No new attacks start.
     # Roles branch on this so the whole team pulses out-and-back together.
     team_phase: str = "sortie"
+    # This drone's DISTINCT home-park point (x spread across the home zone by
+    # the runner so the team doesn't pile on one spot during bank). Roles use
+    # it for the bank/return-home target. None -> fall back to home_park_xy().
+    home_park_xy: Optional[tuple[float, float]] = None
 
 
 class Role(abc.ABC):

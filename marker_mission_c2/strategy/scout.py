@@ -37,7 +37,7 @@ import logging
 import time
 
 from .roles import (
-    Decision, Role, RoleContext, noop, push, stop_cmd, register, home_park_xy,
+    Decision, Role, RoleContext, noop, push, register, home_park_xy,
 )
 
 logger = logging.getLogger(__name__)
@@ -58,7 +58,7 @@ def _scout_target_xy(ctx: RoleContext) -> tuple[float, float]:
               boxes (enemy boxes are out of vision range from home).
     """
     if ctx.team_phase == "bank":
-        return home_park_xy(ctx.our_team)
+        return ctx.home_park_xy or home_park_xy(ctx.our_team)
     return (0.0, 0.0)
 
 
@@ -107,16 +107,14 @@ class ScoutRole(Role):
         if rs.phase == desired_phase and not fc_finished:
             return noop(f"scout: rotating at {desired_phase[6:]} ({ctx.team_phase})")
 
-        # Mid-script but at the WRONG point (team phase just flipped) -> stop
-        # the current rotate so we can re-push toward the new point next tick.
-        if not fc_finished:
-            if rs.phase != desired_phase:
-                return stop_cmd(
-                    f"scout: redirect to {desired_phase[6:]} ({ctx.team_phase})"
-                )
-            return noop(f"scout: FC busy (phase={ctx.state.phase})")
-
-        # FC idle/done -> (re)launch the rotate toward the desired point.
+        # Otherwise (re)launch the rotate toward the desired point NOW. When the
+        # team phase just flipped, the scout is mid-rotate at the WRONG point;
+        # we push the new go-to-point script straight away, which OVERRIDES the
+        # running rotate — instant redirect, no stop-then-wait dance (that cost
+        # the team an extra tick or two getting the scout home each bank).
+        # _apply_decision throttles an identical re-push, so once it's heading
+        # to / rotating at the right point this just falls through to the noop
+        # above and never hammers the FC.
         script = _compose_scout_script(ctx, tx, ty)
         if script is None:
             return noop("scout: cannot compose script")

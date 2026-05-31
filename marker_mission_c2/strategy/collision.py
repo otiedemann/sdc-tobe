@@ -42,6 +42,11 @@ LOOKAHEAD_S = 4.0
 CLEAR_GAP_M = 0.60
 MAX_ALT_M = 5.0      # 1 m below the 6 m ceiling
 MIN_ALT_M = 0.80     # don't dodge into the floor
+# A drone moving faster than this (m/s, horizontal) is treated as TRANSITING
+# (attack run / flying home) and is never told to dodge — the altitude grid
+# keeps lanes apart and the crossing passes in a second or two. Only slower
+# (loitering / drifting) drones get an altitude dodge.
+MOVING_SPEED_MPS = 0.4
 
 # Priority: higher stays, lower yields. The scout holds station at the centre
 # (others route around it); a drone mid-capture outranks one merely cruising.
@@ -105,9 +110,23 @@ class CollisionAvoider:
         return vel
 
     def resolve(self, tracks: List[Track]) -> Dict[str, Tuple[float, str]]:
-        """Return ``{fc: (target_alt_m, reason)}`` for drones that must yield."""
+        """Return ``{fc: (target_alt_m, reason)}`` for drones that must yield.
+
+        Only LOITERING drones (scout rotating, defender/attacker holding) can
+        be told to dodge. A drone transiting horizontally (an attacker on a
+        capture run, anyone flying home) is left alone: the static altitude
+        grid already keeps within-team cruise lanes 0.6 m apart, and the
+        crossing is transient — it passes in 1-2 s. Overriding a transiting
+        attacker with a HEIGHT/HOOVER hold was stalling capture runs (the
+        "massive delay" the operator saw), so we trust the grid for movers and
+        reserve the dodge for two slow drones genuinely drifting together.
+        """
         overrides: Dict[str, Tuple[float, str]] = {}
         alts: Dict[str, float] = {t.fc: t.pos[2] for t in tracks}
+
+        def _moving(t: Track) -> bool:
+            return math.hypot(t.vel[0], t.vel[1]) > MOVING_SPEED_MPS
+
         for i in range(len(tracks)):
             for j in range(i + 1, len(tracks)):
                 a, b = tracks[i], tracks[j]
@@ -117,6 +136,10 @@ class CollisionAvoider:
                 yielder, stayer = (
                     (a, b) if _priority(a) < _priority(b) else (b, a)
                 )
+                # Never break a drone that's actively transiting — the grid
+                # handles it and the crossing is fleeting.
+                if _moving(yielder):
+                    continue
                 target = self._clear_alt(
                     alts[stayer.fc],
                     {fc: z for fc, z in alts.items() if fc != yielder.fc},

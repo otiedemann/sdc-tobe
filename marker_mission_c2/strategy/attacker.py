@@ -60,6 +60,7 @@ import math
 
 from .roles import (
     Decision, Role, RoleContext, noop, push, register, home_park_xy,
+    enemy_heading_deg,
 )
 from .settings import face_id
 
@@ -424,6 +425,15 @@ def _full_attack_script(
     CAPTURE_DESCENT_ALT_M = 1.5
     return _format_script(
         "TAKEOFF",
+        # FACE THE ENEMY FIRST (absolute arena YAW). The whole attack cruises
+        # body-frame forward (FB_RC), which only goes toward the enemy if the
+        # drone is actually facing that way. A previous run / interrupted bank
+        # can leave it facing the home wall, so without this the FB_RC would
+        # drive it BACKWARD into home (the "looking at the wall, massive delay"
+        # the operator saw). Re-asserting the absolute heading every run makes
+        # each attack self-correcting and launch instantly. 0 deg = +Y (red's
+        # enemy side), 180 = -Y (blue's).
+        f"YAW {enemy_heading_deg(ctx.our_team):g}",
         # CLIMB FIRST — Anafi settles at ~0.9m post-takeoff; slot
         # boxes top out at 1.4m. Forward motion BEFORE we clear that
         # height pitches the drone (and its camera) down, with two
@@ -538,12 +548,15 @@ def _return_home_script(ctx: RoleContext) -> str:
     secure the 5-pt attempt (all drones home before the box is recaptured).
     """
     cruise_alt = max(1.4, float(ctx.cruise_alt_m)) if ctx.cruise_alt_m else 1.6
-    hx, hy = home_park_xy(ctx.our_team)
+    hx, hy = ctx.home_park_xy or home_park_xy(ctx.our_team)
     return _format_script(
         "TAKEOFF",
         f"HEIGHT {cruise_alt:.2f}",
         f"TO {hx:g} {hy:g}",
         f"HEIGHT {cruise_alt:.2f}",
+        # End the return facing the ENEMY (absolute YAW) so the NEXT attack's
+        # body-frame cruise drives toward the enemy, not into the home wall.
+        f"YAW {enemy_heading_deg(ctx.our_team):g}",
         f"HOOVER {HOME_REARM_HOVER_S:.1f}",
     )
 
