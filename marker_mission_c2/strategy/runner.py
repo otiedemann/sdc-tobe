@@ -702,13 +702,14 @@ class SwarmRunner:
     # Team scoring coordinator (v7 5-pt play)
     # ------------------------------------------------------------------
 
-    # How long a bank may run before we give up and sortie again. This is the
-    # MAX time the team will sit at home waiting for a straggler before going
-    # back on the attack — keep it short so a single slow/stuck drone can't
-    # park the whole team in the home zone (the "massive delay" the operator
-    # saw). At the timeout we sortie anyway: the capturer is normally home by
-    # then (>=1 pt secured) and re-attacking immediately beats idling.
-    BANK_TIMEOUT_S = 14.0
+    # How long a bank may run before we give up and sortie again. Sized to the
+    # worst-case homeward transit: an attacker deep in the enemy zone (y≈7.5)
+    # is ~13.5 m from its home-park point, ~7 s at the 2 m/s cruise, plus a few
+    # seconds to break off the capture and turn — so ~20 s lets even the
+    # farthest drone get home and secure the 5-pt (all-home) play. At the
+    # timeout we sortie anyway: the capturer itself is normally home by then
+    # (>=1 pt secured) and re-attacking beats idling for a lone straggler.
+    BANK_TIMEOUT_S = 20.0
     # Grace window after the FIRST enemy capture before we actually bank, so a
     # near-simultaneous SECOND capture (the 10-pt double-strike, < 1 s apart)
     # can complete first. > 1 s (the double-strike window) + a margin for
