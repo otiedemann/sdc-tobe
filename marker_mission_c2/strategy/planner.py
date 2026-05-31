@@ -112,12 +112,18 @@ def plan(settings, markers, overview: dict, role_states: dict, now: float
     enemy = "blue" if our == "red" else "red"
     active = [int(x) for x in settings.markers.active_slots]
 
-    # DECAYED belief (not the raw last-seen holder): a slot we haven't
-    # observed in HOLDER_TRUST_S reads as "unknown", so the planner re-checks
-    # / re-captures it instead of trusting a stale "we hold it". This is what
-    # keeps attackers flying continuous capture runs all match — without it
-    # they park at home the moment every enemy box has *ever* been seen ours.
+    # Two belief views:
+    #  * DECAYED (effective_holder): a slot unseen for HOLDER_TRUST_S reads
+    #    "unknown" so we re-check enemy boxes instead of trusting a stale
+    #    "we hold it". Used for ATTACK target selection.
+    #  * RAW (slot_holder): the last face we actually observed, persists until
+    #    re-observed. Used for OUR-OWN-slot DEFENCE — if the last thing we saw
+    #    on our box was the enemy face, it stays "threatened" until a drone
+    #    sees it flipped back. (Decaying a threatened own box to "unknown"
+    #    would make us STOP defending it — the exact bug where blue boxes sat
+    #    un-recaptured in red's home.)
     holder = {sl: markers.effective_holder(sl, now=now) for sl in active}
+    raw_holder = {sl: markers.slot_holder(sl) for sl in active}
     locked = {sl for sl in active if markers.slot_locked(sl, now)}
 
     # Slots an in-flight (non-free) drone of ours is already heading to. We
@@ -136,8 +142,23 @@ def plan(settings, markers, overview: dict, role_states: dict, now: float
     # MUST also be on OUR team — both strategies (red + blue) auto-adopt
     # every FC, so without this filter the red planner would happily
     # dispatch blue drones (and vice-versa).
-    free_attackers: list[str] = []
-    free_defenders: list[str] = []
+    # Two eligibility tiers:
+    #
+    #  RECAPTURE-eligible (defence): our team, FC-ready (init/done), not
+    #  mid-run, no current target. NO in-home gate — a home recapture is a
+    #  0-pt defensive flip the drone flies INTO home to do (the §1.4.4
+    #  home-presence gate only guards new SCORING attempts on enemy boxes),
+    #  and the defender now waits in the NEUTRAL zone so it would never be
+    #  "in home". Role-agnostic: a defender does this by default, but a free
+    #  attacker is pulled in too ("attacker becomes defender" near a flipped
+    #  own box, then reverts to attacking) — this is what the operator asked
+    #  for. We keep them split so we can PREFER the defender.
+    #
+    #  ATTACK-eligible (scoring): the above PLUS in-home (§1.4.4) — only
+    #  attackers, and only while not banking.
+    recap_defenders: list[str] = []   # free defenders, any zone
+    recap_attackers: list[str] = []   # free attackers, any zone
+    free_attackers: list[str] = []    # free attackers, in-home (for scoring)
     for d in settings.drones:
         if not d.enabled or not d.team:
             continue
@@ -148,13 +169,13 @@ def plan(settings, markers, overview: dict, role_states: dict, now: float
             continue
         if not _fc_ready_to_start(overview, d.fc_name):
             continue
-        if not _drone_in_home(overview, d.fc_name, d.team):
-            continue
-        if d.role == "attacker":
-            free_attackers.append(d.fc_name)
-        elif d.role == "defender":
-            free_defenders.append(d.fc_name)
-        # scouts/idle: never participate in scoring plays
+        if d.role == "defender":
+            recap_defenders.append(d.fc_name)
+        elif d.role == "attacker":
+            recap_attackers.append(d.fc_name)
+            if _drone_in_home(overview, d.fc_name, d.team):
+                free_attackers.append(d.fc_name)
+        # scouts/idle: never participate in scoring/defence plays
 
     assignments: list[PlayAssignment] = []
     taken: set[int] = set()
@@ -172,21 +193,49 @@ def plan(settings, markers, overview: dict, role_states: dict, now: float
     if all_ours:
         return []  # let the win timer expire — no further dispatch
 
-    # ----- (1) Defensive re-capture — highest priority -----------------
-    # An own slot held by the enemy is BLEEDING points; recap it instantly
-    # (v7 home recap is 0 pts for us, but it prevents them from scoring
-    # later and resets the lock). Skip locked slots (recap also blocked
-    # during the 5-s window).
-    threatened = [sl for sl in our_slots if holder.get(sl) == enemy and sl not in locked]
+    # ----- (1) Defensive re-capture — HIGHEST priority, runs every tick -----
+    # An own slot whose LAST-OBSERVED face is the enemy's is captured and stays
+    # threatened until a drone sees it flipped back (raw_holder, not the decayed
+    # view — see above). Recapture it instantly: 0 pts, but it stops the enemy
+    # bleeding us and is required to ever reach the all-6 instant win. Skip
+    # slots inside the 5-s post-capture lock and slots already being handled.
+    #
+    # Assignment: the free DEFENDER goes first (its whole job), then the
+    # NEAREST free attacker is pulled in for any remaining threats — i.e. an
+    # attacker near one of our flipped boxes becomes a defender for one run,
+    # then reverts to attacking. Neither needs to be in-home (0-pt defence).
+    threatened = [sl for sl in our_slots
+                  if raw_holder.get(sl) == enemy
+                  and sl not in locked and sl not in taken]
+    # Order threats so the closest-to-any-recapturer is handled first.
+    recap_pool = list(recap_defenders) + list(recap_attackers)
     for sl in threatened:
-        if not free_defenders:
+        if not recap_pool:
             break
-        fc = free_defenders.pop(0)
+        # Prefer a defender if one is still free; else the nearest attacker.
+        free_def = [fc for fc in recap_defenders if fc in recap_pool]
+        if free_def:
+            fc = free_def[0]
+        else:
+            fc = min(recap_pool, key=lambda f: _dist_to_slot(overview, f, sl))
+        recap_pool.remove(fc)
+        if fc in recap_attackers:
+            recap_attackers.remove(fc)
+            if fc in free_attackers:
+                free_attackers.remove(fc)
+        if fc in recap_defenders:
+            recap_defenders.remove(fc)
         assignments.append(PlayAssignment(
             fc_name=fc, slot=sl, play_kind="defend_uncap",
-            reason=f"v7 defend: slot {sl} held by {enemy}",
+            reason=f"v7 defend: slot {sl} held by {enemy} — recapture now",
         ))
         taken.add(sl)
+
+    # During a BANK the whole team is securing the 5-pt attempt (returning
+    # home); the only thing we schedule is the defensive recapture above.
+    # New enemy-box ATTACK plays wait until we sortie again.
+    if team_phase == "bank":
+        return assignments
 
     # Enemy slots we can actually attack right now: not (freshly) confirmed
     # ours, not in the 5-s post-capture lock, not already taken by a defend

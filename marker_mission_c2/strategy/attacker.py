@@ -561,9 +561,58 @@ def _return_home_script(ctx: RoleContext) -> str:
     )
 
 
+def _slot_home_team(slot: int) -> str:
+    """v7 §1.4.2 Table 1: boxes 1-3 are RED home, 4-6 are BLUE home."""
+    return "red" if 1 <= int(slot) <= 3 else "blue"
+
+
 def _enemy_face_for(slot: int, our_team: str) -> int:
     enemy = "blue" if our_team == "red" else "red"
     return face_id(slot, enemy)
+
+
+def _slot_home_team(slot: int) -> str:
+    """v7 §1.4.2 Table 1: boxes 1-3 are RED home, 4-6 are BLUE home."""
+    return "red" if 1 <= int(slot) <= 3 else "blue"
+
+
+def _recapture_script(ctx: RoleContext, slot: int) -> str:
+    """Re-capture one of OUR OWN home boxes that the enemy flipped.
+
+    UNLIKE the enemy-attack script (which cruises body-frame FORWARD toward the
+    enemy side), a recapture target sits IN our own home zone — often behind or
+    beside the drone. So this uses world-frame ``TO`` (heading-agnostic: the FC
+    flies to the xy regardless of which way it points) to go straight to the
+    box, descends into the RFID capture band, hovers to flip it back to our
+    colour, then climbs and returns to the neutral waiting point facing the
+    enemy (ready to attack/defend again). Existing FC verbs only; never lands.
+
+    0 pts (home recapture, regs §1.4.3) but it stops the enemy bleeding us and
+    is required to ever reach the all-6 instant win.
+    """
+    target = SLOT_POSITIONS_M.get(int(slot))
+    if target is None:
+        return _return_home_script(ctx)
+    tx, ty = target
+    cruise_alt = max(1.4, float(ctx.cruise_alt_m)) if ctx.cruise_alt_m else 1.6
+    CAPTURE_ALT = 1.5            # middle of the 1-2 m RFID detection band
+    # Wait after the flip at the neutral point (outside home so the team's
+    # "all out" 5-pt condition still holds during a sortie).
+    wy = -4.5 if ctx.our_team == "red" else 4.5
+    return _format_script(
+        "TAKEOFF",
+        f"HEIGHT {cruise_alt:.2f}",
+        # Go to the box by WORLD position — no heading dependence.
+        f"TO {tx:g} {ty:g}",
+        # Drop into the capture band and dwell to flip the box back.
+        f"HEIGHT {CAPTURE_ALT:.2f}",
+        f"HOOVER {CAPTURE_HOLD_HOVER_S:.1f}",
+        # Climb back out, return to the neutral waiting point, face the enemy.
+        f"HEIGHT {cruise_alt:.2f}",
+        f"TO 0 {wy:g}",
+        f"YAW {enemy_heading_deg(ctx.our_team):g}",
+        f"HOOVER {HOME_REARM_HOVER_S:.1f}",
+    )
 
 
 def _slot_is_ours(ctx: RoleContext, slot: int) -> bool:
@@ -588,6 +637,33 @@ class AttackerRole(Role):
             return noop("attacker: no team assigned")
         if not ctx.state.drone_connected:
             return noop("attacker: drone not connected")
+
+        # ---- RE-CAPTURE: the planner pulled this attacker to defend one of
+        # OUR OWN flipped boxes (an "attacker becomes defender" run). It's a
+        # 0-pt home flip but stops the enemy scoring, so it BEATS both the bank
+        # recall and a fresh enemy attack. Detect it by the target being one of
+        # OUR home slots; fly the heading-agnostic recapture, then the attacker
+        # reverts to normal attacking once the target clears.
+        slot0 = rs.target_slot
+        if slot0 is not None and _slot_home_team(slot0) == ctx.our_team:
+            if rs.phase == "running":
+                if _slot_is_ours(ctx, slot0) or ctx.state.phase in ("init", "done", ""):
+                    rs.target_slot = None
+                    rs.target_assigned_unix_s = None
+                    rs.advance_phase("done", f"slot {slot0} recaptured / run done")
+                    return noop("attacker: recapture complete")
+                return noop(f"attacker: recapturing own slot {slot0}")
+            if _slot_is_ours(ctx, slot0):
+                rs.target_slot = None
+                rs.advance_phase("done", f"slot {slot0} already ours")
+                return noop(f"attacker: own slot {slot0} already ours")
+            if ctx.state.phase not in ("init", "done", ""):
+                return noop(f"attacker: busy; will recapture own slot {slot0} once idle")
+            return push(
+                _recapture_script(ctx, slot0),
+                new_phase="running",
+                reason=f"attacker->defender: re-capture own slot {slot0}",
+            )
 
         # ---- BANK: we just captured an enemy box — get home to secure the
         # 5-pt attempt (ALL drones must return home before the box is

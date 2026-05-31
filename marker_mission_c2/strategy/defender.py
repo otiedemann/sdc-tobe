@@ -45,7 +45,7 @@ from .roles import (
 # Reuse the attacker's primitive-composed capture script + helpers so the
 # defender adds NO new flight maneuvers of its own.
 from .attacker import (
-    _full_attack_script, _enemy_face_for, _slot_is_ours, HOME_REARM_HOVER_S,
+    _recapture_script, _slot_is_ours, HOME_REARM_HOVER_S,
 )
 
 logger = logging.getLogger(__name__)

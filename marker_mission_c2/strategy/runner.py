@@ -436,12 +436,11 @@ class SwarmRunner:
             logger.exception("strategy: team-phase update crashed (continuing)")
 
         # 3b) AUTO mode: auto-assign target slots within operator-set roles
-        # based on the live slot states. This is the event-reaction layer
-        # (enemy captures our slot -> dispatch a free defender, etc.). It
-        # only sets intent; the arming gate still controls actual pushes.
-        # SKIPPED while banking: during a bank we want every drone heading
-        # home to secure the attempt, not starting fresh attack runs.
-        if self.is_auto() and self._team_phase != "bank":
+        # based on the live slot states. Runs EVERY tick (including during a
+        # bank) so a defensive RE-CAPTURE of one of our own flipped boxes is
+        # never starved — the planner itself suppresses new enemy ATTACK plays
+        # while banking, but always schedules recaptures (highest priority).
+        if self.is_auto():
             try:
                 self._auto_plan(s)
             except Exception:
@@ -577,7 +576,7 @@ class SwarmRunner:
         with self._states_lock:
             role_states_snap = dict(self._role_states)
         plays = _planner.plan(s, self._markers, self._last_overview,
-                              role_states_snap, now)
+                              role_states_snap, now, team_phase=self._team_phase)
         for p in plays:
             self.assign_target(p.fc_name, p.slot)
             self._events.add(p.play_kind, p.reason, drone=p.fc_name)
