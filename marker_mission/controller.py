@@ -1251,14 +1251,16 @@ class MissionController:
         # -- this keeps the marker out of the oblique-angle range where
         # the ArUco detector starts to fail.
         if self.smoother.get(now) is not None:
-            # Stop rotation immediately, then step 10° back (CCW — opposite
-            # to the CW search sweep) so the marker is better centred in
-            # the frame before HEIGHT_ALIGN starts.
+            # Stop rotation immediately, then step back (CCW — opposite to
+            # the CW search sweep) by search_backrotate_deg so the marker
+            # is better centred in the frame before HEIGHT_ALIGN starts.
             self._send_rc(0, 0, 0, 0)
-            try:
-                self.api.rotate("ccw", 10)
-            except Exception as e:
-                print(f"[ctrl] SEARCH back-rotate failed: {e}")
+            back_deg = int(getattr(cfg, "search_backrotate_deg", 10))
+            if back_deg > 0:
+                try:
+                    self.api.rotate("ccw", back_deg)
+                except Exception as e:
+                    print(f"[ctrl] SEARCH back-rotate failed: {e}")
             # Reset zoom to 1.0 so APPROACH detection uses native FOV.
             if getattr(self, "_search_zoom", 1.0) > 1.0:
                 try:
@@ -1266,7 +1268,7 @@ class MissionController:
                 except Exception:
                     pass
             self._set_phase(Phase.HEIGHT_ALIGN,
-                            "marker acquired -- stop + 10° back -- aligning altitude")
+                            f"marker acquired -- stop + {back_deg}° back -- aligning altitude")
             return
 
         # Detect new SEARCH phase entry via phase_started_at so escalation

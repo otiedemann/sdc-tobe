@@ -259,6 +259,8 @@ class MissionConfig:
     search_retreat_s: int = 2              # TUNE  seconds of backward drive
     search_retreat_rc: int = 25            # TUNE  RC magnitude during retreat
                                             # (always applied as -fb stick)
+    search_backrotate_deg: int = 10        # TUNE  degrees CCW to step back when
+                                            # marker is first detected mid-sweep
 
     # --- SCOUT step (operator-facing slow 360° look-around) -----------------
     # Yaw stick value held during the SCOUT step. Default 15 is gentle
@@ -671,6 +673,10 @@ TUNING_FIELDS = {
         "label": "SEARCH retreat RC", "kind": "int", "step": 1,
         "desc": "Magnitude of the backward FB stick used during the SEARCH retreat phase. Always applied as -fb (backward); only the magnitude is configured here. Typical 20–30 for a gentle reverse.",
     },
+    "search_backrotate_deg": {
+        "label": "SEARCH back-rotate on detect", "kind": "int", "unit": "°", "step": 1,
+        "desc": "When the target marker is first spotted during a SEARCH sweep, the drone stops rotation immediately and steps back this many degrees CCW (opposite to the CW sweep direction) before entering HEIGHT_ALIGN. This centres the marker in the frame and avoids starting APPROACH from a skewed angle. 0 disables the back-step.",
+    },
     "ud_rc_max": {
         "label": "ud RC max", "kind": "int", "step": 1,
         "desc": "Cap on rc_ud (altitude). The mission doesn't actively command altitude (Anafi self-stabilises), but the cap protects the channel from accidental large values.",
@@ -771,7 +777,7 @@ TUNING_GROUPS = [
          "search_marker_lost_grace_s"]),
     ("Safety / search",
         ["distance_floor_factor", "search_yaw_rc", "scout_yaw_stick",
-         "search_retreat_s", "search_retreat_rc"]),
+         "search_retreat_s", "search_retreat_rc", "search_backrotate_deg"]),
     ("Pose smoothing",
         ["pose_smoothing_alpha", "pose_max_age_s"]),
     ("Operator UX",
