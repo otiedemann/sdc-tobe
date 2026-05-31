@@ -1510,16 +1510,6 @@ class MissionController:
             self._set_phase(Phase.ALIGN,
                             f"height aligned ({drone_h:.2f}m) -- "
                             f"now aligning heading")
-            return
-
-        # Hard timeout: if HEIGHT_ALIGN hasn't settled within height_align_max_s,
-        # proceed to ALIGN anyway. APPROACH corrects altitude continuously so
-        # a noisy tvec[1] estimate can no longer block the whole mission.
-        max_s = float(getattr(cfg, "height_align_max_s", 0.0))
-        if max_s > 0.0 and (now - self.state.phase_started_at) >= max_s:
-            self._set_phase(Phase.ALIGN,
-                            f"HEIGHT_ALIGN timeout ({max_s:.1f}s) -- "
-                            f"proceeding to align (h={drone_h:.2f}m e={e_h:+.2f}m)")
 
     # -------------------------------------------------------------- approach
     def _step_approach(self, tel: Optional[TelemetrySnapshot],

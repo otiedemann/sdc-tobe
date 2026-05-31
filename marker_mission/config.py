@@ -236,8 +236,6 @@ class MissionConfig:
     height_i_clip: float = 1.0             # TUNE  hard bound on |integral|
     height_deadband_m: float = 0.10        # TUNE
     height_settle_time_s: float = 1.0      # TUNE  before HEIGHT_ALIGN -> ALIGN
-    height_align_max_s: float = 3.0        # TUNE  max time in HEIGHT_ALIGN before
-                                            # forcing transition to ALIGN; 0=disabled
 
     # --- Mission script -----------------------------------------------------
     # Defaults filled in when a script step omits its argument.
@@ -608,10 +606,6 @@ TUNING_FIELDS = {
         "label": "HEIGHT_ALIGN settle time", "kind": "float", "unit": "s", "step": 0.01,
         "desc": "How long height + yaw must both stay inside their deadbands before HEIGHT_ALIGN transitions to ALIGN.",
     },
-    "height_align_max_s": {
-        "label": "HEIGHT_ALIGN max duration", "kind": "float", "unit": "s", "step": 0.1,
-        "desc": "Hard timeout for the HEIGHT_ALIGN phase. If the drone hasn't settled within this many seconds it proceeds to ALIGN anyway — APPROACH corrects altitude continuously so skipping a perfect settle here costs little. 0 = disabled (wait indefinitely, old behaviour).",
-    },
     "default_dance_seconds_s": {
         "label": "DANCE default duration", "kind": "float", "unit": "s", "step": 0.01,
         "desc": "Default seconds for a DANCE step in the mission script when the operator omits the argument.",
@@ -771,8 +765,7 @@ TUNING_GROUPS = [
     ("Height control",
         ["default_height_m", "min_height_m", "max_height_m",
          "height_kp", "height_kd", "height_ki", "height_i_clip",
-         "height_deadband_m", "height_settle_time_s", "height_align_max_s",
-         "ud_rc_max"]),
+         "height_deadband_m", "height_settle_time_s", "ud_rc_max"]),
     ("Mission script defaults",
         ["default_dance_seconds_s", "dance_radius_m"]),
     ("Deadbands",
