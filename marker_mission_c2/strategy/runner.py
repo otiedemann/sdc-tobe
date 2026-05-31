@@ -299,6 +299,7 @@ class SwarmRunner:
             "last_tick_unix_s": self._last_tick_unix_s,
             "tick_interval_s": self._tick_interval_s,
             "cruise_alts": dict(self._last_cruise_alts),
+            "team_phase": self._team_phase,
             "drones": {
                 fc: rs.to_dict() for fc, rs in self.role_states().items()
             },
