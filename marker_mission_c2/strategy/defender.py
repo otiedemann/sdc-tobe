@@ -40,12 +40,13 @@ from __future__ import annotations
 import logging
 
 from .roles import (
-    Decision, Role, RoleContext, noop, push, register, home_park_xy,
+    Decision, Role, RoleContext, noop, push, stop_cmd, register, home_park_xy,
 )
 # Reuse the attacker's primitive-composed capture script + helpers so the
 # defender adds NO new flight maneuvers of its own.
 from .attacker import (
     _recapture_script, _slot_is_ours, HOME_REARM_HOVER_S, _format_script,
+    SLOT_POSITIONS_M,
 )
 
 logger = logging.getLogger(__name__)
@@ -65,6 +66,37 @@ _WAIT_ARRIVE_M: float = 1.5
 def _slot_home_team(slot: int) -> str:
     """v7 §1.4.2 Table 1: boxes 1-3 RED home, 4-6 BLUE home."""
     return "red" if 1 <= slot <= 3 else "blue"
+
+
+def _threatened_own_slot(ctx: RoleContext) -> int | None:
+    """The nearest-by-x enemy-held OWN slot that needs recapturing, or None.
+
+    The defender detects threats ITSELF every tick from the marker tracker —
+    it does NOT wait for the planner to assign a target (the planner can only
+    assign when the FC is idle, but our patrol keeps the FC 'running', so a
+    planner-only path would never fire — the exact bug where the defender
+    patrolled while our boxes stayed enemy-held). Uses the RAW last-seen holder
+    so a box stays "threatened" until a drone actually sees it flipped back.
+    Skips slots inside the 5-s post-capture lock (can't recapture yet).
+    """
+    import time as _t
+    now = _t.time()
+    our = ctx.our_team
+    px = ctx.state.world_position_m[0] if ctx.state.world_position_m else 0.0
+    threats = []
+    for sl in ctx.active_slots:
+        if _slot_home_team(sl) != our:
+            continue                       # only OUR home boxes
+        if ctx.markers.slot_holder(sl) != ("blue" if our == "red" else "red"):
+            continue                       # not enemy-held
+        if ctx.markers.slot_locked(sl, now):
+            continue                       # in post-capture lock
+        sx = SLOT_POSITIONS_M.get(sl, (0.0, 0.0))[0]
+        threats.append((abs(sx - px), sl))
+    if not threats:
+        return None
+    threats.sort()
+    return threats[0][1]                    # nearest by x
 
 
 def _wait_xy(ctx: RoleContext) -> tuple[float, float]:
@@ -146,58 +178,62 @@ class DefenderRole(Role):
         if not ctx.state.drone_connected:
             return noop("defender: drone not connected")
 
-        slot = rs.target_slot
+        # ---- (1) RE-CAPTURE — top priority, IMMEDIATE, beats everything -----
+        # Detect the threat OURSELVES every tick (don't wait for the planner —
+        # our patrol keeps the FC 'running' so the planner's idle-gate would
+        # never assign us). If one of our boxes is enemy-held, recapture it NOW.
+        threat = _threatened_own_slot(ctx)
 
-        # ---- (1) RE-CAPTURE — top priority, BEATS the bank recall ----------
-        # The planner assigns a threatened own slot. Defence is a 0-pt home
-        # flip but stops the enemy scoring and is needed for the all-6 win, so
-        # it overrides everything else. Fly the heading-agnostic recapture
-        # (world-frame TO to the box) the instant the FC is idle.
-        if slot is not None and slot in ctx.active_slots:
-            if rs.phase == "running":
-                # Mid-recapture: done when the slot reads ours, or FC finished.
-                if _slot_is_ours(ctx, slot) or ctx.state.phase in ("init", "done", ""):
-                    rs.target_slot = None
-                    rs.target_assigned_unix_s = None
-                    rs.advance_phase("done", f"slot {slot} recaptured / run done")
-                    return noop("defender: recapture complete, return to wait")
-                return noop(f"defender: recapturing slot {slot} "
-                            f"(fc phase={ctx.state.phase})")
-            if _slot_is_ours(ctx, slot):
+        if rs.phase == "recapturing":
+            # Mid-recapture run. Finished when the slot reads ours again, or the
+            # FC script ended -> drop back to patrol (re-evaluated next tick).
+            tgt = rs.target_slot
+            if tgt is None or _slot_is_ours(ctx, tgt) or \
+                    ctx.state.phase in ("init", "done", ""):
                 rs.target_slot = None
-                rs.advance_phase("done", f"slot {slot} already ours")
-                return noop(f"defender: slot {slot} already ours")
+                rs.advance_phase("idle", "recapture done -> back to patrol")
+                return noop("defender: recapture complete")
+            return noop(f"defender: recapturing slot {tgt} "
+                        f"(fc phase={ctx.state.phase})")
+
+        if threat is not None:
+            # We want to recapture `threat`. The FC can only START a mission
+            # from idle (init/done) on real hardware (a start while running is
+            # 409-rejected). If we're mid-patrol/bank, STOP first (1 tick),
+            # which returns the FC to idle; next tick we push the recapture.
             if ctx.state.phase not in ("init", "done", ""):
-                return noop(f"defender: busy (fc phase={ctx.state.phase}); "
-                            f"will recapture slot {slot} once idle")
+                return stop_cmd(f"defender: own slot {threat} flipped — "
+                                f"break off to recapture NOW")
+            rs.target_slot = threat
             return push(
-                _recapture_script(ctx, slot),
-                new_phase="running",
-                reason=f"defender: re-capture slot {slot} (held by enemy)",
+                _recapture_script(ctx, threat),
+                new_phase="recapturing",
+                reason=f"defender: re-capture own slot {threat} (enemy-held)",
             )
+
+        # No threat -> clear any stale recapture intent.
+        rs.target_slot = None
 
         # ---- (2) BANK, no threat — return home to secure the 5-pt attempt --
         if ctx.team_phase == "bank":
-            if ctx.in_home_now and _at_wait(ctx):
+            if ctx.in_home_now:
                 if rs.phase != "waiting":
                     rs.advance_phase("waiting", "bank — home, holding (secured)")
                 return noop("defender: bank — home, holding (secured)")
-            if ctx.state.phase not in ("init", "done", ""):
-                return noop(f"defender: bank — en route home "
-                            f"(fc phase={ctx.state.phase})")
+            if rs.phase == "banking_home" and ctx.state.phase not in (
+                    "init", "done", ""):
+                return noop("defender: bank — en route home")
             return push(
                 _wait_script(ctx),       # _wait_xy -> home during bank
-                new_phase="waiting",
+                new_phase="banking_home",
                 reason="defender: bank — return home to secure the attempt",
             )
 
         # ---- (3) SORTIE, no threat — PATROL the neutral zone left-right -----
-        # The patrol script is a long left-right sweep; while the FC is running
-        # it, just let it keep sweeping. Only (re)push when the FC is idle
-        # (init/done) — i.e. at startup or after a patrol script fully ends.
-        if ctx.state.phase not in ("init", "done", ""):
-            return noop(f"defender: patrolling neutral zone "
-                        f"(fc phase={ctx.state.phase})")
+        # Keep sweeping while the patrol script runs; (re)push only when idle.
+        if rs.phase == "patrolling" and ctx.state.phase not in (
+                "init", "done", ""):
+            return noop("defender: patrolling neutral zone")
         return push(
             _wait_script(ctx),
             new_phase="patrolling",

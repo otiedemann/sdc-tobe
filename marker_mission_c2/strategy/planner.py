@@ -182,26 +182,29 @@ def plan(settings, markers, overview: dict, role_states: dict, now: float,
     #
     #  ATTACK-eligible (scoring): the above PLUS in-home (§1.4.4) — only
     #  attackers, and only while not banking.
-    recap_defenders: list[str] = []   # free defenders, any zone
-    recap_attackers: list[str] = []   # free attackers, any zone
+    # NOTE: the DEFENDER is NOT in any planner pool. It self-detects threats to
+    # our own boxes and recaptures them itself (see defender.py) — the planner
+    # used to also assign it, which fought the defender's own logic and made it
+    # thrash between targets. The planner only pulls in spare ATTACKERS to help
+    # recapture when there are MORE simultaneous threats than the defender alone
+    # can cover.
+    recap_attackers: list[str] = []   # free attackers, any zone (for recapture)
     free_attackers: list[str] = []    # free attackers, in-home (for scoring)
     for d in settings.drones:
         if not d.enabled or not d.team:
             continue
         if d.team != our:
             continue   # other team's drone — not ours to command
+        if d.role != "attacker":
+            continue   # defenders self-manage; scouts/idle never play
         rs = role_states.get(d.fc_name)
         if not _is_free(rs):
             continue
         if not _fc_ready_to_start(overview, d.fc_name):
             continue
-        if d.role == "defender":
-            recap_defenders.append(d.fc_name)
-        elif d.role == "attacker":
-            recap_attackers.append(d.fc_name)
-            if _drone_in_home(overview, d.fc_name, d.team):
-                free_attackers.append(d.fc_name)
-        # scouts/idle: never participate in scoring/defence plays
+        recap_attackers.append(d.fc_name)
+        if _drone_in_home(overview, d.fc_name, d.team):
+            free_attackers.append(d.fc_name)
 
     assignments: list[PlayAssignment] = []
     taken: set[int] = set()
@@ -219,41 +222,28 @@ def plan(settings, markers, overview: dict, role_states: dict, now: float,
     if all_ours:
         return []  # let the win timer expire — no further dispatch
 
-    # ----- (1) Defensive re-capture — HIGHEST priority, runs every tick -----
-    # An own slot whose LAST-OBSERVED face is the enemy's is captured and stays
-    # threatened until a drone sees it flipped back (raw_holder, not the decayed
-    # view — see above). Recapture it instantly: 0 pts, but it stops the enemy
-    # bleeding us and is required to ever reach the all-6 instant win. Skip
-    # slots inside the 5-s post-capture lock and slots already being handled.
-    #
-    # Assignment: the free DEFENDER goes first (its whole job), then the
-    # NEAREST free attacker is pulled in for any remaining threats — i.e. an
-    # attacker near one of our flipped boxes becomes a defender for one run,
-    # then reverts to attacking. Neither needs to be in-home (0-pt defence).
+    # ----- (1) EXTRA defensive re-capture — pull attackers for surplus threats
+    # The DEFENDER recaptures threats itself (defender.py self-detects). But it
+    # can only cover ONE box at a time, so when MULTIPLE of our boxes are
+    # enemy-held at once, pull the nearest free attacker(s) onto the surplus
+    # ones (the defender takes one, attackers take the rest). We leave ONE
+    # threat for the defender (don't assign an attacker to every threat — that
+    # would strip the attack force when the defender already has it covered).
     threatened = [sl for sl in our_slots
                   if raw_holder.get(sl) == enemy
                   and sl not in locked and sl not in taken]
-    # Order threats so the closest-to-any-recapturer is handled first.
-    recap_pool = list(recap_defenders) + list(recap_attackers)
-    for sl in threatened:
-        if not recap_pool:
+    surplus_threats = threatened[1:]      # defender covers threatened[0] itself
+    for sl in surplus_threats:
+        if not recap_attackers:
             break
-        # Prefer a defender if one is still free; else the nearest attacker.
-        free_def = [fc for fc in recap_defenders if fc in recap_pool]
-        if free_def:
-            fc = free_def[0]
-        else:
-            fc = min(recap_pool, key=lambda f: _dist_to_slot(overview, f, sl))
-        recap_pool.remove(fc)
-        if fc in recap_attackers:
-            recap_attackers.remove(fc)
-            if fc in free_attackers:
-                free_attackers.remove(fc)
-        if fc in recap_defenders:
-            recap_defenders.remove(fc)
+        fc = min(recap_attackers, key=lambda f: _dist_to_slot(overview, f, sl))
+        recap_attackers.remove(fc)
+        if fc in free_attackers:
+            free_attackers.remove(fc)
         assignments.append(PlayAssignment(
             fc_name=fc, slot=sl, play_kind="defend_uncap",
-            reason=f"v7 defend: slot {sl} held by {enemy} — recapture now",
+            reason=f"v7 defend (surplus): slot {sl} held by {enemy} — "
+                   f"attacker helps recapture",
         ))
         taken.add(sl)
 
