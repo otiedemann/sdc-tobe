@@ -561,46 +561,6 @@ def _return_home_script(ctx: RoleContext) -> str:
     )
 
 
-# Forward staging point for an idle attacker (no enemy slot free to attack):
-# the neutral zone just past our home boundary, x spread by the drone's lane
-# so multiple idle attackers don't stack. From here it can peel off to either
-# RECAPTURE one of our boxes or STRIKE a freed enemy box with minimum latency,
-# AND it's OUTSIDE home so it helps satisfy the 5-pt "all drones out" rule.
-_STAGE_Y_M: float = 4.0   # 1 m into the neutral zone from |y|=5 home boundary
-_STAGE_ARRIVE_M: float = 1.6
-
-
-def _stage_xy(ctx: RoleContext) -> tuple[float, float]:
-    # Reuse the home-park lane x (spread per drone), but at the neutral
-    # forward-stage y so idle attackers fan out along our front line.
-    hx, _hy = ctx.home_park_xy or home_park_xy(ctx.our_team)
-    sy = -_STAGE_Y_M if ctx.our_team == "red" else _STAGE_Y_M
-    return (hx, sy)
-
-
-def _at_stage(ctx: RoleContext) -> bool:
-    pos = ctx.state.world_position_m
-    if not pos or len(pos) < 3:
-        return False
-    sx, sy = _stage_xy(ctx)
-    dx, dy = float(pos[0]) - sx, float(pos[1]) - sy
-    return (dx * dx + dy * dy) ** 0.5 <= _STAGE_ARRIVE_M and float(pos[2]) > 0.5
-
-
-def _stage_script(ctx: RoleContext) -> str:
-    """Fly to the forward staging point and hover (no land), facing the enemy."""
-    cruise_alt = max(1.4, float(ctx.cruise_alt_m)) if ctx.cruise_alt_m else 1.6
-    sx, sy = _stage_xy(ctx)
-    return _format_script(
-        "TAKEOFF",
-        f"HEIGHT {cruise_alt:.2f}",
-        f"TO {sx:g} {sy:g}",
-        f"HEIGHT {cruise_alt:.2f}",
-        f"YAW {enemy_heading_deg(ctx.our_team):g}",
-        f"HOOVER {HOME_REARM_HOVER_S:.1f}",
-    )
-
-
 def _slot_home_team(slot: int) -> str:
     """v7 §1.4.2 Table 1: boxes 1-3 are RED home, 4-6 are BLUE home."""
     return "red" if 1 <= int(slot) <= 3 else "blue"
@@ -707,26 +667,35 @@ class AttackerRole(Role):
 
         # ---- BANK: we just captured an enemy box — get home to secure the
         # 5-pt attempt (ALL drones must return home before the box is
-        # recaptured). Abandon any attack and head home the FASTEST way.
+        # recaptured). BUT do NOT abort an attacker that's already COMMITTED —
+        # i.e. already in the enemy half (y past the neutral midline toward the
+        # enemy). Yanking a committed drone home wastes a near-complete capture
+        # AND it can't make it home in time anyway; letting it finish lands the
+        # capture, then its own RTH brings it home. Only drones still on our
+        # side / in neutral are recalled (they're close, so the all-home bank
+        # completes fast). This is the key thrash fix: previously every bank
+        # aborted all 3 attackers mid-flight so none ever reached the boxes.
         if ctx.team_phase == "bank":
-            rs.target_slot = None        # abandon any pending attack intent
+            pos = ctx.state.world_position_m
+            enemy_side = False
+            if pos is not None:
+                y = float(pos[1])
+                # red attacks +Y, blue attacks -Y; "committed" = past midline.
+                enemy_side = (y > 0.5) if ctx.our_team == "red" else (y < -0.5)
+            if enemy_side and rs.phase == "running":
+                # Committed: let the in-flight capture + its RTH finish.
+                return noop("attacker: bank — committed in enemy half, "
+                            "finishing capture then RTH")
+            rs.target_slot = None        # not committed -> abandon attack intent
             rs.target_assigned_unix_s = None
             if ctx.in_home_now:
-                # Home — hold here (attempt secured for this drone).
                 if rs.phase not in ("returning_home", "done"):
                     rs.advance_phase("done", "bank — home, holding (secured)")
                 return noop("attacker: bank — home, holding (secured)")
-            # Not home yet. REDIRECT straight home now — do NOT let an
-            # outbound attack run finish first (a fresh run's round-trip to the
-            # far enemy box is ~40 s, far longer than the recapture clock, so
-            # "let it finish" would blow the 5-pt window). Pushing return-home
-            # overrides the current script and turns the drone home immediately;
-            # _apply_decision throttles the identical re-push each tick so the
-            # drone just keeps flying the single homeward script.
             return push(
                 _return_home_script(ctx),
                 new_phase="returning_home",
-                reason="attacker: bank — abort attack, return home NOW",
+                reason="attacker: bank — return home to secure the attempt",
             )
 
         slot = rs.target_slot
@@ -734,32 +703,22 @@ class AttackerRole(Role):
         # ---- idle: waiting for a target slot ------------------------------
         if rs.phase in ("", "idle", "done"):
             if slot is None:
-                # No enemy slot free to attack right now (often: only 1-2 of
-                # the 3 enemy boxes are unlocked at once, but we have 3
-                # attackers). Don't sit at home doing nothing — FORWARD-STAGE
-                # in the neutral zone, facing the enemy, so this drone can peel
-                # off to recapture our box or strike a freed enemy box with
-                # minimum latency, AND it's outside home (helps the 5-pt
-                # "all drones out" rule). During a BANK we instead want
-                # everyone home to secure the attempt, so stage only on sortie.
-                if ctx.team_phase == "bank":
-                    if (not ctx.in_home_now
-                            and ctx.state.phase in ("init", "done", "")):
-                        return push(
-                            _return_home_script(ctx),
-                            new_phase="returning_home",
-                            reason="attacker: bank idle — return home",
-                        )
-                    return noop("attacker: bank idle — holding home")
-                if _at_stage(ctx):
-                    return noop("attacker: staged forward (ready to strike)")
-                if ctx.state.phase in ("init", "done", ""):
+                # No target assigned. Per the spec the attacker must NEVER just
+                # sit there. The §1.4.4 home gate means we can only LAUNCH a new
+                # attack from home, so the productive thing to do while waiting
+                # for the planner to hand us an enemy slot is to be AT HOME,
+                # re-armed and ready to launch the instant one frees. If we're
+                # not home (just finished a run out in neutral/enemy), fly home
+                # now; if we're home, hold there ready. This continuous
+                # home<->attack cycle keeps every attacker always either
+                # attacking or repositioning to attack — never idle-in-place.
+                if not ctx.in_home_now and ctx.state.phase in ("init", "done", ""):
                     return push(
-                        _stage_script(ctx),
-                        new_phase="staging",
-                        reason="attacker: no open target — stage forward in neutral",
+                        _return_home_script(ctx),
+                        new_phase="returning_home",
+                        reason="attacker: no target — return home, ready to strike",
                     )
-                return noop("attacker: idle (no target slot)")
+                return noop("attacker: home, ready — waiting for an enemy slot")
             if _slot_is_ours(ctx, slot):
                 rs.advance_phase(
                     "done", f"slot {slot} already captured by us — no action"
@@ -805,25 +764,6 @@ class AttackerRole(Role):
                 rs.advance_phase("idle", "home — re-armed, ready to attack")
                 return noop("attacker: home, re-armed")
             return noop(f"attacker: returning home (fc phase={ctx.state.phase})")
-
-        # ---- staging: forward-staged in neutral, waiting for an opening -----
-        if rs.phase == "staging":
-            # Got a target while staged? An attack is a §1.4.4 scoring attempt
-            # that must start from home, so dip home to re-arm first; the
-            # returning_home -> idle -> attack chain then launches it.
-            if slot is not None:
-                rs.advance_phase("returning_home",
-                                 f"target {slot} assigned — home to re-arm")
-                return push(
-                    _return_home_script(ctx),
-                    new_phase="returning_home",
-                    reason=f"attacker: target {slot} — return home to re-arm, then strike",
-                )
-            # Reached the stage point -> idle (which re-stages/holds as needed).
-            if ctx.state.phase in ("init", "done", "") and _at_stage(ctx):
-                rs.advance_phase("idle", "staged forward, holding")
-                return noop("attacker: staged forward (ready)")
-            return noop(f"attacker: staging (fc phase={ctx.state.phase})")
 
         # ---- running: waiting for the entire script to finish -------------
         if rs.phase == "running":

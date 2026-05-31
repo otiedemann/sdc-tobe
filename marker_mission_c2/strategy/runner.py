@@ -167,6 +167,10 @@ class SwarmRunner:
         self._bank_since = 0.0
         self._bank_pending_since = 0.0
         self._last_cap_seen = 0.0
+        # Wall-clock the last bank ENDED (sortie resumed). Banking is suppressed
+        # for BANK_COOLDOWN_S after this so attackers get an uninterrupted
+        # attack cycle between banks (no thrash). 0 = never banked yet.
+        self._last_sortie_resumed = 0.0
 
     # ------------------------------------------------------------------
     # Public read API (called from Flask handlers, so must be thread-safe)
@@ -714,6 +718,13 @@ class SwarmRunner:
     # can complete first. > 1 s (the double-strike window) + a margin for
     # capture-detection lag (the scout has to SEE the second flip).
     BANK_GRACE_S = 2.5
+    # After a bank ends (sortie resumes), suppress the NEXT bank for this long.
+    # Without it the team banks every ~30 s, and each bank aborts all in-flight
+    # attacks — so attackers thrashed near home and never reached the enemy
+    # boxes. A cooldown lets the attackers complete a full out-and-back attack
+    # cycle (~45 s) between banks, so most of the match is spent ATTACKING, with
+    # the occasional bank to bag a 5-pt bonus rather than constant whipsawing.
+    BANK_COOLDOWN_S = 45.0
 
     def _update_team_phase(self, s, overview: Dict[str, Any]) -> None:
         """Flip team phase sortie<->bank to maximise 5-pt scoring plays.
@@ -755,7 +766,14 @@ class SwarmRunner:
             # near-simultaneous second capture can complete, THEN bank. Against
             # the ~40 s the enemy needs to fly over and recapture, this <2 s
             # delay costs nothing on the 5-pt "return before recapture" clock.
-            if captured_enemy_box and self._bank_pending_since <= 0.0:
+            # Cooldown gate: don't arm a new bank until the attackers have had
+            # an uninterrupted attack cycle since the last one ended. Captures
+            # during the cooldown still score (1 pt each) — we just don't pull
+            # everyone home to chase the 5-pt upgrade every single time.
+            in_cooldown = (self._last_sortie_resumed > 0.0
+                           and now - self._last_sortie_resumed < self.BANK_COOLDOWN_S)
+            if (captured_enemy_box and self._bank_pending_since <= 0.0
+                    and not in_cooldown):
                 self._bank_pending_since = now
                 self._events.add(
                     "team_bank_arm",
@@ -791,6 +809,7 @@ class SwarmRunner:
         all_home = known > 0 and homed == known and known == len(ours)
         if all_home:
             self._team_phase = "sortie"
+            self._last_sortie_resumed = now      # start the bank cooldown
             self._events.add(
                 "team_sortie",
                 f"all {homed} drones home — attempt secured; sortie again "
@@ -798,6 +817,7 @@ class SwarmRunner:
             )
         elif now - self._bank_since > self.BANK_TIMEOUT_S:
             self._team_phase = "sortie"
+            self._last_sortie_resumed = now      # start the bank cooldown
             self._events.add(
                 "team_sortie",
                 f"bank timeout ({self.BANK_TIMEOUT_S:.0f}s, {homed}/{len(ours)} "

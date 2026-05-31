@@ -45,7 +45,7 @@ from .roles import (
 # Reuse the attacker's primitive-composed capture script + helpers so the
 # defender adds NO new flight maneuvers of its own.
 from .attacker import (
-    _recapture_script, _slot_is_ours, HOME_REARM_HOVER_S,
+    _recapture_script, _slot_is_ours, HOME_REARM_HOVER_S, _format_script,
 )
 
 logger = logging.getLogger(__name__)
@@ -90,24 +90,45 @@ def _at_wait(ctx: RoleContext) -> bool:
     return (dx * dx + dy * dy) ** 0.5 <= _WAIT_ARRIVE_M and float(pos[2]) > 0.5
 
 
-def _wait_script(ctx: RoleContext) -> str:
-    """Fly to the current waiting point and hold there (no land).
+# Left-right patrol bounds (x) for the sortie neutral-zone sweep. The arena is
+# 10 m wide (x in [-5, +5]); ±3.5 keeps the defender clear of the side walls
+# while covering the full width in front of our three home boxes (x in {-3,0,3}).
+_PATROL_X_MAX: float = 3.5
+# How many full left-right cycles per pushed patrol script. Each leg is ~7 m at
+# ~2 m/s ~= 3.5 s, so a cycle ~7 s; 40 cycles ~= a full 10-min match per push,
+# but the script re-pushes whenever the FC reaches phase=done anyway.
+_PATROL_CYCLES: int = 40
 
-    Existing FC verbs only (TAKEOFF / HEIGHT / TO / HOOVER). TAKEOFF is a
-    no-op when already airborne. The script ends with a brief hover so it
-    reaches phase=done — at which the FC holds position (keeps hovering) AND
-    the drone is free for the planner to re-dispatch on a re-capture. We never
-    emit LAND: the defender stays airborne the whole match.
+
+def _wait_script(ctx: RoleContext) -> str:
+    """Defender holding pattern (no land, stays airborne all match).
+
+    On BANK: fly home and hover (return with the team to secure the 5-pt
+    attempt). On SORTIE: PATROL the neutral zone LEFT-RIGHT in front of our
+    home boxes — sweeping x from -3.5 to +3.5 and back, continuously — so the
+    defender is always moving and equally close to any of our three boxes the
+    instant one is flipped (operator spec: "fly left to right"). Existing FC
+    verbs only (TAKEOFF / HEIGHT / TO). TAKEOFF is a no-op when airborne.
     """
     cruise_alt = max(1.5, float(ctx.cruise_alt_m or ctx.drone.attack_alt_m or 1.6))
-    wx, wy = _wait_xy(ctx)
-    lines = [
-        "TAKEOFF",
-        f"HEIGHT {cruise_alt:.2f}",
-        f"TO {wx:g} {wy:g}",
-        f"HEIGHT {cruise_alt:.2f}",
-        f"HOOVER {HOME_REARM_HOVER_S:.1f}",
-    ]
+
+    # BANK: single point at home, hover (handled by _wait_xy -> home).
+    if ctx.team_phase == "bank":
+        wx, wy = _wait_xy(ctx)
+        return _format_script(
+            "TAKEOFF",
+            f"HEIGHT {cruise_alt:.2f}",
+            f"TO {wx:g} {wy:g}",
+            f"HEIGHT {cruise_alt:.2f}",
+            f"HOOVER {HOME_REARM_HOVER_S:.1f}",
+        )
+
+    # SORTIE: continuous left-right patrol along the neutral-zone front line.
+    y = -NEUTRAL_WAIT_Y_M if ctx.our_team == "red" else NEUTRAL_WAIT_Y_M
+    lines = ["TAKEOFF", f"HEIGHT {cruise_alt:.2f}"]
+    for _ in range(max(1, _PATROL_CYCLES)):
+        lines.append(f"TO {_PATROL_X_MAX:g} {y:g}")     # sweep right
+        lines.append(f"TO {-_PATROL_X_MAX:g} {y:g}")    # sweep left
     return "\n".join(lines) + "\n"
 
 
@@ -170,16 +191,17 @@ class DefenderRole(Role):
                 reason="defender: bank — return home to secure the attempt",
             )
 
-        # ---- (3) SORTIE, no threat — WAIT in the neutral zone, ready -------
-        if _at_wait(ctx):
-            return noop("defender: waiting in neutral zone (ready to recapture)")
+        # ---- (3) SORTIE, no threat — PATROL the neutral zone left-right -----
+        # The patrol script is a long left-right sweep; while the FC is running
+        # it, just let it keep sweeping. Only (re)push when the FC is idle
+        # (init/done) — i.e. at startup or after a patrol script fully ends.
         if ctx.state.phase not in ("init", "done", ""):
-            return noop(f"defender: airborne (fc phase={ctx.state.phase}); "
-                        f"holding — FC must be INIT/done to reposition to wait")
+            return noop(f"defender: patrolling neutral zone "
+                        f"(fc phase={ctx.state.phase})")
         return push(
             _wait_script(ctx),
-            new_phase="waiting",
-            reason="defender: hold in neutral zone, ready to recapture",
+            new_phase="patrolling",
+            reason="defender: left-right patrol of the neutral zone",
         )
 
 
