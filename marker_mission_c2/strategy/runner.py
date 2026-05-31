@@ -503,24 +503,6 @@ class SwarmRunner:
                     )
                     rs.reset_for_role(drone.role)
 
-            # Collision avoidance OVERRIDES the role this tick: if this drone is
-            # predicted to conflict, change its altitude (hold xy, climb/descend
-            # to the cleared height) instead of running its mission. Safety wins
-            # over the current capture; once the conflict clears the role
-            # re-dispatches it normally. _apply_decision throttles the repeated
-            # push, so re-asserting the same hold each tick is cheap.
-            if drone.fc_name in avoid:
-                target, reason = avoid[drone.fc_name]
-                await self._apply_decision(drone.fc_name, push(
-                    f"HEIGHT {target:.2f}\nHOOVER 3.0",
-                    reason=f"collision avoidance: {reason}",
-                ))
-                continue
-
-            role = get_role(drone.role) or get_role("idle")
-            if role is None:
-                continue
-
             # v7 §1.4.4 home-presence: True iff the drone is currently inside
             # its own home zone. False if we don't have a position yet (be
             # conservative — better to hold than push from an unknown spot).
@@ -528,6 +510,30 @@ class SwarmRunner:
             if drone.team and ds.world_position_m is not None:
                 x, y, _z = ds.world_position_m
                 in_home_now = in_home_zone(drone.team, x, y)
+
+            # Collision avoidance OVERRIDES the role this tick: if this drone is
+            # predicted to conflict, change its altitude instead of running its
+            # mission. BUT skip the override for a drone that is HOME and not
+            # mid-attack: re-arming attackers all cluster near the home-park
+            # point, which trips the avoider and FREEZES them in a HOOVER hold —
+            # the "8-second stall facing the home wall" the operator saw. At
+            # home the next attack launch (a TO toward the enemy box) naturally
+            # spreads them out within a second, so a hold there is both
+            # unnecessary and harmful. Only hold drones conflicting OUT in the
+            # neutral/enemy transit corridor (the real collision risk).
+            rs_now = self._role_states.get(drone.fc_name)
+            mid_attack = bool(rs_now and rs_now.phase in ("running",))
+            if drone.fc_name in avoid and not (in_home_now and not mid_attack):
+                target, reason = avoid[drone.fc_name]
+                await self._apply_decision(drone.fc_name, push(
+                    f"HEIGHT {target:.2f}\nHOOVER 1.0",
+                    reason=f"collision avoidance: {reason}",
+                ))
+                continue
+
+            role = get_role(drone.role) or get_role("idle")
+            if role is None:
+                continue
             ctx = RoleContext(
                 drone=drone,
                 match=s.match,
@@ -705,14 +711,13 @@ class SwarmRunner:
     # Team scoring coordinator (v7 5-pt play)
     # ------------------------------------------------------------------
 
-    # How long a bank may run before we give up and sortie again. Sized to the
-    # worst-case homeward transit: an attacker deep in the enemy zone (y≈7.5)
-    # is ~13.5 m from its home-park point, ~7 s at the 2 m/s cruise, plus a few
-    # seconds to break off the capture and turn — so ~20 s lets even the
-    # farthest drone get home and secure the 5-pt (all-home) play. At the
-    # timeout we sortie anyway: the capturer itself is normally home by then
-    # (>=1 pt secured) and re-attacking beats idling for a lone straggler.
-    BANK_TIMEOUT_S = 20.0
+    # Safety-net cap on bank duration. The PRIMARY exit is all-5-home (per the
+    # operator spec); this only fires if a drone can't get home (lost position,
+    # stuck). Sized to the worst-case homeward transit: a committed attacker at
+    # y~7.5 is ~13.5 m out, ~7 s at 2 m/s, +turn/brake -> 15 s covers it so the
+    # all-home path normally wins first. The operator accepts this return time
+    # ("ALL 5 must return... by the moment the last drone arrives").
+    BANK_TIMEOUT_S = 15.0
     # Grace window after the FIRST enemy capture before we actually bank, so a
     # near-simultaneous SECOND capture (the 10-pt double-strike, < 1 s apart)
     # can complete first. > 1 s (the double-strike window) + a margin for
@@ -792,12 +797,16 @@ class SwarmRunner:
                 )
             return
 
-        # team_phase == "bank": exit when everyone is home (attempt secured)
-        # or after the safety timeout.
+        # team_phase == "bank": the operator spec is explicit — ALL FIVE drones
+        # must return to the home zone, and THE MOMENT THE LAST ONE ARRIVES the
+        # whole team instantly redeploys (scout->centre, defender->neutral,
+        # attackers->re-attack). So we exit the bank only when every one of our
+        # drones is detected home. The redeploy is automatic: flipping back to
+        # "sortie" makes each role re-decide on the very next tick (~1 s).
         ours = [d for d in s.drones
                 if d.enabled and d.team and d.team.lower() == our]
-        homed = 0
         known = 0
+        homed = 0
         for d in ours:
             ds = DroneState.from_overview(d.fc_name, overview.get(d.fc_name) or {})
             pos = ds.world_position_m
@@ -806,22 +815,24 @@ class SwarmRunner:
             known += 1
             if in_home_zone(d.team, pos[0], pos[1]):
                 homed += 1
-        all_home = known > 0 and homed == known and known == len(ours)
+        all_home = known == len(ours) and known > 0 and homed == known
         if all_home:
             self._team_phase = "sortie"
             self._last_sortie_resumed = now      # start the bank cooldown
             self._events.add(
                 "team_sortie",
-                f"all {homed} drones home — attempt secured; sortie again "
-                "(scout -> centre, attackers re-attack)",
+                f"all {homed} drones home — redeploy NOW "
+                "(scout->centre, defender->neutral, attackers re-attack)",
             )
         elif now - self._bank_since > self.BANK_TIMEOUT_S:
+            # Safety net: a drone that lost its position / can't get home must
+            # not deadlock the team forever. Redeploy anyway.
             self._team_phase = "sortie"
-            self._last_sortie_resumed = now      # start the bank cooldown
+            self._last_sortie_resumed = now
             self._events.add(
                 "team_sortie",
                 f"bank timeout ({self.BANK_TIMEOUT_S:.0f}s, {homed}/{len(ours)} "
-                "home) — sortie again to keep scoring",
+                "home) — redeploy to keep playing",
             )
 
     # ------------------------------------------------------------------
