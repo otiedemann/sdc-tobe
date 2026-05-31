@@ -4607,6 +4607,8 @@ class UiServer:
                                          "max 64 chars, can't start with separator)"}), 400
             try:
                 self.cfg.save(p)
+                from .fleet_sync import push_to_peers
+                push_to_peers()
                 return jsonify({"ok": True, "name": name, "path": str(p)})
             except Exception as e:
                 return jsonify({"ok": False, "error": str(e)}), 500
@@ -4669,6 +4671,8 @@ class UiServer:
                     return jsonify({"ok": False,
                                     "error": "snapshot not found"}), 404
                 set_default("tune", name)
+                from .fleet_sync import push_to_peers
+                push_to_peers()
                 return jsonify({"ok": True, "default": name})
             except Exception as e:
                 return jsonify({"ok": False, "error": str(e)}), 500
@@ -5472,6 +5476,8 @@ class UiServer:
                     return jsonify({"ok": False,
                                     "error": "script not found"}), 404
                 set_default("mission_script", name)
+                from .fleet_sync import push_to_peers
+                push_to_peers()
                 return jsonify({"ok": True, "default": name})
             except Exception as e:
                 return jsonify({"ok": False, "error": str(e)}), 500
