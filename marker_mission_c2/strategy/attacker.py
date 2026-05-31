@@ -577,23 +577,27 @@ class AttackerRole(Role):
             return noop("attacker: drone not connected")
 
         # ---- BANK: we just captured an enemy box — get home to secure the
-        # 5-pt attempt (all drones must return home before recapture). Don't
-        # start any new attack; bring this drone home if it's out, hold if home.
+        # 5-pt attempt (ALL drones must return home before the box is
+        # recaptured). Abandon any attack and head home the FASTEST way.
         if ctx.team_phase == "bank":
             rs.target_slot = None        # abandon any pending attack intent
             rs.target_assigned_unix_s = None
-            if ctx.state.phase == "running":
-                # Mid-run: its own script ends with an RTH into home, so just
-                # let it finish — interrupting would waste the in-flight run.
-                return noop("attacker: bank — finishing run (ends home)")
             if ctx.in_home_now:
-                rs.advance_phase("done", "bank — home, holding")
+                # Home — hold here (attempt secured for this drone).
+                if rs.phase not in ("returning_home", "done"):
+                    rs.advance_phase("done", "bank — home, holding (secured)")
                 return noop("attacker: bank — home, holding (secured)")
-            # Idle/done but not home (e.g. was waiting out) — fly home now.
+            # Not home yet. REDIRECT straight home now — do NOT let an
+            # outbound attack run finish first (a fresh run's round-trip to the
+            # far enemy box is ~40 s, far longer than the recapture clock, so
+            # "let it finish" would blow the 5-pt window). Pushing return-home
+            # overrides the current script and turns the drone home immediately;
+            # _apply_decision throttles the identical re-push each tick so the
+            # drone just keeps flying the single homeward script.
             return push(
                 _return_home_script(ctx),
-                new_phase="returning",
-                reason="attacker: bank — return home to secure the attempt",
+                new_phase="returning_home",
+                reason="attacker: bank — abort attack, return home NOW",
             )
 
         slot = rs.target_slot

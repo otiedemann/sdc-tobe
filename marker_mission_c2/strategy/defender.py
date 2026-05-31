@@ -125,6 +125,23 @@ class DefenderRole(Role):
         if not ctx.state.drone_connected:
             return noop("defender: drone not connected")
 
+        # ---- BANK: the team just captured an enemy box and is securing the
+        # 5-pt attempt — EVERY drone must get home, the defender included. Its
+        # waiting point during bank is already home (_wait_xy), so just send it
+        # there now; abandon any recapture intent until we're banking again.
+        if ctx.team_phase == "bank":
+            rs.target_slot = None
+            rs.target_assigned_unix_s = None
+            if ctx.in_home_now:
+                if rs.phase != "waiting":
+                    rs.advance_phase("waiting", "bank — home, holding (secured)")
+                return noop("defender: bank — home, holding (secured)")
+            return push(
+                _wait_script(ctx),       # _wait_xy -> home during bank
+                new_phase="waiting",
+                reason="defender: bank — return home to secure the attempt",
+            )
+
         slot = rs.target_slot
 
         # ---- idle: waiting for a threatened own slot ----------------------
