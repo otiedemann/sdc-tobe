@@ -561,6 +561,46 @@ def _return_home_script(ctx: RoleContext) -> str:
     )
 
 
+# Forward staging point for an idle attacker (no enemy slot free to attack):
+# the neutral zone just past our home boundary, x spread by the drone's lane
+# so multiple idle attackers don't stack. From here it can peel off to either
+# RECAPTURE one of our boxes or STRIKE a freed enemy box with minimum latency,
+# AND it's OUTSIDE home so it helps satisfy the 5-pt "all drones out" rule.
+_STAGE_Y_M: float = 4.0   # 1 m into the neutral zone from |y|=5 home boundary
+_STAGE_ARRIVE_M: float = 1.6
+
+
+def _stage_xy(ctx: RoleContext) -> tuple[float, float]:
+    # Reuse the home-park lane x (spread per drone), but at the neutral
+    # forward-stage y so idle attackers fan out along our front line.
+    hx, _hy = ctx.home_park_xy or home_park_xy(ctx.our_team)
+    sy = -_STAGE_Y_M if ctx.our_team == "red" else _STAGE_Y_M
+    return (hx, sy)
+
+
+def _at_stage(ctx: RoleContext) -> bool:
+    pos = ctx.state.world_position_m
+    if not pos or len(pos) < 3:
+        return False
+    sx, sy = _stage_xy(ctx)
+    dx, dy = float(pos[0]) - sx, float(pos[1]) - sy
+    return (dx * dx + dy * dy) ** 0.5 <= _STAGE_ARRIVE_M and float(pos[2]) > 0.5
+
+
+def _stage_script(ctx: RoleContext) -> str:
+    """Fly to the forward staging point and hover (no land), facing the enemy."""
+    cruise_alt = max(1.4, float(ctx.cruise_alt_m)) if ctx.cruise_alt_m else 1.6
+    sx, sy = _stage_xy(ctx)
+    return _format_script(
+        "TAKEOFF",
+        f"HEIGHT {cruise_alt:.2f}",
+        f"TO {sx:g} {sy:g}",
+        f"HEIGHT {cruise_alt:.2f}",
+        f"YAW {enemy_heading_deg(ctx.our_team):g}",
+        f"HOOVER {HOME_REARM_HOVER_S:.1f}",
+    )
+
+
 def _slot_home_team(slot: int) -> str:
     """v7 §1.4.2 Table 1: boxes 1-3 are RED home, 4-6 are BLUE home."""
     return "red" if 1 <= int(slot) <= 3 else "blue"
@@ -694,6 +734,31 @@ class AttackerRole(Role):
         # ---- idle: waiting for a target slot ------------------------------
         if rs.phase in ("", "idle", "done"):
             if slot is None:
+                # No enemy slot free to attack right now (often: only 1-2 of
+                # the 3 enemy boxes are unlocked at once, but we have 3
+                # attackers). Don't sit at home doing nothing — FORWARD-STAGE
+                # in the neutral zone, facing the enemy, so this drone can peel
+                # off to recapture our box or strike a freed enemy box with
+                # minimum latency, AND it's outside home (helps the 5-pt
+                # "all drones out" rule). During a BANK we instead want
+                # everyone home to secure the attempt, so stage only on sortie.
+                if ctx.team_phase == "bank":
+                    if (not ctx.in_home_now
+                            and ctx.state.phase in ("init", "done", "")):
+                        return push(
+                            _return_home_script(ctx),
+                            new_phase="returning_home",
+                            reason="attacker: bank idle — return home",
+                        )
+                    return noop("attacker: bank idle — holding home")
+                if _at_stage(ctx):
+                    return noop("attacker: staged forward (ready to strike)")
+                if ctx.state.phase in ("init", "done", ""):
+                    return push(
+                        _stage_script(ctx),
+                        new_phase="staging",
+                        reason="attacker: no open target — stage forward in neutral",
+                    )
                 return noop("attacker: idle (no target slot)")
             if _slot_is_ours(ctx, slot):
                 rs.advance_phase(
@@ -730,6 +795,35 @@ class AttackerRole(Role):
                 new_phase="running",
                 reason=f"attacker: capture slot {slot} (id={attack_id})",
             )
+
+        # ---- returning_home: flying back to re-arm (bank or idle-out) ------
+        if rs.phase == "returning_home":
+            # Done the moment we're detected home (ready for the next attack)
+            # OR the homeward script ends. Reset to idle so the next tick can
+            # immediately launch a fresh attack on an assigned target.
+            if ctx.in_home_now or ctx.state.phase in ("init", "done", ""):
+                rs.advance_phase("idle", "home — re-armed, ready to attack")
+                return noop("attacker: home, re-armed")
+            return noop(f"attacker: returning home (fc phase={ctx.state.phase})")
+
+        # ---- staging: forward-staged in neutral, waiting for an opening -----
+        if rs.phase == "staging":
+            # Got a target while staged? An attack is a §1.4.4 scoring attempt
+            # that must start from home, so dip home to re-arm first; the
+            # returning_home -> idle -> attack chain then launches it.
+            if slot is not None:
+                rs.advance_phase("returning_home",
+                                 f"target {slot} assigned — home to re-arm")
+                return push(
+                    _return_home_script(ctx),
+                    new_phase="returning_home",
+                    reason=f"attacker: target {slot} — return home to re-arm, then strike",
+                )
+            # Reached the stage point -> idle (which re-stages/holds as needed).
+            if ctx.state.phase in ("init", "done", "") and _at_stage(ctx):
+                rs.advance_phase("idle", "staged forward, holding")
+                return noop("attacker: staged forward (ready)")
+            return noop(f"attacker: staging (fc phase={ctx.state.phase})")
 
         # ---- running: waiting for the entire script to finish -------------
         if rs.phase == "running":
