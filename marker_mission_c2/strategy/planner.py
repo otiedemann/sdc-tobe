@@ -85,8 +85,8 @@ def _is_free(rs: Any) -> bool:
 # planner
 # ---------------------------------------------------------------------------
 
-def plan(settings, markers, overview: dict, role_states: dict, now: float
-         ) -> list[PlayAssignment]:
+def plan(settings, markers, overview: dict, role_states: dict, now: float,
+         team_phase: str = "sortie") -> list[PlayAssignment]:
     """Pick the v7 plays to schedule this tick.
 
     Parameters
