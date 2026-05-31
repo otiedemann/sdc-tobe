@@ -3072,7 +3072,10 @@ class OlympeBackend(DroneBackend):
                 results["recording"] = False
                 results["recording_error"] = str(ex)
         if "zoom" in data and HAS_CAMERA_ZOOM:
-            level = (data["zoom"] or {}).get("level", 1.0)
+            # Accept both {"zoom": 1.5} (float, from controller code) and
+            # {"zoom": {"level": 1.5}} (dict, legacy camera-config format).
+            _z = data["zoom"]
+            level = _z.get("level", 1.0) if isinstance(_z, dict) else float(_z or 1.0)
             try:
                 with command_lock:
                     r = d(_CameraSetZoom(
