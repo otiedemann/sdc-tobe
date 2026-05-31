@@ -210,7 +210,10 @@ class PoseSmoother:
     """
 
     HDG_JUMP_MAX_DEG = 5.0            # max plausible per-tick change
-    HDG_JUMP_CONSECUTIVE_MAX = 5      # accept after this many "jump" ticks
+    HDG_JUMP_CONSECUTIVE_MAX = 20     # accept after this many "jump" ticks
+                                      # (was 5 = 0.5s @ 10Hz; raised to 20 = 2s
+                                      # after IPPE branch flips at >10m distance
+                                      # persisted 5+ ticks and contaminated ALIGN)
 
     def __init__(self, alpha: float, max_age_s: float):
         self.alpha = float(alpha)
