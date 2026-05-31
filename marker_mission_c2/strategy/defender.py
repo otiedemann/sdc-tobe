@@ -39,7 +39,9 @@ from __future__ import annotations
 
 import logging
 
-from .roles import Decision, Role, RoleContext, noop, push, register
+from .roles import (
+    Decision, Role, RoleContext, noop, push, register, home_park_xy,
+)
 # Reuse the attacker's primitive-composed capture script + helpers so the
 # defender adds NO new flight maneuvers of its own.
 from .attacker import (
@@ -48,12 +50,14 @@ from .attacker import (
 
 logger = logging.getLogger(__name__)
 
-# Where an idle defender waits: x=0 (centred so the dash to any of our 3 home
-# slots is symmetric), |y| = 4.5 m. The neutral zone is y∈[-5, +5]; 4.5 m is
-# 0.5 m into the neutral zone from our home boundary (|y|=5) — the closest
-# legal neutral-zone point to home, for minimum recapture latency.
+# Where an idle defender waits when on SORTIE: x=0 (centred so the dash to any
+# of our 3 home slots is symmetric), |y| = 4.5 m. The neutral zone is
+# y∈[-5, +5]; 4.5 m is 0.5 m into the neutral zone from our home boundary
+# (|y|=5) — the closest legal neutral-zone point to home, AND crucially OUTSIDE
+# our home zone so the defender satisfies the 5-pt "all drones out" condition
+# while the attackers are scoring.
 NEUTRAL_WAIT_Y_M: float = 4.5
-# How close (m, horizontal) the defender must be to the waiting point to count
+# How close (m, horizontal) the defender must be to its waiting point to count
 # as "already waiting" (so we don't re-push the hold script every tick).
 _WAIT_ARRIVE_M: float = 1.5
 
@@ -63,22 +67,31 @@ def _slot_home_team(slot: int) -> str:
     return "red" if 1 <= slot <= 3 else "blue"
 
 
-def _neutral_wait_xy(our_team: str) -> tuple[float, float]:
-    return (0.0, -NEUTRAL_WAIT_Y_M if our_team == "red" else NEUTRAL_WAIT_Y_M)
+def _wait_xy(ctx: RoleContext) -> tuple[float, float]:
+    """The defender's waiting point for the current team phase.
+
+    sortie -> neutral zone (outside home), poised to recapture — and outside
+              home so the team's 5-pt "all drones out" condition holds.
+    bank   -> our home zone, returning with the team to secure the 5-pt attempt.
+    """
+    if ctx.team_phase == "bank":
+        return home_park_xy(ctx.our_team)
+    y = -NEUTRAL_WAIT_Y_M if ctx.our_team == "red" else NEUTRAL_WAIT_Y_M
+    return (0.0, y)
 
 
-def _at_neutral_wait(ctx: RoleContext) -> bool:
-    """True if the defender is already airborne at its neutral waiting point."""
+def _at_wait(ctx: RoleContext) -> bool:
+    """True if the defender is already airborne at the current waiting point."""
     pos = ctx.state.world_position_m
     if not pos or len(pos) < 3:
         return False
-    wx, wy = _neutral_wait_xy(ctx.our_team)
+    wx, wy = _wait_xy(ctx)
     dx, dy = float(pos[0]) - wx, float(pos[1]) - wy
     return (dx * dx + dy * dy) ** 0.5 <= _WAIT_ARRIVE_M and float(pos[2]) > 0.5
 
 
-def _neutral_wait_script(ctx: RoleContext) -> str:
-    """Fly to the neutral-zone waiting point and hold there (no land).
+def _wait_script(ctx: RoleContext) -> str:
+    """Fly to the current waiting point and hold there (no land).
 
     Existing FC verbs only (TAKEOFF / HEIGHT / TO / HOOVER). TAKEOFF is a
     no-op when already airborne. The script ends with a brief hover so it
@@ -87,7 +100,7 @@ def _neutral_wait_script(ctx: RoleContext) -> str:
     emit LAND: the defender stays airborne the whole match.
     """
     cruise_alt = max(1.5, float(ctx.cruise_alt_m or ctx.drone.attack_alt_m or 1.6))
-    wx, wy = _neutral_wait_xy(ctx.our_team)
+    wx, wy = _wait_xy(ctx)
     lines = [
         "TAKEOFF",
         f"HEIGHT {cruise_alt:.2f}",
@@ -117,23 +130,24 @@ class DefenderRole(Role):
         # ---- idle: waiting for a threatened own slot ----------------------
         if rs.phase in ("", "idle", "done"):
             if slot is None:
-                # No assigned threat — WAIT, airborne, in the neutral zone
-                # near our home boundary, poised to recapture. If we're
-                # already parked there, do nothing (the FC keeps hovering at
-                # phase=done). The FC starts a script only from INIT/done, so
-                # only push the go-to-wait script when idle on the ground or
-                # finished a prior run — and only if not already on station.
-                if _at_neutral_wait(ctx):
-                    return noop("defender: waiting in neutral zone (ready)")
+                # No assigned threat — WAIT, airborne, at the phase's waiting
+                # point: neutral zone on SORTIE (poised to recapture, and OUT
+                # of home so the team's 5-pt condition holds), or our home zone
+                # on BANK (returning with the team to secure the attempt). If
+                # already parked there, do nothing (FC keeps hovering at
+                # phase=done). The FC starts a script only from INIT/done.
+                where = "home zone" if ctx.team_phase == "bank" else "neutral zone"
+                if _at_wait(ctx):
+                    return noop(f"defender: waiting in {where} ({ctx.team_phase})")
                 if ctx.state.phase not in ("init", "done", ""):
                     return noop(
                         f"defender: airborne (fc phase={ctx.state.phase}); "
                         f"holding — FC must be INIT/done to reposition to wait"
                     )
                 return push(
-                    _neutral_wait_script(ctx),
+                    _wait_script(ctx),
                     new_phase="waiting",
-                    reason="defender: hold in neutral zone, ready to recapture",
+                    reason=f"defender: hold in {where} ({ctx.team_phase})",
                 )
             # Only defend OUR slots; ignore a mis-assigned enemy slot.
             if slot not in ctx.active_slots:

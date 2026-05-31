@@ -58,7 +58,9 @@ from __future__ import annotations
 import logging
 import math
 
-from .roles import Decision, Role, RoleContext, noop, push, register
+from .roles import (
+    Decision, Role, RoleContext, noop, push, register, home_park_xy,
+)
 from .settings import face_id
 
 logger = logging.getLogger(__name__)
@@ -528,6 +530,24 @@ def _auto_attack_script(
     )
 
 
+def _return_home_script(ctx: RoleContext) -> str:
+    """Fly back into our home zone and hover (no land) — used during a BANK.
+
+    Existing FC verbs only (TAKEOFF / HEIGHT / TO / HOOVER); TAKEOFF is a no-op
+    when already airborne. Brings an idle/out attacker home so the team can
+    secure the 5-pt attempt (all drones home before the box is recaptured).
+    """
+    cruise_alt = max(1.4, float(ctx.cruise_alt_m)) if ctx.cruise_alt_m else 1.6
+    hx, hy = home_park_xy(ctx.our_team)
+    return _format_script(
+        "TAKEOFF",
+        f"HEIGHT {cruise_alt:.2f}",
+        f"TO {hx:g} {hy:g}",
+        f"HEIGHT {cruise_alt:.2f}",
+        f"HOOVER {HOME_REARM_HOVER_S:.1f}",
+    )
+
+
 def _enemy_face_for(slot: int, our_team: str) -> int:
     enemy = "blue" if our_team == "red" else "red"
     return face_id(slot, enemy)
@@ -555,6 +575,26 @@ class AttackerRole(Role):
             return noop("attacker: no team assigned")
         if not ctx.state.drone_connected:
             return noop("attacker: drone not connected")
+
+        # ---- BANK: we just captured an enemy box — get home to secure the
+        # 5-pt attempt (all drones must return home before recapture). Don't
+        # start any new attack; bring this drone home if it's out, hold if home.
+        if ctx.team_phase == "bank":
+            rs.target_slot = None        # abandon any pending attack intent
+            rs.target_assigned_unix_s = None
+            if ctx.state.phase == "running":
+                # Mid-run: its own script ends with an RTH into home, so just
+                # let it finish — interrupting would waste the in-flight run.
+                return noop("attacker: bank — finishing run (ends home)")
+            if ctx.in_home_now:
+                rs.advance_phase("done", "bank — home, holding")
+                return noop("attacker: bank — home, holding (secured)")
+            # Idle/done but not home (e.g. was waiting out) — fly home now.
+            return push(
+                _return_home_script(ctx),
+                new_phase="returning",
+                reason="attacker: bank — return home to secure the attempt",
+            )
 
         slot = rs.target_slot
 

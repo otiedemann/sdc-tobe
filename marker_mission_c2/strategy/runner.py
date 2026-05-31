@@ -154,6 +154,19 @@ class SwarmRunner:
         self._collision = CollisionAvoider()
         self._avoiding: Dict[str, float] = {}
 
+        # Team scoring coordinator (v7 5-pt play). The whole team pulses
+        # out-and-back together:
+        #   "sortie" — all drones OUT of home, attackers capturing enemy boxes
+        #              (5 pts need every drone outside home at the capture).
+        #   "bank"   — we just captured an enemy box -> recall EVERY drone home
+        #              to secure the attempt (5 pts need all home before the box
+        #              is recaptured), then sortie again.
+        # _last_cap_seen tracks the newest capture-event ts we've reacted to so
+        # a single capture triggers exactly one bank.
+        self._team_phase = "sortie"
+        self._bank_since = 0.0
+        self._last_cap_seen = 0.0
+
     # ------------------------------------------------------------------
     # Public read API (called from Flask handlers, so must be thread-safe)
     # ------------------------------------------------------------------
@@ -411,11 +424,22 @@ class SwarmRunner:
                 )
             s = self._settings.snapshot()          # refresh so they dispatch this tick
 
+        # 3a.5) Team scoring coordinator: flip between "sortie" (attack, all
+        # drones out) and "bank" (we captured an enemy box -> recall all home
+        # to secure the 5-pt attempt). Must run BEFORE the planner so a bank
+        # suppresses new attacks this very tick.
+        try:
+            self._update_team_phase(s, overview)
+        except Exception:
+            logger.exception("strategy: team-phase update crashed (continuing)")
+
         # 3b) AUTO mode: auto-assign target slots within operator-set roles
         # based on the live slot states. This is the event-reaction layer
         # (enemy captures our slot -> dispatch a free defender, etc.). It
         # only sets intent; the arming gate still controls actual pushes.
-        if self.is_auto():
+        # SKIPPED while banking: during a bank we want every drone heading
+        # home to secure the attempt, not starting fresh attack runs.
+        if self.is_auto() and self._team_phase != "bank":
             try:
                 self._auto_plan(s)
             except Exception:
@@ -503,6 +527,7 @@ class SwarmRunner:
                 active_slots=tuple(s.markers.active_slots),
                 cruise_alt_m=cruise_alts.get(drone.fc_name),
                 in_home_now=in_home_now,
+                team_phase=self._team_phase,
             )
 
             try:
@@ -648,6 +673,87 @@ class SwarmRunner:
             if fc not in overrides:
                 del self._avoiding[fc]
         return overrides
+
+    # ------------------------------------------------------------------
+    # Team scoring coordinator (v7 5-pt play)
+    # ------------------------------------------------------------------
+
+    # How long a bank may run before we give up and sortie again, so a drone
+    # that can't get home (lost position, stuck) never deadlocks the team.
+    BANK_TIMEOUT_S = 30.0
+
+    def _update_team_phase(self, s, overview: Dict[str, Any]) -> None:
+        """Flip team phase sortie<->bank to maximise 5-pt scoring plays.
+
+        v7 5-pt rule: a capture earns 5 (not 1) pts when EVERY one of our
+        drones is outside our home zone at the capture, and then ALL of them
+        return home before the box is recaptured. So the whole team pulses:
+
+          sortie : everyone OUT (scout centre, defender neutral, attackers on
+                   enemy boxes) -> attackers capture.
+          bank   : the instant we capture an enemy box, recall EVERY drone
+                   home; once all are home the attempt is secured -> sortie.
+
+        Transitions:
+          sortie -> bank : a fresh capture event by us on an ENEMY box
+                           (home recaptures don't count — those are 0 pts).
+          bank   -> sortie: all our drones detected home, or BANK_TIMEOUT_S.
+        """
+        now = time.time()
+        our = (s.markers.our_team or "").lower()
+
+        # Detect a fresh enemy-box capture by us since we last reacted.
+        newest = self._last_cap_seen
+        captured_enemy_box = False
+        for ev in self._markers.capture_events(limit=20):
+            u = float(ev.get("unix_s", 0.0))
+            if u <= self._last_cap_seen:
+                continue
+            newest = max(newest, u)
+            if ev.get("new") == our and not ev.get("home_recap"):
+                captured_enemy_box = True
+        self._last_cap_seen = newest
+
+        if self._team_phase == "sortie":
+            if captured_enemy_box:
+                self._team_phase = "bank"
+                self._bank_since = now
+                self._events.add(
+                    "team_bank",
+                    "captured an enemy box — recall ALL drones home to "
+                    "secure the 5-pt attempt (no new attacks until home)",
+                )
+            return
+
+        # team_phase == "bank": exit when everyone is home (attempt secured)
+        # or after the safety timeout.
+        ours = [d for d in s.drones
+                if d.enabled and d.team and d.team.lower() == our]
+        homed = 0
+        known = 0
+        for d in ours:
+            ds = DroneState.from_overview(d.fc_name, overview.get(d.fc_name) or {})
+            pos = ds.world_position_m
+            if not pos:
+                continue
+            known += 1
+            if in_home_zone(d.team, pos[0], pos[1]):
+                homed += 1
+        all_home = known > 0 and homed == known and known == len(ours)
+        if all_home:
+            self._team_phase = "sortie"
+            self._events.add(
+                "team_sortie",
+                f"all {homed} drones home — attempt secured; sortie again "
+                "(scout -> centre, attackers re-attack)",
+            )
+        elif now - self._bank_since > self.BANK_TIMEOUT_S:
+            self._team_phase = "sortie"
+            self._events.add(
+                "team_sortie",
+                f"bank timeout ({self.BANK_TIMEOUT_S:.0f}s, {homed}/{len(ours)} "
+                "home) — sortie again to keep scoring",
+            )
 
     # ------------------------------------------------------------------
     # Decision dispatch

@@ -110,6 +110,16 @@ def in_home_zone(team: str, x: float, y: float) -> bool:
     return False
 
 
+def home_park_xy(team: str) -> tuple[float, float]:
+    """Where a drone parks when recalled home to BANK a scoring attempt.
+
+    x=0 (centred), |y|=6 m — comfortably inside the home zone (y in ±[5,10])
+    yet ~1.5 m clear of the boxes at |y|=7.5 so a parked/rotating drone is
+    never a "dead duck" directly over a target (regs §1.3).
+    """
+    return (0.0, -6.0 if team == "red" else 6.0)
+
+
 # ---------------------------------------------------------------------------
 # Per-drone role-runtime state, kept in memory by the runner.
 # ---------------------------------------------------------------------------
@@ -228,6 +238,16 @@ class RoleContext:
     # position_m. Roles must refuse to start a NEW scoring attempt while
     # this is False (the regs require the drone be detected back home).
     in_home_now: bool = False
+    # Team-level scoring phase (set by the runner's team coordinator):
+    #   "sortie" — attack: every drone OUT of our home zone (scout at centre,
+    #              defender in neutral, attackers on enemy boxes). This is the
+    #              state in which a capture earns 5 pts (all drones outside
+    #              home at the moment of capture).
+    #   "bank"   — we just captured an enemy box: recall EVERY drone home to
+    #              secure the attempt (5 pts require all drones return home
+    #              before the box is recaptured). No new attacks start.
+    # Roles branch on this so the whole team pulses out-and-back together.
+    team_phase: str = "sortie"
 
 
 class Role(abc.ABC):

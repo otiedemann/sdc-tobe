@@ -36,7 +36,9 @@ from __future__ import annotations
 import logging
 import time
 
-from .roles import Decision, Role, RoleContext, noop, push, register
+from .roles import (
+    Decision, Role, RoleContext, noop, push, stop_cmd, register, home_park_xy,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -45,7 +47,22 @@ def _format_script(*lines: str) -> str:
     return "\n".join(line for line in lines if line) + "\n"
 
 
-def _compose_scout_script(ctx: RoleContext) -> str | None:
+def _scout_target_xy(ctx: RoleContext) -> tuple[float, float]:
+    """Where the scout rotates this team-phase.
+
+    sortie -> arena centre (0,0): watches all six boxes from the middle while
+              the attackers are out (and, being in neutral, the scout itself is
+              outside our home zone — needed for the 5-pt all-out condition).
+    bank   -> our home zone: the scout must come home with everyone else to
+              secure the attempt; it keeps rotating there to watch our own
+              boxes (enemy boxes are out of vision range from home).
+    """
+    if ctx.team_phase == "bank":
+        return home_park_xy(ctx.our_team)
+    return (0.0, 0.0)
+
+
+def _compose_scout_script(ctx: RoleContext, tx: float, ty: float) -> str | None:
     drone = ctx.drone
     if not drone.team:
         return None
@@ -58,16 +75,12 @@ def _compose_scout_script(ctx: RoleContext) -> str | None:
     # verb so we are the only limit on operator-typed values.
     yaw_stick = max(-100, min(100, yaw_stick))
     duration_s = max(10.0, float(ctx.match.scout_drive_duration_s))
-    # Optionally fly to the arena centre (0,0) first, via the FC's
-    # existing TO verb, so the scout watches all six slots from the
-    # middle. The operator can disable this (match.scout_center=False)
-    # if TO is flaky on their FC — in the sim the drone spawns at 0,0
-    # so it's already centred without TO.
-    center_step = "TO 0 0" if bool(getattr(ctx.match, "scout_center", True)) else ""
+    # Fly to the target point first (via the FC's existing TO verb), then
+    # rotate in place. TAKEOFF is a no-op when already airborne (we never land).
     return _format_script(
         "TAKEOFF",
         f"HEIGHT {alt:.2f}",
-        center_step,
+        f"TO {tx:g} {ty:g}",
         f"RC 0 0 0 {yaw_stick} {duration_s:.0f}",
     )
 
@@ -83,29 +96,35 @@ class ScoutRole(Role):
         if not ctx.state.drone_connected:
             return noop("scout: drone not connected")
 
-        script = _compose_scout_script(ctx)
+        rs = ctx.role_state
+        # The scout tracks WHICH point it's rotating at via its role phase, so
+        # a team-phase flip (centre <-> home) redirects it even mid-rotate.
+        tx, ty = _scout_target_xy(ctx)
+        desired_phase = "scout_home" if ctx.team_phase == "bank" else "scout_center"
+        fc_finished = ctx.state.phase in ("init", "done", "")
+
+        # Already rotating at the right point -> nothing to do.
+        if rs.phase == desired_phase and not fc_finished:
+            return noop(f"scout: rotating at {desired_phase[6:]} ({ctx.team_phase})")
+
+        # Mid-script but at the WRONG point (team phase just flipped) -> stop
+        # the current rotate so we can re-push toward the new point next tick.
+        if not fc_finished:
+            if rs.phase != desired_phase:
+                return stop_cmd(
+                    f"scout: redirect to {desired_phase[6:]} ({ctx.team_phase})"
+                )
+            return noop(f"scout: FC busy (phase={ctx.state.phase})")
+
+        # FC idle/done -> (re)launch the rotate toward the desired point.
+        script = _compose_scout_script(ctx, tx, ty)
         if script is None:
             return noop("scout: cannot compose script")
-
-        # Push only when the FC is truly idle — i.e. phase == init/done.
-        # Phase.IDLE is mid-script HOOVER and must NOT trigger a push (the
-        # C2 would reject it). The "never_pushed" guard alone isn't enough
-        # after a strategy restart: the FC may still be running an old
-        # mission from before the restart, and pushing while it runs
-        # produces the script_push_failed storm we saw.
-        now = time.time()
-        rs = ctx.role_state
-        never_pushed = not rs.last_pushed_script
-        fc_finished = ctx.state.phase in ("init", "done", "")
-        long_enough = (now - rs.last_pushed_unix_s) >= 2.0
-
-        if not fc_finished:
-            return noop(f"scout: FC busy (phase={ctx.state.phase})")
-        if never_pushed:
-            return push(script, new_phase="scouting", reason="scout: initial push")
-        if long_enough:
-            return push(script, new_phase="scouting", reason="scout: loop re-push")
-        return noop("scout: waiting for cooldown")
+        return push(
+            script,
+            new_phase=desired_phase,
+            reason=f"scout: rotate at {desired_phase[6:]} ({ctx.team_phase})",
+        )
 
 
 register(ScoutRole())
