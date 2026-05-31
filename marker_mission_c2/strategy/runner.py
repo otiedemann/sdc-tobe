@@ -165,6 +165,7 @@ class SwarmRunner:
         # a single capture triggers exactly one bank.
         self._team_phase = "sortie"
         self._bank_since = 0.0
+        self._bank_pending_since = 0.0
         self._last_cap_seen = 0.0
 
     # ------------------------------------------------------------------
@@ -681,6 +682,10 @@ class SwarmRunner:
     # How long a bank may run before we give up and sortie again, so a drone
     # that can't get home (lost position, stuck) never deadlocks the team.
     BANK_TIMEOUT_S = 30.0
+    # Grace window after the FIRST enemy capture before we actually bank, so a
+    # near-simultaneous SECOND capture (the 10-pt double-strike, < 1 s apart)
+    # can complete first. > 1 s (the double-strike window) + detection lag.
+    BANK_GRACE_S = 1.5
 
     def _update_team_phase(self, s, overview: Dict[str, Any]) -> None:
         """Flip team phase sortie<->bank to maximise 5-pt scoring plays.
@@ -715,13 +720,29 @@ class SwarmRunner:
         self._last_cap_seen = newest
 
         if self._team_phase == "sortie":
-            if captured_enemy_box:
+            # First enemy capture arms a short grace timer rather than banking
+            # immediately. The 10-pt double-strike needs a SECOND capture < 1 s
+            # later; banking the instant the first lands would recall the
+            # partner before it fires. We hold sortie for BANK_GRACE_S so a
+            # near-simultaneous second capture can complete, THEN bank. Against
+            # the ~40 s the enemy needs to fly over and recapture, this <2 s
+            # delay costs nothing on the 5-pt "return before recapture" clock.
+            if captured_enemy_box and self._bank_pending_since <= 0.0:
+                self._bank_pending_since = now
+                self._events.add(
+                    "team_bank_arm",
+                    f"captured an enemy box — holding sortie {self.BANK_GRACE_S:.1f}s "
+                    "for a possible 10-pt double-strike, then banking",
+                )
+            if (self._bank_pending_since > 0.0
+                    and now - self._bank_pending_since >= self.BANK_GRACE_S):
                 self._team_phase = "bank"
                 self._bank_since = now
+                self._bank_pending_since = 0.0
                 self._events.add(
                     "team_bank",
-                    "captured an enemy box — recall ALL drones home to "
-                    "secure the 5-pt attempt (no new attacks until home)",
+                    "recall ALL drones home to secure the scoring attempt "
+                    "(no new attacks until everyone is home)",
                 )
             return
 
