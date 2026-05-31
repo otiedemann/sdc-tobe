@@ -350,6 +350,19 @@ def _exec_step(drone: SimDrone, world: World, step: Step, dt: float,
         return spd, elapsed >= dur
 
     # -- closed-loop yaw ---------------------------------------------------
+    if verb == "YAW":
+        # ABSOLUTE heading hold (arena frame, deg CW from +Y). Matches the real
+        # marker_mission YAW verb. 0 = face +Y (front/enemy for red), 180 = -Y.
+        # Rotate toward the absolute target regardless of current heading.
+        target = wrap_deg(_arg(step, 0, drone.heading_deg))
+        err = wrap_deg(target - drone.heading_deg)
+        if abs(err) <= ARRIVE_YAW:
+            drone.heading_deg = target
+            return 0.0, True
+        step_deg = math.copysign(min(YAW_RATE * dt, abs(err)), err)
+        drone.heading_deg = wrap_deg(drone.heading_deg + step_deg)
+        return 0.0, abs(wrap_deg(target - drone.heading_deg)) <= ARRIVE_YAW
+
     if verb == "YAW_IMU":
         # Relative rotation by `deg` at YAW_RATE; latch a target heading.
         if "yaw_target" not in mem:

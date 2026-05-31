@@ -113,15 +113,15 @@ def in_home_zone(team: str, x: float, y: float) -> bool:
 def home_park_xy(team: str, lane: int = 0, n_lanes: int = 1) -> tuple[float, float]:
     """Where a drone parks when recalled home to BANK a scoring attempt.
 
-    |y|=6 m — comfortably inside the home zone (y in ±[5,10]) yet ~1.5 m clear
-    of the boxes at |y|=7.5 so a parked/rotating drone is never a "dead duck"
-    over a target (regs §1.3). The x is SPREAD across the 10 m-wide home zone
-    by ``lane`` (this drone's index) of ``n_lanes`` so the whole team doesn't
-    converge on a single point during bank — stacking everyone on x=0 made
-    them cross each other's altitude bands and triggered a collision-avoidance
-    storm that stalled the next attack. Lanes span x in [-3.5, +3.5].
+    |y|=5.5 m — just BARELY inside the home zone (y in ±[5, 10]), i.e. ~4.5 m
+    from the back wall at |y|=10 and SHALLOW (in FRONT of the boxes at |y|=7.5,
+    not over them). Operator: drones should be "only slightly in the home zone,
+    not too deep" — parking at |y|=6+ pushed them deep toward the back wall.
+    The x is SPREAD across the home-zone width by ``lane`` of ``n_lanes`` so the
+    team doesn't converge on one point during a bank (which tripped collision
+    avoidance and stalled the next attack). Lanes span x in [-3.5, +3.5].
     """
-    y = -6.0 if team == "red" else 6.0
+    y = -5.5 if team == "red" else 5.5
     if n_lanes <= 1:
         return (0.0, y)
     span = 7.0   # -3.5 .. +3.5

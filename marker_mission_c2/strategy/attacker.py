@@ -200,11 +200,14 @@ AUTO_ATTACK_APPROACH_SPEED: int = 55
 # (~2 m) doesn't push the drone into the wall behind the marker.
 # Target stop is tighter (1.5 m) — vision drives the final approach
 # now (world fallback is suppressed while vision is live), so we can
-# safely close in. Wall stop stays conservative (3.0 m) since the
-# wall brake leans on the world fallback (vision of the wall marker
-# is less reliable at cruise pitch) and we must not clip the wall.
+# safely close in. Wall stop is 5.0 m: the home wall is at |y|=10 and the
+# home zone is |y| in [5, 10], so braking 5 m short of the wall puts the
+# drone at |y|≈5 — just BARELY inside the home zone, NOT deep against the
+# wall. Operator: "they only need to be slightly in the home zone, 5 m from
+# the wall is fine" (was 3.0 m, which parked them deep at |y|≈7 and risked
+# clipping the back wall on overshoot).
 FB_BRAKE_TARGET_STOP_M: float = 1.5
-FB_BRAKE_WALL_STOP_M: float = 3.0
+FB_BRAKE_WALL_STOP_M: float = 5.0
 # FB_BRAKE drives at the SAME stick as cruise (so we don't accelerate
 # back to full speed during the brake-search phase, which then has
 # more momentum to bleed off). Sticking to ~2 m/s throughout keeps
@@ -417,12 +420,10 @@ def _full_attack_script(
             # airborne, re-arm, and re-attack on the next dispatch.
             home_rearm,
         )
-    # v7 §1.4.3 capture needs the drone in the 1-2 m RFID detection band.
-    # If the deconflicted cruise altitude is above that band (large rosters
-    # push scouts/attackers up to ~3 m+), we MUST descend just before the
-    # target brake or the capture never registers. Aim for the middle of
-    # the band (1.5 m) — well inside z_min/z_max and clear of box tops.
-    CAPTURE_DESCENT_ALT_M = 1.5
+    # Capture altitude over a target box: 1.2 m (operator-specified). The
+    # deconflicted cruise altitude is higher, so we MUST descend to this just
+    # before the target brake or the capture never registers.
+    CAPTURE_DESCENT_ALT_M = 1.2
     return _format_script(
         "TAKEOFF",
         # FACE THE ENEMY FIRST (absolute arena YAW). The whole attack cruises
@@ -595,7 +596,7 @@ def _recapture_script(ctx: RoleContext, slot: int) -> str:
         return _return_home_script(ctx)
     tx, ty = target
     cruise_alt = max(1.4, float(ctx.cruise_alt_m)) if ctx.cruise_alt_m else 1.6
-    CAPTURE_ALT = 1.5            # middle of the 1-2 m RFID detection band
+    CAPTURE_ALT = 1.2           # operator-specified capture altitude over a box
     # Wait after the flip at the neutral point (outside home so the team's
     # "all out" 5-pt condition still holds during a sortie).
     wy = -4.5 if ctx.our_team == "red" else 4.5
