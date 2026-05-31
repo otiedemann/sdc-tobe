@@ -125,99 +125,62 @@ class DefenderRole(Role):
         if not ctx.state.drone_connected:
             return noop("defender: drone not connected")
 
-        # ---- BANK: the team just captured an enemy box and is securing the
-        # 5-pt attempt — EVERY drone must get home, the defender included. Its
-        # waiting point during bank is already home (_wait_xy), so just send it
-        # there now; abandon any recapture intent until we're banking again.
+        slot = rs.target_slot
+
+        # ---- (1) RE-CAPTURE — top priority, BEATS the bank recall ----------
+        # The planner assigns a threatened own slot. Defence is a 0-pt home
+        # flip but stops the enemy scoring and is needed for the all-6 win, so
+        # it overrides everything else. Fly the heading-agnostic recapture
+        # (world-frame TO to the box) the instant the FC is idle.
+        if slot is not None and slot in ctx.active_slots:
+            if rs.phase == "running":
+                # Mid-recapture: done when the slot reads ours, or FC finished.
+                if _slot_is_ours(ctx, slot) or ctx.state.phase in ("init", "done", ""):
+                    rs.target_slot = None
+                    rs.target_assigned_unix_s = None
+                    rs.advance_phase("done", f"slot {slot} recaptured / run done")
+                    return noop("defender: recapture complete, return to wait")
+                return noop(f"defender: recapturing slot {slot} "
+                            f"(fc phase={ctx.state.phase})")
+            if _slot_is_ours(ctx, slot):
+                rs.target_slot = None
+                rs.advance_phase("done", f"slot {slot} already ours")
+                return noop(f"defender: slot {slot} already ours")
+            if ctx.state.phase not in ("init", "done", ""):
+                return noop(f"defender: busy (fc phase={ctx.state.phase}); "
+                            f"will recapture slot {slot} once idle")
+            return push(
+                _recapture_script(ctx, slot),
+                new_phase="running",
+                reason=f"defender: re-capture slot {slot} (held by enemy)",
+            )
+
+        # ---- (2) BANK, no threat — return home to secure the 5-pt attempt --
         if ctx.team_phase == "bank":
-            rs.target_slot = None
-            rs.target_assigned_unix_s = None
-            if ctx.in_home_now:
+            if ctx.in_home_now and _at_wait(ctx):
                 if rs.phase != "waiting":
                     rs.advance_phase("waiting", "bank — home, holding (secured)")
                 return noop("defender: bank — home, holding (secured)")
+            if ctx.state.phase not in ("init", "done", ""):
+                return noop(f"defender: bank — en route home "
+                            f"(fc phase={ctx.state.phase})")
             return push(
                 _wait_script(ctx),       # _wait_xy -> home during bank
                 new_phase="waiting",
                 reason="defender: bank — return home to secure the attempt",
             )
 
-        slot = rs.target_slot
-
-        # ---- idle: waiting for a threatened own slot ----------------------
-        if rs.phase in ("", "idle", "done"):
-            if slot is None:
-                # No assigned threat — WAIT, airborne, at the phase's waiting
-                # point: neutral zone on SORTIE (poised to recapture, and OUT
-                # of home so the team's 5-pt condition holds), or our home zone
-                # on BANK (returning with the team to secure the attempt). If
-                # already parked there, do nothing (FC keeps hovering at
-                # phase=done). The FC starts a script only from INIT/done.
-                where = "home zone" if ctx.team_phase == "bank" else "neutral zone"
-                if _at_wait(ctx):
-                    return noop(f"defender: waiting in {where} ({ctx.team_phase})")
-                if ctx.state.phase not in ("init", "done", ""):
-                    return noop(
-                        f"defender: airborne (fc phase={ctx.state.phase}); "
-                        f"holding — FC must be INIT/done to reposition to wait"
-                    )
-                return push(
-                    _wait_script(ctx),
-                    new_phase="waiting",
-                    reason=f"defender: hold in {where} ({ctx.team_phase})",
-                )
-            # Only defend OUR slots; ignore a mis-assigned enemy slot.
-            if slot not in ctx.active_slots:
-                return noop(f"defender: slot {slot} not active")
-            if _slot_is_ours(ctx, slot):
-                rs.advance_phase("done", f"slot {slot} already ours — no action")
-                return noop(f"defender: slot {slot} already ours")
-            # The FC starts a script only when idle (phase init/done) — i.e.
-            # parked at the neutral waiting point (or mid-reposition having just
-            # finished). If it's mid-run (e.g. still flying to the wait point),
-            # hold until that ends, THEN launch the recapture.
-            if ctx.state.phase not in ("init", "done", ""):
-                return noop(
-                    f"defender: busy (fc phase={ctx.state.phase}); "
-                    f"will launch re-capture once idle"
-                )
-            # NOTE: unlike the attacker, we deliberately do NOT gate on
-            # in_home_now here. The defender waits in the NEUTRAL zone, and a
-            # recapture of one of OUR slots is a 0-pt home defence (not an
-            # enemy-zone scoring attempt that §1.4.4 guards against camping) —
-            # the drone flies INTO its home zone to do it. Gating on home
-            # presence would strand the neutral-waiting defender and it could
-            # never recapture, defeating the whole role.
-            # Enemy holds our slot -> re-capture its currently-showing
-            # (enemy) face with the attacker's primitive script.
-            recap_id = _enemy_face_for(slot, ctx.our_team)
-            rs.last_attack_marker_id = recap_id
-            return push(
-                _full_attack_script(ctx, recap_id, slot),
-                new_phase="running",
-                reason=f"defender: re-capture slot {slot} (id={recap_id})",
-            )
-
-        # ---- running: wait for the script to fully finish -----------------
-        if rs.phase == "running":
-            if slot is not None and _slot_is_ours(ctx, slot):
-                # Re-captured (a scout confirmed our face) — let the script
-                # finish its RTH on its own (ends hovering in home, no land);
-                # reset intent so the idle branch returns us to the neutral
-                # waiting point.
-                rs.target_slot = None
-                rs.target_assigned_unix_s = None
-                rs.advance_phase("done", f"slot {slot} re-captured")
-                return noop("defender: slot re-captured, returning to wait")
-            if ctx.state.phase in ("init", "done", ""):
-                rs.target_slot = None
-                rs.target_assigned_unix_s = None
-                rs.advance_phase("done", "re-capture run complete (FC back to init)")
-                return noop("defender: run complete")
-            return noop(f"defender: running (fc phase={ctx.state.phase})")
-
-        rs.advance_phase("idle", f"unknown phase {rs.phase}")
-        return noop("defender: reset to idle")
+        # ---- (3) SORTIE, no threat — WAIT in the neutral zone, ready -------
+        if _at_wait(ctx):
+            return noop("defender: waiting in neutral zone (ready to recapture)")
+        if ctx.state.phase not in ("init", "done", ""):
+            return noop(f"defender: airborne (fc phase={ctx.state.phase}); "
+                        f"holding — FC must be INIT/done to reposition to wait")
+        return push(
+            _wait_script(ctx),
+            new_phase="waiting",
+            reason="defender: hold in neutral zone, ready to recapture",
+        )
 
 
 register(DefenderRole())

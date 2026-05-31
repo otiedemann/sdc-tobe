@@ -81,6 +81,32 @@ def _is_free(rs: Any) -> bool:
     return rs.phase in ("", "idle", "done")
 
 
+def _drone_xy(overview: dict, fc: str):
+    """(x, y) of drone fc from the C2 overview, or None if unknown."""
+    pos = _drone_state(overview, fc).get("world_position_m")
+    if not isinstance(pos, (list, tuple)) or len(pos) < 2:
+        return None
+    try:
+        return (float(pos[0]), float(pos[1]))
+    except (TypeError, ValueError):
+        return None
+
+
+def _dist_to_slot(overview: dict, fc: str, slot: int) -> float:
+    """Horizontal distance from drone fc to a slot (inf if pos unknown).
+
+    Used to pick the NEAREST free attacker to pull into a recapture so the
+    "attacker becomes defender" handoff costs the least flight time.
+    """
+    import math as _m
+    from .attacker import SLOT_POSITIONS_M as _SP
+    xy = _drone_xy(overview, fc)
+    if xy is None:
+        return float("inf")
+    sx, sy = _SP.get(int(slot), (0.0, 0.0))
+    return _m.hypot(xy[0] - sx, xy[1] - sy)
+
+
 # ---------------------------------------------------------------------------
 # planner
 # ---------------------------------------------------------------------------
