@@ -4381,6 +4381,11 @@ class UiServer:
             except Exception as e:
                 return jsonify({"ok": False, "error": str(e)}), 500
             _reload_live_cfg_after_import("settings-import")
+            # Propagate to peers only when this is an operator import, not a
+            # peer-sync push (avoids push loops).
+            if request.args.get("peer_sync") != "1":
+                from .fleet_sync import push_to_peers
+                push_to_peers()
             return jsonify({"ok": True, **result})
 
         @app.get("/api/mission/settings/backups")
@@ -4496,6 +4501,8 @@ class UiServer:
                 return jsonify({"ok": False, "error": "tuning not wired"}), 503
             try:
                 p = self.cfg.save()
+                from .fleet_sync import push_to_peers
+                push_to_peers()
                 return jsonify({"ok": True, "path": str(p)})
             except Exception as e:
                 return jsonify({"ok": False, "error": str(e)}), 500
@@ -4536,6 +4543,9 @@ class UiServer:
                 if self.controller is not None:
                     self.controller.apply_config_changes()
                 self._log_param_changes(before, source="ui-reset")
+                self.cfg.save()
+                from .fleet_sync import push_to_peers
+                push_to_peers()
                 return jsonify({"ok": True})
             except Exception as e:
                 return jsonify({"ok": False, "error": str(e)}), 500
@@ -4619,6 +4629,9 @@ class UiServer:
                 if self.controller is not None:
                     self.controller.apply_config_changes()
                 self._log_param_changes(before, source=f"ui-snapshot-load:{name}")
+                self.cfg.save()
+                from .fleet_sync import push_to_peers
+                push_to_peers()
                 return jsonify({"ok": True, "name": name})
             except Exception as e:
                 return jsonify({"ok": False, "error": str(e)}), 500
@@ -4783,6 +4796,8 @@ class UiServer:
                     self.arena_holder.set(arena_obj)
                 except Exception as e:
                     print(f"[ui] arena_holder.set failed: {e}")
+            from .fleet_sync import push_to_peers
+            push_to_peers()
             return jsonify({"ok": True})
 
         @app.post("/api/arena/default")
@@ -4844,6 +4859,8 @@ class UiServer:
                                 "error": "invalid name"}), 400
             try:
                 p.write_text(json.dumps(arena_obj.to_json_dict(), indent=2))
+                from .fleet_sync import push_to_peers
+                push_to_peers()
                 return jsonify({"ok": True, "name": name})
             except Exception as e:
                 return jsonify({"ok": False, "error": str(e)}), 500
@@ -5407,6 +5424,8 @@ class UiServer:
                                          "max 64 chars, can't start with separator)"}), 400
             try:
                 p.write_text(text)
+                from .fleet_sync import push_to_peers
+                push_to_peers()
                 return jsonify({"ok": True, "name": name, "path": str(p)})
             except Exception as e:
                 return jsonify({"ok": False, "error": str(e)}), 500
