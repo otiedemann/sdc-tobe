@@ -1259,7 +1259,12 @@ class MissionController:
             # is better centred in the frame before HEIGHT_ALIGN starts.
             self._send_rc(0, 0, 0, 0)
             back_deg = int(getattr(cfg, "search_backrotate_deg", 10))
-            if back_deg > 0:
+            swept = getattr(self, "_search_swept", 0.0)
+            # Only back-rotate when the drone actually swept past the back_deg
+            # threshold — if the marker appeared almost immediately (e.g. on
+            # a HOLD→new-APPROACH transition where the target was already near
+            # the centre of frame) a back-rotation would steer the drone away.
+            if back_deg > 0 and swept >= back_deg:
                 try:
                     self.api.rotate("ccw", back_deg)
                 except Exception as e:
