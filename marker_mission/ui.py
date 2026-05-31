@@ -2368,6 +2368,20 @@ _PAGE_TUNE = _PAGE_BASE_CSS + _PAGE_HEADER + _COMMON_SCRIPT + _PAGE_GRID_OPEN + 
                 style="padding:.5rem .9rem; border:0; border-radius:6px;
                        background:#7f1d1d; color:#fee2e2; cursor:pointer;">
           Reset all to defaults</button>
+        <span style="margin-left:auto; display:flex; gap:.4rem; align-items:center;">
+          <button type="button" id="btn-tune-export"
+                  title="Download all current tune parameters as a JSON file to your computer."
+                  style="padding:.5rem .9rem; border:1px solid #3a4550; border-radius:6px;
+                         background:#1a2530; color:#e6edf3; cursor:pointer;">
+            ⬇ Export to file</button>
+          <label title="Upload a previously exported tune JSON file and apply all values."
+                 style="padding:.5rem .9rem; border:1px solid #2a4a6a; border-radius:6px;
+                        background:#1a3040; color:var(--accent); cursor:pointer;">
+            ⬆ Import from file
+            <input type="file" id="inp-tune-import" accept=".json" hidden>
+          </label>
+          <span id="tune-io-msg" style="font-size:.8rem; color:#aab;"></span>
+        </span>
       </div>
     </form>
   </div>
@@ -2787,6 +2801,64 @@ $('snap-name').addEventListener('keydown', e => {
 
 loadView();
 refreshSnapshots();
+
+// ── Export / Import tune parameters ──────────────────────────────────────────
+$('btn-tune-export').addEventListener('click', async () => {
+  const msg = $('tune-io-msg');
+  try {
+    const r = await fetch('/api/tune', {cache: 'no-store'});
+    const d = await r.json();
+    // Flatten groups → plain {name: value} object
+    const params = {};
+    for (const g of (d.groups || [])) {
+      for (const p of (g.params || [])) {
+        params[p.name] = p.value;
+      }
+    }
+    const blob = new Blob([JSON.stringify(params, null, 2)], {type: 'application/json'});
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    const host = location.hostname.replace(/[^a-zA-Z0-9]/g, '-');
+    a.download = `tune-${host}-${new Date().toISOString().slice(0,16).replace(':','-')}.json`;
+    a.click();
+    URL.revokeObjectURL(url);
+    msg.textContent = 'Exported ✓';
+    msg.style.color = 'var(--good)';
+    setTimeout(() => msg.textContent = '', 3000);
+  } catch(e) {
+    msg.textContent = 'Export failed: ' + e;
+    msg.style.color = 'var(--bad)';
+  }
+});
+
+$('inp-tune-import').addEventListener('change', async function() {
+  const msg = $('tune-io-msg');
+  const file = this.files && this.files[0];
+  if (!file) return;
+  this.value = '';
+  try {
+    const text = await file.text();
+    const params = JSON.parse(text);
+    if (typeof params !== 'object' || Array.isArray(params))
+      throw new Error('expected a JSON object of {name: value} pairs');
+    const r = await fetch('/api/tune/apply', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify(params),
+    });
+    const d = await r.json();
+    if (!d.ok) throw new Error(d.error || r.status);
+    msg.textContent = `Imported ${Object.keys(params).length} params ✓ — click Save to persist`;
+    msg.style.color = 'var(--good)';
+    await loadView();   // refresh form to show imported values
+    setTimeout(() => msg.textContent = '', 6000);
+  } catch(e) {
+    msg.textContent = 'Import failed: ' + e;
+    msg.style.color = 'var(--bad)';
+  }
+});
+
 })();
 </script>
 """ + _PAGE_GRID_CLOSE + _SHARED_SCRIPT
