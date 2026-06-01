@@ -125,6 +125,42 @@ def build_app(
             return _no_cache(app.response_class(body, mimetype="text/plain"))
         return _no_cache(jsonify({"path": ml.path, "missions": entries}))
 
+    @app.route("/api/missions/<fc_name>/download")
+    def api_missions_download(fc_name: str):
+        """Download ONE drone's COMPLETE command list as a .log file.
+
+        Returns every mission script the C2 pushed to ``fc_name`` this match,
+        in order, as a copy-paste-ready marker_mission script: a ``#`` comment
+        header per run (the FC's DSL ignores ``#`` lines) followed by the raw
+        verbs. Served as an attachment so the browser saves it directly — for
+        replaying the exact game on a real drone.
+        """
+        import time as _t
+        ml = runner.mission_log
+        # Newest-last (chronological) so the file reads top-to-bottom as the
+        # match played out. recent() returns newest-first, so reverse it.
+        entries = list(reversed(ml.recent(limit=100000, fc=fc_name)))
+        header = (
+            f"# marker_mission command list — drone {fc_name}\n"
+            f"# exported {_t.strftime('%Y-%m-%d %H:%M:%S')} · "
+            f"{len(entries)} mission(s)\n"
+            f"# '#' lines are comments (ignored by the FC). Paste a block — or\n"
+            f"# the whole file — onto a real drone to replay the game.\n\n"
+        )
+        blocks = [
+            f"# {'=' * 60}\n"
+            f"# [#{e['seq']} {e['time']}] {e['reason']}\n"
+            f"# {'=' * 60}\n"
+            f"{e['script']}"
+            for e in entries
+        ]
+        body = header + ("\n\n".join(blocks) + "\n"
+                         if blocks else "# (no missions recorded for this drone yet)\n")
+        resp = app.response_class(body, mimetype="text/plain")
+        resp.headers["Content-Disposition"] = (
+            f'attachment; filename="{fc_name}_commands.log"')
+        return _no_cache(resp)
+
     @app.route("/api/settings", methods=["GET"])
     def api_settings():
         return _no_cache(jsonify(settings.to_dict()))
@@ -395,6 +431,10 @@ _INDEX_HTML = r"""<!doctype html>
   .events .ev.role .k, .events .ev.target .k { color: var(--yellow); }
   .events .ev.emergency .k, .events .ev.stop .k { color: var(--red); }
   .small { font-size: 11px; color: var(--muted); }
+  .dl-log { display:inline-block; margin-top:6px; font-size:11px;
+            color:#7fb3e6; text-decoration:none; border:1px solid #2c3038;
+            border-radius:4px; padding:3px 8px; }
+  .dl-log:hover { border-color:#3a4350; background:#15171c; }
 </style>
 </head>
 <body>
@@ -424,6 +464,12 @@ _INDEX_HTML = r"""<!doctype html>
 </header>
 
 <main>
+  <section>
+    <h2>Arena <span class="small" style="color:#888">(top-down · live drone positions)</span></h2>
+    <canvas id="arena" width="760" height="400"
+            style="width:100%;max-width:760px;background:#0d0f13;border:1px solid #222;border-radius:8px;display:block"></canvas>
+  </section>
+
   <section>
     <h2>Fleet video</h2>
     <div id="videos" class="video-strip"></div>
@@ -621,6 +667,8 @@ function renderDrones(state) {
                                      background:#111;padding:6px;border-radius:4px;
                                      margin:4px 0 0">${rs.last_pushed_script.replace(/</g,'&lt;')}</pre>
           </details>` : ""}
+          <a class="dl-log" href="/api/missions/${fc}/download" download="${fc}_commands.log"
+             title="Download this drone's COMPLETE command list for the whole game as a .log file — replay it on a real drone.">⤓ download command list</a>
         </div>
         <div class="row">
           <div>
@@ -807,11 +855,93 @@ function dronesIsEditing() {
   return ae.tagName === "SELECT" || ae.tagName === "INPUT";
 }
 
+// ── 2D top-down arena view ───────────────────────────────────────────────
+// Self-contained canvas (no external deps -> always loads offline at the
+// arena). Arena frame: long axis Y in [-10,+10] (20 m), width X in [-5,+5]
+// (10 m). Red home y in [-10,-5], blue home y in [+5,+10], neutral in between.
+// We draw with Y as the HORIZONTAL screen axis (the arena is wide & short on
+// screen) so the 20 m length uses the canvas width.
+const ARENA = { yMin:-10, yMax:10, xMin:-5, xMax:5 };
+// Fixed target-box positions (regs §1.4.2): slots 1-3 red home (y=-7.5),
+// 4-6 blue home (y=+7.5); x in {-3,0,3}.
+const BOXES = {
+  1:[-3,-7.5], 2:[0,-7.5], 3:[3,-7.5], 4:[-3,7.5], 5:[0,7.5], 6:[3,7.5],
+};
+function renderArena(state) {
+  const cv = document.getElementById("arena");
+  if (!cv) return;
+  const ctx = cv.getContext("2d");
+  const W = cv.width, H = cv.height, pad = 26;
+  // arena Y -> screen X ; arena X -> screen Y (flip so +X is up on screen)
+  const sx = y => pad + (y - ARENA.yMin) / (ARENA.yMax - ARENA.yMin) * (W - 2*pad);
+  const sy = x => pad + (ARENA.xMax - x) / (ARENA.xMax - ARENA.xMin) * (H - 2*pad);
+  ctx.clearRect(0, 0, W, H);
+
+  // zones: red home (left), neutral, blue home (right)
+  const yTop = sy(ARENA.xMax), yBot = sy(ARENA.xMin);
+  ctx.fillStyle = "rgba(192,57,43,0.13)";
+  ctx.fillRect(sx(-10), yTop, sx(-5)-sx(-10), yBot-yTop);
+  ctx.fillStyle = "rgba(36,117,194,0.13)";
+  ctx.fillRect(sx(5), yTop, sx(10)-sx(5), yBot-yTop);
+  // arena border
+  ctx.strokeStyle = "#2c3038"; ctx.lineWidth = 1;
+  ctx.strokeRect(sx(-10), yTop, sx(10)-sx(-10), yBot-yTop);
+  // home-boundary lines
+  ctx.setLineDash([4,4]); ctx.strokeStyle = "#444";
+  for (const yb of [-5, 5]) { ctx.beginPath(); ctx.moveTo(sx(yb),yTop); ctx.lineTo(sx(yb),yBot); ctx.stroke(); }
+  ctx.setLineDash([]);
+
+  const ourTeam = (state.settings && state.settings.markers && state.settings.markers.our_team) || "";
+  const slots = state.slots || {};
+  // target boxes, coloured by current holder
+  for (const [sl,[bx,by]] of Object.entries(BOXES)) {
+    const holder = (slots[sl] && slots[sl].holder) || "unknown";
+    const col = holder === "red" ? "#c0392b" : holder === "blue" ? "#2475c2" : "#666";
+    const px = sx(by), py = sy(bx), r = 9;
+    ctx.fillStyle = col; ctx.fillRect(px-r, py-r, 2*r, 2*r);
+    ctx.strokeStyle = "#000"; ctx.lineWidth = 1; ctx.strokeRect(px-r, py-r, 2*r, 2*r);
+    ctx.fillStyle = "#fff"; ctx.font = "10px system-ui"; ctx.textAlign = "center";
+    ctx.fillText("#"+sl, px, py+3);
+  }
+
+  // drones from the live C2 overview (our team only — enemy is filtered server-side)
+  const ov = (state.runner && state.runner.overview) || {};
+  const drones = (state.settings && state.settings.drones) || {};
+  const roleStates = (state.runner && state.runner.drones) || {};
+  for (const fc of Object.keys(ov)) {
+    const st = (ov[fc] && ov[fc].state) || {};
+    const pos = st.world_position_m;
+    if (!pos || pos.length < 2) continue;
+    const team = (drones[fc] && drones[fc].team) || ourTeam;
+    const col = team === "blue" ? "#3a9bf0" : "#e74c3c";
+    const px = sx(pos[1]), py = sy(pos[0]);
+    // heading arrow: heading_deg is CW from +Y (arena front). On screen +Y is
+    // rightward, +X is up. forward = (sin h, cos h) in (X,Y) arena -> screen.
+    const h = (st.heading_deg || 0) * Math.PI / 180;
+    const fY = Math.cos(h), fX = Math.sin(h);          // arena forward unit
+    const dpx = (fY) , dpy = (-fX);                    // to screen dir (Y->x, X-> -y)
+    const L = 13;
+    ctx.strokeStyle = col; ctx.lineWidth = 2;
+    ctx.beginPath(); ctx.moveTo(px, py); ctx.lineTo(px+dpx*L, py+dpy*L); ctx.stroke();
+    ctx.fillStyle = col;
+    ctx.beginPath(); ctx.arc(px, py, 5, 0, 2*Math.PI); ctx.fill();
+    ctx.fillStyle = "#fff"; ctx.font = "10px system-ui"; ctx.textAlign = "center";
+    const rp = (roleStates[fc] && roleStates[fc].role) || "";
+    ctx.fillText(fc + (rp?(" ("+rp[0]+")"):""), px, py-9);
+  }
+  // legend
+  ctx.fillStyle = "#888"; ctx.font = "10px system-ui"; ctx.textAlign = "left";
+  ctx.fillText("◀ red home", sx(-10)+3, yBot+14);
+  ctx.textAlign = "right";
+  ctx.fillText("blue home ▶", sx(10)-3, yBot+14);
+}
+
 async function refresh() {
   try {
     const state = await api("/api/state");
     last = state;
     renderHeader(state);
+    renderArena(state);
     renderVideos(state);   // signature-cached → only rebuilds when roster changes
     renderSlots(state);
     renderEvents(state);
