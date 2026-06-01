@@ -273,6 +273,46 @@ def _build_app(cfg: C2Config, pool: FCPool, library: CalibrationLibrary,
         return jsonify({"ok": ok, "payload": payload, "noop": noop,
                         "error": None if ok else _err(payload)})
 
+    @app.post("/api/c2/<fc>/endpoint")
+    def api_fc_endpoint(fc: str):
+        """Re-point an FC at a new flight-controller endpoint — switch a SIM
+        drone to a REAL drone by IP, or back. Body:
+          {"host": "192.168.42.1", "port": 8080}   (port optional)
+          {"host": "192.168.42.1:8080"}            (host may carry the port)
+          {"reset": true}                          (restore the sim endpoint)
+        Runtime-only (a C2 restart reverts to the config). The poll task picks
+        up the new endpoint on its next cycle."""
+        client = pool.client(fc)
+        if client is None:
+            return jsonify({"ok": False, "error": f"unknown FC: {fc}"}), 404
+        body = request.get_json(silent=True) or {}
+        if body.get("reset"):
+            ce = pool.config_endpoint(fc)
+            if not ce:
+                return jsonify({"ok": False,
+                                "error": "no configured default for this FC"}), 400
+            host, port = ce
+        else:
+            host = str(body.get("host") or "").strip()
+            port = body.get("port")
+            if host and ":" in host and (port is None or port == ""):
+                host, _, p = host.rpartition(":")
+                host, port = host.strip(), p
+            if not host:
+                return jsonify({"ok": False, "error": "host (IP) required"}), 400
+            try:
+                port = int(port) if port not in (None, "") else int(client.spec.port)
+            except (TypeError, ValueError):
+                return jsonify({"ok": False, "error": f"bad port: {port!r}"}), 400
+            if not (1 <= port <= 65535):
+                return jsonify({"ok": False,
+                                "error": f"port out of range: {port}"}), 400
+        ok = _await(pool.set_endpoint(fc, host, int(port)), timeout=5.0)
+        return jsonify({"ok": bool(ok), "name": fc, "host": host,
+                        "port": int(port),
+                        "base_url": f"http://{host}:{int(port)}",
+                        "is_sim": host in ("127.0.0.1", "localhost", "::1")})
+
     # ----------------------------------------------------------- start all
     # Fan out POST /api/start to every configured FC. No script body —
     # each FC uses its own active draft (set per-FC from the overview

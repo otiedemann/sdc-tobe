@@ -259,6 +259,41 @@ def build_app(
             "arena": arena_state.to_client_dict(),
         }))
 
+    @app.route("/api/strategy/fc/<fc_name>/endpoint", methods=["POST"])
+    def api_fc_endpoint(fc_name):
+        """Switch a drone between the SIM and a REAL flight controller by IP.
+
+        Proxies to the C2 (which owns the FC connections). Body:
+          {"host": "192.168.42.1", "port": 8080}  -> point at a real FC
+          {"reset": true}                          -> back to the sim endpoint
+        Team isolation (regs §1.3): only OUR-team (or unassigned) drones. The
+        drone's team is taken from our roster, else sniffed from the FC-name
+        prefix ('red*'/'blue*') — matching the runner's auto-adopt isolation —
+        so we reject the enemy's drones even though they're not in our roster."""
+        s = settings.to_dict()
+        our_team = s["markers"]["our_team"]
+        dd = (s.get("drones") or {}).get(fc_name) or {}
+        nl = fc_name.lower()
+        sniffed = "red" if nl.startswith("red") else ("blue" if nl.startswith("blue") else None)
+        t = dd.get("team") or sniffed
+        if t and t != our_team:
+            return _no_cache(jsonify({
+                "ok": False, "error": "not our drone (team isolation)"})), 403
+        body = request.get_json(silent=True) or {}
+        reset = bool(body.get("reset"))
+        host = body.get("host")
+        port = body.get("port")
+        try:
+            ok, payload = _run_coro(runner._c2.set_fc_endpoint(
+                fc_name, host=host, port=port, reset=reset))
+        except Exception as exc:
+            return _no_cache(jsonify({
+                "ok": False, "error": f"{type(exc).__name__}: {exc}"})), 502
+        where = "sim (reset)" if reset else (
+            (payload or {}).get("base_url") if isinstance(payload, dict) else host)
+        runner.events.add("fc", f"{fc_name} flight controller -> {where}")
+        return _no_cache(jsonify({"ok": bool(ok), "payload": payload}))
+
     @app.route("/api/strategy/roster/reset", methods=["POST"])
     def api_roster_reset():
         """Drop every drone from this strategy's roster (and per-drone role
@@ -656,6 +691,10 @@ function renderDrones(state) {
     // <base_url>/video.mjpg. base_url comes through the overview so it
     // works for sim FCs (127.0.0.1:9101+) and remote ones (sphinx3:8080).
     const videoUrl = ov.base_url ? `${ov.base_url}/video.mjpg` : null;
+    // FC source (sim vs real). base_url comes from the C2 overview; a loopback
+    // host = the simulator, anything else = a real flight controller by IP.
+    const fcBaseUrl = ov.base_url || "—";
+    const fcIsSim = /(^|\/\/)(127\.0\.0\.1|localhost|\[?::1\]?)[:/]/.test(fcBaseUrl);
     // Mission script progress (the script currently EXECUTING on the FC,
     // distinct from rs.last_pushed_script which is what we last pushed).
     const fcScript = ovState.mission_script || [];
@@ -774,6 +813,18 @@ function renderDrones(state) {
             <label>Home alt (m)</label>
             <input type="number" step="0.1" min="0.4" max="3.0"
                    value="${d.home_alt_m}" data-fc="${fc}" data-field="home_alt_m">
+          </div>
+        </div>
+        <div class="fc-source" style="margin-top:6px">
+          <label class="small">Flight controller
+            <span class="badge" style="background:${fcIsSim?'#3a566e':'#1b6e2c'};color:#fff">${fcIsSim?'SIM':'REAL'}</span>
+            <span class="mono small" style="color:#8a93a0"> ${fcBaseUrl}</span>
+          </label>
+          <div style="display:flex;gap:4px;margin-top:2px">
+            <input class="fc-ip" data-fc="${fc}" placeholder="real FC IP (e.g. 192.168.42.1 or 192.168.42.1:8080)"
+                   style="flex:1;min-width:0" title="Set this drone's flight-controller IP to use a REAL drone instead of the simulator.">
+            <button class="fc-ip-apply" data-fc="${fc}" title="Point this drone at a REAL flight controller by IP">Use real</button>
+            <button class="fc-ip-reset" data-fc="${fc}" title="Restore the simulator endpoint for this drone">Use sim</button>
           </div>
         </div>
         <div class="target-row" ${(role!=="attacker"&&role!=="defender")?'style="display:none"':''}>
@@ -1076,6 +1127,32 @@ document.addEventListener("click", async (ev) => {
     const fc = t.getAttribute("data-clear");
     await assignTarget(fc, null);
     refresh();
+  }
+  // Switch a drone to a REAL flight controller by IP.
+  if (t.matches(".fc-ip-apply")) {
+    const fc = t.getAttribute("data-fc");
+    const inp = document.querySelector(`.fc-ip[data-fc="${fc}"]`);
+    const host = (inp && inp.value || "").trim();
+    if (!host) { alert("Enter the real flight-controller IP first."); return; }
+    t.disabled = true;
+    try {
+      const r = await api(`/api/strategy/fc/${encodeURIComponent(fc)}/endpoint`,
+                          {method:"POST", body: JSON.stringify({host})});
+      if (r && r.ok === false) alert("Set FC IP failed: " + (r.error || (r.payload && r.payload.error) || "?"));
+      else if (inp) inp.value = "";
+    } catch (err) { alert("Set FC IP error: " + err); }
+    finally { t.disabled = false; refresh(); }
+  }
+  // Restore the simulator endpoint for a drone.
+  if (t.matches(".fc-ip-reset")) {
+    const fc = t.getAttribute("data-fc");
+    t.disabled = true;
+    try {
+      const r = await api(`/api/strategy/fc/${encodeURIComponent(fc)}/endpoint`,
+                          {method:"POST", body: JSON.stringify({reset:true})});
+      if (r && r.ok === false) alert("Reset to sim failed: " + (r.error || (r.payload && r.payload.error) || "?"));
+    } catch (err) { alert("Reset to sim error: " + err); }
+    finally { t.disabled = false; refresh(); }
   }
 });
 

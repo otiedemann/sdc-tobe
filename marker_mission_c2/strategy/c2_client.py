@@ -80,6 +80,20 @@ class C2Client:
     async def stop(self, fc_name: str) -> Tuple[bool, Any]:
         return await self._post_json(f"/api/c2/{fc_name}/stop", {})
 
+    async def set_fc_endpoint(
+        self, fc_name: str, host: Optional[str] = None,
+        port: Optional[int] = None, reset: bool = False,
+    ) -> Tuple[bool, Any]:
+        """``POST /api/c2/<fc>/endpoint`` — re-point an FC at a real drone's IP
+        (or back to the sim with ``reset=True``)."""
+        if reset:
+            body: Dict[str, Any] = {"reset": True}
+        else:
+            body = {"host": host}
+            if port is not None:
+                body["port"] = port
+        return await self._post_json(f"/api/c2/{fc_name}/endpoint", body)
+
     async def emergency_land_all(self) -> Tuple[bool, Any]:
         return await self._post_json("/api/c2/emergency-land-all", {})
 

@@ -201,6 +201,41 @@ class FCPool:
     def client(self, name: str) -> Optional[AsyncFCClient]:
         return self.clients.get(name)
 
+    # ------------------------------ runtime endpoint re-point (sim <-> real)
+    def config_endpoint(self, name: str) -> Optional[tuple[str, int]]:
+        """The (host, port) this FC was originally CONFIGURED with — used by
+        'reset to sim' to undo a runtime re-point."""
+        for spec in self.cfg.fcs:
+            if spec.name == name:
+                return (spec.host, spec.port)
+        return None
+
+    async def set_endpoint(self, name: str, host: str, port: int) -> bool:
+        """Re-point an existing FC at a new flight-controller endpoint — e.g.
+        switch a simulated drone to a REAL drone's IP, or back.
+
+        Runtime-only: a C2 restart reverts to the configured endpoint (the
+        config JSON stays the source of truth for permanent fleets). The
+        running poll task keeps its client reference and reads
+        ``client.spec.base_url`` per request, so swapping the spec re-points it
+        with no task restart. Stale connection state is dropped so the overview
+        reflects the change immediately."""
+        client = self.clients.get(name)
+        if client is None:
+            return False
+        async with self._locks[name]:
+            client.spec = FCSpec(name=name, host=str(host), port=int(port))
+            st = self.states[name]
+            st.host = str(host)
+            st.port = int(port)
+            st.connection_ok = False
+            st.last_error = "endpoint changed — reconnecting"
+            st.last_state = None
+            st.drone_serial = None
+            st.drone_connected = False
+        self._log.info("FC %s re-pointed -> %s", name, client.spec.base_url)
+        return True
+
     # ------------------------------ helpers used by calibration_sync etc.
     async def set_calibrations(self, name: str, entries: list[dict]) -> None:
         async with self._locks[name]:
