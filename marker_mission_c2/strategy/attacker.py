@@ -79,8 +79,10 @@ logger = logging.getLogger(__name__)
 # via APPROACH, so it stays accurate even if the real boxes differ from these
 # approximate coordinates.
 SLOT_POSITIONS_M: dict[int, tuple[float, float]] = {
-    1: (-3.5, -6.5), 2: (-3.5, -8.5), 3: (3.0, -7.0),
-    4: (-3.0,  7.0), 5: ( 3.5,  8.5), 6: (3.5,  6.5),
+    # Figure 1 triangle: two shallow flanks near neutral (x=±3) + one deep
+    # centre against the back wall (x=0). Red home y in [-10,-5], blue +.
+    1: (-3.0, -6.5), 2: (0.0, -9.0), 3: (3.0, -6.5),
+    4: (-3.0,  6.5), 5: (0.0,  9.0), 6: (3.0,  6.5),
 }
 
 # Stop the FB_IMU close-in this far short of the target so APPROACH has
