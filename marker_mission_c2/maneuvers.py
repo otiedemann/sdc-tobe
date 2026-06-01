@@ -38,8 +38,8 @@ from typing import Optional
 # canonical layout used by strategy/attacker.py + regs §1.1 home-zone
 # bounds (in_home_zone in strategy/roles.py).
 SLOT_POSITIONS_M: dict[int, tuple[float, float]] = {
-    1: (-3.0, -7.5), 2: (0.0, -7.5), 3: (3.0, -7.5),   # RED zone
-    4: (-3.0,  7.5), 5: (0.0,  7.5), 6: (3.0,  7.5),   # BLUE zone
+    1: (-3.5, -6.5), 2: (-3.5, -8.5), 3: (3.0, -7.0),   # RED zone (Figure-1 stagger)
+    4: (-3.0,  7.0), 5: ( 3.5,  8.5), 6: (3.5,  6.5),   # BLUE zone
 }
 
 # Our home-wall marker — the marker the drone APPROACHes on the way back —

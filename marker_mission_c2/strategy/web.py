@@ -864,8 +864,8 @@ function dronesIsEditing() {
 const ARENA = { yMin:-10, yMax:10, xMin:-5, xMax:5 };
 // Fixed target-box positions (regs §1.4.2): slots 1-3 red home (y=-7.5),
 // 4-6 blue home (y=+7.5); x in {-3,0,3}.
-const BOXES = {
-  1:[-3,-7.5], 2:[0,-7.5], 3:[3,-7.5], 4:[-3,7.5], 5:[0,7.5], 6:[3,7.5],
+const BOXES = {  // Figure-1 staggered layout (mirrors default_target_layout.json)
+  1:[-3.5,-6.5], 2:[-3.5,-8.5], 3:[3,-7], 4:[-3,7], 5:[3.5,8.5], 6:[3.5,6.5],
 };
 function renderArena(state) {
   const cv = document.getElementById("arena");
