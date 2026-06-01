@@ -238,24 +238,28 @@ FB_BRAKE_TIMEOUT_S: float = 10.0
 HOME_REARM_HOVER_S: float = 2.0
 
 # ── Vision-based APPROACH standoffs (no absolute positions) ────────────────
-# How close APPROACH closes to the target box's face marker before we descend
-# + hover to trigger the capture. The capture registers only when the drone is
-# within the box's detection radius (sim: 0.8 m xy from the box centre; real
-# RFID is similarly tight), so the standoff must land us COMFORTABLY inside it,
-# not on the edge. 0.4 m from the marker -> ~0.4-0.5 m from the box centre, well
-# within 0.8 m so the dwell reliably accumulates (0.6 m left us at ~0.8 m, right
-# on the edge, so captures only landed intermittently). The box is ~0.5 m wide;
-# APPROACH stops at the standoff and never overshoots, so there's no collision.
-ATTACK_STANDOFF_M: float = 0.4
-# Capture altitude over the box (operator-specified). Middle of the RFID band.
+# Capture move (operator-specified technique): APPROACH the box's face marker
+# to ATTACK_STANDOFF_M (~1 m), RISE to the capture altitude (clearing the 0.73 m
+# box top), then FB_IMU forward ~(standoff - 0.10 m) to sit exactly OVER the box
+# centre, then hover. APPROACH homes purely on vision (no absolute position);
+# FB_IMU is a closed-loop relative move (also no absolute position). The drone
+# is never lower than the box top until it's positioned over the box.
+ATTACK_STANDOFF_M: float = 1.0
+# How far to fly forward after rising, to end up over the box: the marker was
+# ATTACK_STANDOFF_M ahead, minus 10 cm so we stop just shy of the far edge and
+# sit over the box centre (operator: "the distance the marker was away - 10 cm").
+OVER_BOX_FORWARD_M: float = ATTACK_STANDOFF_M - 0.10
+# Capture altitude over the box: 1-1.5 m for the RFID to register (operator).
 CAPTURE_ALT_M: float = 1.2
-# RTH: APPROACH the home-wall marker and stop this far short of it. The wall is
-# at |y|=10 and the home zone is |y| in [5,10], so a 4.5 m standoff parks the
-# drone at |y|≈5.5 — SAFELY inside home (the §1.4.4 "detected back home" gate
-# needs |y|>=5; a 5.0 m standoff lands right on the |y|=5 edge and the arrival
-# tolerance can leave the drone just OUTSIDE, so it never re-arms). Still
-# shallow (~4.5 m from the wall) per the operator's "slightly in home" ask.
-RTH_WALL_STANDOFF_M: float = 4.5
+# Minimum safe altitude anywhere inside a home zone: the target boxes are 0.73 m
+# tall (open), so we must always be above that to avoid clipping a box. We
+# transit/capture well above this; this is the floor for any in-zone HEIGHT.
+BOX_CLEARANCE_ALT_M: float = 1.0
+# RTH: APPROACH the home back-wall marker and stop this far short of it (the
+# operator asked for ~3-4 m). 3.5 m -> the wall is at |y|=10, home zone is
+# |y| in [5,10], so braking 3.5 m short parks the drone at |y|≈6.5 — comfortably
+# inside home (clears the §1.4.4 home-presence gate) and well off the wall.
+RTH_WALL_STANDOFF_M: float = 3.5
 
 
 def _format_script(*lines: str) -> str:
@@ -403,18 +407,22 @@ def _full_attack_script(
         # the target boxes — APPROACH then acquires the marker straight ahead
         # instead of having to spin a full search.
         f"YAW {enemy_heading_deg(ctx.our_team):g}",
-        # Climb to the transit altitude (clears our own home boxes + keeps the
+        # Climb to the transit altitude (clears the 0.73 m boxes + keeps the
         # camera level so it can see the target marker across the arena).
         height_step,
-        # VISION-HOME on the enemy box's face marker and close to the capture
-        # standoff. The FC searches (rotates) for the marker if it's not yet in
-        # view, then drives straight in — stopping ATTACK_STANDOFF_M short.
+        # CAPTURE TECHNIQUE (operator-specified):
+        # 1) VISION-HOME on the box's face marker and stop ~1 m short of it.
+        #    The FC searches (rotates) for the marker if not yet in view.
         f"APPROACH {int(attack_marker_id)} {ATTACK_STANDOFF_M:.2f}",
-        # Descend into the 1-2 m RFID detection band over the box (operator
-        # capture altitude 1.2 m) so the flip registers.
+        # 2) RISE to the capture altitude (1-1.5 m) — above the 0.73 m box top —
+        #    BEFORE moving over the box, so we never clip it.
         f"HEIGHT {CAPTURE_ALT_M:.2f}",
-        # Hover >= 2 s in the band for the box to flip to our colour
-        # (v7 §1.4.3). 2.5 s = 2 s rule + margin.
+        # 3) Fly FORWARD the distance the marker was away minus 10 cm, to sit
+        #    exactly over the box centre. FB_IMU is a closed-loop relative move
+        #    (sensor-fused, no absolute position).
+        f"FB_IMU {OVER_BOX_FORWARD_M:.2f}",
+        # 4) Hover over the box for >= 2 s so the RFID flips it to our colour
+        #    (v7 §1.4.3).
         f"HOOVER {CAPTURE_HOLD_HOVER_S:.1f}",
         *rth_lines,
     )
@@ -533,21 +541,25 @@ def _recapture_script(ctx: RoleContext, slot: int) -> str:
     # The box shows the ENEMY face now (they hold it) -> APPROACH that marker.
     enemy_face = _enemy_face_for(int(slot), ctx.our_team)
     wall_entry = HOME_WALL_MARKER.get(ctx.our_team)
-    settle = ([f"APPROACH {wall_entry[0]} {RTH_WALL_STANDOFF_M:.2f}"]
+    settle = ([f"YAW {enemy_heading_deg(ctx.our_team) + 180:g}",
+               f"APPROACH {wall_entry[0]} {RTH_WALL_STANDOFF_M:.2f}",
+               f"YAW {enemy_heading_deg(ctx.our_team):g}"]
               if wall_entry else [])
     return _format_script(
         "TAKEOFF",
         f"HEIGHT {cruise_alt:.2f}",
-        # VISION-HOME on the (enemy-coloured) face of our flipped box.
+        # Same vision capture technique as the attack:
+        # 1) VISION-HOME on the (enemy-coloured) face of our flipped box, ~1 m.
         f"APPROACH {enemy_face} {ATTACK_STANDOFF_M:.2f}",
-        # Drop into the capture band and dwell to flip the box back to us.
+        # 2) RISE to capture altitude (above the 0.73 m box) before moving over.
         f"HEIGHT {CAPTURE_ALT_M:.2f}",
+        # 3) Fly forward over the box centre (marker distance - 10 cm).
+        f"FB_IMU {OVER_BOX_FORWARD_M:.2f}",
+        # 4) Hover to flip the box back to our colour.
         f"HOOVER {CAPTURE_HOLD_HOVER_S:.1f}",
-        # Climb, re-acquire the home wall to settle shallow inside home.
+        # Climb, re-acquire the home wall, settle shallow inside home.
         f"HEIGHT {cruise_alt:.2f}",
-        f"YAW {enemy_heading_deg(ctx.our_team) + 180:g}",
         *settle,
-        f"YAW {enemy_heading_deg(ctx.our_team):g}",
         f"HOOVER {HOME_REARM_HOVER_S:.1f}",
     )
 

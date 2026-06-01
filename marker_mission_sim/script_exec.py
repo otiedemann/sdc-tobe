@@ -349,6 +349,29 @@ def _exec_step(drone: SimDrone, world: World, step: Step, dt: float,
         )
         return spd, elapsed >= dur
 
+    # -- closed-loop relative moves (Anafi moveBy: forward/right/up by N m) --
+    # FB_IMU/LR_IMU/UD_IMU <meters> — move a FIXED body-frame distance, sensor-
+    # fused on real hardware, blocking until the move completes. Relative (no
+    # absolute position needed). We track the distance moved in mem and stop
+    # once it reaches the request. Sign: +fwd/-back, +right/-left, +up/-down.
+    if verb in ("FB_IMU", "LR_IMU", "UD_IMU"):
+        meters = _arg(step, 0, 0.0)
+        moved = mem.get("imu_moved", 0.0)
+        remaining = abs(meters) - moved
+        if remaining <= ARRIVE_XY:
+            return 0.0, True
+        sign = 1.0 if meters >= 0 else -1.0
+        speed = (CLIMB_SPEED if verb == "UD_IMU"
+                 else LATERAL_SPEED if verb == "LR_IMU" else CRUISE_SPEED)
+        leg = min(speed * dt, remaining)        # don't overshoot the request
+        fb = sign * leg / dt if verb == "FB_IMU" and dt > 0 else 0.0
+        lr = sign * leg / dt if verb == "LR_IMU" and dt > 0 else 0.0
+        ud = sign * leg / dt if verb == "UD_IMU" and dt > 0 else 0.0
+        spd = _apply_body_velocity(drone, world, dt, fb=fb, lr=lr, ud=ud,
+                                   yaw_rate=0.0)
+        mem["imu_moved"] = moved + leg
+        return spd, (moved + leg) >= abs(meters) - ARRIVE_XY
+
     # -- closed-loop yaw ---------------------------------------------------
     if verb == "YAW":
         # ABSOLUTE heading hold (arena frame, deg CW from +Y). Matches the real
