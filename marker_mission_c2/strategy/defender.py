@@ -8,32 +8,36 @@ colour it launches a re-capture run on that slot.
 Design choices:
 
 * **No new FC maneuvers.** Re-capturing our own slot is mechanically
-  identical to attacking an enemy slot — fly to the box, brake on the
-  *currently-showing* face (which is the enemy's face, since the enemy
-  holds it), drift over it, hover to flip it back to our colour, then
-  return. So the defender reuses the attacker's primitive-composed script
-  builder (``TAKEOFF / UD_RC / FB_RC / FB_BRAKE / RC / YAW_IMU``) verbatim —
-  just pointed at one of *our* slots.
+  identical to attacking an enemy slot — APPROACH the box's *currently-showing*
+  face (which is the enemy's face, since the enemy holds it), rise above the
+  box top, move over it, hover to flip it back to our colour, then return on
+  the back-wall marker. So the defender reuses the attacker's vision-based
+  capture script builder (``TAKEOFF / HEIGHT / YAW / APPROACH / FB_IMU /
+  HOOVER``) verbatim — just pointed at one of *our* slots.
 
-* **Waits in the neutral zone (never camps).** With no threat it holds at a
-  fixed point just inside the neutral zone on our side (x=0, |y|=4.5), at its
-  deconflicted cruise altitude. The neutral zone is empty airspace — NOT above
-  any box — so this never trips the regs §1.3 "dead duck over a target" rule,
-  and it puts the defender as close as legally possible to our home slots for
-  minimum recapture latency. (The earlier design flew an anti-camp patrol over
-  our own boxes; waiting in neutral is both cleaner — no dead-duck risk — and
-  faster to respond.)
+* **Hovers on-station in the neutral zone (never camps, never patrols).** With
+  no threat it holds at a single fixed point just inside the neutral zone on
+  our side (x=0, |y|=4.5), FACING THE BACK WALL and positioned by a vision
+  ``APPROACH`` on our back-wall marker — no absolute ``TO`` (so no GPS-style
+  position) and no left-right sweep. The neutral zone is empty airspace — NOT
+  above any box — so this never trips the regs §1.3 "dead duck over a target"
+  rule, and |y|=4.5 keeps the defender just OUTSIDE our home zone (the 5-pt
+  "all drones out" condition holds) yet as close as legally possible to our
+  home slots for minimum recapture latency.
 
-* **Target selection.** The operator (MANUAL) or the AUTO planner sets
-  ``role_state.target_slot`` to the threatened own-slot. The defender
-  only acts while that slot is held by the enemy; once it flips back to
-  us (or the script finishes), it resets to idle and returns to its
-  neutral-zone waiting point.
+* **Recaptures the instant a box flips.** Every tick the defender checks the
+  marker tracker itself (it does NOT wait for the planner); the moment one of
+  our boxes shows the enemy colour it breaks the hold and dashes in to
+  recapture that exact slot — see :meth:`DefenderRole.decide` step (1). Target
+  selection: the operator (MANUAL) or the AUTO planner may also set
+  ``role_state.target_slot``, but the per-tick self-detection is what makes the
+  response immediate. Once the slot flips back to us (or the script finishes)
+  it resets to idle and returns to its neutral-zone station.
 
 Phases:
-    idle/waiting → no threat; holding at the neutral-zone waiting point
-    running      → re-capture script pushed; drone executing the sequence
-    done         → script ended; reset to idle (-> returns to neutral wait)
+    idle/holding → no threat; hovering on-station (neutral, facing back wall)
+    recapturing  → re-capture script pushed; drone executing the sequence
+    done         → script ended; reset to idle (-> returns to neutral station)
 """
 from __future__ import annotations
 
@@ -41,12 +45,13 @@ import logging
 
 from .roles import (
     Decision, Role, RoleContext, noop, push, stop_cmd, register, home_park_xy,
+    enemy_heading_deg,
 )
 # Reuse the attacker's primitive-composed capture script + helpers so the
 # defender adds NO new flight maneuvers of its own.
 from .attacker import (
     _recapture_script, _slot_is_ours, HOME_REARM_HOVER_S, _format_script,
-    SLOT_POSITIONS_M,
+    SLOT_POSITIONS_M, HOME_WALL_MARKER,
 )
 
 logger = logging.getLogger(__name__)
@@ -61,6 +66,19 @@ NEUTRAL_WAIT_Y_M: float = 4.5
 # How close (m, horizontal) the defender must be to its waiting point to count
 # as "already waiting" (so we don't re-push the hold script every tick).
 _WAIT_ARRIVE_M: float = 1.5
+# Outward nudge (m, body-relative) the defender uses to leave the home zone
+# before it settles on the back-wall marker. APPROACH can only pull the drone
+# IN toward the wall, never push it out, so after a recapture (which ends deep
+# in home, ~|y|=6.5) we first fly this far toward neutral — facing the enemy —
+# then APPROACH the back-wall marker from the neutral side. 4 m clears the
+# home boundary (|y|=5) from the post-recapture standoff with margin.
+DEFENDER_EXIT_LEG_M: float = 4.0
+# Dwell (s) the defender holds on-station per pushed hold script (re-pushed when
+# it lapses or the drone drifts off-station). A threat breaks the hold instantly
+# via the recapture path (stop_cmd at the top of decide), so a long dwell never
+# delays a recapture — it only keeps the mission/command log clean by avoiding
+# redundant re-pushes while the defender sits idle in neutral.
+DEFENDER_HOLD_HOVER_S: float = 30.0
 
 
 def _slot_home_team(slot: int) -> str:
@@ -112,35 +130,63 @@ def _wait_xy(ctx: RoleContext) -> tuple[float, float]:
     return (0.0, y)
 
 
-def _at_wait(ctx: RoleContext) -> bool:
-    """True if the defender is already airborne at the current waiting point."""
+def _on_station_sortie(ctx: RoleContext) -> bool:
+    """True if the defender is already holding its sortie station.
+
+    The vision ``APPROACH`` on the back-wall marker pins the drone to a fixed
+    *standoff arc* around the marker, NOT to an exact (0, |y|) point — its x is
+    left wherever the last recapture ended. So "on station" is judged by depth/
+    arc, not an exact xy: airborne, in the neutral zone (just OUTSIDE our home,
+    so the 5-pt "all out" condition holds), and ~``standoff`` from the marker.
+    Judging by the arc (not a point) is what lets the hover settle and stop
+    re-pushing every tick when it parks slightly off-centre.
+    """
     pos = ctx.state.world_position_m
-    if not pos or len(pos) < 3:
+    if not pos or len(pos) < 3 or float(pos[2]) <= 0.5:
         return False
-    wx, wy = _wait_xy(ctx)
-    dx, dy = float(pos[0]) - wx, float(pos[1]) - wy
-    return (dx * dx + dy * dy) ** 0.5 <= _WAIT_ARRIVE_M and float(pos[2]) > 0.5
+    cur_y = float(pos[1])
+    in_neutral = cur_y > -5.0 if ctx.our_team == "red" else cur_y < 5.0
+    if not in_neutral:
+        return False
+    _mid, (mx, my) = HOME_WALL_MARKER[ctx.our_team]
+    standoff = abs(my) - NEUTRAL_WAIT_Y_M
+    d = ((float(pos[0]) - mx) ** 2 + (cur_y - my) ** 2) ** 0.5
+    return abs(d - standoff) <= _WAIT_ARRIVE_M
 
 
-# Left-right patrol bounds (x) for the sortie neutral-zone sweep. The arena is
-# 10 m wide (x in [-5, +5]); ±3.5 keeps the defender clear of the side walls
-# while covering the full width in front of our three home boxes (x in {-3,0,3}).
-_PATROL_X_MAX: float = 3.5
-# How many full left-right cycles per pushed patrol script. Each leg is ~7 m at
-# ~2 m/s ~= 3.5 s, so a cycle ~7 s; 40 cycles ~= a full 10-min match per push,
-# but the script re-pushes whenever the FC reaches phase=done anyway.
-_PATROL_CYCLES: int = 40
+def _is_inward_of_wait(ctx: RoleContext) -> bool:
+    """True if the drone is DEEPER into our home than the neutral station.
+
+    Happens right after a recapture (the recapture run ends settled near our
+    home wall). APPROACH on the back-wall marker can only pull us further IN,
+    so in that case the hold script must first nudge OUT toward neutral with a
+    relative forward move before APPROACHing the marker from the neutral side.
+    Uses the C2's own position estimate purely to PICK the script — the actual
+    motion is still vision/relative, never an absolute TO.
+    """
+    pos = ctx.state.world_position_m
+    if not pos or len(pos) < 2:
+        return False
+    cur_y = float(pos[1])
+    wy = -NEUTRAL_WAIT_Y_M if ctx.our_team == "red" else NEUTRAL_WAIT_Y_M
+    margin = 0.5
+    return cur_y < wy - margin if ctx.our_team == "red" else cur_y > wy + margin
 
 
-def _wait_script(ctx: RoleContext) -> str:
+def _wait_script(ctx: RoleContext, *, need_exit: bool = False) -> str:
     """Defender holding pattern (no land, stays airborne all match).
 
-    On BANK: fly home and hover (return with the team to secure the 5-pt
-    attempt). On SORTIE: PATROL the neutral zone LEFT-RIGHT in front of our
-    home boxes — sweeping x from -3.5 to +3.5 and back, continuously — so the
-    defender is always moving and equally close to any of our three boxes the
-    instant one is flipped (operator spec: "fly left to right"). Existing FC
-    verbs only (TAKEOFF / HEIGHT / TO). TAKEOFF is a no-op when airborne.
+    BANK: fly home and hover (return with the team to secure the 5-pt attempt).
+
+    SORTIE: HOVER at a single fixed station just inside the neutral zone
+    (x=0, |y|=``NEUTRAL_WAIT_Y_M``), FACING THE BACK WALL, positioned by a
+    vision ``APPROACH`` on our back-wall marker — NO left-right patrol and NO
+    absolute ``TO``, so the hold is drift-free and needs no GPS-style position.
+    The instant one of our boxes is flipped the decide() recapture path breaks
+    this hold and dashes in. ``need_exit`` prepends an outward nudge for when
+    we're currently deeper in home than the station (APPROACH alone can't push
+    us back out toward neutral). FC verbs only (TAKEOFF / HEIGHT / YAW /
+    FB_IMU / APPROACH / HOOVER); TAKEOFF is a no-op when already airborne.
     """
     cruise_alt = max(1.5, float(ctx.cruise_alt_m or ctx.drone.attack_alt_m or 1.6))
 
@@ -155,13 +201,25 @@ def _wait_script(ctx: RoleContext) -> str:
             f"HOOVER {HOME_REARM_HOVER_S:.1f}",
         )
 
-    # SORTIE: continuous left-right patrol along the neutral-zone front line.
-    y = -NEUTRAL_WAIT_Y_M if ctx.our_team == "red" else NEUTRAL_WAIT_Y_M
+    # SORTIE: hover on-station, facing the back wall, set by a vision APPROACH
+    # on the back-wall marker. standoff = (wall depth) - (station depth) so the
+    # APPROACH stops us exactly at |y|=NEUTRAL_WAIT_Y_M (0.5 m into neutral).
+    home_marker_id, (_mx, my) = HOME_WALL_MARKER[ctx.our_team]
+    standoff = abs(my) - NEUTRAL_WAIT_Y_M               # 10 - 4.5 = 5.5 m
     lines = ["TAKEOFF", f"HEIGHT {cruise_alt:.2f}"]
-    for _ in range(max(1, _PATROL_CYCLES)):
-        lines.append(f"TO {_PATROL_X_MAX:g} {y:g}")     # sweep right
-        lines.append(f"TO {-_PATROL_X_MAX:g} {y:g}")    # sweep left
-    return "\n".join(lines) + "\n"
+    if need_exit:
+        # We're inward of the station (e.g. just recaptured). Come OUT toward
+        # neutral first: face the enemy, then a relative forward move.
+        lines += [
+            f"YAW {enemy_heading_deg(ctx.our_team):g}",
+            f"FB_IMU {DEFENDER_EXIT_LEG_M:.2f}",
+        ]
+    lines += [
+        f"YAW {enemy_heading_deg(ctx.our_team) + 180.0:g}",  # face the back wall
+        f"APPROACH {home_marker_id} {standoff:.2f}",         # settle on-station
+        f"HOOVER {DEFENDER_HOLD_HOVER_S:.1f}",               # hold, facing wall
+    ]
+    return _format_script(*lines)
 
 
 class DefenderRole(Role):
@@ -229,15 +287,19 @@ class DefenderRole(Role):
                 reason="defender: bank — return home to secure the attempt",
             )
 
-        # ---- (3) SORTIE, no threat — PATROL the neutral zone left-right -----
-        # Keep sweeping while the patrol script runs; (re)push only when idle.
-        if rs.phase == "patrolling" and ctx.state.phase not in (
-                "init", "done", ""):
-            return noop("defender: patrolling neutral zone")
+        # ---- (3) SORTIE, no threat — HOLD a fixed neutral-zone station ------
+        # Hover just inside the neutral zone, FACING THE BACK WALL, positioned
+        # by a vision APPROACH on the back-wall marker (no patrol, no TO). Hold
+        # while the script runs and we're on-station; re-push only once it
+        # lapses or we've drifted off (a threat is handled above, immediately).
+        if (rs.phase == "holding"
+                and ctx.state.phase not in ("init", "done", "")
+                and _on_station_sortie(ctx)):
+            return noop("defender: holding station in neutral, facing back wall")
         return push(
-            _wait_script(ctx),
-            new_phase="patrolling",
-            reason="defender: left-right patrol of the neutral zone",
+            _wait_script(ctx, need_exit=_is_inward_of_wait(ctx)),
+            new_phase="holding",
+            reason="defender: hold neutral station (APPROACH back-wall marker)",
         )
 
 
