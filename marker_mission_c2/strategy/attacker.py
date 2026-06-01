@@ -251,8 +251,11 @@ ATTACK_STANDOFF_M: float = 1.0
 # ATTACK_STANDOFF_M ahead, minus 10 cm so we stop just shy of the far edge and
 # sit over the box centre (operator: "the distance the marker was away - 10 cm").
 OVER_BOX_FORWARD_M: float = ATTACK_STANDOFF_M - 0.10
-# Capture altitude over the box: 1-1.5 m for the RFID to register (operator).
-CAPTURE_ALT_M: float = 1.2
+# Capture altitude over the box: the RFID detects in the 1-2 m band; the
+# operator wants 1-2 m, "better 1.5 m max". 1.5 m sits mid-band — a full 0.77 m
+# above the 0.73 m open box top and 0.5 m below the 2 m ceiling — so the box
+# reliably registers the drone with margin on both sides.
+CAPTURE_ALT_M: float = 1.5
 # Minimum safe altitude anywhere inside a home zone: the target boxes are 0.73 m
 # tall (open), so we must always be above that to avoid clipping a box. We
 # transit/capture well above this; this is the floor for any in-zone HEIGHT.
