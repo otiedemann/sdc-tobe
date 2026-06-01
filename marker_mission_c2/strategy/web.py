@@ -17,11 +17,14 @@ POST /api/strategy/emergency-land     — emergency-land everyone
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
+import urllib.request
 from typing import Any, Dict, Optional
 
 from flask import Flask, jsonify, request
 
+from . import arena_state
 from .markers import MarkerTracker
 from .roles import all_roles
 from .runner import SwarmRunner
@@ -43,8 +46,10 @@ def build_app(
     runner: SwarmRunner,
     markers: MarkerTracker,
     loop: asyncio.AbstractEventLoop,
+    sim_url: Optional[str] = None,
 ) -> Flask:
     app = Flask(__name__)
+    _sim_url = sim_url.rstrip("/") if sim_url else None
 
     def _run_coro(coro):
         return asyncio.run_coroutine_threadsafe(coro, loop).result()
@@ -82,6 +87,7 @@ def build_app(
         return _no_cache(jsonify({
             "settings": s,
             "runner": runner_snap,
+            "arena": arena_state.to_client_dict(),
             "slots": markers.to_dict(our_team=our_team),
             "events": runner.events.to_list()[-50:],
             "roles": sorted(all_roles().keys()),
@@ -201,6 +207,57 @@ def build_app(
     def api_disarm():
         runner.disarm("web")
         return _no_cache(jsonify({"ok": True, "armed": runner.is_armed()}))
+
+    @app.route("/api/arena", methods=["GET"])
+    def api_arena_get():
+        """Active arena geometry the dashboard renders from."""
+        return _no_cache(jsonify({"ok": True, "arena": arena_state.to_client_dict()}))
+
+    @app.route("/api/arena/switch", methods=["POST"])
+    def api_arena_switch():
+        """Live arena switch. Body ``{"name": "real"|"gvz"}``.
+
+        The SIM owns the active arena (the shared physical world), so we proxy
+        the switch to the sim UI — its wall markers + boxes change without a
+        restart. This strategy then follows (the runner polls the sim each few
+        ticks); we also set it locally now for instant dashboard feedback, and
+        the OTHER team's strategy follows the sim independently. On real HW
+        (no sim URL) the switch still re-points this strategy and is pushed to
+        the FCs by the C2 (see Phase 5)."""
+        body = request.get_json(silent=True) or {}
+        name = str(body.get("name", "")).strip()
+        if not name:
+            return _no_cache(jsonify({"ok": False, "error": "missing 'name'"})), 400
+        if name not in (arena_state.arena_names() or [name]):
+            return _no_cache(jsonify({"ok": False,
+                                      "error": f"unknown arena {name!r}",
+                                      "available": arena_state.arena_names()})), 400
+        sim_result = None
+        if _sim_url:
+            try:
+                req = urllib.request.Request(
+                    f"{_sim_url}/api/arena",
+                    data=json.dumps({"name": name}).encode("utf-8"),
+                    headers={"Content-Type": "application/json"},
+                    method="POST")
+                with urllib.request.urlopen(req, timeout=4.0) as resp:
+                    sim_result = json.loads(
+                        resp.read().decode("utf-8", "replace") or "{}")
+            except Exception as exc:
+                return _no_cache(jsonify({
+                    "ok": False,
+                    "error": f"sim switch failed: {type(exc).__name__}: {exc}",
+                })), 502
+        try:
+            st = arena_state.set_active(name)
+        except Exception as exc:
+            return _no_cache(jsonify({
+                "ok": False, "error": f"{type(exc).__name__}: {exc}"})), 500
+        runner.events.add("arena", f"operator switched arena -> {name}")
+        return _no_cache(jsonify({
+            "ok": True, "name": st.name, "sim": sim_result,
+            "arena": arena_state.to_client_dict(),
+        }))
 
     @app.route("/api/strategy/roster/reset", methods=["POST"])
     def api_roster_reset():
@@ -450,11 +507,14 @@ _INDEX_HTML = r"""<!doctype html>
     Special: <span id="special-text">–</span>
   </span>
   <span class="pill">tick <span id="tick">–</span></span>
+  <span class="pill" id="arena-pill" title="Active arena — shared by both teams. Switching changes the whole stack (sim + both strategies) live, no restart.">arena: <b id="arena-name">–</b></span>
   <span class="small">our team:</span>
   <select id="our-team">
     <option value="red">red</option>
     <option value="blue">blue</option>
   </select>
+  <span class="small">arena:</span>
+  <select id="arena-sel" title="Switch the WHOLE stack (sim + both strategies) between the real-match and GVZ testing arena — live, no restart"></select>
   <span class="spacer"></span>
   <button id="mode-btn" class="warn" title="Toggle MANUAL / AUTO">Go AUTO</button>
   <button id="arm-btn" class="primary">Arm</button>
@@ -627,9 +687,12 @@ function renderDrones(state) {
     let inHome = "?", inHomeCls = "";
     if (Array.isArray(wpos) && wpos.length >= 2 && team && wpos[0] != null && wpos[1] != null) {
       const x = Number(wpos[0]), y = Number(wpos[1]);
-      const inX = Math.abs(x) <= 5.0;
-      if (team === "red")  inHome = (inX && y >= -10 && y <= -5) ? "yes" : "no";
-      if (team === "blue") inHome = (inX && y >= 5 && y <= 10) ? "yes" : "no";
+      const A = state.arena || _ARENA_FALLBACK;
+      const rh = A.red_home_y || _ARENA_FALLBACK.red_home_y;
+      const bh = A.blue_home_y || _ARENA_FALLBACK.blue_home_y;
+      const inX = Math.abs(x) <= (A.x_max != null ? A.x_max : 5.0);
+      if (team === "red")  inHome = (inX && y >= rh[0] && y <= rh[1]) ? "yes" : "no";
+      if (team === "blue") inHome = (inX && y >= bh[0] && y <= bh[1]) ? "yes" : "no";
       inHomeCls = inHome === "yes" ? "good" : (inHome === "no" ? "warn" : "");
     }
     const visible = ovState.visible_marker_ids;
@@ -795,6 +858,26 @@ function renderHeader(state) {
   const modeBtn = document.getElementById("mode-btn");
   modeBtn.textContent = auto ? "Go MANUAL" : "Go AUTO";
   document.getElementById("tick").textContent = state.runner ? state.runner.tick_count : "–";
+  // Active arena (shared) + keep the switch dropdown in sync (follows the sim,
+  // so a switch by the other team is reflected here too).
+  const arena = state.arena || {};
+  const an = document.getElementById("arena-name");
+  if (an) an.textContent = arena.name || "–";
+  const asel = document.getElementById("arena-sel");
+  if (asel && !asel.dataset.busy) {
+    const avail = arena.available || (arena.name ? [arena.name] : []);
+    const want = avail.join(",");
+    if (asel.dataset.opts !== want) {       // rebuild options only when the set changes
+      asel.innerHTML = "";
+      for (const nm of avail) {
+        const o = document.createElement("option");
+        o.value = nm; o.textContent = nm;
+        asel.appendChild(o);
+      }
+      asel.dataset.opts = want;
+    }
+    if (arena.name && asel.value !== arena.name) asel.value = arena.name;
+  }
   const sc = state.score || {};
   document.getElementById("score-red").textContent  = sc.red  ?? 0;
   document.getElementById("score-blue").textContent = sc.blue ?? 0;
@@ -861,16 +944,22 @@ function dronesIsEditing() {
 // (10 m). Red home y in [-10,-5], blue home y in [+5,+10], neutral in between.
 // We draw with Y as the HORIZONTAL screen axis (the arena is wide & short on
 // screen) so the 20 m length uses the canvas width.
-const ARENA = { yMin:-10, yMax:10, xMin:-5, xMax:5 };
-// Fixed target-box positions (regs §1.4.2): slots 1-3 red home (y=-7.5),
-// 4-6 blue home (y=+7.5); x in {-3,0,3}.
-const BOXES = {  // Figure-1 triangle (mirrors default_target_layout.json):
-  // two shallow flanks near neutral (x=±3) + one deep centre (x=0) per zone.
-  1:[-3,-6.5], 2:[0,-9], 3:[3,-6.5], 4:[-3,6.5], 5:[0,9], 6:[3,6.5],
+// Fallback geometry (used only if the server didn't send state.arena, e.g. an
+// older server). Normally the canvas is DATA-DRIVEN from state.arena so it
+// redraws the right markers/boxes/home-bands when the arena is switched live.
+const _ARENA_FALLBACK = {
+  y_min:-10, y_max:10, x_min:-5, x_max:5,
+  red_home_y:[-10,-5], blue_home_y:[5,10],
+  boxes: {1:[-3,-6.5], 2:[0,-9], 3:[3,-6.5], 4:[-3,6.5], 5:[0,9], 6:[3,6.5]},
 };
 function renderArena(state) {
   const cv = document.getElementById("arena");
   if (!cv) return;
+  const A = state.arena || _ARENA_FALLBACK;
+  const ARENA = { yMin:A.y_min, yMax:A.y_max, xMin:A.x_min, xMax:A.x_max };
+  const BOXES = A.boxes || _ARENA_FALLBACK.boxes;
+  const redHome = A.red_home_y || _ARENA_FALLBACK.red_home_y;
+  const blueHome = A.blue_home_y || _ARENA_FALLBACK.blue_home_y;
   const ctx = cv.getContext("2d");
   const W = cv.width, H = cv.height, pad = 26;
   // arena Y -> screen X ; arena X -> screen Y (flip so +X is up on screen)
@@ -878,18 +967,18 @@ function renderArena(state) {
   const sy = x => pad + (ARENA.xMax - x) / (ARENA.xMax - ARENA.xMin) * (H - 2*pad);
   ctx.clearRect(0, 0, W, H);
 
-  // zones: red home (left), neutral, blue home (right)
+  // zones: red home (left), neutral, blue home (right) — from active arena
   const yTop = sy(ARENA.xMax), yBot = sy(ARENA.xMin);
   ctx.fillStyle = "rgba(192,57,43,0.13)";
-  ctx.fillRect(sx(-10), yTop, sx(-5)-sx(-10), yBot-yTop);
+  ctx.fillRect(sx(redHome[0]), yTop, sx(redHome[1])-sx(redHome[0]), yBot-yTop);
   ctx.fillStyle = "rgba(36,117,194,0.13)";
-  ctx.fillRect(sx(5), yTop, sx(10)-sx(5), yBot-yTop);
+  ctx.fillRect(sx(blueHome[0]), yTop, sx(blueHome[1])-sx(blueHome[0]), yBot-yTop);
   // arena border
   ctx.strokeStyle = "#2c3038"; ctx.lineWidth = 1;
-  ctx.strokeRect(sx(-10), yTop, sx(10)-sx(-10), yBot-yTop);
+  ctx.strokeRect(sx(ARENA.yMin), yTop, sx(ARENA.yMax)-sx(ARENA.yMin), yBot-yTop);
   // home-boundary lines
   ctx.setLineDash([4,4]); ctx.strokeStyle = "#444";
-  for (const yb of [-5, 5]) { ctx.beginPath(); ctx.moveTo(sx(yb),yTop); ctx.lineTo(sx(yb),yBot); ctx.stroke(); }
+  for (const yb of [redHome[1], blueHome[0]]) { ctx.beginPath(); ctx.moveTo(sx(yb),yTop); ctx.lineTo(sx(yb),yBot); ctx.stroke(); }
   ctx.setLineDash([]);
 
   const ourTeam = (state.settings && state.settings.markers && state.settings.markers.our_team) || "";
@@ -932,9 +1021,9 @@ function renderArena(state) {
   }
   // legend
   ctx.fillStyle = "#888"; ctx.font = "10px system-ui"; ctx.textAlign = "left";
-  ctx.fillText("◀ red home", sx(-10)+3, yBot+14);
+  ctx.fillText("◀ red home", sx(ARENA.yMin)+3, yBot+14);
   ctx.textAlign = "right";
-  ctx.fillText("blue home ▶", sx(10)-3, yBot+14);
+  ctx.fillText("blue home ▶", sx(ARENA.yMax)-3, yBot+14);
 }
 
 async function refresh() {
@@ -995,6 +1084,20 @@ document.getElementById("mode-btn").addEventListener("click", async () => {
   const auto = !!(last && last.runner && last.runner.auto);
   await api("/api/strategy/mode", {method:"POST", body: JSON.stringify({auto: !auto})});
   refresh();
+});
+document.getElementById("arena-sel").addEventListener("change", async (e) => {
+  // Switch the WHOLE stack to the chosen arena (the sim swaps its physical
+  // world; both strategies follow). Live, no restart.
+  const sel = e.target, name = sel.value;
+  sel.dataset.busy = "1"; sel.disabled = true;
+  try {
+    const r = await api("/api/arena/switch", {method:"POST", body: JSON.stringify({name})});
+    if (r && r.ok === false) alert("Arena switch failed: " + (r.error || "?"));
+  } catch (err) {
+    alert("Arena switch error: " + err);
+  } finally {
+    delete sel.dataset.busy; sel.disabled = false; refresh();
+  }
 });
 document.getElementById("arm-btn").addEventListener("click", async () => {
   await api("/api/strategy/arm", {method:"POST"});

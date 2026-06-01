@@ -133,6 +133,7 @@ class World:
     def __init__(self, cfg: SimConfig) -> None:
         self.cfg = cfg
         self.arena: ArenaDef = cfg.arena
+        self.arena_name: str = getattr(cfg, "arena_name", None) or "real"
         self.wall_markers: list[WallMarkerDef] = list(cfg.arena.wall_markers)
         self.lock = threading.RLock()
         self.rng = random.Random(cfg.seed)
@@ -179,6 +180,42 @@ class World:
             self.log("stop", "mission stopped", drone_id)
             return True
 
+    # -- arena hot-swap (called from the UI API) ---------------------------
+    def swap_arena(self, new_arena: ArenaDef, name: str) -> dict:
+        """Replace the live arena (wall markers + boxes) WITHOUT dropping any
+        drone. Box holders/locks carry over for slots that persist; a drone's
+        in-progress capture dwell is cleared only if its target slot vanished.
+        Atomic under ``self.lock`` so no half-swapped frame is ever observed by
+        ``tick``/vision/capture/snapshot. Returns a small summary dict."""
+        with self.lock:
+            if name == self.arena_name:
+                return {"ok": True, "arena_name": name, "changed": False,
+                        "n_wall_markers": len(self.wall_markers),
+                        "n_boxes": len(self.boxes)}
+            self.arena = new_arena
+            self.wall_markers = list(new_arena.wall_markers)
+            old = self.boxes
+            new_boxes: dict[int, SimBox] = {}
+            for b in new_arena.boxes:
+                nb = SimBox.from_def(b)
+                prev = old.get(b.slot)
+                if prev is not None:            # slot survives -> carry state
+                    nb.holder = prev.holder
+                    nb.last_flip_unix_s = prev.last_flip_unix_s
+                    nb.lock_until = prev.lock_until
+                new_boxes[b.slot] = nb
+            self.boxes = new_boxes
+            for d in self.drones.values():      # drop dwell on vanished slots
+                if d.capture_slot is not None and d.capture_slot not in new_boxes:
+                    d.capture_slot = None
+                    d.capture_since = 0.0
+            self.arena_name = name
+            self.log("arena", f"arena switched -> {name} "
+                     f"({len(self.wall_markers)} markers, {len(new_boxes)} boxes)")
+            return {"ok": True, "arena_name": name, "changed": True,
+                    "n_wall_markers": len(self.wall_markers),
+                    "n_boxes": len(new_boxes)}
+
     # -- tick --------------------------------------------------------------
     def tick(self, dt: float, now: Optional[float] = None) -> None:
         now = now if now is not None else time.time()
@@ -215,6 +252,7 @@ class World:
         with self.lock:
             return {
                 "t": round(time.time() - self.start_unix_s, 2),
+                "arena_name": self.arena_name,
                 "arena": {
                     "width_m": self.arena.width_m,
                     "depth_m": self.arena.depth_m,

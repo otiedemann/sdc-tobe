@@ -1,0 +1,138 @@
+{
+  "_comment": "SDC26 REAL-MATCH arena (the current built-in default_arena, serialized so both the sim and the strategy load it from one file). 16 wall markers: upper ring z=4 (ids 1-8), lower ring z=2 (ids 9-16); front/back/left/right naming; 10x20 m. Back wall marker 13 = red home, front wall marker 9 = blue home.",
+  "marker_size_m": 0.5,
+  "width_m": 10.0,
+  "depth_m": 20.0,
+  "top_z_m": 4.0,
+  "bottom_z_m": 2.0,
+  "markers": [
+    {
+      "id": 1,
+      "label": "Front high #1",
+      "wall": "front",
+      "x": 0.0,
+      "y": 10.0,
+      "z": 4.0
+    },
+    {
+      "id": 2,
+      "label": "Right high #2",
+      "wall": "right",
+      "x": 5.0,
+      "y": 5.0,
+      "z": 4.0
+    },
+    {
+      "id": 3,
+      "label": "Right high #3",
+      "wall": "right",
+      "x": 5.0,
+      "y": 0.0,
+      "z": 4.0
+    },
+    {
+      "id": 4,
+      "label": "Right high #4",
+      "wall": "right",
+      "x": 5.0,
+      "y": -5.0,
+      "z": 4.0
+    },
+    {
+      "id": 5,
+      "label": "Back high #5",
+      "wall": "back",
+      "x": 0.0,
+      "y": -10.0,
+      "z": 4.0
+    },
+    {
+      "id": 6,
+      "label": "Left high #6",
+      "wall": "left",
+      "x": -5.0,
+      "y": -5.0,
+      "z": 4.0
+    },
+    {
+      "id": 7,
+      "label": "Left high #7",
+      "wall": "left",
+      "x": -5.0,
+      "y": 0.0,
+      "z": 4.0
+    },
+    {
+      "id": 8,
+      "label": "Left high #8",
+      "wall": "left",
+      "x": -5.0,
+      "y": 5.0,
+      "z": 4.0
+    },
+    {
+      "id": 9,
+      "label": "Front low #9",
+      "wall": "front",
+      "x": 0.0,
+      "y": 10.0,
+      "z": 2.0
+    },
+    {
+      "id": 10,
+      "label": "Right low #10",
+      "wall": "right",
+      "x": 5.0,
+      "y": 5.0,
+      "z": 2.0
+    },
+    {
+      "id": 11,
+      "label": "Right low #11",
+      "wall": "right",
+      "x": 5.0,
+      "y": 0.0,
+      "z": 2.0
+    },
+    {
+      "id": 12,
+      "label": "Right low #12",
+      "wall": "right",
+      "x": 5.0,
+      "y": -5.0,
+      "z": 2.0
+    },
+    {
+      "id": 13,
+      "label": "Back low #13",
+      "wall": "back",
+      "x": 0.0,
+      "y": -10.0,
+      "z": 2.0
+    },
+    {
+      "id": 14,
+      "label": "Left low #14",
+      "wall": "left",
+      "x": -5.0,
+      "y": -5.0,
+      "z": 2.0
+    },
+    {
+      "id": 15,
+      "label": "Left low #15",
+      "wall": "left",
+      "x": -5.0,
+      "y": 0.0,
+      "z": 2.0
+    },
+    {
+      "id": 16,
+      "label": "Left low #16",
+      "wall": "left",
+      "x": -5.0,
+      "y": 5.0,
+      "z": 2.0
+    }
+  ]
+}

@@ -24,6 +24,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, Optional
 
+from . import arena_state
 from .markers import MarkerTracker
 from .settings import DroneSettings, MatchSettings
 
@@ -101,13 +102,9 @@ class DroneState:
 # ("a drone may only start a new attempt after it has been detected back in
 # its own home zone").
 def in_home_zone(team: str, x: float, y: float) -> bool:
-    if abs(x) > 5.0:
-        return False
-    if team == "red":
-        return -10.0 <= y <= -5.0
-    if team == "blue":
-        return 5.0 <= y <= 10.0
-    return False
+    # Bounds derived from the ACTIVE arena (dims) so a live arena switch is
+    # honoured; both real + gvz are 10x20 -> x in [-5,5], red y in [-10,-5].
+    return arena_state.in_home_zone(team, x, y)
 
 
 def home_park_xy(team: str, lane: int = 0, n_lanes: int = 1) -> tuple[float, float]:
@@ -121,12 +118,8 @@ def home_park_xy(team: str, lane: int = 0, n_lanes: int = 1) -> tuple[float, flo
     team doesn't converge on one point during a bank (which tripped collision
     avoidance and stalled the next attack). Lanes span x in [-3.5, +3.5].
     """
-    y = -5.5 if team == "red" else 5.5
-    if n_lanes <= 1:
-        return (0.0, y)
-    span = 7.0   # -3.5 .. +3.5
-    x = -span / 2.0 + span * (lane / (n_lanes - 1))
-    return (round(x, 2), y)
+    # Derived from the ACTIVE arena's home band (inner boundary - 0.5 m).
+    return arena_state.home_park_xy(team, lane, n_lanes)
 
 
 def enemy_heading_deg(team: str) -> float:

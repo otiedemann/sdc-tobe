@@ -58,6 +58,7 @@ from __future__ import annotations
 import logging
 import math
 
+from . import arena_state
 from .roles import (
     Decision, Role, RoleContext, noop, push, register, home_park_xy,
     enemy_heading_deg,
@@ -67,23 +68,54 @@ from .settings import face_id
 logger = logging.getLogger(__name__)
 
 
-# Physical target slot positions in arena frame (x, y) — z is fixed at
-# 1.0 m by the box pedestals and isn't needed for the close-in distance.
-# Per SDC26 v7 regs §1.4.2 Table 1: boxes 1-3 live in the RED home zone
-# (-Y end, default markers 41/42/43), boxes 4-6 in the BLUE home zone
-# (+Y end, default markers 34/35/36), all spread across x in {-3, 0, +3}.
-# Box positions per Figure 1 of the v7 regs (staggered triangle per zone, not
-# a straight line) — must mirror tools/sphinx-arena/default_target_layout.json.
-# Used only for the C2's own bookkeeping (defender threat-distance sort, the
-# dashboard map). The ATTACK does NOT use these — it homes on the ArUco marker
-# via APPROACH, so it stays accurate even if the real boxes differ from these
-# approximate coordinates.
-SLOT_POSITIONS_M: dict[int, tuple[float, float]] = {
-    # Figure 1 triangle: two shallow flanks near neutral (x=±3) + one deep
-    # centre against the back wall (x=0). Red home y in [-10,-5], blue +.
-    1: (-3.0, -6.5), 2: (0.0, -9.0), 3: (3.0, -6.5),
-    4: (-3.0,  6.5), 5: (0.0,  9.0), 6: (3.0,  6.5),
-}
+# ---------------------------------------------------------------------------
+# Arena-derived geometry (LIVE — follows the active arena, see arena_state).
+#
+# ``SLOT_POSITIONS_M`` (target box xy, for the C2's bookkeeping + dashboard map)
+# and ``HOME_WALL_MARKER`` (per-team home back-wall marker) used to be hardcoded
+# literals here. They now read through ``arena_state`` so a live arena switch
+# (real<->gvz) is reflected immediately. They stay exposed under these names —
+# a thin ``_LiveMap`` keeps the ``[team]`` / ``.get(slot)`` call sites (here and
+# the ``from .attacker import ...`` in defender.py / planner.py) working
+# unchanged, while always returning the CURRENT arena's values. The ATTACK
+# itself doesn't use slot xy — it homes on the ArUco marker via APPROACH — so
+# these only drive bookkeeping + the map.
+class _LiveMap:
+    """Read-only mapping view that re-derives from a thunk on every access, so
+    it always reflects the active arena (never a stale snapshot)."""
+
+    __slots__ = ("_fn",)
+
+    def __init__(self, fn):
+        self._fn = fn                       # fn() -> dict
+
+    def get(self, key, default=None):
+        return self._fn().get(key, default)
+
+    def __getitem__(self, key):
+        return self._fn()[key]
+
+    def __contains__(self, key):
+        return key in self._fn()
+
+    def __iter__(self):
+        return iter(self._fn())
+
+    def __len__(self):
+        return len(self._fn())
+
+    def keys(self):
+        return self._fn().keys()
+
+    def values(self):
+        return self._fn().values()
+
+    def items(self):
+        return self._fn().items()
+
+
+SLOT_POSITIONS_M = _LiveMap(arena_state.slot_positions)
+HOME_WALL_MARKER = _LiveMap(lambda: arena_state.current().home_wall_marker)
 
 # Stop the FB_IMU close-in this far short of the target so APPROACH has
 # room to do its precision dance. 7 m gives 18 cm markers comfortable
@@ -172,13 +204,10 @@ INITIAL_CLIMB_DURATION_S: float = 1.2  # ~0.5m climb → ~1.4m total alt
 # is worth the extra ~3 s per turn — heading accuracy is critical
 # because the cruise that follows is open-loop.
 
-# Home-wall markers for RTH braking. 0.5 m markers on each team's
-# home wall, LOW position (2.0 m altitude) — close to cruise altitude
-# for stable APPROACH lock. Maps team → (marker_id, (arena_x, arena_y)).
-HOME_WALL_MARKER: dict[str, tuple[int, tuple[float, float]]] = {
-    "red": (13, (0.0, -10.0)),
-    "blue": (9, (0.0, 10.0)),
-}
+# (Home-wall markers for RTH braking now live in ``arena_state`` and are
+# exposed above as the live ``HOME_WALL_MARKER`` proxy — derived per arena as
+# the back-wall marker for red / front-wall marker for blue, at flight-camera
+# height. real + gvz both resolve to red=13 / blue=9.)
 
 RTH_APPROACH_DISTANCE_M: float = 2.0
 

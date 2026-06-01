@@ -22,6 +22,9 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Deque, Dict, Iterable, List, Optional
 
+import httpx
+
+from . import arena_state
 from .c2_client import C2Client
 from .collision import CollisionAvoider, Track
 from .markers import MarkerTracker
@@ -109,12 +112,18 @@ class SwarmRunner:
         events: Optional[EventLog] = None,
         tick_interval_s: float = TICK_INTERVAL_S,
         mission_log: Optional[MissionLog] = None,
+        sim_url: Optional[str] = None,
     ) -> None:
         self._settings = settings
         self._c2 = c2
         self._markers = markers
         self._events = events or EventLog()
         self._tick_interval_s = tick_interval_s
+        # Sim UI base URL (e.g. http://127.0.0.1:9100). When set, the runner
+        # FOLLOWS the sim's active arena (the sim owns it) so a live operator
+        # toggle re-points this strategy's geometry. None on real HW.
+        self._sim_url = sim_url.rstrip("/") if sim_url else None
+        self._sim_http: Optional[httpx.AsyncClient] = None
         # Records the exact mission scripts we push to the FCs (for the
         # operator to read back / copy-paste onto live drones). Always present
         # so callers don't have to null-check; file sink is optional.
@@ -330,7 +339,43 @@ class SwarmRunner:
         except asyncio.CancelledError:
             pass
         self._task = None
+        if self._sim_http is not None:
+            try:
+                await self._sim_http.aclose()
+            except Exception:
+                pass
+            self._sim_http = None
         self._events.add("runner", "loop stopped")
+
+    # ------------------------------------------------------------------
+    # Arena follow (sim is the source of truth for the active arena)
+    # ------------------------------------------------------------------
+
+    async def _follow_sim_arena(self) -> None:
+        """Re-point ``arena_state`` at whatever arena the sim currently runs.
+
+        The sim owns the active arena (it's the shared physical world); the
+        operator toggles it from the dashboard. Reading its ``arena_name`` here
+        and calling :func:`arena_state.set_active` makes this strategy's home
+        markers / box positions / home-zone bounds track the switch live —
+        without the two team strategies ever needing to talk to each other.
+        Throttled (~every 5 ticks) and a no-op when no sim URL is configured
+        (real HW keeps the arena pushed to the FCs).
+        """
+        if not self._sim_url:
+            return
+        if self._tick_count % 5 != 0:
+            return
+        try:
+            if self._sim_http is None:
+                self._sim_http = httpx.AsyncClient(timeout=2.0)
+            r = await self._sim_http.get(f"{self._sim_url}/api/world")
+            name = (r.json() or {}).get("arena_name")
+        except Exception:
+            return   # sim unreachable -> keep the current arena
+        if name and name != arena_state.active_name():
+            arena_state.set_active(str(name))
+            self._events.add("arena", f"following sim -> arena '{name}'")
 
     # ------------------------------------------------------------------
     # Loop body
@@ -352,6 +397,10 @@ class SwarmRunner:
             raise
 
     async def _tick_once(self) -> None:
+        # 0) Follow the sim's active arena (independent of C2 health, so do it
+        # before the overview early-return).
+        await self._follow_sim_arena()
+
         # 1) Pull settings snapshot once per tick (fresh each loop).
         s = self._settings.snapshot()
         # Keep the marker tracker's active slots in sync with config.

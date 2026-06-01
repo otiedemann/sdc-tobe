@@ -1,0 +1,75 @@
+{
+  "_comment": "SDC26 GVZ TESTING arena. Lower marker ring only (8 markers ids 9-16, z=2), front/back/left/right; back 13 = red home, front 9 = blue home; side markers y=+-5.3/+-4.7; 10x20 m; magnetic_north_arena_yaw_deg=25 (real-FC IPPE only).",
+  "marker_size_m": 0.5,
+  "width_m": 10.0,
+  "depth_m": 20.0,
+  "top_z_m": 2.0,
+  "bottom_z_m": 2.0,
+  "markers": [
+    {
+      "id": 9,
+      "label": "",
+      "wall": "front",
+      "x": 0.0,
+      "y": 10.0,
+      "z": 2.0
+    },
+    {
+      "id": 10,
+      "label": "",
+      "wall": "right",
+      "x": 5.0,
+      "y": -5.3,
+      "z": 2.0
+    },
+    {
+      "id": 11,
+      "label": "",
+      "wall": "right",
+      "x": 5.0,
+      "y": 0.0,
+      "z": 2.0
+    },
+    {
+      "id": 12,
+      "label": "",
+      "wall": "right",
+      "x": 5.0,
+      "y": 4.7,
+      "z": 2.0
+    },
+    {
+      "id": 13,
+      "label": "",
+      "wall": "back",
+      "x": 0.0,
+      "y": -10.0,
+      "z": 2.0
+    },
+    {
+      "id": 14,
+      "label": "",
+      "wall": "left",
+      "x": -5.0,
+      "y": 4.7,
+      "z": 2.0
+    },
+    {
+      "id": 15,
+      "label": "",
+      "wall": "left",
+      "x": -5.0,
+      "y": 0.0,
+      "z": 2.0
+    },
+    {
+      "id": 16,
+      "label": "",
+      "wall": "left",
+      "x": -5.0,
+      "y": -5.3,
+      "z": 2.0
+    }
+  ],
+  "magnetic_north_arena_yaw_deg": 25.0
+}

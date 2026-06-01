@@ -1,0 +1,16 @@
+{
+  "_comment": "Named-arena registry shared by the sim (marker_mission_sim.config.load_arena_by_name) and the strategy (marker_mission_c2.strategy.arena_state). Paths are relative to the repo root. 'real' = the SDC26 real-match arena (serialized default_arena, 16 markers). 'gvz' = the GVZ testing arena (8 markers). Switch the whole stack live from the strategy dashboard.",
+  "default": "real",
+  "arenas": {
+    "real": {
+      "label": "Real match",
+      "arena_config_path": "marker_mission_c2/arena/real_arena_config.json",
+      "target_layout_path": "tools/sphinx-arena/default_target_layout.json"
+    },
+    "gvz": {
+      "label": "GVZ testing",
+      "arena_config_path": "marker_mission_c2/arena/gvz_arena_config.json",
+      "target_layout_path": "marker_mission_c2/arena/gvz_target_layout.json"
+    }
+  }
+}

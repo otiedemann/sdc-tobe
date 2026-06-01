@@ -1,0 +1,151 @@
+{
+  "_comment": "GVZ TESTING arena target boxes \u2014 copied from default_target_layout.json (same 6-box triangle). Fine-tune x/y here for the GVZ venue; attack is vision-based so exact positions only affect sim ground-truth + dashboard. ",
+  "marker_size_m": 0.19,
+  "box_size_m": 0.5,
+  "boxes": [
+    {
+      "id": 41,
+      "team": "red",
+      "label": "Red box 1 (default) \u2014 shallow flank (-x), near neutral",
+      "x": -3.0,
+      "y": -6.5,
+      "z": 1.0,
+      "pitch_deg": 0.0,
+      "yaw_deg": 0.0,
+      "enabled": true,
+      "roll_deg": 270.0
+    },
+    {
+      "id": 42,
+      "team": "red",
+      "label": "Red box 2 (default) \u2014 deep centre, against back wall",
+      "x": 0.0,
+      "y": -9.0,
+      "z": 1.0,
+      "pitch_deg": 0.0,
+      "yaw_deg": 0.0,
+      "enabled": true,
+      "roll_deg": 270.0
+    },
+    {
+      "id": 43,
+      "team": "red",
+      "label": "Red box 3 (default) \u2014 shallow flank (+x), near neutral",
+      "x": 3.0,
+      "y": -6.5,
+      "z": 1.0,
+      "pitch_deg": 0.0,
+      "yaw_deg": 0.0,
+      "enabled": true,
+      "roll_deg": 270.0
+    },
+    {
+      "id": 34,
+      "team": "blue",
+      "label": "Blue box 4 (default) \u2014 shallow flank (-x), near neutral",
+      "x": -3.0,
+      "y": 6.5,
+      "z": 1.0,
+      "pitch_deg": 0.0,
+      "yaw_deg": 0.0,
+      "enabled": true,
+      "roll_deg": 90.0
+    },
+    {
+      "id": 35,
+      "team": "blue",
+      "label": "Blue box 5 (default) \u2014 deep centre, against back wall",
+      "x": 0.0,
+      "y": 9.0,
+      "z": 1.0,
+      "pitch_deg": 0.0,
+      "yaw_deg": 0.0,
+      "enabled": true,
+      "roll_deg": 90.0
+    },
+    {
+      "id": 36,
+      "team": "blue",
+      "label": "Blue box 6 (default) \u2014 shallow flank (+x), near neutral",
+      "x": 3.0,
+      "y": 6.5,
+      "z": 1.0,
+      "pitch_deg": 0.0,
+      "yaw_deg": 0.0,
+      "enabled": true,
+      "roll_deg": 90.0
+    },
+    {
+      "id": 31,
+      "team": "blue",
+      "label": "Box 1 captured-by-blue (spare)",
+      "x": 0.0,
+      "y": 0.0,
+      "z": 1.0,
+      "pitch_deg": 0.0,
+      "yaw_deg": 0.0,
+      "enabled": false,
+      "roll_deg": 270.0
+    },
+    {
+      "id": 32,
+      "team": "blue",
+      "label": "Box 2 captured-by-blue (spare)",
+      "x": 0.0,
+      "y": 0.0,
+      "z": 1.0,
+      "pitch_deg": 0.0,
+      "yaw_deg": 0.0,
+      "enabled": false,
+      "roll_deg": 270.0
+    },
+    {
+      "id": 33,
+      "team": "blue",
+      "label": "Box 3 captured-by-blue (spare)",
+      "x": 0.0,
+      "y": 0.0,
+      "z": 1.0,
+      "pitch_deg": 0.0,
+      "yaw_deg": 0.0,
+      "enabled": false,
+      "roll_deg": 270.0
+    },
+    {
+      "id": 44,
+      "team": "red",
+      "label": "Box 4 captured-by-red (spare)",
+      "x": 0.0,
+      "y": 0.0,
+      "z": 1.0,
+      "pitch_deg": 0.0,
+      "yaw_deg": 0.0,
+      "enabled": false,
+      "roll_deg": 90.0
+    },
+    {
+      "id": 45,
+      "team": "red",
+      "label": "Box 5 captured-by-red (spare)",
+      "x": 0.0,
+      "y": 0.0,
+      "z": 1.0,
+      "pitch_deg": 0.0,
+      "yaw_deg": 0.0,
+      "enabled": false,
+      "roll_deg": 90.0
+    },
+    {
+      "id": 46,
+      "team": "red",
+      "label": "Box 6 captured-by-red (spare)",
+      "x": 0.0,
+      "y": 0.0,
+      "z": 1.0,
+      "pitch_deg": 0.0,
+      "yaw_deg": 0.0,
+      "enabled": false,
+      "roll_deg": 90.0
+    }
+  ]
+}

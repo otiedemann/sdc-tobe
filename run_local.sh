@@ -160,12 +160,14 @@ wait_http "http://127.0.0.1:8090/api/c2/overview" "C2 server" 20
 if [ "$NO_STRATEGY" = 0 ]; then
   RED_SETTINGS="$LOGDIR/strat_red.json"; seed_settings "$RED_SETTINGS" red
   start strategy_red "$PY" -m marker_mission_c2.strategy \
-        --c2 http://127.0.0.1:8090 --port 8091 --settings "$RED_SETTINGS"
+        --c2 http://127.0.0.1:8090 --port 8091 --settings "$RED_SETTINGS" \
+        --sim-url http://127.0.0.1:9100
   wait_http "http://127.0.0.1:8091/api/state" "strategy (red)" 20
   if [ "$MATCH" = 1 ]; then
     BLUE_SETTINGS="$LOGDIR/strat_blue.json"; seed_settings "$BLUE_SETTINGS" blue
     start strategy_blue "$PY" -m marker_mission_c2.strategy \
-          --c2 http://127.0.0.1:8090 --port 8092 --settings "$BLUE_SETTINGS"
+          --c2 http://127.0.0.1:8090 --port 8092 --settings "$BLUE_SETTINGS" \
+          --sim-url http://127.0.0.1:9100
     wait_http "http://127.0.0.1:8092/api/state" "strategy (blue)" 20
   fi
 fi

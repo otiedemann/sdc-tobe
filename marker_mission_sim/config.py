@@ -137,6 +137,7 @@ class SimConfig:
     sim_hz: float = 30.0
     arena_config_path: Optional[str] = None
     target_layout_path: Optional[str] = None
+    arena_name: Optional[str] = None   # registry name (arenas.json); wins over paths
     noise: NoiseConfig = field(default_factory=NoiseConfig)
     capture: CaptureConfig = field(default_factory=CaptureConfig)
     seed: int = 0                # RNG seed for reproducible noise
@@ -146,7 +147,20 @@ class SimConfig:
 
     def __post_init__(self) -> None:
         if self.arena is None:
-            self.arena = load_arena(self.arena_config_path, self.target_layout_path)
+            if self.arena_name:
+                self.arena = load_arena_by_name(self.arena_name)
+            elif self.arena_config_path or self.target_layout_path:
+                self.arena = load_arena(self.arena_config_path,
+                                        self.target_layout_path)
+            else:
+                # Nothing specified -> load the registry's default arena BY NAME
+                # so the sim's startup geometry is byte-identical to a live
+                # switch back to that arena (not the built-in default_arena()).
+                self.arena_name = default_arena_name()
+                self.arena = load_arena_by_name(self.arena_name)
+        # Always resolve a human-facing arena name so the World can report it.
+        if not self.arena_name:
+            self.arena_name = default_arena_name()
 
     @classmethod
     def load(cls, path: Optional[str]) -> "SimConfig":
@@ -162,6 +176,7 @@ class SimConfig:
             sim_hz=float(data.get("sim_hz", 30.0)),
             arena_config_path=data.get("arena_config_path"),
             target_layout_path=data.get("target_layout_path"),
+            arena_name=data.get("arena_name"),
             noise=NoiseConfig.from_dict(data.get("noise", {})),
             capture=CaptureConfig.from_dict(data.get("capture", {})),
             seed=int(data.get("seed", 0)),
@@ -230,3 +245,41 @@ def load_arena(arena_config_path: Optional[str],
         wall_markers=wall_markers,
         boxes=boxes,
     )
+
+
+# ---------------------------------------------------------------------------
+# Named-arena registry (shared with the strategy) — enables a live switch
+# ---------------------------------------------------------------------------
+
+ARENA_REGISTRY_PATH = REPO_ROOT / "marker_mission_c2" / "arena" / "arenas.json"
+
+
+def _read_registry() -> dict:
+    try:
+        return json.loads(ARENA_REGISTRY_PATH.read_text())
+    except (OSError, ValueError):
+        return {"default": "real", "arenas": {}}
+
+
+def arena_names() -> list[str]:
+    """Registered arena names, e.g. ['real', 'gvz']."""
+    return list(_read_registry().get("arenas", {}).keys())
+
+
+def default_arena_name() -> str:
+    """The registry's default arena name (falls back to 'real')."""
+    return str(_read_registry().get("default", "real"))
+
+
+def load_arena_by_name(name: str) -> ArenaDef:
+    """Build an :class:`ArenaDef` for a *registered* arena name (see
+    ``marker_mission_c2/arena/arenas.json``). Unknown names fall back to the
+    built-in default arena + default target layout."""
+    entry = _read_registry().get("arenas", {}).get(str(name))
+    if not entry:
+        return load_arena(None, None)
+    acp = entry.get("arena_config_path")
+    tlp = entry.get("target_layout_path")
+    acp = str(REPO_ROOT / acp) if acp else None
+    tlp = str(REPO_ROOT / tlp) if tlp else None
+    return load_arena(acp, tlp)

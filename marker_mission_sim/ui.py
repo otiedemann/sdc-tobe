@@ -24,7 +24,9 @@ from pathlib import Path
 
 from flask import Flask, Response, jsonify, request, send_from_directory
 
-from .config import SimConfig
+from .config import (
+    SimConfig, arena_names, default_arena_name, load_arena_by_name,
+)
 from .world import World
 
 WEB_DIR = Path(__file__).resolve().parent / "web"
@@ -79,6 +81,42 @@ def make_ui_app(world: World, cfg: SimConfig) -> Flask:
             "Connection": "keep-alive",
         }
         return Response(gen(), mimetype="text/event-stream", headers=headers)
+
+    @app.get("/api/arena")
+    def api_arena_get():
+        """Active arena name + the registry's available names."""
+        return jsonify({
+            "ok": True,
+            "active": world.arena_name,
+            "available": arena_names() or [world.arena_name],
+            "default": default_arena_name(),
+        })
+
+    @app.post("/api/arena")
+    def api_arena_set():
+        """Hot-swap the WHOLE physical arena (wall markers + boxes) live.
+
+        Body ``{"name": "real"|"gvz"}`` (a registry name). Rebuilds the
+        ArenaDef from ``arenas.json`` and swaps it into the running World
+        without dropping drones. The strategies follow within a few ticks by
+        reading ``/api/world``'s ``arena_name``.
+        """
+        body = request.get_json(silent=True) or {}
+        name = str(body.get("name", "")).strip()
+        if not name:
+            return jsonify({"ok": False, "error": "missing 'name'"}), 400
+        avail = arena_names()
+        if avail and name not in avail:
+            return jsonify({"ok": False,
+                            "error": f"unknown arena {name!r}",
+                            "available": avail}), 400
+        try:
+            new_arena = load_arena_by_name(name)
+        except Exception as exc:  # bad/missing config file
+            return jsonify({"ok": False,
+                            "error": f"{type(exc).__name__}: {exc}"}), 500
+        result = world.swap_arena(new_arena, name)
+        return jsonify(result)
 
     @app.post("/api/match/<action>")
     def api_match(action: str):
