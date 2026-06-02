@@ -43,10 +43,12 @@ cd ansible/sphinx-state
 ansible-playbook -i inventory.ini backup.yml --ask-pass
 ```
 
-If using the SDC fleet password:
+If you must script it without the interactive prompt, pass the SSH password
+via the `SSHPASS` environment variable — never hard-code it in a command or in
+this repo:
 ```bash
-sshpass -p sdc26 ansible-playbook -i inventory.ini backup.yml \
-    --extra-vars "ansible_password=sdc26"
+export SSHPASS='<sdc-fleet-ssh-password>'   # set in your shell; do not commit
+sshpass -e ansible-playbook -i inventory.ini backup.yml --ask-become-pass
 ```
 
 Output:
