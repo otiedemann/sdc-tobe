@@ -81,6 +81,13 @@ def arena_names() -> list[str]:
     return list(_read_registry().get("arenas", {}).keys())
 
 
+def arena_labels() -> dict[str, str]:
+    """name -> operator-facing label (e.g. 'real' -> 'Competition'); falls back
+    to the name itself when a registry entry has no label."""
+    arenas = _read_registry().get("arenas", {})
+    return {n: str(e.get("label") or n) for n, e in arenas.items()}
+
+
 def _slot_of_face(fid: int) -> Optional[int]:
     if 31 <= fid <= 36:
         return fid - 30
@@ -226,4 +233,5 @@ def to_client_dict() -> dict:
         "boxes": {str(s): [x, y] for s, (x, y) in st.slot_positions_m.items()},
         "home_markers": {t: v[0] for t, v in st.home_wall_marker.items()},
         "available": arena_names(),
+        "labels": arena_labels(),
     }

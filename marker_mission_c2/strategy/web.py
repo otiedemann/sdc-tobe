@@ -549,7 +549,7 @@ _INDEX_HTML = r"""<!doctype html>
     <option value="blue">blue</option>
   </select>
   <span class="small">arena:</span>
-  <select id="arena-sel" title="Switch the WHOLE stack (sim + both strategies) between the real-match and GVZ testing arena — live, no restart"></select>
+  <select id="arena-sel" title="Switch the WHOLE stack (sim + both strategies) between the Competition and GVZ testing arena — live, no restart"></select>
   <span class="spacer"></span>
   <button id="mode-btn" class="warn" title="Toggle MANUAL / AUTO">Go AUTO</button>
   <button id="arm-btn" class="primary">Arm</button>
@@ -917,12 +917,13 @@ function renderHeader(state) {
   const asel = document.getElementById("arena-sel");
   if (asel && !asel.dataset.busy) {
     const avail = arena.available || (arena.name ? [arena.name] : []);
+    const labels = arena.labels || {};
     const want = avail.join(",");
     if (asel.dataset.opts !== want) {       // rebuild options only when the set changes
       asel.innerHTML = "";
       for (const nm of avail) {
         const o = document.createElement("option");
-        o.value = nm; o.textContent = nm;
+        o.value = nm; o.textContent = labels[nm] || nm;
         asel.appendChild(o);
       }
       asel.dataset.opts = want;

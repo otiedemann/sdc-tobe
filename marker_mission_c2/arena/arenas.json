@@ -3,7 +3,7 @@
   "default": "real",
   "arenas": {
     "real": {
-      "label": "Real match",
+      "label": "Competition",
       "arena_config_path": "marker_mission_c2/arena/real_arena_config.json",
       "target_layout_path": "tools/sphinx-arena/default_target_layout.json"
     },
