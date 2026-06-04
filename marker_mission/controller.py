@@ -878,6 +878,11 @@ class MissionController:
         self._search_start_yaw = None
         self._search_swept = 0.0
         self._search_prev_yaw = None
+        self._search_esc_level: int = 0          # 0=1x/full, 1=2x/half, 2+=navigate
+        self._search_visited_markers: set = set()  # wall-marker IDs already navigated to
+        self._goto_on_settle_phase: Optional[Phase] = None  # override post-GOTO transition
+        self._approach_start_d: Optional[float] = None
+        self._approach_lat_unlocked: bool = False
         self.state.reset(self.cfg)
 
     def set_script(self, steps: List[Step]) -> None:
@@ -955,6 +960,9 @@ class MissionController:
         # would re-use the previous sweep counter and hit search_total_deg
         # almost immediately -- the drone would land instead of actually
         # looking around again.
+        if phase == Phase.APPROACH:
+            self._approach_start_d = None
+            self._approach_lat_unlocked = False
         if phase == Phase.SEARCH:
             self._search_start_yaw = None
             self._search_swept = 0.0
@@ -1245,6 +1253,83 @@ class MissionController:
     _SEARCH_MIN_YAW_RC: int = 3
     # Maximum digital zoom (Anafi hardware cap).
     _SEARCH_MAX_ZOOM: float = 3.0
+    # Distance in front of a wall marker used as the search waypoint.
+    _SEARCH_NAV_DIST_M: float = 3.0
+
+    def _navigate_to_arena_marker(self, now: float) -> bool:
+        """Set up a GOTO to a position _SEARCH_NAV_DIST_M in front of the
+        nearest unvisited wall marker. Returns False when not possible
+        (no arena config, no world position). On success transitions to
+        GOTO with a _goto_on_settle_phase=SEARCH hook so the drone
+        restarts the search from the new vantage point."""
+        arena = self.get_arena() if callable(self.get_arena) else None
+        if arena is None:
+            return False
+        with self.state.lock:
+            wp = self.state.world_position_m
+        if wp is None:
+            return False
+
+        cfg = self.cfg
+        tgt_min = int(cfg.target_marker_id_min)
+        tgt_max = int(cfg.target_marker_id_max)
+
+        # Inward wall normal and facing yaw for each wall label.
+        # Arena frame: +x = right, +y = front-wall direction, yaw 0° = facing +y.
+        _wall_normal = {"front": (0, -1), "back": (0, 1),
+                        "left": (1, 0),  "right": (-1, 0)}
+        _wall_yaw    = {"front": 180.0, "back": 0.0,
+                        "left":  -90.0, "right": 90.0}
+
+        # Build list of wall markers, excluding target markers.
+        candidates = [
+            m for mid, m in arena.markers.items()
+            if not (tgt_min <= mid <= tgt_max)
+            and m.wall in _wall_normal
+            and mid not in self._search_visited_markers
+        ]
+        if not candidates:
+            # All visited — reset and allow revisits.
+            self._search_visited_markers.clear()
+            candidates = [
+                m for mid, m in arena.markers.items()
+                if not (tgt_min <= mid <= tgt_max)
+                and m.wall in _wall_normal
+            ]
+        if not candidates:
+            return False
+
+        # Pick nearest wall marker to current drone position.
+        px, py = float(wp[0]), float(wp[1])
+        best = min(candidates, key=lambda m: (
+            (float(m.position_m[0]) - px) ** 2 +
+            (float(m.position_m[1]) - py) ** 2
+        ))
+        self._search_visited_markers.add(best.id)
+
+        nx, ny = _wall_normal[best.wall]
+        mx, my = float(best.position_m[0]), float(best.position_m[1])
+        mz = float(best.position_m[2])
+        tx = mx + nx * self._SEARCH_NAV_DIST_M
+        ty = my + ny * self._SEARCH_NAV_DIST_M
+        t_yaw = _wall_yaw[best.wall]
+
+        with self.state.lock:
+            self.state.goto_target_x_m = tx
+            self.state.goto_target_y_m = ty
+            self.state.goto_target_z_m = mz
+            self.state.goto_target_yaw_deg = t_yaw
+            self.state.goto_hold_until = None
+
+        self._goto_on_settle_phase = Phase.SEARCH
+        self._set_phase(
+            Phase.GOTO,
+            f"search esc: nav to wall marker {best.id} "
+            f"({best.wall} wall) @ "
+            f"({tx:.1f},{ty:.1f},{mz:.1f})m")
+        print(f"[ctrl] SEARCH nav → marker {best.id} ({best.wall}): "
+              f"goto ({tx:.1f},{ty:.1f},{mz:.1f})m yaw={t_yaw:.0f}°")
+        return True
 
     def _step_search(self, now: float) -> None:
         cfg = self.cfg
@@ -1269,12 +1354,8 @@ class MissionController:
                     self.api.rotate("ccw", back_deg)
                 except Exception as e:
                     print(f"[ctrl] SEARCH back-rotate failed: {e}")
-            # Reset zoom to 1.0 so APPROACH detection uses native FOV.
-            if getattr(self, "_search_zoom", 1.0) > 1.0:
-                try:
-                    self.api.camera_config_set(zoom=1.0)
-                except Exception:
-                    pass
+            # Keep zoom as-is; _step_approach resets to 1x at the
+            # angle-correction-start threshold.
             self._set_phase(Phase.HEIGHT_ALIGN,
                             f"marker acquired -- stop + {back_deg}° back -- aligning altitude")
             return
@@ -1289,7 +1370,12 @@ class MissionController:
             self._search_swept = 0.0
             self._search_prev_yaw = None
             self._search_yaw_rc = float(cfg.search_yaw_rc)
-            self._search_zoom = 1.0
+            self._search_zoom = 1.25
+            self._search_esc_level = 0
+            try:
+                self.api.camera_config_set(zoom=1.25)
+            except Exception:
+                pass
 
         # Retreat-then-yaw: when we entered SEARCH after losing a
         # marker the controller was actively tracking, _set_phase
@@ -1311,8 +1397,7 @@ class MissionController:
             return
 
         # Yaw in place using current (possibly escalation-reduced) speed.
-        self._send_rc(0, 0, 0, int(self._search_yaw_rc),
-                      enforce_cfg_caps=False)
+        self._send_rc(0, 0, 0, int(self._search_yaw_rc))
         # Track how far we've yawed from telemetry to decide when to escalate.
         with self.state.lock:
             tel = self.state.last_telemetry
@@ -1329,36 +1414,35 @@ class MissionController:
                 with self.state.lock:
                     self.state.search_yaw_swept_deg = self._search_swept
                 if self._search_swept >= cfg.search_total_deg:
-                    # Full revolution without sighting — escalate: 25% slower,
-                    # 25% more zoom, capped at _SEARCH_MIN_YAW_RC / _SEARCH_MAX_ZOOM.
-                    new_yaw_rc = max(self._SEARCH_MIN_YAW_RC,
-                                     self._search_yaw_rc * 0.75)
-                    new_zoom = min(self._SEARCH_MAX_ZOOM,
-                                   self._search_zoom * 1.25)
-                    at_speed_floor = new_yaw_rc <= self._SEARCH_MIN_YAW_RC
-                    at_zoom_max = new_zoom >= self._SEARCH_MAX_ZOOM
-                    print(f"[ctrl] SEARCH escalation: "
-                          f"yaw_rc {self._search_yaw_rc:.1f} → {new_yaw_rc:.1f}, "
-                          f"zoom {self._search_zoom:.2f}x → {new_zoom:.2f}x")
-                    self._search_yaw_rc = new_yaw_rc
-                    self._search_zoom = new_zoom
-                    try:
-                        self.api.camera_config_set(zoom=new_zoom)
-                    except Exception as e:
-                        print(f"[ctrl] SEARCH zoom set failed: {e}")
-                    # Reset sweep counter for the next revolution.
+                    # Reset sweep counter for next revolution.
                     self._search_start_yaw = None
                     self._search_swept = 0.0
-                    with self.state.lock:
-                        self.state.note = (
-                            f"SEARCH escalated: yaw_rc={new_yaw_rc:.0f} "
-                            f"zoom={new_zoom:.2f}x"
-                            + (" [speed floor]" if at_speed_floor else "")
-                            + (" [max zoom]" if at_zoom_max else "")
-                        )
-                    if at_speed_floor and at_zoom_max:
-                        self._terminate_script(
-                            "no marker found after escalated sweep -- landing")
+                    self._search_esc_level += 1
+
+                    if self._search_esc_level in (1, 2):
+                        # Level 1: 1.5x → 2x, half speed
+                        # Level 2: 2x  → 3x, half speed again
+                        new_zoom = 2.0 if self._search_esc_level == 1 else 3.0
+                        new_yaw_rc = max(self._SEARCH_MIN_YAW_RC,
+                                         self._search_yaw_rc * 0.5)
+                        self._search_zoom = new_zoom
+                        self._search_yaw_rc = new_yaw_rc
+                        try:
+                            self.api.camera_config_set(zoom=new_zoom)
+                        except Exception as e:
+                            print(f"[ctrl] SEARCH zoom set failed: {e}")
+                        print(f"[ctrl] SEARCH esc→{self._search_esc_level}: "
+                              f"zoom {new_zoom}x, yaw_rc {new_yaw_rc:.0f}")
+                        with self.state.lock:
+                            self.state.note = (
+                                f"SEARCH esc: zoom={new_zoom}x "
+                                f"yaw_rc={new_yaw_rc:.0f}")
+                    else:
+                        # Three+ revolutions without result →
+                        # navigate to a wall marker 3 m in front.
+                        if not self._navigate_to_arena_marker(now):
+                            self._terminate_script(
+                                "search: no arena nav available — giving up")
                     return
         # Fallback timeout if no telemetry yaw is ever reported.
         elif now - phase_entry > 30.0:
@@ -1528,6 +1612,10 @@ class MissionController:
             self._marker_lost(now); return
         d, yaw_to_marker, hdg = meas
 
+        # Capture starting distance on first tick of this APPROACH phase.
+        if self._approach_start_d is None:
+            self._approach_start_d = d
+
         # Hard distance floor: prevent FORWARD motion inside the floor;
         # yaw and lateral PDs keep running so the drone can recenter
         # and correct heading. The PD's natural backward output (when
@@ -1550,11 +1638,8 @@ class MissionController:
         # though approach itself never commanded any lateral motion.
         e_hdg = ((0.0 - hdg) + 540.0) % 360.0 - 180.0
 
-        # Apply dead-bands
-        if abs(e_yaw) < cfg.yaw_deadband_deg:
-            u_yaw = 0.0
-        else:
-            u_yaw = self.pd_yaw.step(e_yaw, now)
+        # Yaw gated by latch (see below). Default = 0; overridden after latch.
+        u_yaw = 0.0
         if abs(e_fwd) < cfg.distance_deadband_m:
             u_fwd_raw = 0.0
         else:
@@ -1576,21 +1661,44 @@ class MissionController:
             cap = max(1, slow_cap)
             u_fwd = max(-cap, min(cap, u_fwd))
 
-        # Lateral: same tangential-slide PD as ALIGN but pinned to
-        # heading 0 for the whole approach. We use approach_heading_deadband_deg
-        # (~5 deg) -- much tighter than ALIGN. ALIGN's +/-30 deg gave
-        # APPROACH 60 deg of free space inside which lateral PD never
-        # fired; heading drift integrated unchecked until it exited the
-        # band already carrying tangential momentum (flight 21-42-17:
-        # +15 -> -45 with rc_lr=0 for 6 s of the drift). With lat_rc_max=4
-        # the lateral correction is still bounded to ~16 cm/s so it
-        # doesn't fight the forward channel.
-        if abs(e_hdg) < cfg.approach_heading_deadband_deg:
+        # Yaw + lateral gated: drone flies forward-only until the latch
+        # fires at approach_yaw_start_fraction of the leg (start_d→target_d).
+        # Formula: threshold = start - frac*(start - target)
+        #   frac=0 → fires immediately   frac=0.5 → midpoint   frac=1 → at target
+        _lat_frac = float(getattr(cfg, "approach_yaw_start_fraction", 0.5))
+        _lat_thr  = (self._approach_start_d
+                     - _lat_frac * (self._approach_start_d - tgt_d))
+        # Reset zoom to 1x 0.3 m before the lateral-correction threshold so
+        # the detector has full FOV when angle correction starts (one-shot).
+        if (not self._approach_lat_unlocked
+                and d <= _lat_thr + 0.3
+                and getattr(self, "_search_zoom", 1.0) > 1.0):
+            self._search_zoom = 1.0
+            try:
+                self.api.camera_config_set(zoom=1.0)
+            except Exception:
+                pass
+        if not self._approach_lat_unlocked and d <= _lat_thr:
+            self._approach_lat_unlocked = True
+            print(f"[ctrl] APPROACH latch: yaw+lat unlocked "
+                  f"d={d:.2f}m start={self._approach_start_d:.2f}m "
+                  f"thr={_lat_thr:.2f}m tgt={tgt_d:.2f}m")
+
+        # Both yaw and lateral are gated by the same latch.
+        # Before latch: drone flies forward only (straight at marker).
+        # After latch: yaw re-centres marker, lateral corrects heading.
+        if not self._approach_lat_unlocked:
+            u_lat_raw = 0.0
+        elif abs(e_hdg) < cfg.approach_heading_deadband_deg:
             u_lat_raw = 0.0
         else:
             arc_err_m = -d * math.radians(e_hdg)
             u_lat_raw = self.pd_lat.step(arc_err_m, now)
         u_lat = self._velocity_damp_lat(u_lat_raw, tel)
+
+        # Yaw: gated by the same latch (assigned earlier as placeholder 0).
+        if self._approach_lat_unlocked and abs(e_yaw) >= cfg.yaw_deadband_deg:
+            u_yaw = self.pd_yaw.step(e_yaw, now)
 
         # Continuous height alignment to the marker's altitude. Same
         # geometry as HEIGHT_ALIGN: marker_height = drone_height -
@@ -2785,8 +2893,16 @@ class MissionController:
                     f"goto-hold complete at "
                     f"({wp[0]:.2f},{wp[1]:.2f},{wp[2]:.2f})m")
         elif settled:
-            self._advance_script(
-                f"goto reached ({wp[0]:.2f},{wp[1]:.2f},{wp[2]:.2f})m")
+            if self._goto_on_settle_phase is not None:
+                next_phase = self._goto_on_settle_phase
+                self._goto_on_settle_phase = None
+                self._set_phase(
+                    next_phase,
+                    f"goto reached ({wp[0]:.2f},{wp[1]:.2f},{wp[2]:.2f})m"
+                    f" → resuming {next_phase.value}")
+            else:
+                self._advance_script(
+                    f"goto reached ({wp[0]:.2f},{wp[1]:.2f},{wp[2]:.2f})m")
 
     # --------------------------------------------------------- dance (script)
     def _step_dance(self, tel: Optional[TelemetrySnapshot],

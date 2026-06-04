@@ -406,6 +406,13 @@ def cmd_fly(args: argparse.Namespace) -> int:
             except Exception as e:
                 print(f"[mission] git_commit.txt save failed: {e}")
 
+        # Reset zoom to 1x on every takeoff so search always starts clean.
+        if new_phase == Phase.TAKEOFF:
+            try:
+                api.camera_config_set(zoom=1.0)
+            except Exception as e:
+                print(f"[mission] zoom reset at TAKEOFF failed: {e}")
+
         # Recording envelope.
         if new_phase in AIRBORNE_PHASES:
             if recording_paused.is_set():

@@ -135,6 +135,9 @@ _PAGE_HEADER = """
     <a href="/settings" class="{{ 'active' if active=='settings' else '' }}">Settings</a>
     <a href="/hardware" class="{{ 'active' if active=='hardware' else '' }}">Hardware</a>
   </nav>
+  <div id="wlan-info" style="font-size:.72rem; color:#bbb; line-height:1.5;
+       font-family:monospace; white-space:nowrap;
+       border:1px solid #444; border-radius:4px; padding:4px 8px;">—</div>
   <span style="margin-left:auto; font-size:.85rem; color:#aab;"
         id="phase">{{ header_label or 'phase: …' }}</span>
   <span style="font-size:.75rem; color:#555; font-family:monospace;"
@@ -314,6 +317,7 @@ _CHARTS_HTML = """
   <div class="card"><h2>Distance to marker (m)</h2><canvas id="c-d" width="700" height="200"></canvas></div>
   <div class="card"><h2>Yaw to marker (°)</h2><canvas id="c-y" width="700" height="200"></canvas></div>
   <div class="card"><h2>Relative heading (°)</h2><canvas id="c-h" width="700" height="200"></canvas></div>
+  <div class="card"><h2>Battery (%)</h2><canvas id="c-bat" width="700" height="200"></canvas></div>
   <div class="card"><h2>Drone telemetry (yaw / battery / height)</h2><canvas id="c-t" width="700" height="200"></canvas></div>
   <div class="card"><h2>RC commands (lr / fb / ud / yaw)</h2><canvas id="c-rc" width="700" height="200"></canvas></div>
 </section>
@@ -1440,6 +1444,7 @@ function updateCharts(s) {
   drawSeries('c-d', [{label:'distance', color:'#58c4ff', data:buf.d, legendX:0}], {target:s.target_distance_m});
   drawSeries('c-y', [{label:'yaw_to_marker', color:'#facc15', data:buf.y, legendX:0}], {target:0});
   drawSeries('c-h', [{label:'rel_heading', color:'#4ade80', data:buf.h, legendX:0}], {target:s.target_relative_heading_deg});
+  drawSeries('c-bat', [{label:'battery%', color:'#a78bfa', data:buf.battery, legendX:0}]);
   drawSeries('c-t', [
     {label:'drone_yaw', color:'#f87171', data:buf.drone_yaw, legendX:0},
     {label:'battery%',  color:'#a78bfa', data:buf.battery,   legendX:2},
@@ -1481,6 +1486,34 @@ async function refresh() {
     }
     lastPhase = s.phase;
   } catch (e) {}
+  // WLAN info: refresh every ~2 s, not every 250 ms
+  if (!window._lastWlanUpdate || Date.now() - window._lastWlanUpdate > 2000) {
+    try {
+      const wr = await fetch('/api/wlan', {cache:'no-store'});
+      const winfo = await wr.json();
+      const wlanEl = $('wlan-info');
+      if (wlanEl && winfo) {
+        let wlanText = '—';
+        for (const [iface, info] of Object.entries(winfo)) {
+          if (iface.startsWith('wl') && info.ssid && info.signal_dbm) {
+            const lines = [];
+            lines.push(`<strong>${info.ssid}</strong>`);
+            lines.push(`Signal: ${info.signal_dbm} dBm`);
+            if (info.link_quality) lines.push(`Quality: ${info.link_quality}%`);
+            if (info.frequency)   lines.push(`Freq: ${info.frequency}`);
+            if (info.band)        lines.push(`Band: ${info.band}`);
+            if (info.bit_rate)    lines.push(`Rate: ${info.bit_rate}`);
+            if (info.tx_power)    lines.push(`TX: ${info.tx_power}`);
+            if (info.mode)        lines.push(`Mode: ${info.mode}`);
+            wlanText = lines.join('<br>');
+            break;
+          }
+        }
+        wlanEl.innerHTML = wlanText;
+        window._lastWlanUpdate = Date.now();
+      }
+    } catch (e) {}
+  }
   setTimeout(refresh, 250);
 }
 // Paint the correct Start/Stop state from the server-rendered phase
@@ -5723,6 +5756,53 @@ class UiServer:
             }
 
             return jsonify(result)
+
+        @app.get("/api/wlan")
+        def api_wlan():
+            import subprocess, re
+            try:
+                out = subprocess.run(
+                    ['iwconfig'], capture_output=True, text=True, timeout=2
+                ).stdout
+                result, iface = {}, None
+                for line in out.split('\n'):
+                    if line and not line[0].isspace():
+                        iface = line.split()[0]
+                        result[iface] = {}
+                    if iface is None:
+                        continue
+                    if 'ESSID:' in line:
+                        result[iface]['ssid'] = (
+                            line.split('ESSID:')[1].strip().strip('"'))
+                    if 'Signal level=' in line:
+                        result[iface]['signal_dbm'] = (
+                            line.split('Signal level=')[1].split()[0])
+                    if 'Link Quality=' in line:
+                        m = re.search(r'Link Quality=(\d+)/(\d+)', line)
+                        if m:
+                            result[iface]['link_quality'] = str(
+                                int(m.group(1)) * 100 // int(m.group(2)))
+                    if 'Bit Rate=' in line:
+                        m = re.search(r'Bit Rate[=:]\s*([0-9.]+)\s*([MG]b/s)', line)
+                        if m:
+                            result[iface]['bit_rate'] = m.group(1) + ' ' + m.group(2)
+                    if 'Frequency' in line and '=' in line:
+                        m = re.search(r'Frequency[=:]\s*([0-9.]+)\s*([MG]Hz)', line)
+                        if m:
+                            result[iface]['frequency'] = m.group(1) + ' ' + m.group(2)
+                            f = float(m.group(1))
+                            result[iface]['band'] = (
+                                '2.4 GHz' if 2400 <= f <= 2500 else
+                                '5 GHz'   if 5000 <= f <= 6000 else '')
+                    if 'Tx-Power=' in line or 'TX Power=' in line:
+                        m = re.search(r'Tx-Power[=:]?\s*([0-9.]+)\s*([a-zA-Z]+)', line)
+                        if m:
+                            result[iface]['tx_power'] = m.group(1) + ' ' + m.group(2)
+                    if 'Mode:' in line:
+                        result[iface]['mode'] = line.split('Mode:')[1].split()[0]
+                return jsonify(result)
+            except Exception as e:
+                return jsonify({'error': str(e)})
 
         @app.get("/team_logo.png")
         def team_logo():

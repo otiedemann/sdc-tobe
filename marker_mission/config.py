@@ -204,6 +204,13 @@ class MissionConfig:
     # slow zone (single-cap behaviour, like before this feature).
     approach_slow_zone_m: float = 0.5      # TUNE  brake zone radius [m]
     approach_slow_rc_max: int = 5          # TUNE  fb cap inside the brake zone
+    # Fraction of the approach leg (start_d → target_d) after which the
+    # lateral / angle correction activates. The yaw PD (marker centring)
+    # is always active so the drone flies straight at the marker first;
+    # the lateral (relative-heading) correction only kicks in once the
+    # drone has crossed this threshold.
+    # 0.0 = lateral active from the start  |  0.5 = second half  |  1.0 = never
+    approach_yaw_start_fraction: float = 0.5  # TUNE
     # Lateral motion has to be slow enough that yaw can keep tracking
     # the marker -- otherwise yaw lags, the marker drifts off-axis, and
     # the commanded "sideways" leaks into radial drift. An early try at
@@ -510,6 +517,10 @@ TUNING_FIELDS = {
         "label": "fwd i clip", "kind": "float", "unit": "m*s", "step": 0.01,
         "desc": "Hard cap on the magnitude of the fwd integrator. With ki=30 and i_clip=1.0, the I term can contribute at most 30 RC counts. Last-line guard against integrator runaway.",
     },
+    "approach_yaw_start_fraction": {
+        "label": "angle correction start (APPROACH)", "kind": "float", "step": 0.05,
+        "desc": "Fraction of the approach leg at which lateral/angle correction activates. 0.5 = flies straight (marker centred) for the first 50 % of (start_d → target_d), then corrects the approach angle. 0.0 = always correct. 1.0 = never correct laterally during approach.",
+    },
     "approach_slow_zone_m": {
         "label": "approach slow zone", "kind": "float", "unit": "m", "step": 0.01,
         "desc": "When |distance - target_distance_m| is below this, the forward RC is hard-capped at approach_slow_rc_max regardless of PD output. Lets you set a high fwd_rc_max for fast cruise from far while still braking to a gentle final approach. 0 disables.",
@@ -757,7 +768,8 @@ TUNING_GROUPS = [
     ("Mission goals", ["target_distance_m", "target_relative_heading_deg", "hold_time_s"]),
     ("Forward PD (closing distance)",
         ["fwd_kp", "fwd_kd", "fwd_kv", "fwd_ki", "fwd_i_clip",
-         "fwd_rc_max", "approach_slow_zone_m", "approach_slow_rc_max"]),
+         "fwd_rc_max", "approach_slow_zone_m", "approach_slow_rc_max",
+         "approach_yaw_start_fraction"]),
     ("Lateral PD (orbiting / heading correction)",
         ["lat_kp", "lat_kd", "lat_kv", "lat_ki", "lat_i_clip", "lat_rc_max"]),
     ("Yaw PD (centring marker)",
