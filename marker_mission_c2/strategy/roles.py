@@ -266,6 +266,11 @@ class RoleContext:
     # the runner so the team doesn't pile on one spot during bank). Roles use
     # it for the bank/return-home target. None -> fall back to home_park_xy().
     home_park_xy: Optional[tuple[float, float]] = None
+    # Own-home slots that OTHER drones are ALREADY recapturing this tick. A
+    # returning attacker (or the defender) that self-converts to defend a
+    # flipped box checks this so two drones never pile onto the same box. The
+    # runner fills it from the live role_states plus within-tick claims.
+    peer_recapture_slots: frozenset = frozenset()
 
 
 class Role(abc.ABC):

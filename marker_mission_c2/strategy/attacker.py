@@ -60,7 +60,7 @@ import math
 
 from . import arena_state
 from .roles import (
-    Decision, Role, RoleContext, noop, push, register, home_park_xy,
+    Decision, Role, RoleContext, noop, push, stop_cmd, register, home_park_xy,
     enemy_heading_deg,
 )
 from .settings import face_id
@@ -607,6 +607,39 @@ def _slot_is_ours(ctx: RoleContext, slot: int) -> bool:
     return ctx.markers.effective_holder(slot) == ctx.our_team
 
 
+def _own_box_under_threat(ctx: RoleContext) -> "int | None":
+    """Nearest-by-x enemy-held OWN slot that needs recapturing, or None.
+
+    Same detection the defender uses (RAW last-seen holder; skip the 5-s
+    post-capture lock) so a returning/home attacker can SELF-convert to a
+    defender the instant it sees one of our boxes flipped — without waiting for
+    the planner's idle-gated assignment. Slots a teammate is already
+    recapturing this tick (``ctx.peer_recapture_slots``) are excluded so two
+    drones never pile onto one box.
+    """
+    import time as _t
+    now = _t.time()
+    our = ctx.our_team
+    enemy = "blue" if our == "red" else "red"
+    px = ctx.state.world_position_m[0] if ctx.state.world_position_m else 0.0
+    threats = []
+    for sl in ctx.active_slots:
+        if _slot_home_team(sl) != our:
+            continue                       # only OUR home boxes
+        if sl in ctx.peer_recapture_slots:
+            continue                       # a teammate is already on it
+        if ctx.markers.slot_holder(sl) != enemy:
+            continue                       # not enemy-held
+        if ctx.markers.slot_locked(sl, now):
+            continue                       # in the 5-s post-capture lock
+        sx = SLOT_POSITIONS_M.get(sl, (0.0, 0.0))[0]
+        threats.append((abs(sx - px), sl))
+    if not threats:
+        return None
+    threats.sort()
+    return threats[0][1]                    # nearest by x
+
+
 class AttackerRole(Role):
     name = "attacker"
 
@@ -647,6 +680,49 @@ class AttackerRole(Role):
                 new_phase="running",
                 reason=f"attacker->defender: re-capture own slot {slot0}",
             )
+
+        # ---- SELF-DEFEND: a RETURNING / HOME attacker that sees one of OUR
+        # boxes flipped to the enemy converts to a defender NOW — it breaks off,
+        # recaptures the box, and (via the branch above, next tick) reverts to
+        # attacking once the box is ours again. We detect this OURSELVES every
+        # tick: the planner's defend assignment is idle-gated and would wait for
+        # our return script to finish. Guards:
+        #  * only when we're home or heading home (the operator's "when the
+        #    attackers return to our home zone" condition) AND physically on our
+        #    own side — never abort a COMMITTED attacker in the enemy half, which
+        #    must finish its capture;
+        #  * peer_recapture_slots dedups vs the defender / other attackers so two
+        #    drones never chase the same box.
+        if slot0 is None or _slot_home_team(slot0) != ctx.our_team:
+            returning = ctx.in_home_now or rs.phase == "returning_home"
+            on_our_side = True
+            pos = ctx.state.world_position_m
+            if pos is not None:
+                y = float(pos[1])
+                on_our_side = (y <= 0.5) if ctx.our_team == "red" else (y >= -0.5)
+            if returning and on_our_side:
+                threat = _own_box_under_threat(ctx)
+                if threat is not None:
+                    # CLAIM the slot first (even on the break-off path) so the
+                    # runner records it in recap_claims and the remaining drones
+                    # this tick dedup against it — otherwise two returning
+                    # attackers both break off for the same box. With the claim
+                    # set, the recapture itself is then driven by the
+                    # planner-assigned-recapture branch above on the next idle
+                    # tick (target is now one of our own slots).
+                    rs.target_slot = threat
+                    rs.target_assigned_unix_s = None
+                    # Break off the current run first (the FC only starts a new
+                    # mission from idle); next tick the branch above pushes it.
+                    if ctx.state.phase not in ("init", "done", ""):
+                        return stop_cmd(
+                            f"attacker->defender: own slot {threat} flipped — "
+                            f"break off to recapture NOW")
+                    return push(
+                        _recapture_script(ctx, threat),
+                        new_phase="running",
+                        reason=f"attacker->defender: re-capture own slot {threat}",
+                    )
 
         # ---- BANK: we just captured an enemy box — get home to secure the
         # 5-pt attempt (ALL drones must return home before the box is

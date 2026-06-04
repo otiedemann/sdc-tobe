@@ -535,6 +535,18 @@ class SwarmRunner:
         # handled by the static red/blue altitude convention).
         avoid = self._collision_overrides(s, overview)
 
+        # Own-home slots already being recaptured (carried over from prior
+        # ticks). A drone that self-converts to defend a flipped box adds its
+        # claim to this set as the loop proceeds, so later drones this tick (and
+        # the planner, via its own `targeted` dedup afterwards) never send a
+        # second drone to the same box.
+        our_team = s.markers.our_team
+        recap_claims: set[int] = {
+            rs0.target_slot for rs0 in self._role_states.values()
+            if rs0.target_slot is not None
+            and self._slot_home_team(rs0.target_slot) == our_team
+        }
+
         # 4) Dispatch each known drone (drones from settings, not C2 — the
         # operator decides who plays; the C2 overview tells us if they're
         # online).
@@ -595,6 +607,10 @@ class SwarmRunner:
                 in_home_now=in_home_now,
                 team_phase=self._team_phase,
                 home_park_xy=home_parks.get(drone.fc_name),
+                peer_recapture_slots=frozenset(
+                    recap_claims
+                    - ({rs.target_slot} if rs.target_slot is not None else set())
+                ),
             )
 
             try:
@@ -604,6 +620,12 @@ class SwarmRunner:
                     "strategy: role %s for %s raised", role.name, drone.fc_name
                 )
                 continue
+
+            # If this drone just (self-)claimed an own-home box to recapture,
+            # record it so the remaining drones this tick dedup against it.
+            if (rs.target_slot is not None
+                    and self._slot_home_team(rs.target_slot) == our_team):
+                recap_claims.add(rs.target_slot)
 
             await self._apply_decision(drone.fc_name, decision)
 

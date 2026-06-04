@@ -105,6 +105,8 @@ def _threatened_own_slot(ctx: RoleContext) -> int | None:
     for sl in ctx.active_slots:
         if _slot_home_team(sl) != our:
             continue                       # only OUR home boxes
+        if sl in ctx.peer_recapture_slots:
+            continue                       # a returning attacker is already on it
         if ctx.markers.slot_holder(sl) != ("blue" if our == "red" else "red"):
             continue                       # not enemy-held
         if ctx.markers.slot_locked(sl, now):
