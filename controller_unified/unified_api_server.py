@@ -2391,7 +2391,20 @@ class OlympeBackend(DroneBackend):
         d = self._d()
         if d is None:
             return False, "not_ready"
+        # Wait up to 10 s for FlyingStateChanged to arrive after reconnect.
+        # Without this, a takeoff attempt immediately post-reconnect sees
+        # state=None and is silently refused by the drone firmware.
         fs = self._get_state(FlyingStateChanged)
+        if fs is None:
+            print("[ANAFI] /api/takeoff — state not ready, waiting up to 10 s...")
+            for _ in range(20):
+                time.sleep(0.5)
+                fs = self._get_state(FlyingStateChanged)
+                if fs is not None:
+                    break
+            if fs is None:
+                print("[ANAFI] /api/takeoff — state still None after 10 s, aborting")
+                return False, "state_not_ready"
         print(f"[ANAFI] /api/takeoff — flying={flying}, state={fs}")
 
         # Pre-takeoff diagnostics — ALWAYS print the current state of every
