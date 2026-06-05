@@ -895,6 +895,7 @@ class MissionController:
         self._goto_on_settle_phase: Optional[Phase] = None  # override post-GOTO transition
         self._goto_last_wp: Optional[tuple] = None    # last accepted world pos in GOTO
         self._goto_jump_until: float = 0.0            # stop+reorient until this monotonic time
+        self._goto_frozen_yaw: Optional[float] = None  # yaw_arena frozen at GOTO entry
         # Scan-pause state machine (periodic 360° scan during GOTO)
         # States: 'fly' | 'scan' | 'realign'
         self._goto_scan_state: str = 'fly'
@@ -986,6 +987,7 @@ class MissionController:
             self._goto_jump_until = 0.0
             self._goto_scan_state = 'fly'
             self._goto_scan_until = 0.0
+            self._goto_frozen_yaw = None  # will be set on first valid yaw in _step_goto
         if phase == Phase.SEARCH:
             self._search_start_yaw = None
             self._search_swept = 0.0
@@ -2803,9 +2805,18 @@ class MissionController:
             t_yaw = self.state.goto_target_yaw_deg
             wp = self.state.world_position_m
             wp_at = self.state.world_position_updated_at
-            yaw_arena = self.state.arena_yaw_deg
+            yaw_arena_live = self.state.arena_yaw_deg
             yaw_at = self.state.arena_yaw_updated_at
             hold_until = self.state.goto_hold_until
+
+        # Freeze yaw_arena at GOTO entry to prevent IPPE branch-flip
+        # jumps from reversing the body-frame decomposition mid-flight.
+        # Use the first valid live estimate; fall back to live if never set.
+        if (self._goto_frozen_yaw is None and yaw_arena_live is not None):
+            self._goto_frozen_yaw = yaw_arena_live
+        yaw_arena = (self._goto_frozen_yaw
+                     if self._goto_frozen_yaw is not None
+                     else yaw_arena_live)
         if tx is None or ty is None:
             self._advance_script("goto: no target set")
             return
