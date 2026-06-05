@@ -1101,8 +1101,14 @@ async function _ensureArenaCache() {
   _arenaCacheTried = true;
   try {
     const r = await fetch('/api/arena/active', {cache:'no-store'});
-    if (r.ok) _arenaCache = await r.json();
-  } catch (e) {}
+    if (r.ok) {
+      _arenaCache = await r.json();
+      // Redraw validator map now that we have dimensions
+      if (typeof drawValidatorMap === 'function') drawValidatorMap();
+    } else {
+      _arenaCacheTried = false;  // retry next call
+    }
+  } catch (e) { _arenaCacheTried = false; }
 }
 const ARENA_YAW_FRESH_S = 1.0;
 function _droneYawArena(s) {
@@ -3569,13 +3575,15 @@ function drawValidatorMap() {
   const W = c.width, H = c.height;
   ctx.clearRect(0, 0, W, H);
 
-  const meta = metaFromInputs();
-  const w = meta.width_m, d = meta.depth_m;
-  if (w <= 0 || d <= 0) return;
-
-  // Load arena config if not already loaded (for drawing reference markers)
-  if (!arena && typeof loadArena === 'function') {
-    loadArena().catch(() => {});  // silently fail if arena unavailable
+  // Derive arena dimensions: prefer the loaded arena object, then
+  // _arenaCache (Camera-tab mini-map), then Arena tab inputs, then default.
+  const _src = arena || _arenaCache || null;
+  const w = (_src && _src.width_m) || (typeof metaFromInputs === 'function' && metaFromInputs().width_m) || 0;
+  const d = (_src && _src.depth_m) || (typeof metaFromInputs === 'function' && metaFromInputs().depth_m) || 0;
+  if (w <= 0 || d <= 0) {
+    // Trigger arena load for next frame
+    if (!_arenaCache && typeof _ensureArenaCache === 'function') _ensureArenaCache();
+    return;
   }
 
   const margin = 20;
