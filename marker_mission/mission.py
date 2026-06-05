@@ -1100,9 +1100,8 @@ def cmd_fly(args: argparse.Namespace) -> int:
                                     m['is_visible'] = False
                             for mid in to_delete:
                                 del _validator_markers[mid]
-                            # Expose to state.
-                            with state.lock:
-                                state.arena_validation_map = dict(_validator_markers)
+                            # Expose to state (already holding state.lock).
+                            state.arena_validation_map = dict(_validator_markers)
                 # Active target's pose method (or empty if not in view).
                 with state.lock:
                     state.target_pose_method = (
