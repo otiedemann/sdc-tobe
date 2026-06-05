@@ -224,13 +224,19 @@ class InProcMjpegReader:
                 "last_error": self._last_error,
             }
 
+    # Cap reader at this rate so vision_worker (ArUco + annotation) has
+    # time to process each frame. Anafi delivers ~30fps; detection takes
+    # ~30-50ms, so 20fps (50ms/frame) is the sustainable ceiling.
+    _MAX_FPS = 20.0
+
     def _run(self) -> None:
         # Read raw BGR frames directly from the callback-driven condition
         # variable in unified_api_server. This avoids the JPEG round-trip
-        # (encode→decode) and the fixed-rate sleep in iter_video_jpegs()
-        # that caused both image distortion and high latency.
+        # (encode→decode) that caused image distortion.
         import unified_api_server as _srv
         last_ts = 0.0
+        last_publish = 0.0
+        min_interval = 1.0 / self._MAX_FPS
         while not self._stop.is_set():
             try:
                 if _srv._video_mode != "mjpeg":
@@ -253,6 +259,13 @@ class InProcMjpegReader:
                 if bgr is None or ts == last_ts:
                     continue
                 last_ts = ts
+                # Rate-cap: skip frames that arrive faster than _MAX_FPS.
+                # Always takes the LATEST frame (not queued), so latency
+                # stays minimal while the vision pipeline isn't overloaded.
+                now = time.monotonic()
+                if now - last_publish < min_interval:
+                    continue
+                last_publish = now
                 self._publish_bgr(bgr, ts)
             except Exception as e:
                 with self._lock:
