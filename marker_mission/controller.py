@@ -2911,12 +2911,20 @@ class MissionController:
         _REALIGN_DUR_S = 1.5   # seconds of re-alignment after scan
         _CONF_THRESHOLD = 0.3  # trigger scan when confidence drops below this
 
+        # Position RC values capped for scan/realign (half speed to avoid
+        # overshooting while the yaw is changing the body frame).
+        pos_lr  = int(u_lat * spd * 0.5)
+        pos_fb  = int(u_fwd * spd * 0.5)
+        pos_ud  = int(u_ud  * spd * 0.5)
+
         if self._goto_scan_state == 'scan':
             if now >= self._goto_scan_until:
                 self._goto_scan_state = 'realign'
                 self._goto_scan_until = now + _REALIGN_DUR_S
             else:
-                self._send_rc(0, 0, 0, scan_yaw_rc, enforce_cfg_caps=False)
+                # Yaw scan AND position hold simultaneously.
+                self._send_rc(pos_lr, pos_fb, pos_ud, scan_yaw_rc,
+                              enforce_cfg_caps=False)
                 with self.state.lock:
                     self.state.note = (f"GOTO: scan pause "
                                        f"({self._goto_scan_until-now:.1f}s)")
@@ -2933,7 +2941,9 @@ class MissionController:
                                    min(scan_yaw_rc, int(e_align * 0.5)))
                 else:
                     align_rc = 0
-                self._send_rc(0, 0, 0, align_rc, enforce_cfg_caps=False)
+                # Realign yaw AND position hold simultaneously.
+                self._send_rc(pos_lr, pos_fb, pos_ud, align_rc,
+                              enforce_cfg_caps=False)
                 with self.state.lock:
                     self.state.note = (f"GOTO: realigning "
                                        f"({self._goto_scan_until-now:.1f}s)")
@@ -2945,7 +2955,8 @@ class MissionController:
             if conf < _CONF_THRESHOLD:
                 self._goto_scan_state = 'scan'
                 self._goto_scan_until = now + _SCAN_DUR_S
-                self._send_rc(0, 0, 0, 0)
+                # Send position hold immediately (no free drift at trigger).
+                self._send_rc(pos_lr, pos_fb, pos_ud, 0)
                 with self.state.lock:
                     self.state.note = (f"GOTO: low confidence ({conf:.2f})"
                                        f" — scanning")
