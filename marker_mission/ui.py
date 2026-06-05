@@ -4554,19 +4554,17 @@ class UiServer:
 
         # Combined-mode race: marker_mission/app.py starts the Flask
         # daemon serving unified_api_server's routes BEFORE this method
-        # runs. Any deploy probe (ansible's wait_for + /api/telemetry)
-        # that lands in that window finalises Flask's URL map, and
-        # Flask 3.x's _check_setup_finished then raises AssertionError
-        # the moment we try @app.get("/mission") below. The route
-        # additions themselves work fine — Flask's check is
-        # precautionary about lookup-time consistency — so we reset the
-        # "first request seen" latch before re-opening setup. Safe in
-        # this codebase because UiServer is the only thing that
-        # registers routes post-startup (unified_api_server adds all
-        # its routes inside init_backend_and_threads).
+        # runs. Any request that lands in that window sets
+        # _got_first_request=True and Flask 3.x's _check_setup_finished
+        # then raises AssertionError the moment we try @app.get below.
+        # Patch _check_setup_finished to a no-op for the duration of
+        # route registration, then restore it. This is safer than
+        # flipping _got_first_request (a concurrent request can set it
+        # back to True between the reset and the first decorator).
+        _orig_check = app._check_setup_finished.__func__ if hasattr(app._check_setup_finished, '__func__') else None
         try:
-            app._got_first_request = False
-        except AttributeError:
+            app.__class__._check_setup_finished = lambda self, f: None
+        except Exception:
             pass
 
         # Per-request context. Returning a fresh dict each call lets
@@ -6147,6 +6145,18 @@ class UiServer:
             resp = send_file(str(p), mimetype="image/png")
             resp.headers["Cache-Control"] = "public, max-age=3600"
             return resp
+
+        # Restore the original _check_setup_finished now that all routes
+        # have been registered.
+        try:
+            if _orig_check is not None:
+                app.__class__._check_setup_finished = _orig_check
+            else:
+                # Restore Flask's default implementation via import
+                from flask.sansio.app import App as _FlaskBase
+                app.__class__._check_setup_finished = _FlaskBase._check_setup_finished
+        except Exception:
+            pass
 
     def start(self) -> None:
         if self._thread and self._thread.is_alive():
