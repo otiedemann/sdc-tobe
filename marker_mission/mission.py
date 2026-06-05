@@ -678,6 +678,8 @@ def cmd_fly(args: argparse.Namespace) -> int:
         # ── Arena Validator: Track visible markers + 30s history ──────────
         _VALIDATOR_HIST_MAX = 30.0  # seconds to keep historical markers
         _validator_markers = {}  # {mid: {wx, wy, wz, detected_at, last_seen_at, conf, is_visible}}
+        _validator_last_update = 0.0  # time of last state exposure
+        _VALIDATOR_UPDATE_INTERVAL = 0.5  # ~2x per second
         # ──────────────────────────────────────────────────────────────────
 
         # Freeze detection: track last frame timestamp change and restart cooldown.
@@ -1100,8 +1102,10 @@ def cmd_fly(args: argparse.Namespace) -> int:
                                     m['is_visible'] = False
                             for mid in to_delete:
                                 del _validator_markers[mid]
-                            # Expose to state (already holding state.lock).
-                            state.arena_validation_map = dict(_validator_markers)
+                            # Expose to state ~2x per second (already holding state.lock).
+                            if now_val - _validator_last_update >= _VALIDATOR_UPDATE_INTERVAL:
+                                state.arena_validation_map = dict(_validator_markers)
+                                _validator_last_update = now_val
                 # Active target's pose method (or empty if not in view).
                 with state.lock:
                     state.target_pose_method = (
