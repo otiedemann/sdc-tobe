@@ -797,6 +797,13 @@ _video_last_jpeg = b""
 _video_jpeg_lock = threading.Lock()
 _video_streaming = False
 
+# Raw BGR frame for in-proc consumers (InProcMjpegReader).
+# Updated by _video_frame_cb on every Anafi frame; readers wait on the
+# condition so they wake immediately on a new frame instead of polling.
+_video_bgr_latest: Optional["np.ndarray"] = None
+_video_bgr_ts: float = 0.0
+_video_bgr_cond = threading.Condition(threading.Lock())
+
 # ── H.264 fan-out state (sim only) ────────────────────────
 # The sim video producer (_sim_video_loop below) writes raw BGR frames
 # here in addition to its JPEG output, so the /api/video/h264 endpoint
@@ -3489,6 +3496,12 @@ class OlympeBackend(DroneBackend):
                 if _video_frame_count == 1:
                     h, w = cv_frame.shape[:2]
                     print(f"[ANAFI] First video frame: {w}x{h}")
+            # Push raw BGR for in-proc readers (no intermediate JPEG decode).
+            global _video_bgr_latest, _video_bgr_ts
+            with _video_bgr_cond:
+                _video_bgr_latest = cv_frame
+                _video_bgr_ts = time.monotonic()
+                _video_bgr_cond.notify_all()
             # Tap frame for positioning and/or recording (non-blocking — drop if queue full).
             # Feeding the queue when ONLY recording is active ensures the recorder
             # still gets frames even if Position Tracker is disabled.

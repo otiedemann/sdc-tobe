@@ -225,34 +225,45 @@ class InProcMjpegReader:
             }
 
     def _run(self) -> None:
-        backoff = 0.5
+        # Read raw BGR frames directly from the callback-driven condition
+        # variable in unified_api_server. This avoids the JPEG round-trip
+        # (encode→decode) and the fixed-rate sleep in iter_video_jpegs()
+        # that caused both image distortion and high latency.
+        import unified_api_server as _srv
+        last_ts = 0.0
         while not self._stop.is_set():
             try:
-                for jpg in drone_core.iter_video_jpegs():
-                    if self._stop.is_set():
-                        return
-                    self._publish(jpg)
-                # Generator returned cleanly — pipeline is no longer
-                # in mjpeg mode. Wait a beat before trying again so we
-                # don't busy-loop while the operator toggles modes.
-                self._stop.wait(0.5)
-                backoff = 0.5
+                if _srv._video_mode != "mjpeg":
+                    self._stop.wait(0.3)
+                    continue
+                with _srv._video_bgr_cond:
+                    # Wait up to 0.5 s for a new frame notification.
+                    notified = _srv._video_bgr_cond.wait_for(
+                        lambda: _srv._video_bgr_ts != last_ts
+                                or self._stop.is_set(),
+                        timeout=0.5,
+                    )
+                if self._stop.is_set():
+                    return
+                if not notified:
+                    continue  # timeout — loop back and check mode/stop
+                with _srv._video_bgr_cond:
+                    bgr = _srv._video_bgr_latest
+                    ts  = _srv._video_bgr_ts
+                if bgr is None or ts == last_ts:
+                    continue
+                last_ts = ts
+                self._publish_bgr(bgr, ts)
             except Exception as e:
                 with self._lock:
                     self._last_error = str(e)
-                if not self._stop.is_set():
-                    self._stop.wait(min(backoff, 5.0))
-                    backoff = min(backoff * 2, 5.0)
+                self._stop.wait(0.5)
 
-    def _publish(self, jpg: bytes) -> None:
-        arr = np.frombuffer(jpg, dtype=np.uint8)
-        frame = cv2.imdecode(arr, cv2.IMREAD_COLOR)
-        if frame is None:
-            return
+    def _publish_bgr(self, frame: np.ndarray, ts: float) -> None:
         with self._lock:
-            self._latest_jpeg = jpg
             self._latest_frame = frame
-            self._latest_ts = time.monotonic()
+            self._latest_jpeg = None   # encoded on demand by callers that need it
+            self._latest_ts = ts
             self._frames_received += 1
             self._last_error = None
 
