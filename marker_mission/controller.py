@@ -818,6 +818,25 @@ class MissionController:
             self.state.target_relative_heading_deg = (
                 self.cfg.target_relative_heading_deg)
 
+        # Initialise all per-mission scratch state. reset() is only called
+        # between missions, so __init__ must also initialise these so the
+        # very first start() finds a clean controller without AttributeErrors.
+        self._land_requested = False
+        self._descent_started_at = None
+        self._search_start_yaw = None
+        self._search_swept = 0.0
+        self._search_prev_yaw = None
+        self._search_esc_level: int = 0
+        self._search_visited_markers: set = set()
+        self._goto_on_settle_phase = None
+        self._goto_last_wp = None
+        self._goto_jump_until: float = 0.0
+        self._goto_frozen_yaw = None
+        self._goto_scan_state: str = 'fly'
+        self._goto_scan_until: float = 0.0
+        self._approach_start_d = None
+        self._approach_lat_unlocked: bool = False
+
     def apply_config_changes(self) -> None:
         """Re-sync per-instance state that was copied out of cfg at
         construction. Call after the cfg dataclass has been mutated
