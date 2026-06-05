@@ -1153,11 +1153,27 @@ class MissionController:
             try:
                 # Emergency rearm: drone landed unexpectedly. Hold all RC
                 # until telemetry_worker issues re-takeoff and clears flag.
+                # Safety watchdog: if flag is stuck while drone is flying,
+                # clear it automatically after 3 s so the mission resumes.
                 with self.state.lock:
                     rearm = self.state.emergency_rearm
                 if rearm:
+                    tel_now = self._refresh_inputs(now)
+                    flying = (tel_now is not None and tel_now.flying)
+                    if flying:
+                        if not hasattr(self, '_rearm_flying_since'):
+                            self._rearm_flying_since = now
+                        elif now - self._rearm_flying_since > 3.0:
+                            print("[ctrl] emergency_rearm stuck while flying — "
+                                  "force-clearing")
+                            with self.state.lock:
+                                self.state.emergency_rearm = False
+                            self._rearm_flying_since = None
+                    else:
+                        self._rearm_flying_since = None
                     self._send_rc(0, 0, 0, 0)
                     continue
+                self._rearm_flying_since = None
 
                 tel = self._refresh_inputs(now)
 

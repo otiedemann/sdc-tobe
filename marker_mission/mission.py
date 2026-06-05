@@ -516,14 +516,16 @@ def cmd_fly(args: argparse.Namespace) -> int:
         # the first time the drone appears -- so the operator can plug
         # the drone in AFTER starting mission and the video feed kicks
         # in automatically.
-        REARM_WAIT_S  = 3.0   # seconds after landing before re-takeoff attempt
-        REARM_TIMEOUT = 120.0 # give up + land safely after this many seconds
+        REARM_WAIT_S      = 3.0   # seconds after confirmed landing before re-takeoff
+        REARM_TIMEOUT     = 120.0 # give up + stop after this many seconds
+        NOT_FLYING_STREAK = 3     # consecutive not-flying readings to confirm landing
         period = 0.25
         was_connected = initially_connected
         video_started = initially_connected
-        video_retry_after: float = 0.0   # monotonic: don't retry before this
+        video_retry_after: float = 0.0
         was_flying = False
-        emergency_land_at: float = 0.0   # monotonic when unexpected landing detected
+        not_flying_count = 0      # consecutive ticks with flying=False during active flight
+        emergency_land_at: float = 0.0
         in_emergency_rearm = False
         takeoff_retry_after: float = 0.0
         while not stop.is_set():
@@ -537,22 +539,43 @@ def cmd_fly(args: argparse.Namespace) -> int:
                 flying_now = False
             ui.drone_connected = connected_now
 
-            # ── Unexpected landing detection ───────────────────────────────
-            if was_flying and not flying_now and not in_emergency_rearm:
+            # ── Emergency rearm: clear immediately if drone is flying ──────
+            # Always check first so a WLAN blip that triggered rearm gets
+            # cleared the moment we see flying=True again.
+            if in_emergency_rearm and flying_now:
+                print("[mission] drone is flying — clearing emergency rearm, "
+                      "resuming mission")
+                with state.lock:
+                    state.emergency_rearm = False
+                    state.note = "mission resumed after re-takeoff"
+                in_emergency_rearm = False
+                not_flying_count = 0
+
+            # ── Unexpected landing detection (require N consecutive ticks) ─
+            # Require NOT_FLYING_STREAK consecutive not-flying readings so a
+            # brief telemetry exception during WLAN blip doesn't falsely
+            # trigger rearm while the drone is still in the air.
+            if not flying_now and not in_emergency_rearm:
                 with state.lock:
                     active_phase = state.phase
                 if active_phase not in NON_AIRBORNE_PHASES:
-                    print(f"[mission] WARN: drone landed unexpectedly during "
-                          f"phase '{active_phase.value}' — pausing, will re-takeoff")
-                    emergency_land_at = time.monotonic()
-                    in_emergency_rearm = True
-                    takeoff_retry_after = emergency_land_at + REARM_WAIT_S
-                    with state.lock:
-                        state.emergency_rearm = True
-                        state.note = "emergency rearm: waiting to re-takeoff"
+                    not_flying_count += 1
+                    if not_flying_count >= NOT_FLYING_STREAK:
+                        print(f"[mission] WARN: drone confirmed landed during "
+                              f"phase '{active_phase.value}' — will re-takeoff")
+                        emergency_land_at = time.monotonic()
+                        in_emergency_rearm = True
+                        takeoff_retry_after = emergency_land_at + REARM_WAIT_S
+                        with state.lock:
+                            state.emergency_rearm = True
+                            state.note = "emergency rearm: waiting to re-takeoff"
+                else:
+                    not_flying_count = 0
+            elif flying_now:
+                not_flying_count = 0
 
             # ── Re-takeoff logic ───────────────────────────────────────────
-            if in_emergency_rearm:
+            if in_emergency_rearm and not flying_now:
                 elapsed = time.monotonic() - emergency_land_at
                 if elapsed > REARM_TIMEOUT:
                     print("[mission] emergency rearm timeout — stopping mission")
@@ -560,14 +583,7 @@ def cmd_fly(args: argparse.Namespace) -> int:
                         state.emergency_rearm = False
                     stop.set()
                     in_emergency_rearm = False
-                elif flying_now:
-                    # Re-takeoff succeeded (drone is flying again)
-                    print("[mission] re-takeoff confirmed — resuming mission")
-                    with state.lock:
-                        state.emergency_rearm = False
-                        state.note = "mission resumed after re-takeoff"
-                    in_emergency_rearm = False
-                elif (connected_now and not flying_now
+                elif (connected_now
                       and time.monotonic() >= takeoff_retry_after):
                     print(f"[mission] attempting re-takeoff "
                           f"({elapsed:.0f}s after unexpected landing)...")
