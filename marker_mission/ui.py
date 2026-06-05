@@ -135,23 +135,24 @@ _PAGE_HEADER = """
     <a href="/settings" class="{{ 'active' if active=='settings' else '' }}">Settings</a>
     <a href="/hardware" class="{{ 'active' if active=='hardware' else '' }}">Hardware</a>
   </nav>
-  <div id="wlan-info" style="font-size:.72rem; color:#bbb; line-height:1.5;
-       font-family:monospace; white-space:nowrap;
-       border:1px solid #444; border-radius:4px; padding:4px 8px;
-       margin-left:200px;">—</div>
-  <div id="header-drone-state"
-       style="font-size:.72rem; font-family:monospace; white-space:nowrap;
-              border:1px solid #444; border-radius:4px; padding:4px 8px;
-              margin-left:.6rem; line-height:1.5; color:#bbb;">—</div>
-  <div id="header-battery"
-       style="font-size:16px; font-weight:700; font-family:monospace;
-              white-space:nowrap; margin-left:1rem;">—</div>
+  <div style="margin-left:auto; display:flex; align-items:center; gap:.6rem;">
+    <div id="wlan-info" style="font-size:.72rem; color:#bbb; line-height:1.5;
+         font-family:monospace; white-space:nowrap;
+         border:1px solid #444; border-radius:4px; padding:4px 8px;">—</div>
+    <div id="header-drone-state"
+         style="font-size:.72rem; font-family:monospace; white-space:nowrap;
+                border:1px solid #444; border-radius:4px; padding:4px 8px;
+                line-height:1.5; color:#bbb;">—</div>
+    <div id="header-battery"
+         style="font-size:16px; font-weight:700; font-family:monospace;
+                white-space:nowrap;">—</div>
+  </div>
   <div id="cam-restart-count" title="Auto camera restarts (freeze detection)"
        style="font-size:.72rem; color:#aab; font-family:monospace;
               margin-left:.6rem; white-space:nowrap; display:none;">
     ↺ <span id="cam-restart-n">0</span>
   </div>
-  <span style="margin-left:auto; font-size:.85rem; color:#aab;"
+  <span style="font-size:.85rem; color:#aab;"
         id="phase">{{ header_label or 'phase: …' }}</span>
   <span style="font-size:.75rem; color:#555; font-family:monospace;"
         title="software version">{{ git_sha }}</span>

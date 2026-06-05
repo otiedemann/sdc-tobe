@@ -520,14 +520,27 @@ def cmd_fly(args: argparse.Namespace) -> int:
         was_connected = initially_connected
         video_started = initially_connected
         video_retry_after: float = 0.0   # monotonic: don't retry before this
+        was_flying = False
         while not stop.is_set():
             try:
                 tel = api.telemetry()
                 tel_holder.set(tel)
                 connected_now = bool(tel.connected)
+                flying_now = bool(tel.flying)
             except Exception:
                 connected_now = False
+                flying_now = False
             ui.drone_connected = connected_now
+            # Detect unexpected landing during active flight: if drone was
+            # flying but now reports landed, and mission is airborne, abort.
+            if was_flying and not flying_now:
+                with state.lock:
+                    active_phase = state.phase
+                if active_phase not in NON_AIRBORNE_PHASES:
+                    print(f"[mission] drone landed unexpectedly during phase "
+                          f"'{active_phase.value}' — aborting mission")
+                    stop.set()  # signal all workers to stop cleanly
+            was_flying = flying_now
             if connected_now and not was_connected:
                 print("[mission] drone connected (was offline at startup) "
                       "-- starting video stream")
