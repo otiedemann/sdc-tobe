@@ -602,6 +602,8 @@ class MissionState:
     # analysis can plot the KF velocity track without re-running the
     # offline replay.
     world_velocity_m_kf: Optional[tuple[float, float, float]] = None
+    camera_restart_count: int = 0   # auto-restarts triggered by freeze detection
+    world_position_confidence: float = 0.0   # base confidence from last estimate
     # solvePnP method for the controller's active TARGET marker
     # (whatever pose_holder.get() returned this tick). "" when the
     # target marker isn't currently in view.
@@ -732,6 +734,14 @@ class MissionState:
                 "world_velocity_m_kf": (list(self.world_velocity_m_kf)
                                         if self.world_velocity_m_kf is not None
                                         else None),
+                "camera_restart_count": self.camera_restart_count,
+                "world_position_confidence": round(
+                    self.world_position_confidence
+                    * max(0.0, 1.0 - (
+                        (time.monotonic() - self.world_position_updated_at)
+                        / 10.0
+                        if self.world_position_updated_at > 0 else 10.0)),
+                    3),
                 "target_pose_method": self.target_pose_method,
                 "arena_yaw_deg": self.arena_yaw_deg,
                 "arena_yaw_age_s": (
@@ -881,6 +891,12 @@ class MissionController:
         self._search_esc_level: int = 0          # 0=1x/full, 1=2x/half, 2+=navigate
         self._search_visited_markers: set = set()  # wall-marker IDs already navigated to
         self._goto_on_settle_phase: Optional[Phase] = None  # override post-GOTO transition
+        self._goto_last_wp: Optional[tuple] = None    # last accepted world pos in GOTO
+        self._goto_jump_until: float = 0.0            # stop+reorient until this monotonic time
+        # Scan-pause state machine (periodic 360° scan during GOTO)
+        # States: 'fly' | 'scan' | 'realign'
+        self._goto_scan_state: str = 'fly'
+        self._goto_scan_until: float = 0.0   # end of current scan/realign phase
         self._approach_start_d: Optional[float] = None
         self._approach_lat_unlocked: bool = False
         self.state.reset(self.cfg)
@@ -963,6 +979,11 @@ class MissionController:
         if phase == Phase.APPROACH:
             self._approach_start_d = None
             self._approach_lat_unlocked = False
+        if phase == Phase.GOTO:
+            self._goto_last_wp = None
+            self._goto_jump_until = 0.0
+            self._goto_scan_state = 'fly'
+            self._goto_scan_until = 0.0
         if phase == Phase.SEARCH:
             self._search_start_yaw = None
             self._search_swept = 0.0
@@ -1896,7 +1917,9 @@ class MissionController:
 
         if not braking:
             # ── DRIVE phase ─────────────────────────────────────────
-            self._send_rc(lr, fb, ud, yaw, enforce_cfg_caps=False)
+            spd = max(0.0, min(1.0, float(getattr(self.cfg, "goto_speed_factor", 1.0))))
+            self._send_rc(int(lr * spd), int(fb * spd), int(ud * spd),
+                          int(yaw * spd), enforce_cfg_caps=False)
             with self.state.lock:
                 remain = (until - now) if until is not None else None
                 self.state.note = (
@@ -2787,23 +2810,51 @@ class MissionController:
 
         wp_age = (now - wp_at) if wp_at > 0.0 else None
         yaw_age = (now - yaw_at) if yaw_at > 0.0 else None
-        fresh = (wp is not None and wp_age is not None
-                 and wp_age <= cfg.pose_max_age_s
-                 and yaw_arena is not None and yaw_age is not None
-                 and yaw_age <= cfg.pose_max_age_s)
+        wp_fresh = (wp is not None and wp_age is not None
+                    and wp_age <= cfg.pose_max_age_s)
+        yaw_fresh = (yaw_arena is not None and yaw_age is not None
+                     and yaw_age <= cfg.pose_max_age_s)
+        # Only require yaw freshness when a yaw target is set; without
+        # a yaw target the drone tracks x/y only, and a stale arena_yaw
+        # was resetting settle_began_at every tick, preventing settle.
+        fresh = wp_fresh and (t_yaw is None or yaw_fresh)
         if not fresh:
-            # Position / yaw lost -- yaw in place to bring a marker
-            # back into view. Reset settle timer so we don't latch a
-            # spurious "arrived" while drifting unobserved.
-            self._send_rc(0, 0, 0, cfg.search_yaw_rc,
-                          enforce_cfg_caps=False)
+            # Position lost — stop translation but keep rotating with
+            # scan_yaw so arena markers come back into view.
+            scan_yaw_stale = int(getattr(cfg, "goto_scan_yaw_rc", 0))
+            self._send_rc(0, 0, 0, scan_yaw_stale, enforce_cfg_caps=False)
             with self.state.lock:
                 self.state.settle_began_at = None
                 age_txt = (f"{wp_age:.1f}s" if wp_age is not None
                            else "never")
                 self.state.note = (f"GOTO: position stale ({age_txt}) "
-                                   f"-- searching")
+                                   f"-- scanning for markers")
             return
+
+        # Position-jump guard: if the measured position jumped more than
+        # _GOTO_JUMP_MAX_M in one tick, it's a bad IPPE branch flip.
+        # Stop the drone and yaw-scan for _GOTO_JUMP_REORIENT_S seconds
+        # to re-acquire stable marker references.
+        _GOTO_JUMP_MAX_M   = 2.0
+        _GOTO_JUMP_REORIENT_S = 3.0
+        scan_yaw_rc = int(getattr(cfg, "goto_scan_yaw_rc", 0))
+        if self._goto_last_wp is not None and wp is not None:
+            dx_jump = abs(wp[0] - self._goto_last_wp[0])
+            dy_jump = abs(wp[1] - self._goto_last_wp[1])
+            if math.hypot(dx_jump, dy_jump) > _GOTO_JUMP_MAX_M:
+                self._goto_jump_until = now + _GOTO_JUMP_REORIENT_S
+                print(f"[ctrl] GOTO: position jump "
+                      f"{math.hypot(dx_jump,dy_jump):.2f}m — reorienting")
+        if now < self._goto_jump_until:
+            # Re-orient: stop translation, yaw slowly to find markers.
+            self._send_rc(0, 0, 0, scan_yaw_rc, enforce_cfg_caps=False)
+            with self.state.lock:
+                self.state.settle_began_at = None
+                self.state.note = (f"GOTO: jump detected — reorienting "
+                                   f"({self._goto_jump_until - now:.1f}s)")
+            return
+        if wp is not None:
+            self._goto_last_wp = tuple(wp)
 
         ex = tx - wp[0]
         ey = ty - wp[1]
@@ -2847,24 +2898,66 @@ class MissionController:
             # No height telemetry -- skip the leg, treat altitude as
             # already-OK rather than blocking the step forever.
 
-        # Optional yaw leg. Drives drone arena yaw to t_yaw. Uses
-        # state.arena_yaw_deg (already published by vision_worker)
-        # which is fresh by the time we got here -- the freshness
-        # gate above failed if it weren't.
+        # Yaw leg disabled during normal flight.
         u_yaw = 0.0
         e_yaw = 0.0
         yaw_ok = True
-        if t_yaw is not None and yaw_arena is not None:
-            e_yaw = ((float(t_yaw) - float(yaw_arena) + 540.0) % 360.0
-                     - 180.0)
-            u_yaw = (0.0 if abs(e_yaw) < cfg.yaw_deadband_deg
-                     else self.pd_yaw.step(e_yaw, now))
-            yaw_ok = abs(e_yaw) < cfg.yaw_deadband_deg
 
-        self._send_rc(int(u_lat), int(u_fwd), int(u_ud), int(u_yaw))
+        spd = max(0.0, min(1.0, float(getattr(cfg, "goto_speed_factor", 1.0))))
+        scan_yaw_rc = int(getattr(cfg, "goto_scan_yaw_rc", 0))
+        _SCAN_DUR_S    = 2.0   # seconds of yaw scan per pause
+        _REALIGN_DUR_S = 1.5   # seconds of re-alignment after scan
+        _CONF_THRESHOLD = 0.3  # trigger scan when confidence drops below this
+
+        if self._goto_scan_state == 'scan':
+            if now >= self._goto_scan_until:
+                self._goto_scan_state = 'realign'
+                self._goto_scan_until = now + _REALIGN_DUR_S
+            else:
+                self._send_rc(0, 0, 0, scan_yaw_rc, enforce_cfg_caps=False)
+                with self.state.lock:
+                    self.state.note = (f"GOTO: scan pause "
+                                       f"({self._goto_scan_until-now:.1f}s)")
+                return
+        elif self._goto_scan_state == 'realign':
+            if now >= self._goto_scan_until:
+                self._goto_scan_state = 'fly'
+            else:
+                if yaw_arena is not None:
+                    target_heading = math.degrees(math.atan2(ex, ey))
+                    e_align = ((target_heading - yaw_arena + 540.0)
+                               % 360.0 - 180.0)
+                    align_rc = max(-scan_yaw_rc,
+                                   min(scan_yaw_rc, int(e_align * 0.5)))
+                else:
+                    align_rc = 0
+                self._send_rc(0, 0, 0, align_rc, enforce_cfg_caps=False)
+                with self.state.lock:
+                    self.state.note = (f"GOTO: realigning "
+                                       f"({self._goto_scan_until-now:.1f}s)")
+                return
+        else:  # 'fly'
+            # Trigger scan when confidence drops below threshold.
+            with self.state.lock:
+                conf = self.state.world_position_confidence
+            if conf < _CONF_THRESHOLD:
+                self._goto_scan_state = 'scan'
+                self._goto_scan_until = now + _SCAN_DUR_S
+                self._send_rc(0, 0, 0, 0)
+                with self.state.lock:
+                    self.state.note = (f"GOTO: low confidence ({conf:.2f})"
+                                       f" — scanning")
+                return
+            # Normal flight — no continuous yaw.
+            self._send_rc(int(u_lat * spd), int(u_fwd * spd),
+                          int(u_ud * spd), 0)
 
         e_xy = math.hypot(ex, ey)
-        in_band = e_xy < cfg.goto_deadband_m and height_ok and yaw_ok
+        # Settle uses per-axis box (|ex| < deadband AND |ey| < deadband)
+        # instead of Euclidean radius so the tolerance is symmetric in x/y.
+        in_band = (abs(ex) < cfg.goto_deadband_m
+                   and abs(ey) < cfg.goto_deadband_m
+                   and height_ok and yaw_ok)
         settled = False
         with self.state.lock:
             z_txt = (f"  z_e={e_h:+.2f}m" if tz is not None else "")
@@ -2876,11 +2969,11 @@ class MissionController:
                 f"{mode_txt}: at ({wp[0]:.2f},{wp[1]:.2f},{wp[2]:.2f})m "
                 f"-> ({tx:.2f},{ty:.2f}"
                 f"{(',' + format(tz, '.2f')) if tz is not None else ''})m"
-                f"  e_xy={e_xy:.2f}m{z_txt}{yaw_txt}")
+                f"  ex={ex:+.2f}m ey={ey:+.2f}m{z_txt}{yaw_txt}")
             if in_band:
                 if self.state.settle_began_at is None:
                     self.state.settle_began_at = now
-                if now - self.state.settle_began_at >= cfg.height_settle_time_s:
+                if now - self.state.settle_began_at >= cfg.approach_settle_time_s:
                     settled = True
             else:
                 self.state.settle_began_at = None
@@ -3378,9 +3471,12 @@ class MissionController:
                 yaw_target = float(yaw_arg)
                 yaw_src = "explicit"
             else:
-                yaw_target = self._best_view_yaw_deg(tx, ty)
-                yaw_src = ("auto" if yaw_target is not None
-                           else "auto-skipped")
+                # No explicit yaw: keep current heading so the settle
+                # condition (xy + height) fires without waiting for yaw.
+                # The best-view heuristic caused 90°+ residual errors that
+                # prevented settling entirely when goto_speed_factor is low.
+                yaw_target = None
+                yaw_src = "keep"
             with self.state.lock:
                 self.state.goto_target_x_m = tx
                 self.state.goto_target_y_m = ty

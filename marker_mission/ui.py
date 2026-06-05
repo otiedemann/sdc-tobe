@@ -137,7 +137,16 @@ _PAGE_HEADER = """
   </nav>
   <div id="wlan-info" style="font-size:.72rem; color:#bbb; line-height:1.5;
        font-family:monospace; white-space:nowrap;
-       border:1px solid #444; border-radius:4px; padding:4px 8px;">—</div>
+       border:1px solid #444; border-radius:4px; padding:4px 8px;
+       margin-left:200px;">—</div>
+  <div id="header-battery"
+       style="font-size:16px; font-weight:700; font-family:monospace;
+              white-space:nowrap; margin-left:1rem;">—</div>
+  <div id="cam-restart-count" title="Auto camera restarts (freeze detection)"
+       style="font-size:.72rem; color:#aab; font-family:monospace;
+              margin-left:.6rem; white-space:nowrap; display:none;">
+    ↺ <span id="cam-restart-n">0</span>
+  </div>
   <span style="margin-left:auto; font-size:.85rem; color:#aab;"
         id="phase">{{ header_label or 'phase: …' }}</span>
   <span style="font-size:.75rem; color:#555; font-family:monospace;"
@@ -314,12 +323,12 @@ _VIDEO_AND_STATUS_HTML = """
 
 _CHARTS_HTML = """
 <section class="grid" style="grid-template-columns: 1fr 1fr; margin-top: 1rem;">
+  <div class="card"><h2>RC commands (lr / fb / ud / yaw)</h2><canvas id="c-rc" width="700" height="200"></canvas></div>
+  <div class="card"><h2>Drone telemetry (yaw / battery / height)</h2><canvas id="c-t" width="700" height="200"></canvas></div>
   <div class="card"><h2>Distance to marker (m)</h2><canvas id="c-d" width="700" height="200"></canvas></div>
   <div class="card"><h2>Yaw to marker (°)</h2><canvas id="c-y" width="700" height="200"></canvas></div>
   <div class="card"><h2>Relative heading (°)</h2><canvas id="c-h" width="700" height="200"></canvas></div>
   <div class="card"><h2>Battery (%)</h2><canvas id="c-bat" width="700" height="200"></canvas></div>
-  <div class="card"><h2>Drone telemetry (yaw / battery / height)</h2><canvas id="c-t" width="700" height="200"></canvas></div>
-  <div class="card"><h2>RC commands (lr / fb / ud / yaw)</h2><canvas id="c-rc" width="700" height="200"></canvas></div>
 </section>
 """
 
@@ -1186,31 +1195,37 @@ function drawPositionView(s) {
       }
     });
   }
-  // Drone position + heading arrow. Dot colour matches the
-  // sidebar's wpAgeColor: fresh = green, stale = yellow/red, so
-  // the operator can spot a frozen position even at a glance.
+  // Drone position + heading arrow — same style as the /arena tab:
+  // cyan circle (fresh) or grey+transparent (stale >2s), coordinate
+  // label, heading arrow with arrowhead.
   const pos = s.world_position_m;
   const txt = $('c-pos-text');
   if (Array.isArray(pos) && pos.length === 3) {
     const dx = ax(pos[0]), dy = ay(pos[1]);
     const age = s.world_position_age_s;
-    const dotCol = (typeof age !== 'number' || age < 1.0) ? '#4ade80'
-                 : (age < 3.0) ? '#facc15'
-                 : '#f87171';
-    ctx.fillStyle = dotCol;
-    ctx.beginPath(); ctx.arc(dx, dy, 5, 0, 2*Math.PI); ctx.fill();
+    const stale = (typeof age === 'number' && age > 2.0);
+    const col  = stale ? '#888'   : '#38bdf8';
+    const bord = stale ? '#555'   : '#0ea5e9';
+    // filled circle
+    ctx.globalAlpha = stale ? 0.5 : 0.85;
+    ctx.fillStyle = col;
+    ctx.beginPath(); ctx.arc(dx, dy, 6, 0, 2*Math.PI); ctx.fill();
+    ctx.globalAlpha = 1.0;
+    ctx.strokeStyle = bord; ctx.lineWidth = 1.5;
+    ctx.beginPath(); ctx.arc(dx, dy, 6, 0, 2*Math.PI); ctx.stroke();
+    // heading arrow
     const yawArena = _droneYawArena(s);
     let yawTxt = '—';
     if (yawArena !== null) {
       const yawRad = yawArena * Math.PI / 180;
-      const L = 18;
+      const L = Math.min(20, pxPerM * 0.7);
       const ex = dx + L * Math.sin(yawRad);
-      const ey = dy - L * Math.cos(yawRad);     // canvas y flipped
-      ctx.strokeStyle = '#4ade80'; ctx.lineWidth = 2;
+      const ey = dy - L * Math.cos(yawRad);
+      ctx.strokeStyle = col; ctx.lineWidth = 2;
       ctx.beginPath(); ctx.moveTo(dx, dy); ctx.lineTo(ex, ey); ctx.stroke();
       const ang = Math.atan2(ey - dy, ex - dx);
       const HEAD = 5;
-      ctx.fillStyle = '#4ade80';
+      ctx.fillStyle = col;
       ctx.beginPath();
       ctx.moveTo(ex, ey);
       ctx.lineTo(ex - HEAD * Math.cos(ang - Math.PI/6),
@@ -1221,15 +1236,50 @@ function drawPositionView(s) {
       const norm = ((yawArena % 360) + 540) % 360 - 180;
       yawTxt = norm.toFixed(1) + '°';
     }
+    // velocity vector arrow
+    const vel = s.world_velocity_m_kf;
+    if (Array.isArray(vel) && !stale) {
+      const vx = vel[0], vy = vel[1];
+      const speed = Math.hypot(vx, vy);
+      if (speed > 0.05) {
+        const VEL_SCALE = pxPerM * 0.75;
+        const vex = dx + vx * VEL_SCALE;
+        const vey = dy - vy * VEL_SCALE;
+        ctx.strokeStyle = '#fb923c'; ctx.lineWidth = 1.5;
+        ctx.beginPath(); ctx.moveTo(dx, dy); ctx.lineTo(vex, vey); ctx.stroke();
+        const ang = Math.atan2(vey - dy, vex - dx);
+        const HEAD = 5;
+        ctx.fillStyle = '#fb923c';
+        ctx.beginPath();
+        ctx.moveTo(vex, vey);
+        ctx.lineTo(vex - HEAD * Math.cos(ang - Math.PI/6),
+                   vey - HEAD * Math.sin(ang - Math.PI/6));
+        ctx.lineTo(vex - HEAD * Math.cos(ang + Math.PI/6),
+                   vey - HEAD * Math.sin(ang + Math.PI/6));
+        ctx.closePath(); ctx.fill();
+      }
+    }
+
+    // sidebar text
     if (txt) {
       const n = (s.world_position_used_markers || []).length;
       const ageCol = wpAgeColor(age) || '#e6e6e6';
       const ageTxt = (typeof age === 'number')
         ? `${age.toFixed(1)} s ago` : 'no fix yet';
+      const speedStr = (Array.isArray(vel) && !stale)
+        ? `speed: <b style="color:#fb923c;">${Math.hypot(vel[0],vel[1]).toFixed(2)} m/s</b><br>`
+        : '';
+      const conf = s.world_position_confidence;
+      const confCol = (typeof conf==='number')
+        ? (conf>=0.7?'#4ade80':conf>=0.4?'#facc15':'#f87171') : '#555';
+      const confTxt = (typeof conf==='number')
+        ? `confidence: <b style="color:${confCol};">${(conf*100).toFixed(0)} %</b><br>` : '';
       txt.innerHTML = `x: <b style="color:#e6e6e6;">${pos[0].toFixed(2)}</b> m<br>`
                     + `y: <b style="color:#e6e6e6;">${pos[1].toFixed(2)}</b> m<br>`
                     + `z: <b style="color:#e6e6e6;">${pos[2].toFixed(2)}</b> m<br>`
                     + `yaw: <b style="color:#e6e6e6;">${yawTxt}</b><br>`
+                    + `${speedStr}`
+                    + `${confTxt}`
                     + `n markers: ${n}<br>`
                     + `age: <b style="color:${ageCol};">${ageTxt}</b>`;
     }
@@ -1470,8 +1520,43 @@ async function refresh() {
     }
     const r = await fetch(STATE_URL, {cache:'no-store'});
     const s = await r.json();
+    // Battery in header
+    {
+      const tel = s.telemetry || {};
+      const bat = tel.battery;
+      const el = $('header-battery');
+      if (el) {
+        if (bat !== undefined && bat !== null) {
+          const col = bat < 20 ? '#f87171' : bat < 35 ? '#facc15' : '#4ade80';
+          el.textContent = bat + ' %';
+          el.style.color = col;
+        } else {
+          el.textContent = '—';
+          el.style.color = '#555';
+        }
+      }
+    }
+    if (typeof s.camera_restart_count === 'number') {
+      const n = s.camera_restart_count;
+      const el = $('cam-restart-count');
+      const nel = $('cam-restart-n');
+      if (el && nel) {
+        nel.textContent = n;
+        el.style.display = n > 0 ? '' : 'none';
+        el.style.color = n > 2 ? '#f87171' : '#facc15';
+      }
+    }
     if (typeof s.drone_connected === 'boolean') {
+      const wasConnected = droneConnected;
       droneConnected = s.drone_connected;
+      if (wasConnected !== droneConnected) {
+        // Connection changed — clear the WLAN panel immediately and
+        // re-fetch so the "no drone" notice appears/disappears at once.
+        window._lastWlanUpdate = null;
+        const wlanEl = $('wlan-info');
+        if (wlanEl) wlanEl.innerHTML = '—';
+        refreshWlan();
+      }
     }
     $('phase').textContent = (REPLAY_ID ? 'replay phase: ' : 'phase: ') + s.phase;
     updateStatus(s);
@@ -1488,33 +1573,40 @@ async function refresh() {
   } catch (e) {}
   // WLAN info: refresh every ~2 s, not every 250 ms
   if (!window._lastWlanUpdate || Date.now() - window._lastWlanUpdate > 2000) {
-    try {
-      const wr = await fetch('/api/wlan', {cache:'no-store'});
-      const winfo = await wr.json();
-      const wlanEl = $('wlan-info');
-      if (wlanEl && winfo) {
-        let wlanText = '—';
-        for (const [iface, info] of Object.entries(winfo)) {
-          if (iface.startsWith('wl') && info.ssid && info.signal_dbm) {
-            const lines = [];
-            lines.push(`<strong>${info.ssid}</strong>`);
-            lines.push(`Signal: ${info.signal_dbm} dBm`);
-            if (info.link_quality) lines.push(`Quality: ${info.link_quality}%`);
-            if (info.frequency)   lines.push(`Freq: ${info.frequency}`);
-            if (info.band)        lines.push(`Band: ${info.band}`);
-            if (info.bit_rate)    lines.push(`Rate: ${info.bit_rate}`);
-            if (info.tx_power)    lines.push(`TX: ${info.tx_power}`);
-            if (info.mode)        lines.push(`Mode: ${info.mode}`);
-            wlanText = lines.join('<br>');
-            break;
-          }
-        }
-        wlanEl.innerHTML = wlanText;
-        window._lastWlanUpdate = Date.now();
-      }
-    } catch (e) {}
+    refreshWlan();
   }
   setTimeout(refresh, 250);
+}
+async function refreshWlan() {
+  try {
+    const wr = await fetch('/api/wlan', {cache:'no-store'});
+    const winfo = await wr.json();
+    const wlanEl = $('wlan-info');
+    if (wlanEl && winfo) {
+      let wlanText = '—';
+      for (const [iface, info] of Object.entries(winfo)) {
+        if (iface.startsWith('wl') && info.ssid && info.signal_dbm) {
+          const lines = [];
+          lines.push(`<strong>${info.ssid}</strong>`);
+          lines.push(`Signal: ${info.signal_dbm} dBm`);
+          if (info.link_quality) lines.push(`Quality: ${info.link_quality}%`);
+          if (info.frequency)   lines.push(`Freq: ${info.frequency}`);
+          if (info.band)        lines.push(`Band: ${info.band}`);
+          if (info.bit_rate)    lines.push(`Rate: ${info.bit_rate}`);
+          if (info.tx_power)    lines.push(`TX: ${info.tx_power}`);
+          if (info.mode)        lines.push(`Mode: ${info.mode}`);
+          wlanText = lines.join('<br>');
+          break;
+        }
+      }
+      if (!droneConnected) {
+        const noConn = '<span style="color:#f87171;">⚠ Keine Drohne verbunden</span>';
+        wlanText = wlanText !== '—' ? wlanText + '<br>' + noConn : noConn;
+      }
+      wlanEl.innerHTML = wlanText;
+      window._lastWlanUpdate = Date.now();
+    }
+  } catch (e) {}
 }
 // Paint the correct Start/Stop state from the server-rendered phase
 // before the first /api/state lands. Otherwise mid-flight refreshes
@@ -2980,6 +3072,9 @@ _PAGE_ARENA = _PAGE_BASE_CSS + _PAGE_HEADER + _COMMON_SCRIPT + _PAGE_GRID_OPEN +
       <canvas id="c-arena" width="700" height="700"
               style="background:#0c0f12; border-radius:6px;
                      width:100%; height:auto;"></canvas>
+      <div id="arena-drone-pos"
+           style="margin-top:.4rem; font-size:.8rem; font-family:monospace;
+                  color:#7dd3fc; min-height:1.2em;">—</div>
     </div>
 
   </section>
@@ -3365,6 +3460,92 @@ function drawArena() {
                  x + 9, y + 4);
     ctx.textAlign = 'center';
   });
+
+  // ── Drone position ─────────────────────────────────────────────────
+  if (_dronePos && typeof _dronePos.wx === 'number' && typeof _dronePos.wy === 'number') {
+    const dx = ax(_dronePos.wx);
+    const dy = ay(_dronePos.wy);
+    const stale = (_dronePos.age || 0) > 2.0;
+    const col = stale ? '#888' : '#38bdf8';   // grey when stale, cyan when fresh
+
+    // filled circle
+    ctx.beginPath();
+    ctx.arc(dx, dy, 8, 0, 2 * Math.PI);
+    ctx.fillStyle = col;
+    ctx.globalAlpha = stale ? 0.5 : 0.85;
+    ctx.fill();
+    ctx.globalAlpha = 1.0;
+    ctx.strokeStyle = stale ? '#555' : '#0ea5e9';
+    ctx.lineWidth = 2;
+    ctx.stroke();
+
+    // heading arrow (arena_yaw_deg: CW from +y / front wall)
+    if (typeof _dronePos.yaw === 'number') {
+      const yawRad = _dronePos.yaw * Math.PI / 180;
+      // +y = front = up on canvas, CW = positive → rotate CCW in canvas coords
+      const arrowLen = Math.min(28, px_per_m * 0.7);
+      const hx = dx + arrowLen * Math.sin(yawRad);
+      const hy = dy - arrowLen * Math.cos(yawRad);
+      ctx.strokeStyle = col; ctx.lineWidth = 2;
+      ctx.beginPath(); ctx.moveTo(dx, dy); ctx.lineTo(hx, hy); ctx.stroke();
+      const ang = Math.atan2(hy - dy, hx - dx);
+      ctx.fillStyle = col;
+      ctx.beginPath();
+      ctx.moveTo(hx, hy);
+      ctx.lineTo(hx - 7 * Math.cos(ang - Math.PI/6), hy - 7 * Math.sin(ang - Math.PI/6));
+      ctx.lineTo(hx - 7 * Math.cos(ang + Math.PI/6), hy - 7 * Math.sin(ang + Math.PI/6));
+      ctx.closePath(); ctx.fill();
+    }
+
+    // velocity vector arrow (arena-frame, m/s → pixels)
+    if (_dronePos.vel && !stale) {
+      const vx = _dronePos.vel[0], vy = _dronePos.vel[1];
+      const speed = Math.hypot(vx, vy);
+      if (speed > 0.05) {
+        const VEL_SCALE = px_per_m * 0.75;  // 1 m/s → 0.75 × px_per_m pixels
+        const vex = dx + vx * VEL_SCALE;
+        const vey = dy - vy * VEL_SCALE;   // canvas y flipped
+        ctx.strokeStyle = '#fb923c'; ctx.lineWidth = 2;
+        ctx.beginPath(); ctx.moveTo(dx, dy); ctx.lineTo(vex, vey); ctx.stroke();
+        const ang = Math.atan2(vey - dy, vex - dx);
+        const HEAD = 6;
+        ctx.fillStyle = '#fb923c';
+        ctx.beginPath();
+        ctx.moveTo(vex, vey);
+        ctx.lineTo(vex - HEAD * Math.cos(ang - Math.PI/6),
+                   vey - HEAD * Math.sin(ang - Math.PI/6));
+        ctx.lineTo(vex - HEAD * Math.cos(ang + Math.PI/6),
+                   vey - HEAD * Math.sin(ang + Math.PI/6));
+        ctx.closePath(); ctx.fill();
+      }
+    }
+
+    // label shown in the div below the canvas, not on the canvas itself
+    const posDiv = $('arena-drone-pos');
+    if (posDiv) {
+      const ageStr = stale
+        ? ` <span style="color:#888">(${_dronePos.age.toFixed(0)}s alt)</span>`
+        : '';
+      const col = stale ? '#888' : '#7dd3fc';
+      const speedStr = (_dronePos.vel && !stale)
+        ? `&nbsp;&nbsp;v: <b>${Math.hypot(_dronePos.vel[0],_dronePos.vel[1]).toFixed(2)} m/s</b>`
+        : '';
+      const conf = _dronePos.conf;
+      const confStr = (conf != null)
+        ? `&nbsp;&nbsp;conf: <b style="color:${conf>=0.7?'#4ade80':conf>=0.4?'#facc15':'#f87171'};">${(conf*100).toFixed(0)}%</b>`
+        : '';
+      posDiv.innerHTML =
+        `<span style="color:${col};">` +
+        `x: <b>${_dronePos.wx.toFixed(2)} m</b>` +
+        `&nbsp;&nbsp;y: <b>${_dronePos.wy.toFixed(2)} m</b>` +
+        (_dronePos.wz != null ? `&nbsp;&nbsp;z: <b>${_dronePos.wz.toFixed(2)} m</b>` : '') +
+        (_dronePos.yaw != null ? `&nbsp;&nbsp;yaw: <b>${((((_dronePos.yaw%360)+540)%360)-180).toFixed(1)}°</b>` : '') +
+        `${speedStr}${confStr}</span>${ageStr}`;
+    }
+  } else {
+    const posDiv = $('arena-drone-pos');
+    if (posDiv) posDiv.innerHTML = '—';
+  }
 }
 
 async function loadArena() {
@@ -3565,8 +3746,35 @@ $('btn-ar-add').addEventListener('click', () => {
 $('btn-ar-save-as').addEventListener('click', () =>
   saveAs($('ar-save-name').value.trim()));
 
+// ── Live drone position polling ──────────────────────────────────────
+let _dronePos = null;
+async function _refreshDronePos() {
+  try {
+    const r = await fetch('/api/state', {cache:'no-store'});
+    const s = await r.json();
+    const pos = s.world_position_m;
+    if (Array.isArray(pos) && pos.length === 3) {
+      _dronePos = {
+        wx:  pos[0],
+        wy:  pos[1],
+        wz:  pos[2],
+        yaw: (typeof s.arena_yaw_deg === 'number') ? s.arena_yaw_deg : null,
+        age: s.world_position_age_s || 0,
+        vel:  Array.isArray(s.world_velocity_m_kf) ? s.world_velocity_m_kf : null,
+        conf: (typeof s.world_position_confidence === 'number')
+              ? s.world_position_confidence : null,
+      };
+    } else {
+      _dronePos = null;
+    }
+  } catch (e) { _dronePos = null; }
+  drawArena();
+  setTimeout(_refreshDronePos, 250);
+}
+
 loadArena();
 refreshList();
+_refreshDronePos();
 })();
 </script>
 """ + _PAGE_GRID_CLOSE + _SHARED_SCRIPT
@@ -4066,6 +4274,27 @@ class UiServer:
         self._thread: Optional[threading.Thread] = None
 
     # ----------------------------------------------- active mission-script
+    def restart_camera(self) -> list:
+        """Full camera restart: stop → start → reader bounce.
+        Returns a list of error strings (empty = success).
+        Called by the 'Restart Camera' button and on every TAKEOFF."""
+        errors = []
+        if self.api is not None:
+            try:
+                self.api.video_stop()
+            except Exception as e:
+                errors.append(f"video_stop: {e}")
+            try:
+                self.api.video_start_mjpeg()
+            except Exception as e:
+                errors.append(f"video_start_mjpeg: {e}")
+        if self.stream_reader is not None:
+            try:
+                self.stream_reader.restart()
+            except Exception as e:
+                errors.append(f"reader.restart: {e}")
+        return errors
+
     def _write_active_script(self, text: str) -> None:
         """Write ``text`` to the active mission-script draft path.
         Creates the parent directory if needed; raises on IO error.
@@ -5126,26 +5355,7 @@ class UiServer:
         # so the UI can show "frames: N" feedback.
         @app.post("/api/video/restart")
         def api_video_restart():
-            errors = []
-            # 1) Cycle upstream. Both calls are best-effort: if the
-            # unified server is itself down, we still want the local
-            # reader to bounce so the operator gets unstuck the moment
-            # the upstream comes back.
-            if self.api is not None:
-                try:
-                    self.api.video_stop()
-                except Exception as e:
-                    errors.append(f"video_stop: {e}")
-                try:
-                    self.api.video_start_mjpeg()
-                except Exception as e:
-                    errors.append(f"video_start_mjpeg: {e}")
-            # 2) Restart local reader.
-            if self.stream_reader is not None:
-                try:
-                    self.stream_reader.restart()
-                except Exception as e:
-                    errors.append(f"reader.restart: {e}")
+            errors = self.restart_camera()
             stats = (self.stream_reader.stats
                      if self.stream_reader is not None else None)
             return jsonify({"ok": not errors,

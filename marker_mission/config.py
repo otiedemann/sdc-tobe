@@ -139,6 +139,8 @@ class MissionConfig:
     # ArUco alone and produces TO steps that never advance. 30cm is
     # plenty for "be in the home zone".
     goto_deadband_m: float = 0.30          # TUNE
+    goto_speed_factor: float = 0.5         # TUNE  scale all RC channels in TO (0.0–1.0)
+    goto_scan_yaw_rc: int = 8              # TUNE  slow CW yaw during TO for marker visibility (0=off)
     heading_deadband_deg: float = 2.0      # TUNE
     lateral_deadband_m: float = 0.05       # TUNE
 
@@ -634,6 +636,14 @@ TUNING_FIELDS = {
         "label": "goto deadband", "kind": "float", "unit": "m", "step": 0.01,
         "desc": "Deadband used by the TO (arena-frame waypoint) step. Loose by design — APPROACH / ALIGN / HOLD use the tight distance_deadband_m because they track a marker, but TO is a 'rough waypoint' command and 5cm precision from far-wall ArUco is impractical. 0.3m is a good default for 'be in the home zone'.",
     },
+    "goto_speed_factor": {
+        "label": "RC speed factor", "kind": "float", "step": 0.05,
+        "desc": "Scale factor applied to all RC channels (lr/fb/ud/yaw) for TO and raw RC script steps (LR_RC/FB_RC/UD_RC/YAW_RC/RC). 1.0 = full speed, 0.5 = 50% speed. Does not affect autopilot phases (APPROACH/ALIGN/HOLD/SEARCH).",
+    },
+    "goto_scan_yaw_rc": {
+        "label": "TO scan yaw RC", "kind": "int", "step": 1,
+        "desc": "Slow CW yaw stick applied continuously during TO navigation so arena markers stay in view for position updates. 0 = disabled. Bypasses yaw_rc_max so the scan rate is independent of the PD cap.",
+    },
     "distance_deadband_m": {
         "label": "distance deadband", "kind": "float", "unit": "m", "step": 0.01,
         "desc": "|distance - target| below this → rc_fb=0. Defines what 'at target distance' means for phase-settle and PD.",
@@ -782,6 +792,7 @@ TUNING_GROUPS = [
         ["default_dance_seconds_s", "dance_radius_m"]),
     ("Deadbands",
         ["yaw_deadband_deg", "distance_deadband_m", "goto_deadband_m",
+         "goto_speed_factor", "goto_scan_yaw_rc",
          "heading_deadband_deg", "approach_heading_deadband_deg",
          "align_heading_deadband_deg"]),
     ("Phase timing",
