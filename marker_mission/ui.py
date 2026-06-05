@@ -287,24 +287,27 @@ _VIDEO_AND_STATUS_HTML = """
       <div id="script-list" style="font-size:.85rem;"></div>
     </details>
     {% endif %}
-    <h2>Position</h2>
-    <div style="display:flex; gap:.6rem; align-items:center;
-                margin-bottom:.6rem;">
-      <canvas id="c-pos" width="240" height="240"
-              style="background:#0c0f12; border-radius:6px;
-                     flex:0 0 auto;"></canvas>
-      <div id="c-pos-text" style="font-size:.8rem; color:#aab;
-                                    font-variant-numeric:tabular-nums;
-                                    line-height:1.5;">—</div>
+    <h2>Position &amp; Validator</h2>
+    <div style="display:flex; gap:1.2rem; margin-bottom:1rem;">
+      <!-- Maps side by side -->
+      <div style="flex:0 0 auto;">
+        <canvas id="c-pos" width="240" height="240"
+                style="background:#0c0f12; border-radius:6px;
+                       display:block; margin-bottom:.5rem;"></canvas>
+      </div>
+      <div style="flex:0 0 auto;">
+        <canvas id="c-validator" width="240" height="240"
+                style="background:#0c0f12; border-radius:6px;
+                       display:block; margin-bottom:.5rem;"></canvas>
+      </div>
     </div>
-
-    <h2>Validator map (30s history)</h2>
-    <div style="display:flex; gap:.6rem; align-items:flex-start;">
-      <canvas id="c-validator" width="240" height="240"
-              style="background:#0c0f12; border-radius:6px;
-                     flex:0 0 auto;"></canvas>
-      <div id="c-validator-text" style="font-size:.75rem; color:#aab;
-                                         line-height:1.3; max-width:200px;">—</div>
+    <!-- Text below maps -->
+    <div style="display:flex; gap:1.2rem; margin-bottom:1rem;">
+      <div id="c-pos-text" style="flex:0 0 240px; font-size:.8rem; color:#aab;
+                                  font-variant-numeric:tabular-nums;
+                                  line-height:1.5;">—</div>
+      <div id="c-validator-text" style="flex:0 0 240px; font-size:.75rem; color:#aab;
+                                        line-height:1.3;">—</div>
     </div>
 
     <h2>{{ 'Replayed flight' if mode == 'replay' else 'Mission status' }}</h2>
