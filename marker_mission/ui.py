@@ -3564,7 +3564,7 @@ function drawArena() {
 function drawValidatorMap() {
   const c = $('c-validator');
   const infoDiv = $('c-validator-text');
-  if (!c || !infoDiv || !arena) return;
+  if (!c || !infoDiv) return;
   const ctx = c.getContext('2d');
   const W = c.width, H = c.height;
   ctx.clearRect(0, 0, W, H);
@@ -3572,6 +3572,11 @@ function drawValidatorMap() {
   const meta = metaFromInputs();
   const w = meta.width_m, d = meta.depth_m;
   if (w <= 0 || d <= 0) return;
+
+  // Load arena config if not already loaded (for drawing reference markers)
+  if (!arena && typeof loadArena === 'function') {
+    loadArena().catch(() => {});  // silently fail if arena unavailable
+  }
 
   const margin = 20;
   const px_per_m = Math.min((W - 2*margin) / w, (H - 2*margin) / d);
@@ -3601,7 +3606,7 @@ function drawValidatorMap() {
   ctx.stroke();
 
   // config markers (configured positions)
-  if (arena.markers) {
+  if (arena && arena.markers) {
     arena.markers.forEach(m => {
       const x = ax(m.x), y = ay(m.y);
       ctx.fillStyle = '#aab4';  // light gray with alpha
