@@ -86,8 +86,11 @@ class DroneApiInProc:
             return False
 
     # ------------------------------------------------------------ video
-    def video_start_mjpeg(self) -> dict:
-        return self._unwrap(*drone_core.do_video_start(mode="mjpeg"))
+    def video_start_mjpeg(self) -> tuple:
+        payload, status = drone_core.do_video_start(mode="mjpeg")
+        ok = status < 400 and bool(payload.get("ok", True) if isinstance(payload, dict) else True)
+        msg = (payload.get("message") or payload.get("error") or "ok") if isinstance(payload, dict) else str(payload)
+        return ok, msg
 
     def video_stop(self) -> dict:
         return self._unwrap(*drone_core.do_video_stop())
