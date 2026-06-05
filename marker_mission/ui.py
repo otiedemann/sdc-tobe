@@ -139,6 +139,10 @@ _PAGE_HEADER = """
        font-family:monospace; white-space:nowrap;
        border:1px solid #444; border-radius:4px; padding:4px 8px;
        margin-left:200px;">—</div>
+  <div id="header-drone-state"
+       style="font-size:.72rem; font-family:monospace; white-space:nowrap;
+              border:1px solid #444; border-radius:4px; padding:4px 8px;
+              margin-left:.6rem; line-height:1.5; color:#bbb;">—</div>
   <div id="header-battery"
        style="font-size:16px; font-weight:700; font-family:monospace;
               white-space:nowrap; margin-left:1rem;">—</div>
@@ -1553,6 +1557,31 @@ async function refresh() {
           el.textContent = '—';
           el.style.color = '#555';
         }
+      }
+    }
+    // Drone state block in header (between WLAN and battery)
+    {
+      const tel  = s.telemetry || {};
+      const el   = $('header-drone-state');
+      if (el) {
+        const flying    = tel.flying;
+        const connected = tel.connected !== false;
+        const h_cm      = tel.height_cm;
+        const phase     = s.phase || '';
+
+        const connCol   = connected ? '#4ade80' : '#f87171';
+        const connTxt   = connected ? 'online' : 'offline';
+        const flyCol    = flying ? '#38bdf8' : '#aab';
+        const flyTxt    = flying ? 'flying' : 'landed';
+        const hTxt      = (h_cm != null && h_cm > 0)
+                          ? `${(h_cm/100).toFixed(1)} m` : '';
+
+        let html = `<span style="color:${connCol}">${connTxt}</span>`;
+        html    += ` · <span style="color:${flyCol}">${flyTxt}</span>`;
+        if (hTxt) html += ` · <span style="color:#38bdf8">${hTxt}</span>`;
+        if (phase && phase !== 'init')
+          html += ` · <span style="color:#facc15">${phase}</span>`;
+        el.innerHTML = html;
       }
     }
     if (typeof s.camera_restart_count === 'number') {
