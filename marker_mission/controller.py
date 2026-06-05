@@ -620,6 +620,10 @@ class MissionState:
 
     abort_reason: str = ""
     note: str = ""                                            # informational
+    # Emergency re-arm: set by telemetry_worker when the drone lands
+    # unexpectedly mid-mission. While True the controller sends only
+    # RC(0,0,0,0) and waits. Cleared once a re-takeoff succeeds.
+    emergency_rearm: bool = False
 
     lock: threading.Lock = field(default_factory=threading.Lock)
 
@@ -1147,6 +1151,14 @@ class MissionController:
             next_tick = now + period
 
             try:
+                # Emergency rearm: drone landed unexpectedly. Hold all RC
+                # until telemetry_worker issues re-takeoff and clears flag.
+                with self.state.lock:
+                    rearm = self.state.emergency_rearm
+                if rearm:
+                    self._send_rc(0, 0, 0, 0)
+                    continue
+
                 tel = self._refresh_inputs(now)
 
                 # Dispatch on phase ------------------------------------------

@@ -516,11 +516,16 @@ def cmd_fly(args: argparse.Namespace) -> int:
         # the first time the drone appears -- so the operator can plug
         # the drone in AFTER starting mission and the video feed kicks
         # in automatically.
+        REARM_WAIT_S  = 3.0   # seconds after landing before re-takeoff attempt
+        REARM_TIMEOUT = 120.0 # give up + land safely after this many seconds
         period = 0.25
         was_connected = initially_connected
         video_started = initially_connected
         video_retry_after: float = 0.0   # monotonic: don't retry before this
         was_flying = False
+        emergency_land_at: float = 0.0   # monotonic when unexpected landing detected
+        in_emergency_rearm = False
+        takeoff_retry_after: float = 0.0
         while not stop.is_set():
             try:
                 tel = api.telemetry()
@@ -531,15 +536,52 @@ def cmd_fly(args: argparse.Namespace) -> int:
                 connected_now = False
                 flying_now = False
             ui.drone_connected = connected_now
-            # Detect unexpected landing during active flight: if drone was
-            # flying but now reports landed, and mission is airborne, abort.
-            if was_flying and not flying_now:
+
+            # ── Unexpected landing detection ───────────────────────────────
+            if was_flying and not flying_now and not in_emergency_rearm:
                 with state.lock:
                     active_phase = state.phase
                 if active_phase not in NON_AIRBORNE_PHASES:
-                    print(f"[mission] drone landed unexpectedly during phase "
-                          f"'{active_phase.value}' — aborting mission")
-                    stop.set()  # signal all workers to stop cleanly
+                    print(f"[mission] WARN: drone landed unexpectedly during "
+                          f"phase '{active_phase.value}' — pausing, will re-takeoff")
+                    emergency_land_at = time.monotonic()
+                    in_emergency_rearm = True
+                    takeoff_retry_after = emergency_land_at + REARM_WAIT_S
+                    with state.lock:
+                        state.emergency_rearm = True
+                        state.note = "emergency rearm: waiting to re-takeoff"
+
+            # ── Re-takeoff logic ───────────────────────────────────────────
+            if in_emergency_rearm:
+                elapsed = time.monotonic() - emergency_land_at
+                if elapsed > REARM_TIMEOUT:
+                    print("[mission] emergency rearm timeout — stopping mission")
+                    with state.lock:
+                        state.emergency_rearm = False
+                    stop.set()
+                    in_emergency_rearm = False
+                elif flying_now:
+                    # Re-takeoff succeeded (drone is flying again)
+                    print("[mission] re-takeoff confirmed — resuming mission")
+                    with state.lock:
+                        state.emergency_rearm = False
+                        state.note = "mission resumed after re-takeoff"
+                    in_emergency_rearm = False
+                elif (connected_now and not flying_now
+                      and time.monotonic() >= takeoff_retry_after):
+                    print(f"[mission] attempting re-takeoff "
+                          f"({elapsed:.0f}s after unexpected landing)...")
+                    try:
+                        ok, msg = api.takeoff()
+                        if ok:
+                            print("[mission] re-takeoff command sent OK")
+                        else:
+                            print(f"[mission] re-takeoff failed: {msg} — retrying in 5s")
+                        takeoff_retry_after = time.monotonic() + 5.0
+                    except Exception as e:
+                        print(f"[mission] re-takeoff error: {e} — retrying in 5s")
+                        takeoff_retry_after = time.monotonic() + 5.0
+
             was_flying = flying_now
             if connected_now and not was_connected:
                 print("[mission] drone connected (was offline at startup) "
