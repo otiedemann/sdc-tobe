@@ -297,6 +297,16 @@ _VIDEO_AND_STATUS_HTML = """
                                     font-variant-numeric:tabular-nums;
                                     line-height:1.5;">—</div>
     </div>
+
+    <h2>Validator map (30s history)</h2>
+    <div style="display:flex; gap:.6rem; align-items:flex-start;">
+      <canvas id="c-validator" width="240" height="240"
+              style="background:#0c0f12; border-radius:6px;
+                     flex:0 0 auto;"></canvas>
+      <div id="c-validator-text" style="font-size:.75rem; color:#aab;
+                                         line-height:1.3; max-width:200px;">—</div>
+    </div>
+
     <h2>{{ 'Replayed flight' if mode == 'replay' else 'Mission status' }}</h2>
     <table id="status">
       <tr><th>Phase</th><td id="s-phase">—</td></tr>
@@ -3548,6 +3558,98 @@ function drawArena() {
   }
 }
 
+function drawValidatorMap() {
+  const c = $('c-validator');
+  const infoDiv = $('c-validator-text');
+  if (!c || !infoDiv || !arena) return;
+  const ctx = c.getContext('2d');
+  const W = c.width, H = c.height;
+  ctx.clearRect(0, 0, W, H);
+
+  const meta = metaFromInputs();
+  const w = meta.width_m, d = meta.depth_m;
+  if (w <= 0 || d <= 0) return;
+
+  const margin = 20;
+  const px_per_m = Math.min((W - 2*margin) / w, (H - 2*margin) / d);
+  const cx = W / 2, cy = H / 2;
+  const ax = (xm) => cx + xm * px_per_m;
+  const ay = (ym) => cy - ym * px_per_m;
+
+  // background
+  ctx.fillStyle = '#0c0f12';
+  ctx.fillRect(0, 0, W, H);
+
+  // arena boundary (light gray)
+  ctx.strokeStyle = '#555'; ctx.lineWidth = 1;
+  ctx.strokeRect(ax(-w/2), ay(d/2), w * px_per_m, d * px_per_m);
+
+  // 5m grid (faint)
+  ctx.strokeStyle = '#222'; ctx.lineWidth = 0.5;
+  ctx.beginPath();
+  for (let xi = Math.ceil(-w/2); xi <= Math.floor(w/2); xi += 5) {
+    const xp = ax(xi);
+    ctx.moveTo(xp, ay(d/2)); ctx.lineTo(xp, ay(-d/2));
+  }
+  for (let yi = Math.ceil(-d/2); yi <= Math.floor(d/2); yi += 5) {
+    const yp = ay(yi);
+    ctx.moveTo(ax(-w/2), yp); ctx.lineTo(ax(w/2), yp);
+  }
+  ctx.stroke();
+
+  // config markers (configured positions)
+  if (arena.markers) {
+    arena.markers.forEach(m => {
+      const x = ax(m.x), y = ay(m.y);
+      ctx.fillStyle = '#aab4';  // light gray with alpha
+      ctx.beginPath(); ctx.arc(x, y, 5, 0, 2*Math.PI); ctx.fill();
+      ctx.fillStyle = '#666'; ctx.font = '8px ui-sans-serif';
+      ctx.textAlign = 'center';
+      ctx.fillText(m.id, x, y+2);
+    });
+  }
+
+  // validated markers from arena_validation_map
+  let info = '';
+  let visibleCnt = 0, historicalCnt = 0;
+  if (_last_snap && _last_snap.arena_validation_map) {
+    Object.entries(_last_snap.arena_validation_map).forEach(([mid, m]) => {
+      if (typeof m.wx === 'number' && typeof m.wy === 'number') {
+        const x = ax(m.wx), y = ay(m.wy);
+        const now = Date.now() / 1000;
+        const age = (now - (m.last_seen_at || m.detected_at)) || 0;
+        const confidence = m.conf || 0.5;
+
+        if (m.is_visible) {
+          visibleCnt++;
+          // green dot for visible
+          ctx.fillStyle = '#22c55e';
+          ctx.globalAlpha = 0.8 + 0.2 * confidence;
+        } else {
+          historicalCnt++;
+          // gray dot for historical
+          ctx.fillStyle = '#666';
+          ctx.globalAlpha = Math.max(0.2, 0.6 - age/30);
+        }
+
+        ctx.beginPath(); ctx.arc(x, y, 4, 0, 2*Math.PI); ctx.fill();
+        ctx.globalAlpha = 1.0;
+
+        // label
+        ctx.fillStyle = '#aab'; ctx.font = '7px ui-sans-serif';
+        ctx.textAlign = 'center';
+        ctx.fillText(mid, x, y+1);
+      }
+    });
+
+    info = `Visible: ${visibleCnt}<br/>Historical: ${historicalCnt}`;
+  } else {
+    info = '—';
+  }
+
+  infoDiv.innerHTML = info;
+}
+
 async function loadArena() {
   try {
     const r = await fetch('/api/arena/active', {cache:'no-store'});
@@ -3748,10 +3850,12 @@ $('btn-ar-save-as').addEventListener('click', () =>
 
 // ── Live drone position polling ──────────────────────────────────────
 let _dronePos = null;
+let _last_snap = null;
 async function _refreshDronePos() {
   try {
     const r = await fetch('/api/state', {cache:'no-store'});
     const s = await r.json();
+    _last_snap = s;  // store snapshot for validator map
     const pos = s.world_position_m;
     if (Array.isArray(pos) && pos.length === 3) {
       _dronePos = {
@@ -3769,6 +3873,7 @@ async function _refreshDronePos() {
     }
   } catch (e) { _dronePos = null; }
   drawArena();
+  drawValidatorMap();
   setTimeout(_refreshDronePos, 250);
 }
 

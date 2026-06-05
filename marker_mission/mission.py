@@ -675,6 +675,11 @@ def cmd_fly(args: argparse.Namespace) -> int:
             return confirmed[:_DD_TOP_N]
         # ──────────────────────────────────────────────────────────────
 
+        # ── Arena Validator: Track visible markers + 30s history ──────────
+        _VALIDATOR_HIST_MAX = 30.0  # seconds to keep historical markers
+        _validator_markers = {}  # {mid: {wx, wy, wz, detected_at, last_seen_at, conf, is_visible}}
+        # ──────────────────────────────────────────────────────────────────
+
         # Freeze detection: track last frame timestamp change and restart cooldown.
         _freeze_last_ts: float = 0.0
         _freeze_restart_after: float = 0.0   # monotonic cooldown (vision_worker local)
@@ -1064,6 +1069,40 @@ def cmd_fly(args: argparse.Namespace) -> int:
                                       est.per_marker_position_m[mid])
                                 for mid in est.used_markers]
                             state.world_velocity_m_kf = world_vel
+                            # Update arena validator with visible markers.
+                            now_val = time.monotonic()
+                            for mid, pos_m in est.per_marker_position_m.items():
+                                if mid not in _validator_markers:
+                                    _validator_markers[mid] = {
+                                        'wx': float(pos_m[0]),
+                                        'wy': float(pos_m[1]),
+                                        'wz': float(pos_m[2]),
+                                        'detected_at': now_val,
+                                        'last_seen_at': now_val,
+                                        'conf': float(est.weights.get(mid, 0.5)),
+                                        'is_visible': True,
+                                    }
+                                else:
+                                    m = _validator_markers[mid]
+                                    m['wx'] = float(pos_m[0])
+                                    m['wy'] = float(pos_m[1])
+                                    m['wz'] = float(pos_m[2])
+                                    m['last_seen_at'] = now_val
+                                    m['conf'] = float(est.weights.get(mid, m['conf']))
+                                    m['is_visible'] = True
+                            # Prune old markers (>30s) and mark stale ones.
+                            prune_before = now_val - _VALIDATOR_HIST_MAX
+                            to_delete = []
+                            for mid, m in _validator_markers.items():
+                                if m['detected_at'] < prune_before:
+                                    to_delete.append(mid)
+                                elif mid not in est.per_marker_position_m:
+                                    m['is_visible'] = False
+                            for mid in to_delete:
+                                del _validator_markers[mid]
+                            # Expose to state.
+                            with state.lock:
+                                state.arena_validation_map = dict(_validator_markers)
                 # Active target's pose method (or empty if not in view).
                 with state.lock:
                     state.target_pose_method = (

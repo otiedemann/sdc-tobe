@@ -604,6 +604,7 @@ class MissionState:
     world_velocity_m_kf: Optional[tuple[float, float, float]] = None
     camera_restart_count: int = 0   # auto-restarts triggered by freeze detection
     world_position_confidence: float = 0.0   # base confidence from last estimate
+    arena_validation_map: dict = field(default_factory=dict)  # marker validator map
     # solvePnP method for the controller's active TARGET marker
     # (whatever pose_holder.get() returned this tick). "" when the
     # target marker isn't currently in view.
@@ -735,6 +736,7 @@ class MissionState:
                                         if self.world_velocity_m_kf is not None
                                         else None),
                 "camera_restart_count": self.camera_restart_count,
+                "arena_validation_map": dict(self.arena_validation_map),
                 "world_position_confidence": round(
                     self.world_position_confidence
                     * max(0.0, 1.0 - (
