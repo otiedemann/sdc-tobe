@@ -2402,9 +2402,26 @@ class OlympeBackend(DroneBackend):
                 fs = self._get_state(FlyingStateChanged)
                 if fs is not None:
                     break
+        if fs is None:
+            # State still missing — Olympe's connection is broken.
+            # Force a hard reset + reconnect (destroys the Drone object and
+            # creates a fresh one) then wait another 10 s.
+            print("[ANAFI] /api/takeoff — state still None, forcing hard reset + reconnect...")
+            try:
+                self.hard_reset()
+                time.sleep(1.0)
+                self.connect()
+            except Exception as e:
+                print(f"[ANAFI] hard reset failed: {e}")
+            for _ in range(20):
+                time.sleep(0.5)
+                fs = self._get_state(FlyingStateChanged)
+                if fs is not None:
+                    break
             if fs is None:
-                print("[ANAFI] /api/takeoff — state still None after 10 s, aborting")
+                print("[ANAFI] /api/takeoff — state still None after reset, aborting")
                 return False, "state_not_ready"
+            print("[ANAFI] /api/takeoff — state recovered after hard reset")
         print(f"[ANAFI] /api/takeoff — flying={flying}, state={fs}")
 
         # Pre-takeoff diagnostics — ALWAYS print the current state of every
