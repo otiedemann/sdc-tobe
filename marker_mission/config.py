@@ -138,7 +138,7 @@ class MissionConfig:
     # rough point in the arena" 5cm is impractical from far-wall
     # ArUco alone and produces TO steps that never advance. 30cm is
     # plenty for "be in the home zone".
-    goto_deadband_m: float = 0.30          # TUNE
+    goto_deadband_m: float = 0.80          # TUNE
     goto_speed_factor: float = 0.5         # TUNE  scale all RC channels in TO (0.0–1.0)
     goto_scan_yaw_rc: int = 8              # TUNE  slow CW yaw during TO for marker visibility (0=off)
     heading_deadband_deg: float = 2.0      # TUNE
