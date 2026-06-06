@@ -322,7 +322,7 @@ def cmd_fly(args: argparse.Namespace) -> int:
     # default -- the previous allowlist silently dropped Phase.GOTO
     # and truncated flight-log.csv at TAKEOFF on every TO-using
     # mission until 2026-05-05.
-    NON_AIRBORNE_PHASES = {Phase.INIT, Phase.DONE, Phase.ABORT}
+    NON_AIRBORNE_PHASES = {Phase.INIT, Phase.LAND, Phase.DONE, Phase.ABORT}
     AIRBORNE_PHASES = {p for p in Phase if p not in NON_AIRBORNE_PHASES}
 
     def on_phase_change(old_phase, new_phase, note):
