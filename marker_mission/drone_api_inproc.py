@@ -112,12 +112,17 @@ class DroneApiInProc:
     def emergency(self) -> dict:
         return self._unwrap(*drone_core.do_emergency())
 
-    def rotate(self, direction: str, degrees: int) -> dict:
+    def rotate(self, direction: str, degrees: int,
+               speed: Optional[int] = None) -> dict:
         if direction not in ("cw", "ccw"):
             raise ValueError("direction must be cw or ccw")
+        # Optional per-rotation angular-speed override (deg/s), YAW_IMU's 2nd
+        # arg. None -> the FC's global MaxRotationSpeed. Mirrors the HTTP
+        # DroneApi.rotate; do_rotate applies it as a temporary MaxRotationSpeed.
         return self._unwrap(*drone_core.do_rotate(
             direction=direction,
             deg=int(max(1, min(360, degrees))),
+            speed=(int(max(1, min(180, speed))) if speed is not None else None),
         ))
 
     def move(self, direction: str, cm: int) -> dict:
