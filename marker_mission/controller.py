@@ -1475,7 +1475,10 @@ class MissionController:
             return
 
         # Yaw in place using current (possibly escalation-reduced) speed.
-        self._send_rc(0, 0, 0, int(self._search_yaw_rc))
+        # enforce_cfg_caps=False: search_yaw_rc is a direct config value,
+        # not PD output — yaw_rc_max must not cap it.
+        self._send_rc(0, 0, 0, int(self._search_yaw_rc),
+                      enforce_cfg_caps=False)
         # Track how far we've yawed from telemetry to decide when to escalate.
         with self.state.lock:
             tel = self.state.last_telemetry
@@ -1756,26 +1759,35 @@ class MissionController:
                 self.api.camera_config_set(zoom=1.0)
             except Exception:
                 pass
-        # Height error — computed once, used for both mid-HA settle check
-        # and the continuous u_ud correction below.
+        # Height error:
+        #   mid-HA pause (at fraction latch): sensor-based, like HEIGHT_ALIGN phase
+        #     → align to absolute marker height using altimeter + tvec[1]
+        #   normal approach flight: visual-only, keep marker centred in frame
+        #     → tvec[1] < 0 = marker above = fly up (e_h > 0)
         u_ud = 0.0
         e_h = 0.0
         pose = self.state.last_pose
-        try:
-            h_cm = (float(tel.raw.get("height_cm"))
-                    if tel and tel.raw.get("height_cm") is not None
-                    else None)
-        except (TypeError, ValueError):
-            h_cm = None
-        if h_cm is not None and pose is not None:
-            drone_h = h_cm / 100.0
+        if pose is not None:
             try:
                 marker_y = float(pose.tvec[1])
             except Exception:
                 marker_y = 0.0
-            target_h = max(cfg.min_height_m,
-                           min(cfg.max_height_m, drone_h - marker_y))
-            e_h = target_h - drone_h
+            if self._approach_mid_ha_active:
+                try:
+                    h_cm = (float(tel.raw.get("height_cm"))
+                            if tel and tel.raw.get("height_cm") is not None
+                            else None)
+                except (TypeError, ValueError):
+                    h_cm = None
+                if h_cm is not None:
+                    drone_h = h_cm / 100.0
+                    target_h = max(cfg.min_height_m,
+                                   min(cfg.max_height_m, drone_h - marker_y))
+                    e_h = target_h - drone_h
+                else:
+                    e_h = -marker_y
+            else:
+                e_h = -marker_y
             if abs(e_h) >= cfg.height_deadband_m:
                 u_ud = self.pd_height.step(e_h, now)
 
@@ -1789,9 +1801,25 @@ class MissionController:
         # Mid-approach height re-align: hold distance, stabilise altitude,
         # then release into final corrected approach.
         if self._approach_mid_ha_active:
-            u_fwd = 0.0
+            # Active brake: counteract residual forward velocity from the
+            # straight-in phase. _velocity_damp_fwd short-circuits at u_raw==0,
+            # so compute body-forward velocity directly and apply a counter-RC.
+            # Clamped to ≤0 so we never reverse past a hover.
+            ws = self._telemetry_world_speed(tel)
+            if ws is not None:
+                _vN, _vE, _yaw = ws
+                v_fwd_b, _ = self._world_to_body(_vN, _vE, _yaw)
+                _bkv = float(getattr(cfg, 'approach_mid_ha_brake_kv', 0.85))
+                u_fwd = max(-cfg.fwd_rc_max, min(0.0, -_bkv * v_fwd_b))
+            else:
+                u_fwd = 0.0
             h_in_band = abs(e_h) < cfg.height_deadband_m
-            if h_in_band:
+            # Also gate on speed: don't release until body speed is low so
+            # residual forward momentum can't carry the drone through the
+            # pause and into the marker.
+            speed = self._body_speed_cms(tel)
+            speed_ok = (speed is None or speed < RC_BRAKE_SPEED_THRESHOLD_CMS)
+            if h_in_band and speed_ok:
                 if self._approach_mid_ha_settled_at is None:
                     self._approach_mid_ha_settled_at = now
                 if now - self._approach_mid_ha_settled_at >= cfg.height_settle_time_s:
@@ -1800,8 +1828,9 @@ class MissionController:
             else:
                 self._approach_mid_ha_settled_at = None
             with self.state.lock:
+                _spd_str = f" spd={speed:.0f}" if speed is not None else ""
                 self.state.note = (f"mid height-align e_h={e_h:+.2f}m "
-                                   f"d={d:.2f}m")
+                                   f"d={d:.2f}m{_spd_str}")
 
         # Both yaw and lateral are gated by the same latch.
         # Before latch or during mid-HA: no lateral steering.
