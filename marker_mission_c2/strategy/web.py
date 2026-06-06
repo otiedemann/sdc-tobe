@@ -1198,6 +1198,42 @@ document.getElementById("land-btn").addEventListener("click", async () => {
   refresh();
 });
 
+// Keyboard killswitch: "?" emergency-lands the WHOLE swarm immediately — the
+// same panic key as marker_mission's per-drone UI. Fires on every "?" press
+// (any focus, incl. while typing in a field — emergency stop must always win);
+// only Ctrl/Cmd/Alt+"?" is left to the browser. The land request goes out
+// before the banner/beep so a press always reaches the swarm. Additive: we do
+// NOT preventDefault, so "?" still types normally where intended.
+document.addEventListener("keydown", (e) => {
+  if (e.ctrlKey || e.metaKey || e.altKey) return;     // browser shortcuts win
+  if ((e.key || "") !== "?") return;
+  // Fire FIRST — disarms + emergency-lands every drone on the server.
+  try { api("/api/strategy/emergency-land", {method:"POST"}); } catch (err) {}
+  // Visual confirmation banner.
+  try {
+    const b = document.createElement("div");
+    b.textContent = "EMERGENCY LAND (?) — landing all drones";
+    b.style.cssText = "position:fixed;top:0;left:0;right:0;z-index:9999;"
+      + "background:#f87171;color:#240707;text-align:center;padding:.6rem;"
+      + "font-weight:700;font-size:1rem;letter-spacing:.02em;";
+    document.body.appendChild(b);
+    setTimeout(() => b.remove(), 4000);
+  } catch (err) {}
+  // Audible low tone, distinct from any UI click.
+  try {
+    const ac = new (window.AudioContext || window.webkitAudioContext)();
+    if (ac.state === "suspended") ac.resume();
+    const o = ac.createOscillator(), g = ac.createGain();
+    o.frequency.value = 220; o.type = "sine";
+    o.connect(g); g.connect(ac.destination);
+    const t0 = ac.currentTime;
+    g.gain.setValueAtTime(0.18, t0);
+    g.gain.exponentialRampToValueAtTime(0.001, t0 + 0.35);
+    o.start(t0); o.stop(t0 + 0.4);
+  } catch (err) {}
+  refresh();
+});
+
 refresh();
 setInterval(refresh, 1000);
 </script>
