@@ -476,15 +476,20 @@ _ARENA_BOUNDS_DEFAULT = {
 }
 _arena_bounds: dict = dict(_ARENA_BOUNDS_DEFAULT)
 _arena_margin_m: float = float(os.getenv("ARENA_SAFETY_MARGIN_M", "1.5"))
-# Toggle: applies to BOTH manual and autonomous flight. DEFAULT OFF.
-# Disabled by default because the active reverse-brake acts on the ArUco
-# ``_pos_st`` fix, which mirrors / goes wrong near walls in the real
-# (metal) arena. On a plain forward command the guard then injected
-# full-RC roll and shot the drone sideways into the wall (flight
-# 2026-05-23, marker 12; reproduced on manual W). Re-enable with
-# ARENA_GUARD_ENABLED=1 only once it's gated on a trusted, fresh fix.
+# Toggle: applies to BOTH manual and autonomous flight. Default ON.
 # When OFF the Pi's RC tick makes no XY boundary decisions — operator
 # takes full responsibility. The altitude ceiling remains on regardless.
+# Arena XY boundary guard. DISABLED by default — the bounds the
+# guard uses come from a stale non-centered arena (``y∈[0, 10.8]``)
+# while the unified positioning subsystem now publishes positions in
+# the centered marker_mission frame (``y∈[-10, +10]``). The two
+# clocks disagree, so the guard either clamps too aggressively
+# (legitimate PD corrections refused, drone stuck in front of a
+# marker it can't centre) or not at all. Until the bounds are
+# regenerated from the active arena config, default off.
+#
+# Re-enable per-host via env: ``ARENA_GUARD_ENABLED=1`` in a systemd
+# drop-in, or live via ``POST /api/config/arena_safety {"enabled": true}``.
 _arena_guard_enabled: bool = os.getenv("ARENA_GUARD_ENABLED", "0") not in {"0", "false", "False"}
 _arena_engaged: bool = False
 _arena_last_reason: str = ""
@@ -791,6 +796,13 @@ _video_mode = "off"
 _video_last_jpeg = b""
 _video_jpeg_lock = threading.Lock()
 _video_streaming = False
+
+# Raw BGR frame for in-proc consumers (InProcMjpegReader).
+# Updated by _video_frame_cb on every Anafi frame; readers wait on the
+# condition so they wake immediately on a new frame instead of polling.
+_video_bgr_latest: Optional["np.ndarray"] = None
+_video_bgr_ts: float = 0.0
+_video_bgr_cond = threading.Condition(threading.Lock())
 
 # ── H.264 fan-out state (sim only) ────────────────────────
 # The sim video producer (_sim_video_loop below) writes raw BGR frames
@@ -2237,18 +2249,18 @@ class OlympeBackend(DroneBackend):
         if d is None:
             return
         if self._detect_piloting_api():
-            try:
-                d.stop_piloting()
-                return
-            except Exception:
-                pass
-        with self._pcmd_seq_lock:
-            self._pcmd_seq = (self._pcmd_seq + 1) & 0x7FFFFFFF
-            seq = self._pcmd_seq
-        try:
-            d(PCMD(0, 0, 0, 0, 0, seq))
-        except Exception:
-            pass
+            for _attempt in range(3):
+                try:
+                    d.stop_piloting()
+                    return
+                except Exception:
+                    if _attempt < 2:
+                        time.sleep(0.15)
+        # If stop_piloting() failed on all retries we do NOT fall back to
+        # sending a PCMD(0) — that would re-activate the piloting interface
+        # and cause the firmware to ignore the subsequent moveBy command.
+        # The RC loop is already paused via start_discrete_window() before
+        # this is called, so no PCMD is being sent anyway.
 
     def _get_state(self, msg_type):
         d = self.drone
@@ -2379,7 +2391,37 @@ class OlympeBackend(DroneBackend):
         d = self._d()
         if d is None:
             return False, "not_ready"
+        # Wait up to 10 s for FlyingStateChanged to arrive after reconnect.
+        # Without this, a takeoff attempt immediately post-reconnect sees
+        # state=None and is silently refused by the drone firmware.
         fs = self._get_state(FlyingStateChanged)
+        if fs is None:
+            print("[ANAFI] /api/takeoff — state not ready, waiting up to 10 s...")
+            for _ in range(20):
+                time.sleep(0.5)
+                fs = self._get_state(FlyingStateChanged)
+                if fs is not None:
+                    break
+        if fs is None:
+            # State still missing — Olympe's connection is broken.
+            # Force a hard reset + reconnect (destroys the Drone object and
+            # creates a fresh one) then wait another 10 s.
+            print("[ANAFI] /api/takeoff — state still None, forcing hard reset + reconnect...")
+            try:
+                self.hard_reset()
+                time.sleep(1.0)
+                self.connect()
+            except Exception as e:
+                print(f"[ANAFI] hard reset failed: {e}")
+            for _ in range(20):
+                time.sleep(0.5)
+                fs = self._get_state(FlyingStateChanged)
+                if fs is not None:
+                    break
+            if fs is None:
+                print("[ANAFI] /api/takeoff — state still None after reset, aborting")
+                return False, "state_not_ready"
+            print("[ANAFI] /api/takeoff — state recovered after hard reset")
         print(f"[ANAFI] /api/takeoff — flying={flying}, state={fs}")
 
         # Pre-takeoff diagnostics — ALWAYS print the current state of every
@@ -2653,7 +2695,7 @@ class OlympeBackend(DroneBackend):
         }[direction]
         print(f"[ANAFI] move({direction}, {cm}cm) -> moveBy{move_args}")
         self._stop_piloting()
-        time.sleep(0.1)
+        time.sleep(0.4)   # give firmware time to exit PCMD mode before moveBy
         with command_lock:
             result = d(moveBy(*move_args)).wait(_timeout=30)
         ok = False
@@ -3067,7 +3109,10 @@ class OlympeBackend(DroneBackend):
                 results["recording"] = False
                 results["recording_error"] = str(ex)
         if "zoom" in data and HAS_CAMERA_ZOOM:
-            level = (data["zoom"] or {}).get("level", 1.0)
+            # Accept both {"zoom": 1.5} (float, from controller code) and
+            # {"zoom": {"level": 1.5}} (dict, legacy camera-config format).
+            _z = data["zoom"]
+            level = _z.get("level", 1.0) if isinstance(_z, dict) else float(_z or 1.0)
             try:
                 with command_lock:
                     r = d(_CameraSetZoom(
@@ -3282,13 +3327,23 @@ class OlympeBackend(DroneBackend):
                     pass
                 time.sleep(0.3)   # let Olympe tear down before we re-start
 
-            # Detect API — still inside the mutex so no concurrent caller
-            # can race between detection and start.
+            # Detect API — retry up to 8 times with 2 s gaps (16 s total).
+            # After reconnect or a _media_removed_impl callback, Olympe
+            # rebuilds its streaming object internally; set_callbacks
+            # briefly disappears during that window. 3×1 s was too short
+            # after a full drone reconnect which can take 10-20 s.
             api = "none"
-            if hasattr(d, "streaming") and hasattr(d.streaming, "set_callbacks"):
-                api = "modern"
-            elif hasattr(d, "set_streaming_callbacks"):
-                api = "legacy"
+            for _attempt in range(9):
+                if hasattr(d, "streaming") and hasattr(d.streaming, "set_callbacks"):
+                    api = "modern"
+                    break
+                elif hasattr(d, "set_streaming_callbacks"):
+                    api = "legacy"
+                    break
+                if _attempt < 8:
+                    print(f"[ANAFI] streaming API not ready yet, retrying in 2 s "
+                          f"(attempt {_attempt + 1}/8)…")
+                    time.sleep(2.0)
             print(f"[ANAFI] Olympe streaming API: {api}")
 
             _video_mode = "mjpeg"
@@ -3471,6 +3526,12 @@ class OlympeBackend(DroneBackend):
                 if _video_frame_count == 1:
                     h, w = cv_frame.shape[:2]
                     print(f"[ANAFI] First video frame: {w}x{h}")
+            # Push raw BGR for in-proc readers (no intermediate JPEG decode).
+            global _video_bgr_latest, _video_bgr_ts
+            with _video_bgr_cond:
+                _video_bgr_latest = cv_frame
+                _video_bgr_ts = time.monotonic()
+                _video_bgr_cond.notify_all()
             # Tap frame for positioning and/or recording (non-blocking — drop if queue full).
             # Feeding the queue when ONLY recording is active ensures the recorder
             # still gets frames even if Position Tracker is disabled.

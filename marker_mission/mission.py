@@ -52,7 +52,8 @@ from .calibration_store import (Calibration, CalibrationStore,
                                 calibrate_from_video)
 from .arena import (ArenaConfig, ARENA_MAG_SLACK_DEG,
                     estimate_position, load_priority_arena,
-                    _arena_yaw_for_branch, _wrap_180, _yaw_diff)
+                    _arena_yaw_for_branch, _wrap_180, _yaw_diff,
+                    MarkerPositionCache)
 from .config import (CALIB_DIR, FLIGHTS_DIR, DEFAULT_DATA_DIR,
                      PER_FLIGHT_SCRIPT_FILENAME, MissionConfig)
 from .controller import MissionController, MissionState, Phase
@@ -321,7 +322,7 @@ def cmd_fly(args: argparse.Namespace) -> int:
     # default -- the previous allowlist silently dropped Phase.GOTO
     # and truncated flight-log.csv at TAKEOFF on every TO-using
     # mission until 2026-05-05.
-    NON_AIRBORNE_PHASES = {Phase.INIT, Phase.DONE, Phase.ABORT}
+    NON_AIRBORNE_PHASES = {Phase.INIT, Phase.LAND, Phase.DONE, Phase.ABORT}
     AIRBORNE_PHASES = {p for p in Phase if p not in NON_AIRBORNE_PHASES}
 
     def on_phase_change(old_phase, new_phase, note):
@@ -405,6 +406,17 @@ def cmd_fly(args: argparse.Namespace) -> int:
                     (new_dir / "git_commit.txt").write_text(commit_text + "\n")
             except Exception as e:
                 print(f"[mission] git_commit.txt save failed: {e}")
+
+        # On every takeoff: reset zoom to 1x, then trigger the same
+        # full camera restart as the "Restart Camera" button in the UI.
+        if new_phase == Phase.TAKEOFF:
+            try:
+                api.camera_config_set(zoom=1.0)
+            except Exception as e:
+                print(f"[mission] zoom reset at TAKEOFF failed: {e}")
+            errs = ui.restart_camera()
+            if errs:
+                print(f"[mission] camera restart at TAKEOFF: {errs}")
 
         # Recording envelope.
         if new_phase in AIRBORNE_PHASES:
@@ -504,28 +516,129 @@ def cmd_fly(args: argparse.Namespace) -> int:
         # the first time the drone appears -- so the operator can plug
         # the drone in AFTER starting mission and the video feed kicks
         # in automatically.
+        REARM_WAIT_S      = 3.0   # seconds after confirmed landing before re-takeoff
+        REARM_TIMEOUT     = 120.0 # give up + stop after this many seconds
+        NOT_FLYING_STREAK = 3     # consecutive not-flying readings to confirm landing
         period = 0.25
         was_connected = initially_connected
         video_started = initially_connected
+        video_retry_after: float = 0.0
+        was_flying = False
+        not_flying_count = 0      # consecutive ticks with flying=False during active flight
+        emergency_land_at: float = 0.0
+        in_emergency_rearm = False
+        takeoff_retry_after: float = 0.0
         while not stop.is_set():
             try:
                 tel = api.telemetry()
                 tel_holder.set(tel)
                 connected_now = bool(tel.connected)
+                flying_now = bool(tel.flying)
             except Exception:
                 connected_now = False
+                flying_now = False
             ui.drone_connected = connected_now
+
+            # ── Emergency rearm: cancel immediately if operator stopped ──────
+            # If abort_reason is set the stop was intentional (killswitch,
+            # UI stop button) — never auto-rearm after an intentional stop.
+            if in_emergency_rearm:
+                with state.lock:
+                    operator_stopped = bool(state.abort_reason)
+                if operator_stopped:
+                    print("[mission] operator stop detected — cancelling emergency rearm")
+                    with state.lock:
+                        state.emergency_rearm = False
+                    in_emergency_rearm = False
+                    not_flying_count = 0
+
+            # ── Emergency rearm: clear immediately if drone is flying ──────
+            # Always check first so a WLAN blip that triggered rearm gets
+            # cleared the moment we see flying=True again.
+            if in_emergency_rearm and flying_now:
+                print("[mission] drone is flying — clearing emergency rearm, "
+                      "resuming mission")
+                with state.lock:
+                    state.emergency_rearm = False
+                    state.note = "mission resumed after re-takeoff"
+                in_emergency_rearm = False
+                not_flying_count = 0
+
+            # ── Unexpected landing detection (require N consecutive ticks) ─
+            # Only trigger if the drone was actually airborne (was_flying)
+            # and no operator stop is pending (abort_reason == "").
+            # This prevents spurious rearm at initial power-on (drone never
+            # flew yet) and after a killswitch-triggered landing.
+            if not flying_now and not in_emergency_rearm:
+                with state.lock:
+                    active_phase = state.phase
+                    operator_stopped = bool(state.abort_reason)
+                if (active_phase not in NON_AIRBORNE_PHASES
+                        and was_flying
+                        and not operator_stopped):
+                    not_flying_count += 1
+                    if not_flying_count >= NOT_FLYING_STREAK:
+                        print(f"[mission] WARN: drone confirmed landed during "
+                              f"phase '{active_phase.value}' — will re-takeoff")
+                        emergency_land_at = time.monotonic()
+                        in_emergency_rearm = True
+                        takeoff_retry_after = emergency_land_at + REARM_WAIT_S
+                        with state.lock:
+                            state.emergency_rearm = True
+                            state.note = "emergency rearm: waiting to re-takeoff"
+                else:
+                    not_flying_count = 0
+            elif flying_now:
+                not_flying_count = 0
+
+            # ── Re-takeoff logic ───────────────────────────────────────────
+            if in_emergency_rearm and not flying_now:
+                elapsed = time.monotonic() - emergency_land_at
+                if elapsed > REARM_TIMEOUT:
+                    print("[mission] emergency rearm timeout — stopping mission")
+                    with state.lock:
+                        state.emergency_rearm = False
+                    stop.set()
+                    in_emergency_rearm = False
+                elif (connected_now
+                      and time.monotonic() >= takeoff_retry_after):
+                    print(f"[mission] attempting re-takeoff "
+                          f"({elapsed:.0f}s after unexpected landing)...")
+                    try:
+                        ok, msg = api.takeoff()
+                        if ok:
+                            print("[mission] re-takeoff command sent OK")
+                        else:
+                            print(f"[mission] re-takeoff failed: {msg} — retrying in 5s")
+                        takeoff_retry_after = time.monotonic() + 5.0
+                    except Exception as e:
+                        print(f"[mission] re-takeoff error: {e} — retrying in 5s")
+                        takeoff_retry_after = time.monotonic() + 5.0
+
+            was_flying = flying_now
             if connected_now and not was_connected:
                 print("[mission] drone connected (was offline at startup) "
                       "-- starting video stream")
+                video_started = False       # force re-start after reconnect
+                video_retry_after = 0.0
             if connected_now and not video_started:
-                try:
-                    api.video_start_mjpeg()
-                    video_started = True
-                except Exception as e:
-                    print(f"[mission] video_start_mjpeg failed: {e}")
+                if time.monotonic() >= video_retry_after:
+                    try:
+                        ok, msg = api.video_start_mjpeg()
+                        if ok:
+                            video_started = True
+                        else:
+                            print(f"[mission] video_start_mjpeg failed: {msg}"
+                                  f" — retrying in 5 s")
+                            video_retry_after = time.monotonic() + 5.0
+                    except Exception as e:
+                        print(f"[mission] video_start_mjpeg error: {e}"
+                              f" — retrying in 5 s")
+                        video_retry_after = time.monotonic() + 5.0
             elif not connected_now and was_connected:
                 print("[mission] drone went offline -- waiting to reconnect")
+                video_started = False
+                video_retry_after = 0.0
             was_connected = connected_now
             time.sleep(period)
 
@@ -539,14 +652,175 @@ def cmd_fly(args: argparse.Namespace) -> int:
         # 2026-04-28_18-06-58_unknown (pose frozen identical for 120 s).
         last_seen_ts = 0.0
         last_expired = False
+
+        # ── Other-drone detection ──────────────────────────────────────
+        # Sparse optical flow + RANSAC homography compensates for camera
+        # movement; residual motion blobs ≥ 20×20 px are drone candidates.
+        # Temporal filter: a blob must appear in ≥ 3 of the last 5 frames.
+        import collections as _col
+        _dd_prev_gray  = None
+        _DD_MIN_PX     = 20     # min blob dimension
+        _DD_MAX_PX     = 300    # max blob dimension (filters walls/ceiling)
+        _DD_CONSEC_REQ = 8      # consecutive frames required to confirm
+        _DD_TOP_N      = 4      # max candidates shown (1 red + 3 yellow)
+        _DD_MATCH_PX   = 40     # centre-distance for track→detection match
+        # Active tracks: list of {'cx','cy','w','h','streak'}
+        _dd_tracks: list = []
+
+        def _detect_drones(raw_frame):
+            """Return list of (x,y,w,h) bounding boxes of drone candidates,
+            sorted largest→smallest (nearest first). Draws nothing."""
+            nonlocal _dd_prev_gray
+            gray = cv2.cvtColor(raw_frame, cv2.COLOR_BGR2GRAY)
+            if _dd_prev_gray is None or _dd_prev_gray.shape != gray.shape:
+                _dd_prev_gray = gray
+                return []
+            # Feature points in previous frame
+            pts = cv2.goodFeaturesToTrack(
+                _dd_prev_gray, maxCorners=300,
+                qualityLevel=0.01, minDistance=8,
+                blockSize=7)
+            if pts is None or len(pts) < 12:
+                _dd_prev_gray = gray
+                return []
+            # Track with LK optical flow
+            pts1, st, _ = cv2.calcOpticalFlowPyrLK(
+                _dd_prev_gray, gray, pts, None,
+                winSize=(21, 21), maxLevel=3)
+            ok = st.ravel() == 1
+            p0, p1 = pts[ok], pts1[ok]
+            if len(p0) < 10:
+                _dd_prev_gray = gray
+                return []
+            # RANSAC homography = camera-motion model
+            H, _ = cv2.findHomography(p0, p1, cv2.RANSAC, 4.0)
+            if H is None:
+                _dd_prev_gray = gray
+                return []
+            h, w = gray.shape
+            warped = cv2.warpPerspective(
+                _dd_prev_gray, H, (w, h),
+                flags=cv2.INTER_LINEAR,
+                borderMode=cv2.BORDER_REPLICATE)
+            diff = cv2.absdiff(warped, gray)
+            _, thr = cv2.threshold(diff, 20, 255, cv2.THRESH_BINARY)
+            ker = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+            thr = cv2.morphologyEx(thr, cv2.MORPH_CLOSE, ker)
+            thr = cv2.morphologyEx(thr, cv2.MORPH_OPEN,  ker)
+            cnts, _ = cv2.findContours(
+                thr, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            blobs = []
+            for c in cnts:
+                x, y, bw, bh = cv2.boundingRect(c)
+                if bw >= _DD_MIN_PX and bh >= _DD_MIN_PX \
+                        and bw <= _DD_MAX_PX and bh <= _DD_MAX_PX:
+                    blobs.append((x, y, bw, bh))
+            blobs.sort(key=lambda b: -(b[2]*b[3]))
+            _dd_prev_gray = gray
+            return blobs[:_DD_TOP_N * 2]
+
+        def _temporal_filter(current_blobs):
+            """Update tracks with current detections.
+            A track must have streak >= _DD_CONSEC_REQ consecutive frames
+            to appear in the overlay. Returns confirmed boxes sorted by area."""
+            nonlocal _dd_tracks
+            matched_track_idx = set()
+            matched_blob_idx  = set()
+            # Match current blobs to existing tracks by centre proximity.
+            for ti, tr in enumerate(_dd_tracks):
+                best_d, best_bi = 9999, -1
+                for bi, box in enumerate(current_blobs):
+                    if bi in matched_blob_idx:
+                        continue
+                    cx = box[0] + box[2] // 2
+                    cy = box[1] + box[3] // 2
+                    d = abs(cx - tr['cx']) + abs(cy - tr['cy'])
+                    if d < _DD_MATCH_PX and d < best_d:
+                        best_d, best_bi = d, bi
+                if best_bi >= 0:
+                    box = current_blobs[best_bi]
+                    tr['cx'] = box[0] + box[2] // 2
+                    tr['cy'] = box[1] + box[3] // 2
+                    tr['w']  = box[2]; tr['h'] = box[3]
+                    tr['streak'] += 1
+                    matched_track_idx.add(ti)
+                    matched_blob_idx.add(best_bi)
+                else:
+                    tr['streak'] = 0   # missed this frame
+            # Remove dead tracks (missed); add new tracks for unmatched blobs.
+            _dd_tracks = [t for t in _dd_tracks if t['streak'] > 0]
+            for bi, box in enumerate(current_blobs):
+                if bi not in matched_blob_idx:
+                    _dd_tracks.append({
+                        'cx': box[0]+box[2]//2, 'cy': box[1]+box[3]//2,
+                        'w': box[2], 'h': box[3], 'streak': 1})
+            # Return confirmed tracks sorted largest→smallest (nearest first).
+            confirmed = [
+                (t['cx']-t['w']//2, t['cy']-t['h']//2, t['w'], t['h'])
+                for t in _dd_tracks if t['streak'] >= _DD_CONSEC_REQ
+            ]
+            confirmed.sort(key=lambda b: -(b[2]*b[3]))
+            return confirmed[:_DD_TOP_N]
+        # ──────────────────────────────────────────────────────────────
+
+        # ── Arena Validator: Track visible markers + 30s history ──────────
+        _VALIDATOR_HIST_MAX = 30.0  # seconds to keep historical markers
+        _validator_markers = {}  # {mid: {wx, wy, wz, detected_at, last_seen_at, conf, is_visible}}
+        _validator_last_update = 0.0  # time of last state exposure
+        _VALIDATOR_UPDATE_INTERVAL = 0.5  # ~2x per second
+        # ──────────────────────────────────────────────────────────────────
+
+        # Freeze detection: track last frame timestamp change and restart cooldown.
+        _freeze_last_ts: float = 0.0
+        _freeze_restart_after: float = 0.0   # monotonic cooldown (vision_worker local)
+        _FREEZE_TIMEOUT_S  = 3.0   # stale frame age that counts as frozen
+        _FREEZE_COOLDOWN_S = 3.0   # min seconds between auto-restarts
+        _MOVE_SPEED_CMS    = 5.0   # drone speed threshold (cm/s) for "moving"
         # Position Kalman filter state. Lives across loop iterations
         # (function-local closure variables persist). Reset on
         # disable -> enable transitions and on dt > kalman_reset_gap_s.
         position_kf = PositionKalman()
         kf_last_t = 0.0
         kf_enabled_prev = False
+        # Marker position history for IMU dead-reckoning.
+        # imu_disp accumulates arena-frame displacement (m) since the
+        # last cache reset; stored per-entry so correction =
+        # current_imu_disp - stored_imu_disp.
+        marker_cache = MarkerPositionCache()
+        imu_disp = np.zeros(3, dtype=float)
+        imu_last_t: float = 0.0
+        # IMU dead-reckoning anchor: last marker-confirmed position and
+        # the imu_disp value at that moment. Used for 25% IMU blend.
+        imu_anchor_pos: Optional[np.ndarray] = None
+        imu_anchor_disp = np.zeros(3, dtype=float)
+        _IMU_WEIGHT = 0.25   # fraction of IMU estimate in final blend
         while not stop.is_set():
             frame, jpg, ts = reader.latest()
+            # ── Freeze detection (runs even when no new frame arrives) ──
+            now_ft = time.monotonic()
+            stats = reader.stats
+            frame_age = stats.get("age_s") or 0.0
+            if frame_age > _FREEZE_TIMEOUT_S and now_ft >= _freeze_restart_after:
+                tel_now = tel_holder.get()
+                if tel_now is not None and tel_now.flying:
+                    try:
+                        spd = math.hypot(
+                            float(tel_now.raw.get("vgx", 0) or 0),
+                            float(tel_now.raw.get("vgy", 0) or 0),
+                        )
+                    except (TypeError, ValueError):
+                        spd = 0.0
+                    if spd >= _MOVE_SPEED_CMS:
+                        print(f"[vision] frame frozen {frame_age:.1f}s while "
+                              f"moving ({spd:.0f} cm/s) — restarting camera")
+                        errs = ui.restart_camera()
+                        _freeze_restart_after = now_ft + _FREEZE_COOLDOWN_S
+                        with state.lock:
+                            state.camera_restart_count += 1
+                        if errs:
+                            print(f"[vision] camera restart errors: {errs}")
+            # ────────────────────────────────────────────────────────────
+
             if frame is None or ts == last_seen_ts:
                 if (last_seen_ts and not last_expired
                         and time.monotonic() - last_seen_ts
@@ -559,6 +833,7 @@ def cmd_fly(args: argparse.Namespace) -> int:
                 continue
             last_seen_ts = ts
             last_expired = False
+
             try:
                 # Pick up runtime cfg toggles (e.g. operator flips
                 # mirror_collapse on /tune mid-flight). Cheap attribute
@@ -702,7 +977,39 @@ def cmd_fly(args: argparse.Namespace) -> int:
                         position_kf.reset()
                         kf_last_t = 0.0
                         kf_enabled_prev = False
+                        # Reset marker history and IMU state so stale
+                        # pre-takeoff observations don't bleed in.
+                        marker_cache.reset()
+                        imu_disp = np.zeros(3, dtype=float)
+                        imu_last_t = 0.0
+                        imu_anchor_pos = None
+                        imu_anchor_disp = np.zeros(3, dtype=float)
                         print("[vision] position estimator reset (TAKEOFF)")
+
+                    # Integrate arena-frame IMU velocity for dead-reckoning.
+                    now_mono = time.monotonic()
+                    # Integrate arena-frame IMU velocity for dead-reckoning.
+                    if (arena_for_swap is not None
+                            and arena_for_swap.magnetic_north_arena_yaw_deg
+                                is not None
+                            and tel_for_swap is not None
+                            and imu_last_t > 0.0):
+                        try:
+                            _vN = float(tel_for_swap.raw["vgx"]) / 100.0
+                            _vE = float(tel_for_swap.raw["vgy"]) / 100.0
+                            _vD = float(tel_for_swap.raw["vgz"]) / 100.0
+                            _v  = ned_velocity_to_arena(
+                                _vN, _vE, _vD,
+                                float(arena_for_swap
+                                      .magnetic_north_arena_yaw_deg))
+                            imu_disp += _v * (now_mono - imu_last_t)
+                        except (KeyError, TypeError, ValueError):
+                            pass
+                    if imu_last_t == 0.0:
+                        imu_last_t = now_mono
+                    imu_last_t = now_mono
+                    marker_cache.prune(now_mono)
+
                     prev_age_s = ((time.monotonic() - prev_at)
                                    if prev_at > 0.0 else None)
                     # Drone altimeter (barometer) reading for the
@@ -726,7 +1033,47 @@ def cmd_fly(args: argparse.Namespace) -> int:
                         enable_alt_branch_swap=cfg.enable_ippe_alt_branch_swap,
                         enable_prev_anchor=cfg.enable_ippe_prev_anchor,
                         enable_aggregate_oob_discard=
-                            cfg.enable_ippe_aggregate_oob_discard)
+                            cfg.enable_ippe_aggregate_oob_discard,
+                        marker_cache=marker_cache,
+                        cache_now=now_mono,
+                        cache_imu_disp=imu_disp)
+                    # Refresh the marker cache with fresh primary
+                    # observations (dist available from poses).
+                    _pose_dist = {int(p.marker_id): float(p.distance_m)
+                                  for p in poses}
+                    if est is not None:
+                        for mid, pos_w in est.per_marker_position_m.items():
+                            dist = _pose_dist.get(mid, 1.0)
+                            marker_cache.record(
+                                mid, pos_w, dist, now_mono, imu_disp)
+                        # 75 % marker estimate + 25 % IMU dead-reckoning.
+                        # imu_anchor_pos is the last marker-confirmed
+                        # position; imu_disp − imu_anchor_disp is the
+                        # displacement since that anchor.
+                        marker_pos = np.asarray(est.position_m, dtype=float)
+                        if imu_anchor_pos is not None:
+                            imu_pos = (imu_anchor_pos
+                                       + (imu_disp - imu_anchor_disp))
+                            blended = ((1.0 - _IMU_WEIGHT) * marker_pos
+                                       + _IMU_WEIGHT * imu_pos)
+                        else:
+                            blended = marker_pos
+                        # Update anchor to the blended result.
+                        imu_anchor_pos = blended.copy()
+                        imu_anchor_disp = imu_disp.copy()
+                        # Override est.position_m with blended value.
+                        est = type(est)(
+                            position_m=blended,
+                            used_markers=est.used_markers,
+                            per_marker_position_m=est.per_marker_position_m,
+                            weights=est.weights,
+                            per_marker_method=est.per_marker_method,
+                            confidence=est.confidence,
+                        )
+                    # Always update confidence (0 if no estimate).
+                    with state.lock:
+                        state.world_position_confidence = float(
+                            est.confidence if est is not None else 0.0)
                     if est is not None:
                         # Optional position Kalman filter. When enabled,
                         # the world_position_m we publish is the KF
@@ -753,9 +1100,8 @@ def cmd_fly(args: argparse.Namespace) -> int:
                                 position_kf.predict(kf_dt)
                             position_kf.update_position(
                                 np.asarray(est.position_m, dtype=float))
-                            # IMU velocity update (NED -> arena).
-                            # Anafi vgx/vgy/vgz come out in cm/s, see
-                            # comment in tools/replay_kalman.py.
+                            # IMU velocity update (NED -> arena, 25% weight
+                            # already applied via blended position above).
                             if (arena_for_swap is not None
                                     and arena_for_swap
                                     .magnetic_north_arena_yaw_deg is not None
@@ -813,6 +1159,41 @@ def cmd_fly(args: argparse.Namespace) -> int:
                                       est.per_marker_position_m[mid])
                                 for mid in est.used_markers]
                             state.world_velocity_m_kf = world_vel
+                            # Update arena validator with visible markers.
+                            now_val = time.monotonic()
+                            for mid, pos_m in est.per_marker_position_m.items():
+                                if mid not in _validator_markers:
+                                    _validator_markers[mid] = {
+                                        'wx': float(pos_m[0]),
+                                        'wy': float(pos_m[1]),
+                                        'wz': float(pos_m[2]),
+                                        'detected_at': now_val,
+                                        'last_seen_at': now_val,
+                                        'conf': float(est.weights.get(mid, 0.5)),
+                                        'is_visible': True,
+                                    }
+                                else:
+                                    m = _validator_markers[mid]
+                                    m['wx'] = float(pos_m[0])
+                                    m['wy'] = float(pos_m[1])
+                                    m['wz'] = float(pos_m[2])
+                                    m['last_seen_at'] = now_val
+                                    m['conf'] = float(est.weights.get(mid, m['conf']))
+                                    m['is_visible'] = True
+                            # Prune old markers (>30s) and mark stale ones.
+                            prune_before = now_val - _VALIDATOR_HIST_MAX
+                            to_delete = []
+                            for mid, m in _validator_markers.items():
+                                if m['detected_at'] < prune_before:
+                                    to_delete.append(mid)
+                                elif mid not in est.per_marker_position_m:
+                                    m['is_visible'] = False
+                            for mid in to_delete:
+                                del _validator_markers[mid]
+                            # Expose to state ~2x per second (already holding state.lock).
+                            if now_val - _validator_last_update >= _VALIDATOR_UPDATE_INTERVAL:
+                                state.arena_validation_map = dict(_validator_markers)
+                                _validator_last_update = now_val
                 # Active target's pose method (or empty if not in view).
                 with state.lock:
                     state.target_pose_method = (
@@ -899,6 +1280,21 @@ def cmd_fly(args: argparse.Namespace) -> int:
                         markers=arena_for_swap.markers,
                         visible_marker_ids=seen_ids,
                     )
+                # ── Other-drone detection + overlay ───────────────────
+                raw_blobs = _detect_drones(frame)
+                confirmed  = _temporal_filter(raw_blobs)
+                if confirmed:
+                    # Largest = nearest (red), rest yellow
+                    for i, (bx, by, bw, bh) in enumerate(confirmed):
+                        color = (0, 0, 255) if i == 0 else (0, 255, 255)
+                        cv2.rectangle(ann, (bx, by),
+                                      (bx + bw, by + bh), color, 2)
+                        label = "drone" if i > 0 else "NEAREST"
+                        cv2.putText(ann, label,
+                                    (bx, max(by - 4, 10)),
+                                    cv2.FONT_HERSHEY_SIMPLEX,
+                                    0.45, color, 1, cv2.LINE_AA)
+                # ──────────────────────────────────────────────────────
                 latest_ann_frame.set(ann)
                 # Record both raw and annotated ----------------------------
                 if not recording_paused.is_set():

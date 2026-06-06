@@ -86,8 +86,11 @@ class DroneApiInProc:
             return False
 
     # ------------------------------------------------------------ video
-    def video_start_mjpeg(self) -> dict:
-        return self._unwrap(*drone_core.do_video_start(mode="mjpeg"))
+    def video_start_mjpeg(self) -> tuple:
+        payload, status = drone_core.do_video_start(mode="mjpeg")
+        ok = status < 400 and bool(payload.get("ok", True) if isinstance(payload, dict) else True)
+        msg = (payload.get("message") or payload.get("error") or "ok") if isinstance(payload, dict) else str(payload)
+        return ok, msg
 
     def video_stop(self) -> dict:
         return self._unwrap(*drone_core.do_video_stop())
@@ -224,35 +227,59 @@ class InProcMjpegReader:
                 "last_error": self._last_error,
             }
 
+    # Cap reader at this rate so vision_worker (ArUco + annotation) has
+    # time to process each frame. Anafi delivers ~30fps; detection takes
+    # ~30-50ms, so 20fps (50ms/frame) is the sustainable ceiling.
+    _MAX_FPS = 20.0
+
     def _run(self) -> None:
-        backoff = 0.5
+        # Read raw BGR frames directly from the callback-driven condition
+        # variable in unified_api_server. This avoids the JPEG round-trip
+        # (encode→decode) that caused image distortion.
+        import unified_api_server as _srv
+        last_ts = 0.0
+        last_publish = 0.0
+        min_interval = 1.0 / self._MAX_FPS
         while not self._stop.is_set():
             try:
-                for jpg in drone_core.iter_video_jpegs():
-                    if self._stop.is_set():
-                        return
-                    self._publish(jpg)
-                # Generator returned cleanly — pipeline is no longer
-                # in mjpeg mode. Wait a beat before trying again so we
-                # don't busy-loop while the operator toggles modes.
-                self._stop.wait(0.5)
-                backoff = 0.5
+                if _srv._video_mode != "mjpeg":
+                    self._stop.wait(0.3)
+                    continue
+                with _srv._video_bgr_cond:
+                    # Wait up to 0.5 s for a new frame notification.
+                    notified = _srv._video_bgr_cond.wait_for(
+                        lambda: _srv._video_bgr_ts != last_ts
+                                or self._stop.is_set(),
+                        timeout=0.5,
+                    )
+                if self._stop.is_set():
+                    return
+                if not notified:
+                    continue  # timeout — loop back and check mode/stop
+                with _srv._video_bgr_cond:
+                    bgr = _srv._video_bgr_latest
+                    ts  = _srv._video_bgr_ts
+                if bgr is None or ts == last_ts:
+                    continue
+                last_ts = ts
+                # Rate-cap: skip frames that arrive faster than _MAX_FPS.
+                # Always takes the LATEST frame (not queued), so latency
+                # stays minimal while the vision pipeline isn't overloaded.
+                now = time.monotonic()
+                if now - last_publish < min_interval:
+                    continue
+                last_publish = now
+                self._publish_bgr(bgr, ts)
             except Exception as e:
                 with self._lock:
                     self._last_error = str(e)
-                if not self._stop.is_set():
-                    self._stop.wait(min(backoff, 5.0))
-                    backoff = min(backoff * 2, 5.0)
+                self._stop.wait(0.5)
 
-    def _publish(self, jpg: bytes) -> None:
-        arr = np.frombuffer(jpg, dtype=np.uint8)
-        frame = cv2.imdecode(arr, cv2.IMREAD_COLOR)
-        if frame is None:
-            return
+    def _publish_bgr(self, frame: np.ndarray, ts: float) -> None:
         with self._lock:
-            self._latest_jpeg = jpg
             self._latest_frame = frame
-            self._latest_ts = time.monotonic()
+            self._latest_jpeg = None   # encoded on demand by callers that need it
+            self._latest_ts = ts
             self._frames_received += 1
             self._last_error = None
 

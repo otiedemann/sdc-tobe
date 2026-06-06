@@ -1,0 +1,54 @@
+---
+# Write fleet.json to every FC so that automatic settings-sync works.
+# Run this once after adding or removing FCs from the fleet.
+#
+# Usage:
+#   ansible-playbook -i inventory.ini init-fleet.yml \
+#       -e "ansible_become_password=sdc26"
+#
+# Each FC gets the same fleet.json listing all hosts in [flightctrl].
+# The marker_mission code filters out the host's own hostname at runtime
+# so a FC never pushes to itself.
+
+- name: Deploy fleet.json to all FCs
+  hosts: flightctrl
+  gather_facts: true
+  become: false
+
+  vars:
+    fleet_path: /home/sdc/.marker_mission/fleet.json
+    mm_port: 8080
+
+  tasks:
+    - name: Ensure .marker_mission directory exists
+      ansible.builtin.file:
+        path: /home/sdc/.marker_mission
+        state: directory
+        owner: sdc
+        group: sdc
+        mode: "0755"
+
+    - name: Write fleet.json
+      ansible.builtin.copy:
+        dest: "{{ fleet_path }}"
+        owner: sdc
+        group: sdc
+        mode: "0644"
+        content: |
+          {
+            "peers": [
+          {% for host in groups['flightctrl'] %}
+              "http://{{ host }}:{{ mm_port }}"{% if not loop.last %},{% endif %}
+
+          {% endfor %}
+            ]
+          }
+
+    - name: Show fleet.json
+      ansible.builtin.command: cat {{ fleet_path }}
+      register: fleet_content
+      changed_when: false
+
+    - name: Display
+      ansible.builtin.debug:
+        var: fleet_content.stdout

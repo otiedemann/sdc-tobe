@@ -49,6 +49,7 @@ _CSV_FIELDS = [
     "target_distance_m", "target_relative_heading_deg",
     "mission_step_idx",
     "world_x", "world_y", "world_z", "world_n_used", "world_position_age_s",
+    "world_position_confidence", "arena_yaw_deg", "arena_yaw_age_s",
     # Position Kalman filter velocity output (arena frame, m/s) when
     # cfg.enable_position_kalman is True. Empty when KF is disabled
     # or hasn't initialised yet. world_x/y/z above already carries
@@ -327,6 +328,13 @@ class FlightRecorder:
             wpa = snap.get("world_position_age_s")
             row["world_position_age_s"] = (
                 f"{wpa:.3f}" if wpa is not None else "")
+            wpc = snap.get("world_position_confidence")
+            row["world_position_confidence"] = (
+                f"{wpc:.3f}" if wpc is not None else "")
+            ayd = snap.get("arena_yaw_deg")
+            row["arena_yaw_deg"] = f"{ayd:.2f}" if ayd is not None else ""
+            aya = snap.get("arena_yaw_age_s")
+            row["arena_yaw_age_s"] = f"{aya:.3f}" if aya is not None else ""
             wvk = snap.get("world_velocity_m_kf")
             if wvk is not None:
                 row["world_vx_kf"] = f"{wvk[0]:.4f}"

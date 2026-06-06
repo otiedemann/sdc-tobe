@@ -28,6 +28,7 @@ WorkingDirectory=/home/sdc/sdc-tobe
 Environment=HOME=/home/sdc
 Environment=SDC_FC_REPO=/home/sdc/sdc-tobe
 Environment=SDC_FC_BRANCH=main
+Environment=VIDEO_FPS=30
 # Additional env vars (DRONE_TYPE, DRONE_IP, MM_DATA_DIR, …) belong in
 # a drop-in: /etc/systemd/system/marker-mission.service.d/override.conf
 

@@ -138,7 +138,9 @@ class MissionConfig:
     # rough point in the arena" 5cm is impractical from far-wall
     # ArUco alone and produces TO steps that never advance. 30cm is
     # plenty for "be in the home zone".
-    goto_deadband_m: float = 0.30          # TUNE
+    goto_deadband_m: float = 0.80          # TUNE
+    goto_speed_factor: float = 0.5         # TUNE  scale all RC channels in TO (0.0–1.0)
+    goto_scan_yaw_rc: int = 8              # TUNE  slow CW yaw during TO for marker visibility (0=off)
     heading_deadband_deg: float = 2.0      # TUNE
     lateral_deadband_m: float = 0.05       # TUNE
 
@@ -204,6 +206,17 @@ class MissionConfig:
     # slow zone (single-cap behaviour, like before this feature).
     approach_slow_zone_m: float = 0.5      # TUNE  brake zone radius [m]
     approach_slow_rc_max: int = 5          # TUNE  fb cap inside the brake zone
+    # Fraction of the approach leg (start_d → target_d) after which the
+    # lateral / angle correction activates. The yaw PD (marker centring)
+    # is always active so the drone flies straight at the marker first;
+    # the lateral (relative-heading) correction only kicks in once the
+    # drone has crossed this threshold.
+    # 0.0 = lateral active from the start  |  0.5 = second half  |  1.0 = never
+    approach_yaw_start_fraction: float = 0.5  # TUNE
+    # Small yaw correction allowed BEFORE the angle-correction latch fires.
+    # Keeps the marker roughly centred in frame during the straight-in phase.
+    # 0.0 = no pre-latch yaw at all  |  10.0 = allow up to ±10° correction.
+    approach_pre_latch_yaw_deg: float = 10.0  # TUNE
     # Lateral motion has to be slow enough that yaw can keep tracking
     # the marker -- otherwise yaw lags, the marker drifts off-axis, and
     # the commanded "sideways" leaks into radial drift. An early try at
@@ -259,12 +272,14 @@ class MissionConfig:
     search_retreat_s: int = 2              # TUNE  seconds of backward drive
     search_retreat_rc: int = 25            # TUNE  RC magnitude during retreat
                                             # (always applied as -fb stick)
+    search_backrotate_deg: int = 10        # TUNE  degrees CCW to step back when
+                                            # marker is first detected mid-sweep
 
     # --- SCOUT step (operator-facing slow 360° look-around) -----------------
     # Yaw stick value held during the SCOUT step. Default 15 is gentle
     # enough for the ArUco detector to lock onto markers as the camera
     # sweeps past them; raise it for faster but rougher scans.
-    scout_yaw_stick: int = 15              # TUNE  RC counts (-100..+100)
+    scout_yaw_stick: int = 25              # TUNE  RC counts (-100..+100)
 
     # --- Phase transition criteria -------------------------------------------
     approach_settle_time_s: float = 1.0    # how long all errors must be inside
@@ -508,6 +523,14 @@ TUNING_FIELDS = {
         "label": "fwd i clip", "kind": "float", "unit": "m*s", "step": 0.01,
         "desc": "Hard cap on the magnitude of the fwd integrator. With ki=30 and i_clip=1.0, the I term can contribute at most 30 RC counts. Last-line guard against integrator runaway.",
     },
+    "approach_yaw_start_fraction": {
+        "label": "angle correction start (APPROACH)", "kind": "float", "step": 0.05,
+        "desc": "Fraction of the approach leg at which lateral/angle correction activates. 0.5 = flies straight (marker centred) for the first 50 % of (start_d → target_d), then corrects the approach angle. 0.0 = always correct. 1.0 = never correct laterally during approach.",
+    },
+    "approach_pre_latch_yaw_deg": {
+        "label": "pre-latch yaw limit (APPROACH)", "kind": "float", "unit": "deg", "step": 1.0,
+        "desc": "Max yaw error at which a small correction is applied BEFORE the angle-correction latch fires. Keeps the marker roughly centred in frame during the straight-in phase without full lateral steering. 0 = no pre-latch yaw. 10 = allow up to ±10° correction.",
+    },
     "approach_slow_zone_m": {
         "label": "approach slow zone", "kind": "float", "unit": "m", "step": 0.01,
         "desc": "When |distance - target_distance_m| is below this, the forward RC is hard-capped at approach_slow_rc_max regardless of PD output. Lets you set a high fwd_rc_max for fast cruise from far while still braking to a gentle final approach. 0 disables.",
@@ -621,6 +644,14 @@ TUNING_FIELDS = {
         "label": "goto deadband", "kind": "float", "unit": "m", "step": 0.01,
         "desc": "Deadband used by the TO (arena-frame waypoint) step. Loose by design — APPROACH / ALIGN / HOLD use the tight distance_deadband_m because they track a marker, but TO is a 'rough waypoint' command and 5cm precision from far-wall ArUco is impractical. 0.3m is a good default for 'be in the home zone'.",
     },
+    "goto_speed_factor": {
+        "label": "RC speed factor", "kind": "float", "step": 0.05,
+        "desc": "Scale factor applied to all RC channels (lr/fb/ud/yaw) for TO and raw RC script steps (LR_RC/FB_RC/UD_RC/YAW_RC/RC). 1.0 = full speed, 0.5 = 50% speed. Does not affect autopilot phases (APPROACH/ALIGN/HOLD/SEARCH).",
+    },
+    "goto_scan_yaw_rc": {
+        "label": "TO scan yaw RC", "kind": "int", "step": 1,
+        "desc": "Slow CW yaw stick applied continuously during TO navigation so arena markers stay in view for position updates. 0 = disabled. Bypasses yaw_rc_max so the scan rate is independent of the PD cap.",
+    },
     "distance_deadband_m": {
         "label": "distance deadband", "kind": "float", "unit": "m", "step": 0.01,
         "desc": "|distance - target| below this → rc_fb=0. Defines what 'at target distance' means for phase-settle and PD.",
@@ -670,6 +701,10 @@ TUNING_FIELDS = {
     "search_retreat_rc": {
         "label": "SEARCH retreat RC", "kind": "int", "step": 1,
         "desc": "Magnitude of the backward FB stick used during the SEARCH retreat phase. Always applied as -fb (backward); only the magnitude is configured here. Typical 20–30 for a gentle reverse.",
+    },
+    "search_backrotate_deg": {
+        "label": "SEARCH back-rotate on detect", "kind": "int", "unit": "°", "step": 1,
+        "desc": "When the target marker is first spotted during a SEARCH sweep, the drone stops rotation immediately and steps back this many degrees CCW (opposite to the CW sweep direction) before entering HEIGHT_ALIGN. This centres the marker in the frame and avoids starting APPROACH from a skewed angle. 0 disables the back-step.",
     },
     "ud_rc_max": {
         "label": "ud RC max", "kind": "int", "step": 1,
@@ -751,7 +786,8 @@ TUNING_GROUPS = [
     ("Mission goals", ["target_distance_m", "target_relative_heading_deg", "hold_time_s"]),
     ("Forward PD (closing distance)",
         ["fwd_kp", "fwd_kd", "fwd_kv", "fwd_ki", "fwd_i_clip",
-         "fwd_rc_max", "approach_slow_zone_m", "approach_slow_rc_max"]),
+         "fwd_rc_max", "approach_slow_zone_m", "approach_slow_rc_max",
+         "approach_yaw_start_fraction"]),
     ("Lateral PD (orbiting / heading correction)",
         ["lat_kp", "lat_kd", "lat_kv", "lat_ki", "lat_i_clip", "lat_rc_max"]),
     ("Yaw PD (centring marker)",
@@ -764,6 +800,7 @@ TUNING_GROUPS = [
         ["default_dance_seconds_s", "dance_radius_m"]),
     ("Deadbands",
         ["yaw_deadband_deg", "distance_deadband_m", "goto_deadband_m",
+         "goto_speed_factor", "goto_scan_yaw_rc",
          "heading_deadband_deg", "approach_heading_deadband_deg",
          "align_heading_deadband_deg"]),
     ("Phase timing",
@@ -771,7 +808,7 @@ TUNING_GROUPS = [
          "search_marker_lost_grace_s"]),
     ("Safety / search",
         ["distance_floor_factor", "search_yaw_rc", "scout_yaw_stick",
-         "search_retreat_s", "search_retreat_rc"]),
+         "search_retreat_s", "search_retreat_rc", "search_backrotate_deg"]),
     ("Pose smoothing",
         ["pose_smoothing_alpha", "pose_max_age_s"]),
     ("Operator UX",

@@ -1,0 +1,108 @@
+---
+# Sync marker-mission settings (tune, scripts, arenas) from one source FC
+# to every other FC in the fleet.
+#
+# Usage:
+#   # Pull from flightctrl1, push to all others
+#   ansible-playbook -i inventory.ini sync-settings.yml \
+#       -e "source=flightctrl1"
+#
+#   # Pull from flightctrl3, push only to flightctrl4 and flightctrl5
+#   ansible-playbook -i inventory.ini sync-settings.yml \
+#       -e "source=flightctrl3 target=flightctrl4,flightctrl5"
+#
+# What is synced (via /api/mission/settings/export + /import):
+#   config.json                 live tune state
+#   defaults.json               pinned-default pointers
+#   active_mission_script.txt   live mission script draft
+#   active_arena_config.json    live arena config
+#   snapshots/*.json            saved tune snapshots
+#   mission_scripts/*.txt       saved mission scripts
+#   arenas/*.json               saved arena configs
+#
+# What is NOT synced (intentionally):
+#   calibrations/*.npz          per-drone camera intrinsics (drone-specific)
+#   camera_configs/*.json       per-drone camera tuning (drone-specific)
+#   flights/                    per-flight recordings (large, host-specific)
+#
+# Each destination creates a backup of its current state automatically
+# before the import overwrites it (visible in the Settings > Backups table).
+
+- name: Sync marker-mission settings across fleet
+  hosts: localhost
+  gather_facts: false
+
+  vars:
+    source: ""          # required — source hostname (e.g. flightctrl1)
+    target: ""          # optional — comma-separated; empty = all except source
+    port: 8080
+    tmp_zip: "/tmp/mm-settings-sync-{{ source }}.zip"
+
+  pre_tasks:
+    - name: Require source
+      ansible.builtin.fail:
+        msg: "Pass -e 'source=flightctrl<N>' to specify the settings source."
+      when: source == ""
+
+    - name: Resolve target list
+      ansible.builtin.set_fact:
+        target_list: >-
+          {{
+            (target.split(',') | map('trim') | select('string') | list)
+            if target != ""
+            else (groups['flightctrl'] | difference([source]))
+          }}
+
+    - name: Show sync plan
+      ansible.builtin.debug:
+        msg:
+          - "Source : http://{{ source }}:{{ port }}"
+          - "Targets: {{ target_list | join(', ') }}"
+          - "Tmp ZIP: {{ tmp_zip }}"
+
+  tasks:
+    # ── 1. Export settings from source FC ────────────────────────────────────
+    - name: Export settings ZIP from source
+      ansible.builtin.command: >
+        curl --silent --show-error --fail
+          --output {{ tmp_zip }}
+          http://{{ source }}:{{ port }}/api/mission/settings/export
+      changed_when: true
+
+    - name: Verify ZIP was downloaded
+      ansible.builtin.stat:
+        path: "{{ tmp_zip }}"
+      register: zip_stat
+      failed_when: not zip_stat.stat.exists or zip_stat.stat.size == 0
+
+    - name: Show ZIP size
+      ansible.builtin.debug:
+        msg: "Downloaded {{ zip_stat.stat.size }} bytes from {{ source }}"
+
+    # ── 2. Import settings to each target FC ─────────────────────────────────
+    - name: Import settings to target FCs
+      ansible.builtin.command: >
+        curl --silent --show-error --fail
+          --form "file=@{{ tmp_zip }};type=application/zip"
+          http://{{ item }}:{{ port }}/api/mission/settings/import
+      loop: "{{ target_list }}"
+      register: import_results
+      changed_when: true
+
+    - name: Show import responses
+      ansible.builtin.debug:
+        msg: "{{ item.item }}: {{ item.stdout | from_json | default(item.stdout) }}"
+      loop: "{{ import_results.results | default([]) }}"
+      when: item.stdout is defined
+
+    # ── 3. Cleanup ────────────────────────────────────────────────────────────
+    - name: Remove temp ZIP
+      ansible.builtin.file:
+        path: "{{ tmp_zip }}"
+        state: absent
+
+    - name: Sync complete
+      ansible.builtin.debug:
+        msg:
+          - "✓ Settings synced from {{ source }} to: {{ target_list | join(', ') }}"
+          - "  Each destination created a backup before overwriting."

@@ -219,6 +219,10 @@ def do_move(direction: Any = "", cm: Any = 20) -> tuple[dict, int]:
             1.0 if _srv.drone_type == "tello"
             else max(1.0, abs(dist_cm) / 50)
         )
+        # Wait at least one RC-loop cycle (50 ms @ 20 Hz) so the loop
+        # notices in_discrete=True and stops sending PCMD before
+        # _stop_piloting() is called inside b.move().
+        import time as _time; _time.sleep(0.1)
         ok, msg = b.move(direction, dist_cm)
         if ok:
             return {"ok": True, "dir": direction, "cm": dist_cm}, 200
@@ -247,6 +251,7 @@ def do_rotate(direction: Any = "", deg: Any = 45) -> tuple[dict, int]:
         _srv.start_discrete_window(
             1.0 if _srv.drone_type == "tello" else max(1.0, degrees / 90)
         )
+        import time as _time; _time.sleep(0.1)
         ok, msg = b.rotate(direction, degrees)
         if ok:
             return {"ok": True, "dir": direction, "deg": degrees}, 200

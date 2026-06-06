@@ -22,10 +22,24 @@ from __future__ import annotations
 
 import datetime as _dt
 import json
+import subprocess as _sp
 import threading
 import time
 from pathlib import Path
 from typing import Callable, Optional
+
+
+def _git_sha() -> str:
+    try:
+        return _sp.check_output(
+            ["git", "-C", str(Path(__file__).parent), "rev-parse", "--short", "HEAD"],
+            stderr=_sp.DEVNULL, text=True,
+        ).strip()
+    except Exception:
+        return "unknown"
+
+
+_GIT_SHA = _git_sha()
 
 import cv2
 import numpy as np
@@ -119,9 +133,29 @@ _PAGE_HEADER = """
     <a href="/arena" class="{{ 'active' if active=='arena' else '' }}">Arena</a>
     <a href="/calibrate" class="{{ 'active' if active=='calibrate' else '' }}">Calibrate</a>
     <a href="/settings" class="{{ 'active' if active=='settings' else '' }}">Settings</a>
+    <a href="/hardware" class="{{ 'active' if active=='hardware' else '' }}">Hardware</a>
   </nav>
-  <span style="margin-left:auto; font-size:.85rem; color:#aab;"
+  <div style="margin-left:auto; display:flex; align-items:center; gap:.6rem;">
+    <div id="wlan-info" style="font-size:.72rem; color:#bbb; line-height:1.5;
+         font-family:monospace; white-space:nowrap;
+         border:1px solid #444; border-radius:4px; padding:4px 8px;">—</div>
+    <div id="header-drone-state"
+         style="font-size:.72rem; font-family:monospace; white-space:nowrap;
+                border:1px solid #444; border-radius:4px; padding:4px 8px;
+                line-height:1.5; color:#bbb;">—</div>
+    <div id="header-battery"
+         style="font-size:16px; font-weight:700; font-family:monospace;
+                white-space:nowrap;">—</div>
+  </div>
+  <div id="cam-restart-count" title="Auto camera restarts (freeze detection)"
+       style="font-size:.72rem; color:#aab; font-family:monospace;
+              margin-left:.6rem; white-space:nowrap; display:none;">
+    ↺ <span id="cam-restart-n">0</span>
+  </div>
+  <span style="font-size:.85rem; color:#aab;"
         id="phase">{{ header_label or 'phase: …' }}</span>
+  <span style="font-size:.75rem; color:#555; font-family:monospace;"
+        title="software version">{{ git_sha }}</span>
 </header>
 """
 
@@ -258,19 +292,33 @@ _VIDEO_AND_STATUS_HTML = """
       <div id="script-list" style="font-size:.85rem;"></div>
     </details>
     {% endif %}
-    <h2>Position</h2>
-    <div style="display:flex; gap:.6rem; align-items:center;
-                margin-bottom:.6rem;">
-      <canvas id="c-pos" width="240" height="240"
-              style="background:#0c0f12; border-radius:6px;
-                     flex:0 0 auto;"></canvas>
-      <div id="c-pos-text" style="font-size:.8rem; color:#aab;
-                                    font-variant-numeric:tabular-nums;
-                                    line-height:1.5;">—</div>
+    <h2>Position &amp; Validator</h2>
+    <div style="display:flex; gap:1.2rem; margin-bottom:1rem;">
+      <!-- Maps side by side -->
+      <div style="flex:0 0 auto;">
+        <canvas id="c-pos" width="240" height="240"
+                style="background:#0c0f12; border-radius:6px;
+                       display:block; margin-bottom:.5rem;"></canvas>
+      </div>
+      <div style="flex:0 0 auto;">
+        <canvas id="c-validator" width="240" height="240"
+                style="background:#0c0f12; border-radius:6px;
+                       display:block; margin-bottom:.5rem;"></canvas>
+      </div>
     </div>
+    <!-- Text below maps -->
+    <div style="display:flex; gap:1.2rem; margin-bottom:1rem;">
+      <div id="c-pos-text" style="flex:0 0 240px; font-size:.8rem; color:#aab;
+                                  font-variant-numeric:tabular-nums;
+                                  line-height:1.5;">—</div>
+      <div id="c-validator-text" style="flex:0 0 240px; font-size:.75rem; color:#aab;
+                                        line-height:1.3;">—</div>
+    </div>
+
     <h2>{{ 'Replayed flight' if mode == 'replay' else 'Mission status' }}</h2>
     <table id="status">
       <tr><th>Phase</th><td id="s-phase">—</td></tr>
+      <tr><th>Last flight</th><td id="s-last-dur">—</td></tr>
       <tr><th>Phase age</th><td id="s-pa">—</td></tr>
       <tr><th>Distance</th><td id="s-d">—</td></tr>
       <tr><th>Yaw to marker</th><td id="s-y">—</td></tr>
@@ -293,11 +341,12 @@ _VIDEO_AND_STATUS_HTML = """
 
 _CHARTS_HTML = """
 <section class="grid" style="grid-template-columns: 1fr 1fr; margin-top: 1rem;">
+  <div class="card"><h2>RC commands (lr / fb / ud / yaw)</h2><canvas id="c-rc" width="700" height="200"></canvas></div>
+  <div class="card"><h2>Drone telemetry (yaw / battery / height)</h2><canvas id="c-t" width="700" height="200"></canvas></div>
   <div class="card"><h2>Distance to marker (m)</h2><canvas id="c-d" width="700" height="200"></canvas></div>
   <div class="card"><h2>Yaw to marker (°)</h2><canvas id="c-y" width="700" height="200"></canvas></div>
   <div class="card"><h2>Relative heading (°)</h2><canvas id="c-h" width="700" height="200"></canvas></div>
-  <div class="card"><h2>Drone telemetry (yaw / battery / height)</h2><canvas id="c-t" width="700" height="200"></canvas></div>
-  <div class="card"><h2>RC commands (lr / fb / ud / yaw)</h2><canvas id="c-rc" width="700" height="200"></canvas></div>
+  <div class="card"><h2>Battery (%)</h2><canvas id="c-bat" width="700" height="200"></canvas></div>
 </section>
 """
 
@@ -345,6 +394,7 @@ _COMPACT_SIDEBAR_HTML = """
   <h2>Mission status</h2>
   <table id="status">
     <tr><th>Phase</th><td id="s-phase">—</td></tr>
+    <tr><th>Last flight</th><td id="s-last-dur">—</td></tr>
     <tr><th>Phase age</th><td id="s-pa">—</td></tr>
     <tr><th>Distance</th><td id="s-d">—</td></tr>
     <tr><th>Yaw to marker</th><td id="s-y">—</td></tr>
@@ -1056,8 +1106,14 @@ async function _ensureArenaCache() {
   _arenaCacheTried = true;
   try {
     const r = await fetch('/api/arena/active', {cache:'no-store'});
-    if (r.ok) _arenaCache = await r.json();
-  } catch (e) {}
+    if (r.ok) {
+      _arenaCache = await r.json();
+      // Redraw validator map now that we have dimensions
+      if (typeof drawValidatorMap === 'function') drawValidatorMap();
+    } else {
+      _arenaCacheTried = false;  // retry next call
+    }
+  } catch (e) { _arenaCacheTried = false; }
 }
 const ARENA_YAW_FRESH_S = 1.0;
 function _droneYawArena(s) {
@@ -1163,31 +1219,37 @@ function drawPositionView(s) {
       }
     });
   }
-  // Drone position + heading arrow. Dot colour matches the
-  // sidebar's wpAgeColor: fresh = green, stale = yellow/red, so
-  // the operator can spot a frozen position even at a glance.
+  // Drone position + heading arrow — same style as the /arena tab:
+  // cyan circle (fresh) or grey+transparent (stale >2s), coordinate
+  // label, heading arrow with arrowhead.
   const pos = s.world_position_m;
   const txt = $('c-pos-text');
   if (Array.isArray(pos) && pos.length === 3) {
     const dx = ax(pos[0]), dy = ay(pos[1]);
     const age = s.world_position_age_s;
-    const dotCol = (typeof age !== 'number' || age < 1.0) ? '#4ade80'
-                 : (age < 3.0) ? '#facc15'
-                 : '#f87171';
-    ctx.fillStyle = dotCol;
-    ctx.beginPath(); ctx.arc(dx, dy, 5, 0, 2*Math.PI); ctx.fill();
+    const stale = (typeof age === 'number' && age > 2.0);
+    const col  = stale ? '#888'   : '#38bdf8';
+    const bord = stale ? '#555'   : '#0ea5e9';
+    // filled circle
+    ctx.globalAlpha = stale ? 0.5 : 0.85;
+    ctx.fillStyle = col;
+    ctx.beginPath(); ctx.arc(dx, dy, 6, 0, 2*Math.PI); ctx.fill();
+    ctx.globalAlpha = 1.0;
+    ctx.strokeStyle = bord; ctx.lineWidth = 1.5;
+    ctx.beginPath(); ctx.arc(dx, dy, 6, 0, 2*Math.PI); ctx.stroke();
+    // heading arrow
     const yawArena = _droneYawArena(s);
     let yawTxt = '—';
     if (yawArena !== null) {
       const yawRad = yawArena * Math.PI / 180;
-      const L = 18;
+      const L = Math.min(20, pxPerM * 0.7);
       const ex = dx + L * Math.sin(yawRad);
-      const ey = dy - L * Math.cos(yawRad);     // canvas y flipped
-      ctx.strokeStyle = '#4ade80'; ctx.lineWidth = 2;
+      const ey = dy - L * Math.cos(yawRad);
+      ctx.strokeStyle = col; ctx.lineWidth = 2;
       ctx.beginPath(); ctx.moveTo(dx, dy); ctx.lineTo(ex, ey); ctx.stroke();
       const ang = Math.atan2(ey - dy, ex - dx);
       const HEAD = 5;
-      ctx.fillStyle = '#4ade80';
+      ctx.fillStyle = col;
       ctx.beginPath();
       ctx.moveTo(ex, ey);
       ctx.lineTo(ex - HEAD * Math.cos(ang - Math.PI/6),
@@ -1198,15 +1260,50 @@ function drawPositionView(s) {
       const norm = ((yawArena % 360) + 540) % 360 - 180;
       yawTxt = norm.toFixed(1) + '°';
     }
+    // velocity vector arrow
+    const vel = s.world_velocity_m_kf;
+    if (Array.isArray(vel) && !stale) {
+      const vx = vel[0], vy = vel[1];
+      const speed = Math.hypot(vx, vy);
+      if (speed > 0.05) {
+        const VEL_SCALE = pxPerM * 0.75;
+        const vex = dx + vx * VEL_SCALE;
+        const vey = dy - vy * VEL_SCALE;
+        ctx.strokeStyle = '#fb923c'; ctx.lineWidth = 1.5;
+        ctx.beginPath(); ctx.moveTo(dx, dy); ctx.lineTo(vex, vey); ctx.stroke();
+        const ang = Math.atan2(vey - dy, vex - dx);
+        const HEAD = 5;
+        ctx.fillStyle = '#fb923c';
+        ctx.beginPath();
+        ctx.moveTo(vex, vey);
+        ctx.lineTo(vex - HEAD * Math.cos(ang - Math.PI/6),
+                   vey - HEAD * Math.sin(ang - Math.PI/6));
+        ctx.lineTo(vex - HEAD * Math.cos(ang + Math.PI/6),
+                   vey - HEAD * Math.sin(ang + Math.PI/6));
+        ctx.closePath(); ctx.fill();
+      }
+    }
+
+    // sidebar text
     if (txt) {
       const n = (s.world_position_used_markers || []).length;
       const ageCol = wpAgeColor(age) || '#e6e6e6';
       const ageTxt = (typeof age === 'number')
         ? `${age.toFixed(1)} s ago` : 'no fix yet';
+      const speedStr = (Array.isArray(vel) && !stale)
+        ? `speed: <b style="color:#fb923c;">${Math.hypot(vel[0],vel[1]).toFixed(2)} m/s</b><br>`
+        : '';
+      const conf = s.world_position_confidence;
+      const confCol = (typeof conf==='number')
+        ? (conf>=0.7?'#4ade80':conf>=0.4?'#facc15':'#f87171') : '#555';
+      const confTxt = (typeof conf==='number')
+        ? `confidence: <b style="color:${confCol};">${(conf*100).toFixed(0)} %</b><br>` : '';
       txt.innerHTML = `x: <b style="color:#e6e6e6;">${pos[0].toFixed(2)}</b> m<br>`
                     + `y: <b style="color:#e6e6e6;">${pos[1].toFixed(2)}</b> m<br>`
                     + `z: <b style="color:#e6e6e6;">${pos[2].toFixed(2)}</b> m<br>`
                     + `yaw: <b style="color:#e6e6e6;">${yawTxt}</b><br>`
+                    + `${speedStr}`
+                    + `${confTxt}`
                     + `n markers: ${n}<br>`
                     + `age: <b style="color:${ageCol};">${ageTxt}</b>`;
     }
@@ -1421,6 +1518,7 @@ function updateCharts(s) {
   drawSeries('c-d', [{label:'distance', color:'#58c4ff', data:buf.d, legendX:0}], {target:s.target_distance_m});
   drawSeries('c-y', [{label:'yaw_to_marker', color:'#facc15', data:buf.y, legendX:0}], {target:0});
   drawSeries('c-h', [{label:'rel_heading', color:'#4ade80', data:buf.h, legendX:0}], {target:s.target_relative_heading_deg});
+  drawSeries('c-bat', [{label:'battery%', color:'#a78bfa', data:buf.battery, legendX:0}]);
   drawSeries('c-t', [
     {label:'drone_yaw', color:'#f87171', data:buf.drone_yaw, legendX:0},
     {label:'battery%',  color:'#a78bfa', data:buf.battery,   legendX:2},
@@ -1446,8 +1544,68 @@ async function refresh() {
     }
     const r = await fetch(STATE_URL, {cache:'no-store'});
     const s = await r.json();
+    // Battery in header
+    {
+      const tel = s.telemetry || {};
+      const bat = tel.battery;
+      const el = $('header-battery');
+      if (el) {
+        if (bat !== undefined && bat !== null) {
+          const col = bat < 20 ? '#f87171' : bat < 35 ? '#facc15' : '#4ade80';
+          el.textContent = bat + ' %';
+          el.style.color = col;
+        } else {
+          el.textContent = '—';
+          el.style.color = '#555';
+        }
+      }
+    }
+    // Drone state block in header (between WLAN and battery)
+    {
+      const tel  = s.telemetry || {};
+      const el   = $('header-drone-state');
+      if (el) {
+        const flying    = tel.flying;
+        const connected = tel.connected !== false;
+        const h_cm      = tel.height_cm;
+        const phase     = s.phase || '';
+
+        const connCol   = connected ? '#4ade80' : '#f87171';
+        const connTxt   = connected ? 'online' : 'offline';
+        const flyCol    = flying ? '#38bdf8' : '#aab';
+        const flyTxt    = flying ? 'flying' : 'landed';
+        const hTxt      = (h_cm != null && h_cm > 0)
+                          ? `${(h_cm/100).toFixed(1)} m` : '';
+
+        let html = `<span style="color:${connCol}">${connTxt}</span>`;
+        html    += ` · <span style="color:${flyCol}">${flyTxt}</span>`;
+        if (hTxt) html += ` · <span style="color:#38bdf8">${hTxt}</span>`;
+        if (phase && phase !== 'init')
+          html += ` · <span style="color:#facc15">${phase}</span>`;
+        el.innerHTML = html;
+      }
+    }
+    if (typeof s.camera_restart_count === 'number') {
+      const n = s.camera_restart_count;
+      const el = $('cam-restart-count');
+      const nel = $('cam-restart-n');
+      if (el && nel) {
+        nel.textContent = n;
+        el.style.display = n > 0 ? '' : 'none';
+        el.style.color = n > 2 ? '#f87171' : '#facc15';
+      }
+    }
     if (typeof s.drone_connected === 'boolean') {
+      const wasConnected = droneConnected;
       droneConnected = s.drone_connected;
+      if (wasConnected !== droneConnected) {
+        // Connection changed — clear the WLAN panel immediately and
+        // re-fetch so the "no drone" notice appears/disappears at once.
+        window._lastWlanUpdate = null;
+        const wlanEl = $('wlan-info');
+        if (wlanEl) wlanEl.innerHTML = '—';
+        refreshWlan();
+      }
     }
     $('phase').textContent = (REPLAY_ID ? 'replay phase: ' : 'phase: ') + s.phase;
     updateStatus(s);
@@ -1462,7 +1620,42 @@ async function refresh() {
     }
     lastPhase = s.phase;
   } catch (e) {}
+  // WLAN info: refresh every ~2 s, not every 250 ms
+  if (!window._lastWlanUpdate || Date.now() - window._lastWlanUpdate > 2000) {
+    refreshWlan();
+  }
   setTimeout(refresh, 250);
+}
+async function refreshWlan() {
+  try {
+    const wr = await fetch('/api/wlan', {cache:'no-store'});
+    const winfo = await wr.json();
+    const wlanEl = $('wlan-info');
+    if (wlanEl && winfo) {
+      let wlanText = '—';
+      for (const [iface, info] of Object.entries(winfo)) {
+        if (iface.startsWith('wl') && info.ssid && info.signal_dbm) {
+          const lines = [];
+          lines.push(`<strong>${info.ssid}</strong>`);
+          lines.push(`Signal: ${info.signal_dbm} dBm`);
+          if (info.link_quality) lines.push(`Quality: ${info.link_quality}%`);
+          if (info.frequency)   lines.push(`Freq: ${info.frequency}`);
+          if (info.band)        lines.push(`Band: ${info.band}`);
+          if (info.bit_rate)    lines.push(`Rate: ${info.bit_rate}`);
+          if (info.tx_power)    lines.push(`TX: ${info.tx_power}`);
+          if (info.mode)        lines.push(`Mode: ${info.mode}`);
+          wlanText = lines.join('<br>');
+          break;
+        }
+      }
+      if (!droneConnected) {
+        const noConn = '<span style="color:#f87171;">⚠ Keine Drohne verbunden</span>';
+        wlanText = wlanText !== '—' ? wlanText + '<br>' + noConn : noConn;
+      }
+      wlanEl.innerHTML = wlanText;
+      window._lastWlanUpdate = Date.now();
+    }
+  } catch (e) {}
 }
 // Paint the correct Start/Stop state from the server-rendered phase
 // before the first /api/state lands. Otherwise mid-flight refreshes
@@ -1472,6 +1665,25 @@ if (typeof setMissionButtons === 'function') {
   try { setMissionButtons(INITIAL_PHASE); } catch (e) {}
 }
 refresh();
+
+// Populate "Last flight" duration from the most recent replay entry.
+// Fetched once on page load; static data, no polling needed.
+(async function loadLastFlightDur() {
+  try {
+    const r = await fetch('/api/flights', {cache: 'no-store'});
+    if (!r.ok) return;
+    const flights = await r.json();
+    const last = flights.find(f => f.final_phase === 'done' && typeof f.duration_s === 'number');
+    const el = $('s-last-dur');
+    if (!el) return;
+    if (last) {
+      el.textContent = Math.round(last.duration_s) + 's';
+      el.title = last.flight_id;
+    } else {
+      el.textContent = 'no data';
+    }
+  } catch (e) {}
+})();
 </script>
 """
 
@@ -2330,6 +2542,20 @@ _PAGE_TUNE = _PAGE_BASE_CSS + _PAGE_HEADER + _COMMON_SCRIPT + _PAGE_GRID_OPEN + 
                 style="padding:.5rem .9rem; border:0; border-radius:6px;
                        background:#7f1d1d; color:#fee2e2; cursor:pointer;">
           Reset all to defaults</button>
+        <span style="margin-left:auto; display:flex; gap:.4rem; align-items:center;">
+          <button type="button" id="btn-tune-export"
+                  title="Download all current tune parameters as a JSON file to your computer."
+                  style="padding:.5rem .9rem; border:1px solid #3a4550; border-radius:6px;
+                         background:#1a2530; color:#e6edf3; cursor:pointer;">
+            ⬇ Export to file</button>
+          <label title="Upload a previously exported tune JSON file and apply all values."
+                 style="padding:.5rem .9rem; border:1px solid #2a4a6a; border-radius:6px;
+                        background:#1a3040; color:var(--accent); cursor:pointer;">
+            ⬆ Import from file
+            <input type="file" id="inp-tune-import" accept=".json" hidden>
+          </label>
+          <span id="tune-io-msg" style="font-size:.8rem; color:#aab;"></span>
+        </span>
       </div>
     </form>
   </div>
@@ -2749,6 +2975,64 @@ $('snap-name').addEventListener('keydown', e => {
 
 loadView();
 refreshSnapshots();
+
+// ── Export / Import tune parameters ──────────────────────────────────────────
+$('btn-tune-export').addEventListener('click', async () => {
+  const msg = $('tune-io-msg');
+  try {
+    const r = await fetch('/api/tune', {cache: 'no-store'});
+    const d = await r.json();
+    // Flatten groups → plain {name: value} object
+    const params = {};
+    for (const g of (d.groups || [])) {
+      for (const p of (g.params || [])) {
+        params[p.name] = p.value;
+      }
+    }
+    const blob = new Blob([JSON.stringify(params, null, 2)], {type: 'application/json'});
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    const host = location.hostname.replace(/[^a-zA-Z0-9]/g, '-');
+    a.download = `tune-${host}-${new Date().toISOString().slice(0,16).replace(':','-')}.json`;
+    a.click();
+    URL.revokeObjectURL(url);
+    msg.textContent = 'Exported ✓';
+    msg.style.color = 'var(--good)';
+    setTimeout(() => msg.textContent = '', 3000);
+  } catch(e) {
+    msg.textContent = 'Export failed: ' + e;
+    msg.style.color = 'var(--bad)';
+  }
+});
+
+$('inp-tune-import').addEventListener('change', async function() {
+  const msg = $('tune-io-msg');
+  const file = this.files && this.files[0];
+  if (!file) return;
+  this.value = '';
+  try {
+    const text = await file.text();
+    const params = JSON.parse(text);
+    if (typeof params !== 'object' || Array.isArray(params))
+      throw new Error('expected a JSON object of {name: value} pairs');
+    const r = await fetch('/api/tune/apply', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify(params),
+    });
+    const d = await r.json();
+    if (!d.ok) throw new Error(d.error || r.status);
+    msg.textContent = `Imported ${Object.keys(params).length} params ✓ — click Save to persist`;
+    msg.style.color = 'var(--good)';
+    await loadView();   // refresh form to show imported values
+    setTimeout(() => msg.textContent = '', 6000);
+  } catch(e) {
+    msg.textContent = 'Import failed: ' + e;
+    msg.style.color = 'var(--bad)';
+  }
+});
+
 })();
 </script>
 """ + _PAGE_GRID_CLOSE + _SHARED_SCRIPT
@@ -2785,7 +3069,13 @@ _PAGE_ARENA = _PAGE_BASE_CSS + _PAGE_HEADER + _COMMON_SCRIPT + _PAGE_GRID_OPEN +
                       style="margin-left:.4rem; padding:.2rem .55rem;
                              border:1px solid #2a3038; border-radius:4px;
                              background:#1f2937; color:#e6edf3;
-                             cursor:pointer; font-size:.8rem;">Capture</button>
+                             cursor:pointer; font-size:.8rem;">Capture (from markers)</button>
+              <button id="btn-ar-magcap-front" type="button"
+                      title="Use this when you've physically aligned the drone to face the front wall (arena_yaw = 0 by definition). Reads tel.yaw and stores -tel.yaw. No markers needed."
+                      style="margin-left:.3rem; padding:.2rem .55rem;
+                             border:1px solid #2a3038; border-radius:4px;
+                             background:#1f2937; color:#e6edf3;
+                             cursor:pointer; font-size:.8rem;">Capture (facing front wall)</button>
               <span id="ar-magcap-msg" style="margin-left:.4rem;
                     font-size:.78rem; color:#aab;"></span>
             </td></tr>
@@ -2806,10 +3096,34 @@ _PAGE_ARENA = _PAGE_BASE_CSS + _PAGE_HEADER + _COMMON_SCRIPT + _PAGE_GRID_OPEN +
     </div>
 
     <div class="card">
+      <h2>Magnetometer hardware calibration</h2>
+      <div style="display:flex; align-items:center; gap:.75rem; flex-wrap:wrap; margin-bottom:.6rem;">
+        <div>
+          Status: <span id="mag-status" style="font-weight:600;">—</span>
+          &nbsp;·&nbsp; Axes: <span id="mag-axes" style="font-family:monospace;">—</span>
+        </div>
+        <button id="btn-mag-cal" type="button"
+                style="padding:.4rem .85rem; border:0; border-radius:5px;
+                       background:#2563eb; color:#fff; font-weight:600;
+                       cursor:pointer; font-size:.85rem;">
+          Start calibration
+        </button>
+        <span id="mag-cal-msg" style="font-size:.82rem; color:#aab;"></span>
+      </div>
+      <p style="margin:.3rem 0; font-size:.82rem; color:#aab;">
+        Nach dem Start die Drohne in einer <strong style="color:#e6e6e6;">liegenden Acht</strong>
+        bewegen (~20–30 s, alle Achsen abdecken) bis alle Achsen grün sind.
+      </p>
+    </div>
+
+    <div class="card">
       <h2>Top-down view (+y = front, +x = right)</h2>
       <canvas id="c-arena" width="700" height="700"
               style="background:#0c0f12; border-radius:6px;
                      width:100%; height:auto;"></canvas>
+      <div id="arena-drone-pos"
+           style="margin-top:.4rem; font-size:.8rem; font-family:monospace;
+                  color:#7dd3fc; min-height:1.2em;">—</div>
     </div>
 
   </section>
@@ -2930,6 +3244,41 @@ async function captureMagNorth() {
     msg.textContent =
       'captured ' + offset.toFixed(2) + ' deg from '
       + used + ' markers (press Save active to persist)';
+  } catch (e) {
+    msg.style.color = 'var(--bad)';
+    msg.textContent = 'capture failed: ' + e;
+  }
+}
+// Alternate capture: operator has physically pointed the drone at
+// the front wall, so arena_yaw is 0 by definition. We only need
+// tel.yaw to derive the offset. No markers required — works on the
+// ground, in any phase, as long as telemetry is alive.
+async function captureMagNorthFromFront() {
+  const msg = $('ar-magcap-msg');
+  msg.style.color = '#aab'; msg.textContent = 'reading state...';
+  try {
+    const r = await fetch('/api/state', {cache:'no-store'});
+    const s = await r.json();
+    const tyaw = (s.telemetry || {}).yaw;
+    if (typeof tyaw !== 'number') {
+      msg.style.color = 'var(--bad)';
+      msg.textContent = 'no tel.yaw available — is the drone connected?';
+      return;
+    }
+    if (!confirm('Confirm the drone is physically pointed AT THE FRONT WALL '
+               + '(arena_yaw = 0 by definition).\\n\\ntel.yaw = '
+               + tyaw.toFixed(2) + ' deg → magnetic offset = '
+               + _wrap180(-tyaw).toFixed(2) + ' deg')) {
+      msg.style.color = '#aab'; msg.textContent = '';
+      return;
+    }
+    // arena_yaw = 0 (operator-asserted) → offset = 0 - tel.yaw = -tel.yaw
+    const offset = _wrap180(-tyaw);
+    $('ar-magnorth').value = offset.toFixed(2);
+    msg.style.color = 'var(--good)';
+    msg.textContent =
+      'captured ' + offset.toFixed(2) + ' deg from tel.yaw=' + tyaw.toFixed(2)
+      + ' (drone facing front wall — press Save active to persist)';
   } catch (e) {
     msg.style.color = 'var(--bad)';
     msg.textContent = 'capture failed: ' + e;
@@ -3160,6 +3509,191 @@ function drawArena() {
                  x + 9, y + 4);
     ctx.textAlign = 'center';
   });
+
+  // ── Drone position ─────────────────────────────────────────────────
+  if (_dronePos && typeof _dronePos.wx === 'number' && typeof _dronePos.wy === 'number') {
+    const dx = ax(_dronePos.wx);
+    const dy = ay(_dronePos.wy);
+    const stale = (_dronePos.age || 0) > 2.0;
+    const col = stale ? '#888' : '#38bdf8';   // grey when stale, cyan when fresh
+
+    // filled circle
+    ctx.beginPath();
+    ctx.arc(dx, dy, 8, 0, 2 * Math.PI);
+    ctx.fillStyle = col;
+    ctx.globalAlpha = stale ? 0.5 : 0.85;
+    ctx.fill();
+    ctx.globalAlpha = 1.0;
+    ctx.strokeStyle = stale ? '#555' : '#0ea5e9';
+    ctx.lineWidth = 2;
+    ctx.stroke();
+
+    // heading arrow (arena_yaw_deg: CW from +y / front wall)
+    if (typeof _dronePos.yaw === 'number') {
+      const yawRad = _dronePos.yaw * Math.PI / 180;
+      // +y = front = up on canvas, CW = positive → rotate CCW in canvas coords
+      const arrowLen = Math.min(28, px_per_m * 0.7);
+      const hx = dx + arrowLen * Math.sin(yawRad);
+      const hy = dy - arrowLen * Math.cos(yawRad);
+      ctx.strokeStyle = col; ctx.lineWidth = 2;
+      ctx.beginPath(); ctx.moveTo(dx, dy); ctx.lineTo(hx, hy); ctx.stroke();
+      const ang = Math.atan2(hy - dy, hx - dx);
+      ctx.fillStyle = col;
+      ctx.beginPath();
+      ctx.moveTo(hx, hy);
+      ctx.lineTo(hx - 7 * Math.cos(ang - Math.PI/6), hy - 7 * Math.sin(ang - Math.PI/6));
+      ctx.lineTo(hx - 7 * Math.cos(ang + Math.PI/6), hy - 7 * Math.sin(ang + Math.PI/6));
+      ctx.closePath(); ctx.fill();
+    }
+
+    // velocity vector arrow (arena-frame, m/s → pixels)
+    if (_dronePos.vel && !stale) {
+      const vx = _dronePos.vel[0], vy = _dronePos.vel[1];
+      const speed = Math.hypot(vx, vy);
+      if (speed > 0.05) {
+        const VEL_SCALE = px_per_m * 0.75;  // 1 m/s → 0.75 × px_per_m pixels
+        const vex = dx + vx * VEL_SCALE;
+        const vey = dy - vy * VEL_SCALE;   // canvas y flipped
+        ctx.strokeStyle = '#fb923c'; ctx.lineWidth = 2;
+        ctx.beginPath(); ctx.moveTo(dx, dy); ctx.lineTo(vex, vey); ctx.stroke();
+        const ang = Math.atan2(vey - dy, vex - dx);
+        const HEAD = 6;
+        ctx.fillStyle = '#fb923c';
+        ctx.beginPath();
+        ctx.moveTo(vex, vey);
+        ctx.lineTo(vex - HEAD * Math.cos(ang - Math.PI/6),
+                   vey - HEAD * Math.sin(ang - Math.PI/6));
+        ctx.lineTo(vex - HEAD * Math.cos(ang + Math.PI/6),
+                   vey - HEAD * Math.sin(ang + Math.PI/6));
+        ctx.closePath(); ctx.fill();
+      }
+    }
+
+    // label shown in the div below the canvas, not on the canvas itself
+    const posDiv = $('arena-drone-pos');
+    if (posDiv) {
+      const ageStr = stale
+        ? ` <span style="color:#888">(${_dronePos.age.toFixed(0)}s alt)</span>`
+        : '';
+      const col = stale ? '#888' : '#7dd3fc';
+      const speedStr = (_dronePos.vel && !stale)
+        ? `&nbsp;&nbsp;v: <b>${Math.hypot(_dronePos.vel[0],_dronePos.vel[1]).toFixed(2)} m/s</b>`
+        : '';
+      const conf = _dronePos.conf;
+      const confStr = (conf != null)
+        ? `&nbsp;&nbsp;conf: <b style="color:${conf>=0.7?'#4ade80':conf>=0.4?'#facc15':'#f87171'};">${(conf*100).toFixed(0)}%</b>`
+        : '';
+      posDiv.innerHTML =
+        `<span style="color:${col};">` +
+        `x: <b>${_dronePos.wx.toFixed(2)} m</b>` +
+        `&nbsp;&nbsp;y: <b>${_dronePos.wy.toFixed(2)} m</b>` +
+        (_dronePos.wz != null ? `&nbsp;&nbsp;z: <b>${_dronePos.wz.toFixed(2)} m</b>` : '') +
+        (_dronePos.yaw != null ? `&nbsp;&nbsp;yaw: <b>${((((_dronePos.yaw%360)+540)%360)-180).toFixed(1)}°</b>` : '') +
+        `${speedStr}${confStr}</span>${ageStr}`;
+    }
+  } else {
+    const posDiv = $('arena-drone-pos');
+    if (posDiv) posDiv.innerHTML = '—';
+  }
+}
+
+function drawValidatorMap() {
+  const c = $('c-validator');
+  const infoDiv = $('c-validator-text');
+  if (!c || !infoDiv) return;
+  const ctx = c.getContext('2d');
+  const W = c.width, H = c.height;
+  ctx.clearRect(0, 0, W, H);
+
+  // Derive arena dimensions: prefer the loaded arena object, then
+  // _arenaCache (Camera-tab mini-map), then Arena tab inputs, then default.
+  const _src = arena || _arenaCache || null;
+  const w = (_src && _src.width_m) || (typeof metaFromInputs === 'function' && metaFromInputs().width_m) || 0;
+  const d = (_src && _src.depth_m) || (typeof metaFromInputs === 'function' && metaFromInputs().depth_m) || 0;
+  if (w <= 0 || d <= 0) {
+    // Trigger arena load for next frame
+    if (!_arenaCache && typeof _ensureArenaCache === 'function') _ensureArenaCache();
+    return;
+  }
+
+  const margin = 20;
+  const px_per_m = Math.min((W - 2*margin) / w, (H - 2*margin) / d);
+  const cx = W / 2, cy = H / 2;
+  const ax = (xm) => cx + xm * px_per_m;
+  const ay = (ym) => cy - ym * px_per_m;
+
+  // background
+  ctx.fillStyle = '#0c0f12';
+  ctx.fillRect(0, 0, W, H);
+
+  // arena boundary (light gray)
+  ctx.strokeStyle = '#555'; ctx.lineWidth = 1;
+  ctx.strokeRect(ax(-w/2), ay(d/2), w * px_per_m, d * px_per_m);
+
+  // 5m grid (faint)
+  ctx.strokeStyle = '#222'; ctx.lineWidth = 0.5;
+  ctx.beginPath();
+  for (let xi = Math.ceil(-w/2); xi <= Math.floor(w/2); xi += 5) {
+    const xp = ax(xi);
+    ctx.moveTo(xp, ay(d/2)); ctx.lineTo(xp, ay(-d/2));
+  }
+  for (let yi = Math.ceil(-d/2); yi <= Math.floor(d/2); yi += 5) {
+    const yp = ay(yi);
+    ctx.moveTo(ax(-w/2), yp); ctx.lineTo(ax(w/2), yp);
+  }
+  ctx.stroke();
+
+  // config markers (configured positions)
+  if (arena && arena.markers) {
+    arena.markers.forEach(m => {
+      const x = ax(m.x), y = ay(m.y);
+      ctx.fillStyle = '#aab4';  // light gray with alpha
+      ctx.beginPath(); ctx.arc(x, y, 5, 0, 2*Math.PI); ctx.fill();
+      ctx.fillStyle = '#666'; ctx.font = '8px ui-sans-serif';
+      ctx.textAlign = 'center';
+      ctx.fillText(m.id, x, y+2);
+    });
+  }
+
+  // validated markers from arena_validation_map
+  let info = '';
+  let visibleCnt = 0, historicalCnt = 0;
+  if (_last_snap && _last_snap.arena_validation_map) {
+    Object.entries(_last_snap.arena_validation_map).forEach(([mid, m]) => {
+      if (typeof m.wx === 'number' && typeof m.wy === 'number') {
+        const x = ax(m.wx), y = ay(m.wy);
+        const now = Date.now() / 1000;
+        const age = (now - (m.last_seen_at || m.detected_at)) || 0;
+        const confidence = m.conf || 0.5;
+
+        if (m.is_visible) {
+          visibleCnt++;
+          // green dot for visible
+          ctx.fillStyle = '#22c55e';
+          ctx.globalAlpha = 0.8 + 0.2 * confidence;
+        } else {
+          historicalCnt++;
+          // gray dot for historical
+          ctx.fillStyle = '#666';
+          ctx.globalAlpha = Math.max(0.2, 0.6 - age/30);
+        }
+
+        ctx.beginPath(); ctx.arc(x, y, 4, 0, 2*Math.PI); ctx.fill();
+        ctx.globalAlpha = 1.0;
+
+        // label
+        ctx.fillStyle = '#aab'; ctx.font = '7px ui-sans-serif';
+        ctx.textAlign = 'center';
+        ctx.fillText(mid, x, y+1);
+      }
+    });
+
+    info = `Visible: ${visibleCnt}<br/>Historical: ${historicalCnt}`;
+  } else {
+    info = '—';
+  }
+
+  infoDiv.innerHTML = info;
 }
 
 async function loadArena() {
@@ -3295,9 +3829,61 @@ async function refreshList() {
 ['ar-width','ar-depth','ar-topz','ar-botz','ar-msize'].forEach(id => {
   const el = $(id); if (el) el.addEventListener('input', drawArena);
 });
+// ── Magnetometer hardware calibration ────────────────────────────────────
+let _magPollTimer = null;
+function _stopMagPoll() { if (_magPollTimer) { clearInterval(_magPollTimer); _magPollTimer = null; } }
+
+async function _updateMagStatus() {
+  try {
+    const r = await fetch('/api/magneto', {cache:'no-store'});
+    if (!r.ok) return;
+    const d = await r.json();
+    const required = d.required;
+    const axes = d.axes || '—';
+    const status = $('mag-status');
+    const axEl = $('mag-axes');
+    if (status) {
+      status.textContent = required ? 'REQUIRED' : 'OK';
+      status.style.color = required ? 'var(--bad)' : 'var(--good)';
+    }
+    if (axEl) {
+      // axes like "x1y1z1" — colour each digit
+      axEl.innerHTML = (axes === '—') ? '—' : axes.replace(/(x|y|z)([01])/g,
+        (_, ax, v) => `${ax}<span style="color:${v==='1'?'var(--good)':'var(--bad)'};">${v}</span>`);
+    }
+    if (!required && _magPollTimer) {
+      _stopMagPoll();
+      const msg = $('mag-cal-msg');
+      if (msg) { msg.textContent = '✓ Calibration complete'; msg.style.color = 'var(--good)'; }
+    }
+  } catch(e) {}
+}
+
+async function startMagCal() {
+  const msg = $('mag-cal-msg');
+  if (msg) { msg.textContent = 'Starting…'; msg.style.color = 'var(--accent)'; }
+  try {
+    const r = await fetch('/api/magneto/calibrate', {method:'POST'});
+    const d = await r.json();
+    if (d.ok) {
+      if (msg) { msg.textContent = 'In progress — move drone in figure-8'; msg.style.color = 'var(--warn)'; }
+      _stopMagPoll();
+      _magPollTimer = setInterval(_updateMagStatus, 1000);
+    } else {
+      if (msg) { msg.textContent = 'Error: ' + (d.error || d.message || '?'); msg.style.color = 'var(--bad)'; }
+    }
+  } catch(e) {
+    if (msg) { msg.textContent = 'Request failed'; msg.style.color = 'var(--bad)'; }
+  }
+}
+
+_updateMagStatus();
+$('btn-mag-cal').addEventListener('click', startMagCal);
+
 $('btn-ar-reset').addEventListener('click', resetToDefault);
 $('btn-ar-save').addEventListener('click', saveActive);
 $('btn-ar-magcap').addEventListener('click', captureMagNorth);
+$('btn-ar-magcap-front').addEventListener('click', captureMagNorthFromFront);
 $('btn-ar-add').addEventListener('click', () => {
   const meta = metaFromInputs();
   arena.markers.push({id: (Math.max(0, ...arena.markers.map(m=>m.id))+1),
@@ -3308,8 +3894,38 @@ $('btn-ar-add').addEventListener('click', () => {
 $('btn-ar-save-as').addEventListener('click', () =>
   saveAs($('ar-save-name').value.trim()));
 
+// ── Live drone position polling ──────────────────────────────────────
+let _dronePos = null;
+let _last_snap = null;
+async function _refreshDronePos() {
+  try {
+    const r = await fetch('/api/state', {cache:'no-store'});
+    const s = await r.json();
+    _last_snap = s;  // store snapshot for validator map
+    const pos = s.world_position_m;
+    if (Array.isArray(pos) && pos.length === 3) {
+      _dronePos = {
+        wx:  pos[0],
+        wy:  pos[1],
+        wz:  pos[2],
+        yaw: (typeof s.arena_yaw_deg === 'number') ? s.arena_yaw_deg : null,
+        age: s.world_position_age_s || 0,
+        vel:  Array.isArray(s.world_velocity_m_kf) ? s.world_velocity_m_kf : null,
+        conf: (typeof s.world_position_confidence === 'number')
+              ? s.world_position_confidence : null,
+      };
+    } else {
+      _dronePos = null;
+    }
+  } catch (e) { _dronePos = null; }
+  drawArena();
+  drawValidatorMap();
+  setTimeout(_refreshDronePos, 250);
+}
+
 loadArena();
 refreshList();
+_refreshDronePos();
 })();
 </script>
 """ + _PAGE_GRID_CLOSE + _SHARED_SCRIPT
@@ -3498,6 +4114,241 @@ _PAGE_SETTINGS = _PAGE_BASE_CSS + _PAGE_HEADER + _COMMON_SCRIPT + _PAGE_GRID_OPE
 
 
 # ---------------------------------------------------------------------------
+# Hardware check page
+# ---------------------------------------------------------------------------
+
+_PAGE_HARDWARE = _PAGE_BASE_CSS + _PAGE_HEADER + _COMMON_SCRIPT + _PAGE_GRID_OPEN + """
+<style>
+.hw-card { background:var(--panel); border-radius:8px; padding:1rem;
+           margin-bottom:1rem; }
+.hw-card h2 { margin:0 0 .6rem; font-size:.85rem; font-weight:500;
+              color:#aab; text-transform:uppercase; letter-spacing:.03em; }
+.hw-table { width:100%; border-collapse:collapse; font-size:.88rem; }
+.hw-table td, .hw-table th { padding:.28rem .5rem; text-align:left; }
+.hw-table th { color:#aab; font-weight:500; width:45%; }
+.hw-table tr + tr td, .hw-table tr + tr th { border-top:1px solid #2a3038; }
+.hw-val { font-variant-numeric:tabular-nums; }
+.hw-ok   { color:var(--good); font-weight:600; }
+.hw-warn { color:var(--warn); font-weight:600; }
+.hw-bad  { color:var(--bad);  font-weight:600; }
+.hw-na   { color:#555; }
+[title] { cursor:help; border-bottom:1px dotted #3a4550; }
+</style>
+
+<div style="padding:1rem;">
+  <div style="display:flex; align-items:center; gap:1rem; margin-bottom:1rem;">
+    <button id="btn-hw-check"
+            style="padding:.5rem 1.2rem; border:0; border-radius:6px;
+                   background:#2563eb; color:#fff; font-weight:700;
+                   font-size:.95rem; cursor:pointer;">
+      ▶ Run Hardware Check
+    </button>
+    <span id="hw-ts" style="font-size:.82rem; color:#555;"></span>
+  </div>
+  <div id="hw-results" style="display:none;">
+
+    <div class="hw-card">
+      <h2>Drone — flight readiness</h2>
+      <table class="hw-table">
+        <tr>
+          <th title="Alert state reported by the Anafi firmware. 'none' = no active alert. Any other value (low_battery, too_much_angle, motor_error, …) blocks takeoff.">Alert</th>
+          <td class="hw-val" id="h-alert">—</td>
+        </tr>
+        <tr>
+          <th title="Motor error code. 'noError' = all four motors healthy. Values like 'motorStalled', 'motorCutOut', or 'motorError' indicate a physical motor fault.">Motors</th>
+          <td class="hw-val" id="h-motor">—</td>
+        </tr>
+        <tr>
+          <th title="Sensor health (IMU, barometer, optical flow). 'all OK' = every sensor passes Parrot's self-test. A 'KO' suffix means that sensor is reporting a fault.">Sensors</th>
+          <td class="hw-val" id="h-sensors">—</td>
+        </tr>
+        <tr>
+          <th title="Magnetometer calibration state. 'REQUIRED' = figure-8 dance needed before the drone will arm. 'not-required' = calibrated and ready.">Magnetometer</th>
+          <td class="hw-val" id="h-magneto">—</td>
+        </tr>
+        <tr>
+          <th title="Per-axis magnetometer calibration bits (x/y/z). Green = axis calibrated. The figure-8 movement must cover all three axes for full calibration.">Magneto axes</th>
+          <td class="hw-val" id="h-mag-axes">—</td>
+        </tr>
+      </table>
+    </div>
+
+    <div class="hw-card">
+      <h2>Drone — telemetry</h2>
+      <table class="hw-table">
+        <tr>
+          <th title="Battery level in %. Warning below 30%, critical below 15%. Below ~58% this airframe loses climb authority.">Battery</th>
+          <td class="hw-val" id="h-bat">—</td>
+        </tr>
+        <tr>
+          <th title="Current barometric height in cm above takeoff point. 0 = on the ground.">Height</th>
+          <td class="hw-val" id="h-height">—</td>
+        </tr>
+        <tr>
+          <th title="Whether the Anafi firmware reports the drone as airborne.">Flying</th>
+          <td class="hw-val" id="h-flying">—</td>
+        </tr>
+        <tr>
+          <th title="Drone yaw (heading) in degrees, CW from magnetic north. Used by the arena positioning system.">Yaw</th>
+          <td class="hw-val" id="h-yaw">—</td>
+        </tr>
+        <tr>
+          <th title="Firmware-reported flying state machine: landed, takingoff, hovering, flying, landing, emergency.">State</th>
+          <td class="hw-val" id="h-fstate">—</td>
+        </tr>
+        <tr>
+          <th title="Time elapsed since the drone last sent a telemetry packet. Values above 1s indicate a connection problem.">Telemetry age</th>
+          <td class="hw-val" id="h-telage">—</td>
+        </tr>
+      </table>
+    </div>
+
+    <div class="hw-card">
+      <h2>Flight controller — system</h2>
+      <table class="hw-table">
+        <tr>
+          <th title="Hostname of this Raspberry Pi flight controller.">Hostname</th>
+          <td class="hw-val" id="h-host">—</td>
+        </tr>
+        <tr>
+          <th title="Serial number of the Anafi drone currently connected to this FC.">Drone serial</th>
+          <td class="hw-val" id="h-serial">—</td>
+        </tr>
+        <tr>
+          <th title="Total number of active Python threads. Should stay roughly stable across flights. A steadily growing count indicates a thread leak.">Threads</th>
+          <td class="hw-val" id="h-threads">—</td>
+        </tr>
+        <tr>
+          <th title="Video streaming mode and frame count since service start.">Video</th>
+          <td class="hw-val" id="h-video">—</td>
+        </tr>
+        <tr>
+          <th title="Soft altitude ceiling enforced by the FC's RC loop at 20 Hz, independent of the C2 connection. Prevents the drone from climbing above this height regardless of stick input.">Altitude ceiling</th>
+          <td class="hw-val" id="h-ceiling">—</td>
+        </tr>
+        <tr>
+          <th title="Number of active position SSE / WebSocket subscriber clients. 0 is fine when not using the C2 overview.">Position clients</th>
+          <td class="hw-val" id="h-posclients">—</td>
+        </tr>
+      </table>
+    </div>
+
+  </div>
+  <div id="hw-err" style="color:var(--bad); font-size:.85rem; margin-top:.5rem;"></div>
+</div>
+
+<script>
+async function runHwCheck() {
+  const btn = document.getElementById('btn-hw-check');
+  const ts  = document.getElementById('hw-ts');
+  const res = document.getElementById('hw-results');
+  const err = document.getElementById('hw-err');
+  btn.disabled = true; btn.textContent = '⏳ Checking…';
+  err.textContent = '';
+  try {
+    const r = await fetch('/api/hardware/check', {cache:'no-store'});
+    const d = await r.json();
+    if (!d.ok) { err.textContent = 'Check failed: ' + (d.error || r.status); return; }
+    res.style.display = '';
+    ts.textContent = 'Last run: ' + new Date().toLocaleTimeString('de-DE');
+
+    function set(id, text, cls) {
+      const el = document.getElementById(id);
+      if (!el) return;
+      el.textContent = text;
+      el.className = 'hw-val ' + (cls || '');
+    }
+    function cls_ok(v, bad_vals, warn_vals) {
+      if (v === null || v === undefined) return 'hw-na';
+      const s = String(v).toLowerCase();
+      if ((bad_vals  || []).some(b => s.includes(b))) return 'hw-bad';
+      if ((warn_vals || []).some(w => s.includes(w))) return 'hw-warn';
+      return 'hw-ok';
+    }
+
+    // ── Drone readiness ───────────────────────────────────────────────────
+    const dr = d.drone || {};
+    const alert = dr.alert ?? '—';
+    set('h-alert', alert === null ? 'n/a' : (alert || 'none'),
+        cls_ok(alert, ['error','stall','cutout','motor','battery','angle'],
+               ['low_battery','too_much_angle']));
+
+    const motor = dr.motor ?? null;
+    set('h-motor', motor === null ? 'no issue' : motor,
+        motor === null ? 'hw-ok' : 'hw-bad');
+
+    const sens = dr.sensors ?? null;
+    set('h-sensors', sens === null ? 'all OK' : sens,
+        sens === null ? 'hw-ok' : 'hw-bad');
+
+    const mag = dr.magneto ?? '—';
+    set('h-magneto', mag || '—',
+        cls_ok(mag, ['required'], ['in-progress']));
+
+    // Axes: colour x0y1z1 style
+    const axRaw = dr.magneto_axes || '—';
+    const axEl = document.getElementById('h-mag-axes');
+    if (axEl) {
+      if (axRaw === '—') { axEl.textContent = '—'; axEl.className = 'hw-val hw-na'; }
+      else {
+        axEl.innerHTML = axRaw.replace(/(x|y|z)([01])/g,
+          (_, a, v) => `${a}<span style="color:${v==='1'?'var(--good)':'var(--bad)'};">${v}</span>`);
+        axEl.className = 'hw-val';
+      }
+    }
+
+    // ── Telemetry ────────────────────────────────────────────────────────
+    const tel = d.telemetry || {};
+    const bat = tel.battery;
+    set('h-bat', bat !== undefined ? bat + ' %' : '—',
+        bat === undefined ? 'hw-na' : bat < 20 ? 'hw-bad' : bat < 35 ? 'hw-warn' : 'hw-ok');
+
+    const hcm = tel.height_cm;
+    set('h-height', hcm !== undefined && hcm !== null ? hcm + ' cm' : '—', '');
+
+    const fly = tel.flying;
+    set('h-flying', fly === undefined ? '—' : (fly ? 'yes' : 'no'),
+        fly ? 'hw-warn' : '');
+
+    set('h-yaw', tel.yaw !== undefined ? tel.yaw.toFixed(1) + '°' : '—', '');
+
+    set('h-fstate', tel.flying_state || '—', '');
+
+    const age = tel.state_age_s;
+    set('h-telage', age !== undefined ? age.toFixed(2) + ' s' : '—',
+        age === undefined ? 'hw-na' : age > 2 ? 'hw-bad' : age > 0.8 ? 'hw-warn' : 'hw-ok');
+
+    // ── System ───────────────────────────────────────────────────────────
+    const sys = d.system || {};
+    set('h-host', sys.hostname || '—', '');
+    set('h-serial', d.drone_serial || '—', '');
+    set('h-threads', sys.thread_count !== undefined ? sys.thread_count : '—',
+        sys.thread_count > 60 ? 'hw-warn' : '');
+    set('h-video', sys.video_mode
+        ? sys.video_mode + ' · ' + (sys.video_streaming ? 'streaming' : 'idle')
+          + ' · ' + (sys.video_frame_count || 0) + ' frames'
+        : '—', '');
+
+    const ceil = (d.ceiling || {});
+    set('h-ceiling', ceil.ceiling_m !== undefined
+        ? ceil.ceiling_m + ' m' + (ceil.engaged ? ' [ENGAGED]' : '') : '—',
+        ceil.engaged ? 'hw-warn' : '');
+
+    const pos = (sys.pos_sse_clients || 0) + (sys.pos_ws_clients || 0);
+    set('h-posclients', pos, '');
+
+  } catch(e) {
+    err.textContent = 'Request failed: ' + e;
+  } finally {
+    btn.disabled = false; btn.textContent = '▶ Run Hardware Check';
+  }
+}
+document.getElementById('btn-hw-check').addEventListener('click', runHwCheck);
+</script>
+""" + _PAGE_GRID_CLOSE + _SHARED_SCRIPT
+
+
+# ---------------------------------------------------------------------------
 # UI server
 # ---------------------------------------------------------------------------
 
@@ -3574,6 +4425,27 @@ class UiServer:
         self._thread: Optional[threading.Thread] = None
 
     # ----------------------------------------------- active mission-script
+    def restart_camera(self) -> list:
+        """Full camera restart: stop → start → reader bounce.
+        Returns a list of error strings (empty = success).
+        Called by the 'Restart Camera' button and on every TAKEOFF."""
+        errors = []
+        if self.api is not None:
+            try:
+                self.api.video_stop()
+            except Exception as e:
+                errors.append(f"video_stop: {e}")
+            try:
+                self.api.video_start_mjpeg()
+            except Exception as e:
+                errors.append(f"video_start_mjpeg: {e}")
+        if self.stream_reader is not None:
+            try:
+                self.stream_reader.restart()
+            except Exception as e:
+                errors.append(f"reader.restart: {e}")
+        return errors
+
     def _write_active_script(self, text: str) -> None:
         """Write ``text`` to the active mission-script draft path.
         Creates the parent directory if needed; raises on IO error.
@@ -3712,19 +4584,17 @@ class UiServer:
 
         # Combined-mode race: marker_mission/app.py starts the Flask
         # daemon serving unified_api_server's routes BEFORE this method
-        # runs. Any deploy probe (ansible's wait_for + /api/telemetry)
-        # that lands in that window finalises Flask's URL map, and
-        # Flask 3.x's _check_setup_finished then raises AssertionError
-        # the moment we try @app.get("/mission") below. The route
-        # additions themselves work fine — Flask's check is
-        # precautionary about lookup-time consistency — so we reset the
-        # "first request seen" latch before re-opening setup. Safe in
-        # this codebase because UiServer is the only thing that
-        # registers routes post-startup (unified_api_server adds all
-        # its routes inside init_backend_and_threads).
+        # runs. Any request that lands in that window sets
+        # _got_first_request=True and Flask 3.x's _check_setup_finished
+        # then raises AssertionError the moment we try @app.get below.
+        # Patch _check_setup_finished to a no-op for the duration of
+        # route registration, then restore it. This is safer than
+        # flipping _got_first_request (a concurrent request can set it
+        # back to True between the reset and the first decorator).
+        _orig_check = app._check_setup_finished.__func__ if hasattr(app._check_setup_finished, '__func__') else None
         try:
-            app._got_first_request = False
-        except AttributeError:
+            app.__class__._check_setup_finished = lambda self, f: None
+        except Exception:
             pass
 
         # Per-request context. Returning a fresh dict each call lets
@@ -3761,6 +4631,7 @@ class UiServer:
                 drone_connected=self.drone_connected,
                 killswitch_key=killswitch_key(),
                 initial_phase=current_phase,
+                git_sha=_GIT_SHA,
             )
             base.update(overrides)
             return base
@@ -3993,6 +4864,11 @@ class UiServer:
             except Exception as e:
                 return jsonify({"ok": False, "error": str(e)}), 500
             _reload_live_cfg_after_import("settings-import")
+            # Propagate to peers only when this is an operator import, not a
+            # peer-sync push (avoids push loops).
+            if request.args.get("peer_sync") != "1":
+                from .fleet_sync import push_to_peers
+                push_to_peers()
             return jsonify({"ok": True, **result})
 
         @app.get("/api/mission/settings/backups")
@@ -4108,6 +4984,8 @@ class UiServer:
                 return jsonify({"ok": False, "error": "tuning not wired"}), 503
             try:
                 p = self.cfg.save()
+                from .fleet_sync import push_to_peers
+                push_to_peers()
                 return jsonify({"ok": True, "path": str(p)})
             except Exception as e:
                 return jsonify({"ok": False, "error": str(e)}), 500
@@ -4148,6 +5026,9 @@ class UiServer:
                 if self.controller is not None:
                     self.controller.apply_config_changes()
                 self._log_param_changes(before, source="ui-reset")
+                self.cfg.save()
+                from .fleet_sync import push_to_peers
+                push_to_peers()
                 return jsonify({"ok": True})
             except Exception as e:
                 return jsonify({"ok": False, "error": str(e)}), 500
@@ -4209,6 +5090,8 @@ class UiServer:
                                          "max 64 chars, can't start with separator)"}), 400
             try:
                 self.cfg.save(p)
+                from .fleet_sync import push_to_peers
+                push_to_peers()
                 return jsonify({"ok": True, "name": name, "path": str(p)})
             except Exception as e:
                 return jsonify({"ok": False, "error": str(e)}), 500
@@ -4231,6 +5114,9 @@ class UiServer:
                 if self.controller is not None:
                     self.controller.apply_config_changes()
                 self._log_param_changes(before, source=f"ui-snapshot-load:{name}")
+                self.cfg.save()
+                from .fleet_sync import push_to_peers
+                push_to_peers()
                 return jsonify({"ok": True, "name": name})
             except Exception as e:
                 return jsonify({"ok": False, "error": str(e)}), 500
@@ -4268,6 +5154,8 @@ class UiServer:
                     return jsonify({"ok": False,
                                     "error": "snapshot not found"}), 404
                 set_default("tune", name)
+                from .fleet_sync import push_to_peers
+                push_to_peers()
                 return jsonify({"ok": True, "default": name})
             except Exception as e:
                 return jsonify({"ok": False, "error": str(e)}), 500
@@ -4395,6 +5283,8 @@ class UiServer:
                     self.arena_holder.set(arena_obj)
                 except Exception as e:
                     print(f"[ui] arena_holder.set failed: {e}")
+            from .fleet_sync import push_to_peers
+            push_to_peers()
             return jsonify({"ok": True})
 
         @app.post("/api/arena/default")
@@ -4456,6 +5346,8 @@ class UiServer:
                                 "error": "invalid name"}), 400
             try:
                 p.write_text(json.dumps(arena_obj.to_json_dict(), indent=2))
+                from .fleet_sync import push_to_peers
+                push_to_peers()
                 return jsonify({"ok": True, "name": name})
             except Exception as e:
                 return jsonify({"ok": False, "error": str(e)}), 500
@@ -4612,26 +5504,7 @@ class UiServer:
         # so the UI can show "frames: N" feedback.
         @app.post("/api/video/restart")
         def api_video_restart():
-            errors = []
-            # 1) Cycle upstream. Both calls are best-effort: if the
-            # unified server is itself down, we still want the local
-            # reader to bounce so the operator gets unstuck the moment
-            # the upstream comes back.
-            if self.api is not None:
-                try:
-                    self.api.video_stop()
-                except Exception as e:
-                    errors.append(f"video_stop: {e}")
-                try:
-                    self.api.video_start_mjpeg()
-                except Exception as e:
-                    errors.append(f"video_start_mjpeg: {e}")
-            # 2) Restart local reader.
-            if self.stream_reader is not None:
-                try:
-                    self.stream_reader.restart()
-                except Exception as e:
-                    errors.append(f"reader.restart: {e}")
+            errors = self.restart_camera()
             stats = (self.stream_reader.stats
                      if self.stream_reader is not None else None)
             return jsonify({"ok": not errors,
@@ -5019,6 +5892,8 @@ class UiServer:
                                          "max 64 chars, can't start with separator)"}), 400
             try:
                 p.write_text(text)
+                from .fleet_sync import push_to_peers
+                push_to_peers()
                 return jsonify({"ok": True, "name": name, "path": str(p)})
             except Exception as e:
                 return jsonify({"ok": False, "error": str(e)}), 500
@@ -5065,6 +5940,8 @@ class UiServer:
                     return jsonify({"ok": False,
                                     "error": "script not found"}), 404
                 set_default("mission_script", name)
+                from .fleet_sync import push_to_peers
+                push_to_peers()
                 return jsonify({"ok": True, "default": name})
             except Exception as e:
                 return jsonify({"ok": False, "error": str(e)}), 500
@@ -5130,6 +6007,162 @@ class UiServer:
             return Response(gen(),
                             mimetype="multipart/x-mixed-replace; boundary=frame")
 
+        # ── Hardware check page + API ──────────────────────────────────
+        @app.get("/hardware")
+        def hardware_page():
+            return render_template_string(_PAGE_HARDWARE,
+                                          **live_ctx(active="hardware"))
+
+        @app.get("/api/hardware/check")
+        def api_hardware_check():
+            import socket as _socket
+            import unified_api_server as _srv
+
+            result: dict = {"ok": True}
+
+            # ── Drone hardware state (Olympe) ────────────────────────────
+            drone_info: dict = {}
+            try:
+                b = _srv.backend
+                if b is not None:
+                    drone_info["alert"]   = getattr(b, "_read_alert_state",   lambda: None)()
+                    drone_info["motor"]   = getattr(b, "_read_motor_error_state", lambda: None)()
+                    drone_info["sensors"] = getattr(b, "_read_sensors_state", lambda: None)()
+                    drone_info["magneto"] = getattr(b, "_read_magnetometer_state", lambda: None)()
+            except Exception as e:
+                drone_info["read_error"] = str(e)
+
+            # Magneto axes from /api/magneto
+            try:
+                mag_r = _srv.backend
+                if mag_r is not None:
+                    from unified_api_server import (
+                        HAS_MAGNETO_CALIB,
+                        MagnetoCalibrationRequiredState,
+                        MagnetoCalibrationStateChanged,
+                    )
+                    if HAS_MAGNETO_CALIB:
+                        st = mag_r._get_state(MagnetoCalibrationStateChanged)
+                        if st is not None:
+                            x = st.get("xAxisCalibration", 0)
+                            y = st.get("yAxisCalibration", 0)
+                            z = st.get("zAxisCalibration", 0)
+                            drone_info["magneto_axes"] = f"x{x}y{y}z{z}"
+            except Exception:
+                pass
+
+            result["drone"] = drone_info
+
+            # ── Drone serial ─────────────────────────────────────────────
+            try:
+                snap = self.state.snapshot() if self.state else {}
+                tel  = snap.get("telemetry") or {}
+                result["drone_serial"] = (tel.get("serial_number")
+                                          or tel.get("serial") or None)
+            except Exception:
+                result["drone_serial"] = None
+
+            # ── Telemetry snapshot ───────────────────────────────────────
+            tel_snap: dict = {}
+            try:
+                with _srv.telemetry_lock:
+                    raw = dict(_srv.telemetry)
+                for key in ("battery", "height_cm", "flying", "yaw",
+                            "flying_state", "state_age_s"):
+                    if key in raw:
+                        tel_snap[key] = raw[key]
+                # friendly flying_state string
+                fs = raw.get("flying_state")
+                if fs is not None:
+                    tel_snap["flying_state"] = (getattr(fs, "name", None)
+                                                or str(fs))
+            except Exception as e:
+                tel_snap["read_error"] = str(e)
+            result["telemetry"] = tel_snap
+
+            # ── Pi / system diagnostics ──────────────────────────────────
+            import threading as _th
+            threads = _th.enumerate()
+            by_name: dict = {}
+            for t in threads:
+                name = t.name
+                for pfx in ("ThreadPoolExecutor-", "Thread-"):
+                    if name.startswith(pfx):
+                        name = pfx + "*"; break
+                by_name[name] = by_name.get(name, 0) + 1
+
+            sys_info: dict = {
+                "hostname":       _socket.gethostname(),
+                "thread_count":   len(threads),
+                "threads_by_name": by_name,
+                "video_mode":     _srv._video_mode,
+                "video_streaming": _srv._video_streaming,
+                "video_frame_count": _srv._video_frame_count,
+            }
+            try:
+                with _srv._pos_sse_lock:
+                    sys_info["pos_sse_clients"] = len(_srv._pos_sse_queues)
+                    sys_info["pos_ws_clients"]  = len(_srv._pos_ws_queues)
+            except Exception:
+                pass
+            result["system"] = sys_info
+
+            # ── Altitude ceiling ─────────────────────────────────────────
+            result["ceiling"] = {
+                "ceiling_m": round(float(_srv.MAX_ALTITUDE_M), 2),
+                "engaged":   bool(_srv._ceiling_engaged),
+                "reason":    _srv._ceiling_last_reason or "",
+            }
+
+            return jsonify(result)
+
+        @app.get("/api/wlan")
+        def api_wlan():
+            import subprocess, re
+            try:
+                out = subprocess.run(
+                    ['iwconfig'], capture_output=True, text=True, timeout=2
+                ).stdout
+                result, iface = {}, None
+                for line in out.split('\n'):
+                    if line and not line[0].isspace():
+                        iface = line.split()[0]
+                        result[iface] = {}
+                    if iface is None:
+                        continue
+                    if 'ESSID:' in line:
+                        result[iface]['ssid'] = (
+                            line.split('ESSID:')[1].strip().strip('"'))
+                    if 'Signal level=' in line:
+                        result[iface]['signal_dbm'] = (
+                            line.split('Signal level=')[1].split()[0])
+                    if 'Link Quality=' in line:
+                        m = re.search(r'Link Quality=(\d+)/(\d+)', line)
+                        if m:
+                            result[iface]['link_quality'] = str(
+                                int(m.group(1)) * 100 // int(m.group(2)))
+                    if 'Bit Rate=' in line:
+                        m = re.search(r'Bit Rate[=:]\s*([0-9.]+)\s*([MG]b/s)', line)
+                        if m:
+                            result[iface]['bit_rate'] = m.group(1) + ' ' + m.group(2)
+                    if 'Frequency' in line and '=' in line:
+                        m = re.search(r'Frequency[=:]\s*([0-9.]+)\s*([MG]Hz)', line)
+                        if m:
+                            result[iface]['frequency'] = m.group(1) + ' ' + m.group(2)
+                            f = float(m.group(1))
+                            result[iface]['band'] = (
+                                '2.4 GHz' if 2400 <= f <= 2500 else
+                                '5 GHz'   if 5000 <= f <= 6000 else '')
+                    if 'Tx-Power=' in line or 'TX Power=' in line:
+                        m = re.search(r'Tx-Power[=:]?\s*([0-9.]+)\s*([a-zA-Z]+)', line)
+                        if m:
+                            result[iface]['tx_power'] = m.group(1) + ' ' + m.group(2)
+                    if 'Mode:' in line:
+                        result[iface]['mode'] = line.split('Mode:')[1].split()[0]
+                return jsonify(result)
+            except Exception as e:
+                return jsonify({'error': str(e)})
+
         @app.get("/team_logo.png")
         def team_logo():
             # Repo asset, lives next to the package -- ../1_Doc/...
@@ -5142,6 +6175,18 @@ class UiServer:
             resp = send_file(str(p), mimetype="image/png")
             resp.headers["Cache-Control"] = "public, max-age=3600"
             return resp
+
+        # Restore the original _check_setup_finished now that all routes
+        # have been registered.
+        try:
+            if _orig_check is not None:
+                app.__class__._check_setup_finished = _orig_check
+            else:
+                # Restore Flask's default implementation via import
+                from flask.sansio.app import App as _FlaskBase
+                app.__class__._check_setup_finished = _FlaskBase._check_setup_finished
+        except Exception:
+            pass
 
     def start(self) -> None:
         if self._thread and self._thread.is_alive():

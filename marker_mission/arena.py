@@ -62,6 +62,70 @@ from .aruco_detector import MarkerPose
 
 VALID_WALLS = ("front", "back", "left", "right")
 
+# ---------------------------------------------------------------------------
+# Marker position history / dead-reckoning cache
+# ---------------------------------------------------------------------------
+HISTORY_MAX_AGE_S: float = 20.0   # keep observations up to this age
+HISTORY_WEIGHT_MIN: float = 0.1   # minimum age-weight factor (at max age)
+
+
+class MarkerPositionCache:
+    """Rolling buffer of per-marker world-position votes for IMU-assisted
+    dead-reckoning when markers temporarily leave the field of view.
+
+    Each entry stores the drone's world position vote from a single marker at
+    the time of observation, plus the cumulative arena-frame IMU displacement
+    at that moment.  When the stale vote is consumed, the corrected position
+    is ``stored_pos + (current_imu_disp - stored_imu_disp)``.
+
+    Weight decays linearly: 1.0 at age=0 → HISTORY_WEIGHT_MIN at
+    HISTORY_MAX_AGE_S, then stays at HISTORY_WEIGHT_MIN beyond that.
+    """
+
+    def __init__(self) -> None:
+        # {marker_id: {'t': float, 'pos_w': ndarray(3),
+        #              'dist': float, 'imu': ndarray(3)}}
+        self._data: Dict[int, dict] = {}
+
+    def record(self, marker_id: int, pos_w: np.ndarray, dist: float,
+               t: float, imu_disp: np.ndarray) -> None:
+        """Store or refresh one marker's world-position vote."""
+        self._data[int(marker_id)] = {
+            't':     float(t),
+            'pos_w': np.asarray(pos_w,    dtype=float).copy(),
+            'dist':  max(0.1, float(dist)),
+            'imu':   np.asarray(imu_disp, dtype=float).copy(),
+        }
+
+    def stale_votes(self, now: float, current_imu_disp: np.ndarray,
+                    skip_ids: set) -> List[tuple]:
+        """Return ``(marker_id, corrected_pos_w, weight, method)`` for all
+        cached markers whose id is NOT in *skip_ids* (i.e. not currently
+        visible on this frame)."""
+        cur = np.asarray(current_imu_disp, dtype=float)
+        votes: List[tuple] = []
+        for mid, e in self._data.items():
+            if mid in skip_ids:
+                continue
+            age = now - e['t']
+            frac = min(1.0, age / HISTORY_MAX_AGE_S)
+            age_w = max(HISTORY_WEIGHT_MIN,
+                        1.0 - (1.0 - HISTORY_WEIGHT_MIN) * frac)
+            corrected = e['pos_w'] + (cur - e['imu'])
+            votes.append((mid, corrected,
+                          (1.0 / e['dist']) * age_w,
+                          f"hist:{age:.1f}s"))
+        return votes
+
+    def reset(self) -> None:
+        self._data.clear()
+
+    def prune(self, now: float, keep_s: float = 60.0) -> None:
+        """Drop entries older than *keep_s* to prevent unbounded growth."""
+        cutoff = now - keep_s
+        self._data = {k: v for k, v in self._data.items()
+                      if v['t'] > cutoff}
+
 # Sensible defaults used both for ``ArenaConfig.load`` (when the JSON
 # doesn't carry the metadata fields) and for ``default_arena``.
 DEFAULT_WIDTH_M = 10.0
@@ -377,6 +441,40 @@ class PositionEstimate:
     # solvePnP path used for each contributing marker (same key set as
     # weights). See ``MarkerPose.pose_method`` for the value vocabulary.
     per_marker_method: Dict[int, str] = field(default_factory=dict)
+    # Confidence in this estimate [0.0 … 1.0].
+    # Factors: number of fresh markers, method quality, history age.
+    confidence: float = 0.0
+
+
+def _estimate_confidence(contributions: list) -> float:
+    """Compute a [0, 1] confidence score for a set of position contributions.
+
+    contributions: list of (mid, pos_w, weight, method, alt_validated)
+    """
+    if not contributions:
+        return 0.0
+    n_fresh = sum(1 for _, _, _, m, _ in contributions
+                  if not m.startswith('hist:'))
+    hist_ages = []
+    for _, _, _, m, _ in contributions:
+        if m.startswith('hist:'):
+            try:
+                hist_ages.append(float(m.split(':')[1].rstrip('s')))
+            except (IndexError, ValueError):
+                pass
+    max_hist_age = max(hist_ages, default=0.0)
+
+    # Base from fresh marker count: 1→0.50, 2→0.75, 3+→0.95
+    base = min(0.95, 0.50 + 0.25 * max(0, n_fresh - 1))
+
+    if n_fresh == 0:
+        # Only history markers — heavily penalised
+        decay = max(0.0, 1.0 - max_hist_age / 20.0)
+        return round(min(0.35, base * decay), 3)
+
+    # Mix of fresh + possibly history: mild penalty for old history
+    hist_factor = max(0.5, 1.0 - max_hist_age / 30.0) if max_hist_age > 0 else 1.0
+    return round(min(1.0, base * hist_factor), 3)
 
 
 def position_from_marker(pose: MarkerPose,
@@ -515,6 +613,9 @@ def estimate_position(arena: ArenaConfig,
                       enable_alt_branch_swap: bool = True,
                       enable_prev_anchor: bool = False,
                       enable_aggregate_oob_discard: bool = True,
+                      marker_cache: Optional[MarkerPositionCache] = None,
+                      cache_now: Optional[float] = None,
+                      cache_imu_disp: Optional[np.ndarray] = None,
                       ) -> Optional[PositionEstimate]:
     """Weighted average of camera world positions derived from each visible
     reference marker.
@@ -757,18 +858,36 @@ def estimate_position(arena: ArenaConfig,
             contributions.append((int(p.marker_id), pos_w, weight, method,
                                   alt_validated))
 
-    if not contributions:
+    # Cold-start single-marker reject (primary observations only).
+    # Historical votes count as additional support AFTER this gate so a
+    # single fresh marker still gets the quorum check; only the primary
+    # contribution count matters here.
+    primary_count = len(contributions)
+    if primary_count == 0 and (
+            marker_cache is None
+            or cache_now is None
+            or cache_imu_disp is None):
+        return None
+    if ((not use_anchor)
+            and primary_count < 2
+            and primary_count > 0
+            and not any(av for _, _, _, _, av in contributions)):
         return None
 
-    # Cold-start single-marker reject. With only one wall marker visible
-    # and no fresh anchor to disambiguate against, the IPPE planar-pose
-    # mirror branch can be confidently inside the arena AND wrong. EXCEPT
-    # when the altimeter layer (above) disambiguated the branch from the
-    # drone's barometric height — that's a robust independent signal
-    # that lets single-marker fixes through safely.
-    if ((not use_anchor)
-            and len(contributions) < 2
-            and not any(av for _, _, _, _, av in contributions)):
+    # Blend in IMU-corrected historical votes for markers not visible now.
+    if (marker_cache is not None
+            and cache_now is not None
+            and cache_imu_disp is not None):
+        visible_ids = {mid for mid, _, _, _, _ in contributions}
+        for mid, hist_pos, hist_w, hist_method in marker_cache.stale_votes(
+                cache_now, cache_imu_disp, skip_ids=visible_ids):
+            # Only add the vote if it lands inside the arena (OOB correction
+            # means the IMU drifted the stored position out of the arena).
+            if enable_arena_oob_filter and not _vote_in_bounds(hist_pos, arena):
+                continue
+            contributions.append((mid, hist_pos, hist_w, hist_method, False))
+
+    if not contributions:
         return None
 
     total_w = sum(w for _, _, w, _, _ in contributions)
@@ -777,13 +896,7 @@ def estimate_position(arena: ArenaConfig,
         weighted_sum += pos_w * w
     avg = weighted_sum / total_w
 
-    # Final aggregate sanity gate: even with all per-marker votes
-    # in-bounds, the weighted average can sit just outside the
-    # arena box if the contributions hug the boundary asymmetrically.
-    # Discard the whole estimate in that case so the caller's sticky
-    # state.world_position_m is preserved -- a fix that places the
-    # drone outside the arena is by definition wrong, no matter how
-    # confident the per-marker votes look.
+    # Final aggregate sanity gate.
     if enable_aggregate_oob_discard and not _vote_in_bounds(avg, arena):
         return None
 
@@ -793,4 +906,5 @@ def estimate_position(arena: ArenaConfig,
         per_marker_position_m={mid: pos for mid, pos, _, _, _ in contributions},
         weights={mid: w / total_w for mid, _, w, _, _ in contributions},
         per_marker_method={mid: meth for mid, _, _, meth, _ in contributions},
+        confidence=_estimate_confidence(contributions),
     )
