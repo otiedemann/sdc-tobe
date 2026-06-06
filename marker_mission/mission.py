@@ -1244,10 +1244,16 @@ def cmd_fly(args: argparse.Namespace) -> int:
                 # cfg.marker_size_m was the older path and is stale
                 # whenever an arena has been loaded (which is always,
                 # in production).
+                # Current camera digital-zoom factor. The controller drives it
+                # (1.0x normally; SEARCH escalates to 1.25/2/3x to spot distant
+                # markers, then resets to 1.0x on approach), so reading its
+                # tracked value shows the operator the live zoom on the overlay.
+                zoom_x = float(getattr(controller, "_search_zoom", 1.0) or 1.0)
                 lines = [
                     f"phase: {snap['phase']}",
                     f"target id={active_mid}  "
-                    f"size={detector.marker_size*100:.0f}cm",
+                    f"size={detector.marker_size*100:.0f}cm  "
+                    f"zoom={zoom_x:.2f}x",
                 ]
                 d_s = snap.get("distance_m")
                 y_s = snap.get("yaw_to_marker_deg")
