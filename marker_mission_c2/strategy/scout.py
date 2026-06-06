@@ -14,10 +14,10 @@ use absolute goto here.
 
 Self-centering by vision-homing
 -------------------------------
-Instead we recenter with ``APPROACH_HOME`` onto our own back-wall marker — the
+Instead we recenter with ``GO_HOME`` onto our own back-wall marker — the
 one marker that is always present and that the FC's APPROACH auto-rotates to
 find (frame-independent vision homing, robust to a stale/mirrored heading).
-APPROACH_HOME closes to a *loose* standoff distance equal to the wall→centre
+GO_HOME closes to a *loose* standoff distance equal to the wall→centre
 distance, so the scout ends up on the arena centreline (≈ 0,0) facing home,
 then spins up.
 
@@ -42,7 +42,7 @@ centred; this is not a replacement for absolute localisation.
 * ``sortie`` — centre of the arena (outside our home zone, watching all six
   boxes while the attackers are out — needed for the all-out 5-pt condition).
 * ``bank``   — recall: the scout must come home with everyone else to secure
-  the attempt, so it APPROACH_HOMEs *into* the home zone (shallow standoff) and
+  the attempt, so it GO_HOMEs *into* the home zone (shallow standoff) and
   rotates there, watching our own boxes.
 """
 from __future__ import annotations
@@ -59,7 +59,7 @@ from .settings import slot_for_face
 
 logger = logging.getLogger(__name__)
 
-# Loose APPROACH_HOME arrival band (m): "be roughly there", no precise hold.
+# Loose GO_HOME arrival band (m): "be roughly there", no precise hold.
 RECENTER_TOL_M = 0.6
 # A pushed script is only treated as "finished" once it has been running for
 # at least this long — filters the command-latency window where the FC still
@@ -87,7 +87,7 @@ def _rotate_duration(ctx: RoleContext) -> float:
 
 
 def _standoff_to(ctx: RoleContext, target_xy: tuple[float, float]):
-    """(home_wall_marker_id, distance) so an APPROACH_HOME onto our back-wall
+    """(home_wall_marker_id, distance) so an GO_HOME onto our back-wall
     marker lands the scout at ``target_xy``. None if the wall marker is unknown.
 
     The scout homes head-on onto the wall marker (APPROACH centres it in view),
@@ -117,7 +117,7 @@ def _seek_script(ctx: RoleContext) -> str | None:
     return _format_script(
         "TAKEOFF",
         f"HEIGHT {_scout_alt(ctx):.2f}",
-        f"APPROACH_HOME {mid} {dist:.2f} {RECENTER_TOL_M:g}",
+        f"GO_HOME {mid} {dist:.2f} {RECENTER_TOL_M:g}",
         "SCOUT",
     )
 
@@ -132,7 +132,7 @@ def _rotate_script(ctx: RoleContext) -> str | None:
 
 
 def _home_script(ctx: RoleContext) -> str | None:
-    """Bank: APPROACH_HOME *into* our home zone (shallow standoff), then rotate
+    """Bank: GO_HOME *into* our home zone (shallow standoff), then rotate
     there to keep watching our own boxes while the team secures the attempt."""
     park = ctx.home_park_xy or home_park_xy(ctx.our_team)
     so = _standoff_to(ctx, park)
@@ -142,7 +142,7 @@ def _home_script(ctx: RoleContext) -> str | None:
     return _format_script(
         "TAKEOFF",
         f"HEIGHT {_scout_alt(ctx):.2f}",
-        f"APPROACH_HOME {mid} {dist:.2f} {RECENTER_TOL_M:g}",
+        f"GO_HOME {mid} {dist:.2f} {RECENTER_TOL_M:g}",
         f"RC 0 0 0 {_yaw_stick(ctx)} {_rotate_duration(ctx):.0f}",
     )
 

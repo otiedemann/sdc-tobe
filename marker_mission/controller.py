@@ -445,7 +445,7 @@ class MissionState:
     # specifies an explicit value can't pollute the cfg defaults that
     # subsequent missions parse from.
     target_distance_m: float = 1.0
-    # Loose arrival band (metres) for APPROACH_HOME: when set, the approach
+    # Loose arrival band (metres) for GO_HOME: when set, the approach
     # phase completes as soon as the forward error is within ±this many
     # metres of target_distance_m, instead of the tight cfg.distance_deadband_m.
     # None -> fall back to the tight deadband (a precise APPROACH).
@@ -1713,7 +1713,7 @@ class MissionController:
         with self.state.lock:
             tgt_d = self.state.target_distance_m
             tol_override = self.state.target_distance_tol_m
-        # Effective forward arrival band. APPROACH_HOME sets a loose
+        # Effective forward arrival band. GO_HOME sets a loose
         # target_distance_tol_m (e.g. 0.5 m) so the drone settles anywhere
         # within ±tol of tgt_d ("be roughly in the home zone"); a plain
         # APPROACH leaves it None -> tight cfg.distance_deadband_m for a
@@ -3313,7 +3313,7 @@ class MissionController:
             with self.state.lock:
                 self.state.active_marker_id = int(step.marker_id)
                 self.state.target_distance_m = float(step.distance)
-                # APPROACH_HOME carries a loose arrival band (step.arrive_tol_m);
+                # GO_HOME carries a loose arrival band (step.arrive_tol_m);
                 # a plain APPROACH leaves it None -> tight cfg.distance_deadband_m.
                 self.state.target_distance_tol_m = (
                     float(step.arrive_tol_m)

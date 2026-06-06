@@ -20,7 +20,7 @@ Nineteen commands. Suffix convention:
 
     TAKEOFF
     APPROACH [<marker-id>] [<distance>]
-    APPROACH_HOME [<marker-id>] [<distance>] [<tol>]   loose approach (default 3.5m +/- 0.5m)
+    GO_HOME [<marker-id>] [<distance>] [<tol>]   loose approach (default 3.5m +/- 0.5m)
                                                        — just get inside the home zone
     HOOVER   [<seconds>]
     AWAIT    <marker-id> <timeout-seconds>
@@ -161,7 +161,7 @@ class Step:
     # Optional rotation speed (deg/s) for kind="YAW" (YAW_IMU's 2nd arg).
     # None -> the firmware's global MaxRotationSpeed default.
     rotation_speed: Optional[int] = None
-    # Loose arrival tolerance (m) for an APPROACH_HOME step: the approach is
+    # Loose arrival tolerance (m) for an GO_HOME step: the approach is
     # "done" once within this band of the target distance (vs the tight
     # distance_deadband_m), so the drone just gets INTO the home zone without
     # fussing for precision. None -> normal tight APPROACH arrival.
@@ -246,25 +246,25 @@ def parse(text: str, defaults: dict) -> List[Step]:
             out.append(Step(kind="APPROACH",
                             marker_id=mid, distance=dist,
                             line_no=raw_line_no))
-        elif cmd == "APPROACH_HOME":
+        elif cmd == "GO_HOME":
             # Like APPROACH but with a LOOSE arrival band: we only want to be
             # sure we're inside our home zone, not precisely positioned. Default
             # 3.5 m +/- 0.5 m from the home-wall marker (so anywhere 3-4 m).
             if len(args) > 3:
                 raise ScriptError(raw_line_no,
-                                  f"APPROACH_HOME takes 0-3 arguments "
+                                  f"GO_HOME takes 0-3 arguments "
                                   f"(<marker-id> [<dist>] [<tol>]), "
                                   f"got {len(args)}")
-            mid = (_parse_int(args[0], raw_line_no, "APPROACH_HOME marker-id")
+            mid = (_parse_int(args[0], raw_line_no, "GO_HOME marker-id")
                    if len(args) >= 1
                    else int(_required_default(defaults, "marker_id", raw_line_no)))
-            dist = (_parse_float(args[1], raw_line_no, "APPROACH_HOME distance")
+            dist = (_parse_float(args[1], raw_line_no, "GO_HOME distance")
                     if len(args) >= 2 else 3.5)
-            tol = (_parse_float(args[2], raw_line_no, "APPROACH_HOME tolerance")
+            tol = (_parse_float(args[2], raw_line_no, "GO_HOME tolerance")
                    if len(args) >= 3 else 0.5)
             if tol <= 0:
                 raise ScriptError(raw_line_no,
-                                  f"APPROACH_HOME tolerance must be > 0, got {tol}")
+                                  f"GO_HOME tolerance must be > 0, got {tol}")
             out.append(Step(kind="APPROACH", marker_id=mid, distance=dist,
                             arrive_tol_m=tol, line_no=raw_line_no))
         elif cmd == "HOOVER":
@@ -611,7 +611,7 @@ def format(steps: List[Step]) -> str:
             lines.append("TAKEOFF")
         elif s.kind == "APPROACH":
             if s.arrive_tol_m is not None:
-                lines.append(f"APPROACH_HOME {s.marker_id} {s.distance:g} "
+                lines.append(f"GO_HOME {s.marker_id} {s.distance:g} "
                              f"{s.arrive_tol_m:g}")
             else:
                 lines.append(f"APPROACH {s.marker_id} {s.distance:g}")

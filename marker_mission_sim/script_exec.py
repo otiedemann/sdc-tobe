@@ -56,7 +56,7 @@ HOME_INSET = 2.5        # m  — TO_HOME sits this far in from the team's wall
 # Verbs whose FIRST argument is a marker id. ``parse_script`` copies that
 # token into ``Step.marker_id`` so world.py can report the active target
 # marker on /api/state without re-parsing.
-_MARKER_ID_VERBS = frozenset({"APPROACH", "APPROACH_HOME", "FB_BRAKE", "AWAIT"})
+_MARKER_ID_VERBS = frozenset({"APPROACH", "GO_HOME", "FB_BRAKE", "AWAIT"})
 
 
 @dataclass
@@ -445,10 +445,10 @@ def _exec_step(drone: SimDrone, world: World, step: Step, dt: float,
         spd, _ = _step_xy(drone, world, tgt.x, tgt.y, dt, CRUISE_SPEED)
         return spd, drone.pos.dist_xy(tgt) <= dist + ARRIVE_XY
 
-    if verb == "APPROACH_HOME":
+    if verb == "GO_HOME":
         # Loose APPROACH onto the home back-wall marker: settle anywhere
         # within ±tol of `dist` ("be roughly in the home zone"). Mirrors the
-        # FC's APPROACH_HOME (APPROACH with a wide target_distance_tol_m).
+        # FC's GO_HOME (APPROACH with a wide target_distance_tol_m).
         # args: [marker_id, dist=3.5, tol=0.5]
         dist = _arg(step, 1, 3.5)
         tol = _arg(step, 2, 0.5)
