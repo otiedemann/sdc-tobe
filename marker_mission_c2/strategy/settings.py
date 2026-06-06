@@ -31,7 +31,7 @@ Settings shape::
           "team":          "red"|"blue"|null,
           "role":          "idle"|"scout"|"attacker",
           "enabled":       true,
-          "scout_alt_m":   1.8,
+          "scout_alt_m":   1.0,
           "attack_alt_m":  1.0,
           "home_alt_m":    0.8
         }
@@ -70,7 +70,7 @@ _EXAMPLE_PATH = _HERE / "settings.example.json"
 
 
 VALID_TEAMS = ("red", "blue")
-VALID_ROLES = ("idle", "scout", "attacker")
+VALID_ROLES = ("idle", "scout", "attacker", "defender")
 
 # All slots ever used in the SDC26 layout (1..6).
 ALL_SLOTS: tuple[int, ...] = (1, 2, 3, 4, 5, 6)
@@ -137,6 +137,14 @@ class MatchSettings:
     capture_ascend_m: float = 1.5
     capture_forward_m: float = 0.5
     capture_hover_s: float = 3.0
+    # Sustained hover (s) the drone holds in its OWN home zone at the end
+    # of every attack/defend run. Per SDC26 regs the drone must return to
+    # the home zone and remain inside to validate the capture (>=5 s) and
+    # the drone must NEVER land during a match. We end runs with this hover
+    # instead of LAND. Default ~ a full 10-min match so the drone keeps
+    # holding at home (the FC only safety-lands once the script ends, i.e.
+    # after the match). The FC's own arena guard keeps it inside the zone.
+    home_hover_s: float = 600.0
     # Hover seconds between consecutive SCOUT rotations within a single
     # scout script. Short = fast cadence; long = more time for the
     # marker tracker to register the latest rotation's observations.
@@ -154,6 +162,12 @@ class MatchSettings:
     # FC safety-lands. The strategy then re-pushes (TAKEOFF + RC ...).
     # Default 600s = ~10 minutes per push; battery dies around 25 min.
     scout_drive_duration_s: float = 600.0
+    # When true the scout flies to the arena centre (0,0) via the FC's
+    # existing TO verb before starting its yaw drive, so it watches all
+    # six slots from the middle. Disable if TO is unreliable on your FC
+    # (the scout then just rotates wherever it took off — which is the
+    # arena centre in the sim, where the drone spawns at 0,0).
+    scout_center: bool = True
 
 
 @dataclass(frozen=True)
@@ -184,7 +198,15 @@ class DroneSettings:
     team: Optional[str] = None      # "red" | "blue" | None (unassigned)
     role: str = "idle"              # one of VALID_ROLES
     enabled: bool = True
-    scout_alt_m: float = 1.8
+    # Default cruise altitude for the scout role (m). 3.0 puts the drone
+    # comfortably above the 2 m lower wall markers, well below the 4 m
+    # upper wall markers, and clear of the 1.4 m box tops — so the camera
+    # is LOW (~1 m) on purpose: the box faces sit at ~1 m, so the scout must
+    # fly level with them to read the slot status (from 3-4 m the faces are
+    # past the 8 m vision range once you add the vertical offset, and seen at
+    # a steep angle). The runner's deconfliction places scouts in a dedicated
+    # low band (red 1.0 m / blue 1.3 m) below the movers' cruise band.
+    scout_alt_m: float = 1.0
     attack_alt_m: float = 1.0
     home_alt_m: float = 0.8
 
@@ -281,7 +303,7 @@ def _drone_from(fc_name: str, raw: Any) -> DroneSettings:
         team=_coerce_team(raw.get("team")),
         role=_coerce_role(raw.get("role")),
         enabled=bool(raw.get("enabled", True)),
-        scout_alt_m=float(raw.get("scout_alt_m", 1.8)),
+        scout_alt_m=float(raw.get("scout_alt_m", 1.0)),
         attack_alt_m=float(raw.get("attack_alt_m", 1.0)),
         home_alt_m=float(raw.get("home_alt_m", 0.8)),
     )
@@ -298,9 +320,11 @@ def _settings_to_dict(s: StrategySettings) -> Dict[str, Any]:
             "capture_ascend_m": float(s.match.capture_ascend_m),
             "capture_forward_m": float(s.match.capture_forward_m),
             "capture_hover_s": float(s.match.capture_hover_s),
+            "home_hover_s": float(s.match.home_hover_s),
             "scout_hover_s": float(s.match.scout_hover_s),
             "scout_yaw_stick": int(s.match.scout_yaw_stick),
             "scout_drive_duration_s": float(s.match.scout_drive_duration_s),
+            "scout_center": bool(s.match.scout_center),
         },
         "markers": {
             "our_team": s.markers.our_team,
@@ -331,6 +355,7 @@ def _settings_from_dict(raw: Any, *, known_fc_names: Iterable[str]) -> StrategyS
         capture_hover_s=float(
             m_raw.get("capture_hover_s", m_defaults.capture_hover_s)
         ),
+        home_hover_s=float(m_raw.get("home_hover_s", m_defaults.home_hover_s)),
         scout_hover_s=float(m_raw.get("scout_hover_s", m_defaults.scout_hover_s)),
         scout_yaw_stick=max(-100, min(100, int(
             m_raw.get("scout_yaw_stick", m_defaults.scout_yaw_stick)
@@ -338,6 +363,7 @@ def _settings_from_dict(raw: Any, *, known_fc_names: Iterable[str]) -> StrategyS
         scout_drive_duration_s=float(
             m_raw.get("scout_drive_duration_s", m_defaults.scout_drive_duration_s)
         ),
+        scout_center=bool(m_raw.get("scout_center", m_defaults.scout_center)),
     )
 
     markers_raw = raw.get("markers") or {}
@@ -439,6 +465,20 @@ class SettingsStore:
                     return d
             return None
 
+    def reset_drones(self) -> int:
+        """Drop every drone from the roster and persist the empty state.
+
+        Returns the number of drones removed. The runner's auto-adopt path
+        will re-populate the roster from the C2 overview on the next tick,
+        with fresh DroneSettings defaults (so e.g. an out-of-date persisted
+        ``scout_alt_m`` reverts to the current code default).
+        """
+        with self._lock:
+            removed = len(self._settings.drones)
+            self._settings = replace(self._settings, drones=())
+            self._write_atomic(_settings_to_dict(self._settings))
+            return removed
+
     # ----- write API ----------------------------------------------------------
 
     def update_drone(self, fc_name: str, **changes: Any) -> DroneSettings:
@@ -489,6 +529,7 @@ class SettingsStore:
                 "capture_ascend_m",
                 "capture_forward_m",
                 "capture_hover_s",
+                "home_hover_s",
                 "scout_hover_s",
                 "scout_drive_duration_s",
             ):
@@ -505,6 +546,8 @@ class SettingsStore:
                 if val is not None:
                     # Clamp to the RC channel range.
                     allowed["scout_yaw_stick"] = max(-100, min(100, val))
+            if "scout_center" in changes:
+                allowed["scout_center"] = bool(changes["scout_center"])
             patched = replace(m, **allowed)
             self._settings = replace(self._settings, match=patched)
             self._write_atomic(_settings_to_dict(self._settings))

@@ -1,0 +1,53 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>marker_mission_sim — arena view</title>
+  <link rel="stylesheet" href="/web/app.css" />
+  <!-- No build step: pull Three.js + OrbitControls as ES modules via an import map. -->
+  <script type="importmap">
+  {
+    "imports": {
+      "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+      "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+    }
+  }
+  </script>
+</head>
+<body>
+  <canvas id="view"></canvas>
+
+  <div id="hud" class="hud">
+    <div class="hud-head">
+      <span class="title">marker_mission_sim</span>
+      <span id="clock" class="clock">t = —</span>
+    </div>
+
+    <div class="hud-section">
+      <div class="hud-label">Drones</div>
+      <div id="drones" class="hud-list">
+        <div class="hud-empty">waiting for feed…</div>
+      </div>
+    </div>
+
+    <div class="hud-section">
+      <div class="hud-label">Slots</div>
+      <div id="slots" class="hud-list slots-grid">
+        <div class="hud-empty">—</div>
+      </div>
+    </div>
+
+    <div id="conn" class="conn">connecting…</div>
+  </div>
+
+  <div id="legend" class="legend">
+    <span><i class="swatch red"></i>red</span>
+    <span><i class="swatch blue"></i>blue</span>
+    <span><i class="swatch neutral"></i>neutral</span>
+    <span class="hint">drag to orbit · scroll to zoom</span>
+  </div>
+
+  <script type="module" src="/web/app.js"></script>
+</body>
+</html>

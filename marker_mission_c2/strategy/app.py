@@ -15,10 +15,12 @@ import os
 import signal
 import sys
 import threading
+from pathlib import Path
 from typing import Any, Dict, Optional
 
 from .c2_client import C2Client
 from .markers import MarkerTracker
+from .missions import MissionLog
 from .runner import SwarmRunner
 from .settings import SettingsStore
 from .web import build_app
@@ -36,8 +38,17 @@ def _parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
                    help="C2 server base URL. If omitted, derived from "
                         "the --config bind block (falls back to "
                         "http://127.0.0.1:8090)")
+    p.add_argument("--sim-url", default=os.environ.get("SDC_SIM_URL"),
+                   help="Sim UI base URL (e.g. http://127.0.0.1:9100). When set, "
+                        "the strategy FOLLOWS the sim's active arena (live switch) "
+                        "and proxies the dashboard's arena toggle to it. Omit on "
+                        "real hardware.")
     p.add_argument("--settings", default=None,
                    help="Path to settings.json (default: alongside this package)")
+    p.add_argument("--mission-log", default=None,
+                   help="Path to the mission-step log file (default: next to "
+                        "--settings, e.g. strat_red.missions.log). Records the "
+                        "exact scripts the C2 sends, for copy-paste onto drones.")
     p.add_argument("--fc-names", default=None,
                    help="Comma-separated FC names for bootstrap "
                         "(e.g. 'flightctrl1,flightctrl2,flightctrl3')")
@@ -166,6 +177,19 @@ def main(argv: Optional[list[str]] = None) -> int:
         active_slots=settings.snapshot().markers.active_slots,
     )
 
+    # Mission-step log: record every script the C2 sends to the FCs so the
+    # operator can copy-paste it onto a live drone. Default path sits next to
+    # the settings file (e.g. strat_red.json -> strat_red.missions.log), or
+    # ./missions.log when no --settings was given. Override with --mission-log.
+    if args.mission_log:
+        mission_log_path = args.mission_log
+    elif args.settings:
+        mission_log_path = str(Path(args.settings).with_suffix(".missions.log"))
+    else:
+        mission_log_path = "missions.log"
+    mission_log = MissionLog(path=mission_log_path)
+    logger.info("strategy: mission-step log -> %s", mission_log.path)
+
     # Start the async loop on a background thread; build runner + client on it.
     th = _AsyncLoopThread()
     th.start()
@@ -174,7 +198,8 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     async def _bootstrap():
         c2 = C2Client(base_url=c2_url)
-        runner = SwarmRunner(settings=settings, c2=c2, markers=markers)
+        runner = SwarmRunner(settings=settings, c2=c2, markers=markers,
+                             mission_log=mission_log, sim_url=args.sim_url)
         await runner.start()
         return c2, runner
 
@@ -182,7 +207,8 @@ def main(argv: Optional[list[str]] = None) -> int:
     c2, runner = fut.result()
 
     flask_app = build_app(
-        settings=settings, runner=runner, markers=markers, loop=th.loop
+        settings=settings, runner=runner, markers=markers, loop=th.loop,
+        sim_url=args.sim_url,
     )
 
     # Graceful shutdown on SIGTERM/SIGINT.

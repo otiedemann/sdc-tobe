@@ -1,6 +1,6 @@
 {
-  "ssid": "TELLO-D86AEE_plus",
-  "password": "sandiegosandiego",
+  "ssid": "TELLO-XXXXXX",
+  "password": "REPLACE_WITH_YOUR_TELLO_WIFI_PASSWORD",
   "ifname": "wlan0",
   "sudo": false
 }

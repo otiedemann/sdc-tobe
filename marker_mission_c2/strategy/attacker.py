@@ -11,16 +11,18 @@ mission script that does everything end-to-end:
     YAW_IMU 180
     HOOVER <capture_hover_s>
     HEIGHT <home_alt>                   # cruise altitude above boxes
+    HEIGHT <cruise_alt>                 # climb back to distinct cruise alt
     FB_RC 100 <rth_dur_s>               # FAST cruise toward home
-    FB_BRAKE <wall_marker> 2.5 100 5    # vision-tripped brake on home wall
+    FB_BRAKE <wall_marker> 2.5 100 5 x y# vision/world brake on home wall
     YAW_IMU 180                         # face enemy again so next attack starts correct
-    LAND
+    HOOVER <rearm>                      # brief home hover — NO land
 
 The drone closes in toward the enemy side, ascends, locks onto the
 marker via APPROACH, drifts over it, hovers, then cruises home at full
-speed and brakes on a 0.5 m wall marker via a second APPROACH. After
-the script fully ends (FC drops back to Phase.INIT), the role marks
-itself done and the target is cleared.
+speed and brakes on a 0.5 m wall marker via a second APPROACH. The script
+ends with a brief home hover and NO land: the drone must stay airborne the
+whole match, so it hovers at phase=done in the home zone until re-dispatched.
+When the script ends the role marks itself done and the target is cleared.
 
 OPERATOR CONVENTION
 -------------------
@@ -56,21 +58,64 @@ from __future__ import annotations
 import logging
 import math
 
-from .roles import Decision, Role, RoleContext, noop, push, register
+from . import arena_state
+from .roles import (
+    Decision, Role, RoleContext, noop, push, stop_cmd, register, home_park_xy,
+    enemy_heading_deg,
+)
 from .settings import face_id
 
 logger = logging.getLogger(__name__)
 
 
-# Physical target slot positions in arena frame (x, y) — z is fixed at
-# 1.0 m by the box pedestals and isn't needed for the close-in distance.
-# Pulled from tools/sphinx-arena/default_target_layout.json and the
-# §1.1 regs: red slots 4-6 at y=-7.5, blue slots 1-3 at y=+7.5, all
-# spread across x ∈ {-3, 0, +3}.
-SLOT_POSITIONS_M: dict[int, tuple[float, float]] = {
-    1: (-3.0, 7.5),  2: (0.0, 7.5),  3: (3.0, 7.5),
-    4: (-3.0, -7.5), 5: (0.0, -7.5), 6: (3.0, -7.5),
-}
+# ---------------------------------------------------------------------------
+# Arena-derived geometry (LIVE — follows the active arena, see arena_state).
+#
+# ``SLOT_POSITIONS_M`` (target box xy, for the C2's bookkeeping + dashboard map)
+# and ``HOME_WALL_MARKER`` (per-team home back-wall marker) used to be hardcoded
+# literals here. They now read through ``arena_state`` so a live arena switch
+# (real<->gvz) is reflected immediately. They stay exposed under these names —
+# a thin ``_LiveMap`` keeps the ``[team]`` / ``.get(slot)`` call sites (here and
+# the ``from .attacker import ...`` in defender.py / planner.py) working
+# unchanged, while always returning the CURRENT arena's values. The ATTACK
+# itself doesn't use slot xy — it homes on the ArUco marker via APPROACH — so
+# these only drive bookkeeping + the map.
+class _LiveMap:
+    """Read-only mapping view that re-derives from a thunk on every access, so
+    it always reflects the active arena (never a stale snapshot)."""
+
+    __slots__ = ("_fn",)
+
+    def __init__(self, fn):
+        self._fn = fn                       # fn() -> dict
+
+    def get(self, key, default=None):
+        return self._fn().get(key, default)
+
+    def __getitem__(self, key):
+        return self._fn()[key]
+
+    def __contains__(self, key):
+        return key in self._fn()
+
+    def __iter__(self):
+        return iter(self._fn())
+
+    def __len__(self):
+        return len(self._fn())
+
+    def keys(self):
+        return self._fn().keys()
+
+    def values(self):
+        return self._fn().values()
+
+    def items(self):
+        return self._fn().items()
+
+
+SLOT_POSITIONS_M = _LiveMap(arena_state.slot_positions)
+HOME_WALL_MARKER = _LiveMap(lambda: arena_state.current().home_wall_marker)
 
 # Stop the FB_IMU close-in this far short of the target so APPROACH has
 # room to do its precision dance. 7 m gives 18 cm markers comfortable
@@ -112,6 +157,14 @@ DRIFT_OVER_BOX_DURATION_S: float = 0.3
 # box top during the brief sideways momentum-bleed.
 DRIFT_OVER_BOX_UD_RC: int = 20
 
+# v7 §1.4.3 capture rule: the attacker must hover over the target box for ≥ 2 s
+# within the 1-2 m RFID band for the flip to register. 3.5 s gives a solid
+# margin over the 2 s floor — the descent into the band (from cruise altitude)
+# eats the first ~1 s of the HOOVER, so a 2.5 s hover left only ~1.5 s of
+# qualifying dwell and captures landed intermittently. 3.5 s ensures ≥ 2 s in
+# the band even after the descent. Existing FC verb only.
+CAPTURE_HOLD_HOVER_S: float = 3.5
+
 # Combined-motion sticks for the "climb + cruise" RC step that
 # replaces dedicated HEIGHT + FB_RC sequences. Anafi accepts all four
 # sticks on a single PCMD frame — sending fb + ud simultaneously
@@ -151,13 +204,10 @@ INITIAL_CLIMB_DURATION_S: float = 1.2  # ~0.5m climb → ~1.4m total alt
 # is worth the extra ~3 s per turn — heading accuracy is critical
 # because the cruise that follows is open-loop.
 
-# Home-wall markers for RTH braking. 0.5 m markers on each team's
-# home wall, LOW position (2.0 m altitude) — close to cruise altitude
-# for stable APPROACH lock. Maps team → (marker_id, (arena_x, arena_y)).
-HOME_WALL_MARKER: dict[str, tuple[int, tuple[float, float]]] = {
-    "red": (13, (0.0, -10.0)),
-    "blue": (9, (0.0, 10.0)),
-}
+# (Home-wall markers for RTH braking now live in ``arena_state`` and are
+# exposed above as the live ``HOME_WALL_MARKER`` proxy — derived per arena as
+# the back-wall marker for red / front-wall marker for blue, at flight-camera
+# height. real + gvz both resolve to red=13 / blue=9.)
 
 RTH_APPROACH_DISTANCE_M: float = 2.0
 
@@ -186,11 +236,14 @@ AUTO_ATTACK_APPROACH_SPEED: int = 55
 # (~2 m) doesn't push the drone into the wall behind the marker.
 # Target stop is tighter (1.5 m) — vision drives the final approach
 # now (world fallback is suppressed while vision is live), so we can
-# safely close in. Wall stop stays conservative (3.0 m) since the
-# wall brake leans on the world fallback (vision of the wall marker
-# is less reliable at cruise pitch) and we must not clip the wall.
+# safely close in. Wall stop is 5.0 m: the home wall is at |y|=10 and the
+# home zone is |y| in [5, 10], so braking 5 m short of the wall puts the
+# drone at |y|≈5 — just BARELY inside the home zone, NOT deep against the
+# wall. Operator: "they only need to be slightly in the home zone, 5 m from
+# the wall is fine" (was 3.0 m, which parked them deep at |y|≈7 and risked
+# clipping the back wall on overshoot).
 FB_BRAKE_TARGET_STOP_M: float = 1.5
-FB_BRAKE_WALL_STOP_M: float = 3.0
+FB_BRAKE_WALL_STOP_M: float = 5.0
 # FB_BRAKE drives at the SAME stick as cruise (so we don't accelerate
 # back to full speed during the brake-search phase, which then has
 # more momentum to bleed off). Sticking to ~2 m/s throughout keeps
@@ -203,6 +256,44 @@ FB_BRAKE_STICK: int = 50
 # FB_BRAKE timeout is safe: vision/world will trip well within it,
 # and if both somehow fail the guard stops the drone at the wall.
 FB_BRAKE_TIMEOUT_S: float = 10.0
+
+# After returning home, hover briefly (registers v7 §1.4.4 home-zone presence)
+# and then simply END the script — WITHOUT landing. The drones must stay in
+# the air for the WHOLE match (operator requirement), so we never emit LAND.
+# When the script ends the FC drops to phase=done while still hovering in the
+# home zone; the strategy then re-dispatches the drone for its NEXT attack and
+# the new mission's TAKEOFF is a no-op (already airborne). Ending the script
+# is what frees the drone for re-dispatch — landing was never needed for that;
+# the OLD ~10-minute home hover just never ended, so the drone got stuck in
+# one mission and could fly only ONE attack per match. 2 s ≈ 2 C2 ticks.
+HOME_REARM_HOVER_S: float = 2.0
+
+# ── Vision-based APPROACH standoffs (no absolute positions) ────────────────
+# Capture move (operator-specified technique): APPROACH the box's face marker
+# to ATTACK_STANDOFF_M (~1 m), RISE to the capture altitude (clearing the 0.73 m
+# box top), then FB_IMU forward ~(standoff - 0.10 m) to sit exactly OVER the box
+# centre, then hover. APPROACH homes purely on vision (no absolute position);
+# FB_IMU is a closed-loop relative move (also no absolute position). The drone
+# is never lower than the box top until it's positioned over the box.
+ATTACK_STANDOFF_M: float = 1.0
+# How far to fly forward after rising, to end up over the box: the marker was
+# ATTACK_STANDOFF_M ahead, minus 10 cm so we stop just shy of the far edge and
+# sit over the box centre (operator: "the distance the marker was away - 10 cm").
+OVER_BOX_FORWARD_M: float = ATTACK_STANDOFF_M - 0.10
+# Capture altitude over the box: the RFID detects in the 1-2 m band; the
+# operator wants 1-2 m, "better 1.5 m max". 1.5 m sits mid-band — a full 0.77 m
+# above the 0.73 m open box top and 0.5 m below the 2 m ceiling — so the box
+# reliably registers the drone with margin on both sides.
+CAPTURE_ALT_M: float = 1.5
+# Minimum safe altitude anywhere inside a home zone: the target boxes are 0.73 m
+# tall (open), so we must always be above that to avoid clipping a box. We
+# transit/capture well above this; this is the floor for any in-zone HEIGHT.
+BOX_CLEARANCE_ALT_M: float = 1.0
+# RTH: APPROACH the home back-wall marker and stop this far short of it (the
+# operator asked for ~3-4 m). 3.5 m -> the wall is at |y|=10, home zone is
+# |y| in [5,10], so braking 3.5 m short parks the drone at |y|≈6.5 — comfortably
+# inside home (clears the §1.4.4 home-presence gate) and well off the wall.
+RTH_WALL_STANDOFF_M: float = 3.5
 
 
 def _format_script(*lines: str) -> str:
@@ -271,7 +362,7 @@ def _full_attack_script(
                                             # no HOOVER — starts immediately)
         FB_BRAKE <wall_marker> 2.5 100 5    # vision-tripped brake on home wall
         YAW_RC 100 1.0                      # fast 180° turn back to enemy-facing
-        LAND
+        HOOVER <rearm>                      # brief home hover — NO land (stay airborne)
 
     Speed-optimised design notes:
 
@@ -306,88 +397,69 @@ def _full_attack_script(
     already holds altitude via its own PD; the short FB_RC drift
     over the box is what actually puts us on top of the target.
     """
-    m = ctx.match
-    approach_d = max(0.2, float(m.approach_distance_m))
-    # capture_ascend_m and capture_hover_s are still read for compat
-    # but no longer drive separate HEIGHT / HOOVER steps — combined
-    # RC handles both. Kept here so config writes don't crash if the
-    # operator still flips these in the dashboard.
-    _ = max(0.6, float(m.capture_ascend_m))
-    _ = max(0.0, float(m.capture_hover_s))
-    home = (
-        ctx.match.home_red if ctx.our_team == "red" else ctx.match.home_blue
-    )
-    _ = max(0.6, float(ctx.drone.home_alt_m or home.alt))
+    # This drone's DISTINCT cruise altitude (team-keyed grid, >= 0.30 m from
+    # every other drone of both teams) for the out-and-back transit. Floored
+    # above the box tops; falls back to a safe default if not deconflicted.
+    cruise_alt = max(1.4, float(ctx.cruise_alt_m)) if ctx.cruise_alt_m else 1.6
+    height_step = f"HEIGHT {cruise_alt:.2f}"
 
-    # Attack-leg cruise duration (distance ÷ calibrated cruise speed).
-    # Pure FB_RC (no simultaneous up-stick) — the dedicated UD_RC
-    # climb step before this puts us at safe altitude; adding ud
-    # here would force the drone to keep pitching forward AND up,
-    # which destabilises camera pointing and the velocity controller.
-    close_in = _close_in_distance_m((home.x, home.y), slot)
-    close_in_dur = _cruise_duration_s(close_in)
-    close_in_step = (
-        f"FB_RC {CRUISE_RC_STICK} {close_in_dur:.2f}"
-        if close_in_dur > 0 else ""
-    )
+    # End-of-run: hover briefly at home (confirms v7 §1.4.4 presence) then the
+    # script ENDS — no LAND, stay airborne for the next dispatch.
+    home_rearm = f"HOOVER {HOME_REARM_HOVER_S:.1f}"
 
-    # Slot box position in arena frame — used by FB_BRAKE's
-    # world-position fallback so the drone can brake even when vision
-    # can't see the target face marker (slot faces aren't in
-    # arena_config; the FC wouldn't otherwise know where they are).
-    target_xy = SLOT_POSITIONS_M.get(int(slot))
-    target_world_hint = (
-        f" {target_xy[0]:g} {target_xy[1]:g}" if target_xy else ""
-    )
-
+    # RTH leg: VISION-HOME on the home-wall marker (APPROACH), not a world goto.
+    # The drone can't know its absolute position in the live arena, so it visually
+    # acquires the wall marker and closes to a standoff — stopping shallow inside
+    # home, never overshooting into the wall.
     wall_entry = HOME_WALL_MARKER.get(ctx.our_team)
     if wall_entry:
         wall_marker_id, _w_xy = wall_entry
-        rth_close_in = _rth_close_in_distance_m(slot, ctx.our_team)
-        rth_dur = _cruise_duration_s(rth_close_in)
-        # Pure FB_RC for RTH at the same conservative cruise stick.
-        rth_cruise_step = (
-            f"FB_RC {CRUISE_RC_STICK} {rth_dur:.2f}"
-            if rth_dur > 0 else ""
-        )
         rth_lines = (
-            # NO HOOVER between YAW and RTH cruise — start the run
-            # back immediately per user's "much faster flight" req.
-            rth_cruise_step,
-            f"FB_BRAKE {wall_marker_id} {FB_BRAKE_WALL_STOP_M:.2f} "
-            f"{FB_BRAKE_STICK} {FB_BRAKE_TIMEOUT_S:.1f}",
-            "YAW_IMU 180",
-            "LAND",
+            height_step,                       # climb to our transit altitude
+            # APPROACH homes on the wall marker by vision — it ROTATES to find
+            # the marker on its own, so no pre-orientation step is needed — and
+            # stops RTH_WALL_STANDOFF_M short of it (just inside home). Then a
+            # relative 180 deg turn re-faces the enemy for the next run. The FC
+            # has no absolute-heading verb, only the relative YAW_IMU.
+            f"APPROACH {wall_marker_id} {RTH_WALL_STANDOFF_M:.2f}",
+            "YAW_IMU 180",                     # re-face the enemy, ready to re-arm
+            home_rearm,
         )
     else:
-        rth_lines = (
-            f"TO_HOME {ctx.drone.home_alt_m or 3.0:.2f}",
-            "LAND",
-        )
+        rth_lines = (home_rearm,)
+
+    # ── VISION-BASED ATTACK ────────────────────────────────────────────────
+    # The whole capture is driven by APPROACH <marker_id> <distance>: the FC
+    # visually acquires the marker (rotating to search if needed) and closes to
+    # the standoff — NO absolute coordinates, so it works in the live arena
+    # where the drone only knows what ArUco markers it sees. It physically
+    # cannot overshoot into a wall: it stops at a standoff from a marker it can
+    # see. (The old script used TO <x,y> / FB_RC <duration> / world-coord
+    # brakes, all of which assume a known absolute position the drone doesn't
+    # have — that's what drove drones into walls on bad position estimates.)
     return _format_script(
         "TAKEOFF",
-        # CLIMB FIRST — Anafi settles at ~0.9m post-takeoff; slot
-        # boxes top out at 1.4m. Forward motion BEFORE we clear that
-        # height pitches the drone (and its camera) down, with two
-        # consequences: (a) drone risks clipping its own home-side
-        # slot boxes on the way out, (b) the camera looks at the
-        # ground instead of forward → vision misses the target.
-        # 1.2 s of up-stick + auto-brake gets us safely to ~1.4 m.
-        f"UD_RC {INITIAL_CLIMB_UD_RC} {INITIAL_CLIMB_DURATION_S:g}",
-        # Combined RC for the long cruise.
-        close_in_step,
-        # FB_BRAKE on the target's face marker, with explicit world
-        # coords passed in so the controller's world-fallback brake
-        # works (slot face markers aren't in arena_config).
-        f"FB_BRAKE {int(attack_marker_id)} {FB_BRAKE_TARGET_STOP_M:.2f} "
-        f"{FB_BRAKE_STICK} {FB_BRAKE_TIMEOUT_S:.1f}{target_world_hint}",
-        # Drift over the box (brief forward push + slight up-stick
-        # to stay above the box top during momentum bleed).
-        f"RC 0 {DRIFT_OVER_BOX_RC} {DRIFT_OVER_BOX_UD_RC} 0 "
-        f"{DRIFT_OVER_BOX_DURATION_S:.2f}",
-        "YAW_IMU 180",
-        # No HOOVER — RTH starts immediately. Capture detection is
-        # the scout role's job; the attacker just commits and runs.
+        # The operator orients the drone facing the enemy before take-off, and
+        # APPROACH re-acquires the box marker by rotating if it isn't already in
+        # view — so no explicit heading step is needed (and the FC has no
+        # absolute-heading verb anyway, only the relative YAW_IMU).
+        # Climb to the transit altitude (clears the 0.73 m boxes + keeps the
+        # camera level so it can see the target marker across the arena).
+        height_step,
+        # CAPTURE TECHNIQUE (operator-specified):
+        # 1) VISION-HOME on the box's face marker and stop ~1 m short of it.
+        #    The FC searches (rotates) for the marker if not yet in view.
+        f"APPROACH {int(attack_marker_id)} {ATTACK_STANDOFF_M:.2f}",
+        # 2) RISE to the capture altitude (1-1.5 m) — above the 0.73 m box top —
+        #    BEFORE moving over the box, so we never clip it.
+        f"HEIGHT {CAPTURE_ALT_M:.2f}",
+        # 3) Fly FORWARD the distance the marker was away minus 10 cm, to sit
+        #    exactly over the box centre. FB_IMU is a closed-loop relative move
+        #    (sensor-fused, no absolute position).
+        f"FB_IMU {OVER_BOX_FORWARD_M:.2f}",
+        # 4) Hover over the box for >= 2 s so the RFID flips it to our colour
+        #    (v7 §1.4.3).
+        f"HOOVER {CAPTURE_HOLD_HOVER_S:.1f}",
         *rth_lines,
     )
 
@@ -395,7 +467,16 @@ def _full_attack_script(
 def _auto_attack_script(
     ctx: RoleContext, attack_marker_id: int, slot: int
 ) -> str:
-    """Reactive end-to-end attack via the FC's AUTO_ATTACK phase.
+    """DEPRECATED / UNUSED — retained for reference only.
+
+    The C2 no longer emits the FC's monolithic ``AUTO_ATTACK`` maneuver:
+    per the "build strictly the C2, compose from existing FC primitives"
+    rule, the attacker now uses :func:`_full_attack_script` (TAKEOFF /
+    UD_RC / HEIGHT / FB_RC / FB_BRAKE / RC / YAW_IMU / LAND). This
+    function is kept only so the AUTO_ATTACK choreography notes aren't
+    lost; nothing calls it.
+
+    Reactive end-to-end attack via the FC's AUTO_ATTACK phase.
 
     Instead of a fixed choreography (climb N s, cruise M s, brake, …),
     we hand the FC a single AUTO_ATTACK step carrying the target slot
@@ -428,7 +509,10 @@ def _auto_attack_script(
     # Cruise altitude: per-drone attack_alt_m, floored at 1.4 m so we
     # always clear the slot boxes. Approach speed: a conservative
     # forward-stick default (operator can raise for a faster run).
-    altitude_m = max(1.4, float(ctx.drone.attack_alt_m or 1.6))
+    # Prefer the deconflicted cruise altitude (distinct per drone) so two
+    # attackers transit at different heights; floor at 1.4 m to always
+    # clear the slot boxes. Fall back to the per-drone attack_alt_m.
+    altitude_m = max(1.4, float(ctx.cruise_alt_m or ctx.drone.attack_alt_m or 1.6))
     approach_speed = AUTO_ATTACK_APPROACH_SPEED
     return _format_script(
         "TAKEOFF",
@@ -439,13 +523,125 @@ def _auto_attack_script(
     )
 
 
+def _return_home_script(ctx: RoleContext) -> str:
+    """Return into our home zone and hover (no land) — used during a BANK.
+
+    VISION-BASED: APPROACH the home-wall marker (no absolute coords), so the
+    drone homes on a marker it can see and stops a standoff short of the wall —
+    shallow inside the home zone, never overshooting. TAKEOFF is a no-op when
+    already airborne. Brings an out attacker home so the team can secure the
+    5-pt attempt (all drones home before the box is recaptured).
+    """
+    cruise_alt = max(1.4, float(ctx.cruise_alt_m)) if ctx.cruise_alt_m else 1.6
+    wall_entry = HOME_WALL_MARKER.get(ctx.our_team)
+    if wall_entry is None:
+        return _format_script(
+            "TAKEOFF", f"HEIGHT {cruise_alt:.2f}",
+            f"HOOVER {HOME_REARM_HOVER_S:.1f}")
+    wall_marker_id, _w_xy = wall_entry
+    return _format_script(
+        "TAKEOFF",
+        f"HEIGHT {cruise_alt:.2f}",
+        # Vision-home onto the home-wall marker (APPROACH rotates to find it),
+        # then a relative 180 deg turn to re-face the enemy. No absolute YAW.
+        f"APPROACH {wall_marker_id} {RTH_WALL_STANDOFF_M:.2f}",
+        "YAW_IMU 180",                                      # re-face the enemy
+        f"HOOVER {HOME_REARM_HOVER_S:.1f}",
+    )
+
+
+def _slot_home_team(slot: int) -> str:
+    """v7 §1.4.2 Table 1: boxes 1-3 are RED home, 4-6 are BLUE home."""
+    return "red" if 1 <= int(slot) <= 3 else "blue"
+
+
 def _enemy_face_for(slot: int, our_team: str) -> int:
     enemy = "blue" if our_team == "red" else "red"
     return face_id(slot, enemy)
 
 
+def _recapture_script(ctx: RoleContext, slot: int) -> str:
+    """Re-capture one of OUR OWN home boxes that the enemy flipped.
+
+    VISION-BASED, like the attack: the enemy currently holds this box, so its
+    visible face shows the ENEMY's marker for that slot. We APPROACH that marker
+    (the FC searches for it by rotating, then homes — no absolute coords needed),
+    descend into the RFID band, and hover to flip it back to our colour. Then
+    re-acquire the home-wall marker to settle shallow inside home, facing the
+    enemy, ready to attack/defend again. Never lands.
+
+    0 pts (home recapture, regs §1.4.3) but it stops the enemy bleeding us and
+    is required to ever reach the all-6 instant win.
+    """
+    cruise_alt = max(1.4, float(ctx.cruise_alt_m)) if ctx.cruise_alt_m else 1.6
+    # The box shows the ENEMY face now (they hold it) -> APPROACH that marker.
+    enemy_face = _enemy_face_for(int(slot), ctx.our_team)
+    wall_entry = HOME_WALL_MARKER.get(ctx.our_team)
+    # After the box APPROACH we're already facing into home, so go straight to
+    # the home-wall APPROACH (it rotates to find the marker), then a relative
+    # 180 deg turn to re-face the enemy. No absolute-heading verb on the FC.
+    settle = ([f"APPROACH {wall_entry[0]} {RTH_WALL_STANDOFF_M:.2f}",
+               "YAW_IMU 180"]
+              if wall_entry else [])
+    return _format_script(
+        "TAKEOFF",
+        f"HEIGHT {cruise_alt:.2f}",
+        # Same vision capture technique as the attack:
+        # 1) VISION-HOME on the (enemy-coloured) face of our flipped box, ~1 m.
+        f"APPROACH {enemy_face} {ATTACK_STANDOFF_M:.2f}",
+        # 2) RISE to capture altitude (above the 0.73 m box) before moving over.
+        f"HEIGHT {CAPTURE_ALT_M:.2f}",
+        # 3) Fly forward over the box centre (marker distance - 10 cm).
+        f"FB_IMU {OVER_BOX_FORWARD_M:.2f}",
+        # 4) Hover to flip the box back to our colour.
+        f"HOOVER {CAPTURE_HOLD_HOVER_S:.1f}",
+        # Climb, re-acquire the home wall, settle shallow inside home.
+        f"HEIGHT {cruise_alt:.2f}",
+        *settle,
+        f"HOOVER {HOME_REARM_HOVER_S:.1f}",
+    )
+
+
 def _slot_is_ours(ctx: RoleContext, slot: int) -> bool:
-    return ctx.markers.slot_holder(slot) == ctx.our_team
+    # DECAYED belief (same as the planner): only treat the slot as ours if a
+    # drone has actually SEEN it ours recently. A stale "we hold it" must not
+    # cancel a capture run — the enemy can re-capture the instant we leave and
+    # we can't see the slot from home. Once the belief decays to "unknown" the
+    # attacker flies back out to re-check / re-capture it (continuous play).
+    return ctx.markers.effective_holder(slot) == ctx.our_team
+
+
+def _own_box_under_threat(ctx: RoleContext) -> "int | None":
+    """Nearest-by-x enemy-held OWN slot that needs recapturing, or None.
+
+    Same detection the defender uses (RAW last-seen holder; skip the 5-s
+    post-capture lock) so a returning/home attacker can SELF-convert to a
+    defender the instant it sees one of our boxes flipped — without waiting for
+    the planner's idle-gated assignment. Slots a teammate is already
+    recapturing this tick (``ctx.peer_recapture_slots``) are excluded so two
+    drones never pile onto one box.
+    """
+    import time as _t
+    now = _t.time()
+    our = ctx.our_team
+    enemy = "blue" if our == "red" else "red"
+    px = ctx.state.world_position_m[0] if ctx.state.world_position_m else 0.0
+    threats = []
+    for sl in ctx.active_slots:
+        if _slot_home_team(sl) != our:
+            continue                       # only OUR home boxes
+        if sl in ctx.peer_recapture_slots:
+            continue                       # a teammate is already on it
+        if ctx.markers.slot_holder(sl) != enemy:
+            continue                       # not enemy-held
+        if ctx.markers.slot_locked(sl, now):
+            continue                       # in the 5-s post-capture lock
+        sx = SLOT_POSITIONS_M.get(sl, (0.0, 0.0))[0]
+        threats.append((abs(sx - px), sl))
+    if not threats:
+        return None
+    threats.sort()
+    return threats[0][1]                    # nearest by x
 
 
 class AttackerRole(Role):
@@ -462,30 +658,182 @@ class AttackerRole(Role):
         if not ctx.state.drone_connected:
             return noop("attacker: drone not connected")
 
+        # ---- RE-CAPTURE: the planner pulled this attacker to defend one of
+        # OUR OWN flipped boxes (an "attacker becomes defender" run). It's a
+        # 0-pt home flip but stops the enemy scoring, so it BEATS both the bank
+        # recall and a fresh enemy attack. Detect it by the target being one of
+        # OUR home slots; fly the heading-agnostic recapture, then the attacker
+        # reverts to normal attacking once the target clears.
+        slot0 = rs.target_slot
+        if slot0 is not None and _slot_home_team(slot0) == ctx.our_team:
+            if rs.phase == "running":
+                if _slot_is_ours(ctx, slot0) or ctx.state.phase in ("init", "done", ""):
+                    rs.target_slot = None
+                    rs.target_assigned_unix_s = None
+                    rs.advance_phase("done", f"slot {slot0} recaptured / run done")
+                    return noop("attacker: recapture complete")
+                return noop(f"attacker: recapturing own slot {slot0}")
+            if _slot_is_ours(ctx, slot0):
+                rs.target_slot = None
+                rs.advance_phase("done", f"slot {slot0} already ours")
+                return noop(f"attacker: own slot {slot0} already ours")
+            if ctx.state.phase not in ("init", "done", ""):
+                return noop(f"attacker: busy; will recapture own slot {slot0} once idle")
+            return push(
+                _recapture_script(ctx, slot0),
+                new_phase="running",
+                reason=f"attacker->defender: re-capture own slot {slot0}",
+            )
+
+        # ---- SELF-DEFEND: a RETURNING / HOME attacker that sees one of OUR
+        # boxes flipped to the enemy converts to a defender NOW — it breaks off,
+        # recaptures the box, and (via the branch above, next tick) reverts to
+        # attacking once the box is ours again. We detect this OURSELVES every
+        # tick: the planner's defend assignment is idle-gated and would wait for
+        # our return script to finish. Guards:
+        #  * only when we're home or heading home (the operator's "when the
+        #    attackers return to our home zone" condition) AND physically on our
+        #    own side — never abort a COMMITTED attacker in the enemy half, which
+        #    must finish its capture;
+        #  * peer_recapture_slots dedups vs the defender / other attackers so two
+        #    drones never chase the same box.
+        if slot0 is None or _slot_home_team(slot0) != ctx.our_team:
+            returning = ctx.in_home_now or rs.phase == "returning_home"
+            on_our_side = True
+            pos = ctx.state.world_position_m
+            if pos is not None:
+                y = float(pos[1])
+                on_our_side = (y <= 0.5) if ctx.our_team == "red" else (y >= -0.5)
+            if returning and on_our_side:
+                threat = _own_box_under_threat(ctx)
+                if threat is not None:
+                    # CLAIM the slot first (even on the break-off path) so the
+                    # runner records it in recap_claims and the remaining drones
+                    # this tick dedup against it — otherwise two returning
+                    # attackers both break off for the same box. With the claim
+                    # set, the recapture itself is then driven by the
+                    # planner-assigned-recapture branch above on the next idle
+                    # tick (target is now one of our own slots).
+                    rs.target_slot = threat
+                    rs.target_assigned_unix_s = None
+                    # Break off the current run first (the FC only starts a new
+                    # mission from idle); next tick the branch above pushes it.
+                    if ctx.state.phase not in ("init", "done", ""):
+                        return stop_cmd(
+                            f"attacker->defender: own slot {threat} flipped — "
+                            f"break off to recapture NOW")
+                    return push(
+                        _recapture_script(ctx, threat),
+                        new_phase="running",
+                        reason=f"attacker->defender: re-capture own slot {threat}",
+                    )
+
+        # ---- BANK: we just captured an enemy box — get home to secure the
+        # 5-pt attempt (ALL drones must return home before the box is
+        # recaptured). BUT do NOT abort an attacker that's already COMMITTED —
+        # i.e. already in the enemy half (y past the neutral midline toward the
+        # enemy). Yanking a committed drone home wastes a near-complete capture
+        # AND it can't make it home in time anyway; letting it finish lands the
+        # capture, then its own RTH brings it home. Only drones still on our
+        # side / in neutral are recalled (they're close, so the all-home bank
+        # completes fast). This is the key thrash fix: previously every bank
+        # aborted all 3 attackers mid-flight so none ever reached the boxes.
+        if ctx.team_phase == "bank":
+            pos = ctx.state.world_position_m
+            enemy_side = False
+            if pos is not None:
+                y = float(pos[1])
+                # red attacks +Y, blue attacks -Y; "committed" = past midline.
+                enemy_side = (y > 0.5) if ctx.our_team == "red" else (y < -0.5)
+            if enemy_side and rs.phase == "running":
+                # Committed: let the in-flight capture + its RTH finish.
+                return noop("attacker: bank — committed in enemy half, "
+                            "finishing capture then RTH")
+            rs.target_slot = None        # not committed -> abandon attack intent
+            rs.target_assigned_unix_s = None
+            if ctx.in_home_now:
+                if rs.phase not in ("returning_home", "done"):
+                    rs.advance_phase("done", "bank — home, holding (secured)")
+                return noop("attacker: bank — home, holding (secured)")
+            return push(
+                _return_home_script(ctx),
+                new_phase="returning_home",
+                reason="attacker: bank — return home to secure the attempt",
+            )
+
         slot = rs.target_slot
 
         # ---- idle: waiting for a target slot ------------------------------
         if rs.phase in ("", "idle", "done"):
             if slot is None:
-                return noop("attacker: idle (no target slot)")
+                # No target assigned. Per the spec the attacker must NEVER just
+                # sit there. The §1.4.4 home gate means we can only LAUNCH a new
+                # attack from home, so the productive thing to do while waiting
+                # for the planner to hand us an enemy slot is to be AT HOME,
+                # re-armed and ready to launch the instant one frees. If we're
+                # not home (just finished a run out in neutral/enemy), fly home
+                # now; if we're home, hold there ready. This continuous
+                # home<->attack cycle keeps every attacker always either
+                # attacking or repositioning to attack — never idle-in-place.
+                if not ctx.in_home_now and ctx.state.phase in ("init", "done", ""):
+                    return push(
+                        _return_home_script(ctx),
+                        new_phase="returning_home",
+                        reason="attacker: no target — return home, ready to strike",
+                    )
+                return noop("attacker: home, ready — waiting for an enemy slot")
             if _slot_is_ours(ctx, slot):
                 rs.advance_phase(
                     "done", f"slot {slot} already captured by us — no action"
                 )
                 return noop(f"attacker: slot {slot} already ours")
+            # The FC can only START a mission from INIT (on the ground). Since
+            # runs now end with a home HOVER (we never land mid-match), a drone
+            # that already flew a run is still airborne and CANNOT begin a new
+            # mission — pushing would just be rejected. Hold instead. (Doing
+            # several no-land runs needs them chained into one mission.)
+            if ctx.state.phase not in ("init", "done", ""):
+                return noop(
+                    f"attacker: airborne (fc phase={ctx.state.phase}); "
+                    f"holding — FC must be INIT to start a new run"
+                )
+            # v7 §1.4.4: a drone may only start a new scoring attempt after it
+            # has been detected back in its own home zone. Refuse to push until
+            # in_home_now flips True (computed from world_position_m + team).
+            if not ctx.in_home_now:
+                return noop(
+                    "attacker: not yet detected back in home zone "
+                    "(v7 §1.4.4 requires home-zone presence before re-attempt)"
+                )
             attack_id = _enemy_face_for(slot, ctx.our_team)
             rs.last_attack_marker_id = attack_id
+            # Compose the attack from EXISTING basic FC verbs (TAKEOFF /
+            # UD_RC / HEIGHT / FB_RC / FB_BRAKE / RC / YAW_IMU / LAND).
+            # We intentionally do NOT use the FC's monolithic AUTO_ATTACK
+            # state machine: the C2 owns the choreography and only orders
+            # the FC around with primitives it already provides.
             return push(
-                _auto_attack_script(ctx, attack_id, slot),
+                _full_attack_script(ctx, attack_id, slot),
                 new_phase="running",
-                reason=f"attacker: AUTO_ATTACK on slot {slot} (id={attack_id})",
+                reason=f"attacker: capture slot {slot} (id={attack_id})",
             )
+
+        # ---- returning_home: flying back to re-arm (bank or idle-out) ------
+        if rs.phase == "returning_home":
+            # Done the moment we're detected home (ready for the next attack)
+            # OR the homeward script ends. Reset to idle so the next tick can
+            # immediately launch a fresh attack on an assigned target.
+            if ctx.in_home_now or ctx.state.phase in ("init", "done", ""):
+                rs.advance_phase("idle", "home — re-armed, ready to attack")
+                return noop("attacker: home, re-armed")
+            return noop(f"attacker: returning home (fc phase={ctx.state.phase})")
 
         # ---- running: waiting for the entire script to finish -------------
         if rs.phase == "running":
             if slot is None:
                 # Target cleared while in flight — let the script finish on
-                # its own (it ends with LAND); we just reset our state.
+                # its own (it ends with a brief home hover, no land); we just
+                # reset our state.
                 rs.advance_phase("idle", "target cleared mid-flight")
                 return noop("attacker: target cleared mid-flight")
             # Only "init" reliably means the script has fully ended (FC has

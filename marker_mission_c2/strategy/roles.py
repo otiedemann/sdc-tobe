@@ -24,6 +24,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, Optional
 
+from . import arena_state
 from .markers import MarkerTracker
 from .settings import DroneSettings, MatchSettings
 
@@ -49,6 +50,12 @@ class DroneState:
     visible_marker_ids: tuple[int, ...] = ()
     active_marker_id: Optional[int] = None
     mission_running: bool = False
+    # v7 §1.4.4 needs to know whether the drone is currently inside its
+    # own home zone before allowing a new scoring attempt. We pull the
+    # arena-frame position straight from /api/state (sim + real FC both
+    # publish it) and the runner derives in_home_now from drone.team.
+    world_position_m: Optional[tuple[float, float, float]] = None
+    heading_deg: Optional[float] = None   # arena-frame yaw (0 = +Y), if published
     raw: Dict[str, Any] = field(default_factory=dict)
 
     @classmethod
@@ -69,6 +76,18 @@ class DroneState:
             active_id = int(active) if active is not None else None
         except (TypeError, ValueError):
             active_id = None
+        pos_raw = state.get("world_position_m")
+        pos_t: Optional[tuple[float, float, float]] = None
+        if isinstance(pos_raw, (list, tuple)) and len(pos_raw) >= 3:
+            try:
+                pos_t = (float(pos_raw[0]), float(pos_raw[1]), float(pos_raw[2]))
+            except (TypeError, ValueError):
+                pos_t = None
+        hdg_raw = state.get("heading_deg")
+        try:
+            hdg = float(hdg_raw) if hdg_raw is not None else None
+        except (TypeError, ValueError):
+            hdg = None
         return cls(
             fc_name=fc_name,
             connection_ok=bool(item.get("connection_ok", False)),
@@ -77,8 +96,49 @@ class DroneState:
             visible_marker_ids=vmids,
             active_marker_id=active_id,
             mission_running=phase not in ("", "unknown", "init", "idle", "landed"),
+            world_position_m=pos_t,
+            heading_deg=hdg,
             raw=item,
         )
+
+
+# v7 §1.1 home-zone bounds (regs-fixed): the playing field is 20 m along
+# the long (Y) axis split into red (5 m) + neutral (10 m) + blue (5 m), with
+# the 10 m width spanning x in [-5, +5]. Used by the runner to decide whether
+# a drone is currently INSIDE its own home zone for the §1.4.4 gate
+# ("a drone may only start a new attempt after it has been detected back in
+# its own home zone").
+def in_home_zone(team: str, x: float, y: float) -> bool:
+    # Bounds derived from the ACTIVE arena (dims) so a live arena switch is
+    # honoured; both real + gvz are 10x20 -> x in [-5,5], red y in [-10,-5].
+    return arena_state.in_home_zone(team, x, y)
+
+
+def home_park_xy(team: str, lane: int = 0, n_lanes: int = 1) -> tuple[float, float]:
+    """Where a drone parks when recalled home to BANK a scoring attempt.
+
+    |y|=5.5 m — just BARELY inside the home zone (y in ±[5, 10]), i.e. ~4.5 m
+    from the back wall at |y|=10 and SHALLOW (in FRONT of the boxes at |y|=7.5,
+    not over them). Operator: drones should be "only slightly in the home zone,
+    not too deep" — parking at |y|=6+ pushed them deep toward the back wall.
+    The x is SPREAD across the home-zone width by ``lane`` of ``n_lanes`` so the
+    team doesn't converge on one point during a bank (which tripped collision
+    avoidance and stalled the next attack). Lanes span x in [-3.5, +3.5].
+    """
+    # Derived from the ACTIVE arena's home band (inner boundary - 0.5 m).
+    return arena_state.home_park_xy(team, lane, n_lanes)
+
+
+def enemy_heading_deg(team: str) -> float:
+    """Absolute arena heading (for the FC ``YAW`` verb) that faces the ENEMY.
+
+    The arena long axis is Y; red's home is -Y and its targets are +Y, blue is
+    the mirror. heading 0 deg = facing +Y, 180 deg = facing -Y. So red attacks
+    facing 0, blue facing 180. Used to orient an attacker before its body-frame
+    cruise so it never drives the wrong way (e.g. into the home wall) because
+    of an inherited heading from a previous run / interrupted mission.
+    """
+    return 0.0 if team == "red" else 180.0
 
 
 # ---------------------------------------------------------------------------
@@ -94,6 +154,12 @@ class RoleState:
     target_slot: Optional[int] = None              # 1..6, set by operator
     target_assigned_unix_s: Optional[float] = None
     last_attack_marker_id: Optional[int] = None    # face id we last APPROACHed
+    # Logical heading the LAST pushed script leaves the drone in — "enemy"
+    # (+Y end / target boxes) or "home" (our back wall). The FC has no
+    # absolute-heading verb (only the relative YAW_IMU), so a role that needs a
+    # body-frame move (e.g. the defender's outward FB_IMU) reads this to know
+    # whether a 180 deg flip is needed first. Frame-independent on purpose.
+    facing: str = "enemy"
     last_pushed_script: str = ""
     last_pushed_unix_s: float = 0.0
     last_decision_reason: str = ""
@@ -187,6 +253,37 @@ class RoleContext:
     role_state: RoleState
     our_team: str                     # "red" | "blue"
     active_slots: tuple[int, ...]     # which slots are in play (1..6)
+    # Per-drone CRUISE altitude after height-deconfliction (distinct per
+    # drone so two drones never share a cruise height — see runner's
+    # deconflict step). None means "use the drone's own *_alt_m setting".
+    # Roles should prefer this for their cruise/loiter HEIGHT; the final
+    # capture descent still drops to the box-detect band regardless.
+    cruise_alt_m: Optional[float] = None
+    # v7 §1.4.4 gate: True iff drone.world_position_m is currently inside
+    # this drone's TEAM home zone (red y in [-10,-5] / blue y in [5,10],
+    # x in [-5,+5]). Computed by the runner from drone.team + state.world_
+    # position_m. Roles must refuse to start a NEW scoring attempt while
+    # this is False (the regs require the drone be detected back home).
+    in_home_now: bool = False
+    # Team-level scoring phase (set by the runner's team coordinator):
+    #   "sortie" — attack: every drone OUT of our home zone (scout at centre,
+    #              defender in neutral, attackers on enemy boxes). This is the
+    #              state in which a capture earns 5 pts (all drones outside
+    #              home at the moment of capture).
+    #   "bank"   — we just captured an enemy box: recall EVERY drone home to
+    #              secure the attempt (5 pts require all drones return home
+    #              before the box is recaptured). No new attacks start.
+    # Roles branch on this so the whole team pulses out-and-back together.
+    team_phase: str = "sortie"
+    # This drone's DISTINCT home-park point (x spread across the home zone by
+    # the runner so the team doesn't pile on one spot during bank). Roles use
+    # it for the bank/return-home target. None -> fall back to home_park_xy().
+    home_park_xy: Optional[tuple[float, float]] = None
+    # Own-home slots that OTHER drones are ALREADY recapturing this tick. A
+    # returning attacker (or the defender) that self-converts to defend a
+    # flipped box checks this so two drones never pile onto the same box. The
+    # runner fills it from the live role_states plus within-tick claims.
+    peer_recapture_slots: frozenset = frozenset()
 
 
 class Role(abc.ABC):

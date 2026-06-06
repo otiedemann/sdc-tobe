@@ -1,0 +1,235 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SDC26 — Local Control Hub</title>
+<style>
+  :root{
+    --bg:#0e0f12; --panel:#1a1c20; --panel2:#23262c; --text:#e6e6e6;
+    --muted:#9aa0a6; --border:#2c3038; --red:#c0392b; --blue:#2475c2;
+    --green:#2ecc71; --yellow:#f1c40f;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--text);
+       font:14px/1.45 system-ui,sans-serif}
+  header{padding:18px 22px;background:var(--panel);
+         border-bottom:1px solid var(--border)}
+  header h1{margin:0;font-size:20px}
+  header p{margin:4px 0 0;color:var(--muted);font-size:13px}
+  main{padding:22px;max-width:1100px;margin:0 auto}
+  h2{font-size:13px;text-transform:uppercase;letter-spacing:.06em;
+     color:var(--muted);margin:26px 0 12px}
+  .cards{display:grid;gap:14px;
+         grid-template-columns:repeat(auto-fill,minmax(240px,1fr))}
+  .card{display:block;background:var(--panel);border:1px solid var(--border);
+        border-radius:10px;padding:16px;text-decoration:none;color:inherit;
+        transition:border-color .15s,transform .05s}
+  .card:hover{border-color:#3a4350;transform:translateY(-1px)}
+  .card .top{display:flex;align-items:center;gap:8px;margin-bottom:6px}
+  .card .name{font-weight:600;font-size:15px;flex:1}
+  .card .url{color:var(--muted);font-family:ui-monospace,monospace;font-size:12px;
+             word-break:break-all}
+  .card .desc{color:var(--muted);font-size:12px;margin-top:8px}
+  .dot{width:10px;height:10px;border-radius:50%;background:#555;flex:none;
+       box-shadow:0 0 0 0 rgba(0,0,0,0)}
+  .dot.up{background:var(--green);box-shadow:0 0 8px var(--green)}
+  .dot.down{background:var(--red)}
+  .badge{font-size:11px;padding:2px 8px;border-radius:999px;
+         background:var(--panel2);color:var(--muted)}
+  .badge.red{background:var(--red);color:#fff}
+  .badge.blue{background:var(--blue);color:#fff}
+  .drones{display:grid;gap:14px;
+          grid-template-columns:repeat(auto-fill,minmax(280px,1fr))}
+  .drone{background:var(--panel);border:1px solid var(--border);
+         border-radius:10px;overflow:hidden}
+  .drone .vid{width:100%;aspect-ratio:16/9;background:#000;display:block;
+              object-fit:cover}
+  .drone .meta{display:flex;align-items:center;gap:8px;padding:10px 12px}
+  .drone .meta .name{font-weight:600;flex:1}
+  .drone .links{display:flex;gap:8px;padding:0 12px 12px}
+  .drone .links a{font-size:12px;color:#7fb3e6;text-decoration:none;
+                  border:1px solid var(--border);border-radius:6px;
+                  padding:4px 8px}
+  .drone .links a:hover{border-color:#3a4350}
+  .foot{color:var(--muted);font-size:12px;margin-top:28px;
+        border-top:1px solid var(--border);padding-top:14px}
+  code{background:var(--panel2);padding:1px 5px;border-radius:4px}
+  /* Match control bar */
+  .matchbar{display:flex;align-items:center;gap:12px;flex-wrap:wrap;
+            background:var(--panel);border:1px solid var(--border);
+            border-radius:10px;padding:14px 16px}
+  .btn{font:600 14px system-ui,sans-serif;color:#fff;border:none;
+       border-radius:8px;padding:10px 16px;cursor:pointer;
+       transition:filter .12s,transform .05s}
+  .btn:hover{filter:brightness(1.1)} .btn:active{transform:translateY(1px)}
+  .btn:disabled{opacity:.5;cursor:default;filter:none}
+  .btn-go{background:var(--green);color:#08361b}
+  .btn-stop{background:var(--panel2);color:var(--text);
+            border:1px solid var(--border)}
+  .matchmsg{font-size:13px;color:var(--muted);font-family:ui-monospace,monospace}
+  .matchmsg.ok{color:var(--green)} .matchmsg.err{color:var(--red)}
+  .matchbar .hint{color:var(--muted);font-size:12px;margin-left:auto}
+</style>
+</head>
+<body>
+<header>
+  <h1>SDC26 — Local Control Hub</h1>
+  <p>All local services in one place. Locally the <b>simulator</b> stands in for the
+     real <code>marker_mission</code> flight controllers (Olympe is Linux-only), so the
+     drones below are simulated FCs.</p>
+</header>
+
+<main>
+  <h2>Match control</h2>
+  <div class="matchbar">
+    <button id="armBoth" class="btn btn-go">▶ Arm both teams — start match</button>
+    <button id="disarmBoth" class="btn btn-stop">■ Disarm both</button>
+    <span id="matchMsg" class="matchmsg"></span>
+    <span class="hint">Both strategies default to AUTO, so Arm is all it takes.</span>
+  </div>
+
+  <h2>Command &amp; Strategy</h2>
+  <div id="services" class="cards"></div>
+
+  <h2>marker_mission flight controllers (simulated)</h2>
+  <div id="drones" class="drones"></div>
+
+  <div class="foot">
+    Status dots ping each service every few seconds. Both strategies (red +
+    blue) run by default; start the stack with <code>--no-blue</code> for a
+    red-only run. Started via <code>./run_local.sh</code>.
+  </div>
+</main>
+
+<script>
+const HOST = location.hostname || "127.0.0.1";
+// The hub is served by the sim UI, so the sim's port is our own.
+const SIM_PORT = location.port || "9100";
+
+// Well-known services from run_local.sh (standard ports).
+const SERVICES = [
+  {key:"strat_red",  name:"Strategy — RED",  port:8091, path:"/",
+   desc:"SDC26 strategy dashboard (assign roles/targets, MANUAL/AUTO).", badge:"red"},
+  {key:"strat_blue", name:"Strategy — BLUE", port:8092, path:"/",
+   desc:"Second strategy (only with --match).", badge:"blue"},
+  {key:"c2",         name:"C2 Server",       port:8090, path:"/",
+   desc:"Command &amp; control server — overview of all FCs.", badge:""},
+  {key:"sim3d",      name:"Sim — 3D Arena",  port:SIM_PORT, path:"/",
+   desc:"Live 3D view of the arena, drones and target boxes.", badge:""},
+];
+
+function url(port, path){ return `http://${HOST}:${port}${path||"/"}`; }
+
+function renderServices(){
+  const root = document.getElementById("services");
+  root.innerHTML = "";
+  for(const s of SERVICES){
+    const u = url(s.port, s.path);
+    const a = document.createElement("a");
+    a.className = "card"; a.href = u; a.target = "_blank"; a.rel = "noopener";
+    a.dataset.ping = url(s.port, "/");
+    a.innerHTML =
+      `<div class="top"><span class="dot" data-dot></span>
+         <span class="name">${s.name}</span>
+         ${s.badge?`<span class="badge ${s.badge}">${s.badge}</span>`:""}</div>
+       <div class="url">${u}</div>
+       <div class="desc">${s.desc}</div>`;
+    root.appendChild(a);
+  }
+}
+
+function renderDrones(drones){
+  const root = document.getElementById("drones");
+  if(!drones || !drones.length){
+    root.innerHTML = `<div class="desc" style="color:var(--muted)">No drones reported by the sim yet…</div>`;
+    return;
+  }
+  root.innerHTML = "";
+  for(const d of drones){
+    const port = d.fc_port;
+    const vid = url(port, "/video.mjpg");
+    const card = document.createElement("div");
+    card.className = "drone";
+    card.innerHTML =
+      `<img class="vid" src="${vid}" alt="${d.id} camera"
+            onerror="this.style.opacity=.25;this.alt='no video';">
+       <div class="meta">
+         <span class="dot up"></span>
+         <span class="name">${d.id}</span>
+         <span class="badge ${d.team}">${d.team}</span>
+       </div>
+       <div class="links">
+         <a href="${vid}" target="_blank" rel="noopener">video ↗</a>
+         <a href="${url(port,"/api/state")}" target="_blank" rel="noopener">state ↗</a>
+         <span class="url" style="margin-left:auto">:${port}</span>
+       </div>`;
+    root.appendChild(card);
+  }
+}
+
+// Ping a URL cross-origin (no-cors) with a timeout. Resolves -> up.
+async function ping(u){
+  const ctl = new AbortController();
+  const t = setTimeout(()=>ctl.abort(), 1500);
+  try{ await fetch(u, {mode:"no-cors", signal:ctl.signal}); return true; }
+  catch(_){ return false; }
+  finally{ clearTimeout(t); }
+}
+
+async function refreshStatus(){
+  const cards = document.querySelectorAll("#services .card");
+  await Promise.all([...cards].map(async c=>{
+    const dot = c.querySelector("[data-dot]");
+    const ok = await ping(c.dataset.ping);
+    dot.className = "dot " + (ok?"up":"down");
+  }));
+}
+
+async function refreshDrones(){
+  try{
+    const r = await fetch(url(SIM_PORT, "/api/world"), {cache:"no-store"});
+    const w = await r.json();
+    renderDrones(w.drones || []);
+  }catch(_){ /* sim not up yet */ }
+}
+
+// --- Match control: arm/disarm BOTH strategy servers in one click. ---
+// We POST same-origin to the sim, which proxies to each strategy server
+// (avoids cross-origin/CORS to the :8091/:8092 strategy ports).
+async function matchAction(action){
+  const msg = document.getElementById("matchMsg");
+  const armB = document.getElementById("armBoth");
+  const disB = document.getElementById("disarmBoth");
+  armB.disabled = disB.disabled = true;
+  msg.className = "matchmsg";
+  msg.textContent = (action === "arm" ? "Arming" : "Disarming") + " both teams…";
+  try{
+    const r = await fetch(url(SIM_PORT, "/api/match/" + action),
+                          {method:"POST", cache:"no-store"});
+    const j = await r.json();
+    const parts = Object.entries(j.teams || {}).map(([t, v]) =>
+      v.ok ? `${t}: ${v.armed === false ? "disarmed" : "ARMED ✓"}`
+           : `${t}: ✗ unreachable`);
+    msg.textContent = parts.join("    ·    ") || (j.ok ? "done" : "failed");
+    msg.className = "matchmsg " + (j.ok ? "ok" : "err");
+  }catch(e){
+    msg.textContent = "✗ " + e;
+    msg.className = "matchmsg err";
+  }finally{
+    armB.disabled = disB.disabled = false;
+    refreshStatus();
+  }
+}
+document.getElementById("armBoth")
+        .addEventListener("click", () => matchAction("arm"));
+document.getElementById("disarmBoth")
+        .addEventListener("click", () => matchAction("disarm"));
+
+renderServices();
+refreshStatus(); refreshDrones();
+setInterval(refreshStatus, 4000);
+setInterval(refreshDrones, 10000);   // drones list rarely changes; video <img> auto-refreshes
+</script>
+</body>
+</html>
