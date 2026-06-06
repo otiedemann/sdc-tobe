@@ -166,6 +166,10 @@ class Step:
     # distance_deadband_m), so the drone just gets INTO the home zone without
     # fussing for precision. None -> normal tight APPROACH arrival.
     arrive_tol_m: Optional[float] = None
+    # Optional arrival heading angle (degrees) for GO_HOME: the angle the drone
+    # should hold relative to the marker's normal at arrival. Range ±80°; None
+    # means head-on (0°). Settle gate: ±12° tolerance around this target.
+    arrive_hdg_deg: Optional[float] = None
     # Closed-loop position-relative move for kind="MOVE_IMU"
     # (FB_IMU / LR_IMU / UD_IMU). ``move_direction`` is one of
     # "forward"/"back"/"left"/"right"/"up"/"down" (sign baked in,
@@ -250,10 +254,13 @@ def parse(text: str, defaults: dict) -> List[Step]:
             # Like APPROACH but with a LOOSE arrival band: we only want to be
             # sure we're inside our home zone, not precisely positioned. Default
             # 3.5 m +/- 0.5 m from the home-wall marker (so anywhere 3-4 m).
-            if len(args) > 3:
+            # Optional 4th arg: arrival heading angle relative to marker normal
+            # (-80..+80 deg). The drone is considered settled only when also
+            # within ±12° of this target. Default 0 (head-on).
+            if len(args) > 4:
                 raise ScriptError(raw_line_no,
-                                  f"GO_HOME takes 0-3 arguments "
-                                  f"(<marker-id> [<dist>] [<tol>]), "
+                                  f"GO_HOME takes 0-4 arguments "
+                                  f"(<marker-id> [<dist>] [<tol>] [<hdg>]), "
                                   f"got {len(args)}")
             mid = (_parse_int(args[0], raw_line_no, "GO_HOME marker-id")
                    if len(args) >= 1
@@ -265,8 +272,16 @@ def parse(text: str, defaults: dict) -> List[Step]:
             if tol <= 0:
                 raise ScriptError(raw_line_no,
                                   f"GO_HOME tolerance must be > 0, got {tol}")
+            hdg = None
+            if len(args) >= 4:
+                hdg = _parse_float(args[3], raw_line_no, "GO_HOME heading")
+                if not (-80.0 <= hdg <= 80.0):
+                    raise ScriptError(raw_line_no,
+                                      f"GO_HOME heading must be -80..+80 deg, "
+                                      f"got {hdg}")
             out.append(Step(kind="APPROACH", marker_id=mid, distance=dist,
-                            arrive_tol_m=tol, line_no=raw_line_no))
+                            arrive_tol_m=tol, arrive_hdg_deg=hdg,
+                            line_no=raw_line_no))
         elif cmd == "HOOVER":
             if len(args) > 1:
                 raise ScriptError(raw_line_no,
@@ -611,8 +626,10 @@ def format(steps: List[Step]) -> str:
             lines.append("TAKEOFF")
         elif s.kind == "APPROACH":
             if s.arrive_tol_m is not None:
+                hdg_part = (f" {s.arrive_hdg_deg:g}"
+                            if s.arrive_hdg_deg is not None else "")
                 lines.append(f"GO_HOME {s.marker_id} {s.distance:g} "
-                             f"{s.arrive_tol_m:g}")
+                             f"{s.arrive_tol_m:g}{hdg_part}")
             else:
                 lines.append(f"APPROACH {s.marker_id} {s.distance:g}")
         elif s.kind == "HOOVER":

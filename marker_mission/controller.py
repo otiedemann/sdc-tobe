@@ -450,6 +450,10 @@ class MissionState:
     # metres of target_distance_m, instead of the tight cfg.distance_deadband_m.
     # None -> fall back to the tight deadband (a precise APPROACH).
     target_distance_tol_m: Optional[float] = None
+    # Heading tolerance (deg) for GO_HOME settle: when set, the approach also
+    # gates on abs(e_hdg) < arrive_hdg_tol_deg before advancing.
+    # None -> no heading gate (plain APPROACH or GO_HOME without hdg arg).
+    arrive_hdg_tol_deg: Optional[float] = None
     target_relative_heading_deg: float = 90.0
     active_marker_id: Optional[int] = None
     hold_time_s: float = 60.0
@@ -825,6 +829,7 @@ class MissionController:
             self.state.hold_time_s = self.cfg.hold_time_s
             self.state.target_distance_m = self.cfg.target_distance_m
             self.state.target_distance_tol_m = None
+            self.state.arrive_hdg_tol_deg = None
             self.state.target_relative_heading_deg = (
                 self.cfg.target_relative_heading_deg)
 
@@ -889,6 +894,7 @@ class MissionController:
             self.state.started_at = time.monotonic()
             self.state.target_distance_m = self.cfg.target_distance_m
             self.state.target_distance_tol_m = None
+            self.state.arrive_hdg_tol_deg = None
             self.state.target_relative_heading_deg = self.cfg.target_relative_heading_deg
             self.state.active_marker_id = self.cfg.target_marker_id
             self.state.hold_time_s = self.cfg.hold_time_s
@@ -1731,7 +1737,9 @@ class MissionController:
         # drift over the long approach -- on flight 21-28-02 the drone
         # drifted from hdg=+15 to hdg=-46 across 9 s of approach, even
         # though approach itself never commanded any lateral motion.
-        e_hdg = ((0.0 - hdg) + 540.0) % 360.0 - 180.0
+        with self.state.lock:
+            _tgt_hdg = self.state.target_relative_heading_deg
+        e_hdg = ((_tgt_hdg - hdg) + 540.0) % 360.0 - 180.0
 
         # Yaw gated by latch (see below). Default = 0; overridden after latch.
         u_yaw = 0.0
@@ -1876,8 +1884,12 @@ class MissionController:
         # under the lock, then release before calling _set_phase -- which
         # itself takes the lock and would self-deadlock since
         # threading.Lock is non-reentrant.
+        with self.state.lock:
+            _hdg_tol = self.state.arrive_hdg_tol_deg
+        hdg_ok = (_hdg_tol is None or abs(e_hdg) < _hdg_tol)
         in_band = (abs(e_yaw) < cfg.yaw_deadband_deg
-                   and abs(e_fwd) < eff_tol)
+                   and abs(e_fwd) < eff_tol
+                   and hdg_ok)
         settled = False
         with self.state.lock:
             if in_band:
@@ -3318,10 +3330,14 @@ class MissionController:
                 self.state.target_distance_tol_m = (
                     float(step.arrive_tol_m)
                     if step.arrive_tol_m is not None else None)
-                # APPROACH always closes head-on so the marker stays
-                # inside the detector's reliable angle range. HOLD
-                # inherits this 0 setpoint via state.target_relative_heading_deg.
-                self.state.target_relative_heading_deg = 0.0
+                # GO_HOME may specify an arrival heading (±80°, ±12° tol).
+                # Plain APPROACH always closes head-on (0°); HOLD inherits
+                # this setpoint via state.target_relative_heading_deg.
+                self.state.target_relative_heading_deg = (
+                    float(step.arrive_hdg_deg)
+                    if step.arrive_hdg_deg is not None else 0.0)
+                self.state.arrive_hdg_tol_deg = (
+                    12.0 if step.arrive_hdg_deg is not None else None)
             self._set_phase(Phase.SEARCH,
                             note + f" id={int(step.marker_id)}"
                                    f" d={float(step.distance):g}m"

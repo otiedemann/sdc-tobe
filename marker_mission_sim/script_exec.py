@@ -449,7 +449,9 @@ def _exec_step(drone: SimDrone, world: World, step: Step, dt: float,
         # Loose APPROACH onto the home back-wall marker: settle anywhere
         # within ±tol of `dist` ("be roughly in the home zone"). Mirrors the
         # FC's GO_HOME (APPROACH with a wide target_distance_tol_m).
-        # args: [marker_id, dist=3.5, tol=0.5]
+        # args: [marker_id, dist=3.5, tol=0.5, hdg=0]
+        # hdg (±80°) is the arrival heading relative to the marker normal;
+        # ignored in the sim (position-only model, no heading gate).
         dist = _arg(step, 1, 3.5)
         tol = _arg(step, 2, 0.5)
         try:
