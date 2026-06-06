@@ -1627,7 +1627,7 @@ class MissionController:
             # Without height telemetry, hand off to ALIGN. The state
             # machine continues to function, just without height
             # alignment for this run.
-            self._set_phase(Phase.ALIGN,
+            self._set_phase(Phase.APPROACH,
                             "no height telemetry -- skipping HEIGHT_ALIGN")
             return
 
@@ -1671,9 +1671,9 @@ class MissionController:
             else:
                 self.state.settle_began_at = None
         if settled:
-            self._set_phase(Phase.ALIGN,
+            self._set_phase(Phase.APPROACH,
                             f"height aligned ({drone_h:.2f}m) -- "
-                            f"now aligning heading")
+                            f"closing distance (angle correction at yaw_start_fraction)")
 
     # -------------------------------------------------------------- approach
     def _step_approach(self, tel: Optional[TelemetrySnapshot],
