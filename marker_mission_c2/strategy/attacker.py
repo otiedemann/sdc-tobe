@@ -410,11 +410,24 @@ def _full_attack_script(
     cruise_alt = max(BOX_CLEARANCE_ALT_M, float(ctx.drone.attack_alt_m or 1.0))
     height_step = f"HEIGHT {cruise_alt:.2f}"
 
+    # COLLISION AVOIDANCE on the way home (operator): the RTH cruise flies at
+    # this drone's DISTINCT deconflicted altitude (not the flat approach
+    # altitude), so several attackers returning at once are vertically separated
+    # during the cruise. Floored at box clearance; falls back to the approach
+    # altitude when no deconfliction is available (single drone).
+    rth_alt = max(BOX_CLEARANCE_ALT_M, float(ctx.cruise_alt_m or cruise_alt))
+    # And each attacker approaches the home-wall marker from a DIFFERENT bearing
+    # (3 attackers -> -45 / 0 / +45 deg relative to the marker normal) so they
+    # fan out to distinct points around it instead of converging on one standoff
+    # and colliding. GO_HOME's 4th arg is that arrival heading.
+    rth_hdg = (ctx.rth_approach_angle_deg
+               if ctx.rth_approach_angle_deg is not None else 0.0)
+
     # End-of-run: hover briefly at home (confirms v7 §1.4.4 presence) then the
     # script ENDS — no LAND, stay airborne for the next dispatch.
     home_rearm = f"HOOVER {HOME_REARM_HOVER_S:.1f}"
 
-    # RTH leg: VISION-HOME on the home-wall marker (APPROACH), not a world goto.
+    # RTH leg: VISION-HOME on the home-wall marker (GO_HOME), not a world goto.
     # The drone can't know its absolute position in the live arena, so it visually
     # acquires the wall marker and closes to a standoff — stopping shallow inside
     # home, never overshooting into the wall.
@@ -422,13 +435,13 @@ def _full_attack_script(
     if wall_entry:
         wall_marker_id, _w_xy = wall_entry
         rth_lines = (
-            height_step,                       # climb to our transit altitude
-            # APPROACH homes on the wall marker by vision — it ROTATES to find
-            # the marker on its own, so no pre-orientation step is needed — and
-            # stops RTH_WALL_STANDOFF_M short of it (just inside home). Then a
-            # relative 180 deg turn re-faces the enemy for the next run. The FC
-            # has no absolute-heading verb, only the relative YAW_IMU.
-            f"APPROACH {wall_marker_id} {RTH_WALL_STANDOFF_M:.2f}",
+            f"HEIGHT {rth_alt:.2f}",           # DISTINCT per-drone RTH cruise altitude
+            # GO_HOME homes on the wall marker by vision — it ROTATES to find the
+            # marker on its own — stops RTH_WALL_STANDOFF_M short of it (just
+            # inside home), AND arrives at the per-drone bearing {rth_hdg}° so
+            # concurrent returns fan out instead of converging. Then a relative
+            # 180 deg turn re-faces the enemy for the next run.
+            f"GO_HOME {wall_marker_id} {RTH_WALL_STANDOFF_M:.2f} 0.5 {rth_hdg:g}",
             "YAW_IMU 180",                     # re-face the enemy, ready to re-arm
             home_rearm,
         )
@@ -539,11 +552,16 @@ def _return_home_script(ctx: RoleContext) -> str:
     already airborne. Brings an out attacker home so the team can secure the
     5-pt attempt (all drones home before the box is recaptured).
     """
-    # Fly LOW so the camera sees the 0.73 m box / camera-height wall markers:
-    # honor attack_alt_m (default 1.0 m), floored at box clearance — NOT the
-    # deconflicted cruise_alt_m (that band assumes 1.4 m boxes). See the note
-    # in _full_attack_script on multi-drone separation.
-    cruise_alt = max(BOX_CLEARANCE_ALT_M, float(ctx.drone.attack_alt_m or 1.0))
+    # COLLISION AVOIDANCE on the way home (operator): fly the cruise at this
+    # drone's DISTINCT deconflicted altitude so concurrently-returning attackers
+    # are vertically separated; floored at box clearance, falls back to the flat
+    # approach altitude for a single drone.
+    cruise_alt = max(BOX_CLEARANCE_ALT_M, float(ctx.cruise_alt_m or
+                                                ctx.drone.attack_alt_m or 1.0))
+    # Per-drone arrival bearing so several attackers fan out around the wall
+    # marker instead of converging (3 attackers -> -45 / 0 / +45 deg).
+    rth_hdg = (ctx.rth_approach_angle_deg
+               if ctx.rth_approach_angle_deg is not None else 0.0)
     wall_entry = HOME_WALL_MARKER.get(ctx.our_team)
     if wall_entry is None:
         return _format_script(
@@ -553,9 +571,10 @@ def _return_home_script(ctx: RoleContext) -> str:
     return _format_script(
         "TAKEOFF",
         f"HEIGHT {cruise_alt:.2f}",
-        # Vision-home onto the home-wall marker (APPROACH rotates to find it),
-        # then a relative 180 deg turn to re-face the enemy. No absolute YAW.
-        f"APPROACH {wall_marker_id} {RTH_WALL_STANDOFF_M:.2f}",
+        # Vision-home onto the home-wall marker (GO_HOME rotates to find it) at
+        # the per-drone arrival bearing, then a relative 180 deg turn to re-face
+        # the enemy. No absolute YAW / no absolute coords.
+        f"GO_HOME {wall_marker_id} {RTH_WALL_STANDOFF_M:.2f} 0.5 {rth_hdg:g}",
         "YAW_IMU 180",                                      # re-face the enemy
         f"HOOVER {HOME_REARM_HOVER_S:.1f}",
     )
