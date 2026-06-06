@@ -438,12 +438,24 @@ def _exec_step(drone: SimDrone, world: World, step: Step, dt: float,
         if tgt is None:
             # Unknown marker: hold briefly then give up.
             return 0.0, elapsed >= UNKNOWN_MARKER_HOLD_S
-        # Approach to a standoff `dist` short of the marker (xy plane).
+        # Home to a standoff `dist` from the marker (xy plane). The real FC's
+        # forward PD drives toward the marker when too far AND backs off when too
+        # close, holding the standoff — so we aim for the point on the standoff
+        # ring along the current bearing (marker -> drone), not the marker xy.
+        # Without this, a drone that starts CLOSER than `dist` (e.g. the scout,
+        # already within 6 m of a side marker) would count as "arrived" without
+        # ever centring.
         cur_d = drone.pos.dist_xy(tgt)
-        if cur_d <= dist + ARRIVE_XY:
+        if abs(cur_d - dist) <= ARRIVE_XY:
             return 0.0, True
-        spd, _ = _step_xy(drone, world, tgt.x, tgt.y, dt, CRUISE_SPEED)
-        return spd, drone.pos.dist_xy(tgt) <= dist + ARRIVE_XY
+        if cur_d > 1e-6:
+            ux = (drone.pos.x - tgt.x) / cur_d
+            uy = (drone.pos.y - tgt.y) / cur_d
+        else:
+            ux, uy = 0.0, 1.0
+        spd, _ = _step_xy(drone, world, tgt.x + dist * ux, tgt.y + dist * uy,
+                          dt, CRUISE_SPEED)
+        return spd, abs(drone.pos.dist_xy(tgt) - dist) <= ARRIVE_XY
 
     if verb == "GO_HOME":
         # Loose APPROACH onto the home back-wall marker: settle anywhere

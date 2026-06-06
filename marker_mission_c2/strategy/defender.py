@@ -192,14 +192,18 @@ def _wait_script(ctx: RoleContext, *, need_exit: bool = False) -> str:
     """
     cruise_alt = max(1.5, float(ctx.cruise_alt_m or ctx.drone.attack_alt_m or 1.6))
 
-    # BANK: single point at home, hover (handled by _wait_xy -> home).
+    # BANK: come home and hover. Vision-home INTO the home zone with GO_HOME on
+    # our back-wall marker (NO absolute TO) — the FC rotates to find the marker
+    # and stops a shallow standoff short of it, landing the defender just inside
+    # home. standoff = wall depth - park depth.
     if ctx.team_phase == "bank":
-        wx, wy = _wait_xy(ctx)
+        _wx, wy = _wait_xy(ctx)
+        home_marker_id, (_mx, my) = HOME_WALL_MARKER[ctx.our_team]
+        standoff = max(0.5, abs(my) - abs(wy))          # 10 - 5.5 = 4.5 m
         return _format_script(
             "TAKEOFF",
             f"HEIGHT {cruise_alt:.2f}",
-            f"TO {wx:g} {wy:g}",
-            f"HEIGHT {cruise_alt:.2f}",
+            f"GO_HOME {home_marker_id} {standoff:.2f} 0.5",
             f"HOOVER {HOME_REARM_HOVER_S:.1f}",
         )
 
