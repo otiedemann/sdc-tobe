@@ -213,6 +213,10 @@ class MissionConfig:
     # drone has crossed this threshold.
     # 0.0 = lateral active from the start  |  0.5 = second half  |  1.0 = never
     approach_yaw_start_fraction: float = 0.5  # TUNE
+    # Small yaw correction allowed BEFORE the angle-correction latch fires.
+    # Keeps the marker roughly centred in frame during the straight-in phase.
+    # 0.0 = no pre-latch yaw at all  |  10.0 = allow up to ±10° correction.
+    approach_pre_latch_yaw_deg: float = 10.0  # TUNE
     # Lateral motion has to be slow enough that yaw can keep tracking
     # the marker -- otherwise yaw lags, the marker drifts off-axis, and
     # the commanded "sideways" leaks into radial drift. An early try at
@@ -522,6 +526,10 @@ TUNING_FIELDS = {
     "approach_yaw_start_fraction": {
         "label": "angle correction start (APPROACH)", "kind": "float", "step": 0.05,
         "desc": "Fraction of the approach leg at which lateral/angle correction activates. 0.5 = flies straight (marker centred) for the first 50 % of (start_d → target_d), then corrects the approach angle. 0.0 = always correct. 1.0 = never correct laterally during approach.",
+    },
+    "approach_pre_latch_yaw_deg": {
+        "label": "pre-latch yaw limit (APPROACH)", "kind": "float", "unit": "deg", "step": 1.0,
+        "desc": "Max yaw error at which a small correction is applied BEFORE the angle-correction latch fires. Keeps the marker roughly centred in frame during the straight-in phase without full lateral steering. 0 = no pre-latch yaw. 10 = allow up to ±10° correction.",
     },
     "approach_slow_zone_m": {
         "label": "approach slow zone", "kind": "float", "unit": "m", "step": 0.01,

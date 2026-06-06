@@ -1768,9 +1768,16 @@ class MissionController:
             u_lat_raw = self.pd_lat.step(arc_err_m, now)
         u_lat = self._velocity_damp_lat(u_lat_raw, tel)
 
-        # Yaw: gated by the same latch (assigned earlier as placeholder 0).
-        if self._approach_lat_unlocked and abs(e_yaw) >= cfg.yaw_deadband_deg:
-            u_yaw = self.pd_yaw.step(e_yaw, now)
+        # Yaw: full correction after latch; small pre-latch correction to
+        # keep the marker centred in frame during the straight-in phase.
+        pre_latch_limit = float(getattr(cfg, "approach_pre_latch_yaw_deg", 10.0))
+        if self._approach_lat_unlocked:
+            if abs(e_yaw) >= cfg.yaw_deadband_deg:
+                u_yaw = self.pd_yaw.step(e_yaw, now)
+        elif pre_latch_limit > 0 and abs(e_yaw) >= cfg.yaw_deadband_deg:
+            u_yaw = self.pd_yaw.step(
+                max(-pre_latch_limit, min(pre_latch_limit, e_yaw)), now
+            )
 
         # Continuous height alignment to the marker's altitude. Same
         # geometry as HEIGHT_ALIGN: marker_height = drone_height -
