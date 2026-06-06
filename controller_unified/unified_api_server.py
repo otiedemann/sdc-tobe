@@ -1576,7 +1576,8 @@ class DroneBackend(abc.ABC):
     @abc.abstractmethod
     def move(self, direction: str, cm: int) -> Tuple[bool, str]: ...
     @abc.abstractmethod
-    def rotate(self, direction: str, degrees: int) -> Tuple[bool, str]: ...
+    def rotate(self, direction: str, degrees: int,
+               speed: Optional[int] = None) -> Tuple[bool, str]: ...
     @abc.abstractmethod
     def go_xyz(self, x: int, y: int, z: int, speed: int) -> Tuple[bool, str]: ...
 
@@ -1776,7 +1777,11 @@ class TelloBackend(DroneBackend):
             fn(cm)
         return True, "ok"
 
-    def rotate(self, direction: str, degrees: int) -> Tuple[bool, str]:
+    def rotate(self, direction: str, degrees: int,
+               speed: Optional[int] = None) -> Tuple[bool, str]:
+        # Tello SDK has no per-rotation angular-speed control; the optional
+        # ``speed`` override (used on Anafi) is accepted and ignored here so
+        # the YAW_IMU 2nd arg degrades gracefully on Tello hardware.
         t = self._t()
         if t is None:
             return False, "not_ready"
@@ -2710,7 +2715,8 @@ class OlympeBackend(DroneBackend):
         # Even if moveBy "failed", check if the drone actually moved
         return False, "move_failed"
 
-    def rotate(self, direction: str, degrees: int) -> Tuple[bool, str]:
+    def rotate(self, direction: str, degrees: int,
+               speed: Optional[int] = None) -> Tuple[bool, str]:
         d = self._d()
         if d is None:
             return False, "not_ready"
@@ -2718,8 +2724,30 @@ class OlympeBackend(DroneBackend):
         d_psi = rad if direction == "cw" else -rad
         self._stop_piloting()
         time.sleep(0.1)
-        with command_lock:
-            result = d(moveBy(0, 0, 0, d_psi)).wait(_timeout=15)
+        # Optional per-rotation angular-speed override: temporarily raise
+        # (or lower) MaxRotationSpeed for THIS moveBy only, then restore the
+        # configured global. The moveBy yaw rate is capped by MaxRotationSpeed,
+        # so this is how YAW_IMU's 2nd arg speeds up / slows down the turn.
+        spd_applied = None
+        if speed is not None:
+            spd_applied = max(1, min(200, float(speed)))
+            try:
+                d(MaxRotationSpeed(spd_applied)).wait(_timeout=2)
+                print(f"[ANAFI] rotate speed override -> MaxRotationSpeed={spd_applied}°/s")
+            except Exception as e:
+                print(f"[ANAFI] rotate speed override failed: {e}")
+                spd_applied = None
+        try:
+            with command_lock:
+                result = d(moveBy(0, 0, 0, d_psi)).wait(_timeout=15)
+        finally:
+            # Always restore the global default so a one-off fast turn
+            # doesn't leak into subsequent rotations.
+            if spd_applied is not None:
+                try:
+                    d(MaxRotationSpeed(MAX_YAW_SPEED)).wait(_timeout=2)
+                except Exception as e:
+                    print(f"[ANAFI] restore MaxRotationSpeed failed: {e}")
         self._start_piloting()
         if result and result.success():
             return True, "ok"
@@ -4993,6 +5021,7 @@ def api_rotate():
     payload, status = drone_core.do_rotate(
         direction=data.get("dir", ""),
         deg=data.get("deg", 45),
+        speed=data.get("speed"),
     )
     return jsonify(payload), status
 

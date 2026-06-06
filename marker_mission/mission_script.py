@@ -6,7 +6,7 @@ that ``MissionController._advance_script`` walks one at a time. The
 language is one-command-per-line, case-insensitive, with ``#`` comments
 and blank lines ignored.
 
-Eighteen commands. Suffix convention:
+Nineteen commands. Suffix convention:
 
   * ``_RC`` — raw RC stick at the given deflection for a duration.
     Open-loop, fast, may drift; use when you want "stick at X% for
@@ -20,6 +20,8 @@ Eighteen commands. Suffix convention:
 
     TAKEOFF
     APPROACH [<marker-id>] [<distance>]
+    APPROACH_HOME [<marker-id>] [<distance>] [<tol>]   loose approach (default 3.5m +/- 0.5m)
+                                                       — just get inside the home zone
     HOOVER   [<seconds>]
     AWAIT    <marker-id> <timeout-seconds>
     PAUSE    <seconds>
@@ -35,7 +37,7 @@ Eighteen commands. Suffix convention:
     LR_IMU   <meters>                              +right / -left,   |m| in [0.01, 5.0]
     FB_IMU   <meters>                              +forward / -back, |m| in [0.01, 5.0]
     UD_IMU   <meters>                              +up / -down,      |m| in [0.01, 5.0]
-    YAW_IMU  <deg>                                 +cw / -ccw,       deg in [-180, +180]
+    YAW_IMU  <deg> [<speed_deg_s>]                 +cw / -ccw, deg in [-180,+180]; opt speed 1-180
     RC       <lr> <fb> <ud> <yaw> [<seconds>]      all four sticks at once
     SCOUT                                          slow 360° yaw spin (cw, stick=15)
     AUTO_ATTACK <tgt_id> <home_id> [<alt_m>] [<speed>]   reactive attack (ids→arena config)
@@ -156,6 +158,14 @@ class Step:
     # non-YAW step. No seconds — api.rotate is synchronous and the
     # step advances when it returns.
     rotation_deg: Optional[int] = None
+    # Optional rotation speed (deg/s) for kind="YAW" (YAW_IMU's 2nd arg).
+    # None -> the firmware's global MaxRotationSpeed default.
+    rotation_speed: Optional[int] = None
+    # Loose arrival tolerance (m) for an APPROACH_HOME step: the approach is
+    # "done" once within this band of the target distance (vs the tight
+    # distance_deadband_m), so the drone just gets INTO the home zone without
+    # fussing for precision. None -> normal tight APPROACH arrival.
+    arrive_tol_m: Optional[float] = None
     # Closed-loop position-relative move for kind="MOVE_IMU"
     # (FB_IMU / LR_IMU / UD_IMU). ``move_direction`` is one of
     # "forward"/"back"/"left"/"right"/"up"/"down" (sign baked in,
@@ -236,6 +246,27 @@ def parse(text: str, defaults: dict) -> List[Step]:
             out.append(Step(kind="APPROACH",
                             marker_id=mid, distance=dist,
                             line_no=raw_line_no))
+        elif cmd == "APPROACH_HOME":
+            # Like APPROACH but with a LOOSE arrival band: we only want to be
+            # sure we're inside our home zone, not precisely positioned. Default
+            # 3.5 m +/- 0.5 m from the home-wall marker (so anywhere 3-4 m).
+            if len(args) > 3:
+                raise ScriptError(raw_line_no,
+                                  f"APPROACH_HOME takes 0-3 arguments "
+                                  f"(<marker-id> [<dist>] [<tol>]), "
+                                  f"got {len(args)}")
+            mid = (_parse_int(args[0], raw_line_no, "APPROACH_HOME marker-id")
+                   if len(args) >= 1
+                   else int(_required_default(defaults, "marker_id", raw_line_no)))
+            dist = (_parse_float(args[1], raw_line_no, "APPROACH_HOME distance")
+                    if len(args) >= 2 else 3.5)
+            tol = (_parse_float(args[2], raw_line_no, "APPROACH_HOME tolerance")
+                   if len(args) >= 3 else 0.5)
+            if tol <= 0:
+                raise ScriptError(raw_line_no,
+                                  f"APPROACH_HOME tolerance must be > 0, got {tol}")
+            out.append(Step(kind="APPROACH", marker_id=mid, distance=dist,
+                            arrive_tol_m=tol, line_no=raw_line_no))
         elif cmd == "HOOVER":
             if len(args) > 1:
                 raise ScriptError(raw_line_no,
@@ -457,17 +488,22 @@ def parse(text: str, defaults: dict) -> List[Step]:
             # side — the step advances when api.rotate returns. No
             # seconds argument because the rotation has its own
             # duration determined by the firmware's yaw rate.
-            if len(args) != 1:
+            if not (1 <= len(args) <= 2):
                 raise ScriptError(raw_line_no,
-                                  f"YAW_IMU takes exactly 1 argument "
-                                  f"(<deg>, +cw / -ccw, "
-                                  f"range [-180, +180]), got {len(args)}")
+                                  f"YAW_IMU takes 1-2 arguments "
+                                  f"(<deg> [<speed_deg_s>]), got {len(args)}")
             deg = _parse_int(args[0], raw_line_no, "YAW_IMU deg")
             if not (-180 <= deg <= 180):
                 raise ScriptError(raw_line_no,
                                   f"YAW_IMU deg must be in [-180, +180], "
                                   f"got {deg}")
-            out.append(Step(kind="YAW", rotation_deg=deg,
+            spd = (_parse_int(args[1], raw_line_no, "YAW_IMU speed")
+                   if len(args) >= 2 else None)
+            if spd is not None and not (1 <= spd <= 180):
+                raise ScriptError(raw_line_no,
+                                  f"YAW_IMU speed must be in [1, 180] deg/s, "
+                                  f"got {spd}")
+            out.append(Step(kind="YAW", rotation_deg=deg, rotation_speed=spd,
                             line_no=raw_line_no))
         elif cmd in ("FB_IMU", "LR_IMU", "UD_IMU"):
             # Closed-loop position-relative move using Anafi's
@@ -574,7 +610,11 @@ def format(steps: List[Step]) -> str:
         if s.kind == "TAKEOFF":
             lines.append("TAKEOFF")
         elif s.kind == "APPROACH":
-            lines.append(f"APPROACH {s.marker_id} {s.distance:g}")
+            if s.arrive_tol_m is not None:
+                lines.append(f"APPROACH_HOME {s.marker_id} {s.distance:g} "
+                             f"{s.arrive_tol_m:g}")
+            else:
+                lines.append(f"APPROACH {s.marker_id} {s.distance:g}")
         elif s.kind == "HOOVER":
             lines.append(f"HOOVER {s.seconds:g}")
         elif s.kind == "AWAIT":
@@ -649,7 +689,11 @@ def format(steps: List[Step]) -> str:
                     parts.append(f"{s.aa_approach_speed}")
             lines.append(" ".join(parts))
         elif s.kind == "YAW":
-            lines.append(f"YAW_IMU {int(s.rotation_deg or 0)}")
+            if s.rotation_speed is not None:
+                lines.append(f"YAW_IMU {int(s.rotation_deg or 0)} "
+                             f"{int(s.rotation_speed)}")
+            else:
+                lines.append(f"YAW_IMU {int(s.rotation_deg or 0)}")
         elif s.kind == "MOVE_IMU":
             # Re-encode the direction back into the signed-meters form
             # of the appropriate single-axis IMU command.

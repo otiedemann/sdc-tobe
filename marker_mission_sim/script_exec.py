@@ -56,7 +56,7 @@ HOME_INSET = 2.5        # m  — TO_HOME sits this far in from the team's wall
 # Verbs whose FIRST argument is a marker id. ``parse_script`` copies that
 # token into ``Step.marker_id`` so world.py can report the active target
 # marker on /api/state without re-parsing.
-_MARKER_ID_VERBS = frozenset({"APPROACH", "FB_BRAKE", "AWAIT"})
+_MARKER_ID_VERBS = frozenset({"APPROACH", "APPROACH_HOME", "FB_BRAKE", "AWAIT"})
 
 
 @dataclass
@@ -387,16 +387,26 @@ def _exec_step(drone: SimDrone, world: World, step: Step, dt: float,
         return 0.0, abs(wrap_deg(target - drone.heading_deg)) <= ARRIVE_YAW
 
     if verb == "YAW_IMU":
-        # Relative rotation by `deg` at YAW_RATE; latch a target heading.
+        # Relative rotation by `deg` at `rate`; latch a target heading.
+        # Optional 2nd arg overrides the rotation rate (deg/s) — mirrors the
+        # FC's YAW_IMU speed override (temporary MaxRotationSpeed). None ->
+        # the default YAW_RATE.
         if "yaw_target" not in mem:
             deg = _arg(step, 0, 0.0)
             mem["yaw_target"] = wrap_deg(drone.heading_deg + deg)
+        spd = _arg(step, 1, None)
+        rate = YAW_RATE
+        if spd is not None:
+            try:
+                rate = max(1.0, min(180.0, float(spd)))
+            except (TypeError, ValueError):
+                rate = YAW_RATE
         target = mem["yaw_target"]
         err = wrap_deg(target - drone.heading_deg)
         if abs(err) <= ARRIVE_YAW:
             drone.heading_deg = wrap_deg(target)
             return 0.0, True
-        step_deg = math.copysign(min(YAW_RATE * dt, abs(err)), err)
+        step_deg = math.copysign(min(rate * dt, abs(err)), err)
         drone.heading_deg = wrap_deg(drone.heading_deg + step_deg)
         return 0.0, abs(wrap_deg(target - drone.heading_deg)) <= ARRIVE_YAW
 
@@ -434,6 +444,39 @@ def _exec_step(drone: SimDrone, world: World, step: Step, dt: float,
             return 0.0, True
         spd, _ = _step_xy(drone, world, tgt.x, tgt.y, dt, CRUISE_SPEED)
         return spd, drone.pos.dist_xy(tgt) <= dist + ARRIVE_XY
+
+    if verb == "APPROACH_HOME":
+        # Loose APPROACH onto the home back-wall marker: settle anywhere
+        # within ±tol of `dist` ("be roughly in the home zone"). Mirrors the
+        # FC's APPROACH_HOME (APPROACH with a wide target_distance_tol_m).
+        # args: [marker_id, dist=3.5, tol=0.5]
+        dist = _arg(step, 1, 3.5)
+        tol = _arg(step, 2, 0.5)
+        try:
+            band = max(0.05, float(tol))
+        except (TypeError, ValueError):
+            band = 0.5
+        tgt = marker_world_pos(world, step.marker_id)
+        if tgt is None:
+            return 0.0, elapsed >= UNKNOWN_MARKER_HOLD_S
+        cur_d = drone.pos.dist_xy(tgt)
+        # Arrived once we are within the [dist-band, dist+band] standoff ring.
+        if abs(cur_d - dist) <= band:
+            return 0.0, True
+        # Aim for the point on the standoff ring along the CURRENT bearing
+        # (marker -> drone), so we drive toward the marker when too far AND
+        # back away from it when too close — mirrors the FC's forward PD, which
+        # retreats on a negative distance error. Driving straight at the marker
+        # xy (the plain-APPROACH behaviour) would overshoot a large standoff.
+        if cur_d > 1e-6:
+            ux = (drone.pos.x - tgt.x) / cur_d
+            uy = (drone.pos.y - tgt.y) / cur_d
+        else:
+            ux, uy = 0.0, 1.0   # degenerate: sitting on the marker, pick +Y
+        ring_x = tgt.x + dist * ux
+        ring_y = tgt.y + dist * uy
+        spd, _ = _step_xy(drone, world, ring_x, ring_y, dt, CRUISE_SPEED)
+        return spd, abs(drone.pos.dist_xy(tgt) - dist) <= band
 
     if verb == "FB_BRAKE":
         stop_m = _arg(step, 1, 0.5)
