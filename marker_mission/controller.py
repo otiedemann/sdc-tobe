@@ -840,6 +840,8 @@ class MissionController:
         self._goto_scan_until: float = 0.0
         self._approach_start_d = None
         self._approach_lat_unlocked: bool = False
+        self._approach_mid_ha_active: bool = False
+        self._approach_mid_ha_settled_at: Optional[float] = None
 
     def apply_config_changes(self) -> None:
         """Re-sync per-instance state that was copied out of cfg at
@@ -925,6 +927,8 @@ class MissionController:
         self._goto_scan_until: float = 0.0   # end of current scan/realign phase
         self._approach_start_d: Optional[float] = None
         self._approach_lat_unlocked: bool = False
+        self._approach_mid_ha_active: bool = False
+        self._approach_mid_ha_settled_at: Optional[float] = None
         self.state.reset(self.cfg)
 
     def set_script(self, steps: List[Step]) -> None:
@@ -1005,6 +1009,8 @@ class MissionController:
         if phase == Phase.APPROACH:
             self._approach_start_d = None
             self._approach_lat_unlocked = False
+            self._approach_mid_ha_active = False
+            self._approach_mid_ha_settled_at = None
         if phase == Phase.GOTO:
             self._goto_last_wp = None
             self._goto_jump_until = 0.0
@@ -1750,44 +1756,10 @@ class MissionController:
                 self.api.camera_config_set(zoom=1.0)
             except Exception:
                 pass
-        if not self._approach_lat_unlocked and d <= _lat_thr:
-            self._approach_lat_unlocked = True
-            print(f"[ctrl] APPROACH latch: yaw+lat unlocked "
-                  f"d={d:.2f}m start={self._approach_start_d:.2f}m "
-                  f"thr={_lat_thr:.2f}m tgt={tgt_d:.2f}m")
-
-        # Both yaw and lateral are gated by the same latch.
-        # Before latch: drone flies forward only (straight at marker).
-        # After latch: yaw re-centres marker, lateral corrects heading.
-        if not self._approach_lat_unlocked:
-            u_lat_raw = 0.0
-        elif abs(e_hdg) < cfg.approach_heading_deadband_deg:
-            u_lat_raw = 0.0
-        else:
-            arc_err_m = -d * math.radians(e_hdg)
-            u_lat_raw = self.pd_lat.step(arc_err_m, now)
-        u_lat = self._velocity_damp_lat(u_lat_raw, tel)
-
-        # Yaw: full correction after latch; small pre-latch correction to
-        # keep the marker centred in frame during the straight-in phase.
-        pre_latch_limit = float(getattr(cfg, "approach_pre_latch_yaw_deg", 10.0))
-        if self._approach_lat_unlocked:
-            if abs(e_yaw) >= cfg.yaw_deadband_deg:
-                u_yaw = self.pd_yaw.step(e_yaw, now)
-        elif pre_latch_limit > 0 and abs(e_yaw) >= cfg.yaw_deadband_deg:
-            u_yaw = self.pd_yaw.step(
-                max(-pre_latch_limit, min(pre_latch_limit, e_yaw)), now
-            )
-
-        # Continuous height alignment to the marker's altitude. Same
-        # geometry as HEIGHT_ALIGN: marker_height = drone_height -
-        # tvec[1] (camera y points world-down thanks to the gimbal).
-        # HEIGHT_ALIGN's one-shot settle isn't enough -- approach can
-        # take many seconds and small altitude drift (Anafi self-stabilise
-        # bias, wind, residual ud from prior phases) lets the marker
-        # walk out of frame. Soft no-op if telemetry / pose isn't
-        # available so approach itself keeps working.
+        # Height error — computed once, used for both mid-HA settle check
+        # and the continuous u_ud correction below.
         u_ud = 0.0
+        e_h = 0.0
         pose = self.state.last_pose
         try:
             h_cm = (float(tel.raw.get("height_cm"))
@@ -1806,6 +1778,53 @@ class MissionController:
             e_h = target_h - drone_h
             if abs(e_h) >= cfg.height_deadband_m:
                 u_ud = self.pd_height.step(e_h, now)
+
+        if not self._approach_lat_unlocked and d <= _lat_thr:
+            self._approach_lat_unlocked = True
+            self._approach_mid_ha_active = True
+            self._approach_mid_ha_settled_at = None
+            print(f"[ctrl] APPROACH latch: mid height-align starting "
+                  f"d={d:.2f}m e_h={e_h:.2f}m tgt={tgt_d:.2f}m")
+
+        # Mid-approach height re-align: hold distance, stabilise altitude,
+        # then release into final corrected approach.
+        if self._approach_mid_ha_active:
+            u_fwd = 0.0
+            h_in_band = abs(e_h) < cfg.height_deadband_m
+            if h_in_band:
+                if self._approach_mid_ha_settled_at is None:
+                    self._approach_mid_ha_settled_at = now
+                if now - self._approach_mid_ha_settled_at >= cfg.height_settle_time_s:
+                    self._approach_mid_ha_active = False
+                    print("[ctrl] APPROACH mid height-align done — final approach")
+            else:
+                self._approach_mid_ha_settled_at = None
+            with self.state.lock:
+                self.state.note = (f"mid height-align e_h={e_h:+.2f}m "
+                                   f"d={d:.2f}m")
+
+        # Both yaw and lateral are gated by the same latch.
+        # Before latch or during mid-HA: no lateral steering.
+        # After latch + mid-HA done: yaw + lateral correct heading.
+        if not self._approach_lat_unlocked or self._approach_mid_ha_active:
+            u_lat_raw = 0.0
+        elif abs(e_hdg) < cfg.approach_heading_deadband_deg:
+            u_lat_raw = 0.0
+        else:
+            arc_err_m = -d * math.radians(e_hdg)
+            u_lat_raw = self.pd_lat.step(arc_err_m, now)
+        u_lat = self._velocity_damp_lat(u_lat_raw, tel)
+
+        # Yaw: full correction after latch; small pre-latch correction to
+        # keep the marker centred in frame during the straight-in phase.
+        pre_latch_limit = float(getattr(cfg, "approach_pre_latch_yaw_deg", 10.0))
+        if self._approach_lat_unlocked:
+            if abs(e_yaw) >= cfg.yaw_deadband_deg:
+                u_yaw = self.pd_yaw.step(e_yaw, now)
+        elif pre_latch_limit > 0 and abs(e_yaw) >= cfg.yaw_deadband_deg:
+            u_yaw = self.pd_yaw.step(
+                max(-pre_latch_limit, min(pre_latch_limit, e_yaw)), now
+            )
 
         self._send_rc(lr=int(u_lat), fb=int(u_fwd), ud=int(u_ud),
                       yaw=int(u_yaw))
