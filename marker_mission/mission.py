@@ -539,6 +539,19 @@ def cmd_fly(args: argparse.Namespace) -> int:
                 flying_now = False
             ui.drone_connected = connected_now
 
+            # ── Emergency rearm: cancel immediately if operator stopped ──────
+            # If abort_reason is set the stop was intentional (killswitch,
+            # UI stop button) — never auto-rearm after an intentional stop.
+            if in_emergency_rearm:
+                with state.lock:
+                    operator_stopped = bool(state.abort_reason)
+                if operator_stopped:
+                    print("[mission] operator stop detected — cancelling emergency rearm")
+                    with state.lock:
+                        state.emergency_rearm = False
+                    in_emergency_rearm = False
+                    not_flying_count = 0
+
             # ── Emergency rearm: clear immediately if drone is flying ──────
             # Always check first so a WLAN blip that triggered rearm gets
             # cleared the moment we see flying=True again.
@@ -552,13 +565,17 @@ def cmd_fly(args: argparse.Namespace) -> int:
                 not_flying_count = 0
 
             # ── Unexpected landing detection (require N consecutive ticks) ─
-            # Require NOT_FLYING_STREAK consecutive not-flying readings so a
-            # brief telemetry exception during WLAN blip doesn't falsely
-            # trigger rearm while the drone is still in the air.
+            # Only trigger if the drone was actually airborne (was_flying)
+            # and no operator stop is pending (abort_reason == "").
+            # This prevents spurious rearm at initial power-on (drone never
+            # flew yet) and after a killswitch-triggered landing.
             if not flying_now and not in_emergency_rearm:
                 with state.lock:
                     active_phase = state.phase
-                if active_phase not in NON_AIRBORNE_PHASES:
+                    operator_stopped = bool(state.abort_reason)
+                if (active_phase not in NON_AIRBORNE_PHASES
+                        and was_flying
+                        and not operator_stopped):
                     not_flying_count += 1
                     if not_flying_count >= NOT_FLYING_STREAK:
                         print(f"[mission] WARN: drone confirmed landed during "
