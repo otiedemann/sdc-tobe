@@ -154,11 +154,18 @@ class DroneApi:
     def emergency(self) -> dict:
         return self._post("/api/emergency")
 
-    def rotate(self, direction: str, degrees: int) -> dict:
+    def rotate(self, direction: str, degrees: int,
+               speed: Optional[int] = None) -> dict:
         if direction not in ("cw", "ccw"):
             raise ValueError("direction must be cw or ccw")
-        return self._post("/api/rotate", {"dir": direction,
-                                          "deg": int(max(1, min(360, degrees)))})
+        body = {"dir": direction, "deg": int(max(1, min(360, degrees)))}
+        if speed is not None:
+            # Optional per-rotation angular-speed override (deg/s). The FC
+            # applies it as a temporary MaxRotationSpeed for this moveBy
+            # only, then restores the global default. Out of range -> the
+            # server clamps; we clamp to a sane envelope here as well.
+            body["speed"] = int(max(1, min(180, speed)))
+        return self._post("/api/rotate", body)
 
     def move(self, direction: str, cm: int) -> dict:
         """Closed-loop position-relative move (Olympe moveBy under the

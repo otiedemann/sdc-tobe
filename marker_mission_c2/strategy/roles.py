@@ -165,6 +165,11 @@ class RoleState:
     last_decision_reason: str = ""
     phase_started_unix_s: float = field(default_factory=time.time)
     history: list[dict] = field(default_factory=list)
+    # Free-form per-role scratch that survives across ticks (the role object
+    # itself is stateless — see Role). The scout uses it to accumulate which
+    # target slots it has seen during a scan rotation and how many recenter
+    # attempts it has made. Cleared on role change.
+    scratch: dict = field(default_factory=dict)
 
     def reset_for_role(self, new_role: str) -> None:
         self.role = new_role
@@ -177,6 +182,7 @@ class RoleState:
         self.last_decision_reason = "role changed"
         self.phase_started_unix_s = time.time()
         self.history.clear()
+        self.scratch.clear()
 
     def advance_phase(self, new_phase: str, reason: str = "") -> None:
         if new_phase == self.phase:
