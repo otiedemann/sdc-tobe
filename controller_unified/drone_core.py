@@ -30,7 +30,7 @@ from __future__ import annotations
 import threading
 import time
 import traceback
-from typing import Any
+from typing import Any, Optional
 
 
 # ---------------------------------------------------------------------------
@@ -235,8 +235,15 @@ def do_move(direction: Any = "", cm: Any = 20) -> tuple[dict, int]:
 # Rotation
 # ---------------------------------------------------------------------------
 
-def do_rotate(direction: Any = "", deg: Any = 45) -> tuple[dict, int]:
-    """Discrete CW/CCW rotation. Degrees clamped to [1, 360]."""
+def do_rotate(direction: Any = "", deg: Any = 45,
+              speed: Any = None) -> tuple[dict, int]:
+    """Discrete CW/CCW rotation. Degrees clamped to [1, 360].
+
+    ``speed`` (deg/s) is an optional per-rotation angular-speed override
+    (YAW_IMU's 2nd arg). None -> use the FC's global MaxRotationSpeed. On
+    Anafi it temporarily reshapes MaxRotationSpeed for this turn; on Tello
+    it is accepted and ignored.
+    """
     import unified_api_server as _srv  # sibling import; see header note
     b = _srv.backend
     with _srv.conn_lock:
@@ -246,15 +253,29 @@ def do_rotate(direction: Any = "", deg: Any = 45) -> tuple[dict, int]:
     direction = str(direction or "").lower()
     if direction not in {"cw", "ccw"}:
         return {"ok": False, "error": "dir must be one of cw|ccw"}, 400
+    spd: Optional[int] = None
+    if speed is not None:
+        try:
+            spd = max(1, min(200, int(speed)))
+        except (TypeError, ValueError):
+            spd = None
     try:
         degrees = max(1, min(360, int(deg)))
+        # A faster turn finishes sooner; size the discrete window to the
+        # actual angular rate so we don't hold the command window open
+        # longer than the rotation takes (default rate ~90 deg/s).
+        rate = float(spd) if spd else 90.0
         _srv.start_discrete_window(
-            1.0 if _srv.drone_type == "tello" else max(1.0, degrees / 90)
+            1.0 if _srv.drone_type == "tello"
+            else max(1.0, degrees / max(1.0, rate))
         )
         import time as _time; _time.sleep(0.1)
-        ok, msg = b.rotate(direction, degrees)
+        ok, msg = b.rotate(direction, degrees, spd)
         if ok:
-            return {"ok": True, "dir": direction, "deg": degrees}, 200
+            payload = {"ok": True, "dir": direction, "deg": degrees}
+            if spd is not None:
+                payload["speed"] = spd
+            return payload, 200
         return {"ok": False, "error": msg}, 500
     except Exception as e:
         return {"ok": False, "error": str(e)}, 500

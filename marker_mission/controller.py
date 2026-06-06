@@ -445,6 +445,11 @@ class MissionState:
     # specifies an explicit value can't pollute the cfg defaults that
     # subsequent missions parse from.
     target_distance_m: float = 1.0
+    # Loose arrival band (metres) for APPROACH_HOME: when set, the approach
+    # phase completes as soon as the forward error is within ±this many
+    # metres of target_distance_m, instead of the tight cfg.distance_deadband_m.
+    # None -> fall back to the tight deadband (a precise APPROACH).
+    target_distance_tol_m: Optional[float] = None
     target_relative_heading_deg: float = 90.0
     active_marker_id: Optional[int] = None
     hold_time_s: float = 60.0
@@ -819,6 +824,7 @@ class MissionController:
             self.state.active_marker_id = self.cfg.target_marker_id
             self.state.hold_time_s = self.cfg.hold_time_s
             self.state.target_distance_m = self.cfg.target_distance_m
+            self.state.target_distance_tol_m = None
             self.state.target_relative_heading_deg = (
                 self.cfg.target_relative_heading_deg)
 
@@ -882,6 +888,7 @@ class MissionController:
         with self.state.lock:
             self.state.started_at = time.monotonic()
             self.state.target_distance_m = self.cfg.target_distance_m
+            self.state.target_distance_tol_m = None
             self.state.target_relative_heading_deg = self.cfg.target_relative_heading_deg
             self.state.active_marker_id = self.cfg.target_marker_id
             self.state.hold_time_s = self.cfg.hold_time_s
@@ -1705,6 +1712,13 @@ class MissionController:
         # (flight 22-09-49: stuck at d=1.37, hdg=22 with rc=0,0,0,0).
         with self.state.lock:
             tgt_d = self.state.target_distance_m
+            tol_override = self.state.target_distance_tol_m
+        # Effective forward arrival band. APPROACH_HOME sets a loose
+        # target_distance_tol_m (e.g. 0.5 m) so the drone settles anywhere
+        # within ±tol of tgt_d ("be roughly in the home zone"); a plain
+        # APPROACH leaves it None -> tight cfg.distance_deadband_m for a
+        # precise capture-distance hold.
+        eff_tol = tol_override if tol_override is not None else cfg.distance_deadband_m
         floor_active = d < cfg.distance_floor_factor * tgt_d
 
         # Errors
@@ -1721,7 +1735,7 @@ class MissionController:
 
         # Yaw gated by latch (see below). Default = 0; overridden after latch.
         u_yaw = 0.0
-        if abs(e_fwd) < cfg.distance_deadband_m:
+        if abs(e_fwd) < eff_tol:
             u_fwd_raw = 0.0
         else:
             u_fwd_raw = self.pd_fwd.step(e_fwd, now)
@@ -1863,7 +1877,7 @@ class MissionController:
         # itself takes the lock and would self-deadlock since
         # threading.Lock is non-reentrant.
         in_band = (abs(e_yaw) < cfg.yaw_deadband_deg
-                   and abs(e_fwd) < cfg.distance_deadband_m)
+                   and abs(e_fwd) < eff_tol)
         settled = False
         with self.state.lock:
             if in_band:
@@ -3299,13 +3313,20 @@ class MissionController:
             with self.state.lock:
                 self.state.active_marker_id = int(step.marker_id)
                 self.state.target_distance_m = float(step.distance)
+                # APPROACH_HOME carries a loose arrival band (step.arrive_tol_m);
+                # a plain APPROACH leaves it None -> tight cfg.distance_deadband_m.
+                self.state.target_distance_tol_m = (
+                    float(step.arrive_tol_m)
+                    if step.arrive_tol_m is not None else None)
                 # APPROACH always closes head-on so the marker stays
                 # inside the detector's reliable angle range. HOLD
                 # inherits this 0 setpoint via state.target_relative_heading_deg.
                 self.state.target_relative_heading_deg = 0.0
             self._set_phase(Phase.SEARCH,
                             note + f" id={int(step.marker_id)}"
-                                   f" d={float(step.distance):g}m")
+                                   f" d={float(step.distance):g}m"
+                            + (f" tol={float(step.arrive_tol_m):g}m"
+                               if step.arrive_tol_m is not None else ""))
             return
         if step.kind == "HOOVER":
             with self.state.lock:
@@ -3549,8 +3570,14 @@ class MissionController:
             # tick handler is needed; the brief Phase.ROTATE shows on
             # the UI for the operator's situational awareness.
             deg = int(step.rotation_deg or 0)
+            # Optional per-step rotation-speed override (deg/s). None ->
+            # the FC uses its global MaxRotationSpeed. Validated 1..180 by
+            # the parser; clamp defensively here too.
+            spd = step.rotation_speed
+            spd = max(1, min(180, int(spd))) if spd is not None else None
             self._set_phase(Phase.ROTATE,
-                            note + f" {deg:+d}deg")
+                            note + f" {deg:+d}deg"
+                            + (f" @{spd}deg/s" if spd is not None else ""))
             if deg == 0:
                 # No-op rotation — skip the API call entirely.
                 self._advance_script("yaw 0 — no-op")
@@ -3558,9 +3585,10 @@ class MissionController:
             direction = "cw" if deg > 0 else "ccw"
             magnitude = max(1, min(180, abs(deg)))
             try:
-                self.api.rotate(direction, magnitude)
+                self.api.rotate(direction, magnitude, speed=spd)
                 self._advance_script(
-                    f"yaw {deg:+d}deg complete ({direction} {magnitude})"
+                    f"yaw {deg:+d}deg complete ({direction} {magnitude}"
+                    + (f" @{spd}deg/s)" if spd is not None else ")")
                 )
             except DroneApiError as e:
                 # Don't abort the whole mission for a transient
