@@ -397,10 +397,17 @@ def _full_attack_script(
     already holds altitude via its own PD; the short FB_RC drift
     over the box is what actually puts us on top of the target.
     """
-    # This drone's DISTINCT cruise altitude (team-keyed grid, >= 0.30 m from
-    # every other drone of both teams) for the out-and-back transit. Floored
-    # above the box tops; falls back to a safe default if not deconflicted.
-    cruise_alt = max(1.4, float(ctx.cruise_alt_m)) if ctx.cruise_alt_m else 1.6
+    # Operator requirement: fly LOW enough to actually SEE the 0.73 m box
+    # markers during APPROACH. It was flying the deconflicted ~1.6 m "mover"
+    # band (which assumes 1.4 m boxes) and looking straight OVER the markers, so
+    # it never acquired the target. Honor the per-drone attack_alt_m (default
+    # 1.0 m), floored only at box clearance (0.73 m boxes -> 1.0 m clears them).
+    # We deliberately do NOT use the high deconflicted cruise_alt_m here.
+    # NOTE (multi-drone): this reduces attacker-vs-attacker altitude separation;
+    # the deconfliction ladder in runner.py is built around the stale 1.4 m box
+    # assumption and should be re-centred low to restore it. Single-drone runs
+    # are unaffected.
+    cruise_alt = max(BOX_CLEARANCE_ALT_M, float(ctx.drone.attack_alt_m or 1.0))
     height_step = f"HEIGHT {cruise_alt:.2f}"
 
     # End-of-run: hover briefly at home (confirms v7 §1.4.4 presence) then the
@@ -532,7 +539,11 @@ def _return_home_script(ctx: RoleContext) -> str:
     already airborne. Brings an out attacker home so the team can secure the
     5-pt attempt (all drones home before the box is recaptured).
     """
-    cruise_alt = max(1.4, float(ctx.cruise_alt_m)) if ctx.cruise_alt_m else 1.6
+    # Fly LOW so the camera sees the 0.73 m box / camera-height wall markers:
+    # honor attack_alt_m (default 1.0 m), floored at box clearance — NOT the
+    # deconflicted cruise_alt_m (that band assumes 1.4 m boxes). See the note
+    # in _full_attack_script on multi-drone separation.
+    cruise_alt = max(BOX_CLEARANCE_ALT_M, float(ctx.drone.attack_alt_m or 1.0))
     wall_entry = HOME_WALL_MARKER.get(ctx.our_team)
     if wall_entry is None:
         return _format_script(
@@ -573,7 +584,11 @@ def _recapture_script(ctx: RoleContext, slot: int) -> str:
     0 pts (home recapture, regs §1.4.3) but it stops the enemy bleeding us and
     is required to ever reach the all-6 instant win.
     """
-    cruise_alt = max(1.4, float(ctx.cruise_alt_m)) if ctx.cruise_alt_m else 1.6
+    # Fly LOW so the camera sees the 0.73 m box / camera-height wall markers:
+    # honor attack_alt_m (default 1.0 m), floored at box clearance — NOT the
+    # deconflicted cruise_alt_m (that band assumes 1.4 m boxes). See the note
+    # in _full_attack_script on multi-drone separation.
+    cruise_alt = max(BOX_CLEARANCE_ALT_M, float(ctx.drone.attack_alt_m or 1.0))
     # The box shows the ENEMY face now (they hold it) -> APPROACH that marker.
     enemy_face = _enemy_face_for(int(slot), ctx.our_team)
     wall_entry = HOME_WALL_MARKER.get(ctx.our_team)
