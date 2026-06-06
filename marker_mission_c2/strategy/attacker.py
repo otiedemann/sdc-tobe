@@ -416,11 +416,13 @@ def _full_attack_script(
         wall_marker_id, _w_xy = wall_entry
         rth_lines = (
             height_step,                       # climb to our transit altitude
-            f"YAW {enemy_heading_deg(ctx.our_team) + 180:g}",  # face home wall
-            # APPROACH homes on the wall marker by vision and stops
-            # RTH_WALL_STANDOFF_M short of it (~5 m -> just inside home).
+            # APPROACH homes on the wall marker by vision — it ROTATES to find
+            # the marker on its own, so no pre-orientation step is needed — and
+            # stops RTH_WALL_STANDOFF_M short of it (just inside home). Then a
+            # relative 180 deg turn re-faces the enemy for the next run. The FC
+            # has no absolute-heading verb, only the relative YAW_IMU.
             f"APPROACH {wall_marker_id} {RTH_WALL_STANDOFF_M:.2f}",
-            f"YAW {enemy_heading_deg(ctx.our_team):g}",        # re-face enemy
+            "YAW_IMU 180",                     # re-face the enemy, ready to re-arm
             home_rearm,
         )
     else:
@@ -437,10 +439,10 @@ def _full_attack_script(
     # have — that's what drove drones into walls on bad position estimates.)
     return _format_script(
         "TAKEOFF",
-        # Face the enemy side first (absolute YAW) so the camera looks toward
-        # the target boxes — APPROACH then acquires the marker straight ahead
-        # instead of having to spin a full search.
-        f"YAW {enemy_heading_deg(ctx.our_team):g}",
+        # The operator orients the drone facing the enemy before take-off, and
+        # APPROACH re-acquires the box marker by rotating if it isn't already in
+        # view — so no explicit heading step is needed (and the FC has no
+        # absolute-heading verb anyway, only the relative YAW_IMU).
         # Climb to the transit altitude (clears the 0.73 m boxes + keeps the
         # camera level so it can see the target marker across the arena).
         height_step,
@@ -535,15 +537,15 @@ def _return_home_script(ctx: RoleContext) -> str:
     if wall_entry is None:
         return _format_script(
             "TAKEOFF", f"HEIGHT {cruise_alt:.2f}",
-            f"YAW {enemy_heading_deg(ctx.our_team):g}",
             f"HOOVER {HOME_REARM_HOVER_S:.1f}")
     wall_marker_id, _w_xy = wall_entry
     return _format_script(
         "TAKEOFF",
         f"HEIGHT {cruise_alt:.2f}",
-        f"YAW {enemy_heading_deg(ctx.our_team) + 180:g}",   # face the home wall
-        f"APPROACH {wall_marker_id} {RTH_WALL_STANDOFF_M:.2f}",  # vision-home home
-        f"YAW {enemy_heading_deg(ctx.our_team):g}",         # re-face the enemy
+        # Vision-home onto the home-wall marker (APPROACH rotates to find it),
+        # then a relative 180 deg turn to re-face the enemy. No absolute YAW.
+        f"APPROACH {wall_marker_id} {RTH_WALL_STANDOFF_M:.2f}",
+        "YAW_IMU 180",                                      # re-face the enemy
         f"HOOVER {HOME_REARM_HOVER_S:.1f}",
     )
 
@@ -575,9 +577,11 @@ def _recapture_script(ctx: RoleContext, slot: int) -> str:
     # The box shows the ENEMY face now (they hold it) -> APPROACH that marker.
     enemy_face = _enemy_face_for(int(slot), ctx.our_team)
     wall_entry = HOME_WALL_MARKER.get(ctx.our_team)
-    settle = ([f"YAW {enemy_heading_deg(ctx.our_team) + 180:g}",
-               f"APPROACH {wall_entry[0]} {RTH_WALL_STANDOFF_M:.2f}",
-               f"YAW {enemy_heading_deg(ctx.our_team):g}"]
+    # After the box APPROACH we're already facing into home, so go straight to
+    # the home-wall APPROACH (it rotates to find the marker), then a relative
+    # 180 deg turn to re-face the enemy. No absolute-heading verb on the FC.
+    settle = ([f"APPROACH {wall_entry[0]} {RTH_WALL_STANDOFF_M:.2f}",
+               "YAW_IMU 180"]
               if wall_entry else [])
     return _format_script(
         "TAKEOFF",

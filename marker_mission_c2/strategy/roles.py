@@ -55,6 +55,7 @@ class DroneState:
     # arena-frame position straight from /api/state (sim + real FC both
     # publish it) and the runner derives in_home_now from drone.team.
     world_position_m: Optional[tuple[float, float, float]] = None
+    heading_deg: Optional[float] = None   # arena-frame yaw (0 = +Y), if published
     raw: Dict[str, Any] = field(default_factory=dict)
 
     @classmethod
@@ -82,6 +83,11 @@ class DroneState:
                 pos_t = (float(pos_raw[0]), float(pos_raw[1]), float(pos_raw[2]))
             except (TypeError, ValueError):
                 pos_t = None
+        hdg_raw = state.get("heading_deg")
+        try:
+            hdg = float(hdg_raw) if hdg_raw is not None else None
+        except (TypeError, ValueError):
+            hdg = None
         return cls(
             fc_name=fc_name,
             connection_ok=bool(item.get("connection_ok", False)),
@@ -91,6 +97,7 @@ class DroneState:
             active_marker_id=active_id,
             mission_running=phase not in ("", "unknown", "init", "idle", "landed"),
             world_position_m=pos_t,
+            heading_deg=hdg,
             raw=item,
         )
 
@@ -147,6 +154,12 @@ class RoleState:
     target_slot: Optional[int] = None              # 1..6, set by operator
     target_assigned_unix_s: Optional[float] = None
     last_attack_marker_id: Optional[int] = None    # face id we last APPROACHed
+    # Logical heading the LAST pushed script leaves the drone in — "enemy"
+    # (+Y end / target boxes) or "home" (our back wall). The FC has no
+    # absolute-heading verb (only the relative YAW_IMU), so a role that needs a
+    # body-frame move (e.g. the defender's outward FB_IMU) reads this to know
+    # whether a 180 deg flip is needed first. Frame-independent on purpose.
+    facing: str = "enemy"
     last_pushed_script: str = ""
     last_pushed_unix_s: float = 0.0
     last_decision_reason: str = ""

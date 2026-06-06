@@ -187,7 +187,7 @@ def _wait_script(ctx: RoleContext, *, need_exit: bool = False) -> str:
     The instant one of our boxes is flipped the decide() recapture path breaks
     this hold and dashes in. ``need_exit`` prepends an outward nudge for when
     we're currently deeper in home than the station (APPROACH alone can't push
-    us back out toward neutral). FC verbs only (TAKEOFF / HEIGHT / YAW /
+    us back out toward neutral). FC verbs only (TAKEOFF / HEIGHT / YAW_IMU /
     FB_IMU / APPROACH / HOOVER); TAKEOFF is a no-op when already airborne.
     """
     cruise_alt = max(1.5, float(ctx.cruise_alt_m or ctx.drone.attack_alt_m or 1.6))
@@ -211,13 +211,26 @@ def _wait_script(ctx: RoleContext, *, need_exit: bool = False) -> str:
     lines = ["TAKEOFF", f"HEIGHT {cruise_alt:.2f}"]
     if need_exit:
         # We're inward of the station (e.g. just recaptured). Come OUT toward
-        # neutral first: face the enemy, then a relative forward move.
-        lines += [
-            f"YAW {enemy_heading_deg(ctx.our_team):g}",
-            f"FB_IMU {DEFENDER_EXIT_LEG_M:.2f}",
-        ]
+        # neutral by moving FORWARD while facing the enemy (+Y). The FC has no
+        # absolute-heading verb, only the relative YAW_IMU — and a fixed 180 deg
+        # flip would inherit any off-axis heading left by the prior APPROACH and
+        # drift the FB_IMU sideways into a wall. So compute the EXACT relative
+        # turn from the live arena heading (this turn runs right after TAKEOFF,
+        # so no rotation intervenes). Fall back to the tracked-facing 180 flip
+        # if no heading telemetry is available.
+        want = enemy_heading_deg(ctx.our_team)
+        cur = ctx.state.heading_deg
+        if cur is not None:
+            delta = ((want - float(cur) + 180.0) % 360.0) - 180.0   # [-180,180]
+            if abs(delta) > 3.0:
+                lines.append(f"YAW_IMU {delta:.0f}")
+        elif ctx.role_state.facing != "enemy":
+            lines.append("YAW_IMU 180")
+        lines.append(f"FB_IMU {DEFENDER_EXIT_LEG_M:.2f}")
     lines += [
-        f"YAW {enemy_heading_deg(ctx.our_team) + 180.0:g}",  # face the back wall
+        # APPROACH rotates to find the back-wall marker itself and ends facing
+        # it, so no explicit "face the wall" step is needed (and the FC has no
+        # absolute-heading verb). standoff lands us at |y|=NEUTRAL_WAIT_Y_M.
         f"APPROACH {home_marker_id} {standoff:.2f}",         # settle on-station
         f"HOOVER {DEFENDER_HOLD_HOVER_S:.1f}",               # hold, facing wall
     ]
@@ -265,11 +278,13 @@ class DefenderRole(Role):
                 return stop_cmd(f"defender: own slot {threat} flipped — "
                                 f"break off to recapture NOW")
             rs.target_slot = threat
-            return push(
+            dec = push(
                 _recapture_script(ctx, threat),
                 new_phase="recapturing",
                 reason=f"defender: re-capture own slot {threat} (enemy-held)",
             )
+            rs.facing = "enemy"   # recapture ends with a 180 deg turn re-facing enemy
+            return dec
 
         # No threat -> clear any stale recapture intent.
         rs.target_slot = None
@@ -283,11 +298,13 @@ class DefenderRole(Role):
             if rs.phase == "banking_home" and ctx.state.phase not in (
                     "init", "done", ""):
                 return noop("defender: bank — en route home")
-            return push(
+            dec = push(
                 _wait_script(ctx),       # _wait_xy -> home during bank
                 new_phase="banking_home",
                 reason="defender: bank — return home to secure the attempt",
             )
+            rs.facing = "home"       # banked home, roughly facing our back wall
+            return dec
 
         # ---- (3) SORTIE, no threat — HOLD a fixed neutral-zone station ------
         # Hover just inside the neutral zone, FACING THE BACK WALL, positioned
@@ -298,11 +315,13 @@ class DefenderRole(Role):
                 and ctx.state.phase not in ("init", "done", "")
                 and _on_station_sortie(ctx)):
             return noop("defender: holding station in neutral, facing back wall")
-        return push(
+        dec = push(
             _wait_script(ctx, need_exit=_is_inward_of_wait(ctx)),
             new_phase="holding",
             reason="defender: hold neutral station (APPROACH back-wall marker)",
         )
+        rs.facing = "home"           # hold ends facing the back wall
+        return dec
 
 
 register(DefenderRole())
