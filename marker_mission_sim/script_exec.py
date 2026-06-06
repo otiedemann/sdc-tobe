@@ -135,6 +135,21 @@ def marker_world_pos(world: World, marker_id) -> Optional[Vec3]:
     return None
 
 
+def _marker_inward_normal(world: World, marker_id) -> Optional[tuple]:
+    """Inward (into-arena) unit normal of a wall marker, by its wall side, or
+    None if the marker isn't a wall marker. Used by GO_HOME's fan-out arrival."""
+    try:
+        mid = int(marker_id)
+    except (TypeError, ValueError):
+        return None
+    for m in world.wall_markers:
+        if m.id == mid:
+            wall = str(getattr(m, "wall", "")).lower()
+            return {"back": (0.0, 1.0), "front": (0.0, -1.0),
+                    "left": (1.0, 0.0), "right": (-1.0, 0.0)}.get(wall)
+    return None
+
+
 def _home_pos(world: World, team: str, alt: Optional[float]) -> Vec3:
     """Team home: red near the back (-y) wall, blue near the front (+y)."""
     arena = world.arena
@@ -462,10 +477,9 @@ def _exec_step(drone: SimDrone, world: World, step: Step, dt: float,
         # within ±tol of `dist` ("be roughly in the home zone"). Mirrors the
         # FC's GO_HOME (APPROACH with a wide target_distance_tol_m).
         # args: [marker_id, dist=3.5, tol=0.5, hdg=0]
-        # hdg (±80°) is the arrival heading relative to the marker normal;
-        # ignored in the sim (position-only model, no heading gate).
         dist = _arg(step, 1, 3.5)
         tol = _arg(step, 2, 0.5)
+        hdg = _arg(step, 3, None)        # arrival bearing off the marker normal
         try:
             band = max(0.05, float(tol))
         except (TypeError, ValueError):
@@ -473,6 +487,22 @@ def _exec_step(drone: SimDrone, world: World, step: Step, dt: float,
         tgt = marker_world_pos(world, step.marker_id)
         if tgt is None:
             return 0.0, elapsed >= UNKNOWN_MARKER_HOLD_S
+        if hdg is not None:
+            # Fan-out arrival: aim for the point on the standoff ring at `hdg`
+            # degrees off the marker's INWARD normal, so several drones with
+            # different hdg land at DIFFERENT points around the marker (no
+            # convergence). Mirrors the FC's target_relative_heading_deg.
+            nrm = _marker_inward_normal(world, step.marker_id) or (0.0, 1.0)
+            th = math.radians(float(hdg))
+            nx, ny = nrm
+            ux = nx * math.cos(th) - ny * math.sin(th)
+            uy = nx * math.sin(th) + ny * math.cos(th)
+            aim_x, aim_y = tgt.x + dist * ux, tgt.y + dist * uy
+            if math.hypot(drone.pos.x - aim_x, drone.pos.y - aim_y) <= band:
+                return 0.0, True
+            spd, _ = _step_xy(drone, world, aim_x, aim_y, dt, CRUISE_SPEED)
+            return spd, math.hypot(drone.pos.x - aim_x,
+                                   drone.pos.y - aim_y) <= band
         cur_d = drone.pos.dist_xy(tgt)
         # Arrived once we are within the [dist-band, dist+band] standoff ring.
         if abs(cur_d - dist) <= band:

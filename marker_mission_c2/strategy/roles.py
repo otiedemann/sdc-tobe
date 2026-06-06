@@ -290,6 +290,12 @@ class RoleContext:
     # flipped box checks this so two drones never pile onto the same box. The
     # runner fills it from the live role_states plus within-tick claims.
     peer_recapture_slots: frozenset = frozenset()
+    # This attacker's DISTINCT arrival bearing (deg, relative to the home-wall
+    # marker normal) for its RTH GO_HOME, so concurrently-returning attackers
+    # fan out to different points around the marker instead of converging and
+    # colliding (e.g. 3 attackers -> -45 / 0 / +45). Assigned by the runner.
+    # None -> 0 (head-on).
+    rth_approach_angle_deg: Optional[float] = None
 
 
 class Role(abc.ABC):

@@ -527,6 +527,13 @@ class SwarmRunner:
         # avoider). Stable order by fc_name -> stable lane assignment.
         home_parks = self._home_park_lanes(s)
 
+        # 3c.6) Per-attacker RTH arrival bearings (-45/0/+45 for 3 attackers):
+        # each approaches the home-wall marker from a different angle so several
+        # returning at once fan out instead of converging on one standoff. Pairs
+        # with the distinct RTH cruise altitude (above) for vertical + lateral
+        # separation on the way home.
+        rth_angles = self._rth_approach_angles(s)
+
         # 3d) Collision avoidance: predict our drones' paths from live position
         # + speed and, where two are on course to come within SAFETY_RADIUS,
         # tell the lower-priority one to change altitude. Computed once per tick
@@ -611,6 +618,7 @@ class SwarmRunner:
                     recap_claims
                     - ({rs.target_slot} if rs.target_slot is not None else set())
                 ),
+                rth_approach_angle_deg=rth_angles.get(drone.fc_name),
             )
 
             try:
@@ -734,6 +742,33 @@ class SwarmRunner:
         n = len(ours)
         team = our or "red"
         return {fc: _hp(team, i, n) for i, fc in enumerate(ours)}
+
+    def _rth_approach_angles(self, s) -> Dict[str, float]:
+        """Return {fc: angle_deg} for OUR-team ATTACKERS — the arrival bearing
+        (relative to the home back-wall marker normal) each attacker uses for its
+        RTH GO_HOME, so attackers returning at the same time fan out to DIFFERENT
+        points around the marker instead of converging on one standoff and
+        colliding. Spread symmetrically across [-A, +A] by stable fc-name order:
+        1 -> 0; 2 -> -45/+45; 3 -> -45/0/+45; more -> evenly within +-60 (GO_HOME
+        caps at +-80). Combined with the distinct RTH cruise altitude, returning
+        attackers are separated both vertically (cruise) and laterally (arrival).
+        """
+        our = (s.markers.our_team or "").lower()
+        attackers = sorted(
+            d.fc_name for d in s.drones
+            if d.enabled and d.role == "attacker"
+            and d.team and d.team.lower() == our
+        )
+        n = len(attackers)
+        if n == 0:
+            return {}
+        if n == 1:
+            return {attackers[0]: 0.0}
+        half = 45.0 if n <= 3 else 60.0
+        return {
+            fc: round(-half + (2.0 * half) * i / (n - 1), 1)
+            for i, fc in enumerate(attackers)
+        }
 
     # ------------------------------------------------------------------
     # Collision avoidance
