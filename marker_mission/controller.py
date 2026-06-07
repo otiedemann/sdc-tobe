@@ -807,7 +807,7 @@ class MissionController:
         # markers and score candidate yaws. Optional; without an
         # arena_provider TO falls back to "no yaw drive" for auto.
         self.get_arena = arena_provider
-        self.get_drone_threat = drone_threat_provider   # callable -> int px, or None
+        self.get_drone_threat = drone_threat_provider   # callable -> (int px, float dx) or None
 
         # PD/PID controllers. ``ki`` defaults to 0 in cfg, so today's
         # behaviour (pure PD) is preserved unless the operator bumps
@@ -3298,7 +3298,7 @@ class MissionController:
         """
         if self.get_drone_threat is None:
             return
-        threat_w = self.get_drone_threat()
+        threat_w, _threat_dx = self.get_drone_threat()
         phase = self.state.phase
 
         if threat_w >= self._THREAT_BLOB_PX:
@@ -3360,7 +3360,8 @@ class MissionController:
         self._send_rc(0, 0, 0, 0)
         with self.state.lock:
             since = self.state.threat_observe_since or now
-            threat_w = self.get_drone_threat() if self.get_drone_threat else 0
+        threat_w, _dx = self.get_drone_threat() if self.get_drone_threat else (0, 0.0)
+        with self.state.lock:
             self.state.note = (
                 f"THREAT observe {now - since:.1f}/{self._THREAT_OBSERVE_S:.0f}s "
                 f"blob={threat_w}px")
@@ -3372,36 +3373,26 @@ class MissionController:
     def _step_threat_evade(self,
                            tel: Optional['TelemetrySnapshot'],
                            now: float) -> None:
-        """Fly laterally toward the arena centre to pass the enemy drone.
-        Direction is determined from world_position_m if available,
-        otherwise a fixed positive rc_lr."""
-        rc_lr = self._THREAT_EVADE_RC  # default: right
-
-        # Compute direction toward arena centre (world x=0, y=0).
-        with self.state.lock:
-            wp = self.state.world_position_m
-            arena_yaw = self.state.arena_yaw_deg
-
-        if wp is not None and arena_yaw is not None:
-            # Arena-frame displacement toward centre: -wx in x, -wy in y.
-            dx_arena = -wp[0]
-            dy_arena = -wp[1]
-            # Rotate arena-frame vector to body-right using arena_yaw.
-            # arena_yaw is CW from +y (front wall), so body-right component:
-            th = math.radians(arena_yaw)
-            # body-right = dx_arena * sin(th) + dy_arena * (-cos(th))  ... arena→body
-            # Simpler: project onto body-right axis.
-            body_right_component = (dx_arena * math.sin(th)
-                                    - dy_arena * math.cos(th))
-            rc_lr = self._THREAT_EVADE_RC if body_right_component >= 0 else -self._THREAT_EVADE_RC
+        """Fly laterally in the direction opposite to the enemy drone's
+        movement (camera-frame dx). If dx ≈ 0 (stationary threat) fall
+        back to rc_lr = +_THREAT_EVADE_RC (right)."""
+        threat_w, threat_dx = (self.get_drone_threat()
+                                if self.get_drone_threat else (0, 0.0))
+        # Enemy moves right (dx > 0) → we go left (negative rc_lr), and vice-versa.
+        # Dead-zone of ±1 px/frame to ignore noise when blob is nearly still.
+        if threat_dx > 1.0:
+            rc_lr = -self._THREAT_EVADE_RC   # enemy rightward → evade left
+        elif threat_dx < -1.0:
+            rc_lr = self._THREAT_EVADE_RC    # enemy leftward  → evade right
+        else:
+            rc_lr = self._THREAT_EVADE_RC    # stationary: default right
 
         self._send_rc(rc_lr, 0, 0, 0)
-        threat_w = self.get_drone_threat() if self.get_drone_threat else 0
         with self.state.lock:
             since = self.state.threat_observe_since or now
             self.state.note = (
                 f"THREAT evade rc_lr={rc_lr:+d}  blob={threat_w}px  "
-                f"t={now - since:.1f}s")
+                f"dx={threat_dx:+.1f}px  t={now - since:.1f}s")
 
     # --------------------------------------------------- mission script driver
     def _terminate_script(self, reason: str) -> None:

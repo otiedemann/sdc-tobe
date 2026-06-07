@@ -120,19 +120,23 @@ class _ArenaHolder:
 
 
 class _DroneThreatHolder:
-    """Thread-safe: largest confirmed enemy-drone blob width this frame (px).
-    0 means no threat currently detected."""
+    """Thread-safe: largest confirmed enemy-drone blob width (px) + lateral
+    movement direction in camera frame (dx, pixels/frame, positive = moving right).
+    max_w=0 means no threat detected."""
     def __init__(self):
         self._lock = threading.Lock()
         self._max_w: int = 0
+        self._dx: float = 0.0   # camera-frame lateral movement of nearest blob
 
-    def set(self, max_w: int) -> None:
+    def set(self, max_w: int, dx: float = 0.0) -> None:
         with self._lock:
             self._max_w = max_w
+            self._dx = dx
 
-    def get(self) -> int:
+    def get(self) -> tuple:
+        """Returns (max_w: int, dx: float)."""
         with self._lock:
-            return self._max_w
+            return self._max_w, self._dx
 
 
 # ---------------------------------------------------------------------------
@@ -677,6 +681,7 @@ def cmd_fly(args: argparse.Namespace) -> int:
         # Temporal filter: a blob must appear in ≥ 3 of the last 5 frames.
         import collections as _col
         _dd_prev_gray  = None
+        _dd_prev_threat_cx: float = None  # camera-x centre of last nearest blob
         _DD_MIN_W      = 30     # min blob width  (2:1 aspect → drones are wide)
         _DD_MIN_H      = 15     # min blob height
         _DD_MAX_W      = 300    # max blob width  (filters walls/ceiling)
@@ -1308,8 +1313,16 @@ def cmd_fly(args: argparse.Namespace) -> int:
                 # ── Other-drone detection + overlay ───────────────────
                 raw_blobs = _detect_drones(frame)
                 confirmed  = _temporal_filter(raw_blobs)
-                _threat_w = confirmed[0][2] if confirmed else 0
-                drone_threat_holder.set(_threat_w)
+                if confirmed:
+                    _bx, _by, _bw, _bh = confirmed[0]
+                    _threat_cx = _bx + _bw / 2.0
+                    _threat_dx = ((_threat_cx - _dd_prev_threat_cx)
+                                  if _dd_prev_threat_cx is not None else 0.0)
+                    _dd_prev_threat_cx = _threat_cx
+                    drone_threat_holder.set(_bw, _threat_dx)
+                else:
+                    _dd_prev_threat_cx = None
+                    drone_threat_holder.set(0, 0.0)
                 if confirmed:
                     # Largest = nearest (red), rest yellow
                     for i, (bx, by, bw, bh) in enumerate(confirmed):
