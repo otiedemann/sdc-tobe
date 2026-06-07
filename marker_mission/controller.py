@@ -3885,11 +3885,15 @@ class MissionController:
                     + (f" @{spd}deg/s)" if spd is not None else ")")
                 )
             except DroneApiError as e:
-                # Don't abort the whole mission for a transient
-                # rotate failure; log and move on so subsequent
-                # steps (notably LAND) still execute.
-                print(f"[ctrl] yaw rotate {deg:+d}deg failed: {e}")
-                self._advance_script(f"yaw rotate failed: {e}")
+                # The backend already waits-for-hover + retries the moveBy a few
+                # times, so a DroneApiError here means the rotation PERSISTENTLY
+                # failed. Do NOT silently advance: a missed turn (esp. a 180°)
+                # leaves the drone facing the WRONG way, and the next FB/APPROACH
+                # then drives it in the wrong direction (operator saw exactly
+                # this). Abort to a safe hold instead of flying blind.
+                print(f"[ctrl] yaw rotate {deg:+d}deg FAILED after retries: {e}")
+                self._abort(f"yaw rotate {deg:+d}deg failed after retries — "
+                            f"holding to avoid a wrong-heading flight")
             return
         if step.kind == "LAND":
             self._set_phase(Phase.LAND, note)
