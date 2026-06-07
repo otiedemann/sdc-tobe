@@ -3435,13 +3435,61 @@ function renderRows() {
     tdWall.appendChild(sel);
     tr.appendChild(tdWall);
 
-    [['x', m.x], ['y', m.y], ['z', m.z]].forEach(([key, val]) => {
-      const [td, inp] = inputCell(val, {type:'number', step:0.01});
-      inp.addEventListener('input', () => {
-        arena.markers[idx][key] = parseFloat(inp.value); drawArena();
-      });
-      tr.appendChild(td);
+    // x / y cells: ONE is derived from the wall (read-only display),
+    // the OTHER is the "slide along the wall" coordinate (editable).
+    //   front / back wall -> y is fixed, x is editable
+    //   left  / right wall -> x is fixed, y is editable
+    // JSON keeps both as numeric values so saved configs are unchanged;
+    // the readonly cell just mirrors the auto-snapped value.
+    const meta = metaFromInputs();
+    const xFixed = (m.wall === 'left' || m.wall === 'right');
+    const yFixed = (m.wall === 'front' || m.wall === 'back');
+    [['x', m.x, xFixed], ['y', m.y, yFixed]].forEach(([key, val, fixed]) => {
+      if (fixed) {
+        const td = cell(`<span style="color:#778; font-family:monospace;">`
+                      + `${(+val).toFixed(2)}</span>`);
+        tr.appendChild(td);
+      } else {
+        const [td, inp] = inputCell(val, {type:'number', step:0.01});
+        inp.addEventListener('input', () => {
+          arena.markers[idx][key] = parseFloat(inp.value); drawArena();
+        });
+        tr.appendChild(td);
+      }
     });
+
+    // z cell: top / bottom select. The arena config has exactly two
+    // legal z levels (top_z_m, bottom_z_m), so a numeric input invites
+    // typos that don't land on a wall. We store the *resolved* z value
+    // on the marker (so JSON stays unchanged) but the UI shows the
+    // level. The currently-selected level is inferred by nearest match
+    // -- legacy configs with slightly off values snap to the closer
+    // arena z on next save.
+    const tdZ = document.createElement('td');
+    tdZ.style.padding = '.2rem .3rem';
+    const zSel = document.createElement('select');
+    zSel.style.cssText = 'background:#0c0f12; color:var(--fg);'
+                      + ' border:1px solid #2a3038; border-radius:4px;'
+                      + ' padding:.15rem .3rem; font-size:.8rem;';
+    const zPos = (Math.abs(m.z - meta.top_z_m)
+                  <= Math.abs(m.z - meta.bottom_z_m)) ? 'top' : 'bottom';
+    [['top', 'top'], ['bottom', 'bottom']].forEach(([v, label]) => {
+      const o = document.createElement('option');
+      o.value = v; o.textContent = label;
+      if (v === zPos) o.selected = true;
+      zSel.appendChild(o);
+    });
+    zSel.addEventListener('change', () => {
+      const meta2 = metaFromInputs();
+      arena.markers[idx].z = (zSel.value === 'top'
+                              ? meta2.top_z_m : meta2.bottom_z_m);
+      drawArena();
+    });
+    // Make sure m.z matches the displayed level on render (handles
+    // legacy configs with z values that aren't exactly top_z / bottom_z).
+    arena.markers[idx].z = (zPos === 'top') ? meta.top_z_m : meta.bottom_z_m;
+    tdZ.appendChild(zSel);
+    tr.appendChild(tdZ);
 
     const [tdLabel, inpLabel] = inputCell(m.label || '', {type:'text'});
     inpLabel.style.width = '12em';
@@ -3988,6 +4036,52 @@ $('btn-ar-add').addEventListener('click', () => {
                       wall:'front', x:0, y:meta.depth_m/2,
                       z:meta.top_z_m, label:''});
   renderRows(); drawArena();
+});
+
+// Resnap every marker's wall-locked coord and z level to the new
+// arena dimensions. Used when width / depth / top_z / bottom_z
+// change -- without this the per-marker x/y/z would silently lag
+// behind the meta input and the saved JSON would carry stale values.
+// Inference uses the OLD meta values so a marker on the bottom row
+// stays on the bottom row when the user edits bottom_z (rather than
+// flipping to top because it's now numerically closer to top).
+function resnapAllMarkers(oldMeta) {
+  if (!arena || !arena.markers) return;
+  const meta = metaFromInputs();
+  arena.markers.forEach(m => {
+    if (m.wall === 'front') m.y = +meta.depth_m / 2;
+    else if (m.wall === 'back') m.y = -meta.depth_m / 2;
+    else if (m.wall === 'right') m.x = +meta.width_m / 2;
+    else if (m.wall === 'left')  m.x = -meta.width_m / 2;
+    // Infer z level against the OLD meta (pre-edit), then resolve
+    // against the NEW one. Falls back to nearest-of-new if oldMeta
+    // is absent (e.g. first call before a real edit).
+    let zPos;
+    if (oldMeta) {
+      zPos = (Math.abs(m.z - oldMeta.top_z_m)
+              <= Math.abs(m.z - oldMeta.bottom_z_m)) ? 'top' : 'bottom';
+    } else {
+      zPos = (Math.abs(m.z - meta.top_z_m)
+              <= Math.abs(m.z - meta.bottom_z_m)) ? 'top' : 'bottom';
+    }
+    m.z = (zPos === 'top') ? meta.top_z_m : meta.bottom_z_m;
+  });
+}
+
+// Wire the four dimension inputs so every edit propagates to the
+// per-marker rows. Captures the pre-edit meta on focus so the z-level
+// inference in resnapAllMarkers uses the right reference.
+['ar-width', 'ar-depth', 'ar-topz', 'ar-botz'].forEach(id => {
+  const el = $(id);
+  if (!el) return;
+  let oldMeta = null;
+  el.addEventListener('focus', () => { oldMeta = metaFromInputs(); });
+  el.addEventListener('change', () => {
+    resnapAllMarkers(oldMeta);
+    renderRows();
+    drawArena();
+    oldMeta = null;
+  });
 });
 $('btn-ar-save-as').addEventListener('click', () =>
   saveAs($('ar-save-name').value.trim()));
