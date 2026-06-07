@@ -1,39 +1,34 @@
 """ATTACKER role.
 
 Operator assigns a target *slot* (1..6). The role pushes ONE complete
-mission script that does everything end-to-end:
+mission script — the operator's canonical 5-step attack:
 
     TAKEOFF
-    HEIGHT <capture_ascend_m>           # ascend for camera line-of-sight
-    FB_RC 100 <close_in_dur_s>          # FAST cruise within ArUco range
-    FB_BRAKE <enemy-face-id> 2.0 100 5  # vision-tripped brake on target
-    FB_RC <drift_rc> <drift_dur_s>      # short drift over the box
-    YAW_IMU 180
-    HOOVER <capture_hover_s>
-    HEIGHT <home_alt>                   # cruise altitude above boxes
-    HEIGHT <cruise_alt>                 # climb back to distinct cruise alt
-    FB_RC 100 <rth_dur_s>               # FAST cruise toward home
-    FB_BRAKE <wall_marker> 2.5 100 5 x y# vision/world brake on home wall
-    YAW_IMU 180                         # face enemy again so next attack starts correct
-    HOOVER <rearm>                      # brief home hover — NO land
+    APPROACH <enemy-face-id> 1     # vision-home onto the box face, stop ~1 m short
+    FB_UD_IMU 0.9 0.5              # ONE combined move: slide 0.9 m forward over the
+                                   #   box WHILE rising 0.5 m — clears the 0.73 m top
+                                   #   and parks in the 1-2 m RFID band → box flips
+    YAW_IMU 180                    # turn to face home
+    GO_HOME <wall-marker>          # vision-home onto the home back-wall marker,
+                                   #   settle shallow inside the home zone
 
-The drone closes in toward the enemy side, ascends, locks onto the
-marker via APPROACH, drifts over it, hovers, then cruises home at full
-speed and brakes on a 0.5 m wall marker via a second APPROACH. The script
-ends with a brief home hover and NO land: the drone must stay airborne the
-whole match, so it hovers at phase=done in the home zone until re-dispatched.
-When the script ends the role marks itself done and the target is cleared.
+The drone vision-homes onto the enemy box face (APPROACH rotates to find
+it — no absolute coordinates), slides up and over it in a single combined
+FB_UD_IMU move (rising as it advances, so it clears the open box top and
+sits in the RFID band to flip the box), turns around, and GO_HOMEs onto
+the home back-wall marker. The script ENDS at GO_HOME, so the FC safety-
+lands the drone inside its own home zone (satisfying the v7 §1.4.4 home-
+presence gate); the next dispatch re-launches it with TAKEOFF.
 
 OPERATOR CONVENTION
 -------------------
-The FB_IMU close-in assumes the drone is placed at takeoff with its
-front camera pointing toward the enemy side (i.e. red drones face arena
-+y, blue drones face -y). FB_IMU is forward-in-drone-frame, not arena
-frame — without the right takeoff orientation the drone would fly off
-into a wall. We don't try to align via YAW_IMU because the absolute
-IMU↔arena yaw transform is unreliable (no compass calibration in sim,
-magnetic_north_arena_yaw_deg drifts). Operator-set takeoff orientation
-is simple and reliable.
+The capture move assumes the drone is placed at takeoff with its front
+camera pointing toward the enemy side (red drones face arena +y, blue
+drones face -y) so the box face is in front. APPROACH will rotate to
+search if the marker isn't already in view, and the FC has no absolute-
+heading verb anyway (only the relative YAW_IMU), so no compass-based
+alignment is attempted — operator-set takeoff orientation is simple and
+reliable.
 
 We deliberately keep it as a single push (rather than separate attack +
 RTH scripts) because pushing a second script while the first is still
@@ -280,6 +275,13 @@ ATTACK_STANDOFF_M: float = 1.0
 # ATTACK_STANDOFF_M ahead, minus 10 cm so we stop just shy of the far edge and
 # sit over the box centre (operator: "the distance the marker was away - 10 cm").
 OVER_BOX_FORWARD_M: float = ATTACK_STANDOFF_M - 0.10
+# How far to RISE while sliding forward over the box. FB_UD_IMU does the climb
+# and the forward slide in ONE combined moveBy (rises WHILE advancing), so the
+# drone is already above the 0.73 m box top by the time it's over the centre —
+# no separate HEIGHT step, no clip. 0.5 m over the ~0.9 m takeoff/approach
+# height lands it ~1.4 m, inside the 1-2 m RFID capture band. Operator default
+# (FB_UD_IMU 0.9 0.5).
+CAPTURE_RISE_M: float = 0.5
 # Capture altitude over the box: the RFID detects in the 1-2 m band; the
 # operator wants 1-2 m, "better 1.5 m max". 1.5 m sits mid-band — a full 0.77 m
 # above the 0.73 m open box top and 0.5 m below the 2 m ceiling — so the box
@@ -350,137 +352,76 @@ def _rth_close_in_distance_m(slot: int, our_team: str) -> float:
 def _full_attack_script(
     ctx: RoleContext, attack_marker_id: int, slot: int
 ) -> str:
-    """Close in toward the enemy side, capture, RTH via wall marker, land.
+    """Operator's canonical attack: APPROACH the box, slide-up over it to flip,
+    turn around, and GO_HOME onto the home back-wall marker.
 
-    Script shape:
+    Default script (operator-specified, e.g. attacking face 31, home wall 13):
+
         TAKEOFF
-        RC 0 100 80 0 <close_in_dur>        # COMBINED climb + cruise (no HEIGHT)
-        FB_BRAKE <id> 2.0 100 5             # vision-tripped brake on target
-        RC 0 60 20 0 0.3                    # drift over box (fwd + slight up)
-        YAW_RC 100 1.0                      # fast 180° turn (~2 s vs YAW_IMU 5 s)
-        RC 0 100 60 0 <rth_dur>             # COMBINED climb + RTH cruise (no HEIGHT,
-                                            # no HOOVER — starts immediately)
-        FB_BRAKE <wall_marker> 2.5 100 5    # vision-tripped brake on home wall
-        YAW_RC 100 1.0                      # fast 180° turn back to enemy-facing
-        HOOVER <rearm>                      # brief home hover — NO land (stay airborne)
+        APPROACH 31 1                 # vision-home onto the box face, stop ~1 m short
+        FB_UD_IMU 0.9 0.5             # ONE combined move: slide 0.9 m forward over the
+                                      #   box WHILE rising 0.5 m — clears the 0.73 m top
+                                      #   and parks in the 1-2 m RFID band → box flips
+        YAW_IMU 180                   # turn to face home
+        GO_HOME 13                    # vision-home onto the home back-wall marker,
+                                      #   settle shallow inside the home zone
 
-    Speed-optimised design notes:
+    This replaces the old 10-line form (HEIGHT / APPROACH / HEIGHT / FB_IMU /
+    HOOVER / HEIGHT / APPROACH / YAW / HOOVER). The combined ``FB_UD_IMU`` does
+    the rise + forward slide in a single closed-loop ``moveBy`` (rises WHILE
+    advancing), so there is no separate HEIGHT/HOOVER and no risk of clipping the
+    box on the way over it.
 
-    Two-stage closing on every target / wall:
+    Everything is VISION-BASED (APPROACH / GO_HOME home on ArUco markers, no
+    absolute coordinates), so it works in the live arena where the drone only
+    knows what markers it sees and can never open-loop into a wall.
 
-      1. FB_RC at full stick for the bulk of the distance (~4 m/s
-         in sim — 8x the closed-loop moveBy speed). Open-loop, so
-         it can overshoot/undershoot by a metre or two.
-      2. FB_BRAKE on the relevant marker. The DSL primitive cruises
-         at full stick AND watches the marker's IPPE distance; the
-         moment d < stop_m the FC zeros sticks and enters its
-         standard IMU-velocity brake. Replaces APPROACH (which was
-         60-75 s of slow-zone PD per leg → 5 s of vision-tripped
-         brake instead).
-
-    RTH uses FB_BRAKE on the home-wall marker instead of TO_HOME.
-    The position estimator drifts ~5 m at cruise speeds, making
-    TO_HOME overshoot into the back wall. Per-marker IPPE distance
-    is reliable — braking on a 0.5 m wall marker stops the drone
-    precisely in the home zone regardless of estimator state.
-
-    The final YAW_IMU 180 (after the wall-marker APPROACH) is the
-    key to a repeatable multi-attack sequence: without it, the
-    drone lands facing the home wall (the natural result of the
-    APPROACH on a back-wall marker), and the NEXT attack's TAKEOFF
-    inherits that heading — the next FB_RC would drive backward
-    into the home wall. Two YAW_IMUs per attack keeps the
-    spawn-orientation convention (drone faces enemy) consistent
-    across runs.
-
-    The post-APPROACH HEIGHT re-assert was removed because APPROACH
-    already holds altitude via its own PD; the short FB_RC drift
-    over the box is what actually puts us on top of the target.
+    The script ENDS at GO_HOME: the FC's safety-land then sets the drone down
+    inside its own home zone (satisfying the v7 §1.4.4 home-presence gate), and
+    the next dispatch begins with TAKEOFF. ``marker_id`` and the home-wall marker
+    are arena-derived, so this is identical in the real and GVZ arenas (face
+    31-36/41-46, wall 13 red / 9 blue).
     """
-    # Operator requirement: fly LOW enough to actually SEE the 0.73 m box
-    # markers during APPROACH. It was flying the deconflicted ~1.6 m "mover"
-    # band (which assumes 1.4 m boxes) and looking straight OVER the markers, so
-    # it never acquired the target. Honor the per-drone attack_alt_m (default
-    # 1.0 m), floored only at box clearance (0.73 m boxes -> 1.0 m clears them).
-    # We deliberately do NOT use the high deconflicted cruise_alt_m here.
-    # NOTE (multi-drone): this reduces attacker-vs-attacker altitude separation;
-    # the deconfliction ladder in runner.py is built around the stale 1.4 m box
-    # assumption and should be re-centred low to restore it. Single-drone runs
-    # are unaffected.
-    cruise_alt = max(BOX_CLEARANCE_ALT_M, float(ctx.drone.attack_alt_m or 1.0))
-    height_step = f"HEIGHT {cruise_alt:.2f}"
-
-    # COLLISION AVOIDANCE on the way home (operator): the RTH cruise flies at
-    # this drone's DISTINCT deconflicted altitude (not the flat approach
-    # altitude), so several attackers returning at once are vertically separated
-    # during the cruise. Floored at box clearance; falls back to the approach
-    # altitude when no deconfliction is available (single drone).
-    rth_alt = max(BOX_CLEARANCE_ALT_M, float(ctx.cruise_alt_m or cruise_alt))
-    # And each attacker approaches the home-wall marker from a DIFFERENT bearing
+    # Each attacker approaches the home-wall marker from a DIFFERENT bearing
     # (3 attackers -> -45 / 0 / +45 deg relative to the marker normal) so they
     # fan out to distinct points around it instead of converging on one standoff
-    # and colliding. GO_HOME's 4th arg is that arrival heading.
+    # and colliding. GO_HOME's 4th arg is that arrival heading (per-drone,
+    # editable in the C2). 0 = head-on.
     rth_hdg = (ctx.rth_approach_angle_deg
                if ctx.rth_approach_angle_deg is not None else 0.0)
-
-    # End-of-run: hover briefly at home (confirms v7 §1.4.4 presence) then the
-    # script ENDS — no LAND, stay airborne for the next dispatch.
-    home_rearm = f"HOOVER {HOME_REARM_HOVER_S:.1f}"
 
     # RTH leg: VISION-HOME on the home-wall marker (GO_HOME), not a world goto.
     # The drone can't know its absolute position in the live arena, so it visually
     # acquires the wall marker and closes to a standoff — stopping shallow inside
-    # home, never overshooting into the wall.
+    # home, never overshooting into the wall. GO_HOME rotates to FIND the marker.
     wall_entry = HOME_WALL_MARKER.get(ctx.our_team)
     if wall_entry:
         wall_marker_id, _w_xy = wall_entry
-        rth_lines = (
-            f"HEIGHT {rth_alt:.2f}",           # DISTINCT per-drone RTH cruise altitude
-            # GO_HOME homes on the wall marker by vision — it ROTATES to find the
-            # marker on its own — stops RTH_WALL_STANDOFF_M short of it (just
-            # inside home), AND arrives at the per-drone bearing {rth_hdg}° so
-            # concurrent returns fan out instead of converging. Then a relative
-            # 180 deg turn re-faces the enemy for the next run.
-            f"GO_HOME {wall_marker_id} {RTH_WALL_STANDOFF_M:.2f} 0.5 {rth_hdg:g}",
-            "YAW_IMU 180",                     # re-face the enemy, ready to re-arm
-            home_rearm,
-        )
+        home_line = (f"GO_HOME {wall_marker_id} {RTH_WALL_STANDOFF_M:.2f} "
+                     f"0.5 {rth_hdg:g}")
     else:
-        rth_lines = (home_rearm,)
+        # No wall marker mapped (shouldn't happen) — just hover briefly so the
+        # script still ends cleanly in place rather than mid-capture.
+        home_line = f"HOOVER {HOME_REARM_HOVER_S:.1f}"
 
-    # ── VISION-BASED ATTACK ────────────────────────────────────────────────
-    # The whole capture is driven by APPROACH <marker_id> <distance>: the FC
-    # visually acquires the marker (rotating to search if needed) and closes to
-    # the standoff — NO absolute coordinates, so it works in the live arena
-    # where the drone only knows what ArUco markers it sees. It physically
-    # cannot overshoot into a wall: it stops at a standoff from a marker it can
-    # see. (The old script used TO <x,y> / FB_RC <duration> / world-coord
-    # brakes, all of which assume a known absolute position the drone doesn't
-    # have — that's what drove drones into walls on bad position estimates.)
     return _format_script(
         "TAKEOFF",
         # The operator orients the drone facing the enemy before take-off, and
         # APPROACH re-acquires the box marker by rotating if it isn't already in
-        # view — so no explicit heading step is needed (and the FC has no
+        # view — so no explicit heading step is needed (the FC has no
         # absolute-heading verb anyway, only the relative YAW_IMU).
-        # Climb to the transit altitude (clears the 0.73 m boxes + keeps the
-        # camera level so it can see the target marker across the arena).
-        height_step,
-        # CAPTURE TECHNIQUE (operator-specified):
         # 1) VISION-HOME on the box's face marker and stop ~1 m short of it.
-        #    The FC searches (rotates) for the marker if not yet in view.
         f"APPROACH {int(attack_marker_id)} {ATTACK_STANDOFF_M:.2f}",
-        # 2) RISE to the capture altitude (1-1.5 m) — above the 0.73 m box top —
-        #    BEFORE moving over the box, so we never clip it.
-        f"HEIGHT {CAPTURE_ALT_M:.2f}",
-        # 3) Fly FORWARD the distance the marker was away minus 10 cm, to sit
-        #    exactly over the box centre. FB_IMU is a closed-loop relative move
-        #    (sensor-fused, no absolute position).
-        f"FB_IMU {OVER_BOX_FORWARD_M:.2f}",
-        # 4) Hover over the box for >= 2 s so the RFID flips it to our colour
-        #    (v7 §1.4.3).
-        f"HOOVER {CAPTURE_HOLD_HOVER_S:.1f}",
-        *rth_lines,
+        # 2) ONE combined move: slide forward over the box centre (marker was
+        #    ~1 m ahead, minus 10 cm) WHILE rising into the 1-2 m RFID band —
+        #    rises as it advances, so it clears the 0.73 m box top without a
+        #    separate HEIGHT step and flips the box to our colour.
+        f"FB_UD_IMU {OVER_BOX_FORWARD_M:.2f} {CAPTURE_RISE_M:.2f}",
+        # 3) Turn to face home for the return leg.
+        "YAW_IMU 180",
+        # 4) Vision-home onto the home back-wall marker; settle shallow inside
+        #    home. The script ends here -> FC safety-lands in the home zone.
+        home_line,
     )
 
 
@@ -603,36 +544,26 @@ def _recapture_script(ctx: RoleContext, slot: int) -> str:
     0 pts (home recapture, regs §1.4.3) but it stops the enemy bleeding us and
     is required to ever reach the all-6 instant win.
     """
-    # Fly LOW so the camera sees the 0.73 m box / camera-height wall markers:
-    # honor attack_alt_m (default 1.0 m), floored at box clearance — NOT the
-    # deconflicted cruise_alt_m (that band assumes 1.4 m boxes). See the note
-    # in _full_attack_script on multi-drone separation.
-    cruise_alt = max(BOX_CLEARANCE_ALT_M, float(ctx.drone.attack_alt_m or 1.0))
     # The box shows the ENEMY face now (they hold it) -> APPROACH that marker.
     enemy_face = _enemy_face_for(int(slot), ctx.our_team)
     wall_entry = HOME_WALL_MARKER.get(ctx.our_team)
-    # After the box APPROACH we're already facing into home, so go straight to
-    # the home-wall APPROACH (it rotates to find the marker), then a relative
-    # 180 deg turn to re-face the enemy. No absolute-heading verb on the FC.
-    settle = ([f"APPROACH {wall_entry[0]} {RTH_WALL_STANDOFF_M:.2f}",
-               "YAW_IMU 180"]
+    rth_hdg = (ctx.rth_approach_angle_deg
+               if ctx.rth_approach_angle_deg is not None else 0.0)
+    # After flipping our box back, turn to face home and GO_HOME onto the home
+    # wall marker (it rotates to find it), settling shallow inside home. No
+    # absolute-heading verb on the FC. Script ends -> safety-land at home.
+    settle = (["YAW_IMU 180",
+               f"GO_HOME {wall_entry[0]} {RTH_WALL_STANDOFF_M:.2f} 0.5 {rth_hdg:g}"]
               if wall_entry else [])
     return _format_script(
         "TAKEOFF",
-        f"HEIGHT {cruise_alt:.2f}",
         # Same vision capture technique as the attack:
         # 1) VISION-HOME on the (enemy-coloured) face of our flipped box, ~1 m.
         f"APPROACH {enemy_face} {ATTACK_STANDOFF_M:.2f}",
-        # 2) RISE to capture altitude (above the 0.73 m box) before moving over.
-        f"HEIGHT {CAPTURE_ALT_M:.2f}",
-        # 3) Fly forward over the box centre (marker distance - 10 cm).
-        f"FB_IMU {OVER_BOX_FORWARD_M:.2f}",
-        # 4) Hover to flip the box back to our colour.
-        f"HOOVER {CAPTURE_HOLD_HOVER_S:.1f}",
-        # Climb, re-acquire the home wall, settle shallow inside home.
-        f"HEIGHT {cruise_alt:.2f}",
+        # 2) ONE combined move: slide forward over the box centre WHILE rising
+        #    into the RFID band — clears the 0.73 m box top and flips it back.
+        f"FB_UD_IMU {OVER_BOX_FORWARD_M:.2f} {CAPTURE_RISE_M:.2f}",
         *settle,
-        f"HOOVER {HOME_REARM_HOVER_S:.1f}",
     )
 
 
