@@ -12,6 +12,8 @@ POST /api/settings/markers            — patch our_team / active_slots
 POST /api/strategy/arm                — arm the runner (allow pushes)
 POST /api/strategy/disarm             — disarm
 POST /api/strategy/target/<fc>        — body {slot: int|null} → set/clear slot
+POST /api/strategy/fc/<fc>/endpoint   — point ONE FC at a real drone / sim
+POST /api/strategy/fc/all             — body {mode: "real"|"sim"} → switch ALL FCs
 POST /api/strategy/emergency-land     — emergency-land everyone
 """
 from __future__ import annotations
@@ -293,6 +295,51 @@ def build_app(
             (payload or {}).get("base_url") if isinstance(payload, dict) else host)
         runner.events.add("fc", f"{fc_name} flight controller -> {where}")
         return _no_cache(jsonify({"ok": bool(ok), "payload": payload}))
+
+    @app.route("/api/strategy/fc/all", methods=["POST"])
+    def api_fc_all():
+        """Bulk-switch EVERY flight controller between REAL hardware and the SIM.
+        Body: {"mode": "real"|"sim"}.
+          real -> point each FC at flightctrl<N>:8080, where N is the trailing
+                  digit of the FC name (flightctrl2 -> flightctrl2, sim-3 ->
+                  flightctrl3), else its 1-based sorted position.
+          sim  -> reset each FC to its configured (sim) endpoint — identical to
+                  the per-drone "Use sim" button, applied to all."""
+        import re as _re
+        body = request.get_json(silent=True) or {}
+        mode = str(body.get("mode") or "").lower()
+        if mode not in ("real", "sim"):
+            return _no_cache(jsonify({
+                "ok": False, "error": "mode must be 'real' or 'sim'"})), 400
+        try:
+            names = sorted(_run_coro(runner._c2.fc_names()) or [])
+        except Exception as exc:
+            return _no_cache(jsonify({
+                "ok": False, "error": f"{type(exc).__name__}: {exc}"})), 502
+        if not names:
+            return _no_cache(jsonify({
+                "ok": False, "error": "no flight controllers known to the C2"})), 404
+        results: dict = {}
+        for i, fc in enumerate(names, start=1):
+            try:
+                if mode == "sim":
+                    ok, payload = _run_coro(
+                        runner._c2.set_fc_endpoint(fc, reset=True))
+                else:
+                    m = _re.search(r"(\d+)\s*$", fc)
+                    n = int(m.group(1)) if m else i
+                    ok, payload = _run_coro(runner._c2.set_fc_endpoint(
+                        fc, host=f"flightctrl{n}", port=8080))
+                results[fc] = {"ok": bool(ok), "payload": payload}
+            except Exception as exc:
+                results[fc] = {"ok": False,
+                               "error": f"{type(exc).__name__}: {exc}"}
+        n_ok = sum(1 for r in results.values() if r.get("ok"))
+        runner.events.add(
+            "fc", f"ALL flight controllers -> {mode} "
+                  f"({n_ok}/{len(names)} ok)")
+        return _no_cache(jsonify({
+            "ok": n_ok == len(names), "mode": mode, "results": results}))
 
     @app.route("/api/strategy/roster/reset", methods=["POST"])
     def api_roster_reset():
@@ -577,6 +624,8 @@ _INDEX_HTML = r"""<!doctype html>
   <button id="arm-btn" class="primary">Arm</button>
   <button id="disarm-btn">Disarm</button>
   <button id="reset-btn" title="Drop every drone from the roster — auto-adopt then re-fills it from the C2 with fresh defaults. Useful for clearing ghost drones / stale per-drone settings.">Reset roster</button>
+  <button id="all-real-btn" title="Point EVERY flight controller at the REAL drones (flightctrl1-5 on :8080).">All real</button>
+  <button id="all-sim-btn" title="Point EVERY flight controller back at the SIMULATOR (its configured endpoint).">All sim</button>
   <button id="land-btn" class="danger">Emergency Land</button>
 </header>
 
@@ -1278,6 +1327,24 @@ document.getElementById("land-btn").addEventListener("click", async () => {
   await api("/api/strategy/emergency-land", {method:"POST"});
   refresh();
 });
+async function switchAllFc(mode) {
+  const label = mode === "real" ? "REAL drones (flightctrl1-5:8080)" : "the SIMULATOR";
+  if (!confirm(`Point EVERY flight controller at ${label}?`)) return;
+  const btn = document.getElementById(mode === "real" ? "all-real-btn" : "all-sim-btn");
+  if (btn) btn.disabled = true;
+  try {
+    const r = await api("/api/strategy/fc/all", {method:"POST", body: JSON.stringify({mode})});
+    console.log(`all ${mode}:`, r);
+    if (r && r.ok === false) alert(`Some FCs failed to switch to ${mode}. See console / event log.`);
+  } catch (e) {
+    alert(`All-${mode} failed: ${e}`);
+  } finally {
+    if (btn) btn.disabled = false;
+    refresh();
+  }
+}
+document.getElementById("all-real-btn").addEventListener("click", () => switchAllFc("real"));
+document.getElementById("all-sim-btn").addEventListener("click", () => switchAllFc("sim"));
 
 // Keyboard killswitch: "?" emergency-lands the WHOLE swarm immediately — the
 // same panic key as marker_mission's per-drone UI. Fires on every "?" press
