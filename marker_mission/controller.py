@@ -1849,7 +1849,22 @@ class MissionController:
             marker_y = float(pose.tvec[1])
         except Exception:
             marker_y = 0.0
+
+        # Camera-based height error: drive marker_y toward 0 so the marker
+        # is level with the drone. Positive e_h = need to rise; negative = descend.
+        # This is used instead of the altimeter-derived (target_h - drone_h) so
+        # that barometer drift/offset cannot cause a premature "settled" verdict.
         e_h = -marker_y
+
+        # Safety floor (altimeter only): if the barometer says we are already
+        # at or below min_height, do not command further descent regardless of
+        # what the camera says — the altimeter may be wrong but we keep this as
+        # a hard lower bound to avoid hitting the ground.
+        if drone_h <= cfg.min_height_m and e_h < 0:
+            e_h = 0.0
+        # Safety ceiling: symmetric guard.
+        if drone_h >= cfg.max_height_m and e_h > 0:
+            e_h = 0.0
 
         e_yaw = yaw_to_marker
         u_yaw = (0.0 if abs(e_yaw) < cfg.yaw_deadband_deg
@@ -1860,11 +1875,13 @@ class MissionController:
         self._send_rc(lr=0, fb=0, ud=int(u_ud), yaw=int(u_yaw))
 
         with self.state.lock:
-            self.state.note = (f"HEIGHT_ALIGN (vision): marker_y={marker_y:+.2f}m  "
+            self.state.note = (f"HEIGHT_ALIGN: drone={drone_h:.2f}m  "
+                               f"marker_y={marker_y:+.2f}m  "
                                f"e={e_h:+.2f}m")
 
         # Settle: both height and yaw inside their deadbands for the
         # configured time -> transition to ALIGN.
+        # e_h is camera-derived so this settle is independent of the altimeter.
         in_band = (abs(e_h)   < cfg.height_deadband_m
                    and abs(e_yaw) < cfg.yaw_deadband_deg)
         settled = False
