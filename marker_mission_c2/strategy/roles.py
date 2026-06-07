@@ -153,6 +153,11 @@ class RoleState:
     phase: str = "idle"
     target_slot: Optional[int] = None              # 1..6, set by operator
     target_assigned_unix_s: Optional[float] = None
+    # TESTING override: an explicit marker id to attack, set by the operator.
+    # When non-None the attacker flies the standard attack script straight at
+    # this marker, bypassing the slot->enemy-face mapping and the slot-based
+    # holder/recapture logic. One-shot: cleared when the run completes.
+    target_marker_id: Optional[int] = None
     last_attack_marker_id: Optional[int] = None    # face id we last APPROACHed
     # Logical heading the LAST pushed script leaves the drone in — "enemy"
     # (+Y end / target boxes) or "home" (our back wall). The FC has no
@@ -176,6 +181,7 @@ class RoleState:
         self.phase = "idle"
         self.target_slot = None
         self.target_assigned_unix_s = None
+        self.target_marker_id = None
         self.last_attack_marker_id = None
         self.last_pushed_script = ""
         self.last_pushed_unix_s = 0.0
@@ -206,6 +212,7 @@ class RoleState:
             "phase": self.phase,
             "target_slot": self.target_slot,
             "target_assigned_unix_s": self.target_assigned_unix_s,
+            "target_marker_id": self.target_marker_id,
             "last_attack_marker_id": self.last_attack_marker_id,
             "last_pushed_script": self.last_pushed_script,
             "last_pushed_unix_s": self.last_pushed_unix_s,

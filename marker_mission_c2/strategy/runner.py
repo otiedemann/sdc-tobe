@@ -298,6 +298,33 @@ class SwarmRunner:
             drone=fc_name,
         )
 
+    def assign_target_marker(self, fc_name: str, marker_id: Optional[int]) -> None:
+        """TESTING: pin (or clear) an explicit target MARKER id for an attacker.
+
+        When set, the attacker flies the standard attack script straight at this
+        marker, bypassing the slot->enemy-face mapping. One-shot (the attacker
+        clears it when the run completes). Independent of MANUAL/AUTO mode.
+        """
+        with self._states_lock:
+            rs = self._role_states.setdefault(
+                fc_name, RoleState(fc_name=fc_name)
+            )
+            rs.target_marker_id = int(marker_id) if marker_id is not None else None
+            rs.last_attack_marker_id = None
+            rs.advance_phase(
+                "idle",
+                reason=(
+                    "test marker cleared" if marker_id is None
+                    else f"test marker {marker_id} assigned"
+                ),
+            )
+        self._events.add(
+            "target",
+            ("test marker cleared" if marker_id is None
+             else f"test marker {marker_id} assigned"),
+            drone=fc_name,
+        )
+
     def snapshot(self) -> Dict[str, Any]:
         # Expose the last C2 overview (per-FC live telemetry: drone_connected,
         # battery, height, world_position, visible_marker_ids, FC phase, …)
