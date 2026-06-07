@@ -1852,9 +1852,20 @@ class MissionController:
         # in and overshoot. Capping AFTER velocity damping so the
         # damping can still pull u_fwd negative for braking and not
         # be clipped to a small positive.
+        #
+        # For GO_HOME (tol_override set): the loose arrive_tol can be
+        # larger than slow_zone, which would place the slow zone entirely
+        # inside the deadband (where u_fwd_raw is already 0). Fix: expand
+        # the effective slow zone by tol_override so it reaches beyond the
+        # deadband boundary and caps the PD output during final approach.
         slow_zone = float(getattr(cfg, "approach_slow_zone_m", 0.0))
         slow_cap = int(getattr(cfg, "approach_slow_rc_max", cfg.fwd_rc_max))
-        if slow_zone > 0.0 and abs(e_fwd) < slow_zone:
+        eff_slow_zone = slow_zone
+        if (slow_zone > 0.0
+                and tol_override is not None
+                and tol_override > slow_zone):
+            eff_slow_zone = slow_zone + tol_override
+        if eff_slow_zone > 0.0 and abs(e_fwd) < eff_slow_zone:
             cap = max(1, slow_cap)
             u_fwd = max(-cap, min(cap, u_fwd))
 
