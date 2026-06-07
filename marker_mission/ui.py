@@ -195,10 +195,8 @@ _PAGE_HEADER = """
     <div id="header-drone-state"
          style="font-size:.72rem; font-family:monospace; white-space:nowrap;
                 border:1px solid #444; border-radius:4px; padding:4px 8px;
-                line-height:1.5; color:#bbb;">—</div>
-    <div id="header-battery"
-         style="font-size:16px; font-weight:700; font-family:monospace;
-                white-space:nowrap;">—</div>
+                line-height:1.6; color:#bbb;">—</div>
+    <div id="header-battery" style="display:none;">—</div>
   </div>
   <div id="cam-restart-count" title="Auto camera restarts (freeze detection)"
        style="font-size:.72rem; color:#aab; font-family:monospace;
@@ -1602,23 +1600,7 @@ async function refresh() {
     }
     const r = await fetch(STATE_URL, {cache:'no-store'});
     const s = await r.json();
-    // Battery in header
-    {
-      const tel = s.telemetry || {};
-      const bat = tel.battery;
-      const el = $('header-battery');
-      if (el) {
-        if (bat !== undefined && bat !== null) {
-          const col = bat < 20 ? '#f87171' : bat < 35 ? '#facc15' : '#4ade80';
-          el.textContent = bat + ' %';
-          el.style.color = col;
-        } else {
-          el.textContent = '—';
-          el.style.color = '#555';
-        }
-      }
-    }
-    // Drone state block in header (between WLAN and battery)
+    // Drone state + battery block in header — stacked lines
     {
       const tel  = s.telemetry || {};
       const el   = $('header-drone-state');
@@ -1627,19 +1609,21 @@ async function refresh() {
         const connected = tel.connected !== false;
         const h_cm      = tel.height_cm;
         const phase     = s.phase || '';
+        const bat       = tel.battery;
 
-        const connCol   = connected ? '#4ade80' : '#f87171';
-        const connTxt   = connected ? 'online' : 'offline';
-        const flyCol    = flying ? '#38bdf8' : '#aab';
-        const flyTxt    = flying ? 'flying' : 'landed';
-        const hTxt      = (h_cm != null && h_cm > 0)
-                          ? `${(h_cm/100).toFixed(1)} m` : '';
+        const connCol = connected ? '#4ade80' : '#f87171';
+        const flyCol  = flying ? '#38bdf8' : '#aab';
+        const hTxt    = (h_cm != null && h_cm > 0)
+                        ? ` ${(h_cm/100).toFixed(1)} m` : '';
+        const batCol  = bat == null ? '#555'
+                      : bat < 20 ? '#f87171' : bat < 35 ? '#facc15' : '#4ade80';
+        const batTxt  = bat != null ? bat + ' %' : '— %';
 
-        let html = `<span style="color:${connCol}">${connTxt}</span>`;
-        html    += ` · <span style="color:${flyCol}">${flyTxt}</span>`;
-        if (hTxt) html += ` · <span style="color:#38bdf8">${hTxt}</span>`;
+        let html = `<div><span style="color:${connCol}">${connected ? 'online' : 'offline'}</span></div>`;
+        html    += `<div><span style="color:${flyCol}">${flying ? 'flying' : 'landed'}${hTxt}</span></div>`;
         if (phase && phase !== 'init')
-          html += ` · <span style="color:#facc15">${phase}</span>`;
+          html += `<div><span style="color:#facc15">${phase}</span></div>`;
+        html    += `<div><span style="color:${batCol};font-weight:700;">${batTxt}</span></div>`;
         el.innerHTML = html;
       }
     }
