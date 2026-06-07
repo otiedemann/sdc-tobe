@@ -62,6 +62,7 @@ from .drone_api import DroneApi, MjpegStreamReader, TelemetrySnapshot
 from .drone_api_inproc import DroneApiInProc, InProcMjpegReader
 from .kalman import PositionKalman, ned_velocity_to_arena
 from .recorder import FlightRecorder, make_flight_dir, write_meta
+from . import cpu_monitor
 from .ui import LatestFrame, UiServer
 from .web_calibration import CalibrationCapture
 
@@ -340,6 +341,12 @@ def cmd_fly(args: argparse.Namespace) -> int:
     pose_holder = _PoseHolder()
     tel_holder = _TelemetryHolder()
     drone_threat_holder = _DroneThreatHolder()
+    # Background sampler for host + process CPU / memory usage. Daemon
+    # thread, idempotent start. state.snapshot() reads the latest
+    # sample so every CSV row + /api/state response carries it; the
+    # UI uses it to surface a live resource indicator. Costs ~5 reads
+    # from /proc per second.
+    cpu_monitor.start(sample_period_s=1.0)
     latest_ann_frame = LatestFrame()
 
     # ---------- 3. Set up mission state, recorder, UI ---------------------

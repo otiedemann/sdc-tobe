@@ -71,6 +71,14 @@ _CSV_FIELDS = [
     # Grep for telemetry_rc_gated=1 to find moments where the
     # recorded rc=(0,0,0,0) reflects a safety override, not PD intent.
     "telemetry_stalled", "telemetry_rc_gated",
+    # Host resource indicators sampled at ~1 Hz by cpu_monitor.
+    # ``host_cpu_pct`` is system-wide (all cores busy ratio),
+    # ``host_proc_cpu_pct`` is THIS process expressed as % of one
+    # core (>100 = using more than one core's worth). Lets us
+    # correlate telemetry stalls / RC chatter with CPU pressure
+    # offline: a stall coincident with cpu spike points at the host,
+    # a stall with idle cpu points at the drone link.
+    "host_cpu_pct", "host_proc_cpu_pct", "host_load_1m", "host_mem_pct",
     # Note + abort reason carry whatever the controller's state
     # machine has surfaced this tick. The killswitch / Stop button
     # write a non-empty abort_reason synchronously into state so
@@ -381,6 +389,13 @@ class FlightRecorder:
                                         else "0")
             row["telemetry_rc_gated"] = ("1" if snap.get("telemetry_rc_gated")
                                          else "0")
+            host = snap.get("host") or {}
+            for src, dst in [("system_cpu_pct", "host_cpu_pct"),
+                             ("process_cpu_pct", "host_proc_cpu_pct"),
+                             ("load_1m", "host_load_1m"),
+                             ("mem_used_pct", "host_mem_pct")]:
+                v = host.get(src)
+                row[dst] = "" if v is None else v
             row["note"] = (snap.get("note") or "")
             row["abort_reason"] = (snap.get("abort_reason") or "")
             vmids = snap.get("visible_marker_ids") or []

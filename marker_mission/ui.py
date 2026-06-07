@@ -136,6 +136,9 @@ _PAGE_HEADER = """
     <a href="/hardware" class="{{ 'active' if active=='hardware' else '' }}">Hardware</a>
   </nav>
   <div style="margin-left:auto; display:flex; align-items:center; gap:.6rem;">
+    <span id="host-cpu" title="host CPU usage / process CPU / 1-min load"
+          style="font-size:.72rem; color:#778; font-family:ui-monospace,monospace;
+                 white-space:nowrap;">cpu …</span>
     <span id="tel-stall" title="telemetry stall indicator"
           style="display:none; font-size:.72rem; font-weight:600; color:#0c0f12;
                  background:#f0b429; padding:.1rem .4rem; border-radius:3px;
@@ -1657,6 +1660,25 @@ async function refresh() {
       }
     }
     $('phase').textContent = (REPLAY_ID ? 'replay phase: ' : 'phase: ') + s.phase;
+    // Header host-CPU indicator. Colour ramps to yellow/red as system
+    // load grows; the proc + load values are informative diagnostics.
+    // Keep this lightweight -- runs every 250 ms on every page.
+    const hc = $('host-cpu');
+    if (hc) {
+      const h = s.host || {};
+      if (h.system_cpu_pct == null) {
+        hc.textContent = 'cpu …';
+        hc.style.color = '#778';
+      } else {
+        const sys = Math.round(h.system_cpu_pct);
+        const proc = h.process_cpu_pct == null
+                       ? '—' : Math.round(h.process_cpu_pct);
+        const load = h.load_1m == null ? '—' : h.load_1m.toFixed(2);
+        hc.textContent = `cpu ${sys}% · proc ${proc}% · load ${load}`;
+        hc.style.color = sys > 85 ? 'var(--bad)'
+                       : sys > 60 ? 'var(--warn)' : 'var(--good)';
+      }
+    }
     // Header telemetry-stall indicator. Hidden when healthy; amber for
     // detect-level stall (CSV marked, RC still flowing); red for gate-
     // level stall (RC has been forced to zero). Tiny update so the

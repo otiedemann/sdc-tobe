@@ -55,6 +55,25 @@ from .config import MissionConfig
 from .drone_api import DroneApi, DroneApiError, TelemetrySnapshot
 from .mission_script import (HARDCODED_DEFAULT_SCRIPT, ScriptError, Step,
                               defaults_from_cfg, parse as parse_script)
+from . import cpu_monitor
+
+
+def _host_resource_dict() -> dict:
+    """Latest CPU / memory sample as a serialisable dict for
+    state.snapshot(). Returns all-None fields if the sampler hasn't
+    produced a delta yet."""
+    s = cpu_monitor.last_sample()
+    return {
+        "system_cpu_pct": (None if s.system_cpu_pct is None
+                           else round(s.system_cpu_pct, 1)),
+        "process_cpu_pct": (None if s.process_cpu_pct is None
+                            else round(s.process_cpu_pct, 1)),
+        "load_1m": s.load_1m,
+        "mem_used_pct": (None if s.mem_used_pct is None
+                         else round(s.mem_used_pct, 1)),
+        "sample_age_s": (round(time.monotonic() - s.sampled_at, 2)
+                         if s.sampled_at > 0.0 else None),
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -747,6 +766,7 @@ class MissionState:
                 "telemetry": tel,
                 "telemetry_stalled": bool(self.telemetry_stalled),
                 "telemetry_rc_gated": bool(self.telemetry_rc_gated),
+                "host": _host_resource_dict(),
                 "marker_seen_age_s": (time.monotonic() - self.last_marker_seen_at)
                                        if self.last_marker_seen_at else None,
                 "mission_script": script_lines,
