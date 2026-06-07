@@ -336,6 +336,27 @@ def build_app(
         runner.assign_target(fc_name, slot)
         return _no_cache(jsonify({"ok": True, "slot": slot}))
 
+    @app.route("/api/strategy/target-marker/<fc_name>", methods=["POST"])
+    def api_target_marker(fc_name: str):
+        """TESTING: pin (or clear) an explicit target MARKER id for an attacker.
+        Body: {"marker_id": int|null}. Bypasses the slot->face mapping."""
+        body = request.get_json(silent=True) or {}
+        raw = body.get("marker_id", body.get("marker"))
+        marker_id: Optional[int]
+        if raw is None or raw == "" or raw == "null":
+            marker_id = None
+        else:
+            try:
+                marker_id = int(raw)
+            except (TypeError, ValueError):
+                return _no_cache(jsonify(
+                    {"ok": False, "error": "invalid marker_id"})), 400
+            if not (0 < marker_id < 1000):
+                return _no_cache(jsonify(
+                    {"ok": False, "error": "marker_id out of range 1..999"})), 400
+        runner.assign_target_marker(fc_name, marker_id)
+        return _no_cache(jsonify({"ok": True, "marker_id": marker_id}))
+
     @app.route("/api/strategy/emergency-land", methods=["POST"])
     def api_emergency():
         from .c2_client import C2Client
@@ -600,6 +621,10 @@ async function assignTarget(fc, slot) {
   return api(`/api/strategy/target/${encodeURIComponent(fc)}`, {
     method:"POST", body: JSON.stringify({slot: slot})});
 }
+async function assignTargetMarker(fc, markerId) {
+  return api(`/api/strategy/target-marker/${encodeURIComponent(fc)}`, {
+    method:"POST", body: JSON.stringify({marker_id: markerId})});
+}
 
 function ageStr(s) {
   if (s == null) return "never";
@@ -861,8 +886,17 @@ function renderDrones(state) {
           <select data-target="${fc}">${slotOpts}</select>
           <button data-clear="${fc}">Clear</button>
         </div>
+        <div class="target-row" ${role!=="attacker"?'style="display:none"':''}
+             title="TESTING: fly the attack script straight at this marker id, bypassing the slot->face mapping. One-shot.">
+          <label class="small">Test marker:</label>
+          <input type="number" min="1" max="999" step="1" data-marker-input="${fc}"
+                 value="${rs.target_marker_id==null?'':rs.target_marker_id}"
+                 placeholder="id" style="width:5em">
+          <button data-marker-go="${fc}">Attack</button>
+          <button data-marker-clear="${fc}">Clear</button>
+        </div>
         <div class="phase" title="${reason}">
-          phase=${phase}${rs.target_slot!=null?` slot=${rs.target_slot}`:''}${attackId?` last_aim=${attackId}`:''}${cruiseAlt!=null?` · cruise ${cruiseAlt}m`:''}${lastPush?` · ${lastPush}`:''}
+          phase=${phase}${rs.target_marker_id!=null?` <b>test→${rs.target_marker_id}</b>`:''}${rs.target_slot!=null?` slot=${rs.target_slot}`:''}${attackId?` last_aim=${attackId}`:''}${cruiseAlt!=null?` · cruise ${cruiseAlt}m`:''}${lastPush?` · ${lastPush}`:''}
           ${reason?` · ${reason}`:''}
         </div>
       </div>
@@ -1159,6 +1193,21 @@ document.addEventListener("click", async (ev) => {
   if (t.matches("[data-clear]")) {
     const fc = t.getAttribute("data-clear");
     await assignTarget(fc, null);
+    refresh();
+  }
+  // TESTING: launch / clear an explicit target-marker attack.
+  if (t.matches("[data-marker-go]")) {
+    const fc = t.getAttribute("data-marker-go");
+    const inp = document.querySelector(`[data-marker-input="${fc}"]`);
+    const raw = (inp && inp.value || "").trim();
+    const id = raw === "" ? null : parseInt(raw, 10);
+    if (id == null || !(id > 0)) { alert("Enter a marker id (1..999) first."); return; }
+    await assignTargetMarker(fc, id);
+    refresh();
+  }
+  if (t.matches("[data-marker-clear]")) {
+    const fc = t.getAttribute("data-marker-clear");
+    await assignTargetMarker(fc, null);
     refresh();
   }
   // Switch a drone to a REAL flight controller by IP.

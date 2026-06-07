@@ -623,6 +623,38 @@ class AttackerRole(Role):
         if not ctx.state.drone_connected:
             return noop("attacker: drone not connected")
 
+        # ---- MANUAL TARGET MARKER (testing): the operator pinned an explicit
+        # marker id to attack. Fly the standard attack script STRAIGHT at that
+        # marker -- bypassing the slot->enemy-face mapping and all the slot-based
+        # holder/recapture/bank logic below. One-shot: cleared when the run
+        # finishes. Takes priority over everything else so a test always wins.
+        manual_id = rs.target_marker_id
+        if manual_id is not None:
+            if rs.phase == "running":
+                # Only "init"/"done" means the whole script (incl. the GO_HOME +
+                # safety-land) has finished.
+                if ctx.state.phase in ("init", "done", ""):
+                    rs.target_marker_id = None
+                    rs.advance_phase(
+                        "done", f"manual attack on marker {manual_id} complete")
+                    return noop("attacker: manual attack complete (marker cleared)")
+                return noop(
+                    f"attacker: manual attack on marker {manual_id} running "
+                    f"(fc phase={ctx.state.phase})")
+            # Not running yet: the FC can only START a mission from INIT (on the
+            # ground / idle). We deliberately do NOT gate on in_home here -- a
+            # test should launch from wherever the drone is placed.
+            if ctx.state.phase not in ("init", "done", ""):
+                return noop(
+                    f"attacker: airborne (fc phase={ctx.state.phase}); "
+                    f"manual attack waits for the FC to be INIT")
+            rs.last_attack_marker_id = manual_id
+            return push(
+                _full_attack_script(ctx, manual_id, 0),
+                new_phase="running",
+                reason=f"attacker: MANUAL attack on marker {manual_id} (testing)",
+            )
+
         # ---- RE-CAPTURE: the planner pulled this attacker to defend one of
         # OUR OWN flipped boxes (an "attacker becomes defender" run). It's a
         # 0-pt home flip but stops the enemy scoring, so it BEATS both the bank
