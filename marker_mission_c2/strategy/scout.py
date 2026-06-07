@@ -16,18 +16,19 @@ absolute position needed).
 Centre positioning (operator-specified)
 ---------------------------------------
 Markers **11** (right wall) and **15** (left wall) sit at x=±5, y=0, z=2 m — the
-mid-field side markers, present in both the real and GVZ arenas. Each cycle the
-scout:
+mid-field side markers, present in both the real and GVZ arenas. The scout:
 
   1. ``APPROACH``es whichever of 11 / 15 it can find, to a 6 m standoff — that
-     lands it ~1 m past the arena centre on the y=0 line.
-  2. rotates 360° three times (3× ``SCOUT``) to scan every box.
-  3. when the FC finishes the cycle, the C2 pushes a fresh one — the new
-     ``APPROACH`` re-acquires a side marker and re-adjusts the scout back to the
-     centre ("re-check and re-adjust position").
+     lands it ~1 m past the arena centre on the y=0 line, at its SET
+     ``scout_alt_m`` altitude.
+  2. then rotates **continuously** in place (one long ``RC`` yaw drive) to scan
+     every box — it does NOT land. The FC safety-lands the moment a script
+     COMPLETES, so a "rotate N times then end" script would land the scout; the
+     long drive keeps it airborne until EMERGENCY LAND or a team ``bank`` recall.
+     If the FC ever does go idle, the C2 re-pushes (re-centres) automatically.
 
-The side marker for each cycle is chosen by :func:`_pick_center_marker` — the
-one already in view if any, else either (APPROACH searches for it regardless).
+The side marker is chosen by :func:`_pick_center_marker` — the one already in
+view if any, else either (APPROACH searches for it regardless).
 
 ``team_phase``
 --------------
@@ -66,7 +67,13 @@ SCRIPT_GRACE_S = 6.0
 # Operator-specified positioning method.
 CENTER_MARKERS: tuple[int, int] = (11, 15)
 CENTER_STANDOFF_M: float = 6.0
-N_CENTER_ROTATIONS: int = 3
+# The scout rotates CONTINUOUSLY, not in discrete SCOUT turns. The FC SAFETY-
+# LANDS the drone the instant a mission script completes, so a "rotate 3× then
+# end" script lands the scout after 3 rotations. One long RC yaw drive keeps it
+# spinning in place AND airborne for the whole match — only EMERGENCY LAND (or a
+# team bank recall) brings it down. 3600 s ≫ any match ("effectively forever");
+# if the FC ever does go idle the C2 re-pushes (re-centres) automatically.
+SCOUT_ROTATE_DURATION_S: float = 3600.0
 
 
 def _format_script(*lines: str) -> str:
@@ -74,8 +81,11 @@ def _format_script(*lines: str) -> str:
 
 
 def _scout_alt(ctx: RoleContext) -> float:
-    drone = ctx.drone
-    return max(0.6, float(ctx.cruise_alt_m if ctx.cruise_alt_m else drone.scout_alt_m))
+    # Honor the operator's per-drone scout_alt_m (e.g. 1.0 m) so the scout flies
+    # at the SET altitude. We deliberately do NOT use the deconflicted
+    # cruise_alt_m here — that was lifting the scout to ~1.6 m and ignoring the
+    # setting. A single centre-loitering scout has no peer to deconflict against.
+    return max(0.6, float(ctx.drone.scout_alt_m or 1.0))
 
 
 def _yaw_stick(ctx: RoleContext) -> int:
@@ -120,14 +130,16 @@ def _pick_center_marker(ctx: RoleContext, rs) -> int:
 
 def _center_script(ctx: RoleContext, marker_id: int) -> str:
     """Vision-home onto a mid-field side marker to sit near the arena centre,
-    then rotate 360° N times to scan. APPROACH searches (rotates) to acquire the
-    marker itself, then closes to CENTER_STANDOFF_M head-on. TAKEOFF is a no-op
-    once airborne — we never land between cycles."""
+    then rotate CONTINUOUSLY in place to scan. APPROACH searches (rotates) to
+    acquire the marker, then closes to CENTER_STANDOFF_M head-on; the long RC yaw
+    drive then keeps the scout spinning AND airborne (the FC safety-lands on
+    script completion, so we never let the script finish). TAKEOFF is a no-op
+    once airborne — we never land between (re)centres."""
     return _format_script(
         "TAKEOFF",
         f"HEIGHT {_scout_alt(ctx):.2f}",
         f"APPROACH {int(marker_id)} {CENTER_STANDOFF_M:.2f}",
-        *(["SCOUT"] * N_CENTER_ROTATIONS),
+        f"RC 0 0 0 {_yaw_stick(ctx)} {SCOUT_ROTATE_DURATION_S:.0f}",
     )
 
 
@@ -171,20 +183,20 @@ class ScoutRole(Role):
             return self._decide_bank(ctx, rs, fc_idle, since_push)
         return self._decide_sortie(ctx, rs, script_done)
 
-    # -- sortie: centre via a side marker, rotate 3×, re-check & re-adjust ----
+    # -- sortie: centre via a side marker, then rotate continuously -----------
     def _decide_sortie(self, ctx: RoleContext, rs, script_done: bool) -> Decision:
-        # One cycle = APPROACH 11/15 to 6 m (vision-home to the centre) followed
-        # by N×360° scans. When the FC finishes the cycle we push a fresh one:
-        # its APPROACH re-acquires a side marker and re-adjusts the scout back to
-        # the centre — the operator's "re-check and re-adjust position" step.
+        # APPROACH 11/15 to 6 m (vision-home to the centre), then rotate in place
+        # CONTINUOUSLY (no land). We only push a fresh cycle if the FC actually
+        # goes idle (after the long rotation elapses or an emergency land); the
+        # new APPROACH then re-acquires a side marker and re-centres.
         if rs.phase == "scout_center" and not script_done:
-            return noop(f"scout: centring via marker {rs.scratch.get('center_marker')}"
-                        f" + {N_CENTER_ROTATIONS}×360°")
+            return noop(f"scout: centred via marker {rs.scratch.get('center_marker')}"
+                        f", rotating")
         marker = _pick_center_marker(ctx, rs)
         rs.scratch["center_marker"] = marker
         return push(_center_script(ctx, marker), new_phase="scout_center",
                     reason=f"scout: APPROACH {marker} {CENTER_STANDOFF_M:g}m -> "
-                           f"centre, then {N_CENTER_ROTATIONS}×360°")
+                           f"centre, then rotate continuously")
 
     # -- bank: recall into our home zone and rotate --------------------------
     def _decide_bank(self, ctx: RoleContext, rs, fc_idle: bool,
