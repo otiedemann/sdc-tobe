@@ -838,6 +838,11 @@ function renderDrones(state) {
                    value="${d.go_home_angle_deg==null?'':d.go_home_angle_deg}"
                    data-fc="${fc}" data-field="go_home_angle_deg">
           </div>
+          <div>
+            <label title="Scout rotation speed: yaw-stick 1..100. The drone spins at ~(this/100) × the FC max rotation speed (~150°/s). Higher = faster scanning.">Scout rot. speed</label>
+            <input type="number" step="5" min="1" max="100"
+                   value="${d.scout_yaw_stick}" data-fc="${fc}" data-field="scout_yaw_stick">
+          </div>
         </div>
         <div class="fc-source" style="margin-top:6px">
           <label class="small">Flight controller
@@ -1132,6 +1137,7 @@ document.addEventListener("change", async (ev) => {
     let val = t.value;
     if (field === "enabled") val = (val === "true");
     if (["scout_alt_m","attack_alt_m","home_alt_m"].includes(field)) val = parseFloat(val);
+    if (field === "scout_yaw_stick") val = parseInt(val, 10);
     // GO_HOME angle: blank -> null (auto-fan), else numeric.
     if (field === "go_home_angle_deg") val = (val === "" ? null : parseFloat(val));
     await patchDrone(fc, {[field]: val});

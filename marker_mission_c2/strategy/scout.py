@@ -89,7 +89,10 @@ def _scout_alt(ctx: RoleContext) -> float:
 
 
 def _yaw_stick(ctx: RoleContext) -> int:
-    return max(-100, min(100, int(ctx.match.scout_yaw_stick)))
+    # Rotation speed: per-drone scout_yaw_stick (editable in the dashboard), with
+    # the old match-level value as a fallback for configs that predate it.
+    stick = getattr(ctx.drone, "scout_yaw_stick", None) or ctx.match.scout_yaw_stick
+    return max(1, min(100, int(stick)))
 
 
 def _rotate_duration(ctx: RoleContext) -> float:
