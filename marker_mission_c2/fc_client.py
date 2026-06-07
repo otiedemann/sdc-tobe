@@ -121,6 +121,12 @@ class AsyncFCClient:
     async def get_identity(self) -> Result:
         return await self._get("/api/identity")
 
+    async def get_wlan(self) -> Result:
+        """The FC host's WLAN interfaces (iwconfig): {iface: {ssid, signal_dbm,
+        band, ...}}. The wl* interface's SSID is the connected drone's WiFi
+        name. Polled at a slow cadence by the pool."""
+        return await self._get("/api/wlan")
+
     # --------------------------------------------------------- mission ctrl
     async def start_mission(self, script: Optional[str] = None) -> Result:
         body: dict = {}

@@ -742,6 +742,21 @@ function renderDrones(state) {
     const droneDotTitle = droneOk ? `drone link: connected` : `drone link: not connected`;
     const lastPush = rs.last_pushed_age_s != null ? `pushed ${ageStr(rs.last_pushed_age_s)} ago` : "";
 
+    // Drone WiFi (which AP this FC's Pi is connected to) — the SSID is the
+    // drone's WiFi name, so the operator sees at a glance which drone is on each FC.
+    const wlan = ov.wlan || {};
+    const wifiName = wlan.ssid || "—";
+    const wifiDetail = [
+      (wlan.signal_dbm != null && wlan.signal_dbm !== "") ? `${wlan.signal_dbm} dBm` : "",
+      wlan.band || "",
+      wlan.link_quality ? `Q ${wlan.link_quality}%` : "",
+      wlan.bit_rate || "",
+    ].filter(Boolean).join("  ");
+    const wifiTitle = wlan.ssid
+      ? `Drone WiFi: ${wlan.ssid}${wifiDetail ? "  —  " + wifiDetail : ""}`
+      : "drone WiFi: unknown";
+    const wifiCls = wlan.ssid ? "good" : "warn";
+
     const html = `
       <div class="drone">
         <div class="head">
@@ -750,6 +765,7 @@ function renderDrones(state) {
           <span class="badge ${roleBadge}">${role}</span>
           <span class="status-dot ${c2DotCls}" title="${c2DotTitle}"></span>
           <span class="status-dot ${droneDotCls}" title="${droneDotTitle}"></span>
+          <span class="badge ${wifiCls}" title="${wifiTitle}" style="margin-left:auto">📶 ${wifiName}</span>
         </div>
         <div class="status-grid">
           <div><span class="k">battery</span><span class="v ${battCls}">${battStr}</span></div>
@@ -758,6 +774,7 @@ function renderDrones(state) {
           <div><span class="k">in home</span><span class="v ${inHomeCls}">${inHome}</span></div>
           <div><span class="k">world pos</span><span class="v mono">${posStr}</span></div>
           <div><span class="k">sees</span><span class="v mono" title="visible ArUco IDs">${visStr}</span></div>
+          <div><span class="k">wifi</span><span class="v mono ${wifiCls}" title="${wifiTitle}">${wifiName}${wlan.signal_dbm!=null&&wlan.signal_dbm!==""?` (${wlan.signal_dbm} dBm)`:""}</span></div>
         </div>
         <div class="mission-row" style="margin-top:6px">
           <div class="small" title="The mission script currently EXECUTING on the FC (from C2 overview), with the current step highlighted.">
