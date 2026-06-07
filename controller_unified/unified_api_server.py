@@ -7141,6 +7141,62 @@ def _save_drones_csv(rows: list):
         raise
 
 
+@app.get("/api/wifi/scan")
+def api_wifi_scan():
+    """Trigger a WiFi rescan, then return visible networks annotated with
+    drone CSV matches. Response: {ok, networks: [{ssid, signal, security,
+    in_use, drone_id?, drone_name?}]}. Takes ~3 s (rescan wait)."""
+    import re as _re
+    try:
+        subprocess.run(["sudo", "nmcli", "device", "wifi", "rescan"],
+                       capture_output=True, timeout=10)
+        time.sleep(3.0)
+    except Exception:
+        pass
+
+    try:
+        r = subprocess.run(
+            ["nmcli", "-t", "-f", "IN-USE,SSID,SIGNAL,SECURITY",
+             "--escape", "yes", "device", "wifi", "list"],
+            capture_output=True, text=True, timeout=10,
+        )
+    except Exception as e:
+        return jsonify(ok=False, error=str(e)), 500
+
+    drones = _load_drones_csv()
+    drone_by_ssid = {d["name"]: d for d in drones}
+
+    seen: set = set()
+    networks: list = []
+    for line in r.stdout.splitlines():
+        # nmcli -t separates fields with ':'; literal ':' in values is escaped as '\:'
+        parts = _re.split(r'(?<!\\):', line)
+        if len(parts) < 4:
+            continue
+        in_use   = parts[0].strip() == "*"
+        ssid     = parts[1].replace("\\:", ":").strip()
+        signal   = parts[2].strip()
+        security = ":".join(parts[3:]).replace("\\:", ":").strip()
+        if not ssid or ssid in seen:
+            continue
+        seen.add(ssid)
+        entry: dict = {
+            "ssid":     ssid,
+            "signal":   int(signal) if signal.lstrip("-").isdigit() else 0,
+            "security": security,
+            "in_use":   in_use,
+        }
+        if ssid in drone_by_ssid:
+            d = drone_by_ssid[ssid]
+            entry["drone_id"]   = d["id"]
+            entry["drone_name"] = d["name"]
+        networks.append(entry)
+
+    # Known drones first, then by descending signal
+    networks.sort(key=lambda n: (0 if "drone_id" in n else 1, -n["signal"]))
+    return jsonify(ok=True, networks=networks)
+
+
 @app.get("/api/drones")
 def api_drones_list():
     """List all drones from the fleet CSV (passwords omitted)."""
