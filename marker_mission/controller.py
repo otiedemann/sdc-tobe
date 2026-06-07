@@ -855,6 +855,7 @@ class MissionController:
         self._search_esc_level: int = 0
         self._search_visited_markers: set = set()
         self._goto_on_settle_phase = None
+        self._goto_on_settle_restart_mission = False
         self._goto_last_wp = None
         self._goto_jump_until: float = 0.0
         self._goto_frozen_yaw = None
@@ -942,6 +943,7 @@ class MissionController:
         self._search_esc_level: int = 0          # 0=1x/full, 1=2x/half, 2+=navigate
         self._search_visited_markers: set = set()  # wall-marker IDs already navigated to
         self._goto_on_settle_phase: Optional[Phase] = None  # override post-GOTO transition
+        self._goto_on_settle_restart_mission: bool = False  # restart mission from step 0 on GOTO settle
         self._goto_last_wp: Optional[tuple] = None    # last accepted world pos in GOTO
         self._goto_jump_until: float = 0.0            # stop+reorient until this monotonic time
         self._goto_frozen_yaw: Optional[float] = None  # yaw_arena frozen at GOTO entry
@@ -1440,6 +1442,69 @@ class MissionController:
               f"goto ({tx:.1f},{ty:.1f},{mz:.1f})m yaw={t_yaw:.0f}°")
         return True
 
+    def _navigate_to_visible_arena_marker(self, now: float) -> bool:
+        """APPROACH/GO_HOME recovery: fly 3 m in front of the nearest
+        currently VISIBLE arena marker, then restart the mission from
+        step 0. Returns False when no suitable visible marker is available
+        (no arena config, no world position, or none visible)."""
+        arena = self.get_arena() if callable(self.get_arena) else None
+        if arena is None:
+            return False
+        with self.state.lock:
+            wp           = self.state.world_position_m
+            visible_ids  = list(self.state.visible_marker_ids)
+            active_mid   = self.state.active_marker_id
+
+        if wp is None or not visible_ids:
+            return False
+
+        _wall_normal = {"front": (0, -1), "back": (0, 1),
+                        "left":  (1, 0),  "right": (-1, 0)}
+        _wall_yaw    = {"front": 180.0, "back": 0.0,
+                        "left":  -90.0,  "right": 90.0}
+
+        # Consider only visible markers that exist in the arena layout,
+        # are on a known wall, and are not the current mission target.
+        candidates = [
+            m for mid, m in arena.markers.items()
+            if mid in visible_ids
+            and mid != active_mid
+            and m.wall in _wall_normal
+        ]
+        if not candidates:
+            return False
+
+        px, py = float(wp[0]), float(wp[1])
+        best = min(candidates, key=lambda m: (
+            (float(m.position_m[0]) - px) ** 2 +
+            (float(m.position_m[1]) - py) ** 2
+        ))
+
+        nx, ny = _wall_normal[best.wall]
+        mx, my = float(best.position_m[0]), float(best.position_m[1])
+        mz     = float(best.position_m[2])
+        tx = mx + nx * self._SEARCH_NAV_DIST_M
+        ty = my + ny * self._SEARCH_NAV_DIST_M
+        t_yaw = _wall_yaw[best.wall]
+
+        with self.state.lock:
+            self.state.goto_target_x_m   = tx
+            self.state.goto_target_y_m   = ty
+            self.state.goto_target_z_m   = mz
+            self.state.goto_target_yaw_deg = t_yaw
+            self.state.goto_hold_until   = None
+
+        self._goto_on_settle_phase = None
+        self._goto_on_settle_restart_mission = True
+        self._set_phase(
+            Phase.GOTO,
+            f"approach recovery: nav to visible marker {best.id} "
+            f"({best.wall}) @ ({tx:.1f},{ty:.1f},{mz:.1f})m")
+        print(f"[ctrl] APPROACH recovery → visible marker {best.id} "
+              f"({best.wall}): goto ({tx:.1f},{ty:.1f},{mz:.1f})m "
+              f"yaw={t_yaw:.0f}° then restart mission")
+        return True
+
     def _step_search(self, now: float) -> None:
         cfg = self.cfg
         # If we already see the marker, switch immediately. ALIGN orbits
@@ -1530,6 +1595,18 @@ class MissionController:
                     self._search_start_yaw = None
                     self._search_swept = 0.0
                     self._search_esc_level += 1
+
+                    # After first rotation: APPROACH/GO_HOME steps attempt
+                    # recovery to a visible arena marker + mission restart
+                    # before escalating zoom.
+                    if self._search_esc_level == 1:
+                        with self.state.lock:
+                            step_kind = self.state.current_step_kind
+                        if step_kind == "APPROACH":
+                            if self._navigate_to_visible_arena_marker(now):
+                                return
+                            # No visible reference marker — fall through to
+                            # normal zoom escalation.
 
                     if self._search_esc_level in (1, 2):
                         # Level 1: 1.5x → 2x, half speed
@@ -3156,7 +3233,15 @@ class MissionController:
                     f"goto-hold complete at "
                     f"({wp[0]:.2f},{wp[1]:.2f},{wp[2]:.2f})m")
         elif settled:
-            if self._goto_on_settle_phase is not None:
+            if self._goto_on_settle_restart_mission:
+                self._goto_on_settle_restart_mission = False
+                self._goto_on_settle_phase = None
+                print("[ctrl] GOTO settled at arena marker — restarting mission")
+                with self.state.lock:
+                    self.state.mission_step_idx = -1
+                    self.state.last_completed_step_kind = None
+                self._advance_script("arena-nav recovery: mission restart")
+            elif self._goto_on_settle_phase is not None:
                 next_phase = self._goto_on_settle_phase
                 self._goto_on_settle_phase = None
                 self._set_phase(
