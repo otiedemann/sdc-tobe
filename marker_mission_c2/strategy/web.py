@@ -364,6 +364,7 @@ def _drone_dict(d) -> Dict[str, Any]:
         "scout_alt_m": d.scout_alt_m,
         "attack_alt_m": d.attack_alt_m,
         "home_alt_m": d.home_alt_m,
+        "go_home_angle_deg": d.go_home_angle_deg,
     }
 
 
@@ -814,6 +815,12 @@ function renderDrones(state) {
             <input type="number" step="0.1" min="0.4" max="3.0"
                    value="${d.home_alt_m}" data-fc="${fc}" data-field="home_alt_m">
           </div>
+          <div>
+            <label title="RTH GO_HOME arrival bearing around the home wall marker (-80..+80°). Blank = auto-fan (-45/0/+45).">GO_HOME angle (°)</label>
+            <input type="number" step="5" min="-80" max="80" placeholder="auto"
+                   value="${d.go_home_angle_deg==null?'':d.go_home_angle_deg}"
+                   data-fc="${fc}" data-field="go_home_angle_deg">
+          </div>
         </div>
         <div class="fc-source" style="margin-top:6px">
           <label class="small">Flight controller
@@ -1108,6 +1115,8 @@ document.addEventListener("change", async (ev) => {
     let val = t.value;
     if (field === "enabled") val = (val === "true");
     if (["scout_alt_m","attack_alt_m","home_alt_m"].includes(field)) val = parseFloat(val);
+    // GO_HOME angle: blank -> null (auto-fan), else numeric.
+    if (field === "go_home_angle_deg") val = (val === "" ? null : parseFloat(val));
     await patchDrone(fc, {[field]: val});
     refresh();
     return;

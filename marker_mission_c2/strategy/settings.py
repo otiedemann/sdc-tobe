@@ -209,6 +209,11 @@ class DroneSettings:
     scout_alt_m: float = 1.0
     attack_alt_m: float = 1.0
     home_alt_m: float = 0.8
+    # Per-drone RTH arrival bearing (deg, -80..+80) for the GO_HOME on the home
+    # wall marker: the angle around the marker this drone returns to, so several
+    # attackers fan out instead of converging. None -> the runner auto-assigns
+    # (-45/0/+45 across the attackers). Set explicitly to pin a drone's lane.
+    go_home_angle_deg: Optional[float] = None
 
 
 @dataclass(frozen=True)
@@ -292,7 +297,20 @@ def _drone_to_dict(d: DroneSettings) -> Dict[str, Any]:
         "scout_alt_m": float(d.scout_alt_m),
         "attack_alt_m": float(d.attack_alt_m),
         "home_alt_m": float(d.home_alt_m),
+        "go_home_angle_deg": (None if d.go_home_angle_deg is None
+                              else float(d.go_home_angle_deg)),
     }
+
+
+def _coerce_go_home_angle(raw: Any) -> Optional[float]:
+    """Optional RTH approach angle. Empty/None/"auto" -> None (auto-assign);
+    else a float clamped to the GO_HOME-legal [-80, +80] deg."""
+    if raw is None or raw == "" or raw == "auto":
+        return None
+    try:
+        return max(-80.0, min(80.0, float(raw)))
+    except (TypeError, ValueError):
+        return None
 
 
 def _drone_from(fc_name: str, raw: Any) -> DroneSettings:
@@ -306,6 +324,7 @@ def _drone_from(fc_name: str, raw: Any) -> DroneSettings:
         scout_alt_m=float(raw.get("scout_alt_m", 1.0)),
         attack_alt_m=float(raw.get("attack_alt_m", 1.0)),
         home_alt_m=float(raw.get("home_alt_m", 0.8)),
+        go_home_angle_deg=_coerce_go_home_angle(raw.get("go_home_angle_deg")),
     )
 
 
@@ -497,6 +516,10 @@ class SettingsStore:
                         allowed[key] = float(changes[key])
                     except (TypeError, ValueError):
                         continue
+            if "go_home_angle_deg" in changes:
+                # None / "" / "auto" -> auto-assign; else clamped float.
+                allowed["go_home_angle_deg"] = _coerce_go_home_angle(
+                    changes["go_home_angle_deg"])
             patched = replace(existing, **allowed)
             new_drones = []
             seen = False
