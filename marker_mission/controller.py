@@ -920,6 +920,15 @@ class MissionController:
         self._search_visited_markers: set = set()
         self._goto_on_settle_phase = None
         self._goto_on_settle_restart_mission = False
+        # Set by the marker-lost GO_HOME recovery: restart the mission when the
+        # recovery APPROACH settles (vision-only, no TO). See _recover_via_gohome.
+        self._approach_on_settle_restart_mission = False
+        # Bounded recovery budget: consecutive GO_HOME re-anchor hops without
+        # re-acquiring the TARGET. Reset to 0 on real target re-acquisition.
+        # Once it hits _MAX_RECOVERY_HOPS we stop the active-flight recovery and
+        # fall through to an in-place spin (low power) waiting for the C2 to
+        # re-task -- so a persistently-unrecoverable target can't loop forever.
+        self._recovery_count = 0
         self._goto_last_wp = None
         self._goto_jump_until: float = 0.0
         self._goto_frozen_yaw = None
@@ -1010,6 +1019,8 @@ class MissionController:
         self._search_visited_markers: set = set()  # wall-marker IDs already navigated to
         self._goto_on_settle_phase: Optional[Phase] = None  # override post-GOTO transition
         self._goto_on_settle_restart_mission: bool = False  # restart mission from step 0 on GOTO settle
+        self._approach_on_settle_restart_mission: bool = False  # restart mission on recovery-GO_HOME settle
+        self._recovery_count: int = 0                 # bounded marker-lost recovery hops
         self._goto_last_wp: Optional[tuple] = None    # last accepted world pos in GOTO
         self._goto_jump_until: float = 0.0            # stop+reorient until this monotonic time
         self._goto_frozen_yaw: Optional[float] = None  # yaw_arena frozen at GOTO entry
@@ -1033,6 +1044,12 @@ class MissionController:
             self.state.mission_step_idx = -1
             self.state.current_step_kind = None
             self.state.last_completed_step_kind = None
+        # A freshly-loaded mission (a NEW C2 task) gets a fresh marker-lost
+        # recovery budget. The recovery's own restart re-runs the SAME script
+        # via _advance_script (NOT set_script), so it does not reset this — the
+        # budget only resets on a genuinely new task or a real re-acquisition.
+        self._recovery_count = 0
+        self._approach_on_settle_restart_mission = False
 
     def trigger(self) -> bool:
         """Release the run loop so it proceeds into the script's first
@@ -1430,168 +1447,74 @@ class MissionController:
     _SEARCH_MIN_YAW_RC: int = 3
     # Maximum digital zoom (Anafi hardware cap).
     _SEARCH_MAX_ZOOM: float = 3.0
-    # Distance in front of a wall marker used as the search waypoint.
-    _SEARCH_NAV_DIST_M: float = 3.0
+    # Marker-lost recovery (NO absolute TO): GO_HOME onto whatever marker is
+    # visible, to this loose standoff, then restart the mission. Operator:
+    # "rotate at 70 until a marker is seen and approach it with GO_HOME 3 1".
+    _RECOVERY_STANDOFF_M: float = 3.0
+    _RECOVERY_TOL_M: float = 1.0
+    # Cap on consecutive recover->restart hops without re-acquiring the target.
+    # Past this we stop the active-flight recovery and spin in place waiting for
+    # the C2 to re-task, so an unrecoverable target can't loop (and burn the
+    # battery) forever.
+    _MAX_RECOVERY_HOPS: int = 3
 
-    def _navigate_to_arena_marker(self, now: float) -> bool:
-        """Set up a GOTO to a position _SEARCH_NAV_DIST_M in front of the
-        nearest unvisited wall marker. Returns False when not possible
-        (no arena config, no world position). On success transitions to
-        GOTO with a _goto_on_settle_phase=SEARCH hook so the drone
-        restarts the search from the new vantage point."""
-        arena = self.get_arena() if callable(self.get_arena) else None
-        if arena is None:
+    def _recover_via_gohome(self, now: float) -> bool:
+        """Marker-lost recovery WITHOUT any absolute TO. Pick a currently-VISIBLE
+        ArUco marker and GO_HOME onto it by vision (loose 3 m / ±1 m, holding
+        altitude), then RESTART the mission so the C2's task re-runs. Returns
+        False if nothing is visible (caller keeps rotating) OR the recovery
+        budget (_MAX_RECOVERY_HOPS) is exhausted — so the caller stops re-anchor
+        flight and spins in place. Replaces the old GOTO/TO ``_navigate_to_*``."""
+        if self._recovery_count >= self._MAX_RECOVERY_HOPS:
             return False
         with self.state.lock:
-            wp = self.state.world_position_m
-        if wp is None:
+            visible_ids = list(self.state.visible_marker_ids)
+            last_pose = self.state.last_pose
+        if not visible_ids:
             return False
-
-        cfg = self.cfg
-        tgt_min = int(cfg.target_marker_id_min)
-        tgt_max = int(cfg.target_marker_id_max)
-
-        # Inward wall normal and facing yaw for each wall label.
-        # Arena frame: +x = right, +y = front-wall direction, yaw 0° = facing +y.
-        _wall_normal = {"front": (0, -1), "back": (0, 1),
-                        "left": (1, 0),  "right": (-1, 0)}
-        _wall_yaw    = {"front": 180.0, "back": 0.0,
-                        "left":  -90.0, "right": 90.0}
-
-        # Build list of wall markers, excluding target markers.
-        candidates = [
-            m for mid, m in arena.markers.items()
-            if not (tgt_min <= mid <= tgt_max)
-            and m.wall in _wall_normal
-            and mid not in self._search_visited_markers
-        ]
-        if not candidates:
-            # All visited — reset and allow revisits.
-            self._search_visited_markers.clear()
-            candidates = [
-                m for mid, m in arena.markers.items()
-                if not (tgt_min <= mid <= tgt_max)
-                and m.wall in _wall_normal
-            ]
-        if not candidates:
-            return False
-
-        # Pick nearest wall marker to current drone position.
-        px, py = float(wp[0]), float(wp[1])
-        best = min(candidates, key=lambda m: (
-            (float(m.position_m[0]) - px) ** 2 +
-            (float(m.position_m[1]) - py) ** 2
-        ))
-        self._search_visited_markers.add(best.id)
-
-        nx, ny = _wall_normal[best.wall]
-        mx, my = float(best.position_m[0]), float(best.position_m[1])
-        mz = float(best.position_m[2])
-        tx = mx + nx * self._SEARCH_NAV_DIST_M
-        ty = my + ny * self._SEARCH_NAV_DIST_M
-        t_yaw = _wall_yaw[best.wall]
-
+        # Prefer the marker we already have a fresh pose for; else an arena wall
+        # marker (stable reference); else just the first visible id. Any marker
+        # works — we only need a vision anchor to re-establish position.
+        best: Optional[int] = None
+        if last_pose is not None:
+            try:
+                lp_id = int(last_pose.marker_id)
+            except (TypeError, ValueError, AttributeError):
+                lp_id = None
+            if lp_id is not None and lp_id in visible_ids:
+                best = lp_id
+        if best is None:
+            arena = self.get_arena() if callable(self.get_arena) else None
+            if arena is not None:
+                for mid in visible_ids:
+                    if mid in arena.markers:
+                        best = int(mid)
+                        break
+        if best is None:
+            best = int(visible_ids[0])
+        # Reset the smoother so it doesn't blend the OLD target's pose with the
+        # new anchor marker's pose across the switch.
+        self.smoother.reset()
         with self.state.lock:
-            self.state.goto_target_x_m = tx
-            self.state.goto_target_y_m = ty
-            self.state.goto_target_z_m = mz
-            self.state.goto_target_yaw_deg = t_yaw
-            self.state.goto_hold_until = None
-
-        self._goto_on_settle_phase = Phase.SEARCH
+            self.state.active_marker_id = best
+            self.state.target_distance_m = self._RECOVERY_STANDOFF_M
+            self.state.target_distance_tol_m = self._RECOVERY_TOL_M
+            self.state.approach_positioning = True    # vision-home, hold altitude
+            self.state.arrive_hdg_tol_deg = None
+            self.state.arrive_yaw_tol_deg = None
+            self.state.target_relative_heading_deg = 0.0
+            self.state.settle_began_at = None
+        self._approach_on_settle_restart_mission = True
+        self._recovery_count += 1
         self._set_phase(
-            Phase.GOTO,
-            f"search esc: nav to wall marker {best.id} "
-            f"({best.wall} wall) @ "
-            f"({tx:.1f},{ty:.1f},{mz:.1f})m")
-        print(f"[ctrl] SEARCH nav → marker {best.id} ({best.wall}): "
-              f"goto ({tx:.1f},{ty:.1f},{mz:.1f})m yaw={t_yaw:.0f}°")
-        return True
-
-    def _target_is_wall_marker(self, mid) -> bool:
-        """True iff ``mid`` is a known WALL marker in the active arena.
-
-        The nav-to-wall-marker search recoveries (``_navigate_to_visible_arena_
-        marker`` / ``_navigate_to_arena_marker``) fly the drone TOWARD a wall
-        marker. That is only sane when the mission TARGET is itself a wall marker
-        (e.g. ``GO_HOME`` onto the home-wall marker) — repositioning near it helps
-        re-acquire it. A box-face target (an attack ``APPROACH``, ids like 31/34)
-        is never a wall marker, so this returns False and the caller must NOT fly
-        toward a wall (it would drive away from the box and into the wall — the
-        operator saw a drone head straight at marker 13 doing exactly this)."""
-        if mid is None:
-            return False
-        arena = self.get_arena() if callable(self.get_arena) else None
-        markers = getattr(arena, "markers", None)
-        if not markers:
-            return False
-        try:
-            m = markers.get(int(mid))
-        except (TypeError, ValueError):
-            return False
-        return bool(m is not None and getattr(m, "wall", None) in
-                    ("front", "back", "left", "right"))
-
-    def _navigate_to_visible_arena_marker(self, now: float) -> bool:
-        """APPROACH/GO_HOME recovery: fly 3 m in front of the nearest
-        currently VISIBLE arena marker, then restart the mission from
-        step 0. Returns False when no suitable visible marker is available
-        (no arena config, no world position, or none visible)."""
-        arena = self.get_arena() if callable(self.get_arena) else None
-        if arena is None:
-            return False
-        with self.state.lock:
-            wp           = self.state.world_position_m
-            visible_ids  = list(self.state.visible_marker_ids)
-            active_mid   = self.state.active_marker_id
-
-        if wp is None or not visible_ids:
-            return False
-
-        _wall_normal = {"front": (0, -1), "back": (0, 1),
-                        "left":  (1, 0),  "right": (-1, 0)}
-        _wall_yaw    = {"front": 180.0, "back": 0.0,
-                        "left":  -90.0,  "right": 90.0}
-
-        # Consider all visible markers that exist in the arena layout
-        # and are on a known wall (any ID, including the mission target).
-        candidates = [
-            m for mid, m in arena.markers.items()
-            if mid in visible_ids
-            and m.wall in _wall_normal
-        ]
-        if not candidates:
-            return False
-
-        px, py = float(wp[0]), float(wp[1])
-        best = min(candidates, key=lambda m: (
-            (float(m.position_m[0]) - px) ** 2 +
-            (float(m.position_m[1]) - py) ** 2
-        ))
-
-        nx, ny = _wall_normal[best.wall]
-        mx, my = float(best.position_m[0]), float(best.position_m[1])
-        mz     = float(best.position_m[2])
-        tx = mx + nx * self._SEARCH_NAV_DIST_M
-        ty = my + ny * self._SEARCH_NAV_DIST_M
-        t_yaw = _wall_yaw[best.wall]
-
-        with self.state.lock:
-            self.state.goto_target_x_m   = tx
-            self.state.goto_target_y_m   = ty
-            self.state.goto_target_z_m   = mz
-            self.state.goto_target_yaw_deg = t_yaw
-            self.state.goto_hold_until   = None
-
-        self._goto_on_settle_phase = None
-        self._goto_on_settle_restart_mission = True
-        self._set_phase(
-            Phase.GOTO,
-            f"approach recovery: nav to visible marker {best.id} "
-            f"({best.wall}) @ ({tx:.1f},{ty:.1f},{mz:.1f})m")
-        print(f"[ctrl] APPROACH recovery → visible marker {best.id} "
-              f"({best.wall}): goto ({tx:.1f},{ty:.1f},{mz:.1f})m "
-              f"yaw={t_yaw:.0f}° then restart mission")
+            Phase.SEARCH,
+            f"recovery {self._recovery_count}/{self._MAX_RECOVERY_HOPS}: "
+            f"GO_HOME visible marker {best} "
+            f"({self._RECOVERY_STANDOFF_M:g}m) then restart mission")
+        print(f"[ctrl] marker-lost recovery "
+              f"{self._recovery_count}/{self._MAX_RECOVERY_HOPS} → GO_HOME "
+              f"visible marker {best} ({self._RECOVERY_STANDOFF_M:g}m, vision, "
+              f"no TO) then restart")
         return True
 
     def _step_search(self, now: float) -> None:
@@ -1606,6 +1529,13 @@ class MissionController:
             # the CW search sweep) by search_backrotate_deg so the marker
             # is better centred in the frame before HEIGHT_ALIGN starts.
             self._send_rc(0, 0, 0, 0)
+            # Re-acquired a GENUINE target (a capture APPROACH or a real
+            # GO_HOME step — NOT a recovery anchor, which keeps the restart
+            # flag set): the marker-lost recovery succeeded, so clear the hop
+            # budget. (The recovery anchor acquisition leaves the flag True and
+            # must NOT reset it, else the budget could never bound the loop.)
+            if not self._approach_on_settle_restart_mission:
+                self._recovery_count = 0
             back_deg = int(getattr(cfg, "search_backrotate_deg", 10))
             swept = getattr(self, "_search_swept", 0.0)
             # Only back-rotate when the drone actually swept past the back_deg
@@ -1699,64 +1629,57 @@ class MissionController:
                     self._search_swept = 0.0
                     self._search_esc_level += 1
 
-                    with self.state.lock:
-                        step_kind = self.state.current_step_kind
-                        active_mid = self.state.active_marker_id
-                    # The nav-to-wall-marker recoveries fly the drone TOWARD a
-                    # wall. Only do that when the TARGET is itself a wall marker
-                    # (GO_HOME). For a box-face attack APPROACH (target not a wall
-                    # marker) we NEVER fly toward a wall — it drives away from the
-                    # box and into the wall (near-crash on marker 13). Box targets
-                    # just keep searching in place (rotate + zoom escalate).
-                    target_is_wall = (step_kind == "APPROACH"
-                                      and self._target_is_wall_marker(active_mid))
-
-                    # After the first rotation: reposition to a visible arena
-                    # marker — ONLY for a wall target.
-                    if self._search_esc_level == 1 and target_is_wall:
-                        if self._navigate_to_visible_arena_marker(now):
-                            return
-                        # No visible reference marker — fall through to zoom.
-
+                    # RECOVERY (operator-specified, NO absolute TO): after a full
+                    # rotation without re-acquiring the target, if ANY marker is
+                    # now visible, GO_HOME onto it (vision, 3 m) to re-establish a
+                    # position anchor, then restart the mission. This replaces the
+                    # old GOTO/TO-based nav-to-wall recoveries entirely (which
+                    # drove the drone toward walls and risked crashes). It is safe
+                    # for any target — GO_HOME stops a standoff short of a marker
+                    # it can SEE, so it never open-loops into a wall.
+                    if self._recover_via_gohome(now):
+                        return
+                    # Recovery returned False -> either nothing visible OR the
+                    # hop budget is exhausted. If exhausted, STOP looping: end
+                    # the mission so the FC goes idle and the C2 can re-task
+                    # (its decide() only pushes a new script when the FC is
+                    # idle, so an in-place spin would never get re-tasked). This
+                    # is the vision-only replacement for the old give-up LAND.
+                    if self._recovery_count >= self._MAX_RECOVERY_HOPS:
+                        self._terminate_script(
+                            f"marker-lost recovery exhausted "
+                            f"({self._MAX_RECOVERY_HOPS} GO_HOME hops, target "
+                            f"unrecoverable) — ending mission, yielding to C2")
+                        return
+                    # Nothing visible yet — keep rotating at the search speed and
+                    # escalate zoom (1.25 -> 2 -> 3x) to spot a distant marker.
                     if self._search_esc_level in (1, 2):
-                        # Level 1: 1.5x → 2x, half speed
-                        # Level 2: 2x  → 3x, half speed again
                         new_zoom = 2.0 if self._search_esc_level == 1 else 3.0
-                        new_yaw_rc = max(self._SEARCH_MIN_YAW_RC,
-                                         self._search_yaw_rc * 0.5)
                         self._search_zoom = new_zoom
-                        self._search_yaw_rc = new_yaw_rc
                         try:
                             self.api.camera_config_set(zoom=new_zoom)
                         except Exception as e:
                             print(f"[ctrl] SEARCH zoom set failed: {e}")
                         print(f"[ctrl] SEARCH esc→{self._search_esc_level}: "
-                              f"zoom {new_zoom}x, yaw_rc {new_yaw_rc:.0f}")
+                              f"zoom {new_zoom}x (no marker visible, still "
+                              f"rotating at {self._search_yaw_rc:.0f})")
                         with self.state.lock:
                             self.state.note = (
-                                f"SEARCH esc: zoom={new_zoom}x "
-                                f"yaw_rc={new_yaw_rc:.0f}")
-                    elif target_is_wall:
-                        # Three+ revolutions on a WALL target → reposition to a
-                        # wall-marker vantage (stops 3 m short), else give up.
-                        if not self._navigate_to_arena_marker(now):
-                            self._terminate_script(
-                                "search: no arena nav available — giving up")
+                                f"SEARCH: no marker visible, zoom={new_zoom}x "
+                                f"rotating @{self._search_yaw_rc:.0f}")
                     else:
-                        # Box target, search exhausted: do NOT fly to a wall.
-                        # Drop the zoom and keep rotating in place from level 0 so
-                        # the search continues safely; the operator (or a higher
-                        # timeout) can intervene if the box truly isn't findable.
+                        # 3+ revolutions, still nothing visible: reset zoom and
+                        # keep rotating in place at the search speed. Do NOT fly
+                        # anywhere (no TO). The operator/C2 can intervene.
                         self._search_esc_level = 0
-                        self._search_yaw_rc = int(getattr(cfg, "search_yaw_rc", 15))
                         if getattr(self, "_search_zoom", 1.0) != 1.0:
                             self._search_zoom = 1.0
                             try:
                                 self.api.camera_config_set(zoom=1.0)
                             except Exception as e:
                                 print(f"[ctrl] SEARCH zoom reset failed: {e}")
-                        print("[ctrl] SEARCH (box target): no nav-to-wall — "
-                              "continuing in-place search")
+                        print("[ctrl] SEARCH: no marker visible after 3 sweeps — "
+                              "continuing in-place rotation (no TO)")
                     return
         # Fallback timeout if no telemetry yaw is ever reported.
         elif now - phase_entry > 30.0:
@@ -2156,7 +2079,21 @@ class MissionController:
             else:
                 self.state.settle_began_at = None
         if settled:
-            self._advance_script("approach settled")
+            # Marker-lost recovery (no TO): this APPROACH was a GO_HOME onto a
+            # visible marker to re-establish a vision anchor. On settle, RESTART
+            # the mission (re-run the operator's task from the top) rather than
+            # advancing to the next step. Mirrors the GOTO restart hook but with
+            # NO absolute-position navigation.
+            if self._approach_on_settle_restart_mission:
+                self._approach_on_settle_restart_mission = False
+                print("[ctrl] recovery GO_HOME settled at visible marker — "
+                      "restarting mission")
+                with self.state.lock:
+                    self.state.mission_step_idx = -1
+                    self.state.last_completed_step_kind = None
+                self._advance_script("marker-lost recovery: mission restart")
+            else:
+                self._advance_script("approach settled")
 
     # ------------------------------------------------------------------ hold
     def _step_hold(self, tel: Optional[TelemetrySnapshot],
@@ -3698,6 +3635,9 @@ class MissionController:
             # stays untouched so it remains the authoritative source of
             # parse-time defaults (defaults_from_cfg) and the user's
             # tune-page values. Phases read from state.target_*.
+            # A real mission APPROACH/GO_HOME step: never the recovery hop, so
+            # clear the recovery restart hook (only _recover_via_gohome sets it).
+            self._approach_on_settle_restart_mission = False
             with self.state.lock:
                 self.state.active_marker_id = int(step.marker_id)
                 self.state.target_distance_m = float(step.distance)
