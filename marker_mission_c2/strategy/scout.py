@@ -128,17 +128,20 @@ def _pick_center_marker(ctx: RoleContext, rs) -> int:
     return last if last in CENTER_MARKERS else CENTER_MARKERS[0]
 
 
-def _center_script(ctx: RoleContext, marker_id: int) -> str:
-    """Vision-home onto a mid-field side marker to sit near the arena centre,
-    then rotate CONTINUOUSLY in place to scan. APPROACH searches (rotates) to
-    acquire the marker, then closes to CENTER_STANDOFF_M head-on; the long RC yaw
-    drive then keeps the scout spinning AND airborne (the FC safety-lands on
-    script completion, so we never let the script finish). TAKEOFF is a no-op
-    once airborne — we never land between (re)centres."""
+def _center_script(ctx: RoleContext) -> str:
+    """Climb to the SET altitude and rotate CONTINUOUSLY in place to scan.
+
+    We deliberately do NOT APPROACH a side marker to centre: APPROACH height-
+    aligns the drone to the marker (the side markers sit at z=2 m, so it climbed
+    the scout off its 1 m setpoint) and its close-capture alignment never settles
+    at a 6 m standoff (it drifted laterally and never reached the spin). So the
+    scout just spins where the operator placed it (near the centre). The long RC
+    yaw drive keeps it spinning AND airborne — the FC safety-lands the instant a
+    script COMPLETES, so we never let the script finish. TAKEOFF is a no-op once
+    airborne."""
     return _format_script(
         "TAKEOFF",
         f"HEIGHT {_scout_alt(ctx):.2f}",
-        f"APPROACH {int(marker_id)} {CENTER_STANDOFF_M:.2f}",
         f"RC 0 0 0 {_yaw_stick(ctx)} {SCOUT_ROTATE_DURATION_S:.0f}",
     )
 
@@ -183,20 +186,15 @@ class ScoutRole(Role):
             return self._decide_bank(ctx, rs, fc_idle, since_push)
         return self._decide_sortie(ctx, rs, script_done)
 
-    # -- sortie: centre via a side marker, then rotate continuously -----------
+    # -- sortie: hold the set altitude and rotate continuously in place -------
     def _decide_sortie(self, ctx: RoleContext, rs, script_done: bool) -> Decision:
-        # APPROACH 11/15 to 6 m (vision-home to the centre), then rotate in place
-        # CONTINUOUSLY (no land). We only push a fresh cycle if the FC actually
-        # goes idle (after the long rotation elapses or an emergency land); the
-        # new APPROACH then re-acquires a side marker and re-centres.
+        # Spin in place at the set altitude (no APPROACH — see _center_script).
+        # Only re-push if the FC actually goes idle (long rotation elapsed or an
+        # emergency land), so the scout keeps rotating until EMERGENCY LAND.
         if rs.phase == "scout_center" and not script_done:
-            return noop(f"scout: centred via marker {rs.scratch.get('center_marker')}"
-                        f", rotating")
-        marker = _pick_center_marker(ctx, rs)
-        rs.scratch["center_marker"] = marker
-        return push(_center_script(ctx, marker), new_phase="scout_center",
-                    reason=f"scout: APPROACH {marker} {CENTER_STANDOFF_M:g}m -> "
-                           f"centre, then rotate continuously")
+            return noop("scout: rotating in place at centre")
+        return push(_center_script(ctx), new_phase="scout_center",
+                    reason="scout: rotate in place at centre (continuous)")
 
     # -- bank: recall into our home zone and rotate --------------------------
     def _decide_bank(self, ctx: RoleContext, rs, fc_idle: bool,
