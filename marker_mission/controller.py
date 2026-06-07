@@ -79,6 +79,8 @@ class Phase(enum.Enum):
     SCOUT     = "scout"     # mission-script SCOUT (slow 360° yaw spin)
     MOVE_IMU  = "move_imu"  # mission-script FB_IMU / LR_IMU / UD_IMU
     AUTO_ATTACK = "auto_attack"  # reactive end-to-end attack (own state machine)
+    THREAT_OBSERVE = "threat_observe"  # enemy drone ≥150 px: hover + watch
+    THREAT_EVADE   = "threat_evade"    # still present after 5 s: lateral evade
     LAND      = "land"
     DONE      = "done"
     ABORT     = "abort"
@@ -629,6 +631,13 @@ class MissionState:
 
     abort_reason: str = ""
     note: str = ""                                            # informational
+
+    # Enemy-drone threat response. Set when a ≥150 px blob is first seen
+    # and cleared once the threat disappears. The suspended_* fields save
+    # the phase + step index so we can resume exactly where we left off.
+    threat_observe_since: Optional[float] = None    # monotonic when threat began
+    threat_suspended_phase: Optional['Phase'] = None
+    threat_suspended_step_idx: int = -1
     # Emergency re-arm: set by telemetry_worker when the drone lands
     # unexpectedly mid-mission. While True the controller sends only
     # RC(0,0,0,0) and waits. Cleared once a re-takeoff succeeds.
@@ -786,6 +795,7 @@ class MissionController:
                  telemetry_provider,            # callable -> TelemetrySnapshot
                  on_phase_change=None,
                  arena_provider=None,           # callable -> Optional[ArenaConfig]
+                 drone_threat_provider=None,    # callable -> int (max blob width px)
                  ):
         self.api = api
         self.cfg = cfg
@@ -797,6 +807,7 @@ class MissionController:
         # markers and score candidate yaws. Optional; without an
         # arena_provider TO falls back to "no yaw drive" for auto.
         self.get_arena = arena_provider
+        self.get_drone_threat = drone_threat_provider   # callable -> int px, or None
 
         # PD/PID controllers. ``ki`` defaults to 0 in cfg, so today's
         # behaviour (pure PD) is preserved unless the operator bumps
@@ -1196,6 +1207,9 @@ class MissionController:
 
                 tel = self._refresh_inputs(now)
 
+                # ── Enemy-drone threat check ─────────────────────────────────
+                self._check_drone_threat(now)
+
                 # Dispatch on phase ------------------------------------------
                 phase = self.state.phase
                 if phase == Phase.TAKEOFF:
@@ -1241,6 +1255,10 @@ class MissionController:
                     # moveBy.wait). Same safety-net behaviour as
                     # Phase.ROTATE.
                     self._send_rc(0, 0, 0, 0)
+                elif phase == Phase.THREAT_OBSERVE:
+                    self._step_threat_observe(tel, now)
+                elif phase == Phase.THREAT_EVADE:
+                    self._step_threat_evade(tel, now)
                 elif phase == Phase.LAND:
                     self._step_land(tel, now)
                 elif phase in (Phase.DONE, Phase.ABORT):
@@ -3256,6 +3274,134 @@ class MissionController:
         with self.state.lock:
             self.state.note = (f"DANCE {mode}  r={r_xy:.2f}m  dh={dh:+.2f}m  "
                                f"t={elapsed:.1f}/{(until - started):.1f}s")
+
+    # ------------------------------------------------- enemy drone avoidance
+
+    # Phases that may be interrupted by a drone threat.
+    _THREAT_INTERRUPTIBLE = frozenset({
+        Phase.SEARCH, Phase.ALIGN, Phase.HEIGHT_ALIGN,
+        Phase.APPROACH, Phase.HOLD, Phase.IDLE, Phase.HEIGHT,
+        Phase.GOTO, Phase.SCOUT,
+    })
+    # Blob width (px) threshold that triggers threat mode.
+    _THREAT_BLOB_PX = 150
+    # Seconds the threat must persist before evade manoeuvre starts.
+    _THREAT_OBSERVE_S = 5.0
+    # RC magnitude for lateral evade (toward arena centre).
+    _THREAT_EVADE_RC = 12
+
+    def _check_drone_threat(self, now: float) -> None:
+        """Called each control tick before phase dispatch.
+
+        Transitions to THREAT_OBSERVE when a ≥150 px blob appears, and
+        resumes (or re-enters current step) once the threat clears.
+        """
+        if self.get_drone_threat is None:
+            return
+        threat_w = self.get_drone_threat()
+        phase = self.state.phase
+
+        if threat_w >= self._THREAT_BLOB_PX:
+            if phase in self._THREAT_INTERRUPTIBLE:
+                # Suspend current phase.
+                with self.state.lock:
+                    self.state.threat_suspended_phase = phase
+                    self.state.threat_suspended_step_idx = self.state.mission_step_idx
+                    self.state.threat_observe_since = now
+                self._set_phase(Phase.THREAT_OBSERVE,
+                                f"enemy drone {threat_w}px wide")
+            elif phase == Phase.THREAT_OBSERVE:
+                # Still threatened — keep counting (handled in _step_threat_observe)
+                pass
+            elif phase == Phase.THREAT_EVADE:
+                # Still evading — let _step_threat_evade handle it
+                pass
+        else:
+            # Threat cleared
+            if phase in (Phase.THREAT_OBSERVE, Phase.THREAT_EVADE):
+                self._resume_after_threat(now)
+
+    def _resume_after_threat(self, now: float) -> None:
+        """Restore the suspended phase. If the target marker is no longer
+        visible, re-enter the current mission step from scratch so SEARCH
+        picks up the marker again."""
+        with self.state.lock:
+            saved_phase = self.state.threat_suspended_phase
+            saved_idx   = self.state.threat_suspended_step_idx
+            script      = list(self.state.mission_script)
+            self.state.threat_observe_since = None
+            self.state.threat_suspended_phase = None
+            self.state.threat_suspended_step_idx = -1
+
+        pose = self.get_pose()
+        marker_visible = (pose is not None)
+
+        if not marker_visible and 0 <= saved_idx < len(script):
+            # Target marker lost — restart current step.
+            print("[ctrl] threat cleared, marker lost — restarting step "
+                  f"{saved_idx}: {script[saved_idx].kind}")
+            with self.state.lock:
+                self.state.mission_step_idx = saved_idx
+                self.state.current_step_kind = script[saved_idx].kind
+            self._apply_step_to_phase(script[saved_idx], "threat cleared, marker lost")
+        elif saved_phase is not None:
+            # Marker still visible (or no step to re-enter) — resume.
+            print(f"[ctrl] threat cleared — resuming {saved_phase.value}")
+            self._set_phase(saved_phase, "threat cleared")
+        else:
+            # No suspended phase recorded (shouldn't happen).
+            self._set_phase(Phase.SEARCH, "threat cleared, no saved phase")
+
+    def _step_threat_observe(self,
+                             tel: Optional['TelemetrySnapshot'],
+                             now: float) -> None:
+        """Hover in place and observe. After _THREAT_OBSERVE_S transition
+        to THREAT_EVADE."""
+        self._send_rc(0, 0, 0, 0)
+        with self.state.lock:
+            since = self.state.threat_observe_since or now
+            threat_w = self.get_drone_threat() if self.get_drone_threat else 0
+            self.state.note = (
+                f"THREAT observe {now - since:.1f}/{self._THREAT_OBSERVE_S:.0f}s "
+                f"blob={threat_w}px")
+        if now - since >= self._THREAT_OBSERVE_S:
+            with self.state.lock:
+                self.state.threat_observe_since = now  # reset timer for evade
+            self._set_phase(Phase.THREAT_EVADE, "threat persists — evading")
+
+    def _step_threat_evade(self,
+                           tel: Optional['TelemetrySnapshot'],
+                           now: float) -> None:
+        """Fly laterally toward the arena centre to pass the enemy drone.
+        Direction is determined from world_position_m if available,
+        otherwise a fixed positive rc_lr."""
+        rc_lr = self._THREAT_EVADE_RC  # default: right
+
+        # Compute direction toward arena centre (world x=0, y=0).
+        with self.state.lock:
+            wp = self.state.world_position_m
+            arena_yaw = self.state.arena_yaw_deg
+
+        if wp is not None and arena_yaw is not None:
+            # Arena-frame displacement toward centre: -wx in x, -wy in y.
+            dx_arena = -wp[0]
+            dy_arena = -wp[1]
+            # Rotate arena-frame vector to body-right using arena_yaw.
+            # arena_yaw is CW from +y (front wall), so body-right component:
+            th = math.radians(arena_yaw)
+            # body-right = dx_arena * sin(th) + dy_arena * (-cos(th))  ... arena→body
+            # Simpler: project onto body-right axis.
+            body_right_component = (dx_arena * math.sin(th)
+                                    - dy_arena * math.cos(th))
+            rc_lr = self._THREAT_EVADE_RC if body_right_component >= 0 else -self._THREAT_EVADE_RC
+
+        self._send_rc(rc_lr, 0, 0, 0)
+        threat_w = self.get_drone_threat() if self.get_drone_threat else 0
+        with self.state.lock:
+            since = self.state.threat_observe_since or now
+            self.state.note = (
+                f"THREAT evade rc_lr={rc_lr:+d}  blob={threat_w}px  "
+                f"t={now - since:.1f}s")
 
     # --------------------------------------------------- mission script driver
     def _terminate_script(self, reason: str) -> None:

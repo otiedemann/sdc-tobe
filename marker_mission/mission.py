@@ -119,6 +119,22 @@ class _ArenaHolder:
             return self._arena
 
 
+class _DroneThreatHolder:
+    """Thread-safe: largest confirmed enemy-drone blob width this frame (px).
+    0 means no threat currently detected."""
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._max_w: int = 0
+
+    def set(self, max_w: int) -> None:
+        with self._lock:
+            self._max_w = max_w
+
+    def get(self) -> int:
+        with self._lock:
+            return self._max_w
+
+
 # ---------------------------------------------------------------------------
 # Subcommands
 # ---------------------------------------------------------------------------
@@ -300,6 +316,7 @@ def cmd_fly(args: argparse.Namespace) -> int:
 
     pose_holder = _PoseHolder()
     tel_holder = _TelemetryHolder()
+    drone_threat_holder = _DroneThreatHolder()
     latest_ann_frame = LatestFrame()
 
     # ---------- 3. Set up mission state, recorder, UI ---------------------
@@ -444,7 +461,8 @@ def cmd_fly(args: argparse.Namespace) -> int:
                                    frame_pose_provider=pose_holder.get,
                                    telemetry_provider=tel_holder.get,
                                    on_phase_change=on_phase_change,
-                                   arena_provider=arena_holder.get)
+                                   arena_provider=arena_holder.get,
+                                   drone_threat_provider=drone_threat_holder.get)
 
     # The Stop button calls controller.stop() which blocks for up to ~25 s
     # waiting for the safe-shutdown to finish. We don't want the Flask
@@ -1290,6 +1308,8 @@ def cmd_fly(args: argparse.Namespace) -> int:
                 # ── Other-drone detection + overlay ───────────────────
                 raw_blobs = _detect_drones(frame)
                 confirmed  = _temporal_filter(raw_blobs)
+                _threat_w = confirmed[0][2] if confirmed else 0
+                drone_threat_holder.set(_threat_w)
                 if confirmed:
                     # Largest = nearest (red), rest yellow
                     for i, (bx, by, bw, bh) in enumerate(confirmed):
