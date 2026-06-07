@@ -300,7 +300,7 @@ class RoleContext:
     # This attacker's DISTINCT arrival bearing (deg, relative to the home-wall
     # marker normal) for its RTH GO_HOME, so concurrently-returning attackers
     # fan out to different points around the marker instead of converging and
-    # colliding (e.g. 3 attackers -> -45 / 0 / +45). Assigned by the runner.
+    # colliding (e.g. 3 attackers -> -30 / 0 / +30). Assigned by the runner.
     # None -> 0 (head-on).
     rth_approach_angle_deg: Optional[float] = None
 

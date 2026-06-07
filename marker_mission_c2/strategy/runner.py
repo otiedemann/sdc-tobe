@@ -780,9 +780,11 @@ class SwarmRunner:
         A drone with an explicit ``go_home_angle_deg`` setting uses that value
         (operator override). The remaining (auto) attackers are spread
         symmetrically across [-A, +A] by stable fc-name order: 1 -> 0; 2 ->
-        -45/+45; 3 -> -45/0/+45; more -> evenly within +-60 (GO_HOME caps at
-        +-80). Combined with the distinct RTH cruise altitude, returning
-        attackers are separated both vertically (cruise) and laterally (arrival).
+        -30/+30; 3 -> -30/0/+30; more -> evenly within +-60 (GO_HOME caps at
+        +-80). 30 deg (was 45) keeps the fan tight enough that each attacker
+        still arrives near the home wall without a wide detour. Combined with
+        the distinct RTH cruise altitude, returning attackers are separated both
+        vertically (cruise) and laterally (arrival).
         """
         our = (s.markers.our_team or "").lower()
         atk = sorted(
@@ -802,7 +804,7 @@ class SwarmRunner:
         if n == 1:
             out[auto[0].fc_name] = 0.0
         elif n >= 2:
-            half = 45.0 if n <= 3 else 60.0
+            half = 30.0 if n <= 3 else 60.0
             for i, d in enumerate(auto):
                 out[d.fc_name] = round(-half + (2.0 * half) * i / (n - 1), 1)
         return out
