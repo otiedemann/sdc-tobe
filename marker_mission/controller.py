@@ -643,6 +643,17 @@ class MissionState:
     # RC(0,0,0,0) and waits. Cleared once a re-takeoff succeeds.
     emergency_rearm: bool = False
 
+    # Two-stage telemetry-stall flags. ``telemetry_stalled`` is the
+    # diagnostic level (age > detect_threshold) -- marks the CSV /
+    # journal so we can quantify stalls without intervention. The
+    # higher-threshold ``telemetry_rc_gated`` reflects ESCALATION:
+    # _send_rc has actually zeroed its output because the link's been
+    # stalled long enough (age > gate_threshold) that acting on the
+    # frozen TelemetrySnapshot is unsafe. Either flag clears on the
+    # first fresh sample.
+    telemetry_stalled: bool = False
+    telemetry_rc_gated: bool = False
+
     lock: threading.Lock = field(default_factory=threading.Lock)
 
     def reset(self, cfg: MissionConfig) -> None:
@@ -734,6 +745,8 @@ class MissionState:
                 "rc": {"lr": self.last_rc[0], "fb": self.last_rc[1],
                        "ud": self.last_rc[2], "yaw": self.last_rc[3]},
                 "telemetry": tel,
+                "telemetry_stalled": bool(self.telemetry_stalled),
+                "telemetry_rc_gated": bool(self.telemetry_rc_gated),
                 "marker_seen_age_s": (time.monotonic() - self.last_marker_seen_at)
                                        if self.last_marker_seen_at else None,
                 "mission_script": script_lines,
@@ -796,12 +809,29 @@ class MissionController:
                  on_phase_change=None,
                  arena_provider=None,           # callable -> Optional[ArenaConfig]
                  drone_threat_provider=None,    # callable -> int (max blob width px)
+                 telemetry_age_provider=None,   # callable -> Optional[float] (s since last fresh tel)
                  ):
         self.api = api
         self.cfg = cfg
         self.state = state
         self.get_pose = frame_pose_provider
         self.get_tel = telemetry_provider
+        # Optional callable returning seconds since the last fresh
+        # telemetry sample (mission.py wires this to
+        # tel_holder.age_s). When provided AND
+        # cfg.enable_telemetry_stall_detector is True AND the returned
+        # age exceeds cfg.telemetry_stall_gate_threshold_s, _send_rc
+        # zeros the output so we don't keep slamming the drone with
+        # stale-state-derived RC during a wifi / Olympe stream stall.
+        self.get_tel_age = telemetry_age_provider
+        # Stall tracking for one-shot logs + state.snapshot exposure.
+        # Two latched levels: _stall_detect_active = "marked in CSV"
+        # (past cfg.telemetry_stall_detect_threshold_s), _stall_gate_active
+        # = "RC actually zeroed" (past cfg.telemetry_stall_gate_threshold_s).
+        # Each transition (enter/leave) logs exactly once so journal volume
+        # stays sane on a flaky link.
+        self._stall_detect_active: bool = False
+        self._stall_gate_active: bool = False
         self.on_phase_change = on_phase_change
         # Lets the TO step's auto-yaw heuristic enumerate reference
         # markers and score candidate yaws. Optional; without an
@@ -4073,6 +4103,55 @@ class MissionController:
                     ud = min(0, ud)
                 if h_m <= cfg.min_height_m:
                     ud = max(0, ud)
+        # ── Telemetry stall: two-stage (detect + gate) ───────────────
+        # If the drone-link has stalled (tel_holder hasn't been
+        # refreshed for a while), we don't want the controller pushing
+        # the PD-derived RC onto the wire -- it was computed against a
+        # stale TelemetrySnapshot and is almost certainly wrong. Two
+        # thresholds:
+        #   - detect (~200ms): mark the stall in CSV / journal. No
+        #     RC change. Catches short blips for diagnostics.
+        #   - gate   (~500ms): escalate -- replace lr/fb/ud/yaw with
+        #     zero so the drone reverts to onboard hover-hold.
+        # dry_run bypasses (pre-flight dry-run has no live drone).
+        if (not dry_run
+                and getattr(cfg, "enable_telemetry_stall_detector", True)
+                and self.get_tel_age is not None):
+            try:
+                age = self.get_tel_age()
+            except Exception:
+                age = None
+            detect_th = float(getattr(
+                cfg, "telemetry_stall_detect_threshold_s", 0.2))
+            gate_th = float(getattr(
+                cfg, "telemetry_stall_gate_threshold_s", 0.5))
+            in_detect = (age is not None and age > detect_th)
+            in_gate = (age is not None and age > gate_th)
+            # ----- detect-level transitions (diagnostic only) -----
+            if in_detect and not self._stall_detect_active:
+                print(f"[ctrl] telemetry stall (age={age:.2f}s "
+                      f"> {detect_th:.2f}s) -- marking CSV")
+                self._stall_detect_active = True
+            elif not in_detect and self._stall_detect_active:
+                age_s = "n/a" if age is None else f"{age:.2f}s"
+                print(f"[ctrl] telemetry recovered (age={age_s})")
+                self._stall_detect_active = False
+            # ----- gate-level transitions (RC override) -----
+            if in_gate and not self._stall_gate_active:
+                print(f"[ctrl] telemetry stall escalated "
+                      f"(age={age:.2f}s > {gate_th:.2f}s) "
+                      f"-- gating RC to zero")
+                self._stall_gate_active = True
+            elif not in_gate and self._stall_gate_active:
+                age_s = "n/a" if age is None else f"{age:.2f}s"
+                print(f"[ctrl] telemetry gate released (age={age_s}) "
+                      f"-- resuming RC")
+                self._stall_gate_active = False
+            if self._stall_gate_active:
+                lr = fb = ud = yaw = 0
+            with self.state.lock:
+                self.state.telemetry_stalled = self._stall_detect_active
+                self.state.telemetry_rc_gated = self._stall_gate_active
         with self.state.lock:
             self.state.last_rc = (lr, fb, ud, yaw)
         if dry_run:

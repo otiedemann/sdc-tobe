@@ -386,6 +386,31 @@ class MissionConfig:
     kalman_vel_meas_var: float = 0.0025      # IMU R, sigma~5cm/s
     kalman_reset_gap_s: float = 0.5          # auto-reset on dt larger than this
 
+    # ── Telemetry-stall detector (safety) ──────────────────────────────
+    # When the drone-link stalls (wifi packet loss, Olympe stream
+    # interruption, drone-side telemetry pipeline glitch), the
+    # _TelemetryHolder keeps returning the LAST snapshot. The PD law
+    # then computes RC output from frozen state and keeps slamming
+    # whatever value it last computed -- in one observed flight,
+    # rc_lr=+28 for 14 s straight while we had zero visibility into
+    # what the drone was actually doing. This detector zeros the
+    # outgoing RC whenever the holder's age exceeds the threshold,
+    # so the drone reverts to whatever it does on rc=0 (Anafi
+    # auto-hold) rather than racing against a stale model. On every
+    # fresh sample the gate releases; the controller resumes normally.
+    # Default ON because it's pure safety -- a stale tel snapshot can
+    # never command the right thing.
+    enable_telemetry_stall_detector: bool = True
+    # Two-stage thresholds. detect_threshold marks the stall in the
+    # CSV / journal so we can quantify how often we lose telemetry
+    # without intervening (catches short blips that the gate ignores).
+    # gate_threshold escalates to "actually do something" -- the
+    # controller zeros RC so we stop slamming the drone with a stale-
+    # state-derived command. detect should be <= gate; equal values
+    # mean "detect == gate" (single-stage behaviour).
+    telemetry_stall_detect_threshold_s: float = 0.2
+    telemetry_stall_gate_threshold_s: float = 0.5
+
     # ------------------------------------------------------------------------
     def update_from_dict(self, values: dict) -> dict:
         """Apply a {field: value} dict to this cfg in-place. Returns a
@@ -788,6 +813,21 @@ TUNING_FIELDS = {
         "unit": "s", "step": 0.1,
         "desc": "Auto-reset the KF when the inter-tick gap exceeds this. Prevents large dt blowing up covariance during long marker-loss windows.",
     },
+
+    "enable_telemetry_stall_detector": {
+        "label": "Telemetry stall detector", "kind": "bool",
+        "desc": "When ON, the controller zeros its RC output if the telemetry holder hasn't produced a fresh sample within telemetry_stall_gate_threshold_s. Prevents the PD law from racing against a frozen drone-state snapshot during a wifi / Olympe stream stall -- otherwise the controller keeps slamming the last computed rc (we've seen rc_lr=+28 for 14s straight while telemetry was stuck). Default ON because acting on stale state can never be correct.",
+    },
+    "telemetry_stall_detect_threshold_s": {
+        "label": "Stall detect threshold", "kind": "float",
+        "unit": "s", "step": 0.05,
+        "desc": "Telemetry age above which we MARK a stall in the CSV (telemetry_stalled column) and emit a journal line. Doesn't gate RC -- purely diagnostic, so short blips (a couple missed packets) show up in the flight log even if they didn't justify intervention. Anafi normally pushes events at >10 Hz so >0.2 s is already a real anomaly. Lower it during development to catch every micro-stall.",
+    },
+    "telemetry_stall_gate_threshold_s": {
+        "label": "Stall gate threshold", "kind": "float",
+        "unit": "s", "step": 0.05,
+        "desc": "Telemetry age above which we ESCALATE to gating RC output to zero. The drone reverts to its onboard hover-hold instead of receiving a stale-state-derived RC command. Must be >= detect threshold. 0.5 s = ~5-10 missed Anafi packets, severe stall. Lower for more aggressive intervention; raise to give the controller more rope on a flaky link.",
+    },
 }
 
 TUNING_GROUPS = [
@@ -835,6 +875,10 @@ TUNING_GROUPS = [
          "kalman_pos_meas_var",
          "kalman_vel_meas_var",
          "kalman_reset_gap_s"]),
+    ("Safety: telemetry stall",
+        ["enable_telemetry_stall_detector",
+         "telemetry_stall_detect_threshold_s",
+         "telemetry_stall_gate_threshold_s"]),
 ]
 
 

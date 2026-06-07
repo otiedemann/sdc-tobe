@@ -89,14 +89,33 @@ class _TelemetryHolder:
     def __init__(self):
         self._lock = threading.Lock()
         self._tel: Optional[TelemetrySnapshot] = None
+        # Process-monotonic timestamp of the last set() call with non-None
+        # data. The stall detector compares (time.monotonic() -
+        # _last_set_at) against cfg.telemetry_stall_*_threshold_s to
+        # decide whether to mark / gate. 0.0 means "never received a
+        # sample yet" (pre-flight, drone not connected).
+        self._last_set_at: float = 0.0
 
     def set(self, tel: Optional[TelemetrySnapshot]) -> None:
         with self._lock:
             self._tel = tel
+            if tel is not None:
+                self._last_set_at = time.monotonic()
 
     def get(self) -> Optional[TelemetrySnapshot]:
         with self._lock:
             return self._tel
+
+    def age_s(self) -> Optional[float]:
+        """Seconds since the last set() with non-None data, or None if
+        no sample has arrived yet. Used by the controller's stall
+        detector -- when this exceeds cfg.telemetry_stall_gate_threshold_s,
+        the controller zeros its RC output instead of acting on a
+        stale TelemetrySnapshot."""
+        with self._lock:
+            if self._last_set_at == 0.0:
+                return None
+            return time.monotonic() - self._last_set_at
 
 
 class _ArenaHolder:
@@ -466,7 +485,8 @@ def cmd_fly(args: argparse.Namespace) -> int:
                                    telemetry_provider=tel_holder.get,
                                    on_phase_change=on_phase_change,
                                    arena_provider=arena_holder.get,
-                                   drone_threat_provider=drone_threat_holder.get)
+                                   drone_threat_provider=drone_threat_holder.get,
+                                   telemetry_age_provider=tel_holder.age_s)
 
     # The Stop button calls controller.stop() which blocks for up to ~25 s
     # waiting for the safe-shutdown to finish. We don't want the Flask

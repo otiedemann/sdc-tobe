@@ -136,6 +136,10 @@ _PAGE_HEADER = """
     <a href="/hardware" class="{{ 'active' if active=='hardware' else '' }}">Hardware</a>
   </nav>
   <div style="margin-left:auto; display:flex; align-items:center; gap:.6rem;">
+    <span id="tel-stall" title="telemetry stall indicator"
+          style="display:none; font-size:.72rem; font-weight:600; color:#0c0f12;
+                 background:#f0b429; padding:.1rem .4rem; border-radius:3px;
+                 font-family:ui-monospace,monospace;">STALL</span>
     <div id="wlan-info" style="font-size:.72rem; color:#bbb; line-height:1.5;
          font-family:monospace; white-space:nowrap;
          border:1px solid #444; border-radius:4px; padding:4px 8px;">—</div>
@@ -1653,6 +1657,28 @@ async function refresh() {
       }
     }
     $('phase').textContent = (REPLAY_ID ? 'replay phase: ' : 'phase: ') + s.phase;
+    // Header telemetry-stall indicator. Hidden when healthy; amber for
+    // detect-level stall (CSV marked, RC still flowing); red for gate-
+    // level stall (RC has been forced to zero). Tiny update so the
+    // 250 ms refresh budget isn't strained on every page.
+    const ts = $('tel-stall');
+    if (ts) {
+      const gated = !!s.telemetry_rc_gated;
+      const stalled = !!s.telemetry_stalled;
+      if (gated) {
+        ts.style.display = '';
+        ts.textContent = 'STALL · RC=0';
+        ts.style.background = 'var(--bad)';
+        ts.style.color = '#fff';
+      } else if (stalled) {
+        ts.style.display = '';
+        ts.textContent = 'STALL';
+        ts.style.background = '#f0b429';
+        ts.style.color = '#0c0f12';
+      } else {
+        ts.style.display = 'none';
+      }
+    }
     updateStatus(s);
     updateCharts(s);
     if (REPLAY_ID) await refreshReplayStatus();

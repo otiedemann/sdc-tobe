@@ -62,6 +62,15 @@ _CSV_FIELDS = [
     "tel_height_cm", "tel_flight_time_s",
     "tel_vgx", "tel_vgy", "tel_vgz",
     "tel_flying", "tel_connected",
+    # Two-stage stall flags. ``telemetry_stalled`` = "diagnostic"
+    # level (age > detect_threshold ~ 200 ms), marks the CSV without
+    # changing RC -- catches short blips for offline analysis. The
+    # higher-threshold ``telemetry_rc_gated`` = "controller actually
+    # zeroed RC" because the link was stalled long enough (age >
+    # gate_threshold ~ 500 ms) to make pushing PD output dangerous.
+    # Grep for telemetry_rc_gated=1 to find moments where the
+    # recorded rc=(0,0,0,0) reflects a safety override, not PD intent.
+    "telemetry_stalled", "telemetry_rc_gated",
     # Note + abort reason carry whatever the controller's state
     # machine has surfaced this tick. The killswitch / Stop button
     # write a non-empty abort_reason synchronously into state so
@@ -368,6 +377,10 @@ class FlightRecorder:
                 row[dst] = v if v is not None else ""
             row["tel_flying"] = "1" if tel_raw.get("flying") else "0"
             row["tel_connected"] = "1" if tel_raw.get("connected") else "0"
+            row["telemetry_stalled"] = ("1" if snap.get("telemetry_stalled")
+                                        else "0")
+            row["telemetry_rc_gated"] = ("1" if snap.get("telemetry_rc_gated")
+                                         else "0")
             row["note"] = (snap.get("note") or "")
             row["abort_reason"] = (snap.get("abort_reason") or "")
             vmids = snap.get("visible_marker_ids") or []
