@@ -823,6 +823,32 @@ def draw_arena_minimap(frame_bgr: np.ndarray,
                     cv2.LINE_AA)
 
 
+def _quad_area(p: MarkerPose) -> float:
+    c = p.corners
+    x, y = c[:, 0], c[:, 1]
+    return 0.5 * abs(float(np.dot(x, np.roll(y, 1)) - np.dot(y, np.roll(x, 1))))
+
+
+def top_n_poses(poses: list[MarkerPose], n: int = 3,
+                target_id: Optional[int] = None) -> list[MarkerPose]:
+    """Return up to *n* poses, keeping the *n* largest by pixel area.
+
+    The target marker is always included even if it falls outside the
+    top-n by area.  Callers use this both inside *annotate_frame* and to
+    derive the ``visible_marker_ids`` passed to *draw_arena_minimap* so
+    that all video annotations are consistently limited to the same set.
+    """
+    if len(poses) <= n:
+        return list(poses)
+    by_area = sorted(poses, key=_quad_area, reverse=True)
+    result = by_area[:n]
+    if target_id is not None and not any(p.marker_id == target_id for p in result):
+        replacement = next((p for p in by_area if p.marker_id == target_id), None)
+        if replacement is not None:
+            result[n - 1] = replacement
+    return result
+
+
 def annotate_frame(frame_bgr: np.ndarray,
                    poses: list[MarkerPose],
                    target_id: Optional[int] = None,
@@ -835,18 +861,7 @@ def annotate_frame(frame_bgr: np.ndarray,
     Only the 3 largest markers (by pixel area) are drawn. The target marker
     is always included even if it is not among the 3 largest.
     """
-    def _quad_area(p: MarkerPose) -> float:
-        c = p.corners
-        x, y = c[:, 0], c[:, 1]
-        return 0.5 * abs(float(np.dot(x, np.roll(y, 1)) - np.dot(y, np.roll(x, 1))))
-
-    if len(poses) > 3:
-        by_area = sorted(poses, key=_quad_area, reverse=True)
-        top3 = by_area[:3]
-        # Always keep the target even if it fell outside the top-3.
-        if target_id is not None and not any(p.marker_id == target_id for p in top3):
-            top3[2] = next((p for p in by_area if p.marker_id == target_id), top3[2])
-        poses = top3
+    poses = top_n_poses(poses, n=3, target_id=target_id)
 
     out = frame_bgr.copy()
     H, W = out.shape[:2]

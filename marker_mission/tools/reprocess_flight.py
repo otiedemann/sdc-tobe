@@ -52,7 +52,7 @@ import math
 
 from ..arena import ArenaConfig, estimate_position, load_priority_arena
 from ..aruco_detector import (ArucoDetector, annotate_frame,
-                                draw_arena_minimap)
+                                draw_arena_minimap, top_n_poses)
 from ..calibration_store import Calibration, CalibrationStore
 from ..config import CALIB_DIR
 
@@ -288,7 +288,7 @@ def reprocess(flight_dir: Path,
         ay_old = _arena_yaw_from(prev_old, poses, arena_old)
         ay_new = _arena_yaw_from(prev_new, poses, arena_new)
 
-        seen_ids = [int(p.marker_id) for p in poses]
+        seen_ids = [int(p.marker_id) for p in top_n_poses(poses, 3)]
 
         # OLD frame.
         ann_old = annotate_frame(frame, poses)

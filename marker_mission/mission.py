@@ -47,7 +47,7 @@ import cv2
 import numpy as np
 
 from .aruco_detector import (ArucoDetector, MarkerPose, annotate_frame,
-                              draw_arena_minimap)
+                              draw_arena_minimap, top_n_poses)
 from .calibration_store import (Calibration, CalibrationStore,
                                 calibrate_from_video)
 from .arena import (ArenaConfig, ARENA_MAG_SLACK_DEG,
@@ -1353,7 +1353,8 @@ def cmd_fly(args: argparse.Namespace) -> int:
                     with state.lock:
                         wp = state.world_position_m
                         ay_deg = state.arena_yaw_deg
-                        seen_ids = list(state.visible_marker_ids)
+                        seen_ids = [p.marker_id for p in
+                                    top_n_poses(poses, 3, active_mid)]
                     draw_arena_minimap(
                         ann,
                         arena_width_m=arena_for_swap.width_m,
