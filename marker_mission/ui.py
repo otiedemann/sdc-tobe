@@ -4550,6 +4550,7 @@ _PAGE_HARDWARE = _PAGE_BASE_CSS + _PAGE_HEADER + _COMMON_SCRIPT + _PAGE_GRID_OPE
       if (d.ok) {
         _setMsg('CSV uploaded (' + d.count + ' drones).', 'var(--good)');
         await loadDrones();
+        await loadWifiNetworks(false);
       } else {
         _setMsg('Upload failed: ' + (d.error || r.status), 'var(--bad)');
       }
