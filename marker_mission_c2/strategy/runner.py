@@ -748,27 +748,37 @@ class SwarmRunner:
         (relative to the home back-wall marker normal) each attacker uses for its
         RTH GO_HOME, so attackers returning at the same time fan out to DIFFERENT
         points around the marker instead of converging on one standoff and
-        colliding. Spread symmetrically across [-A, +A] by stable fc-name order:
-        1 -> 0; 2 -> -45/+45; 3 -> -45/0/+45; more -> evenly within +-60 (GO_HOME
-        caps at +-80). Combined with the distinct RTH cruise altitude, returning
+        colliding.
+
+        A drone with an explicit ``go_home_angle_deg`` setting uses that value
+        (operator override). The remaining (auto) attackers are spread
+        symmetrically across [-A, +A] by stable fc-name order: 1 -> 0; 2 ->
+        -45/+45; 3 -> -45/0/+45; more -> evenly within +-60 (GO_HOME caps at
+        +-80). Combined with the distinct RTH cruise altitude, returning
         attackers are separated both vertically (cruise) and laterally (arrival).
         """
         our = (s.markers.our_team or "").lower()
-        attackers = sorted(
-            d.fc_name for d in s.drones
-            if d.enabled and d.role == "attacker"
-            and d.team and d.team.lower() == our
+        atk = sorted(
+            (d for d in s.drones
+             if d.enabled and d.role == "attacker"
+             and d.team and d.team.lower() == our),
+            key=lambda d: d.fc_name,
         )
-        n = len(attackers)
-        if n == 0:
-            return {}
+        out: Dict[str, float] = {}
+        # Operator-pinned angles first.
+        auto = [d for d in atk if d.go_home_angle_deg is None]
+        for d in atk:
+            if d.go_home_angle_deg is not None:
+                out[d.fc_name] = float(d.go_home_angle_deg)
+        # Auto-spread the rest across [-A, +A].
+        n = len(auto)
         if n == 1:
-            return {attackers[0]: 0.0}
-        half = 45.0 if n <= 3 else 60.0
-        return {
-            fc: round(-half + (2.0 * half) * i / (n - 1), 1)
-            for i, fc in enumerate(attackers)
-        }
+            out[auto[0].fc_name] = 0.0
+        elif n >= 2:
+            half = 45.0 if n <= 3 else 60.0
+            for i, d in enumerate(auto):
+                out[d.fc_name] = round(-half + (2.0 * half) * i / (n - 1), 1)
+        return out
 
     # ------------------------------------------------------------------
     # Collision avoidance

@@ -20,8 +20,10 @@ Nineteen commands. Suffix convention:
 
     TAKEOFF
     APPROACH [<marker-id>] [<distance>]
-    GO_HOME [<marker-id>] [<distance>] [<tol>]   loose approach (default 3.5m +/- 0.5m)
-                                                       — just get inside the home zone
+    GO_HOME [<marker-id>] [<distance>] [<tol>] [<hdg>]   loose approach (default 3.5m
+                                                       +/- 0.5m) — just get inside the
+                                                       home zone. hdg = arrival bearing
+                                                       -80..+80 deg off the marker normal
     HOOVER   [<seconds>]
     AWAIT    <marker-id> <timeout-seconds>
     PAUSE    <seconds>
