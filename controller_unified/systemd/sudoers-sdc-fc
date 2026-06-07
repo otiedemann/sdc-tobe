@@ -17,7 +17,8 @@ Cmnd_Alias SDC_FC_SYSTEMCTL = /usr/bin/systemctl start sdc-fc.service, \
                               /usr/bin/systemctl status sdc-fc.service
 Cmnd_Alias SDC_FC_INSTALL   = /home/sdc/sdc-tobe/controller_unified/systemd/install.sh
 Cmnd_Alias SDC_FC_WIFI      = /usr/bin/nmcli device wifi connect *, \
-                              /usr/bin/nmcli device wifi rescan
+                              /usr/bin/nmcli device wifi rescan, \
+                              /usr/bin/nmcli connection delete *
 sdc ALL=(root) NOPASSWD: SDC_FC_SYSTEMCTL, SDC_FC_INSTALL, SDC_FC_WIFI
 
 # ── Blanket alternative (NOT recommended) ──────────────────────────

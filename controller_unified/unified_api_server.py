@@ -7271,6 +7271,11 @@ def api_drones_switch():
                            capture_output=True, timeout=10)
             time.sleep(3.0)  # give scan time to complete
 
+            # Delete any stale NM connection profile for this SSID so it
+            # doesn't override our explicit password with missing/wrong credentials.
+            subprocess.run(["sudo", "nmcli", "connection", "delete", drone_name],
+                           capture_output=True, timeout=10)
+
             _drone_switch_status.update({
                 "status": "wifi",
                 "message": f"Connecting to WiFi SSID '{drone_name}'…",
