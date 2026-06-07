@@ -7267,7 +7267,7 @@ def api_drones_switch():
                 "status": "wifi",
                 "message": f"Connecting to WiFi SSID '{drone_name}'…",
             })
-            wifi_cmd = ["nmcli", "device", "wifi", "connect", drone_name]
+            wifi_cmd = ["sudo", "nmcli", "device", "wifi", "connect", drone_name]
             if drone_password:
                 wifi_cmd += ["password", drone_password]
             r = subprocess.run(wifi_cmd, capture_output=True, text=True, timeout=30)
