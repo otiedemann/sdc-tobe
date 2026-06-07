@@ -1880,7 +1880,10 @@ class MissionController:
         u_ud = (0.0 if abs(e_h) < cfg.height_deadband_m
                 else self.pd_height.step(e_h, now))
 
-        self._send_rc(lr=0, fb=0, ud=int(u_ud), yaw=int(u_yaw))
+        # Camera-based: skip the barometric altitude envelope so that a low
+        # barometer reading cannot block vision-commanded descent.
+        self._send_rc(lr=0, fb=0, ud=int(u_ud), yaw=int(u_yaw),
+                      altitude_envelope=False)
 
         drone_h_str = f"{drone_h:.2f}m" if drone_h is not None else "?"
         with self.state.lock:
@@ -2085,8 +2088,11 @@ class MissionController:
                 max(-pre_latch_limit, min(pre_latch_limit, e_yaw)), now
             )
 
+        # Height correction is camera-based: skip the barometric altitude
+        # envelope so a low barometer reading cannot block vision-commanded
+        # descent.
         self._send_rc(lr=int(u_lat), fb=int(u_fwd), ud=int(u_ud),
-                      yaw=int(u_yaw))
+                      yaw=int(u_yaw), altitude_envelope=False)
 
         # Settle detection. We capture the "settled long enough" decision
         # under the lock, then release before calling _set_phase -- which
@@ -4101,7 +4107,8 @@ class MissionController:
     # ---------------------------------------------------------------- helpers
     def _send_rc(self, lr: int, fb: int, ud: int, yaw: int,
                  dry_run: bool = False,
-                 enforce_cfg_caps: bool = True) -> None:
+                 enforce_cfg_caps: bool = True,
+                 altitude_envelope: bool = True) -> None:
         cfg = self.cfg
         if enforce_cfg_caps:
             # Final clamp -- in case PD output and individual clips disagree.
@@ -4137,7 +4144,7 @@ class MissionController:
                 h_cm = float(tel.raw.get("height_cm"))
             except (TypeError, ValueError):
                 h_cm = None
-            if h_cm is not None:
+            if h_cm is not None and altitude_envelope:
                 h_m = h_cm / 100.0
                 if h_m >= cfg.max_height_m:
                     ud = min(0, ud)
