@@ -1820,14 +1820,18 @@ class MissionController:
     # ---------------------------------------------------------- height-align
     def _step_height_align(self, tel: Optional[TelemetrySnapshot],
                           now: float) -> None:
-        """Drive the drone's altitude to match the marker's altitude.
+        """Drive the drone's altitude to match the marker's altitude -- by
+        VISION ONLY, never the altimeter (the barometric height is unreliable).
 
-        Marker world height = drone_height - tvec[1] (camera +y points
-        DOWN in the world thanks to the gimbal, so a positive tvec[1]
-        means the marker is below the drone). Target is clamped to
-        [min_height_m, max_height_m] -- a marker mounted lower than
-        min_height_m holds the drone at min_height_m instead of
-        descending below the safety floor.
+        tvec[1] is the marker's vertical offset from the camera in the
+        gimbal-stabilised camera frame (camera +y points world-DOWN, so a
+        positive tvec[1] means the marker is BELOW the drone). Driving
+        e_h = -tvec[1] toward zero centres the marker vertically in the camera
+        viewport -- i.e. puts the drone AT the marker's altitude -- without ever
+        reading the (unreliable) altimeter. There is no min/max clamp here
+        because that clamp could only be computed from the altimeter; the marker
+        position itself bounds the motion (once centred, e_h -> 0 and it stops),
+        and the PID output is capped at ud_rc_max.
 
         Yaw is kept on the marker so it doesn't drift out of frame.
         Forward / lateral channels stay zero -- altitude only.
@@ -1839,30 +1843,13 @@ class MissionController:
             self._marker_lost(now); return
         d, yaw_to_marker, hdg = meas
 
-        try:
-            height_cm = float(tel.raw.get("height_cm")) if tel and tel.raw.get("height_cm") is not None else None
-        except (TypeError, ValueError):
-            height_cm = None
-        if height_cm is None:
-            # Without height telemetry, hand off to ALIGN. The state
-            # machine continues to function, just without height
-            # alignment for this run.
-            self._set_phase(Phase.APPROACH,
-                            "no height telemetry -- skipping HEIGHT_ALIGN")
-            return
-
-        drone_h = height_cm / 100.0
-        # tvec[1] is the marker's downward offset from the camera in
-        # the camera frame (gimbal-stabilised, so the camera y-axis
-        # aligns with world-down). Positive => marker is below drone.
+        # VISION-ONLY vertical error: -tvec[1] (marker's camera-frame downward
+        # offset). No altimeter. Positive e_h => marker is above => fly up.
         try:
             marker_y = float(pose.tvec[1])
         except Exception:
             marker_y = 0.0
-        marker_height_m = drone_h - marker_y
-        target_h = max(cfg.min_height_m,
-                       min(cfg.max_height_m, marker_height_m))
-        e_h = target_h - drone_h
+        e_h = -marker_y
 
         e_yaw = yaw_to_marker
         u_yaw = (0.0 if abs(e_yaw) < cfg.yaw_deadband_deg
@@ -1873,9 +1860,8 @@ class MissionController:
         self._send_rc(lr=0, fb=0, ud=int(u_ud), yaw=int(u_yaw))
 
         with self.state.lock:
-            self.state.note = (f"HEIGHT_ALIGN: drone={drone_h:.2f}m  "
-                               f"marker={marker_height_m:.2f}m  "
-                               f"target={target_h:.2f}m  e={e_h:+.2f}m")
+            self.state.note = (f"HEIGHT_ALIGN (vision): marker_y={marker_y:+.2f}m  "
+                               f"e={e_h:+.2f}m")
 
         # Settle: both height and yaw inside their deadbands for the
         # configured time -> transition to ALIGN.
@@ -1892,7 +1878,7 @@ class MissionController:
                 self.state.settle_began_at = None
         if settled:
             self._set_phase(Phase.APPROACH,
-                            f"height aligned ({drone_h:.2f}m) -- "
+                            f"height aligned (marker centred, e={e_h:+.2f}m) -- "
                             f"closing distance (angle correction at yaw_start_fraction)")
 
     # -------------------------------------------------------------- approach
@@ -1990,11 +1976,13 @@ class MissionController:
                 self.api.camera_config_set(zoom=1.0)
             except Exception:
                 pass
-        # Height error:
-        #   mid-HA pause (at fraction latch): sensor-based, like HEIGHT_ALIGN phase
-        #     → align to absolute marker height using altimeter + tvec[1]
-        #   normal approach flight: visual-only, keep marker centred in frame
-        #     → tvec[1] < 0 = marker above = fly up (e_h > 0)
+        # Height error: VISION ONLY, never the altimeter (it's unreliable).
+        # tvec[1] is the marker's downward offset in the gimbal-stabilised
+        # camera frame; driving e_h = -tvec[1] -> 0 keeps the marker centred in
+        # the viewport, i.e. holds the drone AT the marker's altitude. The same
+        # law is used both in the mid-HA pause and in normal approach flight --
+        # no absolute-height / altimeter branch.
+        #   tvec[1] < 0 = marker above = fly up (e_h > 0)
         u_ud = 0.0
         e_h = 0.0
         pose = self.state.last_pose
@@ -2003,22 +1991,7 @@ class MissionController:
                 marker_y = float(pose.tvec[1])
             except Exception:
                 marker_y = 0.0
-            if self._approach_mid_ha_active:
-                try:
-                    h_cm = (float(tel.raw.get("height_cm"))
-                            if tel and tel.raw.get("height_cm") is not None
-                            else None)
-                except (TypeError, ValueError):
-                    h_cm = None
-                if h_cm is not None:
-                    drone_h = h_cm / 100.0
-                    target_h = max(cfg.min_height_m,
-                                   min(cfg.max_height_m, drone_h - marker_y))
-                    e_h = target_h - drone_h
-                else:
-                    e_h = -marker_y
-            else:
-                e_h = -marker_y
+            e_h = -marker_y
             if abs(e_h) >= cfg.height_deadband_m:
                 u_ud = self.pd_height.step(e_h, now)
 
@@ -2192,27 +2165,20 @@ class MissionController:
             u_lat_raw = self.pd_lat.step(arc_err_m, now)
         u_lat = self._velocity_damp_lat(u_lat_raw, tel)
 
-        # Continuous height alignment to the marker, same as APPROACH.
-        # HOLD is only entered after APPROACH (HOOVER step rule), so
-        # the operator's intent is "stay at the marker's height". The
-        # IDLE phase (HOOVER without prior APPROACH) keeps ud=0.
+        # Continuous height alignment to the marker, same as APPROACH --
+        # VISION ONLY, never the altimeter. HOLD is only entered after APPROACH
+        # (HOOVER step rule), so the operator's intent is "stay at the marker's
+        # height". Keep the marker centred in the camera viewport
+        # (e_h = -tvec[1] -> 0). The IDLE phase (HOOVER without prior APPROACH)
+        # keeps ud=0.
         u_ud = 0.0
         pose = self.state.last_pose
-        try:
-            h_cm = (float(tel.raw.get("height_cm"))
-                    if tel and tel.raw.get("height_cm") is not None
-                    else None)
-        except (TypeError, ValueError):
-            h_cm = None
-        if h_cm is not None and pose is not None:
-            drone_h = h_cm / 100.0
+        if pose is not None:
             try:
                 marker_y = float(pose.tvec[1])
             except Exception:
                 marker_y = 0.0
-            target_h = max(cfg.min_height_m,
-                           min(cfg.max_height_m, drone_h - marker_y))
-            e_h = target_h - drone_h
+            e_h = -marker_y
             if abs(e_h) >= cfg.height_deadband_m:
                 u_ud = self.pd_height.step(e_h, now)
 
