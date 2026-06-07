@@ -1611,8 +1611,21 @@ class MissionController:
                     print(f"[ctrl] SEARCH back-rotate failed: {e}")
             # Keep zoom as-is; _step_approach resets to 1x at the
             # angle-correction-start threshold.
-            self._set_phase(Phase.HEIGHT_ALIGN,
-                            f"marker acquired -- stop + {back_deg}° back -- aligning altitude")
+            #
+            # A loose GO_HOME (target_distance_tol_m set) is positioning, NOT a
+            # capture: it must NOT climb to the marker's mounted height (e.g. a
+            # 1.7-2.0 m centre/wall marker would drag a 1.0 m scout up to the
+            # marker). Skip HEIGHT_ALIGN and home horizontally at the current
+            # altitude. Plain APPROACH (capture) still aligns to the marker.
+            with self.state.lock:
+                loose_home = self.state.target_distance_tol_m is not None
+            if loose_home:
+                self._set_phase(Phase.APPROACH,
+                                "marker acquired (GO_HOME) -- homing at current "
+                                "altitude (no climb to marker)")
+            else:
+                self._set_phase(Phase.HEIGHT_ALIGN,
+                                f"marker acquired -- stop + {back_deg}° back -- aligning altitude")
             return
 
         # Detect new SEARCH phase entry via phase_started_at so escalation
@@ -2012,10 +2025,17 @@ class MissionController:
         # law is used both in the mid-HA pause and in normal approach flight --
         # no absolute-height / altimeter branch.
         #   tvec[1] < 0 = marker above = fly up (e_h > 0)
+        #
+        # EXCEPTION: a loose GO_HOME (target_distance_tol_m set) is positioning,
+        # not a capture -- it homes at the CURRENT altitude and must not climb to
+        # the marker's mounted height (which would drag a low scout up to a
+        # 1.7-2.0 m centre/wall marker). Hold altitude (ud=0, Anafi hover).
+        with self.state.lock:
+            _loose_home = self.state.target_distance_tol_m is not None
         u_ud = 0.0
         e_h = 0.0
         pose = self.state.last_pose
-        if pose is not None:
+        if pose is not None and not _loose_home:
             try:
                 marker_y = float(pose.tvec[1])
             except Exception:
