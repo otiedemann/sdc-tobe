@@ -34,6 +34,10 @@ class FCState:
     identity_monotonic: float = 0.0
     calibrations: list[dict] = field(default_factory=list)
     calibrations_monotonic: float = 0.0
+    # Latest WLAN info from the FC host (iwconfig of its wl* interface): the
+    # SSID is the connected drone's WiFi name. Polled at a slow cadence.
+    wlan: Optional[dict] = None
+    wlan_monotonic: float = 0.0
 
 
 class FCPool:
@@ -100,6 +104,13 @@ class FCPool:
             if self.settings.is_fc_enabled(spec.name):
                 ok, payload = await client.get_state()
                 await self._update_state(spec.name, ok, payload)
+                # WLAN (which drone WiFi this FC is on) changes rarely and
+                # iwconfig is a subprocess on the Pi — poll it at a SLOW cadence
+                # (~ every WLAN_POLL_INTERVAL_S) rather than every state tick.
+                st = self.states[spec.name]
+                if time.monotonic() - st.wlan_monotonic >= self.WLAN_POLL_INTERVAL_S:
+                    wok, wpayload = await client.get_wlan()
+                    await self._update_wlan(spec.name, wok, wpayload)
             else:
                 await self._mark_disabled(spec.name)
             elapsed = time.monotonic() - t0
@@ -112,6 +123,34 @@ class FCPool:
             except asyncio.TimeoutError:
                 continue
 
+    # WLAN changes rarely; poll it this often (seconds) instead of every tick.
+    WLAN_POLL_INTERVAL_S: float = 4.0
+
+    @staticmethod
+    def _primary_wlan(payload: Any) -> Optional[dict]:
+        """Pick the connected wireless interface from an /api/wlan payload:
+        the first ``wl*`` iface that actually has an SSID. Returns a compact
+        dict (ssid + the headline radio fields) or None."""
+        if not isinstance(payload, dict):
+            return None
+        for iface, info in payload.items():
+            if (isinstance(iface, str) and iface.startswith("wl")
+                    and isinstance(info, dict) and info.get("ssid")):
+                out = {"iface": iface}
+                for k in ("ssid", "signal_dbm", "link_quality", "bit_rate",
+                          "frequency", "band", "tx_power", "mode"):
+                    if info.get(k) not in (None, ""):
+                        out[k] = info[k]
+                return out
+        return None
+
+    async def _update_wlan(self, name: str, ok: bool, payload: Any) -> None:
+        async with self._locks[name]:
+            st = self.states[name]
+            st.wlan_monotonic = time.monotonic()
+            if ok:
+                st.wlan = self._primary_wlan(payload)
+
     async def _mark_disabled(self, name: str) -> None:
         async with self._locks[name]:
             st = self.states[name]
@@ -120,6 +159,7 @@ class FCPool:
             # Wipe the last known state so the overview doesn't show
             # stale telemetry next to a "disabled" badge.
             st.last_state = None
+            st.wlan = None
 
     async def _update_state(self, name: str, ok: bool, payload: Any) -> None:
         async with self._locks[name]:
@@ -172,6 +212,9 @@ class FCPool:
                 "connection_ok": st.connection_ok,
                 "drone_serial": st.drone_serial,
                 "drone_connected": st.drone_connected,
+                "wlan": copy.deepcopy(st.wlan),
+                "wlan_age_s": (now - st.wlan_monotonic
+                               if st.wlan_monotonic else None),
                 "last_error": st.last_error,
                 "last_state_age_s": age,
                 "last_state_wall": st.last_state_wall,
