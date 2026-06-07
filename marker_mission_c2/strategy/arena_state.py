@@ -48,6 +48,11 @@ class ArenaState:
     # {"red": (marker_id, (x, y)), "blue": (marker_id, (x, y))}
     home_wall_marker: dict[str, tuple[int, tuple[float, float]]]
     slot_positions_m: dict[int, tuple[float, float]]   # {slot: (x, y)}
+    # The two side-wall markers (left + right) nearest each team's home wall —
+    # the defender's wait stations. {"red": (id, id), "blue": (id, id)}. Derived,
+    # so the competition arena yields red=(12,14)/blue=(10,16) while GVZ (markers
+    # mounted on the opposite ends) yields the correct swapped pair automatically.
+    side_markers: dict[str, tuple[int, ...]]
 
     @property
     def half_width_m(self) -> float:
@@ -111,6 +116,36 @@ def _derive_home_markers(arena) -> dict[str, tuple[int, tuple[float, float]]]:
     return out
 
 
+def _derive_side_markers(
+    arena, home_markers
+) -> dict[str, tuple[int, ...]]:
+    """For each team, the LEFT and RIGHT side-wall markers nearest that team's
+    home wall, at flight-camera height (lowest z). These are the defender's wait
+    stations. Derived from positions, so it's correct regardless of which IDs a
+    given hall mounts where: the competition arena gives red=(12,14)/blue=(10,16),
+    GVZ gives the swapped pair, with no code change."""
+    out: dict[str, tuple[int, ...]] = {}
+    for team in ("red", "blue"):
+        hm = home_markers.get(team)
+        if not hm:
+            continue
+        home_y = float(hm[1][1])               # y of our home back-wall marker
+        sign = -1.0 if home_y < 0 else 1.0     # our home direction along y
+        ids: list[int] = []
+        for wall in ("left", "right"):
+            cands = [m for m in arena.markers.values() if str(m.wall) == wall]
+            if not cands:
+                continue
+            min_z = min(float(m.position_m[2]) for m in cands)
+            low = [m for m in cands
+                   if abs(float(m.position_m[2]) - min_z) < 0.5]
+            # nearest OUR home = the most extreme y in our home's direction.
+            best = max(low, key=lambda m: sign * float(m.position_m[1]))
+            ids.append(int(best.id))
+        out[team] = tuple(ids)
+    return out
+
+
 def _load_slot_positions(target_layout_path: Optional[str]) -> dict[int, tuple[float, float]]:
     if not target_layout_path:
         return dict(_FALLBACK_SLOTS)
@@ -139,12 +174,14 @@ def _load_state(name: str) -> ArenaState:
     entry = _read_registry().get("arenas", {}).get(name) or {}
     acp = entry.get("arena_config_path")
     arena = (ArenaConfig.load(REPO_ROOT / acp) if acp else default_arena())
+    home = _derive_home_markers(arena)
     return ArenaState(
         name=name,
         width_m=float(arena.width_m),
         depth_m=float(arena.depth_m),
-        home_wall_marker=_derive_home_markers(arena),
+        home_wall_marker=home,
         slot_positions_m=_load_slot_positions(entry.get("target_layout_path")),
+        side_markers=_derive_side_markers(arena, home),
     )
 
 
@@ -182,6 +219,12 @@ def home_wall_marker(team: str) -> Optional[tuple[int, tuple[float, float]]]:
 
 def slot_positions() -> dict[int, tuple[float, float]]:
     return dict(current().slot_positions_m)
+
+
+def side_markers(team: str) -> tuple[int, ...]:
+    """The side-wall markers nearest ``team``'s home — the defender's wait
+    stations (red=(12,14)/blue=(10,16) in the competition arena)."""
+    return tuple(current().side_markers.get(team, ()))
 
 
 def in_home_zone(team: str, x: float, y: float) -> bool:
