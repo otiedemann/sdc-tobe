@@ -140,7 +140,7 @@ _PAGE_HEADER = """
          font-family:monospace; white-space:nowrap;
          border:1px solid #444; border-radius:4px; padding:4px 8px;">—</div>
     <div id="wifi-set" title="Set the drone's Wi-Fi AP band/channel. Auto picks the cleanest channel in the band. The link drops briefly on change — GROUND ONLY."
-         style="font-size:.70rem; color:#bbb; display:flex; align-items:center;
+         style="font-size:.70rem; color:#bbb; display:{{ 'flex' if active=='hardware' else 'none' }}; align-items:center;
                 gap:3px; border:1px solid #444; border-radius:4px; padding:3px 6px;">
       <span style="color:#888;">WiFi</span>
       <select id="wifi-band" style="font-size:.70rem; background:#222; color:#ddd; border:1px solid #555;">
