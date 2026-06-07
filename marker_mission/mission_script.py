@@ -168,7 +168,7 @@ class Step:
     arrive_tol_m: Optional[float] = None
     # Optional arrival heading angle (degrees) for GO_HOME: the angle the drone
     # should hold relative to the marker's normal at arrival. Range ±80°; None
-    # means head-on (0°). Settle gate: ±12° tolerance around this target.
+    # means head-on (0°). Settle gate: ±15° tolerance around this target.
     arrive_hdg_deg: Optional[float] = None
     # Closed-loop position-relative move for kind="MOVE_IMU"
     # (FB_IMU / LR_IMU / UD_IMU). ``move_direction`` is one of
@@ -256,7 +256,7 @@ def parse(text: str, defaults: dict) -> List[Step]:
             # 3.5 m +/- 0.5 m from the home-wall marker (so anywhere 3-4 m).
             # Optional 4th arg: arrival heading angle relative to marker normal
             # (-80..+80 deg). The drone is considered settled only when also
-            # within ±12° of this target. Default 0 (head-on).
+            # within ±15° of this target. Default 0 (head-on).
             if len(args) > 4:
                 raise ScriptError(raw_line_no,
                                   f"GO_HOME takes 0-4 arguments "

@@ -3337,7 +3337,7 @@ class MissionController:
                     float(step.arrive_hdg_deg)
                     if step.arrive_hdg_deg is not None else 0.0)
                 self.state.arrive_hdg_tol_deg = (
-                    12.0 if step.arrive_hdg_deg is not None else None)
+                    15.0 if step.arrive_hdg_deg is not None else None)
             self._set_phase(Phase.SEARCH,
                             note + f" id={int(step.marker_id)}"
                                    f" d={float(step.distance):g}m"
