@@ -7265,6 +7265,14 @@ def api_drones_switch():
             # ── Step 3: connect to new WiFi ────────────────────────────────
             _drone_switch_status.update({
                 "status": "wifi",
+                "message": f"Scanning for SSID '{drone_name}'…",
+            })
+            subprocess.run(["sudo", "nmcli", "device", "wifi", "rescan"],
+                           capture_output=True, timeout=10)
+            time.sleep(3.0)  # give scan time to complete
+
+            _drone_switch_status.update({
+                "status": "wifi",
                 "message": f"Connecting to WiFi SSID '{drone_name}'…",
             })
             wifi_cmd = ["sudo", "nmcli", "device", "wifi", "connect", drone_name]
