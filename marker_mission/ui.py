@@ -1421,12 +1421,17 @@ if (REPLAY_ID) {
   });
   document.querySelectorAll('.rp-step').forEach(b => {
     b.addEventListener('click', async () => {
+      // Server-side step against the *actual* playhead. Computing
+      // next = slider.value + dt would lose precision because the
+      // slider is a 0.1s-coarse mirror -- a -0.1 step from 5.13s
+      // would land at 5.0 (130 ms back) instead of 5.03 (100 ms
+      // back), and repeating drifted further on each click.
       const dt = parseFloat(b.dataset.step);
-      const seek = $('rp-seek');
-      const cur = seek ? parseFloat(seek.value || '0') : 0;
-      const dur = seek ? parseFloat(seek.max || '0') : 0;
-      const next = Math.max(0, Math.min(dur, cur + dt));
-      await rpSeek(next);
+      const u = new URL(`/api/replay/${encodeURIComponent(REPLAY_ID)}/step`,
+                        window.location.origin);
+      u.searchParams.set('dt', String(dt));
+      try { await fetch(u.toString(), { method: 'POST' }); }
+      catch (e) { console.warn('step failed', e); }
     });
   });
 }
@@ -5130,6 +5135,18 @@ class UiServer:
             except ValueError:
                 return jsonify({"ok": False, "error": "bad t"}), 400
             rp.seek(t); return jsonify({"ok": True})
+
+        @app.post("/api/replay/<flight_id>/step")
+        def api_replay_step(flight_id):
+            rp = self._get_or_create_replay(flight_id)
+            if rp is None:
+                return jsonify({"ok": False}), 404
+            from flask import request
+            try:
+                dt = float(request.args.get("dt", "0"))
+            except ValueError:
+                return jsonify({"ok": False, "error": "bad dt"}), 400
+            rp.step(dt); return jsonify({"ok": True})
 
         @app.post("/api/replay/<flight_id>/speed")
         def api_replay_speed(flight_id):

@@ -208,6 +208,27 @@ class FlightReplay:
             self._playhead_idx = new_idx
         self._wakeup.set()
 
+    def step(self, dt_seconds: float) -> None:
+        """Move the playhead by ``dt_seconds`` relative to its current
+        position. Used by the +/-0.1s / +/-0.5s / +/-1s buttons.
+
+        The buttons used to subtract dt from ``seek.value`` client-side,
+        but the slider is a 0.1s-coarse mirror of the playhead -- so a
+        ``-0.1s`` step from a playhead at 5.13s would compute
+        ``5.1 - 0.1 = 5.0``, only 130 ms back. Worse, the next ``-0.1s``
+        from 5.0 would land at 4.9 (a 100 ms step from the slider but
+        ~230 ms from the real playhead, since the slider had drifted).
+        Doing the math server-side against ``self.timeline[playhead]``
+        guarantees each click moves by exactly ``dt`` from the current
+        position, and bisect lands on the closest CSV row -- no slider
+        round-tripping involved."""
+        with self._lock:
+            idx = self._playhead_idx
+            if not (0 <= idx < len(self.timeline)):
+                return
+            cur_t = float(self.timeline[idx])
+        self.seek(cur_t + float(dt_seconds))
+
     def set_speed(self, rate: float) -> None:
         with self._lock:
             self._speed = max(0.1, min(10.0, float(rate)))
