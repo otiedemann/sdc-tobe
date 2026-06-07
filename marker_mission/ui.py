@@ -4280,7 +4280,153 @@ _PAGE_HARDWARE = _PAGE_BASE_CSS + _PAGE_HEADER + _COMMON_SCRIPT + _PAGE_GRID_OPE
 
   </div>
   <div id="hw-err" style="color:var(--bad); font-size:.85rem; margin-top:.5rem;"></div>
+
+  <div class="hw-card" style="margin-top:1.5rem;">
+    <h2>Switch Drone</h2>
+    <p style="font-size:.82rem; color:#6b7280; margin:0 0 .75rem;">
+      Select a drone from the fleet CSV, then press <strong>Switch</strong> to land the
+      current drone, join the new drone's WiFi, and reinitialize the flight controller.
+    </p>
+    <div style="display:flex; align-items:center; gap:.6rem; flex-wrap:wrap; margin-bottom:.75rem;">
+      <select id="drone-select"
+              style="background:#1a2030; color:#d0d8e0; border:1px solid #2a3038;
+                     border-radius:6px; padding:.4rem .7rem; font-size:.9rem; min-width:220px;">
+        <option value="">— loading drones —</option>
+      </select>
+      <button id="btn-drone-refresh" title="Reload drone list"
+              style="padding:.4rem .7rem; border:1px solid #2a3038; border-radius:6px;
+                     background:#1a2030; color:#d0d8e0; cursor:pointer; font-size:.9rem;">⟳</button>
+      <button id="btn-drone-switch"
+              style="padding:.4rem 1.1rem; border:0; border-radius:6px;
+                     background:#dc2626; color:#fff; font-weight:700;
+                     font-size:.9rem; cursor:pointer;">
+        Switch
+      </button>
+    </div>
+    <div style="display:flex; gap:.6rem; align-items:center; flex-wrap:wrap; margin-bottom:.5rem;">
+      <a href="/api/drones/csv" download="drones.csv"
+         style="padding:.32rem .75rem; border:1px solid #2a3038; border-radius:6px;
+                color:#d0d8e0; text-decoration:none; font-size:.82rem;">
+        ↓ Download CSV
+      </a>
+      <label style="padding:.32rem .75rem; border:1px solid #2a3038; border-radius:6px;
+                    color:#d0d8e0; font-size:.82rem; cursor:pointer;">
+        ↑ Upload CSV
+        <input type="file" id="drone-csv-upload" accept=".csv" style="display:none;">
+      </label>
+    </div>
+    <div id="drone-switch-msg" style="font-size:.82rem; color:#555; min-height:1.2em;"></div>
+  </div>
 </div>
+
+<script>
+(function() {
+  function _setMsg(text, color) {
+    const el = document.getElementById('drone-switch-msg');
+    if (el) { el.textContent = text; el.style.color = color || '#555'; }
+  }
+
+  async function loadDrones() {
+    const sel = document.getElementById('drone-select');
+    try {
+      const r = await fetch('/api/drones', {cache:'no-store'});
+      const d = await r.json();
+      if (!d.ok || !Array.isArray(d.drones) || !d.drones.length) {
+        sel.innerHTML = '<option value="">— no drones in CSV —</option>';
+        return;
+      }
+      sel.innerHTML = d.drones.map(dr =>
+        `<option value="${dr.id}" data-name="${escHtml(dr.name)}">${escHtml(dr.id)}: ${escHtml(dr.name)}</option>`
+      ).join('');
+    } catch(e) {
+      sel.innerHTML = '<option value="">Error loading drones</option>';
+    }
+  }
+
+  function escHtml(s) {
+    return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')
+                    .replace(/"/g,'&quot;');
+  }
+
+  const STATUS_COLORS = {
+    idle: '#555', done: 'var(--good)', error: 'var(--bad)',
+    stopping: '#f59e0b', disconnecting: '#f59e0b',
+    wifi: '#f59e0b', connecting: '#f59e0b', init: '#f59e0b',
+  };
+  const BUSY_STATUSES = new Set(['stopping','disconnecting','wifi','connecting','init']);
+
+  async function pollSwitchStatus() {
+    try {
+      const r = await fetch('/api/drones/switch/status', {cache:'no-store'});
+      const d = await r.json();
+      _setMsg(d.message || '', STATUS_COLORS[d.status] || '#555');
+      if (BUSY_STATUSES.has(d.status)) {
+        setTimeout(pollSwitchStatus, 1500);
+      } else {
+        document.getElementById('btn-drone-switch').disabled = false;
+      }
+    } catch(e) {}
+  }
+
+  document.getElementById('btn-drone-refresh').addEventListener('click', loadDrones);
+
+  document.getElementById('btn-drone-switch').addEventListener('click', async () => {
+    const sel = document.getElementById('drone-select');
+    const opt = sel.options[sel.selectedIndex];
+    if (!opt || !opt.value) {
+      _setMsg('Select a drone first.', 'var(--warn)'); return;
+    }
+    const droneId = opt.value;
+    const btn = document.getElementById('btn-drone-switch');
+    btn.disabled = true;
+    _setMsg('Sending switch command…', '#f59e0b');
+    try {
+      const r = await fetch('/api/drones/switch', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({id: droneId}),
+      });
+      const d = await r.json();
+      if (!d.ok) {
+        _setMsg('Error: ' + (d.error || r.status), 'var(--bad)');
+        btn.disabled = false;
+        return;
+      }
+      setTimeout(pollSwitchStatus, 600);
+    } catch(e) {
+      _setMsg('Request failed: ' + e, 'var(--bad)');
+      btn.disabled = false;
+    }
+  });
+
+  document.getElementById('drone-csv-upload').addEventListener('change', async (ev) => {
+    const file = ev.target.files[0];
+    if (!file) return;
+    _setMsg('Uploading CSV…', '#f59e0b');
+    try {
+      const text = await file.text();
+      const r = await fetch('/api/drones/csv', {
+        method: 'POST',
+        headers: {'Content-Type': 'text/csv'},
+        body: text,
+      });
+      const d = await r.json();
+      if (d.ok) {
+        _setMsg('CSV uploaded (' + d.count + ' drones).', 'var(--good)');
+        await loadDrones();
+      } else {
+        _setMsg('Upload failed: ' + (d.error || r.status), 'var(--bad)');
+      }
+    } catch(e) {
+      _setMsg('Upload error: ' + e, 'var(--bad)');
+    }
+    ev.target.value = '';
+  });
+
+  loadDrones();
+  pollSwitchStatus();
+})();
+</script>
 
 <script>
 async function runHwCheck() {

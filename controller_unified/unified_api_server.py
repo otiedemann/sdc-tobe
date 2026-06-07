@@ -531,6 +531,9 @@ POSITION_CALIB_PATH  = Path(__file__).with_name("position_calib.npz")
 ARENA_CONFIG_PATH    = Path(__file__).with_name("arena_config.json")
 FLIGHT_CONFIG_PATH   = Path(__file__).with_name("flight_config.json")
 
+# Drone fleet CSV — rows: id, name (= WiFi SSID), password
+DRONES_CSV_PATH = Path(__file__).with_name("drones.csv")
+
 
 # ---------------------------------------------------------------------------
 # Auto-detection
@@ -7061,6 +7064,244 @@ def api_arena_config_reset():
     _save_arena_config(cfg)
     _apply_arena_cfg_to_processor(_pos_processor)
     return jsonify(ok=True, **cfg)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Drone fleet CSV — id, name (WiFi SSID), password
+# ═══════════════════════════════════════════════════════════════════════════
+
+def _load_drones_csv() -> list:
+    """Return list of {id, name, password} dicts from drones.csv."""
+    import csv
+    if not DRONES_CSV_PATH.exists():
+        return []
+    try:
+        with open(DRONES_CSV_PATH, newline="", encoding="utf-8") as f:
+            reader = csv.DictReader(f)
+            return [{"id": r.get("id", ""), "name": r.get("name", ""),
+                     "password": r.get("password", "")} for r in reader]
+    except Exception as e:
+        print(f"[DRONES] CSV load error: {e}")
+        return []
+
+
+def _save_drones_csv(rows: list):
+    import csv
+    DRONES_CSV_PATH.parent.mkdir(parents=True, exist_ok=True)
+    tmp = DRONES_CSV_PATH.with_suffix(".csv.tmp")
+    try:
+        with open(tmp, "w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=["id", "name", "password"])
+            writer.writeheader()
+            for row in rows:
+                writer.writerow({k: row.get(k, "") for k in ["id", "name", "password"]})
+        import os as _os
+        _os.replace(tmp, DRONES_CSV_PATH)
+    except Exception as e:
+        print(f"[DRONES] CSV save error: {e}")
+        raise
+
+
+@app.get("/api/drones")
+def api_drones_list():
+    """List all drones from the fleet CSV (passwords omitted)."""
+    try:
+        rows = _load_drones_csv()
+        return jsonify(ok=True,
+                       drones=[{"id": r["id"], "name": r["name"]} for r in rows])
+    except Exception as e:
+        return jsonify(ok=False, error=str(e)), 500
+
+
+@app.get("/api/drones/csv")
+def api_drones_csv_download():
+    """Download the fleet CSV (includes passwords — handle with care)."""
+    if DRONES_CSV_PATH.exists():
+        return send_file(str(DRONES_CSV_PATH), mimetype="text/csv",
+                         download_name="drones.csv", as_attachment=True)
+    template = "id,name,password\n1,ANAFI_XXXXXX,changeme\n"
+    return Response(template, mimetype="text/csv",
+                    headers={"Content-Disposition":
+                             "attachment; filename=\"drones.csv\""})
+
+
+@app.post("/api/drones/csv")
+def api_drones_csv_upload():
+    """Upload a new fleet CSV. Body: raw text/csv."""
+    import csv, io as _io
+    blob = request.get_data(cache=False, as_text=True)
+    if not blob.strip():
+        return jsonify(ok=False, error="empty body"), 400
+    try:
+        reader = csv.DictReader(_io.StringIO(blob))
+        rows = []
+        for row in reader:
+            if not all(k in row for k in ("id", "name", "password")):
+                return jsonify(ok=False,
+                               error="CSV must have id, name, password columns"), 400
+            rows.append({"id": row["id"].strip(),
+                         "name": row["name"].strip(),
+                         "password": row["password"].strip()})
+    except Exception as e:
+        return jsonify(ok=False, error=f"CSV parse error: {e}"), 400
+    try:
+        _save_drones_csv(rows)
+    except Exception as e:
+        return jsonify(ok=False, error=f"write failed: {e}"), 500
+    return jsonify(ok=True, count=len(rows))
+
+
+# Switch state — polled by the UI while the background thread runs
+_drone_switch_lock = threading.Lock()
+_drone_switch_status: dict = {"status": "idle", "message": "", "drone": None}
+
+
+@app.get("/api/drones/switch/status")
+def api_drones_switch_status():
+    return jsonify(**_drone_switch_status)
+
+
+@app.post("/api/drones/switch")
+def api_drones_switch():
+    """Switch the FC to a different drone.
+
+    Body: {"id": "<drone id from CSV>"}
+
+    Steps (async, poll /api/drones/switch/status for progress):
+      1. Land the current drone if flying
+      2. Connect to the new drone's WiFi via nmcli
+      3. Hard-reset and reinitialize the Olympe backend
+    """
+    data = request.get_json(silent=True) or {}
+    drone_id = str(data.get("id", "")).strip()
+    if not drone_id:
+        return jsonify(ok=False, error="'id' field required"), 400
+
+    # Look up drone in CSV
+    rows = _load_drones_csv()
+    match = next((r for r in rows if r["id"] == drone_id), None)
+    if match is None:
+        return jsonify(ok=False, error=f"drone id '{drone_id}' not found in CSV"), 404
+
+    if not _drone_switch_lock.acquire(blocking=False):
+        return jsonify(ok=False, error="switch already in progress"), 409
+
+    def _do_switch(drone_name: str, drone_password: str, d_id: str):
+        global backend, drone_ip
+        try:
+            # ── Step 1: stop / land current drone ──────────────────────────
+            _drone_switch_status.update({
+                "status": "stopping",
+                "message": "Stopping mission and landing current drone…",
+            })
+            with conn_lock:
+                currently_connected = conn_state["connected"]
+            if currently_connected:
+                try:
+                    import drone_core as _dc
+                    _dc.do_land()
+                    # Wait up to 15 s for landing
+                    for _ in range(30):
+                        time.sleep(0.5)
+                        if not flying:
+                            break
+                except Exception as _le:
+                    print(f"[SWITCH] land error (ignored): {_le}")
+
+            # ── Step 2: disconnect existing backend ─────────────────────────
+            _drone_switch_status.update({
+                "status": "disconnecting",
+                "message": "Disconnecting from current drone…",
+            })
+            b = backend
+            if b is not None:
+                try:
+                    b.hard_reset()
+                except Exception as _de:
+                    print(f"[SWITCH] hard_reset error (ignored): {_de}")
+            with conn_lock:
+                conn_state["connected"] = False
+                conn_state["consecutive_failures"] = 0
+
+            # ── Step 3: connect to new WiFi ────────────────────────────────
+            _drone_switch_status.update({
+                "status": "wifi",
+                "message": f"Connecting to WiFi SSID '{drone_name}'…",
+            })
+            wifi_cmd = ["nmcli", "device", "wifi", "connect", drone_name]
+            if drone_password:
+                wifi_cmd += ["password", drone_password]
+            r = subprocess.run(wifi_cmd, capture_output=True, text=True, timeout=30)
+            if r.returncode != 0:
+                err = (r.stderr.strip() or r.stdout.strip() or
+                       f"nmcli exited {r.returncode}")
+                _drone_switch_status.update({
+                    "status": "error",
+                    "message": f"WiFi connect failed: {err}",
+                })
+                return
+
+            # Give DHCP time to settle before Olympe tries to reach the drone
+            _drone_switch_status.update({
+                "status": "connecting",
+                "message": "WiFi up — waiting for drone link…",
+            })
+            time.sleep(3.0)
+
+            # ── Step 4: reinitialize Olympe backend ────────────────────────
+            _drone_switch_status.update({
+                "status": "init",
+                "message": "Re-initializing flight controller…",
+            })
+            if HAS_OLYMPE_SDK:
+                new_b = OlympeBackend(ANAFI_DEFAULT_IP)
+                backend = new_b
+                drone_ip = ANAFI_DEFAULT_IP
+            # else: Tello or no SDK — only WiFi switch matters; reconnect_loop picks up
+
+            # Reset serial so it is re-read from the new drone on first connect
+            if hasattr(backend, "serial_number"):
+                backend.serial_number = None
+            if hasattr(backend, "_serial_high"):
+                backend._serial_high = None
+            if hasattr(backend, "_serial_low"):
+                backend._serial_low = None
+
+            # Kick the reconnect loop — it will call backend.connect() on the
+            # next cycle and run on_connect() which reloads flight limits and
+            # logs magnetometer calibration state.
+            with conn_lock:
+                conn_state["connected"] = False
+                conn_state["last_reconnect"] = 0.0
+                conn_state["consecutive_failures"] = 0
+                conn_state["last_error"] = ""
+
+            _drone_switch_status.update({
+                "status": "done",
+                "message": (f"Switched to '{drone_name}' (id={d_id}). "
+                            f"FC is reconnecting — check telemetry for serial/battery."),
+                "drone": {"id": d_id, "name": drone_name},
+            })
+            print(f"[SWITCH] Done — drone='{drone_name}' id={d_id}")
+
+        except Exception as exc:
+            import traceback as _tb
+            _drone_switch_status.update({
+                "status": "error",
+                "message": str(exc),
+            })
+            print(f"[SWITCH] Unhandled error: {exc}")
+            _tb.print_exc()
+        finally:
+            _drone_switch_lock.release()
+
+    threading.Thread(
+        target=_do_switch,
+        args=(match["name"], match["password"], match["id"]),
+        daemon=True,
+        name="drone-switch",
+    ).start()
+    return jsonify(ok=True, message="switch started"), 202
 
 
 # ═══════════════════════════════════════════════════════════════════════════
