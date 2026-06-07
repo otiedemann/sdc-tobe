@@ -1831,7 +1831,7 @@ class MissionController:
             if ws is not None:
                 _vN, _vE, _yaw = ws
                 v_fwd_b, _ = self._world_to_body(_vN, _vE, _yaw)
-                _bkv = float(getattr(cfg, 'approach_mid_ha_brake_kv', 0.85))
+                _bkv = cfg.approach_mid_ha_brake_kv
                 u_fwd = max(-cfg.fwd_rc_max, min(0.0, -_bkv * v_fwd_b))
             else:
                 u_fwd = 0.0

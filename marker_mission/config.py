@@ -206,6 +206,10 @@ class MissionConfig:
     # slow zone (single-cap behaviour, like before this feature).
     approach_slow_zone_m: float = 0.5      # TUNE  brake zone radius [m]
     approach_slow_rc_max: int = 5          # TUNE  fb cap inside the brake zone
+    # During the mid-approach HEIGHT_ALIGN pause the drone actively brakes
+    # to zero forward velocity before resuming the final leg.
+    # This gain maps body-forward speed → backward RC stick.
+    approach_mid_ha_brake_kv: float = 0.85  # TUNE  (RC/cm/s) mid-HA active brake
     # Fraction of the approach leg (start_d → target_d) after which the
     # lateral / angle correction activates. The yaw PD (marker centring)
     # is always active so the drone flies straight at the marker first;
@@ -537,7 +541,11 @@ TUNING_FIELDS = {
     },
     "approach_slow_rc_max": {
         "label": "approach slow RC max", "kind": "int", "step": 1,
-        "desc": "Forward-channel cap used inside the approach slow zone. Typical 4–8 (≈16–32 cm/s on the Anafi). Higher = faster final approach but more crash risk on small/close markers.",
+        "desc": "Forward-channel cap used inside the approach slow zone. Typical 4–18 (≈16–72 cm/s on the Anafi). Higher = faster final approach but more crash risk on small/close markers.",
+    },
+    "approach_mid_ha_brake_kv": {
+        "label": "mid-HA brake gain (kv)", "kind": "float", "step": 0.05,
+        "desc": "During the mid-approach HEIGHT_ALIGN pause, the drone applies an active brake proportional to body-forward speed: u_fwd = clamp(-kv × v_fwd_body, -fwd_rc_max, 0). 0.85 ≈ one RC count per ~1.2 cm/s residual speed. Set to 0 to disable active braking (drone coasts).",
     },
     "fwd_rc_max": {
         "label": "fwd RC max", "kind": "int", "step": 1,
@@ -787,7 +795,7 @@ TUNING_GROUPS = [
     ("Forward PD (closing distance)",
         ["fwd_kp", "fwd_kd", "fwd_kv", "fwd_ki", "fwd_i_clip",
          "fwd_rc_max", "approach_slow_zone_m", "approach_slow_rc_max",
-         "approach_yaw_start_fraction"]),
+         "approach_mid_ha_brake_kv", "approach_yaw_start_fraction"]),
     ("Lateral PD (orbiting / heading correction)",
         ["lat_kp", "lat_kd", "lat_kv", "lat_ki", "lat_i_clip", "lat_rc_max"]),
     ("Yaw PD (centring marker)",
