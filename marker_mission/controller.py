@@ -1442,6 +1442,30 @@ class MissionController:
               f"goto ({tx:.1f},{ty:.1f},{mz:.1f})m yaw={t_yaw:.0f}°")
         return True
 
+    def _target_is_wall_marker(self, mid) -> bool:
+        """True iff ``mid`` is a known WALL marker in the active arena.
+
+        The nav-to-wall-marker search recoveries (``_navigate_to_visible_arena_
+        marker`` / ``_navigate_to_arena_marker``) fly the drone TOWARD a wall
+        marker. That is only sane when the mission TARGET is itself a wall marker
+        (e.g. ``GO_HOME`` onto the home-wall marker) — repositioning near it helps
+        re-acquire it. A box-face target (an attack ``APPROACH``, ids like 31/34)
+        is never a wall marker, so this returns False and the caller must NOT fly
+        toward a wall (it would drive away from the box and into the wall — the
+        operator saw a drone head straight at marker 13 doing exactly this)."""
+        if mid is None:
+            return False
+        arena = self.get_arena() if callable(self.get_arena) else None
+        markers = getattr(arena, "markers", None)
+        if not markers:
+            return False
+        try:
+            m = markers.get(int(mid))
+        except (TypeError, ValueError):
+            return False
+        return bool(m is not None and getattr(m, "wall", None) in
+                    ("front", "back", "left", "right"))
+
     def _navigate_to_visible_arena_marker(self, now: float) -> bool:
         """APPROACH/GO_HOME recovery: fly 3 m in front of the nearest
         currently VISIBLE arena marker, then restart the mission from
@@ -1595,17 +1619,24 @@ class MissionController:
                     self._search_swept = 0.0
                     self._search_esc_level += 1
 
-                    # After first rotation: APPROACH/GO_HOME steps attempt
-                    # recovery to a visible arena marker + mission restart
-                    # before escalating zoom.
-                    if self._search_esc_level == 1:
-                        with self.state.lock:
-                            step_kind = self.state.current_step_kind
-                        if step_kind == "APPROACH":
-                            if self._navigate_to_visible_arena_marker(now):
-                                return
-                            # No visible reference marker — fall through to
-                            # normal zoom escalation.
+                    with self.state.lock:
+                        step_kind = self.state.current_step_kind
+                        active_mid = self.state.active_marker_id
+                    # The nav-to-wall-marker recoveries fly the drone TOWARD a
+                    # wall. Only do that when the TARGET is itself a wall marker
+                    # (GO_HOME). For a box-face attack APPROACH (target not a wall
+                    # marker) we NEVER fly toward a wall — it drives away from the
+                    # box and into the wall (near-crash on marker 13). Box targets
+                    # just keep searching in place (rotate + zoom escalate).
+                    target_is_wall = (step_kind == "APPROACH"
+                                      and self._target_is_wall_marker(active_mid))
+
+                    # After the first rotation: reposition to a visible arena
+                    # marker — ONLY for a wall target.
+                    if self._search_esc_level == 1 and target_is_wall:
+                        if self._navigate_to_visible_arena_marker(now):
+                            return
+                        # No visible reference marker — fall through to zoom.
 
                     if self._search_esc_level in (1, 2):
                         # Level 1: 1.5x → 2x, half speed
@@ -1625,12 +1656,27 @@ class MissionController:
                             self.state.note = (
                                 f"SEARCH esc: zoom={new_zoom}x "
                                 f"yaw_rc={new_yaw_rc:.0f}")
-                    else:
-                        # Three+ revolutions without result →
-                        # navigate to a wall marker 3 m in front.
+                    elif target_is_wall:
+                        # Three+ revolutions on a WALL target → reposition to a
+                        # wall-marker vantage (stops 3 m short), else give up.
                         if not self._navigate_to_arena_marker(now):
                             self._terminate_script(
                                 "search: no arena nav available — giving up")
+                    else:
+                        # Box target, search exhausted: do NOT fly to a wall.
+                        # Drop the zoom and keep rotating in place from level 0 so
+                        # the search continues safely; the operator (or a higher
+                        # timeout) can intervene if the box truly isn't findable.
+                        self._search_esc_level = 0
+                        self._search_yaw_rc = int(getattr(cfg, "search_yaw_rc", 15))
+                        if getattr(self, "_search_zoom", 1.0) != 1.0:
+                            self._search_zoom = 1.0
+                            try:
+                                self.api.camera_config_set(zoom=1.0)
+                            except Exception as e:
+                                print(f"[ctrl] SEARCH zoom reset failed: {e}")
+                        print("[ctrl] SEARCH (box target): no nav-to-wall — "
+                              "continuing in-place search")
                     return
         # Fallback timeout if no telemetry yaw is ever reported.
         elif now - phase_entry > 30.0:
