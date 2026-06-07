@@ -265,15 +265,18 @@ HOME_REARM_HOVER_S: float = 2.0
 
 # ── Vision-based APPROACH standoffs (no absolute positions) ────────────────
 # Capture move (operator-specified technique): APPROACH the box's face marker
-# to ATTACK_STANDOFF_M (~1 m), RISE to the capture altitude (clearing the 0.73 m
-# box top), then FB_IMU forward ~(standoff - 0.10 m) to sit exactly OVER the box
-# centre, then hover. APPROACH homes purely on vision (no absolute position);
-# FB_IMU is a closed-loop relative move (also no absolute position). The drone
-# is never lower than the box top until it's positioned over the box.
-ATTACK_STANDOFF_M: float = 1.0
+# to ATTACK_STANDOFF_M, then slide forward ~(standoff - 0.10 m) over the box
+# WHILE rising (FB_UD_IMU). APPROACH homes purely on vision (no absolute
+# position) and vision-aligns to the marker's height.
+ATTACK_STANDOFF_M: float = 1.5
+# Arrival distance tolerance (m) for the capture APPROACH: settle within ±this
+# of ATTACK_STANDOFF_M instead of the tight ~5 cm deadband, so the stop is fast
+# and not fussy (operator: "1.5 m with 20 cm deadband"). Still a capture (the
+# approach climbs to the marker's height).
+ATTACK_DIST_TOL_M: float = 0.20
 # How far to fly forward after rising, to end up over the box: the marker was
 # ATTACK_STANDOFF_M ahead, minus 10 cm so we stop just shy of the far edge and
-# sit over the box centre (operator: "the distance the marker was away - 10 cm").
+# sit over the box centre. At a 1.5 m standoff this is 1.4 m (operator).
 OVER_BOX_FORWARD_M: float = ATTACK_STANDOFF_M - 0.10
 # How far to RISE while sliding forward over the box. FB_UD_IMU does the climb
 # and the forward slide in ONE combined moveBy (rises WHILE advancing), so the
@@ -410,10 +413,12 @@ def _full_attack_script(
         # APPROACH re-acquires the box marker by rotating if it isn't already in
         # view — so no explicit heading step is needed (the FC has no
         # absolute-heading verb anyway, only the relative YAW_IMU).
-        # 1) VISION-HOME on the box's face marker and stop ~1 m short of it.
-        f"APPROACH {int(attack_marker_id)} {ATTACK_STANDOFF_M:.2f}",
+        # 1) VISION-HOME on the box's face marker and stop ~1.5 m short of it,
+        #    settling within ±20 cm (fast, not fussy; still climbs to the marker).
+        f"APPROACH {int(attack_marker_id)} {ATTACK_STANDOFF_M:.2f} "
+        f"{ATTACK_DIST_TOL_M:.2f}",
         # 2) ONE combined move: slide forward over the box centre (marker was
-        #    ~1 m ahead, minus 10 cm) WHILE rising into the 1-2 m RFID band —
+        #    ~1.5 m ahead, minus 10 cm = 1.4 m) WHILE rising into the RFID band —
         #    rises as it advances, so it clears the 0.73 m box top without a
         #    separate HEIGHT step and flips the box to our colour.
         f"FB_UD_IMU {OVER_BOX_FORWARD_M:.2f} {CAPTURE_RISE_M:.2f}",
@@ -558,8 +563,9 @@ def _recapture_script(ctx: RoleContext, slot: int) -> str:
     return _format_script(
         "TAKEOFF",
         # Same vision capture technique as the attack:
-        # 1) VISION-HOME on the (enemy-coloured) face of our flipped box, ~1 m.
-        f"APPROACH {enemy_face} {ATTACK_STANDOFF_M:.2f}",
+        # 1) VISION-HOME on the (enemy-coloured) face of our flipped box, ~1.5 m
+        #    (±20 cm band).
+        f"APPROACH {enemy_face} {ATTACK_STANDOFF_M:.2f} {ATTACK_DIST_TOL_M:.2f}",
         # 2) ONE combined move: slide forward over the box centre WHILE rising
         #    into the RFID band — clears the 0.73 m box top and flips it back.
         f"FB_UD_IMU {OVER_BOX_FORWARD_M:.2f} {CAPTURE_RISE_M:.2f}",

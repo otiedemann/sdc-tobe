@@ -19,11 +19,14 @@ Twenty commands. Suffix convention:
 ::
 
     TAKEOFF
-    APPROACH [<marker-id>] [<distance>] [<yaw_tol_deg>]  yaw_tol (1..180) makes the
-                                                       approach advance the instant the
-                                                       distance is reached, from an angle
-                                                       (no head-on settle) — hands off to
-                                                       the next step (e.g. FB_UD_IMU) fast
+    APPROACH [<marker-id>] [<distance>] [<dist_tol_m>] [<yaw_tol_deg>]
+                                                       dist_tol (0.05..5 m) = settle within
+                                                       ±this of the distance (still a vision
+                                                       capture, climbs to the marker); e.g.
+                                                       APPROACH 31 1.5 0.2 -> 1.5 m ±20 cm.
+                                                       yaw_tol (1..180) advances the instant
+                                                       the distance is reached, from an angle
+                                                       (no head-on settle).
     GO_HOME [<marker-id>] [<distance>] [<tol>] [<hdg>]   loose approach (default 3.5m
                                                        +/- 0.5m) — just get inside the
                                                        home zone. hdg = arrival bearing
@@ -184,6 +187,14 @@ class Step:
     # this many degrees of the marker — no head-on settle wait — so the next step
     # (e.g. FB_UD_IMU over the box) launches immediately, from an angle.
     arrive_yaw_tol_deg: Optional[float] = None
+    # Optional ARRIVAL DISTANCE tolerance (m) for a plain capture APPROACH: the
+    # drone settles anywhere within ±this of the target distance, instead of the
+    # tight cfg.distance_deadband_m (~5 cm). Unlike GO_HOME's arrive_tol_m this
+    # does NOT make the move a positioning hop — the approach STILL vision-aligns
+    # to the marker's height (it is a capture). Used for a faster, less fussy
+    # capture stop (e.g. APPROACH 31 1.5 0.2 -> settle at 1.5 m ±20 cm). None ->
+    # the tight default.
+    approach_dist_tol_m: Optional[float] = None
     # Closed-loop position-relative move for kind="MOVE_IMU"
     # (FB_IMU / LR_IMU / UD_IMU). ``move_direction`` is one of
     # "forward"/"back"/"left"/"right"/"up"/"down" (sign baked in,
@@ -257,10 +268,10 @@ def parse(text: str, defaults: dict) -> List[Step]:
                                   f"TAKEOFF takes no arguments, got {args}")
             out.append(Step(kind="TAKEOFF", line_no=raw_line_no))
         elif cmd == "APPROACH":
-            if len(args) > 3:
+            if len(args) > 4:
                 raise ScriptError(raw_line_no,
-                                  f"APPROACH takes 0-3 arguments "
-                                  f"(<marker-id> [<distance>] [<yaw_tol_deg>]), "
+                                  f"APPROACH takes 0-4 arguments (<marker-id> "
+                                  f"[<distance>] [<dist_tol_m>] [<yaw_tol_deg>]), "
                                   f"got {len(args)}")
             mid = (_parse_int(args[0], raw_line_no, "APPROACH marker-id")
                    if len(args) >= 1
@@ -268,19 +279,30 @@ def parse(text: str, defaults: dict) -> List[Step]:
             dist = (_parse_float(args[1], raw_line_no, "APPROACH distance")
                     if len(args) >= 2
                     else float(_required_default(defaults, "distance", raw_line_no)))
-            yaw_tol = None
+            dist_tol = None
             if len(args) >= 3:
+                # Arrival distance tolerance (m): settle anywhere within ±this of
+                # the target distance instead of the tight ~5 cm deadband. Still
+                # a capture (vision height-align). 0.05..5 m.
+                dist_tol = _parse_float(args[2], raw_line_no, "APPROACH dist_tol")
+                if not (0.05 <= dist_tol <= 5.0):
+                    raise ScriptError(raw_line_no,
+                                      f"APPROACH dist_tol must be 0.05..5 m, "
+                                      f"got {dist_tol}")
+            yaw_tol = None
+            if len(args) >= 4:
                 # Advance as soon as the DISTANCE is reached and the drone is
                 # within this many degrees of facing the marker (no head-on
                 # settle wait). 1..180. Use a wide value (e.g. 45) for a fast
                 # capture hand-off from any angle.
-                yaw_tol = _parse_float(args[2], raw_line_no, "APPROACH yaw_tol")
+                yaw_tol = _parse_float(args[3], raw_line_no, "APPROACH yaw_tol")
                 if not (1.0 <= yaw_tol <= 180.0):
                     raise ScriptError(raw_line_no,
                                       f"APPROACH yaw_tol must be 1..180 deg, "
                                       f"got {yaw_tol}")
             out.append(Step(kind="APPROACH",
                             marker_id=mid, distance=dist,
+                            approach_dist_tol_m=dist_tol,
                             arrive_yaw_tol_deg=yaw_tol,
                             line_no=raw_line_no))
         elif cmd == "GO_HOME":
@@ -685,9 +707,15 @@ def format(steps: List[Step]) -> str:
                 lines.append(f"GO_HOME {s.marker_id} {s.distance:g} "
                              f"{s.arrive_tol_m:g}{hdg_part}")
             else:
-                yaw_part = (f" {s.arrive_yaw_tol_deg:g}"
-                            if s.arrive_yaw_tol_deg is not None else "")
-                lines.append(f"APPROACH {s.marker_id} {s.distance:g}{yaw_part}")
+                # 3rd arg = distance tolerance, 4th = yaw tolerance. yaw_tol is
+                # positional after dist_tol, so it is only emitted when dist_tol
+                # is also present (a parsed Step with yaw_tol always has it).
+                extra = ""
+                if s.approach_dist_tol_m is not None:
+                    extra += f" {s.approach_dist_tol_m:g}"
+                    if s.arrive_yaw_tol_deg is not None:
+                        extra += f" {s.arrive_yaw_tol_deg:g}"
+                lines.append(f"APPROACH {s.marker_id} {s.distance:g}{extra}")
         elif s.kind == "HOOVER":
             lines.append(f"HOOVER {s.seconds:g}")
         elif s.kind == "AWAIT":
