@@ -263,7 +263,9 @@ class MissionConfig:
     # --- Search behaviour ----------------------------------------------------
     # When the marker is not visible, we yaw in place looking for it. After
     # one full rotation without a sighting, we give up and land.
-    search_yaw_rc: int = 25                # TUNE  RC value while sweeping
+    search_yaw_rc: int = 70                # TUNE  RC value while sweeping
+                                            # (operator: recover by rotating at 70
+                                            # until any ArUco marker is seen)
     search_total_deg: float = 360.0        # how far to sweep before giving up
     search_marker_lost_grace_s: float = 1.5  # TUNE  hold last command this long
                                               # before declaring the marker
