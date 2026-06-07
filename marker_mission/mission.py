@@ -372,6 +372,24 @@ def cmd_fly(args: argparse.Namespace) -> int:
     NON_AIRBORNE_PHASES = {Phase.INIT, Phase.LAND, Phase.DONE, Phase.ABORT}
     AIRBORNE_PHASES = {p for p in Phase if p not in NON_AIRBORNE_PHASES}
 
+    # Recording grace after phase leaves AIRBORNE (killswitch, abort,
+    # clean land). Keep frames + log rows flowing until BOTH:
+    #   (A) >= RECORDING_GRACE_MIN_S have elapsed since phase exit, AND
+    #   (B) tel.flying is False
+    # with RECORDING_GRACE_MAX_S as a hard cap so a frozen telemetry
+    # feed (tel.flying never updates) can't keep the recorder open
+    # forever. The "video stops too soon" symptom was just the legacy
+    # "set recording_paused immediately on phase exit" behaviour --
+    # the killswitch lurch happens AFTER the phase transition, so the
+    # interesting frames used to land outside the file. The grace
+    # evaluator lives in log_worker (already ticks at 5+ Hz).
+    RECORDING_GRACE_MIN_S = 3.0
+    RECORDING_GRACE_MAX_S = 10.0
+    # Monotonic timestamp at which phase last left AIRBORNE, or None
+    # when currently airborne / never airborne yet. Closure-box so
+    # on_phase_change can write it and log_worker can read it.
+    airborne_exit_mono: list = [None]
+
     def on_phase_change(old_phase, new_phase, note):
         # First-tick of TAKEOFF in this mission: create the flight dir
         # and recorder. We do this BEFORE clearing recording_paused so
@@ -465,15 +483,23 @@ def cmd_fly(args: argparse.Namespace) -> int:
             if errs:
                 print(f"[mission] camera restart at TAKEOFF: {errs}")
 
-        # Recording envelope.
+        # Recording envelope. Entering AIRBORNE re-arms the gate
+        # immediately (frames must flow from the first takeoff tick).
+        # Leaving AIRBORNE does NOT pause immediately -- it marks the
+        # exit time and lets log_worker's grace evaluator decide when
+        # to stop. See RECORDING_GRACE_MIN_S / _MAX_S above.
         if new_phase in AIRBORNE_PHASES:
             if recording_paused.is_set():
                 print(f"[rec] starting recording (phase={new_phase.value})")
             recording_paused.clear()
+            airborne_exit_mono[0] = None
         else:
-            if not recording_paused.is_set():
-                print(f"[rec] stopping recording (phase={new_phase.value})")
-            recording_paused.set()
+            if airborne_exit_mono[0] is None:
+                airborne_exit_mono[0] = time.monotonic()
+                print(f"[rec] phase left airborne (phase={new_phase.value}) "
+                      f"-- grace recording for >={RECORDING_GRACE_MIN_S:.0f}s "
+                      f"(until tel.flying=False, capped at "
+                      f"{RECORDING_GRACE_MAX_S:.0f}s)")
 
         # End-of-flight snapshot. Only if a flight actually happened
         # (cfg_start.json was written above).
@@ -1377,6 +1403,23 @@ def cmd_fly(args: argparse.Namespace) -> int:
         # arriving (useful for diagnosing video drops).
         period = 1.0 / max(2.0, cfg.control_rate_hz / 2)
         while not stop.is_set():
+            # Recording grace evaluator (see RECORDING_GRACE_MIN_S /
+            # _MAX_S). Once phase leaves AIRBORNE, keep frames + rows
+            # flowing until BOTH >= MIN_S elapsed AND tel.flying=False,
+            # capped at MAX_S so frozen telemetry can't run forever.
+            ex_mono = airborne_exit_mono[0]
+            if ex_mono is not None and not recording_paused.is_set():
+                elapsed = time.monotonic() - ex_mono
+                tel = tel_holder.get()
+                still_flying = bool(getattr(tel, "flying", False))
+                min_grace_done = elapsed >= RECORDING_GRACE_MIN_S
+                cap_reached = elapsed >= RECORDING_GRACE_MAX_S
+                if cap_reached or (min_grace_done and not still_flying):
+                    reason = ("cap" if cap_reached
+                              else "tel.flying=False")
+                    print(f"[rec] stopping recording -- grace ended after "
+                          f"{elapsed:.1f}s (reason={reason})")
+                    recording_paused.set()
             if not recording_paused.is_set():
                 rec = recorder_box[0]
                 if rec is not None:
@@ -1462,6 +1505,20 @@ def cmd_fly(args: argparse.Namespace) -> int:
             # entering TAKEOFF (operator pressed Stop in INIT, etc.)
             # leaves recorder_box[0] / flight_dir_box[0] both None and we
             # have nothing to finalize.
+            #
+            # Recording grace: wait for log_worker's evaluator to set
+            # recording_paused (>= RECORDING_GRACE_MIN_S elapsed AND
+            # tel.flying=False, or RECORDING_GRACE_MAX_S cap). This
+            # captures the few seconds AFTER killswitch/abort -- the
+            # interesting frames used to be dropped because the mission
+            # loop set recording_paused the moment the controller exited.
+            if recorder_box[0] is not None and airborne_exit_mono[0] is not None:
+                wait_deadline = (airborne_exit_mono[0]
+                                 + RECORDING_GRACE_MAX_S + 0.5)
+                while (not recording_paused.is_set()
+                       and time.monotonic() < wait_deadline
+                       and not stop.is_set()):
+                    time.sleep(0.05)
             recording_paused.set()
             if recorder_box[0] is not None and flight_dir_box[0] is not None:
                 outcome = {
