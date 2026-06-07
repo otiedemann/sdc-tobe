@@ -65,6 +65,7 @@ SCRIPT_GRACE_S = 6.0
 # close enough to watch all six boxes. APPROACH auto-rotates to FIND its marker
 # (vision homing), so this needs NO TO / absolute goto and no pre-orientation.
 # Operator-specified positioning method.
+# Default centre markers; overridden per hall by match.scout_center_markers.
 CENTER_MARKERS: tuple[int, int] = (11, 15)
 # 5 m head-on from a side marker (x=±5, y=0) lands the scout at the arena centre
 # (x=0, y=0). Operator-specified.
@@ -115,11 +116,23 @@ def _standoff_to(ctx: RoleContext, target_xy: tuple[float, float]):
     return int(mid), float(dist)
 
 
+def _center_markers(ctx: RoleContext) -> tuple[int, ...]:
+    """The configured side-wall centre markers for this hall (operator-editable
+    in the C2: ``match.scout_center_markers``). Falls back to the module
+    default 11/15 for configs that predate the setting."""
+    cm = getattr(ctx.match, "scout_center_markers", None)
+    out = tuple(int(m) for m in cm) if cm else ()
+    return out or CENTER_MARKERS
+
+
 def _pick_center_marker(ctx: RoleContext, rs) -> int:
-    """Which side marker (11/15) to APPROACH this cycle. Prefer the one we are
+    """Which side centre marker to APPROACH this cycle. Prefer the one we are
     already using if it is still in view (stable choice), else any currently
-    visible side marker, else the previous/default one — APPROACH will rotate
-    to search for it regardless ("find one of the two markers")."""
+    visible configured centre marker, else the previous/default one — APPROACH
+    will rotate to search for it regardless ("find one of the markers"). The
+    candidate set comes from ``match.scout_center_markers`` (default 11/15),
+    so it adapts per hall without a code change."""
+    centers = _center_markers(ctx)
     vis = set()
     for mid in ctx.state.visible_marker_ids:
         try:
@@ -127,12 +140,12 @@ def _pick_center_marker(ctx: RoleContext, rs) -> int:
         except (TypeError, ValueError):
             pass
     last = rs.scratch.get("center_marker")
-    if last in vis:
+    if last in vis and last in centers:
         return last
-    for m in CENTER_MARKERS:
+    for m in centers:
         if m in vis:
             return m
-    return last if last in CENTER_MARKERS else CENTER_MARKERS[0]
+    return last if last in centers else centers[0]
 
 
 def _center_script(ctx: RoleContext, marker_id: int) -> str:

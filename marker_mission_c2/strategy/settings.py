@@ -168,6 +168,12 @@ class MatchSettings:
     # (the scout then just rotates wherever it took off — which is the
     # arena centre in the sim, where the drone spawns at 0,0).
     scout_center: bool = True
+    # Which side-wall markers the scout GO_HOMEs onto to reach the arena
+    # centre. These are the mid-field side markers (x = ±5, y = 0) present in
+    # both the real/competition and GVZ halls — IDs 11 (right) and 15 (left).
+    # The scout APPROACHes whichever it can see. Editable per hall: if a venue
+    # uses different centre markers, set them here without a code change.
+    scout_center_markers: tuple[int, ...] = (11, 15)
 
 
 @dataclass(frozen=True)
@@ -294,6 +300,27 @@ def _coerce_slot_list(raw: Any, default: tuple[int, ...]) -> tuple[int, ...]:
     return tuple(out) if out else default
 
 
+def _coerce_marker_ids(raw: Any, default: tuple[int, ...]) -> tuple[int, ...]:
+    """Parse a list/tuple of marker IDs, or a comma/space-separated string
+    (dashboard convenience, e.g. "11,15"). Keeps any positive integer ID,
+    dedups, preserves order; falls back to ``default`` if nothing valid."""
+    if isinstance(raw, str):
+        raw = raw.replace(",", " ").split()
+    if not isinstance(raw, (list, tuple)):
+        return default
+    out: List[int] = []
+    seen: set[int] = set()
+    for x in raw:
+        try:
+            v = int(x)
+        except (TypeError, ValueError):
+            continue
+        if v > 0 and v not in seen:
+            out.append(v)
+            seen.add(v)
+    return tuple(out) if out else default
+
+
 def _drone_to_dict(d: DroneSettings) -> Dict[str, Any]:
     return {
         "team": d.team,
@@ -351,6 +378,7 @@ def _settings_to_dict(s: StrategySettings) -> Dict[str, Any]:
             "scout_yaw_stick": int(s.match.scout_yaw_stick),
             "scout_drive_duration_s": float(s.match.scout_drive_duration_s),
             "scout_center": bool(s.match.scout_center),
+            "scout_center_markers": list(s.match.scout_center_markers),
         },
         "markers": {
             "our_team": s.markers.our_team,
@@ -390,6 +418,9 @@ def _settings_from_dict(raw: Any, *, known_fc_names: Iterable[str]) -> StrategyS
             m_raw.get("scout_drive_duration_s", m_defaults.scout_drive_duration_s)
         ),
         scout_center=bool(m_raw.get("scout_center", m_defaults.scout_center)),
+        scout_center_markers=_coerce_marker_ids(
+            m_raw.get("scout_center_markers"), m_defaults.scout_center_markers
+        ),
     )
 
     markers_raw = raw.get("markers") or {}
@@ -583,6 +614,9 @@ class SettingsStore:
                     allowed["scout_yaw_stick"] = max(-100, min(100, val))
             if "scout_center" in changes:
                 allowed["scout_center"] = bool(changes["scout_center"])
+            if "scout_center_markers" in changes:
+                allowed["scout_center_markers"] = _coerce_marker_ids(
+                    changes["scout_center_markers"], m.scout_center_markers)
             patched = replace(m, **allowed)
             self._settings = replace(self._settings, match=patched)
             self._write_atomic(_settings_to_dict(self._settings))
