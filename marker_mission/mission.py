@@ -659,8 +659,10 @@ def cmd_fly(args: argparse.Namespace) -> int:
         # Temporal filter: a blob must appear in ≥ 3 of the last 5 frames.
         import collections as _col
         _dd_prev_gray  = None
-        _DD_MIN_PX     = 20     # min blob dimension
-        _DD_MAX_PX     = 300    # max blob dimension (filters walls/ceiling)
+        _DD_MIN_W      = 30     # min blob width  (2:1 aspect → drones are wide)
+        _DD_MIN_H      = 15     # min blob height
+        _DD_MAX_W      = 300    # max blob width  (filters walls/ceiling)
+        _DD_MAX_H      = 150    # max blob height (300×15/30 — keeps 2:1 ratio)
         _DD_CONSEC_REQ = 8      # consecutive frames required to confirm
         _DD_TOP_N      = 4      # max candidates shown (1 red + 3 yellow)
         _DD_MATCH_PX   = 40     # centre-distance for track→detection match
@@ -712,8 +714,8 @@ def cmd_fly(args: argparse.Namespace) -> int:
             blobs = []
             for c in cnts:
                 x, y, bw, bh = cv2.boundingRect(c)
-                if bw >= _DD_MIN_PX and bh >= _DD_MIN_PX \
-                        and bw <= _DD_MAX_PX and bh <= _DD_MAX_PX:
+                if bw >= _DD_MIN_W and bh >= _DD_MIN_H \
+                        and bw <= _DD_MAX_W and bh <= _DD_MAX_H:
                     blobs.append((x, y, bw, bh))
             blobs.sort(key=lambda b: -(b[2]*b[3]))
             _dd_prev_gray = gray
