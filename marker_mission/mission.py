@@ -1250,10 +1250,9 @@ def cmd_fly(args: argparse.Namespace) -> int:
                 # tracked value shows the operator the live zoom on the overlay.
                 zoom_x = float(getattr(controller, "_search_zoom", 1.0) or 1.0)
                 lines = [
-                    f"phase: {snap['phase']}",
+                    f"phase: {snap['phase']}  zoom={zoom_x:.2f}x",
                     f"target id={active_mid}  "
-                    f"size={detector.marker_size*100:.0f}cm  "
-                    f"zoom={zoom_x:.2f}x",
+                    f"size={detector.marker_size*100:.0f}cm",
                 ]
                 d_s = snap.get("distance_m")
                 y_s = snap.get("yaw_to_marker_deg")
