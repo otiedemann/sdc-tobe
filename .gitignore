@@ -244,3 +244,7 @@ __marimo__/
 # Strategy runtime settings (operator-local; example template is committed)
 /marker_mission_c2/strategy/settings.json
 
+# Per-FC drone fleet registry (local config — not overwritten by deploys)
+# Copy drones.csv.example to drones.csv and edit for your fleet.
+controller_unified/drones.csv
+

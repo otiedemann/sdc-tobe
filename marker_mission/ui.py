@@ -4378,17 +4378,21 @@ _PAGE_HARDWARE = _PAGE_BASE_CSS + _PAGE_HEADER + _COMMON_SCRIPT + _PAGE_GRID_OPE
         return;
       }
       body.innerHTML = d.networks.map(n => {
-        const inUse   = n.in_use ? '<span style="color:var(--good);">●</span>' : '';
-        const sigStr  = `<span style="font-family:monospace;color:${n.signal>60?'var(--good)':n.signal>35?'var(--warn)':'var(--bad)'}">${sigBar(n.signal)}</span> ${n.signal}%`;
-        const drone   = n.drone_id
+        const inUse  = n.in_use ? '<span style="color:var(--good);">●</span>' : '';
+        const sigStr = `<span style="font-family:monospace;color:${n.signal>60?'var(--good)':n.signal>35?'var(--warn)':'var(--bad)'}">${sigBar(n.signal)}</span> ${n.signal}%`;
+        const drone  = n.drone_id
           ? `<span style="color:var(--good);font-weight:600;">#${escHtmlWifi(n.drone_id)}</span>`
-          : '<span style="color:#444;">—</span>';
+          : '<span style="color:#777;">—</span>';
+        // Known drone → full Switch (land + WiFi + reinit); unknown → plain WiFi connect
         const connectBtn = n.drone_id
           ? `<button onclick="wifiConnect('${escHtmlWifi(n.drone_id)}')"
                style="padding:.25rem .6rem;border:0;border-radius:5px;
                       background:#dc2626;color:#fff;font-size:.8rem;
                       font-weight:700;cursor:pointer;">Switch</button>`
-          : '';
+          : `<button onclick="wifiConnectDirect('${escHtmlWifi(n.ssid)}')"
+               style="padding:.25rem .6rem;border:1px solid #4b5563;border-radius:5px;
+                      background:transparent;color:#d0d8e0;font-size:.8rem;
+                      cursor:pointer;">Connect</button>`;
         return `<tr>
           <td>${inUse}</td>
           <td style="font-family:monospace;">${escHtmlWifi(n.ssid)}</td>
@@ -4405,16 +4409,39 @@ _PAGE_HARDWARE = _PAGE_BASE_CSS + _PAGE_HEADER + _COMMON_SCRIPT + _PAGE_GRID_OPE
     }
   }
 
+  // Known drone: use full Switch flow (land → WiFi + password → reinit)
   window.wifiConnect = function(droneId) {
-    // Populate the switch dropdown and trigger switch
     const sel = document.getElementById('drone-select');
     for (let i = 0; i < sel.options.length; i++) {
-      if (sel.options[i].value === droneId) {
-        sel.selectedIndex = i;
-        break;
-      }
+      if (sel.options[i].value === droneId) { sel.selectedIndex = i; break; }
     }
     document.getElementById('btn-drone-switch').click();
+  };
+
+  // Unknown network: just switch WiFi, reconnect loop finds drone at 192.168.42.1
+  window.wifiConnectDirect = async function(ssid) {
+    const err = document.getElementById('wifi-scan-err');
+    err.textContent = `Connecting to ${ssid}… (≈3 s)`;
+    err.style.color = '#f59e0b';
+    try {
+      const r = await fetch('/api/wifi/connect', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({ssid}),
+        cache: 'no-store',
+      });
+      const d = await r.json();
+      if (d.ok) {
+        err.textContent = `Connected to ${ssid}. Drone will reconnect at 192.168.42.1.`;
+        err.style.color = 'var(--good)';
+      } else {
+        err.textContent = `Connect failed: ${d.error}`;
+        err.style.color = 'var(--bad)';
+      }
+    } catch(e) {
+      err.textContent = 'Request failed: ' + e;
+      err.style.color = 'var(--bad)';
+    }
   };
 
   document.getElementById('btn-wifi-scan').addEventListener('click', runWifiScan);

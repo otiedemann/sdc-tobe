@@ -7197,6 +7197,46 @@ def api_wifi_networks():
     return jsonify(ok=True, networks=networks)
 
 
+@app.post("/api/wifi/connect")
+def api_wifi_connect():
+    """Connect the host to an arbitrary WiFi SSID without a full drone switch.
+    For drones not in the CSV — just join the WiFi and let the reconnect loop
+    find the drone at 192.168.42.1 as usual.
+
+    Body: {"ssid": "ANAFI_XXXXXX", "password": "optional"}
+    """
+    data = request.get_json(silent=True) or {}
+    ssid = str(data.get("ssid", "")).strip()
+    if not ssid:
+        return jsonify(ok=False, error="'ssid' field required"), 400
+    password = str(data.get("password", "")).strip()
+
+    try:
+        subprocess.run(["sudo", "nmcli", "device", "wifi", "rescan"],
+                       capture_output=True, timeout=10)
+        time.sleep(3.0)
+    except Exception:
+        pass
+
+    # Remove stale profile to avoid "Secrets were required" errors
+    subprocess.run(["sudo", "nmcli", "connection", "delete", ssid],
+                   capture_output=True, timeout=10)
+
+    cmd = ["sudo", "nmcli", "device", "wifi", "connect", ssid]
+    if password:
+        cmd += ["password", password]
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+    except subprocess.TimeoutExpired:
+        return jsonify(ok=False, error="nmcli timed out"), 500
+
+    if r.returncode != 0:
+        err = r.stderr.strip() or r.stdout.strip() or f"nmcli exited {r.returncode}"
+        return jsonify(ok=False, error=err), 502
+
+    return jsonify(ok=True)
+
+
 @app.get("/api/drones")
 def api_drones_list():
     """List all drones from the fleet CSV (passwords omitted)."""
