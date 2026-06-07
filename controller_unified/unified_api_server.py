@@ -7141,8 +7141,8 @@ def _save_drones_csv(rows: list):
         raise
 
 
-@app.get("/api/wifi/scan")
-def api_wifi_scan():
+@app.get("/api/wifi/networks")
+def api_wifi_networks():
     """Trigger a WiFi rescan, then return visible networks annotated with
     drone CSV matches. Response: {ok, networks: [{ssid, signal, security,
     in_use, drone_id?, drone_name?}]}. Takes ~3 s (rescan wait)."""

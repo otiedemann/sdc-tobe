@@ -4369,7 +4369,7 @@ _PAGE_HARDWARE = _PAGE_BASE_CSS + _PAGE_HEADER + _COMMON_SCRIPT + _PAGE_GRID_OPE
     ts.textContent = ''; err.textContent = '';
     body.innerHTML = '<tr><td colspan="5" style="color:#555;">Scanning (≈3 s)…</td></tr>';
     try {
-      const r = await fetch('/api/wifi/scan', {cache:'no-store'});
+      const r = await fetch('/api/wifi/networks', {cache:'no-store'});
       const d = await r.json();
       if (!d.ok) { err.textContent = d.error || 'scan failed'; body.innerHTML = ''; return; }
       ts.textContent = new Date().toLocaleTimeString('de-DE');
