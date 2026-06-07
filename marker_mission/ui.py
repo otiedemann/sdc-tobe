@@ -6354,25 +6354,30 @@ class UiServer:
             except Exception as e:
                 return jsonify({'error': str(e)})
 
-        @app.post("/api/wifi/channel")
-        def api_wifi_channel():
-            """Set the connected Anafi's Wi-Fi AP band + channel.
-            Body: {"band": "5_GHz"|"2_4_GHz", "auto": true|false,
-                   "channel": <int, only when auto=false>}.
-            auto picks the cleanest channel in the band. Changing the channel
-            drops the link briefly — only on the ground."""
-            if self.api is None:
-                return jsonify({"ok": False, "error": "no drone api"}), 503
-            data = request.get_json(silent=True) or {}
-            try:
-                res = self.api.set_wifi_channel(
-                    band=str(data.get("band", "5_GHz")),
-                    channel=int(data.get("channel", 0) or 0),
-                    auto=bool(data.get("auto", True)),
-                )
-                return jsonify(res), (200 if res.get("ok") else 502)
-            except Exception as e:
-                return jsonify({"ok": False, "error": str(e)}), 500
+        # In combined mode the unified_api_server already registers this
+        # route at module level — skip it here to avoid a duplicate-endpoint
+        # AssertionError (introduced in f3a6f72 when wifi control landed in
+        # both files simultaneously).
+        if self.owns_app:
+            @app.post("/api/wifi/channel")
+            def api_wifi_channel():
+                """Set the connected Anafi's Wi-Fi AP band + channel.
+                Body: {"band": "5_GHz"|"2_4_GHz", "auto": true|false,
+                       "channel": <int, only when auto=false>}.
+                auto picks the cleanest channel in the band. Changing the channel
+                drops the link briefly — only on the ground."""
+                if self.api is None:
+                    return jsonify({"ok": False, "error": "no drone api"}), 503
+                data = request.get_json(silent=True) or {}
+                try:
+                    res = self.api.set_wifi_channel(
+                        band=str(data.get("band", "5_GHz")),
+                        channel=int(data.get("channel", 0) or 0),
+                        auto=bool(data.get("auto", True)),
+                    )
+                    return jsonify(res), (200 if res.get("ok") else 502)
+                except Exception as e:
+                    return jsonify({"ok": False, "error": str(e)}), 500
 
         @app.get("/team_logo.png")
         def team_logo():
