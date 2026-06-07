@@ -475,6 +475,12 @@ class MissionState:
     # gates on abs(e_hdg) < arrive_hdg_tol_deg before advancing.
     # None -> no heading gate (plain APPROACH or GO_HOME without hdg arg).
     arrive_hdg_tol_deg: Optional[float] = None
+    # Yaw-settle tolerance (deg) for APPROACH's 3rd arg: when set, the approach
+    # advances as soon as abs(e_yaw) < this AND the distance band is met, with NO
+    # settle-time wait — a fast hand-off the instant the target distance is
+    # reached (from an angle). None -> tight head-on settle (cfg.yaw_deadband_deg
+    # + cfg.approach_settle_time_s).
+    arrive_yaw_tol_deg: Optional[float] = None
     target_relative_heading_deg: float = 90.0
     active_marker_id: Optional[int] = None
     hold_time_s: float = 60.0
@@ -891,6 +897,7 @@ class MissionController:
             self.state.target_distance_m = self.cfg.target_distance_m
             self.state.target_distance_tol_m = None
             self.state.arrive_hdg_tol_deg = None
+            self.state.arrive_yaw_tol_deg = None
             self.state.target_relative_heading_deg = (
                 self.cfg.target_relative_heading_deg)
 
@@ -957,6 +964,7 @@ class MissionController:
             self.state.target_distance_m = self.cfg.target_distance_m
             self.state.target_distance_tol_m = None
             self.state.arrive_hdg_tol_deg = None
+            self.state.arrive_yaw_tol_deg = None
             self.state.target_relative_heading_deg = self.cfg.target_relative_heading_deg
             self.state.active_marker_id = self.cfg.target_marker_id
             self.state.hold_time_s = self.cfg.hold_time_s
@@ -2087,8 +2095,19 @@ class MissionController:
         # threading.Lock is non-reentrant.
         with self.state.lock:
             _hdg_tol = self.state.arrive_hdg_tol_deg
+            _yaw_tol_override = self.state.arrive_yaw_tol_deg
         hdg_ok = (_hdg_tol is None or abs(e_hdg) < _hdg_tol)
-        in_band = (abs(e_yaw) < cfg.yaw_deadband_deg
+        # APPROACH's optional 3rd arg (state.arrive_yaw_tol_deg): a WIDE yaw
+        # tolerance lets the approach advance the instant the target distance is
+        # reached, even from an angle (e.g. 30/45° off the marker normal), with
+        # NO settle-time wait -- so the next step (e.g. FB_UD_IMU over the box)
+        # fires immediately. None -> tight head-on settle (cfg defaults).
+        eff_yaw_tol = (_yaw_tol_override
+                       if _yaw_tol_override is not None
+                       else cfg.yaw_deadband_deg)
+        eff_settle = (0.0 if _yaw_tol_override is not None
+                      else cfg.approach_settle_time_s)
+        in_band = (abs(e_yaw) < eff_yaw_tol
                    and abs(e_fwd) < eff_tol
                    and hdg_ok)
         settled = False
@@ -2096,7 +2115,7 @@ class MissionController:
             if in_band:
                 if self.state.settle_began_at is None:
                     self.state.settle_began_at = now
-                if now - self.state.settle_began_at >= cfg.approach_settle_time_s:
+                if now - self.state.settle_began_at >= eff_settle:
                     settled = True
             else:
                 self.state.settle_began_at = None
@@ -3666,6 +3685,15 @@ class MissionController:
                     if step.arrive_hdg_deg is not None else 0.0)
                 self.state.arrive_hdg_tol_deg = (
                     15.0 if step.arrive_hdg_deg is not None else None)
+                # APPROACH's optional 3rd arg: a wide yaw-settle tolerance that
+                # makes the approach advance the instant the target DISTANCE is
+                # reached (no head-on settle, no settle-time wait) so the next
+                # step (e.g. FB_UD_IMU over the box) fires immediately, from an
+                # angle. None -> tight head-on settle.
+                self.state.arrive_yaw_tol_deg = (
+                    float(step.arrive_yaw_tol_deg)
+                    if getattr(step, "arrive_yaw_tol_deg", None) is not None
+                    else None)
             self._set_phase(Phase.SEARCH,
                             note + f" id={int(step.marker_id)}"
                                    f" d={float(step.distance):g}m"
