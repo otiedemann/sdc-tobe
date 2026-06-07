@@ -139,6 +139,51 @@ _PAGE_HEADER = """
     <div id="wlan-info" style="font-size:.72rem; color:#bbb; line-height:1.5;
          font-family:monospace; white-space:nowrap;
          border:1px solid #444; border-radius:4px; padding:4px 8px;">—</div>
+    <div id="wifi-set" title="Set the drone's Wi-Fi AP band/channel. Auto picks the cleanest channel in the band. The link drops briefly on change — GROUND ONLY."
+         style="font-size:.70rem; color:#bbb; display:flex; align-items:center;
+                gap:3px; border:1px solid #444; border-radius:4px; padding:3px 6px;">
+      <span style="color:#888;">WiFi</span>
+      <select id="wifi-band" style="font-size:.70rem; background:#222; color:#ddd; border:1px solid #555;">
+        <option value="5_GHz">5 GHz</option>
+        <option value="2_4_GHz">2.4 GHz</option>
+      </select>
+      <select id="wifi-mode" style="font-size:.70rem; background:#222; color:#ddd; border:1px solid #555;">
+        <option value="auto">auto</option>
+        <option value="manual">manual</option>
+      </select>
+      <input id="wifi-ch" type="number" min="1" max="165" placeholder="ch"
+             style="width:46px; font-size:.70rem; background:#222; color:#ddd; border:1px solid #555; display:none;">
+      <button id="wifi-set-btn" type="button" style="font-size:.70rem; cursor:pointer;">Set</button>
+    </div>
+    <script>
+    (function(){
+      const mode = document.getElementById('wifi-mode');
+      const ch   = document.getElementById('wifi-ch');
+      const btn  = document.getElementById('wifi-set-btn');
+      if (mode && ch) mode.addEventListener('change', () => {
+        ch.style.display = (mode.value === 'manual') ? '' : 'none';
+      });
+      if (btn) btn.addEventListener('click', async () => {
+        const band = document.getElementById('wifi-band').value;
+        const auto = mode.value === 'auto';
+        const channel = parseInt(ch.value || '0', 10) || 0;
+        if (!auto && !channel) { alert('Enter a channel for manual mode'); return; }
+        if (!confirm('Set drone Wi-Fi to ' + band.replace('_',' ') +
+                     (auto ? ' (auto channel)' : ' channel ' + channel) +
+                     '?\\nThe Wi-Fi link will drop for a few seconds. Drone must be on the ground.')) return;
+        btn.disabled = true; const old = btn.textContent; btn.textContent = '…';
+        try {
+          const r = await fetch('/api/wifi/channel', {method:'POST',
+            headers:{'Content-Type':'application/json'},
+            body: JSON.stringify({band, auto, channel})});
+          const j = await r.json();
+          btn.textContent = j.ok ? '✓' : '✗';
+          if (!j.ok) alert('Wi-Fi set failed: ' + (j.error || 'unknown'));
+        } catch(e) { btn.textContent = '✗'; alert('Wi-Fi set error: ' + e); }
+        setTimeout(() => { btn.disabled = false; btn.textContent = old; }, 3000);
+      });
+    })();
+    </script>
     <div id="header-drone-state"
          style="font-size:.72rem; font-family:monospace; white-space:nowrap;
                 border:1px solid #444; border-radius:4px; padding:4px 8px;
@@ -6162,6 +6207,26 @@ class UiServer:
                 return jsonify(result)
             except Exception as e:
                 return jsonify({'error': str(e)})
+
+        @app.post("/api/wifi/channel")
+        def api_wifi_channel():
+            """Set the connected Anafi's Wi-Fi AP band + channel.
+            Body: {"band": "5_GHz"|"2_4_GHz", "auto": true|false,
+                   "channel": <int, only when auto=false>}.
+            auto picks the cleanest channel in the band. Changing the channel
+            drops the link briefly — only on the ground."""
+            if self.api is None:
+                return jsonify({"ok": False, "error": "no drone api"}), 503
+            data = request.get_json(silent=True) or {}
+            try:
+                res = self.api.set_wifi_channel(
+                    band=str(data.get("band", "5_GHz")),
+                    channel=int(data.get("channel", 0) or 0),
+                    auto=bool(data.get("auto", True)),
+                )
+                return jsonify(res), (200 if res.get("ok") else 502)
+            except Exception as e:
+                return jsonify({"ok": False, "error": str(e)}), 500
 
         @app.get("/team_logo.png")
         def team_logo():

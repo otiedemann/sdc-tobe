@@ -173,6 +173,14 @@ class DroneApiInProc:
             r = c.post("/api/camera/config", json=fields)
             return self._unwrap(r.get_json() or {}, r.status_code)
 
+    def set_wifi_channel(self, band: str = "5_GHz", channel: int = 0,
+                         auto: bool = True) -> dict:
+        """Set the Anafi AP Wi-Fi band + channel. auto=True -> drone picks the
+        cleanest channel in the band; else pin ``channel``. Drops the link
+        briefly — ground use only."""
+        return self._unwrap(*drone_core.do_set_wifi_channel(
+            band=band, channel=int(channel), auto=bool(auto)))
+
 
 # ---------------------------------------------------------------------------
 # In-proc MJPEG reader — drop-in for drone_api.MjpegStreamReader

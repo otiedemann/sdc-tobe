@@ -282,6 +282,58 @@ def do_rotate(direction: Any = "", deg: Any = 45,
 
 
 # ---------------------------------------------------------------------------
+# Wi-Fi AP band / channel
+# ---------------------------------------------------------------------------
+
+def do_set_wifi_channel(band: Any = "5_GHz", channel: Any = 0,
+                        auto: Any = True) -> tuple[dict, int]:
+    """Set the Anafi's Wi-Fi AP band + channel (in-proc twin of the HTTP
+    ``/api/wifi/channel``).
+
+    auto=True (recommended): the drone scans and picks the cleanest channel in
+    ``band`` (``"5_GHz"`` / ``"2_4_GHz"``). auto=False: pin ``channel`` (1-13 for
+    2.4 GHz; 36/40/44/48/149/153/157/161/165 for 5 GHz, region-dependent).
+
+    Changing the AP channel briefly DROPS the Wi-Fi link (the drone re-associates
+    on the new channel; the watchdog reconnects). Only issue it on the ground.
+    """
+    import unified_api_server as _srv  # sibling import; see header note
+    if not getattr(_srv, "HAS_WIFI_CTRL", False) or _srv.WifiSetApChannel is None:
+        return {"ok": False, "error": "Wi-Fi control not supported"}, 501
+    b = _srv._anafi_backend()
+    if b is None:
+        return {"ok": False, "error": "drone not connected"}, 503
+    band_str = str(band or "5_GHz").lower()
+    auto_mode = bool(auto)
+    try:
+        ch = int(channel)
+    except (TypeError, ValueError):
+        ch = 0
+    band_enum = _srv._wifi_band_enum(band_str)
+    if auto_mode:
+        which = ("auto_5" if band_str.startswith("5")
+                 else "auto_2_4" if band_str.startswith("2") else "auto_all")
+        sel = _srv._wifi_sel_type_enum(which)
+    else:
+        sel = _srv._wifi_sel_type_enum("manual")
+    try:
+        with _srv.command_lock:
+            b.drone(_srv.WifiSetApChannel(
+                type=sel, band=band_enum,
+                channel=0 if auto_mode else ch)).wait(_timeout=5)
+        mode = "auto" if auto_mode else "manual"
+        print(f"[ANAFI] Wi-Fi: {mode.upper()} -> band={band_str}, "
+              f"channel={'any' if auto_mode else ch}")
+        out = {"ok": True, "mode": mode, "band": band_str,
+               "message": "channel change submitted; the link drops briefly"}
+        if not auto_mode:
+            out["channel"] = ch
+        return out, 200
+    except Exception as e:
+        return {"ok": False, "error": str(e)}, 500
+
+
+# ---------------------------------------------------------------------------
 # Video pipeline (MJPEG / forward)
 # ---------------------------------------------------------------------------
 

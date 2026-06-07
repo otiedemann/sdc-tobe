@@ -203,6 +203,14 @@ class DroneApi:
         plus the post-apply state."""
         return self._post("/api/camera/config", fields)
 
+    def set_wifi_channel(self, band: str = "5_GHz", channel: int = 0,
+                         auto: bool = True) -> dict:
+        """Set the Anafi AP Wi-Fi band + channel. auto=True -> drone picks the
+        cleanest channel in the band; else pin ``channel``. Drops the link
+        briefly — ground use only."""
+        return self._post("/api/wifi/channel", {
+            "band": str(band), "channel": int(channel), "auto": bool(auto)})
+
 
 # ---------------------------------------------------------------------------
 # Video stream reader
