@@ -17,6 +17,7 @@ from __future__ import annotations
 import asyncio
 import collections
 import logging
+import math
 import threading
 import time
 from dataclasses import dataclass, field
@@ -542,10 +543,11 @@ class SwarmRunner:
         except Exception:
             logger.exception("strategy: match_status check crashed (continuing)")
 
-        # 3c) Height deconfliction: assign each enabled drone a DISTINCT
-        # cruise altitude so two drones never loiter/transit at the same
-        # height. Roles read this via RoleContext.cruise_alt_m.
-        cruise_alts = self._deconflicted_cruise_alts(s)
+        # 3c) Height deconfliction: scout at 1.0 m; movers above it (>= 1.3 m),
+        # distinct >= 0.30 m apart when near each other, dropping to the low
+        # 1.3 m rung when spread out (opponents fly high; we stay low). Roles
+        # read this via RoleContext.cruise_alt_m. Proximity uses live positions.
+        cruise_alts = self._deconflicted_cruise_alts(s, overview)
         self._last_cruise_alts = cruise_alts
 
         # 3c.5) Per-drone home-park lanes: spread OUR team across the home
@@ -701,40 +703,38 @@ class SwarmRunner:
     # Height deconfliction
     # ------------------------------------------------------------------
 
-    def _deconflicted_cruise_alts(self, s) -> Dict[str, float]:
-        """Return {fc_name: cruise_altitude_m}, distinct across BOTH teams.
+    # Movers within this xy distance (m) of EACH OTHER need distinct heights;
+    # beyond it they may share the low rung (the operator: "when drones are far
+    # apart you can keep a low altitude — our opponents use higher altitudes").
+    _DECONFLICT_PROX_M = 3.0
 
-        Every drone gets its own height so no two ever share one — the rule is
-        >= MIN_GAP (0.30 m) between ANY two drones, including enemy drones. We
-        can't see enemy drones (regs §1.3), so both teams follow one fixed
-        shared CONVENTION keyed off team colour: RED takes EVEN rungs, BLUE the
-        ODD ones, so the two ladders interleave to >= MIN_GAP without either
-        side reading the other's altitudes. Two bands:
+    def _deconflicted_cruise_alts(self, s, overview: Optional[Dict[str, Any]] = None
+                                  ) -> Dict[str, float]:
+        """Return {fc_name: cruise_altitude_m} for OUR drones.
 
-        SCOUTS fly LOW — level with the ~1 m box faces — so they actually SEE
-        the slot markers and keep the slot-state belief fresh. A high scout is
-        useless for this: the box face sits at ~1 m, so from 3.9 m the line to
-        a centre slot is sqrt(7.5^2 + 2.9^2) ~ 8.0 m — past the 8 m vision
-        range — AND hits the marker at a steep angle. Dropping to ~1 m brings
-        it to 7.5 m (in range) and head-on.
-            red scout  -> SCOUT_BASE + 0*GAP = 1.0 m
-            blue scout -> SCOUT_BASE + 1*GAP = 1.3 m
+        Operator policy:
+          * SCOUT flies at 1.0 m (level with the ~0.73 m box faces so it keeps
+            the slot-state belief fresh).
+          * MOVERS (attackers + defenders) fly HIGHER than the scout — floored
+            at SCOUT + MIN_GAP = 1.3 m — so they never crash into the
+            centre-loitering scout, with DISTINCT heights >= MIN_GAP (0.30 m)
+            apart from EACH OTHER.
+          * BUT a mover that is currently FAR (> _DECONFLICT_PROX_M) from every
+            OTHER mover drops to the LOW rung (1.3 m): no peer to deconflict
+            against, and flying low is safer because the opponents fly high.
+            The 1.3 m floor still clears the scout. So movers spread out -> all
+            low; bunched up -> fanned into a 1.3/1.6/1.9/... ladder.
 
-        MOVERS (attackers + defenders) fly the CRUISE band, above the 1.4 m box
-        tops for collision-free transit and >= MIN_GAP above the highest scout:
-            red  -> 1.6, 2.2, 2.8, 3.4   blue -> 1.9, 2.5, 3.1, 3.7
-
-        All 10: 1.0 1.3 1.6 1.9 2.2 2.5 2.8 3.1 3.4 3.7 — uniform 0.30 m apart.
-        Capped at MAX_ALT_M; ordered by fc_name for a stable mapping.
+        We do NOT interleave with the enemy any more: opponents fly high by
+        convention, so we simply stay low (1.0-~2 m) beneath them. Proximity is
+        evaluated from the live overview positions; with no position yet a mover
+        keeps its distinct ladder rung (the safe default).
         """
-        MIN_GAP = 0.30        # >= 30 cm between ANY two drones (both teams)
-        SCOUT_BASE_M = 1.00   # scouts loiter low, level with the box faces
-        CRUISE_BASE_M = 1.60  # movers: >= MIN_GAP above the top scout (1.3 m)
-                              # AND clear of the 1.4 m box tops for transit
-        MAX_ALT_M = 5.0       # 1 m below the 6 m arena ceiling
-        # Team isolation (regs §1.3): only assign rungs to OUR-team drones.
+        MIN_GAP = 0.30
+        SCOUT_ALT_M = 1.00
+        MOVER_BASE_M = round(SCOUT_ALT_M + MIN_GAP, 2)   # 1.30 — above the scout
+        MAX_ALT_M = 5.0
         our_team = (s.markers.our_team or "").lower()
-        parity = 1 if our_team == "blue" else 0   # red/unknown -> even rungs
         scouts: list[str] = []
         movers: list[str] = []
         for d in s.drones:
@@ -744,15 +744,34 @@ class SwarmRunner:
                 continue
             (scouts if d.role == "scout" else movers).append(d.fc_name)
         out: Dict[str, float] = {}
-        # Scouts: low band, interleaved by team so the two centre-loitering
-        # scouts never share a height.
-        for i, fc in enumerate(sorted(scouts)):
-            k = 2 * i + parity
-            out[fc] = round(SCOUT_BASE_M + k * MIN_GAP, 2)
-        # Movers: cruise band above the scouts, interleaved by team.
-        for i, fc in enumerate(sorted(movers)):
-            k = 2 * i + parity
-            out[fc] = min(round(CRUISE_BASE_M + k * MIN_GAP, 2), MAX_ALT_M)
+        for fc in scouts:
+            out[fc] = SCOUT_ALT_M
+        movers_sorted = sorted(movers)
+        # The DEFAULT distinct ladder rung for each mover (used when bunched up).
+        rung = {fc: min(round(MOVER_BASE_M + i * MIN_GAP, 2), MAX_ALT_M)
+                for i, fc in enumerate(movers_sorted)}
+        # Live xy positions for the proximity test.
+        positions: Dict[str, tuple] = {}
+        if overview:
+            for fc in movers_sorted:
+                ds = DroneState.from_overview(fc, overview.get(fc) or {})
+                p = ds.world_position_m
+                if p and len(p) >= 2:
+                    positions[fc] = (float(p[0]), float(p[1]))
+        for fc in movers_sorted:
+            p = positions.get(fc)
+            if p is None:
+                out[fc] = rung[fc]          # no position -> safe distinct default
+                continue
+            nearest = min(
+                (math.hypot(p[0] - q[0], p[1] - q[1])
+                 for ofc, q in positions.items() if ofc != fc),
+                default=None)
+            # Far from every other mover -> low rung (still above the scout);
+            # near another mover -> its distinct ladder rung.
+            out[fc] = (MOVER_BASE_M
+                       if (nearest is None or nearest > self._DECONFLICT_PROX_M)
+                       else rung[fc])
         return out
 
     def _home_park_lanes(self, s) -> Dict[str, tuple]:

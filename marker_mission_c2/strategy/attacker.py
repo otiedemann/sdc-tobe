@@ -294,6 +294,11 @@ CAPTURE_ALT_M: float = 1.5
 # tall (open), so we must always be above that to avoid clipping a box. We
 # transit/capture well above this; this is the floor for any in-zone HEIGHT.
 BOX_CLEARANCE_ALT_M: float = 1.0
+# Floor for an attacker's cruise altitude: 30 cm ABOVE the 1.0 m centre-
+# loitering scout, so a transiting attacker never crashes into it. The runner's
+# deconfliction (ctx.cruise_alt_m) hands out distinct rungs at/above this; this
+# is the fallback floor when no deconflicted altitude is available.
+ABOVE_SCOUT_ALT_M: float = 1.3
 # RTH: APPROACH the home back-wall marker and stop this far short of it (the
 # operator asked for ~3-4 m). 3.5 m -> the wall is at |y|=10, home zone is
 # |y| in [5,10], so braking 3.5 m short parks the drone at |y|≈6.5 — comfortably
@@ -393,6 +398,18 @@ def _full_attack_script(
     rth_hdg = (ctx.rth_approach_angle_deg
                if ctx.rth_approach_angle_deg is not None else 0.0)
 
+    # DECONFLICTED CRUISE ALTITUDE (operator): every attacker cruises at a
+    # DISTINCT height, >= 30 cm apart and ABOVE the 1.0 m centre-loitering scout,
+    # so it never crashes into the scout while crossing the arena. The runner's
+    # _deconflicted_cruise_alts feeds ctx.cruise_alt_m (>= 1.3 m, distinct when
+    # near another mover, dropping to the low 1.3 m rung when spread out). Floor
+    # at ABOVE_SCOUT_ALT_M so we are always clear of the scout; fall back to the
+    # per-drone attack_alt_m. The APPROACH then descends from here to the box.
+    cruise_alt = max(ABOVE_SCOUT_ALT_M,
+                     float(ctx.cruise_alt_m or ctx.drone.attack_alt_m
+                           or ABOVE_SCOUT_ALT_M))
+    cruise_line = f"HEIGHT {cruise_alt:.2f}"
+
     # RTH leg: VISION-HOME on the home-wall marker (GO_HOME), not a world goto.
     # The drone can't know its absolute position in the live arena, so it visually
     # acquires the wall marker and closes to a standoff — stopping shallow inside
@@ -409,6 +426,9 @@ def _full_attack_script(
 
     return _format_script(
         "TAKEOFF",
+        # Climb to this attacker's DISTINCT, above-the-scout cruise altitude
+        # before transiting — so it never crashes into the centre scout.
+        cruise_line,
         # The operator orients the drone facing the enemy before take-off, and
         # APPROACH re-acquires the box marker by rotating if it isn't already in
         # view — so no explicit heading step is needed (the FC has no
@@ -424,6 +444,9 @@ def _full_attack_script(
         f"FB_UD_IMU {OVER_BOX_FORWARD_M:.2f} {CAPTURE_RISE_M:.2f}",
         # 3) Turn to face home for the return leg.
         "YAW_IMU 180",
+        # 3b) Re-climb to the distinct cruise altitude for the RTH transit (the
+        #     capture left us low over the box) — above the scout again.
+        cruise_line,
         # 4) Vision-home onto the home back-wall marker; settle shallow inside
         #    home. The script ends here -> FC safety-lands in the home zone.
         home_line,
@@ -560,8 +583,14 @@ def _recapture_script(ctx: RoleContext, slot: int) -> str:
     settle = (["YAW_IMU 180",
                f"GO_HOME {wall_entry[0]} {RTH_WALL_STANDOFF_M:.2f} 0.5 {rth_hdg:g}"]
               if wall_entry else [])
+    # Cruise above the centre scout (distinct deconflicted altitude) while
+    # transiting to our flipped box, same as the attack.
+    cruise_alt = max(ABOVE_SCOUT_ALT_M,
+                     float(ctx.cruise_alt_m or ctx.drone.attack_alt_m
+                           or ABOVE_SCOUT_ALT_M))
     return _format_script(
         "TAKEOFF",
+        f"HEIGHT {cruise_alt:.2f}",
         # Same vision capture technique as the attack:
         # 1) VISION-HOME on the (enemy-coloured) face of our flipped box, ~1.5 m
         #    (±20 cm band).
