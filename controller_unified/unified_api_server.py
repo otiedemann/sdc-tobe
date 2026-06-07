@@ -2297,6 +2297,32 @@ class OlympeBackend(DroneBackend):
         except Exception:
             return False
 
+    def _flying_state_name(self) -> Optional[str]:
+        """Lower-case Anafi flying-state name ('hovering'/'flying'/…) or None."""
+        try:
+            fs = self._get_state(FlyingStateChanged)
+            if fs and "state" in fs:
+                s = fs["state"]
+                try:
+                    return s.name.lower()
+                except AttributeError:
+                    return str(s).rsplit(".", 1)[-1].lower()
+        except Exception:
+            pass
+        return None
+
+    def _wait_hovering(self, timeout: float = 4.0) -> bool:
+        """Block until the drone reports 'hovering' — the state from which a
+        moveBy is ACCEPTED. After a previous moveBy (FB_IMU / GO_HOME) the drone
+        lingers in 'flying' for a moment; issuing the next moveBy then gets
+        rejected. Returns True once hovering, False on timeout."""
+        deadline = time.monotonic() + max(0.0, timeout)
+        while time.monotonic() < deadline:
+            if self._flying_state_name() == "hovering":
+                return True
+            time.sleep(0.1)
+        return self._flying_state_name() == "hovering"
+
     def _apply_flight_limits(self, d):
         for cmd, label in [
             (MaxAltitude(MAX_ALTITUDE_M), f"MaxAltitude={MAX_ALTITUDE_M}m"),
@@ -2740,9 +2766,24 @@ class OlympeBackend(DroneBackend):
             except Exception as e:
                 print(f"[ANAFI] rotate speed override failed: {e}")
                 spd_applied = None
+        ok = False
         try:
-            with command_lock:
-                result = d(moveBy(0, 0, 0, d_psi)).wait(_timeout=15)
+            # A moveBy is rejected unless the drone is in a stable hover. After
+            # the previous step's moveBy (FB_IMU / GO_HOME) it lingers in
+            # 'flying', so a rotate issued immediately silently fails — which is
+            # what left the drone facing the wrong way. Wait for hover, then
+            # retry the moveBy a few times before reporting failure.
+            for attempt in range(3):
+                self._wait_hovering(timeout=4.0)
+                with command_lock:
+                    result = d(moveBy(0, 0, 0, d_psi)).wait(_timeout=15)
+                if result and result.success():
+                    ok = True
+                    break
+                print(f"[ANAFI] rotate moveBy rejected/failed "
+                      f"(attempt {attempt + 1}/3, state={self._flying_state_name()}) "
+                      f"— retrying")
+                time.sleep(0.4)
         finally:
             # Always restore the global default so a one-off fast turn
             # doesn't leak into subsequent rotations.
@@ -2752,9 +2793,7 @@ class OlympeBackend(DroneBackend):
                 except Exception as e:
                     print(f"[ANAFI] restore MaxRotationSpeed failed: {e}")
         self._start_piloting()
-        if result and result.success():
-            return True, "ok"
-        return False, "rotate_failed"
+        return (True, "ok") if ok else (False, "rotate_failed")
 
     def go_xyz(self, x: int, y: int, z: int, speed: int) -> Tuple[bool, str]:
         d = self._d()
