@@ -3856,6 +3856,28 @@ class MissionController:
                 print(f"[ctrl] move_imu {direction} {meters:g}m failed: {e}")
                 self._advance_script(f"move_imu failed: {e}")
             return
+        if step.kind == "MOVE_FBUD":
+            # Combined forward+up moveBy (FB_UD_IMU): one diagonal move instead
+            # of HEIGHT then FB_IMU, so the drone RISES WHILE it ADVANCES —
+            # faster capture positioning. go_xyz(x=fwd, y=0, z=up) in cm.
+            fwd_cm = int(round(float(step.move_fb_m or 0.0) * 100.0))
+            up_cm = int(round(float(step.move_up_m or 0.0) * 100.0))
+            self._set_phase(
+                Phase.MOVE_IMU,
+                note + f" fwd {float(step.move_fb_m or 0):g}m "
+                       f"+ up {float(step.move_up_m or 0):g}m")
+            if fwd_cm == 0 and up_cm == 0:
+                self._advance_script("fb_ud_imu 0 — no-op")
+                return
+            try:
+                self.api.go_xyz(fwd_cm, 0, up_cm)
+                self._advance_script(
+                    f"fb_ud_imu complete (fwd {float(step.move_fb_m or 0):g}m "
+                    f"up {float(step.move_up_m or 0):g}m)")
+            except DroneApiError as e:
+                print(f"[ctrl] fb_ud_imu failed: {e}")
+                self._advance_script(f"fb_ud_imu failed: {e}")
+            return
         if step.kind == "YAW":
             # Discrete rotation by ``rotation_deg`` degrees, +CW.
             # api.rotate is synchronous (blocks on the FC's discrete-

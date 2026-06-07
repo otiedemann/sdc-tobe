@@ -387,6 +387,24 @@ def _exec_step(drone: SimDrone, world: World, step: Step, dt: float,
         mem["imu_moved"] = moved + leg
         return spd, (moved + leg) >= abs(meters) - ARRIVE_XY
 
+    # FB_UD_IMU <forward> <up> — combined forward+up in ONE move (rise while
+    # advancing). Drive both body axes together so they finish simultaneously.
+    if verb == "FB_UD_IMU":
+        fwd_m = _arg(step, 0, 0.0)
+        up_m = _arg(step, 1, 0.0)
+        total = math.hypot(fwd_m, up_m)
+        moved = mem.get("imu_moved", 0.0)
+        if total <= 1e-6 or (total - moved) <= ARRIVE_XY:
+            return 0.0, True
+        leg = min(CRUISE_SPEED * dt, total - moved)
+        frac = (leg / total) if total > 0 else 0.0
+        fb = (fwd_m * frac) / dt if dt > 0 else 0.0
+        ud = (up_m * frac) / dt if dt > 0 else 0.0
+        spd = _apply_body_velocity(drone, world, dt, fb=fb, lr=0.0, ud=ud,
+                                   yaw_rate=0.0)
+        mem["imu_moved"] = moved + leg
+        return spd, (moved + leg) >= total - ARRIVE_XY
+
     # -- closed-loop yaw ---------------------------------------------------
     if verb == "YAW":
         # ABSOLUTE heading hold (arena frame, deg CW from +Y). Matches the real

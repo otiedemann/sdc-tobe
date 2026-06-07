@@ -203,6 +203,13 @@ class DroneApi:
         plus the post-apply state."""
         return self._post("/api/camera/config", fields)
 
+    def go_xyz(self, x: int = 0, y: int = 0, z: int = 0,
+               speed: int = 50) -> dict:
+        """Combined relative moveBy: x forward, y right, z up (cm), in one shot.
+        Used by FB_UD_IMU to rise while advancing."""
+        return self._post("/api/go", {"x": int(x), "y": int(y),
+                                       "z": int(z), "speed": int(speed)})
+
     def set_wifi_channel(self, band: str = "5_GHz", channel: int = 0,
                          auto: bool = True) -> dict:
         """Set the Anafi AP Wi-Fi band + channel. auto=True -> drone picks the

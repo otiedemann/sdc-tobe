@@ -231,6 +231,36 @@ def do_move(direction: Any = "", cm: Any = 20) -> tuple[dict, int]:
         return {"ok": False, "error": str(e)}, 500
 
 
+def do_go(x: Any = 0, y: Any = 0, z: Any = 0,
+          speed: Any = 50) -> tuple[dict, int]:
+    """Combined relative move (Olympe moveBy via ``go_xyz``): ``x`` forward,
+    ``y`` right, ``z`` up — all in CENTIMETRES — in ONE moveBy, so a script can
+    move on several axes at once (e.g. forward + up) instead of sequential
+    single-axis IMU steps. In-proc twin of the ``/api/go`` route."""
+    import unified_api_server as _srv  # sibling import; see header note
+    b = _srv.backend
+    with _srv.conn_lock:
+        connected = _srv.conn_state["connected"]
+    if not connected or b is None:
+        return {"ok": False, "error": "controller not ready"}, 503
+    try:
+        xi, yi, zi = int(x), int(y), int(z)
+        sp = max(10, min(100, int(speed)))
+    except (TypeError, ValueError):
+        return {"ok": False, "error": "x/y/z/speed must be integers"}, 400
+    try:
+        reach = max(abs(xi), abs(yi), abs(zi))
+        _srv.start_discrete_window(
+            1.0 if _srv.drone_type == "tello" else max(1.0, reach / 50))
+        import time as _time; _time.sleep(0.1)
+        ok, msg = b.go_xyz(xi, yi, zi, sp)
+        if ok:
+            return {"ok": True, "x": xi, "y": yi, "z": zi, "speed": sp}, 200
+        return {"ok": False, "error": msg}, 500
+    except Exception as e:
+        return {"ok": False, "error": str(e)}, 500
+
+
 # ---------------------------------------------------------------------------
 # Rotation
 # ---------------------------------------------------------------------------

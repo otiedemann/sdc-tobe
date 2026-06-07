@@ -6,7 +6,7 @@ that ``MissionController._advance_script`` walks one at a time. The
 language is one-command-per-line, case-insensitive, with ``#`` comments
 and blank lines ignored.
 
-Nineteen commands. Suffix convention:
+Twenty commands. Suffix convention:
 
   * ``_RC`` — raw RC stick at the given deflection for a duration.
     Open-loop, fast, may drift; use when you want "stick at X% for
@@ -39,6 +39,7 @@ Nineteen commands. Suffix convention:
     LR_IMU   <meters>                              +right / -left,   |m| in [0.01, 5.0]
     FB_IMU   <meters>                              +forward / -back, |m| in [0.01, 5.0]
     UD_IMU   <meters>                              +up / -down,      |m| in [0.01, 5.0]
+    FB_UD_IMU <forward> <up>                       combined fwd+up moveBy (rise WHILE advancing)
     YAW_IMU  <deg> [<speed_deg_s>]                 +cw / -ccw, deg in [-180,+180]; opt speed 1-180
     RC       <lr> <fb> <ud> <yaw> [<seconds>]      all four sticks at once
     SCOUT                                          slow 360° yaw spin (cw, stick=15)
@@ -179,6 +180,11 @@ class Step:
     # api.move which wraps Olympe's moveBy.
     move_direction: Optional[str] = None
     move_distance_m: Optional[float] = None
+    # Combined closed-loop move for kind="MOVE_FBUD" (the FB_UD_IMU verb):
+    # forward AND up in ONE moveBy (signed metres; +fwd/-back, +up/-down), so
+    # the drone rises while it advances instead of HEIGHT then FB_IMU.
+    move_fb_m: Optional[float] = None
+    move_up_m: Optional[float] = None
     # AUTO_ATTACK: the reactive end-to-end attack. marker_id / world_x /
     # world_y carry the TARGET (slot face marker + its known arena
     # position); these three carry the HOME-wall marker + its position.
@@ -555,6 +561,27 @@ def parse(text: str, defaults: dict) -> List[Step]:
                 move_distance_m=abs(float(meters)),
                 line_no=raw_line_no,
             ))
+        elif cmd == "FB_UD_IMU":
+            # Combined closed-loop move: forward AND up in ONE moveBy (vs the
+            # sequential HEIGHT + FB_IMU), so the drone RISES while it ADVANCES —
+            # faster capture positioning. <forward_m> +fwd/-back, <up_m> +up/-down.
+            if len(args) != 2:
+                raise ScriptError(raw_line_no,
+                                  f"FB_UD_IMU takes exactly 2 arguments "
+                                  f"(<forward_m> <up_m>), got {len(args)}")
+            fwd = _parse_float(args[0], raw_line_no, "FB_UD_IMU forward")
+            up = _parse_float(args[1], raw_line_no, "FB_UD_IMU up")
+            for nm, v in (("forward", fwd), ("up", up)):
+                if abs(v) > 5.0:
+                    raise ScriptError(raw_line_no,
+                                      f"FB_UD_IMU |{nm}| must be <= 5.0 "
+                                      f"(safety cap), got {v}")
+            if abs(fwd) < 0.01 and abs(up) < 0.01:
+                raise ScriptError(raw_line_no,
+                                  "FB_UD_IMU needs a non-zero forward or up move")
+            out.append(Step(kind="MOVE_FBUD",
+                            move_fb_m=float(fwd), move_up_m=float(up),
+                            line_no=raw_line_no))
         elif cmd == "SCOUT":
             # Slow 360° yaw spin for visual situational awareness.
             # Yaw stick is hardcoded at 15 (a gentle rate that still
@@ -728,6 +755,9 @@ def format(steps: List[Step]) -> str:
                                          ("FB_IMU", +1))
             meters = sign * float(s.move_distance_m or 0.0)
             lines.append(f"{name} {meters:g}")
+        elif s.kind == "MOVE_FBUD":
+            lines.append(f"FB_UD_IMU {float(s.move_fb_m or 0.0):g} "
+                         f"{float(s.move_up_m or 0.0):g}")
         elif s.kind == "SCOUT":
             lines.append("SCOUT")
         elif s.kind == "DANCE":
