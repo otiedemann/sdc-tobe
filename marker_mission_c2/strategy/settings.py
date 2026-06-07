@@ -223,7 +223,7 @@ class DroneSettings:
     # Per-drone RTH arrival bearing (deg, -80..+80) for the GO_HOME on the home
     # wall marker: the angle around the marker this drone returns to, so several
     # attackers fan out instead of converging. None -> the runner auto-assigns
-    # (-45/0/+45 across the attackers). Set explicitly to pin a drone's lane.
+    # (-30/0/+30 across the attackers). Set explicitly to pin a drone's lane.
     go_home_angle_deg: Optional[float] = None
 
 
