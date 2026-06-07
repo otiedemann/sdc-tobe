@@ -7143,20 +7143,26 @@ def _save_drones_csv(rows: list):
 
 @app.get("/api/wifi/networks")
 def api_wifi_networks():
-    """Trigger a WiFi rescan, then return visible networks annotated with
-    drone CSV matches. Response: {ok, networks: [{ssid, signal, security,
-    in_use, drone_id?, drone_name?}]}. Takes ~3 s (rescan wait)."""
+    """Return visible WiFi networks annotated with drone CSV matches.
+
+    Query params:
+      rescan=1  — trigger nmcli rescan first (~3 s); omit for fast cached list.
+
+    Response: {ok, networks: [{ssid, signal, channel, band, security,
+                                in_use, drone_id?, drone_name?}]}
+    """
     import re as _re
-    try:
-        subprocess.run(["sudo", "nmcli", "device", "wifi", "rescan"],
-                       capture_output=True, timeout=10)
-        time.sleep(3.0)
-    except Exception:
-        pass
+    if request.args.get("rescan") == "1":
+        try:
+            subprocess.run(["sudo", "nmcli", "device", "wifi", "rescan"],
+                           capture_output=True, timeout=10)
+            time.sleep(3.0)
+        except Exception:
+            pass
 
     try:
         r = subprocess.run(
-            ["nmcli", "-t", "-f", "IN-USE,SSID,SIGNAL,SECURITY",
+            ["nmcli", "-t", "-f", "IN-USE,SSID,SIGNAL,CHAN,SECURITY",
              "--escape", "yes", "device", "wifi", "list"],
             capture_output=True, text=True, timeout=10,
         )
@@ -7171,18 +7177,23 @@ def api_wifi_networks():
     for line in r.stdout.splitlines():
         # nmcli -t separates fields with ':'; literal ':' in values is escaped as '\:'
         parts = _re.split(r'(?<!\\):', line)
-        if len(parts) < 4:
+        if len(parts) < 5:
             continue
         in_use   = parts[0].strip() == "*"
         ssid     = parts[1].replace("\\:", ":").strip()
         signal   = parts[2].strip()
-        security = ":".join(parts[3:]).replace("\\:", ":").strip()
+        chan_raw  = parts[3].strip()
+        security = ":".join(parts[4:]).replace("\\:", ":").strip()
         if not ssid or ssid in seen:
             continue
         seen.add(ssid)
+        chan = int(chan_raw) if chan_raw.isdigit() else 0
+        band = "5" if chan >= 36 else "2.4" if chan > 0 else ""
         entry: dict = {
             "ssid":     ssid,
             "signal":   int(signal) if signal.lstrip("-").isdigit() else 0,
+            "channel":  chan,
+            "band":     band,
             "security": security,
             "in_use":   in_use,
         }

@@ -4287,22 +4287,22 @@ _PAGE_HARDWARE = _PAGE_BASE_CSS + _PAGE_HEADER + _COMMON_SCRIPT + _PAGE_GRID_OPE
       <button id="btn-wifi-scan"
               style="padding:.4rem .9rem; border:0; border-radius:6px;
                      background:#2563eb; color:#fff; font-weight:700;
-                     font-size:.88rem; cursor:pointer;">⟳ Scan</button>
+                     font-size:.88rem; cursor:pointer;">⟳ Rescan</button>
       <span id="wifi-scan-ts" style="font-size:.82rem; color:#555;"></span>
     </div>
     <table class="hw-table" style="font-size:.85rem;">
       <thead>
         <tr>
-          <th style="width:6%;">Use</th>
+          <th style="width:4%;">Use</th>
           <th>SSID</th>
-          <th style="width:8%;">Sig</th>
-          <th style="width:12%;">Drone</th>
+          <th style="width:10%;">Sig</th>
+          <th style="width:10%;">Ch</th>
+          <th style="width:10%;">Drone</th>
           <th style="width:10%;"></th>
         </tr>
       </thead>
       <tbody id="wifi-list-body">
-        <tr><td colspan="5" style="color:#555; padding:.5rem 0;">
-          Press Scan to load visible networks.</td></tr>
+        <tr><td colspan="6" style="color:#555; padding:.5rem 0;">Loading…</td></tr>
       </tbody>
     </table>
     <div id="wifi-scan-err" style="font-size:.82rem; color:var(--bad); margin-top:.4rem;"></div>
@@ -4360,30 +4360,36 @@ _PAGE_HARDWARE = _PAGE_BASE_CSS + _PAGE_HEADER + _COMMON_SCRIPT + _PAGE_GRID_OPE
                     .replace(/"/g,'&quot;');
   }
 
-  async function runWifiScan() {
+  // Render the network list; rescan=true triggers a full nmcli rescan (~3 s)
+  async function loadWifiNetworks(rescan) {
     const btn  = document.getElementById('btn-wifi-scan');
     const ts   = document.getElementById('wifi-scan-ts');
     const body = document.getElementById('wifi-list-body');
     const err  = document.getElementById('wifi-scan-err');
-    btn.disabled = true; btn.textContent = '⏳ Scanning…';
-    ts.textContent = ''; err.textContent = '';
-    body.innerHTML = '<tr><td colspan="5" style="color:#555;">Scanning (≈3 s)…</td></tr>';
+    if (rescan) {
+      btn.disabled = true; btn.textContent = '⏳ Scanning…';
+      body.innerHTML = '<tr><td colspan="6" style="color:#555;">Scanning (≈3 s)…</td></tr>';
+    }
+    err.textContent = '';
     try {
-      const r = await fetch('/api/wifi/networks', {cache:'no-store'});
+      const url = rescan ? '/api/wifi/networks?rescan=1' : '/api/wifi/networks';
+      const r = await fetch(url, {cache:'no-store'});
       const d = await r.json();
-      if (!d.ok) { err.textContent = d.error || 'scan failed'; body.innerHTML = ''; return; }
+      if (!d.ok) { err.textContent = d.error || 'request failed'; return; }
       ts.textContent = new Date().toLocaleTimeString('de-DE');
       if (!d.networks.length) {
-        body.innerHTML = '<tr><td colspan="5" style="color:#555;">No networks found.</td></tr>';
+        body.innerHTML = '<tr><td colspan="6" style="color:#555;">No networks found.</td></tr>';
         return;
       }
       body.innerHTML = d.networks.map(n => {
         const inUse  = n.in_use ? '<span style="color:var(--good);">●</span>' : '';
         const sigStr = `<span style="font-family:monospace;color:${n.signal>60?'var(--good)':n.signal>35?'var(--warn)':'var(--bad)'}">${sigBar(n.signal)}</span> ${n.signal}%`;
+        const chStr  = n.channel
+          ? `${n.channel}<span style="font-size:.75em;color:#888;margin-left:2px;">${n.band}G</span>`
+          : '—';
         const drone  = n.drone_id
           ? `<span style="color:var(--good);font-weight:600;">#${escHtmlWifi(n.drone_id)}</span>`
           : '<span style="color:#777;">—</span>';
-        // Known drone → full Switch (land + WiFi + reinit); unknown → plain WiFi connect
         const connectBtn = n.drone_id
           ? `<button onclick="wifiConnect('${escHtmlWifi(n.drone_id)}')"
                style="padding:.25rem .6rem;border:0;border-radius:5px;
@@ -4397,15 +4403,15 @@ _PAGE_HARDWARE = _PAGE_BASE_CSS + _PAGE_HEADER + _COMMON_SCRIPT + _PAGE_GRID_OPE
           <td>${inUse}</td>
           <td style="font-family:monospace;">${escHtmlWifi(n.ssid)}</td>
           <td>${sigStr}</td>
+          <td style="font-family:monospace;">${chStr}</td>
           <td>${drone}</td>
           <td>${connectBtn}</td>
         </tr>`;
       }).join('');
     } catch(e) {
       err.textContent = 'Request failed: ' + e;
-      body.innerHTML = '';
     } finally {
-      btn.disabled = false; btn.textContent = '⟳ Scan';
+      if (rescan) { btn.disabled = false; btn.textContent = '⟳ Rescan'; }
     }
   }
 
@@ -4444,7 +4450,11 @@ _PAGE_HARDWARE = _PAGE_BASE_CSS + _PAGE_HEADER + _COMMON_SCRIPT + _PAGE_GRID_OPE
     }
   };
 
-  document.getElementById('btn-wifi-scan').addEventListener('click', runWifiScan);
+  // Auto-load immediately, then refresh every 20 s (no rescan — just cached list)
+  loadWifiNetworks(false);
+  setInterval(() => loadWifiNetworks(false), 20000);
+
+  document.getElementById('btn-wifi-scan').addEventListener('click', () => loadWifiNetworks(true));
 
   // ── Switch Drone ───────────────────────────────────────────────────────
   function _setMsg(text, color) {
