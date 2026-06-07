@@ -209,6 +209,11 @@ class DroneSettings:
     scout_alt_m: float = 1.0
     attack_alt_m: float = 1.0
     home_alt_m: float = 0.8
+    # Scout rotation speed: the yaw-stick value (1..100) for the continuous spin.
+    # The drone rotates at ~ (this/100) × the FC's MaxRotationSpeed (~150°/s), so
+    # higher = faster scanning. Per-drone + editable in the dashboard. 70 ≈ 105°/s
+    # (~3.4 s per turn). Was a single match-level value (45); now per-drone.
+    scout_yaw_stick: int = 70
     # Per-drone RTH arrival bearing (deg, -80..+80) for the GO_HOME on the home
     # wall marker: the angle around the marker this drone returns to, so several
     # attackers fan out instead of converging. None -> the runner auto-assigns
@@ -297,6 +302,7 @@ def _drone_to_dict(d: DroneSettings) -> Dict[str, Any]:
         "scout_alt_m": float(d.scout_alt_m),
         "attack_alt_m": float(d.attack_alt_m),
         "home_alt_m": float(d.home_alt_m),
+        "scout_yaw_stick": int(d.scout_yaw_stick),
         "go_home_angle_deg": (None if d.go_home_angle_deg is None
                               else float(d.go_home_angle_deg)),
     }
@@ -324,6 +330,7 @@ def _drone_from(fc_name: str, raw: Any) -> DroneSettings:
         scout_alt_m=float(raw.get("scout_alt_m", 1.0)),
         attack_alt_m=float(raw.get("attack_alt_m", 1.0)),
         home_alt_m=float(raw.get("home_alt_m", 0.8)),
+        scout_yaw_stick=max(1, min(100, int(raw.get("scout_yaw_stick", 70)))),
         go_home_angle_deg=_coerce_go_home_angle(raw.get("go_home_angle_deg")),
     )
 
@@ -516,6 +523,11 @@ class SettingsStore:
                         allowed[key] = float(changes[key])
                     except (TypeError, ValueError):
                         continue
+            if "scout_yaw_stick" in changes:
+                try:
+                    allowed["scout_yaw_stick"] = max(1, min(100, int(changes["scout_yaw_stick"])))
+                except (TypeError, ValueError):
+                    pass
             if "go_home_angle_deg" in changes:
                 # None / "" / "auto" -> auto-assign; else clamped float.
                 allowed["go_home_angle_deg"] = _coerce_go_home_angle(
