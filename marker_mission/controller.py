@@ -1463,12 +1463,11 @@ class MissionController:
         _wall_yaw    = {"front": 180.0, "back": 0.0,
                         "left":  -90.0,  "right": 90.0}
 
-        # Consider only visible markers that exist in the arena layout,
-        # are on a known wall, and are not the current mission target.
+        # Consider all visible markers that exist in the arena layout
+        # and are on a known wall (any ID, including the mission target).
         candidates = [
             m for mid, m in arena.markers.items()
             if mid in visible_ids
-            and mid != active_mid
             and m.wall in _wall_normal
         ]
         if not candidates:
