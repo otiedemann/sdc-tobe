@@ -831,7 +831,23 @@ def annotate_frame(frame_bgr: np.ndarray,
 
     The overlay intentionally avoids OpenCV's built-in drawDetectedMarkers
     so we can highlight the target marker in green and others in grey.
+
+    Only the 3 largest markers (by pixel area) are drawn. The target marker
+    is always included even if it is not among the 3 largest.
     """
+    def _quad_area(p: MarkerPose) -> float:
+        c = p.corners
+        x, y = c[:, 0], c[:, 1]
+        return 0.5 * abs(float(np.dot(x, np.roll(y, 1)) - np.dot(y, np.roll(x, 1))))
+
+    if len(poses) > 3:
+        by_area = sorted(poses, key=_quad_area, reverse=True)
+        top3 = by_area[:3]
+        # Always keep the target even if it fell outside the top-3.
+        if target_id is not None and not any(p.marker_id == target_id for p in top3):
+            top3[2] = next((p for p in by_area if p.marker_id == target_id), top3[2])
+        poses = top3
+
     out = frame_bgr.copy()
     H, W = out.shape[:2]
     for p in poses:
