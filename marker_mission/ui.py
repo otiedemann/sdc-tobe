@@ -136,9 +136,10 @@ _PAGE_HEADER = """
     <a href="/hardware" class="{{ 'active' if active=='hardware' else '' }}">Hardware</a>
   </nav>
   <div style="margin-left:auto; display:flex; align-items:center; gap:.6rem;">
-    <span id="host-cpu" title="host CPU usage / process CPU / 1-min load"
-          style="font-size:.72rem; color:#778; font-family:ui-monospace,monospace;
-                 white-space:nowrap;">cpu …</span>
+    <div id="host-cpu" title="host CPU usage / process CPU / 1-min load"
+         style="font-size:.72rem; color:#778; font-family:ui-monospace,monospace;
+                white-space:nowrap; border:1px solid #444; border-radius:4px;
+                padding:4px 8px; line-height:1.6;">cpu …</div>
     <span id="tel-stall" title="telemetry stall indicator"
           style="display:none; font-size:.72rem; font-weight:600; color:#0c0f12;
                  background:#f0b429; padding:.1rem .4rem; border-radius:3px;
@@ -1672,16 +1673,18 @@ async function refresh() {
     if (hc) {
       const h = s.host || {};
       if (h.system_cpu_pct == null) {
-        hc.textContent = 'cpu …';
+        hc.innerHTML = 'cpu …';
         hc.style.color = '#778';
       } else {
         const sys = Math.round(h.system_cpu_pct);
         const proc = h.process_cpu_pct == null
                        ? '—' : Math.round(h.process_cpu_pct);
         const load = h.load_1m == null ? '—' : h.load_1m.toFixed(2);
-        hc.textContent = `cpu ${sys}% · proc ${proc}% · load ${load}`;
-        hc.style.color = sys > 85 ? 'var(--bad)'
-                       : sys > 60 ? 'var(--warn)' : 'var(--good)';
+        const col = sys > 85 ? 'var(--bad)' : sys > 60 ? 'var(--warn)' : 'var(--good)';
+        hc.style.color = col;
+        hc.innerHTML = `<div>cpu&nbsp;&nbsp;${sys}%</div>`
+                     + `<div>proc ${proc}%</div>`
+                     + `<div>load ${load}</div>`;
       }
     }
     // Header telemetry-stall indicator. Hidden when healthy; amber for
@@ -1734,7 +1737,9 @@ async function refreshWlan() {
       for (const [iface, info] of Object.entries(winfo)) {
         if (iface.startsWith('wl') && info.ssid && info.signal_dbm) {
           const lines = [];
-          lines.push(`<strong>${info.ssid}</strong>`);
+          const droneTag = info.drone_id
+            ? ` <span style="color:#aaa;">(#${info.drone_id})</span>` : '';
+          lines.push(`<strong>${info.ssid}</strong>${droneTag}`);
           lines.push(`Signal: ${info.signal_dbm} dBm`);
           if (info.link_quality) lines.push(`Quality: ${info.link_quality}%`);
           if (info.frequency)   lines.push(`Freq: ${info.frequency}`);
@@ -6605,7 +6610,19 @@ class UiServer:
 
         @app.get("/api/wlan")
         def api_wlan():
-            import subprocess, re
+            import subprocess, re, csv as _csv
+            from pathlib import Path as _Path
+            # Build SSID → drone_id lookup from drones.csv
+            _drone_by_ssid: dict = {}
+            try:
+                _csv_path = _Path(__file__).parent.parent / 'controller_unified' / 'drones.csv'
+                if _csv_path.exists():
+                    with open(_csv_path, newline='') as _f:
+                        for _row in _csv.DictReader(_f):
+                            if _row.get('name'):
+                                _drone_by_ssid[_row['name']] = _row.get('id', '')
+            except Exception:
+                pass
             try:
                 out = subprocess.run(
                     ['iwconfig'], capture_output=True, text=True, timeout=2
@@ -6618,8 +6635,10 @@ class UiServer:
                     if iface is None:
                         continue
                     if 'ESSID:' in line:
-                        result[iface]['ssid'] = (
-                            line.split('ESSID:')[1].strip().strip('"'))
+                        _ssid = line.split('ESSID:')[1].strip().strip('"')
+                        result[iface]['ssid'] = _ssid
+                        if _ssid in _drone_by_ssid:
+                            result[iface]['drone_id'] = _drone_by_ssid[_ssid]
                     if 'Signal level=' in line:
                         result[iface]['signal_dbm'] = (
                             line.split('Signal level=')[1].split()[0])
