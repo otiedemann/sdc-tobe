@@ -1843,6 +1843,14 @@ class MissionController:
             self._marker_lost(now); return
         d, yaw_to_marker, hdg = meas
 
+        # Barometric height — used only for safety floor/ceiling guards and the
+        # diagnostic note. Vision drives e_h; the altimeter is untrusted for
+        # the correction itself.
+        drone_h: Optional[float] = (
+            tel.height_cm / 100.0
+            if tel is not None and tel.height_cm is not None else None
+        )
+
         # VISION-ONLY vertical error: -tvec[1] (marker's camera-frame downward
         # offset). No altimeter. Positive e_h => marker is above => fly up.
         try:
@@ -1860,10 +1868,10 @@ class MissionController:
         # at or below min_height, do not command further descent regardless of
         # what the camera says — the altimeter may be wrong but we keep this as
         # a hard lower bound to avoid hitting the ground.
-        if drone_h <= cfg.min_height_m and e_h < 0:
+        if drone_h is not None and drone_h <= cfg.min_height_m and e_h < 0:
             e_h = 0.0
         # Safety ceiling: symmetric guard.
-        if drone_h >= cfg.max_height_m and e_h > 0:
+        if drone_h is not None and drone_h >= cfg.max_height_m and e_h > 0:
             e_h = 0.0
 
         e_yaw = yaw_to_marker
@@ -1874,8 +1882,9 @@ class MissionController:
 
         self._send_rc(lr=0, fb=0, ud=int(u_ud), yaw=int(u_yaw))
 
+        drone_h_str = f"{drone_h:.2f}m" if drone_h is not None else "?"
         with self.state.lock:
-            self.state.note = (f"HEIGHT_ALIGN: drone={drone_h:.2f}m  "
+            self.state.note = (f"HEIGHT_ALIGN: drone={drone_h_str}  "
                                f"marker_y={marker_y:+.2f}m  "
                                f"e={e_h:+.2f}m")
 
