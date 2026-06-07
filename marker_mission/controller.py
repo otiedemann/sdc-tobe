@@ -471,6 +471,12 @@ class MissionState:
     # metres of target_distance_m, instead of the tight cfg.distance_deadband_m.
     # None -> fall back to the tight deadband (a precise APPROACH).
     target_distance_tol_m: Optional[float] = None
+    # True only for a GO_HOME (loose POSITIONING hop): the approach homes at the
+    # CURRENT altitude and does NOT vision-climb to the marker. A plain/capture
+    # APPROACH leaves this False so it still aligns to the marker's height (even
+    # when it carries its own approach_dist_tol_m loose band). Decouples the
+    # "hold altitude" behaviour from target_distance_tol_m (which both verbs set).
+    approach_positioning: bool = False
     # Heading tolerance (deg) for GO_HOME settle: when set, the approach also
     # gates on abs(e_hdg) < arrive_hdg_tol_deg before advancing.
     # None -> no heading gate (plain APPROACH or GO_HOME without hdg arg).
@@ -896,6 +902,7 @@ class MissionController:
             self.state.hold_time_s = self.cfg.hold_time_s
             self.state.target_distance_m = self.cfg.target_distance_m
             self.state.target_distance_tol_m = None
+            self.state.approach_positioning = False
             self.state.arrive_hdg_tol_deg = None
             self.state.arrive_yaw_tol_deg = None
             self.state.target_relative_heading_deg = (
@@ -963,6 +970,7 @@ class MissionController:
             self.state.started_at = time.monotonic()
             self.state.target_distance_m = self.cfg.target_distance_m
             self.state.target_distance_tol_m = None
+            self.state.approach_positioning = False
             self.state.arrive_hdg_tol_deg = None
             self.state.arrive_yaw_tol_deg = None
             self.state.target_relative_heading_deg = self.cfg.target_relative_heading_deg
@@ -1612,13 +1620,14 @@ class MissionController:
             # Keep zoom as-is; _step_approach resets to 1x at the
             # angle-correction-start threshold.
             #
-            # A loose GO_HOME (target_distance_tol_m set) is positioning, NOT a
+            # A loose GO_HOME (state.approach_positioning) is positioning, NOT a
             # capture: it must NOT climb to the marker's mounted height (e.g. a
             # 1.7-2.0 m centre/wall marker would drag a 1.0 m scout up to the
             # marker). Skip HEIGHT_ALIGN and home horizontally at the current
-            # altitude. Plain APPROACH (capture) still aligns to the marker.
+            # altitude. A capture APPROACH still aligns to the marker -- even one
+            # carrying a loose approach_dist_tol_m band (positioning stays False).
             with self.state.lock:
-                loose_home = self.state.target_distance_tol_m is not None
+                loose_home = self.state.approach_positioning
             if loose_home:
                 self._set_phase(Phase.APPROACH,
                                 "marker acquired (GO_HOME) -- homing at current "
@@ -2026,12 +2035,14 @@ class MissionController:
         # no absolute-height / altimeter branch.
         #   tvec[1] < 0 = marker above = fly up (e_h > 0)
         #
-        # EXCEPTION: a loose GO_HOME (target_distance_tol_m set) is positioning,
+        # EXCEPTION: a loose GO_HOME (state.approach_positioning) is positioning,
         # not a capture -- it homes at the CURRENT altitude and must not climb to
         # the marker's mounted height (which would drag a low scout up to a
-        # 1.7-2.0 m centre/wall marker). Hold altitude (ud=0, Anafi hover).
+        # 1.7-2.0 m centre/wall marker). Hold altitude (ud=0, Anafi hover). A
+        # capture APPROACH with a loose approach_dist_tol_m keeps positioning
+        # False, so it still vision-aligns to the marker here.
         with self.state.lock:
-            _loose_home = self.state.target_distance_tol_m is not None
+            _loose_home = self.state.approach_positioning
         u_ud = 0.0
         e_h = 0.0
         pose = self.state.last_pose
@@ -3690,11 +3701,20 @@ class MissionController:
             with self.state.lock:
                 self.state.active_marker_id = int(step.marker_id)
                 self.state.target_distance_m = float(step.distance)
-                # GO_HOME carries a loose arrival band (step.arrive_tol_m);
-                # a plain APPROACH leaves it None -> tight cfg.distance_deadband_m.
+                # Loose arrival band: GO_HOME carries step.arrive_tol_m; a
+                # capture APPROACH may carry its own step.approach_dist_tol_m
+                # (e.g. 0.2 m). Either widens the arrival band; None -> tight
+                # cfg.distance_deadband_m.
+                _arrive_tol = (step.arrive_tol_m
+                               if step.arrive_tol_m is not None
+                               else getattr(step, "approach_dist_tol_m", None))
                 self.state.target_distance_tol_m = (
-                    float(step.arrive_tol_m)
-                    if step.arrive_tol_m is not None else None)
+                    float(_arrive_tol) if _arrive_tol is not None else None)
+                # POSITIONING (hold altitude, no climb to marker) is GO_HOME-only
+                # -- keyed on arrive_tol_m, NOT on the band above, so a capture
+                # APPROACH with approach_dist_tol_m STILL vision-aligns to the
+                # marker's height.
+                self.state.approach_positioning = (step.arrive_tol_m is not None)
                 # GO_HOME may specify an arrival heading (±80°, ±12° tol).
                 # Plain APPROACH always closes head-on (0°); HOLD inherits
                 # this setpoint via state.target_relative_heading_deg.
