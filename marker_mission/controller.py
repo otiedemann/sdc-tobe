@@ -523,6 +523,13 @@ class MissionState:
     mission_step_idx: int = -1            # -1 = before first step
     current_step_kind: Optional[str] = None
     last_completed_step_kind: Optional[str] = None
+    # Live mission-splice forensics (C2 airborne re-target, splice_script()).
+    # splice_count steps up by 1 on each successful splice so flight_log.csv
+    # pins the exact tick it happened; splice_note carries the latest splice's
+    # detail (new step count + APPROACH target ids). Both flow through
+    # snapshot() into the CSV next to note / abort_reason.
+    splice_count: int = 0
+    splice_note: str = ""
     # Per-step transient state used by IDLE / HEIGHT / DANCE / GOTO.
     idle_until: Optional[float] = None
     height_target_m: Optional[float] = None
@@ -795,6 +802,8 @@ class MissionState:
                 "mission_script": script_lines,
                 "mission_step_idx": self.mission_step_idx,
                 "current_step_kind": self.current_step_kind,
+                "splice_count": self.splice_count,
+                "splice_note": self.splice_note,
                 "height_target_m": self.height_target_m,
                 "world_position_m": (list(self.world_position_m)
                                      if self.world_position_m is not None
@@ -1063,6 +1072,60 @@ class MissionController:
         # budget only resets on a genuinely new task or a real re-acquisition.
         self._recovery_count = 0
         self._approach_on_settle_restart_mission = False
+
+    def splice_script(self, steps: List[Step]) -> tuple[bool, str]:
+        """Live-replace the REMAINING mission steps WITHOUT landing.
+
+        Unlike set_script() (which only takes effect on the next trigger()
+        from INIT, i.e. landed), this mutates the running script in place:
+        it KEEPS the currently-executing step and replaces everything after
+        it, so the next _advance_script() walks straight into ``steps``. Used
+        by the C2 to re-target an airborne attacker (new enemy boxes) without
+        the stop -> land -> relaunch cost.
+
+        The step list + index are updated atomically under state.lock, which
+        also serialises against _advance_script() (it reads the list + index
+        under the same lock). We always anchor the kept prefix to the *current*
+        mission_step_idx, so whichever of splice/advance runs first the
+        invariant "keep the current step, replace the tail" holds.
+
+        Returns (ok, message). Rejects when the drone is not airborne, has no
+        active script, or the splice itself contains TAKEOFF (already flying).
+        On any rejection the C2 falls back to the stop->relaunch retask path.
+        """
+        if not steps:
+            return False, "empty splice"
+        if any(s.kind == "TAKEOFF" for s in steps):
+            return False, "splice must not contain TAKEOFF (already airborne)"
+        with self.state.lock:
+            phase = self.state.phase
+            if phase in (Phase.INIT, Phase.LAND, Phase.DONE, Phase.ABORT):
+                return False, f"not airborne (phase={phase.value})"
+            if not self.state.mission_script:
+                return False, "no active mission to splice"
+            # Keep the current step (mission_step_idx) executing; replace the
+            # tail. idx<0 can't happen airborne (TAKEOFF is step 0 and the
+            # index has advanced) but clamp defensively so kept is never empty.
+            idx = self.state.mission_step_idx
+            if idx < 0:
+                idx = 0
+            kept = list(self.state.mission_script[:idx + 1])
+            self.state.mission_script = kept + list(steps)
+            # mission_step_idx / current_step_kind are deliberately left as-is:
+            # the current step finishes, then _advance_script() loads idx+1 =
+            # the first spliced step.
+            n_new = len(steps)
+            # Flight-log forensics: step the counter + record what we spliced
+            # (the distinct APPROACH target ids) so flight_log.csv pins the
+            # tick and the new targets. See MissionState.splice_count.
+            targets = sorted({s.marker_id for s in steps
+                              if s.kind == "APPROACH" and s.marker_id is not None})
+            self.state.splice_count += 1
+            note = (f"splice#{self.state.splice_count}: +{n_new} steps after "
+                    f"idx {idx}; targets {targets}")
+            self.state.splice_note = note
+        print(f"[ctrl] mission splice: {note}")
+        return True, note
 
     def trigger(self) -> bool:
         """Release the run loop so it proceeds into the script's first

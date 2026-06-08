@@ -86,6 +86,11 @@ _CSV_FIELDS = [
     # always captured -- the operator can grep the CSV for the
     # row whose abort_reason transitions from "" to non-empty.
     "note", "abort_reason",
+    # Live mission-splice forensics (C2 airborne re-target). splice_count
+    # steps up by 1 at the exact tick a splice lands -- grep for the row
+    # where it increments. splice_note carries that splice's detail (new
+    # step count + APPROACH target ids).
+    "splice_count", "splice_note",
     # Pipe-joined list of every marker id the detector reported
     # this tick (e.g. "1|3|7"). Distinct from
     # ``arena_pose_methods`` (which only lists markers that
@@ -398,6 +403,8 @@ class FlightRecorder:
                 row[dst] = "" if v is None else v
             row["note"] = (snap.get("note") or "")
             row["abort_reason"] = (snap.get("abort_reason") or "")
+            row["splice_count"] = snap.get("splice_count", 0)
+            row["splice_note"] = (snap.get("splice_note") or "")
             vmids = snap.get("visible_marker_ids") or []
             row["visible_marker_ids"] = "|".join(str(int(m))
                                                   for m in vmids)

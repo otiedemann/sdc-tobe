@@ -130,6 +130,16 @@ class FCPool:
             return False, "unknown fc"
         return await client.stop_mission()
 
+    async def splice(self, name: str, script: str) -> tuple[bool, Any]:
+        """Live-retarget one FC's airborne mission (replace the remaining
+        steps, NO landing). Returns (False, ...) if the FC rejects it (not
+        airborne, or an older FC without the splice endpoint) so the caller
+        can fall back to stop_drone + relaunch."""
+        client = self.clients.get(name)
+        if client is None:
+            return False, "unknown fc"
+        return await client.splice_mission(script)
+
     async def emergency_land_all(self) -> Dict[str, bool]:
         """Land EVERY drone immediately (stop each mission -> rc_zero + land).
         409 'not running' is treated as success (already idle)."""

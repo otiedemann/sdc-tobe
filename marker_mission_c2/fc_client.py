@@ -169,6 +169,15 @@ class AsyncFCClient:
         return await self._post("/api/mission/script",
                                 json_body={"text": text}, timeout=3.0)
 
+    async def splice_mission(self, script: str) -> Result:
+        """Live-replace the FC's REMAINING mission steps WITHOUT landing
+        (re-target an airborne drone). The FC keeps the current step running
+        and walks into the new tail. A non-200 (e.g. 409 'not airborne' on an
+        older FC without the splice endpoint) returns ok=False so the caller
+        falls back to stop->relaunch."""
+        return await self._post("/api/mission/splice",
+                                json_body={"script": script}, timeout=5.0)
+
     async def list_mission_scripts(self) -> Result:
         """List the FC's named mission scripts (its
         ``~/.marker_mission/mission_scripts/*.txt`` directory)."""

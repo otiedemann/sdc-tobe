@@ -30,6 +30,10 @@ PUSH_GRACE_S = 6.0
 # A role change (manual or auto) re-tasks the drone (stop -> land -> relaunch).
 # Stop it at most this often so we never thrash a drone between roles.
 RETASK_COOLDOWN_S = 25.0
+# An attacker can be LIVE re-targeted (new enemy boxes) via a mission splice —
+# no landing — so this can be far shorter than RETASK_COOLDOWN_S. It only damps
+# spamming splices while the scout's box-state settles.
+SPLICE_COOLDOWN_S = 10.0
 # In AUTO, only adopt a new desired role once the coordinator has wanted it
 # consistently for this long — damps box-state flicker into stable roles.
 ROLE_HOLD_S = 12.0
@@ -46,7 +50,9 @@ class Runner:
         self._task: Optional[asyncio.Task] = None
         self._last_push: Dict[str, float] = {}    # fc -> monotonic ts of last start
         self._launched_role: Dict[str, str] = {}  # fc -> role of the running script
+        self._launched_targets: Dict[str, frozenset] = {}  # fc -> attacker's live target faces
         self._last_retask: Dict[str, float] = {}  # fc -> monotonic ts of last stop
+        self._last_splice: Dict[str, float] = {}  # fc -> monotonic ts of last live re-target
         self._desired_role: Dict[str, tuple] = {}  # fc -> (role, since) AUTO hysteresis
         self._last_action: Dict[str, str] = {}    # fc -> human reason (for UI)
 
@@ -124,6 +130,7 @@ class Runner:
                     await self.pool.stop_drone(fc)
                     self._last_retask[fc] = now
                     self._launched_role.pop(fc, None)
+                    self._launched_targets.pop(fc, None)
                     self._last_action[fc] = "stand down (land)"
                 continue
 
@@ -138,7 +145,15 @@ class Runner:
                         await self.pool.stop_drone(fc)
                         self._last_retask[fc] = now
                         self._launched_role.pop(fc, None)
+                        self._launched_targets.pop(fc, None)
                         self._last_action[fc] = f"re-task -> {role}"
+                    continue
+                # Right role, still flying: an attacker can be LIVE re-targeted
+                # to the scout's current enemy-held boxes via a mission splice —
+                # no landing. (Other roles fly a fixed never-land script.)
+                if launched == "attacker" and role == "attacker":
+                    await self._maybe_retarget_attacker(
+                        fc, w, now, mover_rank.get(fc, 0), atk_hdg.get(fc, 0.0))
                 continue
 
             # C) Idle -> launch the current role's never-land script.
@@ -153,6 +168,12 @@ class Runner:
             self._last_push[fc] = now
             if ok:
                 self._launched_role[fc] = role
+                # Record the attacker's launched target set so the live
+                # re-target path (section B) knows when the board has moved.
+                if role == "attacker":
+                    self._launched_targets[fc] = frozenset(
+                        S.enemy_target_faces(self.match.our_team,
+                                             self.match.holders()))
             self._last_action[fc] = (
                 f"launch {role}" if ok else f"launch {role} FAILED: {payload}")
             logger.info("c2_v2: %s -> launch %s (%s)", fc, role,
@@ -208,10 +229,51 @@ class Runner:
             if not wall:
                 return None
             wall_id = int(wall[0])
-            faces = S.enemy_home_faces(team)
+            # Target only the enemy boxes the scout reports as not-ours (with a
+            # fall-back to all of them). The launch chain reflects the board at
+            # launch; section B then live-splices a new chain as the board moves.
+            faces = S.enemy_target_faces(team, self.match.holders())
             return S.attacker_loop_script(faces, wall_id,
                                           S.mover_alt(mover_lane, t), rth_hdg, t)
         return None
+
+    async def _maybe_retarget_attacker(self, fc: str, world, now: float,
+                                       mover_lane: int, rth_hdg: float) -> None:
+        """LIVE re-target an airborne attacker to the scout's current enemy-held
+        boxes, WITHOUT landing, via a mission splice. Only acts when the target
+        set has changed and the splice cooldown has elapsed. If the FC rejects
+        the splice (not airborne, or an older FC without the endpoint), falls
+        back to the stop->relaunch retask gated by RETASK_COOLDOWN_S."""
+        team = self.match.our_team
+        faces = S.enemy_target_faces(team, self.match.holders())
+        want = frozenset(faces)
+        if self._launched_targets.get(fc) == want:
+            return                                    # board unchanged
+        if now - self._last_splice.get(fc, -1e9) < SPLICE_COOLDOWN_S:
+            return
+        wall = arena_state.home_wall_marker(team)
+        if not wall:
+            return
+        t = self.match.tunables
+        script = S.attacker_splice_script(faces, int(wall[0]),
+                                          S.mover_alt(mover_lane, t), rth_hdg, t)
+        ok, payload = await self.pool.splice(fc, script)
+        self._last_splice[fc] = now
+        if ok:
+            self._launched_targets[fc] = want
+            self._last_action[fc] = f"re-target {sorted(faces)} (no land)"
+            logger.info("c2_v2: %s -> splice re-target %s (ok)", fc,
+                        sorted(faces))
+            return
+        # Splice not possible -> fall back to the landing retask.
+        if now - self._last_retask.get(fc, -1e9) >= RETASK_COOLDOWN_S:
+            await self.pool.stop_drone(fc)
+            self._last_retask[fc] = now
+            self._launched_role.pop(fc, None)
+            self._launched_targets.pop(fc, None)
+            self._last_action[fc] = f"re-target via relaunch ({payload})"
+            logger.info("c2_v2: %s -> splice rejected (%s); relaunch", fc,
+                        payload)
 
 
 def _fan_out_angles(n: int) -> List[float]:

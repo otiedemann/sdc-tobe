@@ -6326,6 +6326,36 @@ class UiServer:
                 return jsonify({"ok": False, "error": str(e)}), 500
             return jsonify({"ok": True})
 
+        @app.post("/api/mission/splice")
+        def api_mission_splice():
+            """Live-replace the REMAINING mission steps WITHOUT landing.
+
+            Body: {"script": "<steps>"} (no TAKEOFF -- the drone is already
+            airborne). Keeps the current step running and walks into the new
+            tail. Used by the C2 to re-target an airborne attacker. Returns
+            409 if the drone isn't airborne / has no active mission so the
+            caller can fall back to stop->relaunch."""
+            if self.controller is None or self.cfg is None:
+                return jsonify({"ok": False,
+                                "error": "no controller registered"}), 500
+            data = request.get_json(silent=True) or {}
+            script_text = data.get("script") if isinstance(data, dict) else None
+            if not script_text:
+                return jsonify({"ok": False,
+                                "error": "missing 'script' field"}), 400
+            from .mission_script import (parse as parse_script,
+                                          defaults_from_cfg, ScriptError)
+            try:
+                steps = parse_script(script_text, defaults_from_cfg(self.cfg))
+            except ScriptError as e:
+                return jsonify({"ok": False,
+                                "error": "script parse error",
+                                "script_error": str(e)}), 400
+            ok, msg = self.controller.splice_script(steps)
+            if not ok:
+                return jsonify({"ok": False, "error": msg}), 409
+            return jsonify({"ok": True, "message": msg})
+
         _SCRIPT_NAME_RE = _re.compile(r"^[A-Za-z0-9][A-Za-z0-9_\-\. ]{0,63}$")
 
         def _script_path(name: str) -> Optional[Path]:

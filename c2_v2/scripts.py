@@ -146,3 +146,37 @@ def enemy_home_faces(our_team: str) -> List[int]:
     enemy = "blue" if our_team == "red" else "red"
     enemy_slots = (4, 5, 6) if our_team == "red" else (1, 2, 3)
     return [face_id(s, enemy) for s in enemy_slots]
+
+
+def enemy_target_faces(our_team: str, holders: dict) -> List[int]:
+    """Enemy faces still worth attacking, given the scout's live box state:
+    the enemy slots NOT currently held by us (enemy-held or unknown). Skips
+    boxes already ours — re-attacking those wastes a pass and (since an
+    already-ours box shows OUR face, e.g. 44 not 34) makes APPROACH hunt a
+    marker that isn't up. Falls back to ALL enemy faces when we already hold
+    them all, so the loop keeps pressure as boxes flip back to enemy colour.
+
+    ``holders`` is {slot -> 'red'|'blue'|'unknown'} (the decayed effective
+    holder from MatchState.holders())."""
+    enemy = "blue" if our_team == "red" else "red"
+    enemy_slots = (4, 5, 6) if our_team == "red" else (1, 2, 3)
+    targets = [s for s in enemy_slots if holders.get(s) != our_team]
+    if not targets:                       # we hold them all -> keep full loop
+        targets = list(enemy_slots)
+    return [face_id(s, enemy) for s in targets]
+
+
+def attacker_splice_script(enemy_faces: List[int], wall_marker: int,
+                           cruise_alt_m: float, rth_hdg_deg: float,
+                           t: Tunables) -> str:
+    """Like attacker_loop_script but with NO TAKEOFF — a long capture chain
+    for LIVE-SPLICING into an already-airborne attacker (re-target without
+    landing). The FC keeps the current step running and walks into this tail,
+    so it must not re-take-off. Long enough (``t.attack_passes`` loops) that
+    it never ends within a match -> the drone never lands."""
+    lines: List[str] = []
+    for _ in range(max(1, int(t.attack_passes))):
+        for f in enemy_faces:
+            lines.extend(attack_leg(int(f), wall_marker, cruise_alt_m,
+                                    rth_hdg_deg, t))
+    return _fmt(lines)
