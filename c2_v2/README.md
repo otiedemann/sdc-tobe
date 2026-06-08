@@ -25,8 +25,36 @@ Open `http://<host>:8100/`.
 1. **FC client + live per-drone world + read-only dashboard** ← *current*
 2. Box-state tracker + arena + 6-box status panel + team / arena toggles
 3. **Roles + the never-land mechanism + first commands** ← *current*
-4. The coordinator — unified assignment + 5/10/Special plays + recovery + deconfliction
+4. **The coordinator — autonomous role assignment + strategy** ← *current*
 5. C2-link-loss auto-land, tuning UI, end-to-end verify
+
+## Phase 4 (this commit) — the autonomous brain (AUTO mode)
+
+- `coordinator.py` — a pure decision function: from the live box holders + drone
+  states it assigns each drone a role, biased to **win the game**:
+    * 1 **scout** always (feeds box-state).
+    * **defenders** = our threatened boxes + a baseline home presence (so the
+      enemy can't walk into an undefended box).
+    * **attackers** = the rest (≥1 always) — continuously re-capture the 3 enemy
+      boxes (each capture+home = 1 pt; they flip back when we leave, so the loop
+      scores all match).
+    * **Special push**: at 5/6 boxes ours, go ALL-OUT to grab the last enemy box
+      for the instant-win (hold all 6 for 5 s).
+  Stable assignment — keeps drones in their current role where it fits the
+  target counts, so it re-tasks the *minimum* number of drones.
+- `runner.py` — in AUTO, applies the plan with **hold-time hysteresis** (a role
+  must be wanted 12 s before it's adopted) and a per-drone **re-task cooldown**
+  (25 s between stops), since re-tasking costs a landing. The same re-task path
+  also applies MANUAL role changes (stop → land → relaunch the new role), and
+  "stands down" (lands) a drone turned off / set idle.
+- dashboard — **Go AUTO / MANUAL** toggle, the live coordinator strategy line,
+  and role selectors disabled in AUTO.
+
+> Why not precise 5-pt / 10-pt orchestration? With independent never-land
+> scripts we can't reliably hit the sub-second 10-pt double-strike or the
+> "all drones outside home at the instant of capture" 5-pt window. So the brain
+> banks continuous 1-pt captures and drives toward the **Special instant-win** —
+> the highest-value outcome actually achievable with this architecture.
 
 ## The never-land mechanism
 
