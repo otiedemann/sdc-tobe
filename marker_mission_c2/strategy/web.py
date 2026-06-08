@@ -503,6 +503,8 @@ _INDEX_HTML = r"""<!doctype html>
   .video-tile { position: relative; background: #111; border-radius: 6px;
                 border: 1px solid var(--border); overflow: hidden;
                 aspect-ratio: 16 / 10; cursor: zoom-in; }
+  .video-tile.disabled { cursor: default; opacity: .5;
+                         border-style: dashed; }
   .video-tile img { width: 100%; height: 100%; object-fit: cover;
                     display: block; background: #222; }
   .video-tile .label { position: absolute; top: 4px; left: 6px;
@@ -700,7 +702,8 @@ function renderVideos(state) {
     const ov = overview[fc] || {};
     const url = ov.base_url ? `${ov.base_url}/video.mjpg` : "";
     const team = (drones[fc] || {}).team || "";
-    return `${fc}=${url}=${team}`;
+    const en = (drones[fc] || {}).enabled !== false;   // disabled -> no feed
+    return `${fc}=${url}=${team}=${en}`;
   }).join("|");
   if (sig === _videoCache) return;
   _videoCache = sig;
@@ -713,12 +716,18 @@ function renderVideos(state) {
     const url = ov.base_url ? `${ov.base_url}/video.mjpg` : "";
     const team = (drones[fc] || {}).team || "";
     const teamCls = team === "red" ? "red" : team === "blue" ? "blue" : "";
-    const click = url ? `onclick="window.open('${url}', '_blank')"` : "";
-    const content = url
-      ? `<img src="${url}" alt="${fc} live feed" onerror="this.style.display='none'; this.nextElementSibling && (this.nextElementSibling.style.display='flex');" />
-         <div class="nope" style="display:none">camera offline</div>`
-      : `<div class="nope">no video</div>`;
-    return `<div class="video-tile" ${click} title="${fc} live feed">
+    // A DISABLED drone must NOT show any feed — a stale sim stream would
+    // confuse the operator's read of the live feeds. Show a placeholder
+    // instead of the <img> (no MJPEG connection opened at all).
+    const enabled = (drones[fc] || {}).enabled !== false;
+    const click = (enabled && url) ? `onclick="window.open('${url}', '_blank')"` : "";
+    const content = !enabled
+      ? `<div class="nope">disabled</div>`
+      : (url
+        ? `<img src="${url}" alt="${fc} live feed" onerror="this.style.display='none'; this.nextElementSibling && (this.nextElementSibling.style.display='flex');" />
+           <div class="nope" style="display:none">camera offline</div>`
+        : `<div class="nope">no video</div>`);
+    return `<div class="video-tile${enabled ? "" : " disabled"}" ${click} title="${fc} ${enabled ? "live feed" : "(disabled)"}">
               <span class="label ${teamCls}">${fc}</span>
               ${content}
             </div>`;
