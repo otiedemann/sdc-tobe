@@ -25,12 +25,18 @@ from marker_mission_c2.strategy.settings import ALL_SLOTS
 logger = logging.getLogger("c2_v2.match")
 
 VALID_TEAMS = ("red", "blue")
+VALID_ROLES = ("idle", "scout", "attacker", "defender")
 _STATE_PATH = Path(__file__).resolve().parent / "c2v2_state.json"
+
+# Sensible default roles for a 5-drone fleet (operator can change live):
+# one scout, two attackers, two defenders.
+_DEFAULT_ROLE_BY_LANE = ("scout", "attacker", "attacker", "defender", "defender")
 
 
 class MatchState:
     def __init__(self, our_team: str = "red",
                  arena_name: Optional[str] = None,
+                 fc_names: Optional[list] = None,
                  state_path: Optional[Path] = None) -> None:
         self._lock = threading.RLock()
         self._path = state_path or _STATE_PATH
@@ -43,6 +49,25 @@ class MatchState:
         except Exception as exc:
             logger.warning("c2_v2: could not set arena %r: %s", arena, exc)
         self.tracker = MarkerTracker(active_slots=ALL_SLOTS)
+
+        # Commanding is DISARMED until the operator explicitly arms. The runner
+        # observes always but never pushes a script while disarmed.
+        self.armed = False
+        # Per-drone config: {fc_name: {"role", "enabled", "lane"}}. ``lane`` is a
+        # stable 0-based index used for altitude deconfliction + RTH fan-out.
+        self.drones: dict[str, dict] = {}
+        pd = persisted.get("drones") or {}
+        for lane, name in enumerate(fc_names or []):
+            saved = pd.get(name) or {}
+            role = saved.get("role")
+            if role not in VALID_ROLES:
+                role = (_DEFAULT_ROLE_BY_LANE[lane]
+                        if lane < len(_DEFAULT_ROLE_BY_LANE) else "idle")
+            self.drones[name] = {
+                "role": role,
+                "enabled": bool(saved.get("enabled", True)),
+                "lane": lane,
+            }
 
     # ------------------------------------------------------------------ setters
     def set_team(self, team: str) -> bool:
@@ -63,6 +88,36 @@ class MatchState:
         with self._lock:
             self._save()
         return True
+
+    def set_role(self, fc_name: str, role: str) -> bool:
+        r = (role or "").lower()
+        if r not in VALID_ROLES:
+            return False
+        with self._lock:
+            d = self.drones.get(fc_name)
+            if d is None:
+                return False
+            d["role"] = r
+            self._save()
+        return True
+
+    def set_enabled(self, fc_name: str, enabled: bool) -> bool:
+        with self._lock:
+            d = self.drones.get(fc_name)
+            if d is None:
+                return False
+            d["enabled"] = bool(enabled)
+            self._save()
+        return True
+
+    def set_armed(self, armed: bool) -> None:
+        with self._lock:
+            self.armed = bool(armed)
+            self._save()
+
+    def drone_cfg(self, fc_name: str) -> dict:
+        with self._lock:
+            return dict(self.drones.get(fc_name) or {})
 
     @property
     def enemy_team(self) -> str:
@@ -87,6 +142,8 @@ class MatchState:
             "enemy_team": self.enemy_team,
             "arena": arena_state.active_name(),
             "arena_options": arena_state.arena_labels(),
+            "armed": self.armed,
+            "drones": {k: dict(v) for k, v in self.drones.items()},
             "boxes": boxes,
             "boxes_ours": ours,
             "boxes_enemy": enemy,
@@ -107,8 +164,13 @@ class MatchState:
 
     def _save(self) -> None:
         try:
-            self._path.write_text(json.dumps(
-                {"our_team": self.our_team, "arena": arena_state.active_name()},
-                indent=2))
+            self._path.write_text(json.dumps({
+                "our_team": self.our_team,
+                "arena": arena_state.active_name(),
+                # NOTE: armed is deliberately NOT persisted — every restart comes
+                # up DISARMED for safety.
+                "drones": {k: {"role": v["role"], "enabled": v["enabled"]}
+                           for k, v in self.drones.items()},
+            }, indent=2))
         except OSError as exc:
             logger.warning("c2_v2: could not persist state: %s", exc)

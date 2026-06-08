@@ -23,6 +23,7 @@ from typing import Optional
 from .config import default_fcs, fcs_from_hosts
 from .match import MatchState
 from .pool import FCPool
+from .runner import Runner
 from .web import build_app
 
 logger = logging.getLogger("c2_v2")
@@ -74,19 +75,26 @@ def main(argv: Optional[list[str]] = None) -> int:
     )
 
     specs = fcs_from_hosts(args.fcs.split(",")) if args.fcs else default_fcs()
-    match = MatchState(our_team=args.team or "red", arena_name=args.arena)
+    match = MatchState(our_team=args.team or "red", arena_name=args.arena,
+                       fc_names=[s.name for s in specs])
     pool = FCPool(specs, match=match)
+    runner = Runner(pool, match)
 
     th = _AsyncLoopThread()
     th.start()
     th.wait_ready()
     assert th.loop is not None
     asyncio.run_coroutine_threadsafe(pool.start(), th.loop).result(5.0)
+    asyncio.run_coroutine_threadsafe(runner.start(), th.loop).result(5.0)
 
-    flask_app = build_app(pool, match=match)
+    flask_app = build_app(pool, match=match, runner=runner, loop=th.loop)
 
     def _shutdown(signum, frame):  # noqa: ARG001
         logger.info("c2_v2: shutting down (signal %s)", signum)
+        try:
+            asyncio.run_coroutine_threadsafe(runner.stop(), th.loop).result(2.0)
+        except Exception:
+            pass
         try:
             asyncio.run_coroutine_threadsafe(pool.stop(), th.loop).result(2.0)
         except Exception:
