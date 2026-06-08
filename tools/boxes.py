@@ -51,7 +51,7 @@ MARKER_CM = 18.0  # printed marker pattern size when shown fullscreen
 
 # Offered in the marker page's dropdowns (the current value is always added
 # too, so a hand-edited URL still shows up as a selectable option).
-SCREEN_SIZES = [13.0, 14.0, 15.6, 17.0, 20.0, 21.5, 24.0, 27.0, 32.0, 43.0, 50.0, 55.0, 65.0, 75.0, 86.0]
+SCREEN_SIZES = [13.0, 14.0, 15.6, 17.0, 19.0, 20.0, 21.5, 24.0, 27.0, 32.0, 43.0, 50.0, 55.0, 65.0, 75.0, 86.0]
 FORMATS = ["16x9", "16x10", "4x3", "3x2", "21x9", "1x1"]
 
 
