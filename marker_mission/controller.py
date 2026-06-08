@@ -2032,8 +2032,13 @@ class MissionController:
             # Also gate on speed: don't release until body speed is low so
             # residual forward momentum can't carry the drone through the
             # pause and into the marker.
+            # Exception: loose_home (GO_HOME positioning) already forces e_h=0
+            # so h_in_band is always True; skip the speed gate and rely on the
+            # approach slow_zone to control speed near the target.
             speed = self._body_speed_cms(tel)
-            speed_ok = (speed is None or speed < RC_BRAKE_SPEED_THRESHOLD_CMS)
+            speed_ok = (_loose_home
+                        or speed is None
+                        or speed < RC_BRAKE_SPEED_THRESHOLD_CMS)
             if h_in_band and speed_ok:
                 if self._approach_mid_ha_settled_at is None:
                     self._approach_mid_ha_settled_at = now

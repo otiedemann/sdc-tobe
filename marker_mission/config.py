@@ -261,7 +261,7 @@ class MissionConfig:
     height_kd: float = 10.0                # TUNE  RC counts per (m/s)
     height_ki: float = 0.0                 # TUNE  RC counts per (m*s)
     height_i_clip: float = 1.0             # TUNE  hard bound on |integral|
-    height_deadband_m: float = 0.10        # TUNE
+    height_deadband_m: float = 0.20        # TUNE
     height_settle_time_s: float = 1.0      # TUNE  before HEIGHT_ALIGN -> ALIGN
 
     # --- Mission script -----------------------------------------------------
