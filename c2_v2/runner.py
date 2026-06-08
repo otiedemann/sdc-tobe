@@ -90,9 +90,13 @@ class Runner:
         now = time.monotonic()
 
         # AUTO: let the coordinator (re)assign roles from the game state, with
-        # hold-time hysteresis so box-state flicker doesn't thrash roles.
+        # hold-time hysteresis so box-state flicker doesn't thrash roles. When
+        # AUTO is off, drop any pending hysteresis so a later AUTO-on starts
+        # fresh (no stale desired-role from old game state).
         if self.match.auto:
             self._apply_coordinator(worlds, now)
+        elif self._desired_role:
+            self._desired_role.clear()
 
         # Mover altitude lanes + attacker fan-out, recomputed from current roles.
         movers = sorted(
@@ -117,7 +121,7 @@ class Runner:
             # A) Should NOT be flying (disabled or idle role) but is -> land it.
             if flying and (not enabled or role == "idle"):
                 if now - self._last_retask.get(fc, -1e9) >= RETASK_COOLDOWN_S:
-                    await self.pool.stop(fc)
+                    await self.pool.stop_drone(fc)
                     self._last_retask[fc] = now
                     self._launched_role.pop(fc, None)
                     self._last_action[fc] = "stand down (land)"
@@ -131,7 +135,7 @@ class Runner:
             if flying:
                 if launched is not None and launched != role:
                     if now - self._last_retask.get(fc, -1e9) >= RETASK_COOLDOWN_S:
-                        await self.pool.stop(fc)
+                        await self.pool.stop_drone(fc)
                         self._last_retask[fc] = now
                         self._launched_role.pop(fc, None)
                         self._last_action[fc] = f"re-task -> {role}"
@@ -169,6 +173,11 @@ class Runner:
                                      self.match.holders(), views,
                                      baseline_def=self.match.tunables.baseline_defenders)
         self.match.coord_summary = plan.summary
+        # Drop hysteresis timers for drones the coordinator no longer plans for
+        # (disconnected / disabled) so a stale desired-role can't fire later.
+        for fc in list(self._desired_role):
+            if fc not in plan.roles:
+                self._desired_role.pop(fc, None)
         for fc, want in plan.roles.items():
             cur = self.match.drones.get(fc, {}).get("role")
             if want == cur:

@@ -121,8 +121,10 @@ class FCPool:
             return False, "unknown fc"
         return await client.start_mission(script)
 
-    async def stop(self, name: str) -> tuple[bool, Any]:
-        """Stop one FC's mission. NOTE: the FC LANDS on stop (rc_zero + land)."""
+    async def stop_drone(self, name: str) -> tuple[bool, Any]:
+        """Stop one FC's mission. NOTE: the FC LANDS on stop (rc_zero + land).
+        (Named stop_drone, not stop, so it doesn't shadow the pool-lifecycle
+        stop() used at shutdown.)"""
         client = self.clients.get(name)
         if client is None:
             return False, "unknown fc"
