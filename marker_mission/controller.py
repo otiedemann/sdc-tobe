@@ -311,6 +311,12 @@ RC_BRAKE_MAX_SETTLE_S: float = 1.5
 # camera keeps asking to descend, which can never be satisfied), force-release
 # into the final approach so the drone never hovers metres short of the target.
 MID_HA_MAX_S: float = 5.0
+# Hard timeout for the HEIGHT_ALIGN phase. If the marker is mounted below the
+# drone's physical minimum altitude the settle condition can never be met
+# (min_height floor guard clamps e_h=0 but yaw may still be outside band, or
+# the drone simply cannot descend far enough). Force APPROACH after this many
+# seconds so the mission doesn't stall indefinitely.
+HEIGHT_ALIGN_MAX_S: float = 5.0
 
 # FB_BRAKE world-position fallback parameters. When vision can't see
 # the target marker (yaw drift, occlusion, marker outside FOV), the
@@ -1862,6 +1868,20 @@ class MissionController:
             self._set_phase(Phase.APPROACH,
                             f"height aligned (marker centred, e={e_h:+.2f}m) -- "
                             f"closing distance (angle correction at yaw_start_fraction)")
+            return
+
+        # Hard timeout: if the marker is physically unreachable at this altitude
+        # (e.g. mounted on the floor, drone can't descend below ~48 cm), HEIGHT_ALIGN
+        # would stall forever. After HEIGHT_ALIGN_MAX_S accept the current height
+        # and start the approach anyway.
+        with self.state.lock:
+            _ha_started = self.state.phase_started_at
+        if now - _ha_started >= HEIGHT_ALIGN_MAX_S:
+            print(f"[ctrl] HEIGHT_ALIGN timeout ({HEIGHT_ALIGN_MAX_S:g}s) "
+                  f"-- forcing APPROACH (e_h={e_h:+.2f}m marker_y={marker_y:+.2f}m)")
+            self._set_phase(Phase.APPROACH,
+                            f"height align timeout ({HEIGHT_ALIGN_MAX_S:g}s) -- "
+                            f"starting approach at e_h={e_h:+.2f}m")
 
     # -------------------------------------------------------------- approach
     def _step_approach(self, tel: Optional[TelemetrySnapshot],
