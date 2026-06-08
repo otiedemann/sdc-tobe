@@ -111,6 +111,32 @@ class FCPool:
             dt = time.monotonic() - t0
             await asyncio.sleep(max(0.02, period - dt))
 
+    # ------------------------------------------------------------------ commands
+    async def push_and_start(self, name: str, script: str) -> tuple[bool, Any]:
+        """Set + start a mission on one FC in a single call (the FC's /api/start
+        accepts the script). The FC only starts from idle, so callers gate on
+        the drone's phase being init/done/''."""
+        client = self.clients.get(name)
+        if client is None:
+            return False, "unknown fc"
+        return await client.start_mission(script)
+
+    async def stop(self, name: str) -> tuple[bool, Any]:
+        """Stop one FC's mission. NOTE: the FC LANDS on stop (rc_zero + land)."""
+        client = self.clients.get(name)
+        if client is None:
+            return False, "unknown fc"
+        return await client.stop_mission()
+
+    async def emergency_land_all(self) -> Dict[str, bool]:
+        """Land EVERY drone immediately (stop each mission -> rc_zero + land).
+        409 'not running' is treated as success (already idle)."""
+        results: Dict[str, bool] = {}
+        for name, client in self.clients.items():
+            ok, _ = await client.stop_mission()
+            results[name] = bool(ok)
+        return results
+
     # ------------------------------------------------------------------ snapshot
     def snapshot(self) -> Dict[str, Any]:
         """Thread-safe-enough read for the dashboard. The worlds are mutated by

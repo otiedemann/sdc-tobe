@@ -24,8 +24,16 @@ def _no_cache(resp: Response) -> Response:
     return resp
 
 
-def build_app(pool: FCPool, match: Any = None) -> Flask:
+def build_app(pool: FCPool, match: Any = None, runner: Any = None,
+              loop: Any = None) -> Flask:
     app = Flask(__name__)
+
+    def _run_coro(coro, timeout: float = 8.0):
+        """Run an async runner/pool coroutine from the Flask thread on the
+        asyncio loop."""
+        import asyncio
+        fut = asyncio.run_coroutine_threadsafe(coro, loop)
+        return fut.result(timeout)
 
     @app.route("/api/state")
     def api_state():
@@ -35,7 +43,43 @@ def build_app(pool: FCPool, match: Any = None) -> Flask:
         except Exception as exc:  # arena registry missing -> still serve drones
             snap["arena_geom"] = {"error": f"{type(exc).__name__}: {exc}"}
         snap["match"] = match.to_client() if match is not None else None
+        snap["actions"] = runner.last_actions() if runner is not None else {}
         return _no_cache(jsonify(snap))
+
+    @app.route("/api/arm", methods=["POST"])
+    def api_arm():
+        body = request.get_json(silent=True) or {}
+        if match is None:
+            return _no_cache(jsonify({"ok": False})), 400
+        match.set_armed(bool(body.get("armed", False)))
+        return _no_cache(jsonify({"ok": True, "armed": match.armed}))
+
+    @app.route("/api/emergency-land", methods=["POST"])
+    def api_emergency_land():
+        # Land everyone NOW + disarm. Tolerate a missing runner/loop.
+        if runner is None or loop is None:
+            if match is not None:
+                match.set_armed(False)
+            return _no_cache(jsonify({"ok": True, "note": "disarmed only"}))
+        try:
+            res = _run_coro(runner.emergency_land(), timeout=12.0)
+        except Exception as exc:
+            return _no_cache(jsonify({"ok": False, "error": str(exc)})), 502
+        return _no_cache(jsonify({"ok": True, "results": res}))
+
+    @app.route("/api/drone/<fc>/role", methods=["POST"])
+    def api_role(fc):
+        body = request.get_json(silent=True) or {}
+        if match is None or not match.set_role(fc, str(body.get("role", ""))):
+            return _no_cache(jsonify({"ok": False, "error": "bad role/fc"})), 400
+        return _no_cache(jsonify({"ok": True}))
+
+    @app.route("/api/drone/<fc>/enabled", methods=["POST"])
+    def api_enabled(fc):
+        body = request.get_json(silent=True) or {}
+        if match is None or not match.set_enabled(fc, bool(body.get("enabled", True))):
+            return _no_cache(jsonify({"ok": False, "error": "bad fc"})), 400
+        return _no_cache(jsonify({"ok": True}))
 
     @app.route("/api/team", methods=["POST"])
     def api_team():
@@ -79,6 +123,11 @@ _PAGE = r"""<!doctype html>
   .pill.ok { color:var(--green); } .pill.bad { color:var(--red); }
   .pill.win { color:#0d1117; background:var(--warn); font-weight:700; }
   .pill.red { color:var(--red); } .pill.blue { color:var(--blue); }
+  .pill.armed { color:#0d1117; background:var(--green); font-weight:700; }
+  button { background:var(--panel2); color:var(--fg); border:1px solid #30363d;
+           border-radius:6px; padding:4px 10px; font-size:12px; cursor:pointer; }
+  button.armed { background:var(--green); color:#0d1117; font-weight:700; border-color:var(--green); }
+  button.danger { background:var(--red); color:#fff; font-weight:700; border-color:var(--red); }
   .spacer { flex:1; }
   main { display:grid; grid-template-columns: 1fr 1fr; gap:12px; padding:12px; }
   @media (max-width:900px){ main { grid-template-columns:1fr; } }
@@ -119,6 +168,9 @@ _PAGE = r"""<!doctype html>
   <select id="team-sel"><option value="red">red</option><option value="blue">blue</option></select>
   <span class="small">arena</span>
   <select id="arena-sel"></select>
+  <button id="arm-btn">Arm</button>
+  <button id="land-btn" class="danger">EMERGENCY LAND</button>
+  <span class="pill" id="armed-pill">disarmed</span>
   <span class="spacer"></span>
   <span class="pill" id="conn-pill">– / – connected</span>
   <span class="pill" id="boxes-pill">boxes –</span>
@@ -179,16 +231,34 @@ function renderHeader(s){
     sp.textContent = ms.won? "★ INSTANT WIN" : `ALL 6 OURS ${ms.dwell_s.toFixed(1)}/${ms.threshold_s}s`;
     sp.className = "pill " + (ms.won? "win":"");
   } else { sp.style.display="none"; }
+  // armed state
+  const armed = !!m.armed; armedNow = armed;
+  const ap = document.getElementById("armed-pill");
+  ap.textContent = armed? "ARMED" : "disarmed";
+  ap.className = "pill " + (armed? "armed":"");
+  const ab = document.getElementById("arm-btn");
+  ab.textContent = armed? "Disarm" : "Arm";
+  ab.className = armed? "armed":"";
+}
+function roleOpts(cur){
+  return ["idle","scout","attacker","defender"].map(r=>
+    `<option value="${r}" ${r===cur?"selected":""}>${r}</option>`).join("");
 }
 function renderDrones(s){
   const root = document.getElementById("drones"); root.innerHTML = "";
+  const cfgs = (s.match&&s.match.drones)||{}; const acts=s.actions||{};
   for(const d of s.drones){
     const el = document.createElement("div");
+    const cfg = cfgs[d.name]||{};
     el.className = "drone" + (d.connected? "":" off");
     const pos = d.position_m ? d.position_m.map(x=>x.toFixed(1)).join(", ") : "—";
     const bat = d.battery_pct==null? "—" : Math.round(d.battery_pct)+"%";
     el.innerHTML = `
       <div class="name">${d.name}<span><span class="dot ${d.connected?'ok':'bad'}"></span></span></div>
+      <div style="display:flex;gap:6px;align-items:center;margin-top:4px">
+        <select data-role="${d.name}">${roleOpts(cfg.role||'idle')}</select>
+        <label class="small"><input type="checkbox" data-enabled="${d.name}" ${cfg.enabled!==false?'checked':''}> on</label>
+      </div>
       <div class="kv">
         <div class="k">pos (x,y,z)</div><div class="v">${pos}</div>
         <div class="k">height</div><div class="v">${d.height_m==null?'—':d.height_m+' m'}</div>
@@ -198,6 +268,7 @@ function renderDrones(s){
         <div class="k">wifi</div><div class="v small">${d.wifi_ssid||'—'}</div>
       </div>
       <div class="plan">${d.plan||''}</div>
+      ${acts[d.name]? `<div class="small">↳ ${acts[d.name]}</div>`:''}
       ${d.last_error && !d.connected? `<div class="small" style="color:var(--red)">${d.last_error}</div>`:''}
     `;
     root.appendChild(el);
@@ -263,6 +334,25 @@ document.getElementById("team-sel").addEventListener("change", async (e)=>{
 });
 document.getElementById("arena-sel").addEventListener("change", async (e)=>{
   await api("/api/arena", {name: e.target.value}); tick();
+});
+let armedNow = false;
+document.getElementById("arm-btn").addEventListener("click", async ()=>{
+  if(!armedNow && !confirm("ARM the swarm? Enabled drones will launch their role and fly.")) return;
+  await api("/api/arm", {armed: !armedNow}); tick();
+});
+async function emergencyLand(){
+  // Fire immediately — land must always win, no confirm.
+  try { await api("/api/emergency-land", {}); } catch(e){}
+  tick();
+}
+document.getElementById("land-btn").addEventListener("click", emergencyLand);
+// '?' keyboard kill switch — lands ALL drones immediately, any focus.
+window.addEventListener("keydown", (e)=>{ if(e.key==="?") emergencyLand(); });
+// per-drone role + enabled
+document.addEventListener("change", async (e)=>{
+  const t=e.target;
+  if(t.matches("[data-role]")){ await api(`/api/drone/${encodeURIComponent(t.getAttribute("data-role"))}/role`, {role:t.value}); tick(); }
+  if(t.matches("[data-enabled]")){ await api(`/api/drone/${encodeURIComponent(t.getAttribute("data-enabled"))}/enabled`, {enabled:t.checked}); tick(); }
 });
 tick(); setInterval(tick, 1000);
 </script>
