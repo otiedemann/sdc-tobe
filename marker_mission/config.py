@@ -263,6 +263,7 @@ class MissionConfig:
     height_i_clip: float = 1.0             # TUNE  hard bound on |integral|
     height_deadband_m: float = 0.20        # TUNE
     height_settle_time_s: float = 1.0      # TUNE  before HEIGHT_ALIGN -> ALIGN
+    height_warmup_s: float = 0.0           # TUNE  dead time at HEIGHT start: hover only, no PD
 
     # --- Mission script -----------------------------------------------------
     # Defaults filled in when a script step omits its argument.
@@ -672,6 +673,10 @@ TUNING_FIELDS = {
         "label": "HEIGHT_ALIGN settle time", "kind": "float", "unit": "s", "step": 0.01,
         "desc": "How long height + yaw must both stay inside their deadbands before HEIGHT_ALIGN transitions to ALIGN.",
     },
+    "height_warmup_s": {
+        "label": "HEIGHT warmup (dead time)", "kind": "float", "unit": "s", "step": 0.1,
+        "desc": "Seconds to hover without PD correction at the start of every HEIGHT step. Lets the barometer recover from move_imu pressure artefacts before height control begins. 0 = disabled.",
+    },
     "default_dance_seconds_s": {
         "label": "DANCE default duration", "kind": "float", "unit": "s", "step": 0.01,
         "desc": "Default seconds for a DANCE step in the mission script when the operator omits the argument.",
@@ -855,7 +860,7 @@ TUNING_GROUPS = [
     ("Height control",
         ["default_height_m", "min_height_m", "max_height_m",
          "height_kp", "height_kd", "height_ki", "height_i_clip",
-         "height_deadband_m", "height_settle_time_s", "ud_rc_max"]),
+         "height_deadband_m", "height_settle_time_s", "height_warmup_s", "ud_rc_max"]),
     ("Mission script defaults",
         ["default_dance_seconds_s", "dance_radius_m"]),
     ("Deadbands",

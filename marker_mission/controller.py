@@ -3060,6 +3060,18 @@ class MissionController:
                 self._advance_script("height: no telemetry, advancing")
             return
         drone_h = h_cm / 100.0
+
+        # Dead time: hover without PD for height_warmup_s after phase entry so
+        # the barometer can recover from pressure artefacts (e.g. after move_imu).
+        warmup = float(getattr(cfg, "height_warmup_s", 0.0))
+        if warmup > 0.0 and now - self.state.phase_started_at < warmup:
+            self._send_rc(0, 0, 0, 0)
+            with self.state.lock:
+                self.state.note = (f"HEIGHT warmup: drone={drone_h:.2f}m  "
+                                   f"target={target:.2f}m  "
+                                   f"t={now - self.state.phase_started_at:.1f}s/{warmup:.1f}s")
+            return
+
         e_h = target - drone_h
         u_ud = (0.0 if abs(e_h) < cfg.height_deadband_m
                 else self.pd_height.step(e_h, now))
