@@ -3510,10 +3510,11 @@ class MissionController:
     def _check_drone_threat(self, now: float) -> None:
         """Called each control tick before phase dispatch.
 
-        Transitions to THREAT_OBSERVE when a ≥150 px blob appears, and
-        resumes (or re-enters current step) once the threat clears.
+        Threat response is currently disabled — detected enemy drones are
+        shown in the camera overlay only and do not affect flight.
         """
-        if self.get_drone_threat is None:
+        return
+        if self.get_drone_threat is None:  # noqa: unreachable
             return
         threat_w, _threat_dx = self.get_drone_threat()
         phase = self.state.phase

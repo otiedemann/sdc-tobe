@@ -1381,16 +1381,8 @@ def cmd_fly(args: argparse.Namespace) -> int:
                 # ── Other-drone detection + overlay ───────────────────
                 raw_blobs = _detect_drones(frame)
                 confirmed  = _temporal_filter(raw_blobs)
-                if confirmed:
-                    _bx, _by, _bw, _bh = confirmed[0]
-                    _threat_cx = _bx + _bw / 2.0
-                    _threat_dx = ((_threat_cx - _dd_prev_threat_cx)
-                                  if _dd_prev_threat_cx is not None else 0.0)
-                    _dd_prev_threat_cx = _threat_cx
-                    drone_threat_holder.set(_bw, _threat_dx)
-                else:
+                if not confirmed:
                     _dd_prev_threat_cx = None
-                    drone_threat_holder.set(0, 0.0)
                 if confirmed:
                     # Largest = nearest (red), rest yellow
                     for i, (bx, by, bw, bh) in enumerate(confirmed):
