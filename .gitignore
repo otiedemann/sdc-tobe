@@ -248,3 +248,6 @@ __marimo__/
 # Copy drones.csv.example to drones.csv and edit for your fleet.
 controller_unified/drones.csv
 
+
+# C2 V2 persisted runtime state (team/arena)
+c2_v2/c2v2_state.json

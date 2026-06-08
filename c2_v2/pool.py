@@ -29,7 +29,12 @@ logger = logging.getLogger("c2_v2.pool")
 
 
 class FCPool:
-    def __init__(self, specs: List[FCSpec], poll: Optional[PollConfig] = None):
+    def __init__(self, specs: List[FCSpec], poll: Optional[PollConfig] = None,
+                 match: Any = None):
+        # ``match`` (a MatchState) receives each drone's visible markers every
+        # tick to maintain the live box-state. Optional so the pool also works
+        # standalone (Phase 1). Duck-typed: only ``.ingest(fc, ids)`` is used.
+        self._match = match
         self.poll = poll or PollConfig()
         self._http: httpx.AsyncClient = make_client(self.poll.request_timeout_s)
         self.clients: Dict[str, AsyncFCClient] = {
@@ -79,6 +84,12 @@ class FCPool:
             ok, payload = await client.get_state()
             if ok and isinstance(payload, dict):
                 world.update_from_state(payload, now)
+                # Feed the box-state tracker with this drone's observations.
+                if self._match is not None and world.visible_marker_ids:
+                    try:
+                        self._match.ingest(name, world.visible_marker_ids)
+                    except Exception as exc:
+                        logger.debug("ingest(%s) failed: %s", name, exc)
             else:
                 err = payload if isinstance(payload, str) else str(payload)
                 world.mark_disconnected(err, now, self.poll.stale_after_s)
