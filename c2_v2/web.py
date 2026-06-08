@@ -64,13 +64,21 @@ def build_app(pool: FCPool, match: Any = None, runner: Any = None,
 
     @app.route("/api/emergency-land", methods=["POST"])
     def api_emergency_land():
-        # Land everyone NOW + disarm. Tolerate a missing runner/loop.
-        if runner is None or loop is None:
-            if match is not None:
-                match.set_armed(False)
-            return _no_cache(jsonify({"ok": True, "note": "disarmed only"}))
+        # Land everyone NOW + disarm. Disarm first (cheap, always works), then
+        # land. NEVER report success unless drones were actually commanded down.
+        if match is not None:
+            match.set_armed(False)
+        if loop is None:
+            return _no_cache(jsonify({
+                "ok": False, "error": "no asyncio loop — disarmed only; "
+                "use the physical kill switch"})), 503
         try:
-            res = _run_coro(runner.emergency_land(), timeout=12.0)
+            # Prefer the runner (also records per-drone action); fall back to the
+            # pool directly so a land still happens even without a runner.
+            if runner is not None:
+                res = _run_coro(runner.emergency_land(), timeout=12.0)
+            else:
+                res = _run_coro(pool.emergency_land_all(), timeout=12.0)
         except Exception as exc:
             return _no_cache(jsonify({"ok": False, "error": str(exc)})), 502
         return _no_cache(jsonify({"ok": True, "results": res}))
@@ -238,6 +246,7 @@ async function tick(){
 function renderWarn(s){
   const b = document.getElementById("warn-banner");
   const m = s.match||{};
+  if(landError){ b.style.display=""; b.textContent = "⚠ " + landError; return; }
   const lost = s.drones.filter(d => !d.connected).map(d=>d.name.replace("flightctrl","fc"));
   if(m.armed && lost.length){
     b.style.display="";
@@ -409,9 +418,18 @@ document.getElementById("arm-btn").addEventListener("click", async ()=>{
 document.getElementById("auto-btn").addEventListener("click", async ()=>{
   await api("/api/auto", {auto: !autoNow}); tick();
 });
+let landError = "";
 async function emergencyLand(){
   // Fire immediately — land must always win, no confirm.
-  try { await api("/api/emergency-land", {}); } catch(e){}
+  landError = "";
+  try {
+    const r = await api("/api/emergency-land", {});
+    const j = await r.json().catch(()=>({}));
+    if(!r.ok || j.ok===false){ landError = "EMERGENCY LAND FAILED: " + (j.error||r.status) + " — USE THE PHYSICAL KILL SWITCH"; }
+  } catch(e){
+    landError = "EMERGENCY LAND request failed: " + e + " — USE THE PHYSICAL KILL SWITCH";
+  }
+  if(landError){ console.error(landError); alert(landError); }
   tick();
 }
 document.getElementById("land-btn").addEventListener("click", emergencyLand);
