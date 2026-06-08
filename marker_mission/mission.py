@@ -431,6 +431,13 @@ def cmd_fly(args: argparse.Namespace) -> int:
             new_dir = make_flight_dir(FLIGHTS_DIR, serial)
             recorder_box[0] = FlightRecorder(new_dir, fps=cfg.record_fps)
             flight_dir_box[0] = new_dir
+            # TEMP DEBUG: route arena estimator's per-frame log into the
+            # per-flight artefact dir. Remove with the arena.py patch.
+            try:
+                from . import arena as _arena_dbg
+                _arena_dbg.set_debug_flight_dir(new_dir)
+            except Exception as e:
+                print(f"[mission] arena debug-log route failed: {e}")
             print(f"[mission] flight artefacts: {new_dir} (serial={serial})")
             try:
                 cfg.save(new_dir / "cfg_start.json")
@@ -510,6 +517,13 @@ def cmd_fly(args: argparse.Namespace) -> int:
                     cfg.save(fdir / "cfg_end.json")
                 except Exception as e:
                     print(f"[mission] cfg_end.json save failed: {e}")
+            # TEMP DEBUG: close per-flight arena debug log; next
+            # pre-flight frames go back to the persistent fallback path.
+            try:
+                from . import arena as _arena_dbg
+                _arena_dbg.set_debug_flight_dir(None)
+            except Exception:
+                pass
 
     # Build the controller before the UI so the UI's "Start mission" button
     # can call into it.

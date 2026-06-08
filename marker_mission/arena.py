@@ -59,6 +59,65 @@ import numpy as np
 
 from .aruco_detector import MarkerPose
 
+# ===== TEMP DEBUG (remove before commit) =====
+# Per-marker per-frame log of the estimate_position layer decisions, so
+# we can see WHY a particular IPPE branch was picked (or rejected). One
+# line per visible marker per frame. Path lives outside the project tree
+# so a stray `git add .` doesn't pick it up.
+import os as _dbg_os
+import time as _dbg_time
+# Default (pre-flight / no active flight): persistent across reboots,
+# in the marker_mission state dir alongside snapshots/, arenas/, etc.
+# Once a flight starts, mission.py calls set_debug_flight_dir() and the
+# next log line opens a NEW handle at <flight_dir>/arena_debug.log so
+# the data sits next to flight_log.csv and mission_meta.json.
+# Override the fallback path with env MARKER_MISSION_ARENA_DEBUG_LOG=/path.
+_DBG_FALLBACK_PATH = _dbg_os.environ.get(
+    "MARKER_MISSION_ARENA_DEBUG_LOG",
+    _dbg_os.path.expanduser("~/.marker_mission/arena_debug.log"))
+_dbg_flight_dir = None  # set by mission.py on TAKEOFF, cleared on DONE/ABORT
+_dbg_fh = None
+_dbg_open_path = None   # path the current handle points at
+def set_debug_flight_dir(path) -> None:
+    """Route subsequent arena_debug.log lines into the given per-flight
+    artefact directory. Pass None to revert to the fallback path. Called
+    from mission.py's on_phase_change() at TAKEOFF and DONE/ABORT."""
+    global _dbg_flight_dir, _dbg_fh, _dbg_open_path
+    _dbg_flight_dir = str(path) if path is not None else None
+    if _dbg_fh is not None:
+        try:
+            _dbg_fh.close()
+        except Exception:
+            pass
+        _dbg_fh = None
+        _dbg_open_path = None
+def _dbg(line: str) -> None:
+    global _dbg_fh, _dbg_open_path
+    try:
+        target = (_dbg_os.path.join(_dbg_flight_dir, "arena_debug.log")
+                  if _dbg_flight_dir is not None else _DBG_FALLBACK_PATH)
+        if _dbg_fh is None or _dbg_open_path != target:
+            if _dbg_fh is not None:
+                try: _dbg_fh.close()
+                except Exception: pass
+            _dbg_os.makedirs(_dbg_os.path.dirname(target), exist_ok=True)
+            _dbg_fh = open(target, "a", buffering=1)
+            _dbg_open_path = target
+            _dbg_fh.write(f"\n# ----- estimator opened pid={_dbg_os.getpid()} "
+                          f"t={_dbg_time.strftime('%Y-%m-%d %H:%M:%S')} -----\n")
+        _dbg_fh.write(line + "\n")
+    except Exception:
+        pass
+def _fmt_pos(p) -> str:
+    if p is None:
+        return "None"
+    return f"({float(p[0]):+.2f},{float(p[1]):+.2f},{float(p[2]):+.2f})"
+def _fmt_yaw(y) -> str:
+    return "None" if y is None else f"{float(y):+6.1f}"
+def _fmt_h(h) -> str:
+    return "None" if h is None else f"{float(h):+.2f}"
+# ===== END TEMP DEBUG =====
+
 
 VALID_WALLS = ("front", "back", "left", "right")
 
@@ -672,10 +731,13 @@ def estimate_position(arena: ArenaConfig,
                   + float(arena.magnetic_north_arena_yaw_deg))
         if use_mag else None)
 
-    contributions: List[tuple] = []   # (mid, pos_w, weight, method)
+    contributions: List[tuple] = []   # (mid, pos_w, weight, method, alt_validated)
+    _dbg_frame_ts = _dbg_time.monotonic()
     for p in poses:
         marker = arena.markers.get(int(p.marker_id))
         if marker is None:
+            _dbg(f"t={_dbg_frame_ts:.3f} m={int(p.marker_id)} "
+                 f"DROPPED: not in arena.markers")
             continue
         chosen_pos = position_from_marker(p, marker)
         # collapsed camera position takes precedence: the
@@ -687,6 +749,18 @@ def estimate_position(arena: ArenaConfig,
             alt_pos = _alt_world_position(p, marker)
         chosen_method = str(p.pose_method or "")
         weight = 1.0 / max(0.1, float(p.distance_m))
+
+        # ===== TEMP DEBUG: pre-decision diagnostic fields =====
+        _dbg_chosen_yaw = _arena_yaw_for_branch(p, marker, "chosen")
+        _dbg_alt_yaw = (_arena_yaw_for_branch(p, marker, "alt")
+                        if alt_pos is not None else None)
+        _dbg_d_chosen = (_yaw_diff(_dbg_chosen_yaw, expected_arena_yaw)
+                         if (_dbg_chosen_yaw is not None
+                             and expected_arena_yaw is not None) else None)
+        _dbg_d_alt = (_yaw_diff(_dbg_alt_yaw, expected_arena_yaw)
+                      if (_dbg_alt_yaw is not None
+                          and expected_arena_yaw is not None) else None)
+        # ===== END TEMP DEBUG =====
 
         pos_w = None
         method = chosen_method
@@ -804,6 +878,17 @@ def estimate_position(arena: ArenaConfig,
             # Magnetometer (or altimeter) made the call -- skip the
             # anchor / OOB gates. Final aggregate OOB check still
             # applies below.
+            _dbg(f"t={_dbg_frame_ts:.3f} m={int(p.marker_id)} "
+                 f"chosen={_fmt_pos(chosen_pos)} alt={_fmt_pos(alt_pos)} "
+                 f"yaw_ch={_fmt_yaw(_dbg_chosen_yaw)} "
+                 f"yaw_alt={_fmt_yaw(_dbg_alt_yaw)} "
+                 f"mag_exp={_fmt_yaw(expected_arena_yaw)} "
+                 f"d_ch={_fmt_yaw(_dbg_d_chosen)} "
+                 f"d_alt={_fmt_yaw(_dbg_d_alt)} "
+                 f"tel_h={_fmt_h(tel_height_m)} "
+                 f"use_mag={int(use_mag)} use_anch={int(use_anchor)} "
+                 f"alt_val={int(alt_validated)} "
+                 f"=> LAYER0 pos={_fmt_pos(pos_w)} method={method}")
             contributions.append((int(p.marker_id), pos_w, weight, method,
                                   alt_validated))
             continue
@@ -855,8 +940,30 @@ def estimate_position(arena: ArenaConfig,
                 pos_w = None
 
         if pos_w is not None:
+            _dbg(f"t={_dbg_frame_ts:.3f} m={int(p.marker_id)} "
+                 f"chosen={_fmt_pos(chosen_pos)} alt={_fmt_pos(alt_pos)} "
+                 f"yaw_ch={_fmt_yaw(_dbg_chosen_yaw)} "
+                 f"yaw_alt={_fmt_yaw(_dbg_alt_yaw)} "
+                 f"mag_exp={_fmt_yaw(expected_arena_yaw)} "
+                 f"d_ch={_fmt_yaw(_dbg_d_chosen)} "
+                 f"d_alt={_fmt_yaw(_dbg_d_alt)} "
+                 f"tel_h={_fmt_h(tel_height_m)} "
+                 f"use_mag={int(use_mag)} use_anch={int(use_anchor)} "
+                 f"alt_val={int(alt_validated)} "
+                 f"=> ANCH/COLD pos={_fmt_pos(pos_w)} method={method}")
             contributions.append((int(p.marker_id), pos_w, weight, method,
                                   alt_validated))
+        else:
+            _dbg(f"t={_dbg_frame_ts:.3f} m={int(p.marker_id)} "
+                 f"chosen={_fmt_pos(chosen_pos)} alt={_fmt_pos(alt_pos)} "
+                 f"yaw_ch={_fmt_yaw(_dbg_chosen_yaw)} "
+                 f"yaw_alt={_fmt_yaw(_dbg_alt_yaw)} "
+                 f"mag_exp={_fmt_yaw(expected_arena_yaw)} "
+                 f"d_ch={_fmt_yaw(_dbg_d_chosen)} "
+                 f"d_alt={_fmt_yaw(_dbg_d_alt)} "
+                 f"tel_h={_fmt_h(tel_height_m)} "
+                 f"use_mag={int(use_mag)} use_anch={int(use_anchor)} "
+                 f"=> DROPPED (both OOB / too far / no pick)")
 
     # Cold-start single-marker reject (primary observations only).
     # Historical votes count as additional support AFTER this gate so a
