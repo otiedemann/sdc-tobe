@@ -274,10 +274,12 @@ ATTACK_STANDOFF_M: float = 1.5
 # and not fussy (operator: "1.5 m with 20 cm deadband"). Still a capture (the
 # approach climbs to the marker's height).
 ATTACK_DIST_TOL_M: float = 0.20
-# How far to fly forward after rising, to end up over the box: the marker was
-# ATTACK_STANDOFF_M ahead, minus 10 cm so we stop just shy of the far edge and
-# sit over the box centre. At a 1.5 m standoff this is 1.4 m (operator).
-OVER_BOX_FORWARD_M: float = ATTACK_STANDOFF_M - 0.10
+# How far to fly forward after rising, to end up over the box. Operator's
+# proven manual script slides the FULL standoff (FB_UD_IMU 1.50 0.50 after
+# APPROACH .. 1.50) so the drone ends right at the marker plane / over the box
+# centre — 1.4 m (standoff - 0.1) stopped just short and the upper half of the
+# 0.2 m arrival band missed the box. So forward = the full standoff (1.5 m).
+OVER_BOX_FORWARD_M: float = ATTACK_STANDOFF_M
 # How far to RISE while sliding forward over the box. FB_UD_IMU does the climb
 # and the forward slide in ONE combined moveBy (rises WHILE advancing), so the
 # drone is already above the 0.73 m box top by the time it's over the centre —
@@ -424,33 +426,61 @@ def _full_attack_script(
         # script still ends cleanly in place rather than mid-capture.
         home_line = f"HOOVER {HOME_REARM_HOVER_S:.1f}"
 
-    return _format_script(
-        "TAKEOFF",
-        # Climb to this attacker's DISTINCT, above-the-scout cruise altitude
-        # before transiting — so it never crashes into the centre scout.
+    return _format_script("TAKEOFF",
+                          *_attack_leg(attack_marker_id, cruise_line, home_line))
+
+
+def _attack_leg(marker_id: int, cruise_line: str, home_line: str) -> list[str]:
+    """The lines for ONE capture-and-return leg (no TAKEOFF). Reused by the
+    single attack AND the chained test loop, so the geometry is identical:
+    cruise high -> APPROACH the face -> slide up+over to flip -> turn -> cruise
+    high -> GO_HOME onto the home wall. After GO_HOME the drone is back inside
+    home (the box point scores); the NEXT leg's APPROACH rotates to re-find the
+    enemy face, so legs chain with NO landing in between."""
+    return [
+        # Climb to the distinct, above-the-scout cruise altitude before transiting.
         cruise_line,
-        # The operator orients the drone facing the enemy before take-off, and
-        # APPROACH re-acquires the box marker by rotating if it isn't already in
-        # view — so no explicit heading step is needed (the FC has no
-        # absolute-heading verb anyway, only the relative YAW_IMU).
-        # 1) VISION-HOME on the box's face marker and stop ~1.5 m short of it,
-        #    settling within ±20 cm (fast, not fussy; still climbs to the marker).
-        f"APPROACH {int(attack_marker_id)} {ATTACK_STANDOFF_M:.2f} "
-        f"{ATTACK_DIST_TOL_M:.2f}",
-        # 2) ONE combined move: slide forward over the box centre (marker was
-        #    ~1.5 m ahead, minus 10 cm = 1.4 m) WHILE rising into the RFID band —
-        #    rises as it advances, so it clears the 0.73 m box top without a
-        #    separate HEIGHT step and flips the box to our colour.
+        # 1) VISION-HOME on the box face, stop ~1.5 m short (±20 cm band).
+        f"APPROACH {int(marker_id)} {ATTACK_STANDOFF_M:.2f} {ATTACK_DIST_TOL_M:.2f}",
+        # 2) ONE combined move: slide the full standoff forward over the box
+        #    centre WHILE rising into the RFID band — flips the box to our colour.
         f"FB_UD_IMU {OVER_BOX_FORWARD_M:.2f} {CAPTURE_RISE_M:.2f}",
         # 3) Turn to face home for the return leg.
         "YAW_IMU 180",
-        # 3b) Re-climb to the distinct cruise altitude for the RTH transit (the
-        #     capture left us low over the box) — above the scout again.
+        # 3b) Re-climb to the cruise altitude (the capture left us low over the box).
         cruise_line,
-        # 4) Vision-home onto the home back-wall marker; settle shallow inside
-        #    home. The script ends here -> FC safety-lands in the home zone.
+        # 4) Vision-home onto the home back-wall marker; settle inside home (scores).
         home_line,
-    )
+    ]
+
+
+def _test_loop_script(ctx: RoleContext, markers: "list[int]", repeat: int) -> str:
+    """TESTING MODE: keep attacking a fixed set of marker IDs in a loop.
+
+    Chains ``repeat`` passes over ``markers`` into ONE script: TAKEOFF, then for
+    each marker a full capture-and-return leg. So the drone captures a box,
+    returns home (the point scores), turns and attacks the next — never landing
+    between attacks. Many passes per push means it loops for a long time before
+    the script ends; the attacker re-pushes when the FC next goes idle, so it
+    keeps going. Operator-defined markers, so it works on any boxes."""
+    rth_hdg = (ctx.rth_approach_angle_deg
+               if ctx.rth_approach_angle_deg is not None else 0.0)
+    cruise_alt = max(ABOVE_SCOUT_ALT_M,
+                     float(ctx.cruise_alt_m or ctx.drone.attack_alt_m
+                           or ABOVE_SCOUT_ALT_M))
+    cruise_line = f"HEIGHT {cruise_alt:.2f}"
+    wall_entry = HOME_WALL_MARKER.get(ctx.our_team)
+    if wall_entry:
+        wall_marker_id, _w_xy = wall_entry
+        home_line = (f"GO_HOME {wall_marker_id} {RTH_WALL_STANDOFF_M:.2f} "
+                     f"0.5 {rth_hdg:g}")
+    else:
+        home_line = f"HOOVER {HOME_REARM_HOVER_S:.1f}"
+    lines = ["TAKEOFF"]
+    for _ in range(max(1, int(repeat))):
+        for mid in markers:
+            lines.extend(_attack_leg(int(mid), cruise_line, home_line))
+    return _format_script(*lines)
 
 
 def _auto_attack_script(
@@ -657,6 +687,29 @@ class AttackerRole(Role):
             return noop("attacker: no team assigned")
         if not ctx.state.drone_connected:
             return noop("attacker: drone not connected")
+
+        # ---- TESTING MODE: loop-attack a fixed set of marker IDs. Highest
+        # priority — when the operator turns it on, every attacker ignores the
+        # planner and just keeps capturing test_markers, returning home (the
+        # point scores) and going again, never landing between attacks. The
+        # script chains test_repeat passes, so it loops a long time per push; we
+        # re-push the moment the FC goes idle (its last pass ended), so it never
+        # stops. No in_home gate — a test launches from wherever the drone sits.
+        test_markers = [int(m) for m in getattr(ctx.match, "test_markers", ())]
+        if getattr(ctx.match, "test_mode", False) and test_markers:
+            if rs.phase == "test_loop" and ctx.state.phase not in (
+                    "init", "done", ""):
+                return noop(
+                    f"attacker: test-loop attacking {test_markers} "
+                    f"(fc phase={ctx.state.phase})")
+            rs.last_attack_marker_id = test_markers[0]
+            return push(
+                _test_loop_script(ctx, test_markers,
+                                  int(getattr(ctx.match, "test_repeat", 6))),
+                new_phase="test_loop",
+                reason=f"attacker: TEST loop {test_markers} "
+                       f"x{int(getattr(ctx.match, 'test_repeat', 6))}",
+            )
 
         # ---- MANUAL TARGET MARKER (testing): the operator pinned an explicit
         # marker id to attack. Fly the standard attack script STRAIGHT at that

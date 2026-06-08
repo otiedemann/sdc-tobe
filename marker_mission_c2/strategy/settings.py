@@ -174,6 +174,16 @@ class MatchSettings:
     # The scout APPROACHes whichever it can see. Editable per hall: if a venue
     # uses different centre markers, set them here without a code change.
     scout_center_markers: tuple[int, ...] = (11, 15)
+    # TESTING MODE: when on, every ATTACKER ignores the planner and instead loops
+    # over ``test_markers`` — capture each, return home (scores), turn, repeat —
+    # never landing between attacks. For bench/sim tuning of the capture run.
+    test_mode: bool = False
+    # The marker IDs the testing loop attacks, in order (operator-defined; any
+    # boxes). Typically 3.
+    test_markers: tuple[int, ...] = ()
+    # How many passes over test_markers are chained into one pushed script (more
+    # = longer continuous loop before the FC goes idle and the attacker re-pushes).
+    test_repeat: int = 6
 
 
 @dataclass(frozen=True)
@@ -379,6 +389,9 @@ def _settings_to_dict(s: StrategySettings) -> Dict[str, Any]:
             "scout_drive_duration_s": float(s.match.scout_drive_duration_s),
             "scout_center": bool(s.match.scout_center),
             "scout_center_markers": list(s.match.scout_center_markers),
+            "test_mode": bool(s.match.test_mode),
+            "test_markers": list(s.match.test_markers),
+            "test_repeat": int(s.match.test_repeat),
         },
         "markers": {
             "our_team": s.markers.our_team,
@@ -421,6 +434,11 @@ def _settings_from_dict(raw: Any, *, known_fc_names: Iterable[str]) -> StrategyS
         scout_center_markers=_coerce_marker_ids(
             m_raw.get("scout_center_markers"), m_defaults.scout_center_markers
         ),
+        test_mode=bool(m_raw.get("test_mode", m_defaults.test_mode)),
+        test_markers=_coerce_marker_ids(
+            m_raw.get("test_markers"), m_defaults.test_markers
+        ),
+        test_repeat=max(1, int(m_raw.get("test_repeat", m_defaults.test_repeat))),
     )
 
     markers_raw = raw.get("markers") or {}
@@ -617,6 +635,16 @@ class SettingsStore:
             if "scout_center_markers" in changes:
                 allowed["scout_center_markers"] = _coerce_marker_ids(
                     changes["scout_center_markers"], m.scout_center_markers)
+            if "test_mode" in changes:
+                allowed["test_mode"] = bool(changes["test_mode"])
+            if "test_markers" in changes:
+                allowed["test_markers"] = _coerce_marker_ids(
+                    changes["test_markers"], m.test_markers)
+            if "test_repeat" in changes:
+                try:
+                    allowed["test_repeat"] = max(1, int(changes["test_repeat"]))
+                except (TypeError, ValueError):
+                    pass
             patched = replace(m, **allowed)
             self._settings = replace(self._settings, match=patched)
             self._write_atomic(_settings_to_dict(self._settings))

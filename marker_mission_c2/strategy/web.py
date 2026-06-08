@@ -622,6 +622,12 @@ _INDEX_HTML = r"""<!doctype html>
   <span class="small">arena:</span>
   <select id="arena-sel" title="Switch the WHOLE stack (sim + both strategies) between the Competition and GVZ testing arena — live, no restart"></select>
   <span class="spacer"></span>
+  <label class="small" title="TESTING: every attacker loops these marker IDs — capture each, return home (scores), turn, repeat — never landing between attacks.">
+    <input type="checkbox" id="test-mode-chk"> Test loop
+  </label>
+  <input type="text" id="test-markers-inp" placeholder="31,32,33" style="width:6.5em"
+         title="Comma-separated marker IDs the test loop attacks, in order.">
+  <span class="spacer"></span>
   <button id="mode-btn" class="warn" title="Toggle MANUAL / AUTO">Go AUTO</button>
   <button id="arm-btn" class="primary">Arm</button>
   <button id="disarm-btn">Disarm</button>
@@ -1079,7 +1085,30 @@ function renderHeader(state) {
   if (document.activeElement !== teamSel) {
     teamSel.value = state.settings.markers.our_team || "red";
   }
+  // Test-loop control: reflect current match settings unless the operator is
+  // editing the field/checkbox right now.
+  const match = (state.settings && state.settings.match) || {};
+  const tChk = document.getElementById("test-mode-chk");
+  const tInp = document.getElementById("test-markers-inp");
+  if (tChk && document.activeElement !== tChk) tChk.checked = !!match.test_mode;
+  if (tInp && document.activeElement !== tInp) {
+    tInp.value = (match.test_markers || []).join(",");
+  }
 }
+
+async function applyTestMode() {
+  const tChk = document.getElementById("test-mode-chk");
+  const tInp = document.getElementById("test-markers-inp");
+  const body = { test_mode: !!tChk.checked, test_markers: (tInp.value || "").trim() };
+  if (body.test_mode && !body.test_markers) {
+    alert("Enter the marker IDs to test-attack (e.g. 31,32,33) first.");
+    tChk.checked = false; return;
+  }
+  await api("/api/settings/match", {method:"POST", body: JSON.stringify(body)});
+  refresh();
+}
+document.getElementById("test-mode-chk").addEventListener("change", applyTestMode);
+document.getElementById("test-markers-inp").addEventListener("change", applyTestMode);
 
 let last = null;
 // Suppress the full re-render of the drones panel while the user is
