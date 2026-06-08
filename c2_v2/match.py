@@ -53,6 +53,11 @@ class MatchState:
         # Commanding is DISARMED until the operator explicitly arms. The runner
         # observes always but never pushes a script while disarmed.
         self.armed = False
+        # AUTO: the coordinator assigns roles from the game state. MANUAL: the
+        # operator assigns roles. Persisted.
+        self.auto = bool(persisted.get("auto", False))
+        # Latest coordinator strategy line (for the UI).
+        self.coord_summary = ""
         # Per-drone config: {fc_name: {"role", "enabled", "lane"}}. ``lane`` is a
         # stable 0-based index used for altitude deconfliction + RTH fan-out.
         self.drones: dict[str, dict] = {}
@@ -115,6 +120,15 @@ class MatchState:
             self.armed = bool(armed)
             self._save()
 
+    def set_auto(self, auto: bool) -> None:
+        with self._lock:
+            self.auto = bool(auto)
+            self._save()
+
+    def holders(self) -> dict:
+        """{slot -> effective (decayed) holder} for the coordinator."""
+        return {s: self.tracker.effective_holder(s) for s in range(1, 7)}
+
     def drone_cfg(self, fc_name: str) -> dict:
         with self._lock:
             return dict(self.drones.get(fc_name) or {})
@@ -143,6 +157,8 @@ class MatchState:
             "arena": arena_state.active_name(),
             "arena_options": arena_state.arena_labels(),
             "armed": self.armed,
+            "auto": self.auto,
+            "coord_summary": self.coord_summary,
             "drones": {k: dict(v) for k, v in self.drones.items()},
             "boxes": boxes,
             "boxes_ours": ours,
@@ -167,6 +183,7 @@ class MatchState:
             self._path.write_text(json.dumps({
                 "our_team": self.our_team,
                 "arena": arena_state.active_name(),
+                "auto": self.auto,
                 # NOTE: armed is deliberately NOT persisted — every restart comes
                 # up DISARMED for safety.
                 "drones": {k: {"role": v["role"], "enabled": v["enabled"]}

@@ -19,6 +19,7 @@ from typing import Any, Dict, List, Optional
 from marker_mission_c2.strategy import arena_state
 
 from . import scripts as S
+from .coordinator import Coordinator, DroneView
 
 logger = logging.getLogger("c2_v2.runner")
 
@@ -26,6 +27,12 @@ TICK_S = 1.0
 # After a push, treat the drone as "launching" for this long so we don't spam a
 # second start while the FC transitions idle -> running.
 PUSH_GRACE_S = 6.0
+# A role change (manual or auto) re-tasks the drone (stop -> land -> relaunch).
+# Stop it at most this often so we never thrash a drone between roles.
+RETASK_COOLDOWN_S = 25.0
+# In AUTO, only adopt a new desired role once the coordinator has wanted it
+# consistently for this long — damps box-state flicker into stable roles.
+ROLE_HOLD_S = 12.0
 # FC phases that mean "idle, ready to start a new mission".
 _IDLE_PHASES = ("", "init", "done")
 
@@ -34,10 +41,14 @@ class Runner:
     def __init__(self, pool, match) -> None:
         self.pool = pool
         self.match = match
+        self.coordinator = Coordinator()
         self._running = False
         self._task: Optional[asyncio.Task] = None
-        self._last_push: Dict[str, float] = {}   # fc -> monotonic ts of last start
-        self._last_action: Dict[str, str] = {}   # fc -> human reason (for UI)
+        self._last_push: Dict[str, float] = {}    # fc -> monotonic ts of last start
+        self._launched_role: Dict[str, str] = {}  # fc -> role of the running script
+        self._last_retask: Dict[str, float] = {}  # fc -> monotonic ts of last stop
+        self._desired_role: Dict[str, tuple] = {}  # fc -> (role, since) AUTO hysteresis
+        self._last_action: Dict[str, str] = {}    # fc -> human reason (for UI)
 
     async def start(self) -> None:
         if self._running:
@@ -76,8 +87,14 @@ class Runner:
         if not self.match.armed:
             return
         worlds = self.pool.worlds
-        # Compute mover lanes (altitude) + attacker fan-out from current roles,
-        # so role changes take effect immediately.
+        now = time.monotonic()
+
+        # AUTO: let the coordinator (re)assign roles from the game state, with
+        # hold-time hysteresis so box-state flicker doesn't thrash roles.
+        if self.match.auto:
+            self._apply_coordinator(worlds, now)
+
+        # Mover altitude lanes + attacker fan-out, recomputed from current roles.
         movers = sorted(
             fc for fc, c in self.match.drones.items()
             if c.get("enabled") and c.get("role") in ("attacker", "defender"))
@@ -88,19 +105,39 @@ class Runner:
         fan = _fan_out_angles(len(attackers))
         atk_hdg = {fc: fan[i] for i, fc in enumerate(attackers)}
 
-        now = time.monotonic()
         for fc, cfg in self.match.drones.items():
-            if not cfg.get("enabled"):
-                continue
-            role = cfg.get("role", "idle")
-            if role == "idle":
-                continue
             w = worlds.get(fc)
             if w is None or not w.connected:
                 continue
-            # Only START from idle, and not within the post-push grace window.
-            if w.phase not in _IDLE_PHASES:
+            role = cfg.get("role", "idle")
+            enabled = bool(cfg.get("enabled"))
+            flying = w.phase not in _IDLE_PHASES
+            launched = self._launched_role.get(fc)
+
+            # A) Should NOT be flying (disabled or idle role) but is -> land it.
+            if flying and (not enabled or role == "idle"):
+                if now - self._last_retask.get(fc, -1e9) >= RETASK_COOLDOWN_S:
+                    await self.pool.stop(fc)
+                    self._last_retask[fc] = now
+                    self._launched_role.pop(fc, None)
+                    self._last_action[fc] = "stand down (land)"
                 continue
+
+            if not enabled or role == "idle":
+                continue
+
+            # B) Flying the WRONG role (a role change, manual or auto) -> re-task:
+            #    stop (lands), then a later idle tick relaunches the new role.
+            if flying:
+                if launched is not None and launched != role:
+                    if now - self._last_retask.get(fc, -1e9) >= RETASK_COOLDOWN_S:
+                        await self.pool.stop(fc)
+                        self._last_retask[fc] = now
+                        self._launched_role.pop(fc, None)
+                        self._last_action[fc] = f"re-task -> {role}"
+                continue
+
+            # C) Idle -> launch the current role's never-land script.
             if now - self._last_push.get(fc, -1e9) < PUSH_GRACE_S:
                 continue
             script = self._build_role_script(fc, role, w,
@@ -110,10 +147,39 @@ class Runner:
                 continue
             ok, payload = await self.pool.push_and_start(fc, script)
             self._last_push[fc] = now
+            if ok:
+                self._launched_role[fc] = role
             self._last_action[fc] = (
                 f"launch {role}" if ok else f"launch {role} FAILED: {payload}")
             logger.info("c2_v2: %s -> launch %s (%s)", fc, role,
                         "ok" if ok else f"FAIL {payload}")
+
+    def _apply_coordinator(self, worlds, now: float) -> None:
+        """Run the coordinator and adopt its role plan with per-drone hold-time
+        hysteresis (so a momentary box-state flip doesn't re-task a drone)."""
+        views = {
+            fc: DroneView(
+                fc=fc,
+                connected=bool(worlds.get(fc) and worlds[fc].connected),
+                enabled=bool(cfg.get("enabled")),
+                current_role=cfg.get("role", "idle"))
+            for fc, cfg in self.match.drones.items()
+        }
+        plan = self.coordinator.plan(self.match.our_team,
+                                     self.match.holders(), views)
+        self.match.coord_summary = plan.summary
+        for fc, want in plan.roles.items():
+            cur = self.match.drones.get(fc, {}).get("role")
+            if want == cur:
+                self._desired_role.pop(fc, None)
+                continue
+            prev = self._desired_role.get(fc)
+            if prev is None or prev[0] != want:
+                self._desired_role[fc] = (want, now)      # start the hold timer
+                continue
+            if now - prev[1] >= ROLE_HOLD_S:              # held long enough
+                self.match.set_role(fc, want)
+                self._desired_role.pop(fc, None)
 
     # ------------------------------------------------------------------ scripts
     def _build_role_script(self, fc: str, role: str, world,

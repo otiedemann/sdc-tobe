@@ -54,6 +54,14 @@ def build_app(pool: FCPool, match: Any = None, runner: Any = None,
         match.set_armed(bool(body.get("armed", False)))
         return _no_cache(jsonify({"ok": True, "armed": match.armed}))
 
+    @app.route("/api/auto", methods=["POST"])
+    def api_auto():
+        body = request.get_json(silent=True) or {}
+        if match is None:
+            return _no_cache(jsonify({"ok": False})), 400
+        match.set_auto(bool(body.get("auto", False)))
+        return _no_cache(jsonify({"ok": True, "auto": match.auto}))
+
     @app.route("/api/emergency-land", methods=["POST"])
     def api_emergency_land():
         # Land everyone NOW + disarm. Tolerate a missing runner/loop.
@@ -168,9 +176,11 @@ _PAGE = r"""<!doctype html>
   <select id="team-sel"><option value="red">red</option><option value="blue">blue</option></select>
   <span class="small">arena</span>
   <select id="arena-sel"></select>
+  <button id="auto-btn" title="AUTO: the coordinator assigns roles from the game state. MANUAL: you assign roles.">Go AUTO</button>
   <button id="arm-btn">Arm</button>
   <button id="land-btn" class="danger">EMERGENCY LAND</button>
   <span class="pill" id="armed-pill">disarmed</span>
+  <span class="pill" id="mode-pill">MANUAL</span>
   <span class="spacer"></span>
   <span class="pill" id="conn-pill">– / – connected</span>
   <span class="pill" id="boxes-pill">boxes –</span>
@@ -183,7 +193,7 @@ _PAGE = r"""<!doctype html>
     <canvas id="map" width="520" height="280"></canvas>
   </section>
   <section>
-    <h2>Drones</h2>
+    <h2>Drones <span class="small" id="coord-line"></span></h2>
     <div class="drones" id="drones"></div>
   </section>
   <section class="wide">
@@ -239,6 +249,14 @@ function renderHeader(s){
   const ab = document.getElementById("arm-btn");
   ab.textContent = armed? "Disarm" : "Arm";
   ab.className = armed? "armed":"";
+  // auto/manual mode
+  autoNow = !!m.auto;
+  const mp = document.getElementById("mode-pill");
+  mp.textContent = autoNow? "AUTO" : "MANUAL";
+  mp.className = "pill " + (autoNow? "armed":"");
+  document.getElementById("auto-btn").textContent = autoNow? "Go MANUAL" : "Go AUTO";
+  document.getElementById("coord-line").textContent =
+    autoNow? ("· " + (m.coord_summary||"…")) : "";
 }
 function roleOpts(cur){
   return ["idle","scout","attacker","defender"].map(r=>
@@ -247,6 +265,7 @@ function roleOpts(cur){
 function renderDrones(s){
   const root = document.getElementById("drones"); root.innerHTML = "";
   const cfgs = (s.match&&s.match.drones)||{}; const acts=s.actions||{};
+  const auto = !!(s.match&&s.match.auto);
   for(const d of s.drones){
     const el = document.createElement("div");
     const cfg = cfgs[d.name]||{};
@@ -256,7 +275,7 @@ function renderDrones(s){
     el.innerHTML = `
       <div class="name">${d.name}<span><span class="dot ${d.connected?'ok':'bad'}"></span></span></div>
       <div style="display:flex;gap:6px;align-items:center;margin-top:4px">
-        <select data-role="${d.name}">${roleOpts(cfg.role||'idle')}</select>
+        <select data-role="${d.name}" ${auto?'disabled title="AUTO assigns roles"':''}>${roleOpts(cfg.role||'idle')}</select>
         <label class="small"><input type="checkbox" data-enabled="${d.name}" ${cfg.enabled!==false?'checked':''}> on</label>
       </div>
       <div class="kv">
@@ -335,10 +354,13 @@ document.getElementById("team-sel").addEventListener("change", async (e)=>{
 document.getElementById("arena-sel").addEventListener("change", async (e)=>{
   await api("/api/arena", {name: e.target.value}); tick();
 });
-let armedNow = false;
+let armedNow = false, autoNow = false;
 document.getElementById("arm-btn").addEventListener("click", async ()=>{
   if(!armedNow && !confirm("ARM the swarm? Enabled drones will launch their role and fly.")) return;
   await api("/api/arm", {armed: !armedNow}); tick();
+});
+document.getElementById("auto-btn").addEventListener("click", async ()=>{
+  await api("/api/auto", {auto: !autoNow}); tick();
 });
 async function emergencyLand(){
   // Fire immediately — land must always win, no confirm.
