@@ -245,13 +245,17 @@ class MissionConfig:
     # (drone refuses to descend below min_height even if the marker is
     # mounted on the floor).
     default_height_m: float = 1.5          # TUNE  climb-to height after takeoff
-    min_height_m: float = 1.0              # TUNE  ud >= 0 below this. 1.0 m keeps
-                                            # the drone in the 1-2 m RFID capture
-                                            # band and able to see the 2 m wall
-                                            # markers — the LOW box faces (~0.4 m)
-                                            # would otherwise drag a vision height-
-                                            # align down to the floor (too low to
-                                            # capture / lost the home marker).
+    min_height_m: float = 0.85             # TUNE  ud >= 0 below this. Operator:
+                                            # "do not fly below 73 cm" (the box
+                                            # height). The floor is altimeter-
+                                            # based and the altimeter is only ~0.1
+                                            # m accurate (a 1.0 m command settled
+                                            # at 1.12 m in a replay), so 0.85 m =
+                                            # 0.73 m box top + ~0.12 m margin keeps
+                                            # the TRUE height at/above the box even
+                                            # when the altimeter over-reads. The
+                                            # drone rises ABOVE this for the capture
+                                            # (FB_UD_IMU) and the RTH cruise.
     max_height_m: float = 2.0              # TUNE  ud <= 0 above this
     height_kp: float = 30.0                # TUNE  RC counts per m of height error
     height_kd: float = 10.0                # TUNE  RC counts per (m/s)

@@ -2800,15 +2800,29 @@ class OlympeBackend(DroneBackend):
         if d is None:
             return False, "not_ready"
         dx, dy, dz = x / 100.0, y / 100.0, -z / 100.0
-        dist = math.sqrt(dx**2 + dy**2 + dz**2)
         self._stop_piloting()
         time.sleep(0.1)
-        with command_lock:
-            result = d(moveBy(dx, dy, dz, 0)).wait(_timeout=30)
+        # CRITICAL: a moveBy is REJECTED by the firmware unless the drone is in
+        # the 'hovering' state. FB_UD_IMU runs right after an APPROACH, where the
+        # drone is still 'flying' (residual forward velocity from the closing
+        # PD), so issuing the moveBy immediately gets it silently dropped — the
+        # drone then never rises over the box and stays too low (losing the home
+        # marker). Wait for 'hovering' first (same guard the YAW moveBy uses),
+        # and retry once if the first attempt is still rejected mid-transition.
+        last = "go_failed"
+        for attempt in range(2):
+            self._wait_hovering(timeout=4.0)
+            with command_lock:
+                result = d(moveBy(dx, dy, dz, 0)).wait(_timeout=30)
+            if result is not None and result.success():
+                self._start_piloting()
+                return True, "ok"
+            last = f"go_rejected(attempt {attempt + 1})"
+            print(f"[ANAFI] go_xyz moveBy rejected (attempt {attempt + 1}); "
+                  f"re-waiting for hovering")
+            time.sleep(0.3)
         self._start_piloting()
-        if result and result.success():
-            return True, "ok"
-        return False, "go_failed"
+        return False, last
 
     # --- RC ---
     def send_rc(self, lr: int, fb: int, ud: int, yaw: int):
