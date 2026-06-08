@@ -306,6 +306,11 @@ class PoseSmoother:
 # ---------------------------------------------------------------------------
 RC_BRAKE_SPEED_THRESHOLD_CMS: float = 8.0
 RC_BRAKE_MAX_SETTLE_S: float = 1.5
+# Hard cap on the mid-approach height-align pause. If it can't settle within
+# this (e.g. the marker is mounted below the safe min-altitude floor and the
+# camera keeps asking to descend, which can never be satisfied), force-release
+# into the final approach so the drone never hovers metres short of the target.
+MID_HA_MAX_S: float = 5.0
 
 # FB_BRAKE world-position fallback parameters. When vision can't see
 # the target marker (yaw drift, occlusion, marker outside FOV), the
@@ -938,6 +943,7 @@ class MissionController:
         self._approach_lat_unlocked: bool = False
         self._approach_mid_ha_active: bool = False
         self._approach_mid_ha_settled_at: Optional[float] = None
+        self._approach_mid_ha_started_at: Optional[float] = None
 
     def apply_config_changes(self) -> None:
         """Re-sync per-instance state that was copied out of cfg at
@@ -1032,6 +1038,7 @@ class MissionController:
         self._approach_lat_unlocked: bool = False
         self._approach_mid_ha_active: bool = False
         self._approach_mid_ha_settled_at: Optional[float] = None
+        self._approach_mid_ha_started_at: Optional[float] = None
         self.state.reset(self.cfg)
 
     def set_script(self, steps: List[Step]) -> None:
@@ -1120,6 +1127,7 @@ class MissionController:
             self._approach_lat_unlocked = False
             self._approach_mid_ha_active = False
             self._approach_mid_ha_settled_at = None
+            self._approach_mid_ha_started_at = None
         if phase == Phase.GOTO:
             self._goto_last_wp = None
             self._goto_jump_until = 0.0
@@ -1975,6 +1983,25 @@ class MissionController:
             except Exception:
                 marker_y = 0.0
             e_h = -marker_y
+            # Safety floor / ceiling (SAME guard as the HEIGHT_ALIGN phase): if
+            # the altimeter says we are already at/below min_height (or at/above
+            # max_height) and the marker is below/above us, clamp e_h to 0. This
+            # (a) stops descent below the safe floor toward a marker mounted
+            # LOWER than min_height (the low box faces), and crucially (b) lets
+            # the mid-HA height-settle COMPLETE (h_in_band) instead of freezing
+            # forever chasing an unreachable below-floor marker -- the exact bug
+            # behind the "hover 5 m short of the target" stall.
+            try:
+                _h_cm = (float(tel.raw.get("height_cm"))
+                         if tel and tel.raw.get("height_cm") is not None
+                         else None)
+            except (TypeError, ValueError):
+                _h_cm = None
+            _drone_h = _h_cm / 100.0 if _h_cm is not None else None
+            if _drone_h is not None and _drone_h <= cfg.min_height_m and e_h < 0:
+                e_h = 0.0
+            if _drone_h is not None and _drone_h >= cfg.max_height_m and e_h > 0:
+                e_h = 0.0
             if abs(e_h) >= cfg.height_deadband_m:
                 u_ud = self.pd_height.step(e_h, now)
 
@@ -1982,6 +2009,7 @@ class MissionController:
             self._approach_lat_unlocked = True
             self._approach_mid_ha_active = True
             self._approach_mid_ha_settled_at = None
+            self._approach_mid_ha_started_at = now
             print(f"[ctrl] APPROACH latch: mid height-align starting "
                   f"d={d:.2f}m e_h={e_h:.2f}m tgt={tgt_d:.2f}m")
 
@@ -2014,6 +2042,19 @@ class MissionController:
                     print("[ctrl] APPROACH mid height-align done — final approach")
             else:
                 self._approach_mid_ha_settled_at = None
+            # Hard timeout safety net: NEVER let the mid-HA pause stall the whole
+            # approach. If it hasn't settled within MID_HA_MAX_S (e.g. the marker
+            # is unreachable below the floor, or height telemetry is noisy),
+            # force-release into the final approach so the drone keeps closing
+            # instead of hovering metres short of the target forever.
+            started = getattr(self, "_approach_mid_ha_started_at", None)
+            if (self._approach_mid_ha_active and started is not None
+                    and now - started >= MID_HA_MAX_S):
+                self._approach_mid_ha_active = False
+                self._approach_mid_ha_settled_at = None
+                print(f"[ctrl] APPROACH mid height-align TIMEOUT "
+                      f"({MID_HA_MAX_S:g}s) — forcing final approach "
+                      f"(e_h={e_h:+.2f}m)")
             with self.state.lock:
                 _spd_str = f" spd={speed:.0f}" if speed is not None else ""
                 self.state.note = (f"mid height-align e_h={e_h:+.2f}m "

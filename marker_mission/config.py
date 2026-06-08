@@ -245,7 +245,13 @@ class MissionConfig:
     # (drone refuses to descend below min_height even if the marker is
     # mounted on the floor).
     default_height_m: float = 1.5          # TUNE  climb-to height after takeoff
-    min_height_m: float = 0.5              # TUNE  ud >= 0 below this
+    min_height_m: float = 1.0              # TUNE  ud >= 0 below this. 1.0 m keeps
+                                            # the drone in the 1-2 m RFID capture
+                                            # band and able to see the 2 m wall
+                                            # markers — the LOW box faces (~0.4 m)
+                                            # would otherwise drag a vision height-
+                                            # align down to the floor (too low to
+                                            # capture / lost the home marker).
     max_height_m: float = 2.0              # TUNE  ud <= 0 above this
     height_kp: float = 30.0                # TUNE  RC counts per m of height error
     height_kd: float = 10.0                # TUNE  RC counts per (m/s)
