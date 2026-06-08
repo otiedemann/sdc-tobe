@@ -21,6 +21,7 @@ import threading
 from typing import Optional
 
 from .config import default_fcs, fcs_from_hosts
+from .match import MatchState
 from .pool import FCPool
 from .web import build_app
 
@@ -34,6 +35,10 @@ def _parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     p.add_argument("--fcs", default=None,
                    help="comma-separated FC hosts (default flightctrl1-5); "
                         "each may carry :port, default 8080")
+    p.add_argument("--team", default=None, choices=["red", "blue"],
+                   help="our team (default: persisted, else red)")
+    p.add_argument("--arena", default=None,
+                   help="active arena name (default: persisted, else registry default)")
     p.add_argument("--log-level", default="INFO")
     return p.parse_args(argv)
 
@@ -69,7 +74,8 @@ def main(argv: Optional[list[str]] = None) -> int:
     )
 
     specs = fcs_from_hosts(args.fcs.split(",")) if args.fcs else default_fcs()
-    pool = FCPool(specs)
+    match = MatchState(our_team=args.team or "red", arena_name=args.arena)
+    pool = FCPool(specs, match=match)
 
     th = _AsyncLoopThread()
     th.start()
@@ -77,7 +83,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     assert th.loop is not None
     asyncio.run_coroutine_threadsafe(pool.start(), th.loop).result(5.0)
 
-    flask_app = build_app(pool)
+    flask_app = build_app(pool, match=match)
 
     def _shutdown(signum, frame):  # noqa: ARG001
         logger.info("c2_v2: shutting down (signal %s)", signum)
@@ -91,8 +97,9 @@ def main(argv: Optional[list[str]] = None) -> int:
     signal.signal(signal.SIGTERM, _shutdown)
     signal.signal(signal.SIGINT, _shutdown)
 
-    logger.info("c2_v2: dashboard on http://%s:%d  (FCs: %s)",
-                args.host, args.port, ", ".join(s.name for s in specs))
+    logger.info("c2_v2: team=%s  dashboard on http://%s:%d  (FCs: %s)",
+                match.our_team, args.host, args.port,
+                ", ".join(s.name for s in specs))
     flask_app.run(host=args.host, port=args.port,
                   threaded=True, use_reloader=False, debug=False)
     return 0
