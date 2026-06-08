@@ -67,43 +67,48 @@ def _fmt(lines: List[str]) -> str:
     return "\n".join(l for l in lines if l) + "\n"
 
 
-def mover_alt(lane: int) -> float:
-    """Distinct cruise altitude for mover ``lane`` (0-based), ≥30 cm apart and
+# All builders take a live ``Tunables`` (operator-editable). Defaults equal the
+# proven constants above, so passing Tunables() reproduces the validated values.
+from .tunables import Tunables   # noqa: E402  (after the constants, by design)
+
+
+def mover_alt(lane: int, t: Tunables) -> float:
+    """Distinct cruise altitude for mover ``lane`` (0-based), ≥step apart and
     above the scout, capped."""
-    return min(MAX_MOVER_ALT_M, ABOVE_SCOUT_ALT_M + MOVER_ALT_STEP_M * max(0, lane))
+    return min(MAX_MOVER_ALT_M,
+               t.mover_base_alt_m + t.mover_alt_step_m * max(0, lane))
 
 
 # ── Scout ───────────────────────────────────────────────────────────────────
-def scout_script(center_marker: int, alt_m: float = SCOUT_ALT_M,
-                 yaw_stick: int = SCOUT_YAW_STICK) -> str:
+def scout_script(center_marker: int, t: Tunables) -> str:
     """Fly to the arena centre via a side marker, then rotate in place forever.
 
     GO_HOME (loose, holds altitude) onto the centre marker -> ~arena centre at
     the set altitude; then one long RC yaw drive scans every box. Never lands."""
     return _fmt([
         "TAKEOFF",
-        f"HEIGHT {alt_m:.2f}",
+        f"HEIGHT {t.scout_alt_m:.2f}",
         f"GO_HOME {int(center_marker)} {CENTER_STANDOFF_M:.2f} {CENTER_TOL_M:g} 0",
-        f"HEIGHT {alt_m:.2f}",
-        f"RC 0 0 0 {int(yaw_stick)} {ROTATE_FOREVER_S}",
+        f"HEIGHT {t.scout_alt_m:.2f}",
+        f"RC 0 0 0 {int(t.scout_yaw_stick)} {ROTATE_FOREVER_S}",
     ])
 
 
 # ── Defender ────────────────────────────────────────────────────────────────
-def defender_script(side_marker: int, alt_m: float) -> str:
+def defender_script(side_marker: int, alt_m: float, t: Tunables) -> str:
     """Park in front of a side-wall marker near our home boxes and slow-rotate
     forever — presence blocks enemy capture; the rotation keeps it active."""
     return _fmt([
         "TAKEOFF",
         f"HEIGHT {alt_m:.2f}",
-        f"GO_HOME {int(side_marker)} {DEFENDER_SIDE_STANDOFF_M:.2f} {DEFENDER_SIDE_TOL_M:g} 0",
-        f"RC 0 0 0 {int(DEFENDER_YAW_STICK)} {ROTATE_FOREVER_S}",
+        f"GO_HOME {int(side_marker)} {t.defender_standoff_m:.2f} {DEFENDER_SIDE_TOL_M:g} 0",
+        f"RC 0 0 0 {int(t.defender_yaw_stick)} {ROTATE_FOREVER_S}",
     ])
 
 
 # ── Attacker ────────────────────────────────────────────────────────────────
 def attack_leg(face_id_: int, wall_marker: int, cruise_alt_m: float,
-               rth_hdg_deg: float) -> List[str]:
+               rth_hdg_deg: float, t: Tunables) -> List[str]:
     """One capture-and-return leg (no TAKEOFF). Cruise high -> APPROACH the box
     face -> slide up+over to flip -> turn -> cruise high -> GO_HOME our wall.
     After GO_HOME the box point scores; the next leg's APPROACH re-finds the
@@ -111,25 +116,26 @@ def attack_leg(face_id_: int, wall_marker: int, cruise_alt_m: float,
     cruise = f"HEIGHT {cruise_alt_m:.2f}"
     return [
         cruise,
-        f"APPROACH {int(face_id_)} {ATTACK_STANDOFF_M:.2f} {ATTACK_DIST_TOL_M:.2f}",
-        f"FB_UD_IMU {OVER_BOX_FORWARD_M:.2f} {CAPTURE_RISE_M:.2f}",
+        f"APPROACH {int(face_id_)} {t.attack_standoff_m:.2f} {t.attack_dist_tol_m:.2f}",
+        f"FB_UD_IMU {t.over_box_forward_m:.2f} {t.capture_rise_m:.2f}",
         "YAW_IMU 180",
         cruise,
-        f"GO_HOME {int(wall_marker)} {RTH_WALL_STANDOFF_M:.2f} {RTH_ARRIVE_TOL_M:g} {rth_hdg_deg:g}",
+        f"GO_HOME {int(wall_marker)} {t.rth_standoff_m:.2f} {RTH_ARRIVE_TOL_M:g} {rth_hdg_deg:g}",
     ]
 
 
 def attacker_loop_script(enemy_faces: List[int], wall_marker: int,
-                         cruise_alt_m: float, rth_hdg_deg: float = 0.0,
-                         passes: int = ATTACK_CHAIN_PASSES) -> str:
-    """A long chain: ``passes`` loops over ``enemy_faces``, each a full
+                         cruise_alt_m: float, rth_hdg_deg: float,
+                         t: Tunables) -> str:
+    """A long chain: ``t.attack_passes`` loops over ``enemy_faces``, each a full
     capture-and-return leg. Never ends within a match -> never lands. The enemy
     boxes flip back to enemy colour when we leave, so re-attacking them stays
     productive (continuous offense)."""
     lines: List[str] = ["TAKEOFF"]
-    for _ in range(max(1, int(passes))):
+    for _ in range(max(1, int(t.attack_passes))):
         for f in enemy_faces:
-            lines.extend(attack_leg(int(f), wall_marker, cruise_alt_m, rth_hdg_deg))
+            lines.extend(attack_leg(int(f), wall_marker, cruise_alt_m,
+                                    rth_hdg_deg, t))
     return _fmt(lines)
 
 

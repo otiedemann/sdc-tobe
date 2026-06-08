@@ -22,6 +22,8 @@ from marker_mission_c2.strategy import arena_state
 from marker_mission_c2.strategy.markers import MarkerTracker
 from marker_mission_c2.strategy.settings import ALL_SLOTS
 
+from .tunables import TUNE_SPEC, Tunables, coerce, from_dict as tunables_from_dict
+
 logger = logging.getLogger("c2_v2.match")
 
 VALID_TEAMS = ("red", "blue")
@@ -58,6 +60,8 @@ class MatchState:
         self.auto = bool(persisted.get("auto", False))
         # Latest coordinator strategy line (for the UI).
         self.coord_summary = ""
+        # Live-tunable strategy + capture parameters (operator-editable).
+        self.tunables: Tunables = tunables_from_dict(persisted.get("tunables") or {})
         # Per-drone config: {fc_name: {"role", "enabled", "lane"}}. ``lane`` is a
         # stable 0-based index used for altitude deconfliction + RTH fan-out.
         self.drones: dict[str, dict] = {}
@@ -125,6 +129,15 @@ class MatchState:
             self.auto = bool(auto)
             self._save()
 
+    def set_tunable(self, key: str, value) -> bool:
+        cv = coerce(key, value)
+        if cv is None:
+            return False
+        with self._lock:
+            setattr(self.tunables, key, cv)
+            self._save()
+        return True
+
     def holders(self) -> dict:
         """{slot -> effective (decayed) holder} for the coordinator."""
         return {s: self.tracker.effective_holder(s) for s in range(1, 7)}
@@ -159,6 +172,8 @@ class MatchState:
             "armed": self.armed,
             "auto": self.auto,
             "coord_summary": self.coord_summary,
+            "tunables": self.tunables.to_dict(),
+            "tune_spec": TUNE_SPEC,
             "drones": {k: dict(v) for k, v in self.drones.items()},
             "boxes": boxes,
             "boxes_ours": ours,
@@ -184,6 +199,7 @@ class MatchState:
                 "our_team": self.our_team,
                 "arena": arena_state.active_name(),
                 "auto": self.auto,
+                "tunables": self.tunables.to_dict(),
                 # NOTE: armed is deliberately NOT persisted — every restart comes
                 # up DISARMED for safety.
                 "drones": {k: {"role": v["role"], "enabled": v["enabled"]}

@@ -166,7 +166,8 @@ class Runner:
             for fc, cfg in self.match.drones.items()
         }
         plan = self.coordinator.plan(self.match.our_team,
-                                     self.match.holders(), views)
+                                     self.match.holders(), views,
+                                     baseline_def=self.match.tunables.baseline_defenders)
         self.match.coord_summary = plan.summary
         for fc, want in plan.roles.items():
             cur = self.match.drones.get(fc, {}).get("role")
@@ -185,13 +186,14 @@ class Runner:
     def _build_role_script(self, fc: str, role: str, world,
                            mover_lane: int, rth_hdg: float) -> Optional[str]:
         team = self.match.our_team
+        t = self.match.tunables
         if role == "scout":
             center = _pick_visible(world, S.CENTER_MARKERS) or S.CENTER_MARKERS[0]
-            return S.scout_script(center)
+            return S.scout_script(center, t)
         if role == "defender":
             sides = arena_state.side_markers(team) or S.CENTER_MARKERS
             side = _pick_visible(world, sides) or sides[0]
-            return S.defender_script(side, S.mover_alt(mover_lane))
+            return S.defender_script(side, S.mover_alt(mover_lane, t), t)
         if role == "attacker":
             wall = arena_state.home_wall_marker(team)
             if not wall:
@@ -199,7 +201,7 @@ class Runner:
             wall_id = int(wall[0])
             faces = S.enemy_home_faces(team)
             return S.attacker_loop_script(faces, wall_id,
-                                          S.mover_alt(mover_lane), rth_hdg)
+                                          S.mover_alt(mover_lane, t), rth_hdg, t)
         return None
 
 

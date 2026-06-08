@@ -89,6 +89,14 @@ def build_app(pool: FCPool, match: Any = None, runner: Any = None,
             return _no_cache(jsonify({"ok": False, "error": "bad fc"})), 400
         return _no_cache(jsonify({"ok": True}))
 
+    @app.route("/api/tune", methods=["POST"])
+    def api_tune():
+        body = request.get_json(silent=True) or {}
+        if match is None or not match.set_tunable(str(body.get("key", "")),
+                                                  body.get("value")):
+            return _no_cache(jsonify({"ok": False, "error": "bad tunable"})), 400
+        return _no_cache(jsonify({"ok": True}))
+
     @app.route("/api/team", methods=["POST"])
     def api_team():
         body = request.get_json(silent=True) or {}
@@ -187,6 +195,7 @@ _PAGE = r"""<!doctype html>
   <span class="pill" id="score-pill">score –</span>
   <span class="pill" id="special-pill" style="display:none">special</span>
 </header>
+<div id="warn-banner" style="display:none;background:var(--red);color:#fff;padding:6px 14px;font-weight:600"></div>
 <main>
   <section>
     <h2>Arena <span class="small">(top-down · live ArUco positions · box colour = current holder)</span></h2>
@@ -199,6 +208,17 @@ _PAGE = r"""<!doctype html>
   <section class="wide">
     <h2>Targets <span class="small">(6 boxes · holder from the scout's view)</span></h2>
     <div class="boxes" id="boxes"></div>
+  </section>
+  <section class="wide">
+    <details>
+      <summary style="cursor:pointer;color:var(--muted)">Tuning <span class="small">(live — takes effect on next launch)</span></summary>
+      <div class="tune" id="tune" style="display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:8px;margin-top:8px"></div>
+    </details>
+    <div class="small" style="margin-top:8px;color:var(--muted)">
+      Safety: C2 V2's 5 Hz polling is the v7 §3.3 heartbeat — the FC auto-lands
+      a drone within 2 s of losing C2 requests (REMOTE_TIMEOUT_S=2.0). '?' or
+      EMERGENCY LAND lands everyone immediately.
+    </div>
   </section>
 </main>
 <script>
@@ -213,6 +233,33 @@ async function tick(){
   try { s = await (await fetch("/api/state",{cache:"no-store"})).json(); }
   catch(e){ document.getElementById("conn-pill").textContent = "fetch failed"; return; }
   renderHeader(s); renderDrones(s); renderBoxes(s); renderMap(s);
+  renderTune(s); renderWarn(s);
+}
+function renderWarn(s){
+  const b = document.getElementById("warn-banner");
+  const m = s.match||{};
+  const lost = s.drones.filter(d => !d.connected).map(d=>d.name.replace("flightctrl","fc"));
+  if(m.armed && lost.length){
+    b.style.display="";
+    b.textContent = `⚠ LINK LOST: ${lost.join(", ")} — the FC auto-lands each ~2 s after losing C2 polling. Reconnect or EMERGENCY LAND.`;
+  } else { b.style.display="none"; }
+}
+let tuneBuilt = false;
+function renderTune(s){
+  const m = s.match||{}; const spec = m.tune_spec; const vals = m.tunables;
+  if(!spec || !vals) return;
+  const root = document.getElementById("tune");
+  if(!tuneBuilt){
+    root.innerHTML = spec.map(([key,label,lo,hi,st])=>
+      `<label class="small" style="display:flex;justify-content:space-between;gap:6px;align-items:center">
+         <span>${label}</span>
+         <input type="number" data-tune="${key}" min="${lo}" max="${hi}" step="${st}" style="width:5.5em"></label>`).join("");
+    tuneBuilt = true;
+  }
+  for(const inp of root.querySelectorAll("[data-tune]")){
+    const k = inp.getAttribute("data-tune");
+    if(document.activeElement !== inp && vals[k]!=null) inp.value = vals[k];
+  }
 }
 function renderHeader(s){
   const m = s.match||{};
@@ -375,6 +422,7 @@ document.addEventListener("change", async (e)=>{
   const t=e.target;
   if(t.matches("[data-role]")){ await api(`/api/drone/${encodeURIComponent(t.getAttribute("data-role"))}/role`, {role:t.value}); tick(); }
   if(t.matches("[data-enabled]")){ await api(`/api/drone/${encodeURIComponent(t.getAttribute("data-enabled"))}/enabled`, {enabled:t.checked}); tick(); }
+  if(t.matches("[data-tune]")){ await api("/api/tune", {key:t.getAttribute("data-tune"), value:parseFloat(t.value)}); tick(); }
 });
 tick(); setInterval(tick, 1000);
 </script>
