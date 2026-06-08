@@ -53,7 +53,7 @@ def _enemy_slots(team: str):
 
 class Coordinator:
     def plan(self, our_team: str, holders: Dict[int, str],
-             drones: Dict[str, DroneView]) -> Plan:
+             drones: Dict[str, DroneView], baseline_def: int = 1) -> Plan:
         """holders: {slot -> 'red'|'blue'|'unknown'} (effective, decayed).
         drones: {fc -> DroneView}. Returns the desired role per LIVE drone."""
         enemy = "blue" if our_team == "red" else "red"
@@ -89,9 +89,9 @@ class Coordinator:
             # enemy box; only hold back a defender for a box we've already lost.
             def_n = min(M, len(our_threatened))
         else:
-            # Cover every threatened own box, plus a baseline home presence on a
-            # larger fleet so the enemy can't walk into an undefended box.
-            baseline = 1 if M >= 3 else 0
+            # Cover every threatened own box, plus a baseline home presence
+            # (operator-tunable) so the enemy can't walk into an undefended box.
+            baseline = baseline_def if M >= 3 else 0
             def_n = min(M, len(our_threatened) + baseline)
         atk_n = M - def_n
         if atk_n <= 0:                    # always keep at least one attacker

@@ -25,8 +25,31 @@ Open `http://<host>:8100/`.
 1. **FC client + live per-drone world + read-only dashboard** ← *current*
 2. Box-state tracker + arena + 6-box status panel + team / arena toggles
 3. **Roles + the never-land mechanism + first commands** ← *current*
-4. **The coordinator — autonomous role assignment + strategy** ← *current*
-5. C2-link-loss auto-land, tuning UI, end-to-end verify
+4. The coordinator — autonomous role assignment + strategy
+5. **Tuning UI + C2-link-loss safety + verify** ← *current (rebuild complete)*
+
+## Phase 5 (this commit) — tuning + safety
+
+- `tunables.py` + `match.py` — the proven strategy/capture constants are now
+  **live-editable** (capture standoff/tol/forward/rise, RTH standoff, scout +
+  mover altitudes + step, scout/defender rotate speed, defender standoff, attack
+  chain length, baseline defenders). Clamped to safe ranges, persisted, applied
+  on the next (re)launch. `scripts.py` + the coordinator read them live.
+- dashboard — a **Tuning** panel (collapsible) + a red **LINK-LOST banner** when
+  an armed drone goes unreachable.
+- **C2-link-loss safety (v7 §3.3):** the FC's own watchdog auto-lands a drone if
+  it gets no `/api/` request for `REMOTE_TIMEOUT_S` (= **2.0 s**). C2 V2 polls
+  `/api/state` at **5 Hz**, so **our polling is the heartbeat** — if the C2 link
+  drops, the FC lands the drone within 2 s on its own. No FC change needed
+  (constraint: `marker_mission` untouched).
+
+## Safety model summary
+- **`?` key / EMERGENCY LAND** → lands every drone now + disarms.
+- **C2 link loss** → FC watchdog auto-lands (≤2 s) because polling stops.
+- **FC↔drone radio loss** → `marker_mission`'s own safety lands the drone.
+- **Disarmed** → C2 V2 observes only (drones keep flying their current script;
+  use EMERGENCY LAND to bring them down).
+- Restart always comes up **disarmed**.
 
 ## Phase 4 (this commit) — the autonomous brain (AUTO mode)
 
