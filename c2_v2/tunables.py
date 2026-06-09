@@ -37,6 +37,11 @@ class Tunables:
     defender_standoff_m: float = 2.50
     # offense persistence + strategy bias
     attack_passes: int = 30
+    # Attacker home dwell: after each capture+return the attacker HOVERS in our
+    # home zone this long (scoring, never landing) before flying its straight
+    # lane back out to strike its fixed target again — the "hover at home between
+    # strikes" cadence, which also gives the box time to flip back to enemy.
+    attacker_home_dwell_s: float = 5.0
     # Baseline home defenders (the simplified strategy: 3 attackers + 2
     # defenders). In AUTO this is the default defender count when no own box is
     # threatened; more defenders are added per threatened box.
@@ -61,6 +66,7 @@ TUNE_SPEC = [
     ("defender_yaw_stick", "Defender rotate speed", 5, 100, 5),
     ("defender_standoff_m", "Defender standoff (m)", 1.0, 5.0, 0.1),
     ("attack_passes", "Attack chain passes", 5, 100, 1),
+    ("attacker_home_dwell_s", "Attacker home dwell (s)", 0.0, 30.0, 0.5),
     ("baseline_defenders", "Baseline defenders", 0, 4, 1),
 ]
 _SPEC_BY_KEY = {k: (lo, hi, st) for k, _l, lo, hi, st in TUNE_SPEC}

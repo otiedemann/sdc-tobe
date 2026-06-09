@@ -235,14 +235,40 @@ def _our_slots(our_team: str):
     return (1, 2, 3) if our_team == "red" else (4, 5, 6)
 
 
+# How many capture+return passes one attacker loops. Each pass is a full
+# out-and-back, so far more than a match can fly -> the script never ends -> the
+# drone never lands. Generous so even fast (short) legs outlast a match.
+ATTACK_LANE_PASSES = 90
+
+
 def attacker_lane_script(enemy_face: int, wall_marker: int, cruise_alt_m: float,
                          rth_hdg_deg: float, t: Tunables) -> str:
-    """FIXED-LANE attacker: a never-land loop on ONE enemy box. Fly the straight
-    lane home<->box, capturing it whenever the enemy face is up and holding it by
-    presence; the loop re-attacks the instant the enemy flips it back. Distinct
-    boxes give the 3 attackers spatially-separated lanes."""
-    return attacker_loop_script([int(enemy_face)], wall_marker, cruise_alt_m,
-                                rth_hdg_deg, t)
+    """FIXED-TARGET attacker — a SELF-CONTAINED never-land loop on ONE enemy box.
+    No C2 splice / box-state / FC mission-state needed: the mission itself shuttles
+    the straight lane home<->box. Each pass: fly out and APPROACH the box face,
+    slide up+over to flip it, turn, GO_HOME the back-wall marker to score, then
+    HOVER in our home zone for ``attacker_home_dwell_s`` before striking again.
+    Distinct face per attacker => distinct boxes => collision-safe straight lanes.
+    Loops ATTACK_LANE_PASSES times (>> a match) so it never lands.
+
+    When the box is already ours (just captured, shows OUR face) the APPROACH
+    waits/searches for the enemy face to reappear; the home dwell gives the enemy
+    time to recapture so the next pass usually finds the enemy face up."""
+    cruise = f"HEIGHT {cruise_alt_m:.2f}"
+    dwell = max(1, int(round(t.attacker_home_dwell_s)))
+    leg = [
+        cruise,
+        f"APPROACH {int(enemy_face)} {t.attack_standoff_m:.2f} {t.attack_dist_tol_m:.2f}",
+        f"FB_UD_IMU {t.over_box_forward_m:.2f} {t.capture_rise_m:.2f}",
+        "YAW_IMU 180",
+        cruise,
+        f"GO_HOME {int(wall_marker)} {t.rth_standoff_m:.2f} {RTH_ARRIVE_TOL_M:g} {rth_hdg_deg:g}",
+        f"RC 0 0 0 0 {dwell}",            # hover at home (score), then strike again
+    ]
+    lines: List[str] = ["TAKEOFF"]
+    for _ in range(ATTACK_LANE_PASSES):
+        lines.extend(leg)
+    return _fmt(lines)
 
 
 def enemy_face_for_slot(slot: int, our_team: str) -> int:
@@ -255,11 +281,10 @@ def enemy_face_for_slot(slot: int, our_team: str) -> int:
 
 def attacker_park_script(wall_marker: int, cruise_alt_m: float,
                          rth_hdg_deg: float, t: Tunables) -> str:
-    """Initial attacker mission: take off, settle in our HOME zone, and HOVER
-    forever (never lands). The runner splices one straight out-and-back capture
-    leg per strike (``attacker_attack_splice``) whenever this attacker's single
-    fixed target box is enemy-held — so each attacker just shuttles its own
-    straight lane home<->box, returning home to score between strikes."""
+    """Fallback hover for an EXTRA attacker with no free enemy box (more attackers
+    than the 3 enemy boxes): take off, settle in our HOME zone, and hover forever
+    (never lands). Attackers that DO own a box fly the self-contained
+    ``attacker_lane_script`` loop instead."""
     cruise = f"HEIGHT {cruise_alt_m:.2f}"
     return _fmt([
         "TAKEOFF",
@@ -267,26 +292,6 @@ def attacker_park_script(wall_marker: int, cruise_alt_m: float,
         f"GO_HOME {int(wall_marker)} {t.rth_standoff_m:.2f} {RTH_ARRIVE_TOL_M:g} {rth_hdg_deg:g}",
         cruise,
         *_rc_hold(0, 0, 0, 0),                # hover at home (short-RC chain), never land
-    ])
-
-
-def attacker_attack_splice(enemy_face: int, wall_marker: int, cruise_alt_m: float,
-                           rth_hdg_deg: float, t: Tunables) -> str:
-    """ONE capture-and-return leg with NO TAKEOFF, for live-splicing into an
-    attacker that is hovering at home: straight out to its target box, slide
-    up+over to flip it, turn, straight back home to score, then HOVER again.
-    Spliced only when the drone is home + the target is enemy-held, so it never
-    cuts a leg short and never lands between strikes."""
-    cruise = f"HEIGHT {cruise_alt_m:.2f}"
-    return _fmt([
-        cruise,
-        f"APPROACH {int(enemy_face)} {t.attack_standoff_m:.2f} {t.attack_dist_tol_m:.2f}",
-        f"FB_UD_IMU {t.over_box_forward_m:.2f} {t.capture_rise_m:.2f}",
-        "YAW_IMU 180",
-        cruise,
-        f"GO_HOME {int(wall_marker)} {t.rth_standoff_m:.2f} {RTH_ARRIVE_TOL_M:g} {rth_hdg_deg:g}",
-        cruise,
-        *_rc_hold(0, 0, 0, 0),                # back to hover at home (short-RC chain)
     ])
 
 
