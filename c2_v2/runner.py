@@ -131,8 +131,19 @@ class Runner:
             flying = w.phase not in _IDLE_PHASES
             launched = self._launched_role.get(fc)
 
-            # A) Should NOT be flying (disabled or idle role) but is -> land it.
-            if flying and (not enabled or role == "idle"):
+            # OFF (disabled): COMPLETELY IGNORE it — never command it, and in
+            # particular NEVER issue a LAND/stop. The operator turned it off to
+            # exclude it from the strategy, not to land it; only EMERGENCY LAND
+            # (which lands every drone) ever puts a disabled drone down. Don't
+            # touch its launched-role bookkeeping either, so re-enabling resumes
+            # cleanly without a re-task.
+            if not enabled:
+                self._last_action[fc] = "off — ignored (no land)"
+                continue
+
+            # A) Enabled but role is idle and it's flying -> stand it down (land).
+            #    (An ENABLED drone with no role lands; a disabled one never does.)
+            if flying and role == "idle":
                 if now - self._last_retask.get(fc, -1e9) >= RETASK_COOLDOWN_S:
                     await self.pool.stop_drone(fc)
                     self._last_retask[fc] = now
@@ -141,7 +152,7 @@ class Runner:
                     self._last_action[fc] = "stand down (land)"
                 continue
 
-            if not enabled or role == "idle":
+            if role == "idle":
                 continue
 
             # B) Flying the WRONG role (a role change, manual or auto) -> re-task:
