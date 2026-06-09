@@ -2526,14 +2526,41 @@ class MissionController:
             # ORDER MATTERS. The marker-lost recovery check must run BEFORE
             # the WAIT_AND_ATTACK sibling-hold gate (see gate comment below).
             # Marker-lost recovery (no TO): this APPROACH was a GO_HOME onto a
-            # visible marker to re-establish a vision anchor. On settle, go
-            # directly to SEARCH — the drone is already airborne at the right
-            # height and position (standoff), so TAKEOFF/HEIGHT are unnecessary.
+            # visible anchor marker to re-establish a vision anchor. On settle,
+            # go back to SEARCH for the real target — the drone is already
+            # airborne at the right height and position (standoff), so
+            # TAKEOFF/HEIGHT are unnecessary.
             if self._approach_on_settle_restart_mission:
                 self._approach_on_settle_restart_mission = False
-                print("[ctrl] recovery GO_HOME settled — searching for target")
-                self._set_phase(Phase.SEARCH,
-                                "recovery GO_HOME settled — searching for target")
+                # Re-arm the CURRENT mission step rather than just flipping the
+                # phase. The recovery hop left active_marker_id pointing at the
+                # ANCHOR marker (e.g. 9) and target_distance_m at the recovery
+                # standoff (~10 m). get_pose() returns ONLY active_marker_id's
+                # pose, so a bare _set_phase(SEARCH) makes _step_search's
+                # "already see a marker" shortcut instantly re-lock the anchor
+                # and dive straight back into APPROACH on it — the drone then
+                # hovers at the 10 m standoff forever instead of scanning for
+                # the box. Re-applying the step re-seeds active_marker_id = the
+                # real target, the attack distance, positioning=False and the
+                # tolerances; resetting the smoother drops the cached anchor
+                # pose so SEARCH genuinely runs the stationary 2x-zoom scan and
+                # acquires the target only when it actually rotates into view.
+                self.smoother.reset()
+                with self.state.lock:
+                    _idx = self.state.mission_step_idx
+                    _script = list(self.state.mission_script)
+                    self.state.settle_began_at = None
+                _cur = _script[_idx] if 0 <= _idx < len(_script) else None
+                if _cur is not None:
+                    print("[ctrl] recovery GO_HOME settled — re-arming "
+                          f"step[{_cur.line_no}] {_cur.kind} & searching for target")
+                    self._apply_step_to_phase(
+                        _cur, "recovery GO_HOME settled — re-search for target")
+                else:
+                    print("[ctrl] recovery GO_HOME settled — searching for target")
+                    self._set_phase(
+                        Phase.SEARCH,
+                        "recovery GO_HOME settled — searching for target")
                 return
             # WAIT_AND_ATTACK gate: when we settle while parked on the
             # SIBLING face (target face not yet exposed), DO NOT advance
