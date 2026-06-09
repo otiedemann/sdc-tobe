@@ -52,6 +52,13 @@ def build_app(pool: FCPool, match: Any = None, runner: Any = None,
         if match is None:
             return _no_cache(jsonify({"ok": False})), 400
         match.set_armed(bool(body.get("armed", False)))
+        # On ARM, kick the runner to tick NOW so the launch push doesn't wait for
+        # the next 1 Hz tick (cuts up to ~1 s off press-to-takeoff).
+        if match.armed and runner is not None:
+            try:
+                runner.request_tick()
+            except Exception:
+                pass
         return _no_cache(jsonify({"ok": True, "armed": match.armed}))
 
     @app.route("/api/auto", methods=["POST"])

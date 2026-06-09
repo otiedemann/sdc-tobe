@@ -56,12 +56,27 @@ class Runner:
         self._atk_lane: Dict[str, int] = {}        # attacker fc -> its fixed swimlane (0,1,2)
         self._defender_recapture: Dict[str, int] = {}  # defender fc -> own slot being recaptured
         self._last_action: Dict[str, str] = {}    # fc -> human reason (for UI)
+        # Wake signal: arming (or any operator action that wants an immediate
+        # launch) sets this so the loop ticks NOW instead of waiting out the 1 Hz
+        # period — cuts up to ~1 s off press-to-takeoff. Set thread-safely via
+        # request_tick() from the Flask thread.
+        self._wake = asyncio.Event()
+        self._loop_ref: Optional[asyncio.AbstractEventLoop] = None
 
     async def start(self) -> None:
         if self._running:
             return
         self._running = True
+        self._loop_ref = asyncio.get_running_loop()
         self._task = asyncio.create_task(self._loop(), name="c2v2-runner")
+
+    def request_tick(self) -> None:
+        """Ask the runner loop to tick immediately (thread-safe; callable from the
+        Flask/web thread). Used on ARM so the launch push doesn't wait ~1 s for the
+        next 1 Hz tick."""
+        loop = self._loop_ref
+        if loop is not None:
+            loop.call_soon_threadsafe(self._wake.set)
 
     async def stop(self) -> None:
         self._running = False
@@ -88,7 +103,14 @@ class Runner:
                 await self._tick()
             except Exception as exc:
                 logger.exception("c2_v2 runner tick failed: %s", exc)
-            await asyncio.sleep(max(0.1, TICK_S - (time.monotonic() - t0)))
+            # Sleep out the 1 Hz period, but wake EARLY if request_tick() fired
+            # (e.g. the operator just armed) so the launch happens immediately.
+            self._wake.clear()
+            try:
+                await asyncio.wait_for(self._wake.wait(),
+                                       timeout=max(0.1, TICK_S - (time.monotonic() - t0)))
+            except asyncio.TimeoutError:
+                pass
 
     async def _tick(self) -> None:
         if not self.match.armed:
