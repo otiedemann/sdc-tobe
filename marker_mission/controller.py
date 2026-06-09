@@ -1139,6 +1139,8 @@ class MissionController:
         self._approach_mid_ha_active: bool = False
         self._approach_mid_ha_settled_at: Optional[float] = None
         self._approach_mid_ha_started_at: Optional[float] = None
+        self._approach_locked_marker_id: Optional[int] = None
+        self._approach_realigning: bool = False
         self.state.reset(self.cfg)
 
     def set_script(self, steps: List[Step]) -> None:
@@ -1289,6 +1291,8 @@ class MissionController:
             self._approach_mid_ha_active = False
             self._approach_mid_ha_settled_at = None
             self._approach_mid_ha_started_at = None
+            self._approach_locked_marker_id = None
+            self._approach_realigning = False
         if phase == Phase.GOTO:
             self._goto_last_wp = None
             self._goto_jump_until = 0.0
@@ -2238,6 +2242,37 @@ class MissionController:
             self._marker_lost(now); return
         d, yaw_to_marker, hdg = meas
 
+        # Detect mid-approach marker switch and realign yaw before resuming.
+        # A switch (e.g. marker 15 → 46 mid-flight) causes a sudden distance
+        # jump that saturates the forward PD. Block forward motion and correct
+        # heading first; only then continue the approach with the new marker.
+        with self.state.lock:
+            _current_mid = self.state.active_marker_id
+        if self._approach_locked_marker_id is None:
+            self._approach_locked_marker_id = _current_mid
+        elif (_current_mid is not None
+              and _current_mid != self._approach_locked_marker_id):
+            print(f"[approach] marker switch {self._approach_locked_marker_id}"
+                  f"→{_current_mid} d={d:.2f}m — realigning yaw first",
+                  flush=True)
+            self._approach_locked_marker_id = _current_mid
+            self._approach_start_d = None
+            self._approach_lat_unlocked = False
+            self._approach_mid_ha_active = False
+            self._approach_realigning = True
+
+        if self._approach_realigning:
+            e_yaw = yaw_to_marker
+            u_yaw = (0.0 if abs(e_yaw) < cfg.yaw_deadband_deg
+                     else self.pd_yaw.step(e_yaw, now))
+            self._send_rc(lr=0, fb=0, ud=0, yaw=int(u_yaw))
+            with self.state.lock:
+                self.state.note = (f"marker switch → realign yaw to {_current_mid} "
+                                   f"e_yaw={e_yaw:+.1f}°")
+            if abs(e_yaw) < cfg.yaw_deadband_deg:
+                self._approach_realigning = False
+            return
+
         # Capture starting distance on first tick of this APPROACH phase.
         if self._approach_start_d is None:
             self._approach_start_d = d
@@ -2488,25 +2523,17 @@ class MissionController:
             else:
                 self.state.settle_began_at = None
         if settled:
-            # ORDER MATTERS. The marker-lost recovery restart check must
-            # run BEFORE the WAIT_AND_ATTACK sibling-hold gate: recovery
-            # parks the drone on a wall marker (state.active_marker_id =
-            # 11 or similar) which differs from wait_attack_target_id
-            # (e.g. 46), so the gate would otherwise refuse to advance
-            # AND the recovery's mission_step_idx = -1 restart would
-            # never fire — the drone would loop forever on the wall
-            # marker. Recovery restart re-enters _apply_step_to_phase
-            # from step 0; when the WAIT_AND_ATTACK step is reached
-            # again it re-seeds wait_attack_target_id and active so
-            # SEARCH for the box restarts cleanly.
+            # ORDER MATTERS. The marker-lost recovery check must run BEFORE
+            # the WAIT_AND_ATTACK sibling-hold gate (see gate comment below).
+            # Marker-lost recovery (no TO): this APPROACH was a GO_HOME onto a
+            # visible marker to re-establish a vision anchor. On settle, go
+            # directly to SEARCH — the drone is already airborne at the right
+            # height and position (standoff), so TAKEOFF/HEIGHT are unnecessary.
             if self._approach_on_settle_restart_mission:
                 self._approach_on_settle_restart_mission = False
-                print("[ctrl] recovery GO_HOME settled at visible marker — "
-                      "restarting mission")
-                with self.state.lock:
-                    self.state.mission_step_idx = -1
-                    self.state.last_completed_step_kind = None
-                self._advance_script("marker-lost recovery: mission restart")
+                print("[ctrl] recovery GO_HOME settled — searching for target")
+                self._set_phase(Phase.SEARCH,
+                                "recovery GO_HOME settled — searching for target")
                 return
             # WAIT_AND_ATTACK gate: when we settle while parked on the
             # SIBLING face (target face not yet exposed), DO NOT advance
