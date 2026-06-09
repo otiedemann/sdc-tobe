@@ -105,20 +105,24 @@ class Runner:
         elif self._desired_role:
             self._desired_role.clear()
 
-        # Mover altitude lanes + attacker fan-out, recomputed from current roles.
-        movers = sorted(
-            fc for fc, c in self.match.drones.items()
-            if c.get("enabled") and c.get("role") in ("attacker", "defender"))
-        mover_rank = {fc: i for i, fc in enumerate(movers)}
+        # Role-based ALTITUDE + attacker fan-out, recomputed from current roles.
+        # Attackers fly fixed lanes that never cross -> they all share ONE flat
+        # altitude. Defenders fly a higher tier (so attackers cross beneath them),
+        # vertically separated from each other.
+        t = self.match.tunables
         attackers = sorted(
             fc for fc, c in self.match.drones.items()
             if c.get("enabled") and c.get("role") == "attacker")
+        defenders = sorted(
+            fc for fc, c in self.match.drones.items()
+            if c.get("enabled") and c.get("role") == "defender")
         fan = _fan_out_angles(len(attackers))
         atk_hdg = {fc: fan[i] for i, fc in enumerate(attackers)}
+        cruise_alt = {fc: S.attacker_alt(t) for fc in attackers}
+        cruise_alt.update({fc: S.defender_alt(i, t) for i, fc in enumerate(defenders)})
         # FIXED-LANE assignment: each attacker (by stable rank) owns one enemy
-        # box face, so it flies a constant straight lane home<->box (collision-
-        # safe with the altitude ladder + fan-out). Round-robins if #attackers
-        # != #enemy boxes.
+        # box face, so it flies a constant straight lane home<->box. Round-robins
+        # if #attackers != #enemy boxes.
         lane_faces = S.enemy_home_faces(self.match.our_team)
         self._atk_face = {fc: lane_faces[i % len(lane_faces)]
                           for i, fc in enumerate(attackers)} if lane_faces else {}
@@ -160,14 +164,14 @@ class Runner:
                 # (nothing to do). A DEFENDER reactively recaptures one of our
                 # boxes the instant it flips — via a no-land mission splice.
                 if role == "defender":
-                    await self._maybe_recapture(fc, now, mover_rank.get(fc, 0))
+                    await self._maybe_recapture(fc, now, cruise_alt.get(fc, S.defender_alt(0, t)))
                 continue
 
             # C) Idle -> launch the current role's never-land script.
             if now - self._last_push.get(fc, -1e9) < PUSH_GRACE_S:
                 continue
             script = self._build_role_script(fc, role, w,
-                                             mover_rank.get(fc, 0),
+                                             cruise_alt.get(fc),
                                              atk_hdg.get(fc, 0.0))
             if not script:
                 continue
@@ -226,9 +230,10 @@ class Runner:
         return int(wall[0]), standoff
 
     def _build_role_script(self, fc: str, role: str, world,
-                           mover_lane: int, rth_hdg: float) -> Optional[str]:
+                           cruise_alt: Optional[float], rth_hdg: float) -> Optional[str]:
         team = self.match.our_team
         t = self.match.tunables
+        alt = cruise_alt if cruise_alt is not None else S.attacker_alt(t)
         if role == "scout":
             center = _pick_visible(world, S.CENTER_MARKERS) or S.CENTER_MARKERS[0]
             return S.scout_script(center, t)
@@ -238,8 +243,7 @@ class Runner:
                 return None
             # Wait just outside home in the neutral zone, scanning our 3 boxes;
             # the runner splices a recapture in the instant one flips.
-            return S.defender_neutral_script(wall_id, standoff,
-                                             S.mover_alt(mover_lane, t), t)
+            return S.defender_neutral_script(wall_id, standoff, alt, t)
         if role == "attacker":
             wall = arena_state.home_wall_marker(team)
             if not wall:
@@ -249,13 +253,12 @@ class Runner:
             face = self._atk_face.get(fc)
             if face is not None:
                 return S.attacker_lane_script(int(face), int(wall[0]),
-                                              S.mover_alt(mover_lane, t), rth_hdg, t)
+                                              alt, rth_hdg, t)
             faces = S.enemy_home_faces(team)
-            return S.attacker_loop_script(faces, int(wall[0]),
-                                          S.mover_alt(mover_lane, t), rth_hdg, t)
+            return S.attacker_loop_script(faces, int(wall[0]), alt, rth_hdg, t)
         return None
 
-    async def _maybe_recapture(self, fc: str, now: float, mover_lane: int) -> None:
+    async def _maybe_recapture(self, fc: str, now: float, cruise_alt: float) -> None:
         """DEFENDER reactive recapture: if one of OUR boxes is enemy-held (and
         not in its post-capture lock), splice a recapture leg into this airborne
         defender (no land) — dash in, flip it back, return to the neutral scan.
@@ -287,7 +290,7 @@ class Runner:
             return
         t = self.match.tunables
         script = S.defender_recapture_splice(int(face), wall_id, standoff,
-                                             S.mover_alt(mover_lane, t), t)
+                                             cruise_alt, t)
         ok, payload = await self.pool.splice(fc, script)
         self._last_splice[fc] = now
         if ok:

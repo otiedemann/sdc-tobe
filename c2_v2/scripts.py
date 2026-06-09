@@ -75,12 +75,26 @@ def _fmt(lines: List[str]) -> str:
 from .tunables import Tunables   # noqa: E402  (after the constants, by design)
 
 
-def mover_alt(lane: int, t: Tunables) -> float:
-    """Cruise altitude for mover ``lane`` (0-based): base + step*lane, floored at
-    the 0.73 m box top (never command below it) and capped at MAX_MOVER_ALT_M."""
-    return max(BOX_TOP_M,
-               min(MAX_MOVER_ALT_M,
-                   t.mover_base_alt_m + t.mover_alt_step_m * max(0, lane)))
+def _clamp_alt(a: float) -> float:
+    """Floor at the 0.73 m box top, cap at MAX_MOVER_ALT_M."""
+    return max(BOX_TOP_M, min(MAX_MOVER_ALT_M, a))
+
+
+def attacker_alt(t: Tunables) -> float:
+    """FLAT altitude shared by all attackers — their fixed lanes never cross, so
+    they don't need vertical separation. ~1 m for spotting the low box markers."""
+    return _clamp_alt(t.mover_base_alt_m)
+
+
+def defender_alt(rank: int, t: Tunables) -> float:
+    """Defender altitude: a HIGHER tier than the attackers (so the attackers can
+    cross beneath them), with a small per-defender step so the two defenders that
+    share a neutral station are vertically separated."""
+    return _clamp_alt(t.defender_base_alt_m + t.mover_alt_step_m * max(0, rank))
+
+
+def mover_alt(lane: int, t: Tunables) -> float:  # back-compat (scout/legacy)
+    return _clamp_alt(t.mover_base_alt_m + t.mover_alt_step_m * max(0, lane))
 
 
 # ── Scout ───────────────────────────────────────────────────────────────────
