@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import threading
 import time
 from pathlib import Path
@@ -34,6 +35,30 @@ _STATE_PATH = Path(__file__).resolve().parent / "c2v2_state.json"
 # scout-less strategy — 3 fixed-lane attackers + 2 neutral-zone defenders. The
 # attackers + defenders do their own scouting (each watches the boxes it works).
 _DEFAULT_ROLE_BY_LANE = ("attacker", "attacker", "attacker", "defender", "defender")
+
+
+def _parse_swimlane(value, allow_clear: bool = False):
+    """Parse an operator swimlane binding into ``[slot_a, slot_b]`` (two distinct
+    box slots 1..6) or ``None`` (auto). Accepts a [a,b] list, or a string of two
+    numbers ("3,6" / "3 6" / "3-6") — each number may be a SLOT (1..6) or a full
+    target-marker id (3x/4x, slot = id % 10). Returns ``None`` for empty input and
+    ``False`` for anything unparseable (so callers can reject it)."""
+    if value is None or value == [] or (isinstance(value, str) and not value.strip()):
+        return None
+    nums = [int(n) for n in re.findall(r"\d+", str(value))]
+    if len(nums) != 2:
+        return False
+    slots = []
+    for n in nums:
+        if 1 <= n <= 6:
+            slots.append(n)
+        elif n // 10 in (3, 4) and 1 <= n % 10 <= 6:   # full marker id -> slot
+            slots.append(n % 10)
+        else:
+            return False
+    if slots[0] == slots[1]:
+        return False
+    return slots
 
 
 class MatchState:
@@ -77,6 +102,9 @@ class MatchState:
                 "role": role,
                 "enabled": bool(saved.get("enabled", True)),
                 "lane": lane,
+                # Operator-bound swimlane: [slot_a, slot_b] (e.g. [3, 6]) or None
+                # for auto-assignment. Only used while the drone is an attacker.
+                "swimlane": _parse_swimlane(saved.get("swimlane")),
             }
 
     # ------------------------------------------------------------------ setters
@@ -108,6 +136,21 @@ class MatchState:
             if d is None:
                 return False
             d["role"] = r
+            self._save()
+        return True
+
+    def set_swimlane(self, fc_name: str, value) -> bool:
+        """Bind a drone to a specific swimlane by its two box slots. ``value`` may
+        be a string ("3,6" / "3 6" / "33 36"), a [a,b] list, or empty/None to clear
+        (auto-assign). Returns False on an unknown fc or an unparseable value."""
+        slots = _parse_swimlane(value, allow_clear=True)
+        if slots is False:
+            return False
+        with self._lock:
+            d = self.drones.get(fc_name)
+            if d is None:
+                return False
+            d["swimlane"] = slots                 # [a,b] or None
             self._save()
         return True
 
@@ -203,7 +246,8 @@ class MatchState:
                 "tunables": self.tunables.to_dict(),
                 # NOTE: armed is deliberately NOT persisted — every restart comes
                 # up DISARMED for safety.
-                "drones": {k: {"role": v["role"], "enabled": v["enabled"]}
+                "drones": {k: {"role": v["role"], "enabled": v["enabled"],
+                               "swimlane": v.get("swimlane")}
                            for k, v in self.drones.items()},
             }, indent=2))
         except OSError as exc:

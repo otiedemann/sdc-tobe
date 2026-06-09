@@ -308,6 +308,21 @@ def swimlane_faces(lane: int, our_team: str) -> tuple:
     return face_id(enemy_slot, enemy), face_id(our_slot, enemy)
 
 
+def swimlane_faces_for_boxes(box_a: int, box_b: int, our_team: str) -> tuple:
+    """``(enemy_box_face, our_box_face)`` for an OPERATOR-bound swimlane given its
+    two box SLOTS (e.g. 3 and 6). Both are the box's ENEMY-colour face, so the
+    attacker's WAIT_AND_ATTACK captures the enemy box / recaptures our box whenever
+    each shows the enemy colour. The full marker id = enemy-colour digit (3 blue /
+    4 red) + slot. Ordered enemy-box-first (the box in the ENEMY home), our box
+    second, to match attacker_swimlane_script's step order."""
+    enemy = "blue" if our_team == "red" else "red"
+    our = set(_our_slots(our_team))
+    a, b = int(box_a), int(box_b)
+    if a in our and b not in our:        # put the enemy box first
+        a, b = b, a
+    return face_id(a, enemy), face_id(b, enemy)
+
+
 def attacker_swimlane_script(enemy_box_face: int, our_box_face: int,
                              cruise_alt_m: float, t: Tunables) -> str:
     """SWIMLANE attacker — shuttles a straight vertical lane between an ENEMY box
