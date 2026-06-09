@@ -974,7 +974,12 @@ class MissionController:
         self._search_start_yaw = None
         self._search_swept = 0.0
         self._search_prev_yaw = None
-        self._search_esc_level: int = 0
+        # Two-stage SEARCH protocol state (see _step_search):
+        #   0 = stationary check at zoom 2.0x for cfg.search_zoom_check_s
+        #   1 = yaw spin at zoom 1.25x for one full revolution
+        # After stage 1 without acquisition -> _recover_via_central_marker.
+        self._search_stage: int = 0
+        self._search_stage_started: float = 0.0
         self._search_visited_markers: set = set()
         self._goto_on_settle_phase = None
         self._goto_on_settle_restart_mission = False
@@ -1103,7 +1108,11 @@ class MissionController:
         self._search_start_yaw = None
         self._search_swept = 0.0
         self._search_prev_yaw = None
-        self._search_esc_level: int = 0          # 0=1x/full, 1=2x/half, 2+=navigate
+        # Two-stage SEARCH protocol state (see _step_search):
+        #   0 = stationary check at zoom 2.0x for cfg.search_zoom_check_s
+        #   1 = yaw spin at zoom 1.25x for one full revolution
+        self._search_stage: int = 0
+        self._search_stage_started: float = 0.0
         self._search_visited_markers: set = set()  # wall-marker IDs already navigated to
         # Lost-box "descend back to approach-start height" state.
         # _box_height_marker remembers which box id approach_start_height_m was
@@ -1802,8 +1811,8 @@ class MissionController:
                                 f"marker acquired -- stop + {back_deg}° back -- aligning altitude")
             return
 
-        # Detect new SEARCH phase entry via phase_started_at so escalation
-        # state (yaw speed, zoom) resets cleanly on every fresh SEARCH.
+        # Detect new SEARCH phase entry via phase_started_at so the two-
+        # stage protocol resets cleanly on every fresh SEARCH.
         with self.state.lock:
             phase_entry = self.state.phase_started_at
         if getattr(self, "_search_phase_entry", None) != phase_entry:
@@ -1812,12 +1821,20 @@ class MissionController:
             self._search_swept = 0.0
             self._search_prev_yaw = None
             self._search_yaw_rc = float(cfg.search_yaw_rc)
-            self._search_zoom = 1.25
-            self._search_esc_level = 0
-            # _apply_zoom skips the call if HEIGHT already set 1.25x (the
-            # common path). Only triggers a stream restart on re-entry when
-            # APPROACH has reset zoom to 1.0 in the meantime.
-            self._apply_zoom(1.25)
+            # Two-stage SEARCH protocol:
+            #   stage 0 = stationary at zoom 2.0x (cfg.search_zoom_check_s).
+            #             Acquires distant markers without rotating, so a
+            #             marker that's "there but too small" pops out before
+            #             we change yaw.
+            #   stage 1 = yaw spin at zoom 1.25x (one full revolution).
+            # After stage 1 without acquisition: _recover_via_central_marker;
+            # if recovery can't commit, _terminate_script (yield to C2).
+            self._search_stage = 0
+            # Initialise lazily on first stage-0 execution so descent /
+            # retreat time doesn't count against the stationary window.
+            self._search_stage_started = None
+            self._search_zoom = 2.0
+            self._apply_zoom(2.0)
             # Arm the descend-to-approach-height for a lost TARGET BOX: a brief
             # HEIGHT_ALIGN to a high/oblique marker -- or a GO_HOME recovery
             # anchor -- can strand the drone above the (low) box, out of the
@@ -1886,12 +1903,46 @@ class MissionController:
                 )
             return
 
-        # Yaw in place using current (possibly escalation-reduced) speed.
-        # enforce_cfg_caps=False: search_yaw_rc is a direct config value,
-        # not PD output — yaw_rc_max must not cap it.
+        # ── Stage 0: stationary at zoom 2.0x ─────────────────────────
+        # Hold position with RC zero so the detector gets a window of
+        # frames at higher magnification. The acquisition-check at the
+        # top of _step_search exits SEARCH the instant the smoother
+        # receives a pose, so this stage is bounded by either
+        # cfg.search_zoom_check_s (no acquisition) or detector success.
+        if getattr(self, "_search_stage", 1) == 0:
+            self._send_rc(0, 0, 0, 0)
+            # Lazy start: the timer begins on the first tick that reaches
+            # stage 0 (i.e. after descent + retreat have completed), so
+            # the operator always gets the full stationary window worth
+            # of detector frames.
+            if self._search_stage_started is None:
+                self._search_stage_started = now
+            elapsed = now - self._search_stage_started
+            with self.state.lock:
+                self.state.note = (
+                    f"SEARCH stage 0 (stationary zoom 2.0x) "
+                    f"{elapsed:.1f}/{cfg.search_zoom_check_s:.1f}s")
+            if elapsed >= float(cfg.search_zoom_check_s):
+                # No acquisition at zoom 2.0x — drop to 1.25x and start
+                # the one-revolution yaw sweep.
+                self._search_stage = 1
+                self._search_stage_started = now
+                self._search_zoom = 1.25
+                self._apply_zoom(1.25)
+                self._search_start_yaw = None
+                self._search_swept = 0.0
+                self._search_prev_yaw = None
+                print("[ctrl] SEARCH stage 0 → stage 1: zoom 2.0x check "
+                      f"({cfg.search_zoom_check_s:.1f}s) yielded nothing, "
+                      "spinning at zoom 1.25x")
+            return
+
+        # ── Stage 1: yaw spin at zoom 1.25x ──────────────────────────
+        # Yaw in place at the operator-tunable search rate. One full
+        # revolution without acquisition → central-marker recovery, then
+        # either commit or terminate.
         self._send_rc(0, 0, 0, int(self._search_yaw_rc),
                       enforce_cfg_caps=False)
-        # Track how far we've yawed from telemetry to decide when to escalate.
         with self.state.lock:
             tel = self.state.last_telemetry
         if tel and tel.yaw_deg is not None:
@@ -1907,62 +1958,27 @@ class MissionController:
                 with self.state.lock:
                     self.state.search_yaw_swept_deg = self._search_swept
                 if self._search_swept >= cfg.search_total_deg:
-                    # Reset sweep counter for next revolution.
-                    self._search_start_yaw = None
-                    self._search_swept = 0.0
-                    self._search_esc_level += 1
-
-                    # RECOVERY (NO absolute TO): after a full rotation without
-                    # re-acquiring the target, approach the fixed CENTRE marker
-                    # (vision, 3 m) to re-establish a position anchor, then
-                    # restart the mission. Always homing onto the centre marker
-                    # -- rather than whatever happens to be visible -- stops the
-                    # drone getting stuck on a corner marker and keeps the
-                    # standoff in the arena interior (never backs toward a net).
-                    # It only commits once the centre marker is in view, so it
-                    # never open-loops into a wall.
+                    # One full revolution at zoom 1.25x without
+                    # acquisition. Try the central-marker recovery
+                    # (approach a known wall-centre marker, then restart
+                    # the mission on settle). _recover_via_central_marker
+                    # only commits when a candidate is currently in view
+                    # AND the recovery-hop budget isn't exhausted; in
+                    # both failure cases we terminate so the FC goes
+                    # idle and the C2 can re-task. We reset the sweep
+                    # counter on a successful commit so the new search
+                    # (for the centre marker) gets a fresh budget.
                     if self._recover_via_central_marker(now):
+                        self._search_start_yaw = None
+                        self._search_swept = 0.0
+                        self._search_prev_yaw = None
                         return
-                    # Recovery returned False -> centre marker not yet visible OR
-                    # the hop budget is exhausted. If exhausted, STOP looping: end
-                    # the mission so the FC goes idle and the C2 can re-task
-                    # (its decide() only pushes a new script when the FC is
-                    # idle, so an in-place spin would never get re-tasked). This
-                    # is the vision-only replacement for the old give-up LAND.
-                    if self._recovery_count >= self._MAX_RECOVERY_HOPS:
-                        self._terminate_script(
-                            f"marker-lost recovery exhausted "
-                            f"({self._MAX_RECOVERY_HOPS} centre-marker hops, "
-                            f"target unrecoverable) — ending mission, yielding "
-                            f"to C2")
-                        return
-                    # Nothing visible yet — escalate zoom (1x -> 2x -> 3x) and
-                    # halve rotation speed per zoom level so the detector has
-                    # more time per frame at higher magnification.
-                    if self._search_esc_level in (1, 2):
-                        new_zoom = 2.0 if self._search_esc_level == 1 else 3.0
-                        # Halve speed once per zoom step: level1 → /2, level2 → /4
-                        new_yaw_rc = max(1, int(cfg.search_yaw_rc / (2 ** self._search_esc_level)))
-                        self._search_zoom = new_zoom
-                        self._search_yaw_rc = new_yaw_rc
-                        self._apply_zoom(new_zoom)
-                        print(f"[ctrl] SEARCH esc→{self._search_esc_level}: "
-                              f"zoom {new_zoom}x  yaw_rc {new_yaw_rc} "
-                              f"(was {cfg.search_yaw_rc})")
-                        with self.state.lock:
-                            self.state.note = (
-                                f"SEARCH: no marker visible, zoom={new_zoom}x "
-                                f"rotating @{new_yaw_rc}")
-                    else:
-                        # 3+ revolutions, still nothing visible: reset zoom and
-                        # speed, keep rotating in place. Do NOT fly anywhere.
-                        self._search_esc_level = 0
-                        self._search_yaw_rc = float(cfg.search_yaw_rc)
-                        if getattr(self, "_search_zoom", 1.0) != 1.0:
-                            self._search_zoom = 1.0
-                            self._apply_zoom(1.0)
-                        print("[ctrl] SEARCH: no marker visible after 3 sweeps — "
-                              "resetting zoom+speed, continuing in-place rotation")
+                    self._terminate_script(
+                        "marker-lost: stationary zoom 2.0x check + one "
+                        "sweep at 1.25x yielded nothing, and "
+                        "central-marker recovery could not commit "
+                        "(no visible candidate or hop budget exhausted) "
+                        "— ending mission, yielding to C2")
                     return
         # Fallback timeout if no telemetry yaw is ever reported.
         elif now - phase_entry > 30.0:

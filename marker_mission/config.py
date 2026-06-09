@@ -292,6 +292,13 @@ class MissionConfig:
                                             # (operator: recover by rotating at 70
                                             # until any ArUco marker is seen)
     search_total_deg: float = 360.0        # how far to sweep before giving up
+    # SEARCH stage 0: stationary check at zoom 2.0× before any rotation.
+    # The detector gets a few frames at higher magnification to acquire
+    # markers that are too small for the default zoom. If nothing is
+    # acquired within this window, SEARCH transitions to stage 1 (yaw
+    # spin at zoom 1.25×). Keep short -- this is just "look further out
+    # before turning".
+    search_zoom_check_s: float = 1.5
     search_marker_lost_grace_s: float = 1.5  # TUNE  hold last command this long
                                               # before declaring the marker
                                               # lost (handles brief occlusions)
