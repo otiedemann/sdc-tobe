@@ -33,6 +33,10 @@ REGISTRY_PATH = REPO_ROOT / "marker_mission_c2" / "arena" / "arenas.json"
 # Regs §1.1: each home zone is the outer 5 m of the 20 m-long field.
 HOME_DEPTH_M: float = 5.0
 
+# Default ArUco side length on the capture boxes, when an arena config does not
+# carry its own ``target_size_m``.
+DEFAULT_TARGET_SIZE_M: float = 0.18
+
 # Last-resort triangle (used only if a target layout is missing/unreadable).
 _FALLBACK_SLOTS: dict[int, tuple[float, float]] = {
     1: (-3.0, -6.5), 2: (0.0, -9.0), 3: (3.0, -6.5),
@@ -53,6 +57,9 @@ class ArenaState:
     # so the competition arena yields red=(12,14)/blue=(10,16) while GVZ (markers
     # mounted on the opposite ends) yields the correct swapped pair automatically.
     side_markers: dict[str, tuple[int, ...]]
+    # ArUco side length (m) on the capture boxes (from the arena config's
+    # ``target_size_m``, else DEFAULT_TARGET_SIZE_M).
+    target_size_m: float = DEFAULT_TARGET_SIZE_M
 
     @property
     def half_width_m(self) -> float:
@@ -146,13 +153,31 @@ def _derive_side_markers(
     return out
 
 
-def _load_slot_positions(target_layout_path: Optional[str]) -> dict[int, tuple[float, float]]:
+def _slots_from_targets(targets: list) -> dict[int, tuple[float, float]]:
+    """Parse the arena config's ``targets`` block (id = slot 1..6, team-derived
+    facing). Enabled boxes only. Returns {} if nothing usable."""
+    slots: dict[int, tuple[float, float]] = {}
+    for t in targets:
+        if not isinstance(t, dict) or not t.get("enabled", True):
+            continue
+        try:
+            s = int(t["id"])
+            xy = (round(float(t["x"]), 2), round(float(t["y"]), 2))
+        except (TypeError, ValueError, KeyError):
+            continue
+        if 1 <= s <= 6:
+            slots[s] = xy
+    return slots
+
+
+def _slots_from_layout(target_layout_path: Optional[str]) -> dict[int, tuple[float, float]]:
+    """Legacy fallback: the separate target-layout file (face-id ``boxes``)."""
     if not target_layout_path:
-        return dict(_FALLBACK_SLOTS)
+        return {}
     try:
         tl = json.loads((REPO_ROOT / target_layout_path).read_text())
     except (OSError, ValueError):
-        return dict(_FALLBACK_SLOTS)
+        return {}
     slots: dict[int, tuple[float, float]] = {}
     for b in tl.get("boxes", []):
         if not b.get("enabled", True):
@@ -163,7 +188,19 @@ def _load_slot_positions(target_layout_path: Optional[str]) -> dict[int, tuple[f
             continue
         if s is not None:
             slots[s] = (round(float(b["x"]), 2), round(float(b["y"]), 2))
-    return slots or dict(_FALLBACK_SLOTS)
+    return slots
+
+
+def _read_arena_config(acp: Optional[str]) -> dict:
+    """Raw arena-config JSON (for the keys ``ArenaConfig`` drops: ``targets`` /
+    ``target_size_m``). Empty dict if missing/unreadable."""
+    if not acp:
+        return {}
+    try:
+        d = json.loads((REPO_ROOT / acp).read_text())
+        return d if isinstance(d, dict) else {}
+    except (OSError, ValueError):
+        return {}
 
 
 def _load_state(name: str) -> ArenaState:
@@ -175,13 +212,27 @@ def _load_state(name: str) -> ArenaState:
     acp = entry.get("arena_config_path")
     arena = (ArenaConfig.load(REPO_ROOT / acp) if acp else default_arena())
     home = _derive_home_markers(arena)
+
+    # Target boxes: prefer the arena config's own `targets` block (id = slot,
+    # team-derived facing); fall back to the legacy target-layout file, then to
+    # the hardcoded triangle.
+    raw_cfg = _read_arena_config(acp)
+    slots = (_slots_from_targets(raw_cfg.get("targets") or [])
+             or _slots_from_layout(entry.get("target_layout_path"))
+             or dict(_FALLBACK_SLOTS))
+    try:
+        target_size = float(raw_cfg.get("target_size_m", DEFAULT_TARGET_SIZE_M))
+    except (TypeError, ValueError):
+        target_size = DEFAULT_TARGET_SIZE_M
+
     return ArenaState(
         name=name,
         width_m=float(arena.width_m),
         depth_m=float(arena.depth_m),
         home_wall_marker=home,
-        slot_positions_m=_load_slot_positions(entry.get("target_layout_path")),
+        slot_positions_m=slots,
         side_markers=_derive_side_markers(arena, home),
+        target_size_m=target_size,
     )
 
 
@@ -213,12 +264,115 @@ def active_name() -> str:
     return current().name
 
 
+def load_default() -> ArenaState:
+    """(Re)load the registry's default arena as the active one."""
+    return set_active(default_name())
+
+
+# ---------------------------------------------------------------------------
+# Named-arena registry CRUD — manage arenas.json + the per-arena config files,
+# the same way live tunables are stored/loaded by name. Writes are whole-file.
+# ---------------------------------------------------------------------------
+
+def _write_registry(reg: dict) -> None:
+    REGISTRY_PATH.write_text(json.dumps(reg, indent=2) + "\n")
+
+
+def arena_exists(name: str) -> bool:
+    return str(name) in _read_registry().get("arenas", {})
+
+
+def _arena_config_dict(arena_config) -> dict:
+    """Coerce a ``save_arena`` payload into a JSON-able arena-config dict.
+    Accepts a plain dict or any object exposing ``to_json_dict()`` (e.g. the
+    marker_mission ``ArenaConfig``)."""
+    if isinstance(arena_config, dict):
+        return arena_config
+    to_json = getattr(arena_config, "to_json_dict", None)
+    if callable(to_json):
+        return to_json()
+    raise TypeError("arena_config must be a dict or expose to_json_dict()")
+
+
+def save_arena(name: str, arena_config, *, label: Optional[str] = None,
+               make_default: bool = False, overwrite: bool = True) -> str:
+    """Store ``arena_config`` (a dict, or an object with ``to_json_dict()``)
+    under ``name``: write ``marker_mission_c2/arena/<name>_arena_config.json``
+    and register it in ``arenas.json``. Overwrites an existing entry unless
+    ``overwrite=False`` (then raises ``FileExistsError``). Returns the
+    repo-relative config path. Refreshes the active state if ``name`` is active;
+    does NOT switch the active arena otherwise."""
+    name = str(name)
+    if not name or not name.replace("_", "").replace("-", "").isalnum():
+        raise ValueError(f"invalid arena name {name!r} "
+                         f"(use letters, digits, '-' or '_')")
+    reg = _read_registry()
+    arenas = reg.setdefault("arenas", {})
+    if name in arenas and not overwrite:
+        raise FileExistsError(f"arena {name!r} already exists")
+    rel = f"marker_mission_c2/arena/{name}_arena_config.json"
+    (REPO_ROOT / rel).write_text(
+        json.dumps(_arena_config_dict(arena_config), indent=2) + "\n")
+    entry = dict(arenas.get(name) or {})
+    entry["arena_config_path"] = rel
+    entry["label"] = label or entry.get("label") or name
+    arenas[name] = entry
+    if make_default:
+        reg["default"] = name
+    _write_registry(reg)
+    global _current
+    with _lock:
+        if _current is not None and _current.name == name:
+            _current = _load_state(name)
+    return rel
+
+
+def set_default_arena(name: str) -> bool:
+    """Point the registry default at ``name`` (must already be registered)."""
+    name = str(name)
+    reg = _read_registry()
+    if name not in reg.get("arenas", {}):
+        return False
+    reg["default"] = name
+    _write_registry(reg)
+    return True
+
+
+def delete_arena(name: str, *, remove_file: bool = False) -> bool:
+    """Unregister ``name`` (returns False if unknown). Refuses to delete the
+    current default — set another default first. Optionally deletes the config
+    file from disk too."""
+    name = str(name)
+    reg = _read_registry()
+    arenas = reg.get("arenas", {})
+    if name not in arenas:
+        return False
+    if reg.get("default") == name:
+        raise ValueError(f"cannot delete the default arena {name!r}; "
+                         f"set_default_arena(other) first")
+    entry = arenas.pop(name)
+    _write_registry(reg)
+    if remove_file:
+        acp = entry.get("arena_config_path")
+        if acp:
+            try:
+                (REPO_ROOT / acp).unlink()
+            except OSError:
+                pass
+    return True
+
+
 def home_wall_marker(team: str) -> Optional[tuple[int, tuple[float, float]]]:
     return current().home_wall_marker.get(team)
 
 
 def slot_positions() -> dict[int, tuple[float, float]]:
     return dict(current().slot_positions_m)
+
+
+def target_size_m() -> float:
+    """ArUco side length (m) on the capture boxes for the active arena."""
+    return current().target_size_m
 
 
 def side_markers(team: str) -> tuple[int, ...]:
@@ -274,6 +428,7 @@ def to_client_dict() -> dict:
         "red_home_y": list(st.red_home_y),
         "blue_home_y": list(st.blue_home_y),
         "boxes": {str(s): [x, y] for s, (x, y) in st.slot_positions_m.items()},
+        "target_size_m": st.target_size_m,
         "home_markers": {t: v[0] for t, v in st.home_wall_marker.items()},
         "available": arena_names(),
         "labels": arena_labels(),

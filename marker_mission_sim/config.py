@@ -214,28 +214,57 @@ def load_arena(arena_config_path: Optional[str],
             wall=str(getattr(m, "wall", "") or ""),
         ))
 
-    # Target boxes from the layout JSON (enabled boxes only).
-    tl_path = Path(target_layout_path) if target_layout_path else (
-        REPO_ROOT / "tools" / "sphinx-arena" / "default_target_layout.json")
+    # Target boxes: prefer the arena config's own `targets` block (id = slot
+    # 1..6, team-derived facing); fall back to the legacy target-layout file
+    # (face-id `boxes`). Keeps the sim's ground truth identical to the strategy.
     boxes: list[BoxDef] = []
-    try:
-        tl = json.loads(tl_path.read_text())
-        for b in tl.get("boxes", []):
-            if not b.get("enabled", True):
+    cfg_targets = None
+    if arena_config_path:
+        try:
+            acfg = json.loads(Path(arena_config_path).read_text())
+            if isinstance(acfg.get("targets"), list):
+                cfg_targets = acfg["targets"]
+        except (OSError, ValueError):
+            cfg_targets = None
+
+    if cfg_targets:
+        for t in cfg_targets:
+            if not isinstance(t, dict) or not t.get("enabled", True):
                 continue
-            fid = int(b["id"])
-            slot = _slot_of_face(fid)
-            if slot is None:
+            try:
+                slot = int(t["id"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            if not (1 <= slot <= 6):
                 continue
             boxes.append(BoxDef(
                 slot=slot,
-                pos=Vec3(float(b["x"]), float(b["y"]), float(b.get("z", 1.0))),
-                home_team=str(b.get("team", "red")),
+                pos=Vec3(float(t["x"]), float(t["y"]), float(t.get("z", 1.0))),
+                home_team=str(t.get("team", "red")),
                 blue_face_id=30 + slot,
                 red_face_id=40 + slot,
             ))
-    except (OSError, ValueError, KeyError):
-        boxes = []
+    else:
+        tl_path = Path(target_layout_path) if target_layout_path else (
+            REPO_ROOT / "tools" / "sphinx-arena" / "default_target_layout.json")
+        try:
+            tl = json.loads(tl_path.read_text())
+            for b in tl.get("boxes", []):
+                if not b.get("enabled", True):
+                    continue
+                fid = int(b["id"])
+                slot = _slot_of_face(fid)
+                if slot is None:
+                    continue
+                boxes.append(BoxDef(
+                    slot=slot,
+                    pos=Vec3(float(b["x"]), float(b["y"]), float(b.get("z", 1.0))),
+                    home_team=str(b.get("team", "red")),
+                    blue_face_id=30 + slot,
+                    red_face_id=40 + slot,
+                ))
+        except (OSError, ValueError, KeyError):
+            boxes = []
     boxes.sort(key=lambda x: x.slot)
 
     return ArenaDef(

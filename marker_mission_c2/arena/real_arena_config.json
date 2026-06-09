@@ -1,6 +1,7 @@
 {
-  "_comment": "SDC26 REAL-MATCH arena (the current built-in default_arena, serialized so both the sim and the strategy load it from one file). 16 wall markers: upper ring z=4 (ids 1-8), lower ring z=2 (ids 9-16); front/back/left/right naming; 10x20 m. Back wall marker 13 = red home, front wall marker 9 = blue home.",
+  "_comment": "SDC26 REAL-MATCH arena (the current built-in default_arena, serialized so both the sim and the strategy load it from one file). 16 wall markers: upper ring z=4 (ids 1-8), lower ring z=2 (ids 9-16); front/back/left/right naming; 10x20 m. Back wall marker 13 = red home, front wall marker 9 = blue home. `targets` = the 6 capture boxes (id = slot 1..6; the face shown is derived: red home = 40+slot, blue home = 30+slot, and it faces neutral by team so no roll/pitch/yaw is stored). target_size_m = the ArUco side length on the boxes.",
   "marker_size_m": 0.5,
+  "target_size_m": 0.18,
   "width_m": 10.0,
   "depth_m": 20.0,
   "top_z_m": 4.0,
@@ -134,5 +135,13 @@
       "y": 5.0,
       "z": 2.0
     }
+  ],
+  "targets": [
+    { "id": 1, "team": "red",  "label": "Box 1 — shallow flank (-x)",      "x": -3.0, "y": -6.5, "z": 1.0, "enabled": true },
+    { "id": 2, "team": "red",  "label": "Box 2 — deep centre (back wall)", "x":  0.0, "y": -9.0, "z": 1.0, "enabled": true },
+    { "id": 3, "team": "red",  "label": "Box 3 — shallow flank (+x)",      "x":  3.0, "y": -6.5, "z": 1.0, "enabled": true },
+    { "id": 4, "team": "blue", "label": "Box 4 — shallow flank (-x)",      "x": -3.0, "y":  6.5, "z": 1.0, "enabled": true },
+    { "id": 5, "team": "blue", "label": "Box 5 — deep centre (back wall)", "x":  0.0, "y":  9.0, "z": 1.0, "enabled": true },
+    { "id": 6, "team": "blue", "label": "Box 6 — shallow flank (+x)",      "x":  3.0, "y":  6.5, "z": 1.0, "enabled": true }
   ]
 }
