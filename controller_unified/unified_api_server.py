@@ -76,6 +76,7 @@ except ImportError:
 
 HAS_OLYMPE_SDK = False
 HAS_EMERGENCY = False
+HAS_REBOOT = False
 HAS_CAMERA = False
 HAS_GIMBAL = False
 HAS_GPS_STATE = False
@@ -132,6 +133,17 @@ if HAS_OLYMPE_SDK:
         HAS_EMERGENCY = True
     except (ImportError, KeyError):
         pass
+    # Firmware reboot (Common.Reboot). The drone drops its WiFi link the
+    # instant it accepts this, reboots, and comes back in ~30-60s — the
+    # reconnect watchdog rebuilds the link once it's up again. Some Olympe
+    # builds expose it under a different path; degrade to "not supported"
+    # rather than failing the whole import.
+    try:
+        from olympe.messages.common.Common import Reboot
+        HAS_REBOOT = True
+    except (ImportError, KeyError):
+        Reboot = None
+        HAS_REBOOT = False
     # Diagnostics: why did the Anafi refuse takeoff?
     # AlertStateChanged: low_battery/too_much_angle/magneto_*/motor_error/etc.
     # MotorErrorStateChanged: which motor failed and why.
@@ -1626,6 +1638,8 @@ class DroneBackend(abc.ABC):
         return False, "not_supported"
     def sdk_passthrough(self, command: str) -> Tuple[bool, str]:
         return False, "not_supported"
+    def reboot(self) -> Tuple[bool, str]:
+        return False, "not_supported"
     def camera_photo(self) -> Tuple[bool, str]:
         return False, "not_supported"
     def camera_record_start(self) -> Tuple[bool, str]:
@@ -2695,6 +2709,31 @@ class OlympeBackend(DroneBackend):
             with command_lock:
                 d(Landing()).wait(_timeout=5)
         return True, "ok"
+
+    def reboot(self) -> Tuple[bool, str]:
+        """Reboot the drone's firmware (Common.Reboot). Use only on the
+        ground — a flying drone would lose stabilisation and fall. The
+        command rarely ACKs because the drone tears down its WiFi link the
+        moment it accepts it, so a wait() timeout is NOT a failure: we fire
+        it and let reconnect_loop() rebuild the link once the drone is back
+        (~30-60s)."""
+        d = self._d()
+        if d is None:
+            return False, "not_ready"
+        if not HAS_REBOOT:
+            return False, "reboot_not_supported"
+        # Stop streaming PCMD at a drone that's about to vanish.
+        try:
+            self._stop_piloting()
+        except Exception:
+            pass
+        try:
+            with command_lock:
+                d(Reboot()).wait(_timeout=3)
+        except Exception:
+            # Link dropped before/while ACKing — expected on a real reboot.
+            pass
+        return True, "reboot_sent"
 
     def flip(self, direction: str) -> Tuple[bool, str]:
         d = self._d()
@@ -5137,6 +5176,41 @@ def api_recover():
         with conn_lock:
             conn_state["connected"] = False
         return jsonify(ok=False, message=str(e)), 500
+
+
+@app.post("/api/reboot")
+def api_reboot():
+    """Reboot the drone's firmware. Refuses while the drone is flying
+    (a reboot mid-air = it falls) unless force=true is passed. After a
+    successful send the link is gone; the reconnect watchdog rebuilds it
+    in ~30-60s."""
+    global flying
+    b = backend
+    if b is None:
+        return jsonify(ok=False, error="controller not ready"), 503
+    data = request.get_json(silent=True) or {}
+    if flying and not bool(data.get("force", False)):
+        return jsonify(ok=False,
+                       error="drone is flying; refusing reboot (pass force=true to override)"), 409
+    try:
+        ok, msg = b.reboot()
+    except Exception as e:
+        with conn_lock:
+            conn_state["connected"] = False
+        return jsonify(ok=False, error=str(e)), 500
+    if ok:
+        # Drone is rebooting → connection is gone. Clear piloting state so
+        # the reconnect watchdog rebuilds from scratch.
+        with pressed_lock:
+            pressed_web.clear()
+            key_last_seen.clear()
+        flying = False
+        with conn_lock:
+            conn_state["connected"] = False
+            conn_state["last_reconnect"] = time.time()
+        return jsonify(ok=True, message=msg)
+    # not_supported / reboot_not_supported / not_ready
+    return jsonify(ok=False, error=msg), 501
 
 
 # --- Tello-specific endpoints ---
