@@ -749,6 +749,8 @@ def cmd_fly(args: argparse.Namespace) -> int:
         import collections as _col
         _dd_prev_gray  = None
         _dd_prev_threat_cx: float = None  # camera-x centre of last nearest blob
+        _dd_frame_ctr: int = 0            # frame counter for detection throttle
+        _DD_STRIDE     = 2      # run optical-flow drone detection every Nth frame
         _DD_MIN_W      = 30     # min blob width  (2:1 aspect → drones are wide)
         _DD_MIN_H      = 15     # min blob height
         _DD_MAX_W      = 300    # max blob width  (filters walls/ceiling)
@@ -1397,7 +1399,14 @@ def cmd_fly(args: argparse.Namespace) -> int:
                         visible_marker_ids=seen_ids,
                     )
                 # ── Other-drone detection + overlay ───────────────────
-                raw_blobs = _detect_drones(frame)
+                # Optical-flow pipeline is ~30-50ms on 1280x720; run every
+                # _DD_STRIDE frames. The temporal filter still needs
+                # _DD_CONSEC_REQ hits to confirm, so threat latency ~doubles
+                # (~0.8s → ~1.6s) but frame throughput improves significantly.
+                _dd_frame_ctr += 1
+                raw_blobs = (_detect_drones(frame)
+                             if _dd_frame_ctr % _DD_STRIDE == 0
+                             else [])
                 confirmed  = _temporal_filter(raw_blobs)
                 if not confirmed:
                     _dd_prev_threat_cx = None

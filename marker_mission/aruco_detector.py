@@ -161,6 +161,9 @@ class ArucoDetector:
         self._params.cornerRefinementMethod = cv2.aruco.CORNER_REFINE_SUBPIX
         self._params.cornerRefinementWinSize = 5
         self._detector = cv2.aruco.ArucoDetector(self._aruco_dict, self._params)
+        # Cache zoom-scaled camera matrices: zoom→K_eff. Avoids K.copy() +
+        # scalar multiply on every frame when search zoom is active.
+        self._K_zoom_cache: dict[float, np.ndarray] = {}
 
         # Per-marker cache of the last accepted rvec + timestamp. Used to
         # break the IPPE_SQUARE planar-pose ambiguity by temporal
@@ -290,11 +293,15 @@ class ArucoDetector:
         out: list[MarkerPose] = []
         if ids is None:
             return out
-        K = self.calibration.camera_matrix
-        if zoom != 1.0:
-            K = K.copy()
-            K[0, 0] *= zoom  # f_x scales with effective focal length
-            K[1, 1] *= zoom  # f_y
+        if zoom == 1.0:
+            K = self.calibration.camera_matrix
+        else:
+            K = self._K_zoom_cache.get(zoom)
+            if K is None:
+                K = self.calibration.camera_matrix.copy()
+                K[0, 0] *= zoom  # f_x scales with effective focal length
+                K[1, 1] *= zoom  # f_y
+                self._K_zoom_cache[zoom] = K
         D = self.calibration.dist_coeffs
         for c, id_arr in zip(corners, ids):
             mid = int(id_arr[0])
