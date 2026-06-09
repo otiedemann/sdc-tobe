@@ -235,28 +235,28 @@ def _our_slots(our_team: str):
     return (1, 2, 3) if our_team == "red" else (4, 5, 6)
 
 
-# How many capture+return passes one attacker loops. Each pass is a full
-# out-and-back, so far more than a match can fly -> the script never ends -> the
-# drone never lands. Generous so even fast (short) legs outlast a match.
-ATTACK_LANE_PASSES = 90
-
-
 def attacker_lane_script(enemy_face: int, wall_marker: int, cruise_alt_m: float,
                          rth_hdg_deg: float, t: Tunables) -> str:
-    """FIXED-TARGET attacker — a SELF-CONTAINED never-land loop on ONE enemy box.
-    No C2 splice / box-state / FC mission-state needed: the mission itself shuttles
-    the straight lane home<->box. Each pass: fly out and APPROACH the box face,
-    slide up+over to flip it, turn, GO_HOME the back-wall marker to score, then
-    HOVER in our home zone for ``attacker_home_dwell_s`` before striking again.
+    """FIXED-TARGET attacker — a SELF-CONTAINED never-land loop on ONE enemy box,
+    built with the FC's REPEAT verb. No C2 splice / box-state / FC mission-state
+    needed: the mission itself shuttles the straight lane home<->box. Each pass:
+    fly out and APPROACH the box face, slide up+over to flip it, turn, GO_HOME the
+    back-wall marker to score, then HOVER in our home zone for
+    ``attacker_home_dwell_s`` — then REPEAT loops back to the first non-TAKEOFF
+    step (the leg) forever, skipping TAKEOFF, so the drone NEVER lands on its own.
     Distinct face per attacker => distinct boxes => collision-safe straight lanes.
-    Loops ATTACK_LANE_PASSES times (>> a match) so it never lands.
 
-    When the box is already ours (just captured, shows OUR face) the APPROACH
-    waits/searches for the enemy face to reappear; the home dwell gives the enemy
-    time to recapture so the next pass usually finds the enemy face up."""
+    CAVEAT (FC-side, can't be fixed from c2_v2 per constraint #8): if the box is
+    currently OURS (just captured, shows OUR face -> the enemy face is physically
+    absent) the APPROACH searches for the enemy face and, after the FC's bounded
+    marker-lost recovery exhausts (~3 hops), the FC LANDS — the C2 then relaunches
+    it (DONE -> idle -> push). In a real match the enemy recaptures the box, so the
+    enemy face is up when the attacker returns and this doesn't trigger; it mainly
+    bites no-enemy bench testing. The home dwell gives the box time to flip back."""
     cruise = f"HEIGHT {cruise_alt_m:.2f}"
     dwell = max(1, int(round(t.attacker_home_dwell_s)))
-    leg = [
+    return _fmt([
+        "TAKEOFF",
         cruise,
         f"APPROACH {int(enemy_face)} {t.attack_standoff_m:.2f} {t.attack_dist_tol_m:.2f}",
         f"FB_UD_IMU {t.over_box_forward_m:.2f} {t.capture_rise_m:.2f}",
@@ -264,11 +264,8 @@ def attacker_lane_script(enemy_face: int, wall_marker: int, cruise_alt_m: float,
         cruise,
         f"GO_HOME {int(wall_marker)} {t.rth_standoff_m:.2f} {RTH_ARRIVE_TOL_M:g} {rth_hdg_deg:g}",
         f"RC 0 0 0 0 {dwell}",            # hover at home (score), then strike again
-    ]
-    lines: List[str] = ["TAKEOFF"]
-    for _ in range(ATTACK_LANE_PASSES):
-        lines.extend(leg)
-    return _fmt(lines)
+        "REPEAT",                          # loop the leg forever, skipping TAKEOFF -> never lands
+    ])
 
 
 def enemy_face_for_slot(slot: int, our_team: str) -> int:
