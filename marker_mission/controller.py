@@ -1028,8 +1028,11 @@ class MissionController:
         except Exception as e:
             print(f"[ctrl] zoom set failed: {e}")
 
-    def _apply_stream_settings(self) -> None:
-        """Apply stream mode and recording framerate from cfg once at mission start."""
+    def _apply_stream_settings(self) -> bool:
+        """Apply stream mode and recording framerate from cfg. Returns True on a
+        successful apply. Called from the PRE-FLIGHT wait (so the camera reconfig +
+        stream restart happens off the takeoff critical path), with a GO-time
+        fallback if pre-flight hadn't applied it yet."""
         fps_str = f"fps_{self.cfg.video_framerate_fps}"
         try:
             result = self.api.camera_config_set(
@@ -1039,8 +1042,10 @@ class MissionController:
             )
             print(f"[ctrl] stream settings: mode={self.cfg.video_stream_mode}"
                   f" fps={self.cfg.video_framerate_fps} → {result}")
+            return True
         except Exception as e:
             print(f"[ctrl] stream settings failed: {e}")
+            return False
 
     def apply_config_changes(self) -> None:
         """Re-sync per-instance state that was copied out of cfg at
@@ -1420,9 +1425,18 @@ class MissionController:
         # shutdown). So after the wait we MUST re-check _stop before doing
         # anything irreversible -- otherwise Ctrl-C in pre-flight would
         # take off the drone on the way out the door.
+        # Apply the camera stream/recording settings DURING pre-flight (off the
+        # takeoff critical path). camera_config_set restarts the Anafi video
+        # stream (~1-3 s); doing it here while the operator reviews pre-flight
+        # means GO -> takeoff is immediate. Retried every ~2 s until it sticks.
+        stream_applied = False
+        stream_attempt_t = 0.0
         while not self._go.is_set() and not self._stop.is_set():
             now = time.monotonic()
             tel = self._refresh_inputs(now)
+            if not stream_applied and (now - stream_attempt_t) > 2.0:
+                stream_attempt_t = now
+                stream_applied = self._apply_stream_settings()
             # Compute what the controller WOULD command (for the UI), but
             # don't send anything to the drone. With props off, this lets
             # the operator verify yaw/fwd/lat sign and magnitude by walking
@@ -1433,7 +1447,10 @@ class MissionController:
             print("[ctrl] stop received before takeoff -- exiting cleanly")
             return
 
-        self._apply_stream_settings()
+        # GO-time fallback: only if pre-flight never managed to apply it (e.g. the
+        # operator armed within the first moment). Normally a no-op -> fast takeoff.
+        if not stream_applied:
+            self._apply_stream_settings()
 
         # Hand off to the mission script. The first step (typically
         # TAKEOFF) is loaded here; _apply_step_to_phase handles the
