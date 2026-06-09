@@ -37,6 +37,11 @@ class DroneView:
     current_role: str
 
 
+# Number of attacker swimlanes (one per vertical lane / per own box). The
+# coordinator keeps up to this many attackers; the rest are neutral defenders.
+NUM_SWIMLANES = 3
+
+
 @dataclass
 class Plan:
     roles: Dict[str, str]      # fc -> desired role
@@ -83,19 +88,15 @@ class Coordinator:
         boxes_ours = sum(1 for s in our if holders.get(s) == our_team) + enemy_held_by_us
 
         # 3) Decide the attacker / defender split (target counts).
+        # SWIMLANE strategy: keep up to NUM_SWIMLANES (3) attackers — one per
+        # vertical lane. If an attacker DROPS OUT (disabled / disconnected), a
+        # defender is promoted to refill the lane (atk_n tracks live movers). Any
+        # movers beyond the 3 lanes are DEFENDERS: neutral-zone backup that
+        # reactively recaptures our boxes when they flip. So: 5 movers -> 3 atk +
+        # 2 def; 4 -> 3 atk + 1 def; 3 -> 3 atk + 0 def.
+        atk_n = min(NUM_SWIMLANES, M)
+        def_n = M - atk_n
         special_push = boxes_ours >= 5 and len(enemy_open) >= 1
-        if special_push:
-            # ONE box short of the instant win: go all-out to grab the last
-            # enemy box; only hold back a defender for a box we've already lost.
-            def_n = min(M, len(our_threatened))
-        else:
-            # Cover every threatened own box, plus a baseline home presence
-            # (operator-tunable) so the enemy can't walk into an undefended box.
-            baseline = baseline_def if M >= 3 else 0
-            def_n = min(M, len(our_threatened) + baseline)
-        atk_n = M - def_n
-        if atk_n <= 0:                    # always keep at least one attacker
-            atk_n, def_n = 1, M - 1
 
         # 4) Assign roles to movers STABLY: keep movers in their current role
         #    where it fits the target counts, only changing the minimum number.

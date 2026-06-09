@@ -28,13 +28,16 @@ class Tunables:
     # share a neutral station. Never below the 0.73 m box top.
     scout_alt_m: float = 1.00
     mover_base_alt_m: float = 1.00     # attacker altitude (flat — all attackers)
-    defender_base_alt_m: float = 1.60  # defender tier (above the attackers)
+    defender_alt_above_attacker_m: float = 0.80   # defender altitude = attacker + this (avoid collisions)
     mover_alt_step_m: float = 0.20     # vertical separation between the defenders
     # rotation speeds (RC yaw stick 1..100)
     scout_yaw_stick: int = 70
     defender_yaw_stick: int = 35
     # defender standoff
     defender_standoff_m: float = 2.50
+    # Defender neutral-wait distance: how far OFF our home wall marker the
+    # defender holds (in the neutral zone, scanning our boxes). Operator: 5 m.
+    defender_neutral_m: float = 5.0
     # offense persistence + strategy bias
     attack_passes: int = 30
     # Attacker home dwell: after each capture+return the attacker HOVERS in our
@@ -60,11 +63,12 @@ TUNE_SPEC = [
     ("rth_standoff_m", "RTH wall standoff (m)", 1.0, 6.0, 0.1),
     ("scout_alt_m", "Scout altitude (m)", 0.73, 2.5, 0.05),
     ("mover_base_alt_m", "Attacker altitude (m)", 0.73, 3.0, 0.05),
-    ("defender_base_alt_m", "Defender altitude (m)", 0.73, 3.5, 0.05),
+    ("defender_alt_above_attacker_m", "Defender height above attacker (m)", 0.0, 2.0, 0.05),
     ("mover_alt_step_m", "Defender separation step (m)", 0.0, 1.0, 0.05),
     ("scout_yaw_stick", "Scout rotate speed", 5, 100, 5),
     ("defender_yaw_stick", "Defender rotate speed", 5, 100, 5),
     ("defender_standoff_m", "Defender standoff (m)", 1.0, 5.0, 0.1),
+    ("defender_neutral_m", "Defender neutral distance (m)", 1.0, 8.0, 0.5),
     ("attack_passes", "Attack chain passes", 5, 100, 1),
     ("attacker_home_dwell_s", "Attacker home dwell (s)", 0.0, 30.0, 0.5),
     ("baseline_defenders", "Baseline defenders", 0, 4, 1),

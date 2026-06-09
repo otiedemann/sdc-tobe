@@ -53,7 +53,7 @@ class Runner:
         self._last_retask: Dict[str, float] = {}  # fc -> monotonic ts of last stop
         self._last_splice: Dict[str, float] = {}  # fc -> monotonic ts of last splice
         self._desired_role: Dict[str, tuple] = {}  # fc -> (role, since) AUTO hysteresis
-        self._atk_target: Dict[str, int] = {}      # attacker fc -> its fixed enemy box slot
+        self._atk_lane: Dict[str, int] = {}        # attacker fc -> its fixed swimlane (0,1,2)
         self._defender_recapture: Dict[str, int] = {}  # defender fc -> own slot being recaptured
         self._last_action: Dict[str, str] = {}    # fc -> human reason (for UI)
 
@@ -120,7 +120,7 @@ class Runner:
         atk_hdg = {fc: fan[i] for i, fc in enumerate(attackers)}
         cruise_alt = {fc: S.attacker_alt(t) for fc in attackers}
         cruise_alt.update({fc: S.defender_alt(i, t) for i, fc in enumerate(defenders)})
-        self._assign_targets(attackers)
+        self._assign_lanes(attackers)
 
         for fc, cfg in self.match.drones.items():
             w = worlds.get(fc)
@@ -226,15 +226,17 @@ class Runner:
 
     # ------------------------------------------------------------------ scripts
     def _neutral_standoff(self, team: str):
-        """(home_wall_marker_id, standoff_m) so a GO_HOME onto our home wall
-        stops the drone JUST OUTSIDE our home zone (in neutral). None if the wall
-        marker is unknown."""
+        """(home_wall_marker_id, standoff_m): a GO_HOME onto our home-wall marker
+        stops the defender ``defender_neutral_m`` (operator: 5 m) off the marker,
+        facing our boxes to scan them. NOTE the geometry: the marker is at y=±10
+        and our home band ends ~5 m off it, so 5 m sits AT the home/neutral
+        boundary (and with the GO_HOME arrival tolerance it can settle ~0.5 m into
+        home). Raise defender_neutral_m to ~5.5-6 m to wait clearly out in the
+        neutral zone. None if the wall marker is unknown."""
         wall = arena_state.home_wall_marker(team)
         if not wall:
             return None, None
-        wall_y = abs(float(wall[1][1]))
-        standoff = max(0.5, wall_y - arena_state.neutral_wait_y())   # ~10-4.5=5.5
-        return int(wall[0]), standoff
+        return int(wall[0]), float(self.match.tunables.defender_neutral_m)
 
     def _build_role_script(self, fc: str, role: str, world,
                            cruise_alt: Optional[float], rth_hdg: float) -> Optional[str]:
@@ -252,37 +254,37 @@ class Runner:
             # the runner splices a recapture in the instant one flips.
             return S.defender_neutral_script(wall_id, standoff, alt, t)
         if role == "attacker":
-            wall = arena_state.home_wall_marker(team)
-            if not wall:
-                return None
-            slot = self._atk_target.get(fc)
-            if slot is None:
-                # Extra attacker with no free box -> just hover at home (no land).
+            lane = self._atk_lane.get(fc)
+            if lane is None:
+                # Extra attacker with no free lane -> just hover at home (no land).
+                wall = arena_state.home_wall_marker(team)
+                if not wall:
+                    return None
                 return S.attacker_park_script(int(wall[0]), alt, rth_hdg, t)
-            # SELF-CONTAINED fixed-target loop: take off, then forever fly the
-            # straight lane out to this attacker's ONE box, capture, return home to
-            # score, hover, repeat. No splice / box-state / FC mission-state needed.
-            face = S.enemy_face_for_slot(int(slot), team)
-            return S.attacker_lane_script(int(face), int(wall[0]), alt, rth_hdg, t)
+            # SWIMLANE: take off, then forever shuttle this attacker's straight
+            # vertical lane between its ENEMY box and OUR box, capturing/recapturing
+            # each whenever it shows the enemy colour (WAIT_AND_ATTACK at both ends).
+            # Self-contained REPEAT loop — no splice / box-state / FC mission-state.
+            enemy_face, our_face = S.swimlane_faces(int(lane), team)
+            return S.attacker_swimlane_script(int(enemy_face), int(our_face), alt, t)
         return None
 
-    def _assign_targets(self, attackers: List[str]) -> None:
-        """FIXED-TARGET assignment pinned to DRONE IDENTITY (not sort rank): each
-        attacker owns ONE distinct enemy box for the whole match. KEEP every
-        existing binding, free the boxes of drones that stopped attacking, and
-        give a freed box only to a newly-appeared attacker. So a drone dropping
-        out (disable / role change / disconnect) never reshuffles the other
-        attackers' lanes, and no two attackers ever share a box. Extras beyond the
-        3 enemy boxes get NO target (they just park + hover)."""
-        enemy_slots = (4, 5, 6) if self.match.our_team == "red" else (1, 2, 3)
+    def _assign_lanes(self, attackers: List[str]) -> None:
+        """SWIMLANE assignment pinned to DRONE IDENTITY (not sort rank): each
+        attacker owns ONE distinct vertical swimlane (0,1,2 = box 1<->4, 2<->5,
+        3<->6). KEEP every existing binding, free the lane of a drone that stopped
+        attacking, and give a freed lane only to a newly-appeared attacker (e.g. a
+        defender PROMOTED to attacker takes the dropped attacker's lane). So a
+        dropout never reshuffles the other attackers' lanes, and no two attackers
+        ever share a lane. Extras beyond the 3 lanes get NO lane (they just hover)."""
         attacker_set = set(attackers)
-        for old_fc in [f for f in self._atk_target if f not in attacker_set]:
-            del self._atk_target[old_fc]
-        taken = set(self._atk_target.values())
-        free = [s for s in enemy_slots if s not in taken]
+        for old_fc in [f for f in self._atk_lane if f not in attacker_set]:
+            del self._atk_lane[old_fc]
+        taken = set(self._atk_lane.values())
+        free = [l for l in range(S.NUM_SWIMLANES) if l not in taken]
         for fc in sorted(attackers):         # deterministic fill order
-            if fc not in self._atk_target and free:
-                self._atk_target[fc] = free.pop(0)
+            if fc not in self._atk_lane and free:
+                self._atk_lane[fc] = free.pop(0)
 
     async def _maybe_recapture(self, fc: str, now: float, cruise_alt: float) -> None:
         """DEFENDER reactive recapture: if one of OUR boxes is enemy-held (and
