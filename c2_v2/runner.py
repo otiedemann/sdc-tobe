@@ -254,17 +254,23 @@ class Runner:
             # the runner splices a recapture in the instant one flips.
             return S.defender_neutral_script(wall_id, standoff, alt, t)
         if role == "attacker":
+            # OPERATOR-BOUND swimlane (per-drone field) overrides auto-assignment:
+            # the two box slots the operator entered -> WAIT_AND_ATTACK both ends.
+            manual = (self.match.drones.get(fc) or {}).get("swimlane")
+            if manual and len(manual) == 2:
+                enemy_face, our_face = S.swimlane_faces_for_boxes(
+                    int(manual[0]), int(manual[1]), team)
+                return S.attacker_swimlane_script(int(enemy_face), int(our_face), alt, t)
             lane = self._atk_lane.get(fc)
             if lane is None:
-                # Extra attacker with no free lane -> just hover at home (no land).
+                # No manual swimlane and no free auto lane -> hover at home (no land).
                 wall = arena_state.home_wall_marker(team)
                 if not wall:
                     return None
                 return S.attacker_park_script(int(wall[0]), alt, rth_hdg, t)
-            # SWIMLANE: take off, then forever shuttle this attacker's straight
-            # vertical lane between its ENEMY box and OUR box, capturing/recapturing
-            # each whenever it shows the enemy colour (WAIT_AND_ATTACK at both ends).
-            # Self-contained REPEAT loop — no splice / box-state / FC mission-state.
+            # AUTO swimlane: shuttle this attacker's straight vertical lane between
+            # its ENEMY box and OUR box, capturing/recapturing each whenever it
+            # shows the enemy colour (WAIT_AND_ATTACK at both ends). REPEAT loop.
             enemy_face, our_face = S.swimlane_faces(int(lane), team)
             return S.attacker_swimlane_script(int(enemy_face), int(our_face), alt, t)
         return None
@@ -276,14 +282,25 @@ class Runner:
         attacking, and give a freed lane only to a newly-appeared attacker (e.g. a
         defender PROMOTED to attacker takes the dropped attacker's lane). So a
         dropout never reshuffles the other attackers' lanes, and no two attackers
-        ever share a lane. Extras beyond the 3 lanes get NO lane (they just hover)."""
+        ever share a lane. Extras beyond the 3 lanes get NO lane (they just hover).
+
+        Attackers the operator MANUALLY bound to a swimlane (drones[fc]['swimlane'])
+        are excluded from auto-assignment and don't hold an auto lane; if their
+        binding matches a standard vertical pair, that lane is reserved so an
+        auto-assigned attacker can't double up on it."""
+        drones = self.match.drones
+        manual = {fc for fc in attackers if (drones.get(fc) or {}).get("swimlane")}
         attacker_set = set(attackers)
-        for old_fc in [f for f in self._atk_lane if f not in attacker_set]:
+        for old_fc in [f for f in self._atk_lane if f not in attacker_set or f in manual]:
             del self._atk_lane[old_fc]
         taken = set(self._atk_lane.values())
+        for fc in manual:                    # reserve standard lanes used by bindings
+            lane = _swimlane_std_lane((drones.get(fc) or {}).get("swimlane"))
+            if lane is not None:
+                taken.add(lane)
         free = [l for l in range(S.NUM_SWIMLANES) if l not in taken]
         for fc in sorted(attackers):         # deterministic fill order
-            if fc not in self._atk_lane and free:
+            if fc not in manual and fc not in self._atk_lane and free:
                 self._atk_lane[fc] = free.pop(0)
 
     async def _maybe_recapture(self, fc: str, now: float, cruise_alt: float) -> None:
@@ -328,6 +345,16 @@ class Runner:
         else:
             self._last_action[fc] = f"recapture splice rejected ({payload})"
             logger.info("c2_v2: %s -> recapture splice rejected (%s)", fc, payload)
+
+
+def _swimlane_std_lane(swimlane) -> Optional[int]:
+    """The standard vertical lane (0,1,2) a manual swimlane occupies, or None if
+    it isn't a standard pair (box i <-> box i+3). Used to reserve the lane so
+    auto-assignment can't double up on it."""
+    if not swimlane or len(swimlane) != 2:
+        return None
+    lo, hi = sorted(int(s) for s in swimlane)
+    return (lo - 1) if (lo in (1, 2, 3) and hi == lo + 3) else None
 
 
 def _fan_out_angles(n: int) -> List[float]:

@@ -97,6 +97,13 @@ def build_app(pool: FCPool, match: Any = None, runner: Any = None,
             return _no_cache(jsonify({"ok": False, "error": "bad fc"})), 400
         return _no_cache(jsonify({"ok": True}))
 
+    @app.route("/api/drone/<fc>/swimlane", methods=["POST"])
+    def api_swimlane(fc):
+        body = request.get_json(silent=True) or {}
+        if match is None or not match.set_swimlane(fc, body.get("swimlane")):
+            return _no_cache(jsonify({"ok": False, "error": "bad fc/swimlane"})), 400
+        return _no_cache(jsonify({"ok": True}))
+
     @app.route("/api/tune", methods=["POST"])
     def api_tune():
         body = request.get_json(silent=True) or {}
@@ -338,6 +345,11 @@ function buildDroneCard(name){
       <select data-role="${name}">${roleOpts('idle')}</select>
       <label class="small"><input type="checkbox" data-enabled="${name}"> on</label>
     </div>
+    <div style="display:flex;gap:6px;align-items:center;margin-top:3px" title="Bind this attacker to a swimlane: the 2 box slots it shuttles, e.g. '3 6' (boxes 3 and 6). Empty = auto-assign. The resolved enemy-colour target markers are shown to the right.">
+      <span class="small" style="color:var(--muted)">swimlane</span>
+      <input data-swim="${name}" class="small" placeholder="auto" style="width:4.5em">
+      <span class="small" data-f="swimres" style="color:var(--muted)"></span>
+    </div>
     <div class="kv">
       <div class="k">pos (x,y,z)</div><div class="v" data-f="pos">—</div>
       <div class="k">height</div><div class="v" data-f="height">—</div>
@@ -353,6 +365,7 @@ function buildDroneCard(name){
   el.querySelectorAll("[data-f]").forEach(n=>{ refs[n.getAttribute("data-f")] = n; });
   refs.role = el.querySelector("[data-role]");
   refs.enabled = el.querySelector("[data-enabled]");
+  refs.swim = el.querySelector("[data-swim]");
   // Mark the select as "being edited" the moment the operator touches it (the
   // pointerdown/focus fire BEFORE the native popup opens), and keep it marked
   // briefly after blur so the change->POST->refresh round-trip can land before
@@ -387,6 +400,15 @@ function renderDrones(s){
     r.role.title = auto? "AUTO assigns roles" : "";
     const wantOn = cfg.enabled !== false;
     if(document.activeElement !== r.enabled && r.enabled.checked !== wantOn) r.enabled.checked = wantOn;
+    // swimlane binding: 2 box slots (e.g. "3 6") -> enemy-colour target markers.
+    const sw = cfg.swimlane; const wantSwim = (sw&&sw.length===2)? (sw[0]+" "+sw[1]) : "";
+    if(document.activeElement !== r.swim && r.swim.value.trim() !== wantSwim) r.swim.value = wantSwim;
+    if(r.swimres){
+      if(sw&&sw.length===2){
+        const base = (s.match&&s.match.our_team==='red') ? 30 : 40;  // enemy colour
+        r.swimres.textContent = "→ " + sw.map(x=>base+x).join(", ");
+      } else r.swimres.textContent = "";
+    }
     r.dot.className = "dot " + (d.connected?'ok':'bad');
     r.pos.textContent = d.position_m ? d.position_m.map(x=>x.toFixed(1)).join(", ") : "—";
     r.height.textContent = d.height_m==null?'—':d.height_m+' m';
@@ -497,6 +519,7 @@ document.addEventListener("change", async (e)=>{
   const t=e.target;
   if(t.matches("[data-role]")){ await api(`/api/drone/${encodeURIComponent(t.getAttribute("data-role"))}/role`, {role:t.value}); tick(); }
   if(t.matches("[data-enabled]")){ await api(`/api/drone/${encodeURIComponent(t.getAttribute("data-enabled"))}/enabled`, {enabled:t.checked}); tick(); }
+  if(t.matches("[data-swim]")){ await api(`/api/drone/${encodeURIComponent(t.getAttribute("data-swim"))}/swimlane`, {swimlane:t.value}); tick(); }
   if(t.matches("[data-tune]")){ await api("/api/tune", {key:t.getAttribute("data-tune"), value:parseFloat(t.value)}); tick(); }
 });
 tick(); setInterval(tick, 1000);
