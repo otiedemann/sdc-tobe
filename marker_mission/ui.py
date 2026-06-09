@@ -2710,8 +2710,15 @@ function renderGroups(view) {
         ? `<span class="tune-info" title="${descAttr}" tabindex="0">ⓘ</span>`
         : '';
       row.title = desc;
+      // Choices => render a <select> regardless of kind.
+      const hasChoices = Array.isArray(it.choices) && it.choices.length > 0;
       let inputType, stepAttr, valueAttr;
-      if (it.kind === 'bool') {
+      if (hasChoices) {
+        // Handled below via a different innerHTML branch.
+        inputType = 'select';
+        stepAttr  = '';
+        valueAttr = '';
+      } else if (it.kind === 'bool') {
         inputType = 'checkbox';
         stepAttr  = '';
         // Boolean values come through as JS true/false from the
@@ -2738,12 +2745,24 @@ function renderGroups(view) {
                         padding:.1rem .4rem; border-radius:3px;
                         font-size:.7rem; margin-left:.4rem;">⚠ DANGEROUS</span>`
         : '';
+      let inputHtml;
+      if (hasChoices) {
+        const opts = it.choices.map(c => {
+          const sel = (String(c) === String(it.value)) ? ' selected' : '';
+          const safe = String(c).replace(/&/g, '&amp;').replace(/"/g, '&quot;');
+          return `<option value="${safe}"${sel}>${safe}</option>`;
+        }).join('');
+        inputHtml = `<select class="tune-input" data-name="${it.name}"
+                             data-kind="${it.kind}" title="${descAttr}">${opts}</select>`;
+      } else {
+        inputHtml = `<input class="tune-input" type="${inputType}" data-name="${it.name}"
+               data-kind="${it.kind}" ${stepAttr} ${valueAttr}
+               title="${descAttr}">`;
+      }
       row.innerHTML = `
         <span class="tune-label">${it.label} ${infoHtml}${warnHtml}
           <span style="color:#6b7280; font-size:.75rem;">(${it.name})</span></span>
-        <input class="tune-input" type="${inputType}" data-name="${it.name}"
-               data-kind="${it.kind}" ${stepAttr} ${valueAttr}
-               title="${descAttr}">
+        ${inputHtml}
         <span class="tune-unit">${it.unit || ''}</span>
         <span class="tune-default">default: ${it.default}</span>
         <button type="button" class="tune-resetbtn" data-name="${it.name}">reset</button>
@@ -2754,21 +2773,24 @@ function renderGroups(view) {
   }
   // Wire input change-tracking, per-field reset, and auto-apply
   document.querySelectorAll('.tune-input').forEach(inp => {
-    const isBool = inp.dataset.kind === 'bool';
+    const isBool   = inp.dataset.kind === 'bool';
+    const isSelect = inp.tagName === 'SELECT';
     const fieldVal = () => isBool
       ? (inp.checked ? 'true' : 'false')
       : String(inp.value);
-    inp.addEventListener(isBool ? 'change' : 'input', () => {
+    // Bools + selects: fire on 'change' and commit immediately.
+    // Text/number inputs: fire on 'input' and debounce.
+    const eventName = (isBool || isSelect) ? 'change' : 'input';
+    inp.addEventListener(eventName, () => {
       const name = inp.dataset.name;
       const def = String(TUNE_FIELDS[name].default);
       if (fieldVal() !== def) inp.classList.add('dirty');
       else inp.classList.remove('dirty');
       TUNE_DIRTY.add(name);
-      // Bools commit on change immediately; non-bools debounce.
-      if (isBool) applyFieldNow(name);
-      else        scheduleAutoApply(name);
+      if (isBool || isSelect) applyFieldNow(name);
+      else                    scheduleAutoApply(name);
     });
-    if (!isBool) {
+    if (!isBool && !isSelect) {
       // Also commit immediately on blur / Enter (cancels any pending
       // debounce so the user gets fast feedback when leaving the field).
       inp.addEventListener('change', () => applyFieldNow(inp.dataset.name));

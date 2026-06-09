@@ -290,7 +290,8 @@ def cmd_fly(args: argparse.Namespace) -> int:
     else:
         reader = MjpegStreamReader(api.video_url())
     reader.start()
-    detector = ArucoDetector(calibration, cfg.marker_size_m, cfg.aruco_dict)
+    detector = ArucoDetector(calibration, cfg.marker_size_m, cfg.aruco_dict,
+                             profile=cfg.aruco_detector_profile)
     detector.enable_mirror_collapse = cfg.enable_ippe_mirror_collapse
 
     # ---------- 2b. Arena world-position estimator -----------------------
@@ -965,6 +966,10 @@ def cmd_fly(args: argparse.Namespace) -> int:
                 detector.set_marker_size(
                     _arena_now.marker_size_m if _arena_now is not None
                     else cfg.marker_size_m)
+                # Live-sync detector profile from /tune. set_profile
+                # is a no-op when unchanged; when it changes it rebuilds
+                # the OpenCV ArucoDetector with the new params.
+                detector.set_profile(cfg.aruco_detector_profile)
                 # Per-marker size resolver. Targets (ids 31..46 by
                 # default) are 18cm boxes while wall markers are 50cm;
                 # without this the detector would assume the arena

@@ -105,6 +105,12 @@ class MissionConfig:
     target_marker_id: int = 4              # ArUco ID of the central marker
     marker_size_m: float = 0.18            # physical side length [m]
     aruco_dict: str = "DICT_4X4_50"        # OpenCV dict name
+    # Detector tuning profile: "sensitive" (default -- APRILTAG
+    # refinement + low perimeter floor + high error correction; needed
+    # for small target-box markers), "balanced" (prior behaviour, only
+    # adequate for large wall markers), or "strict" (fewer false
+    # positives, may miss small markers).
+    aruco_detector_profile: str = "sensitive"
     # --- Per-id size override fallback ---------------------------------------
     # When the arena config doesn't carry a per-marker ``size_m`` override
     # (legacy arena.json files don't), the detector falls back to this:
@@ -790,6 +796,12 @@ TUNING_FIELDS = {
         "desc": "Single character. Pressing this key anywhere on the web UI (including inside textareas / number inputs) immediately triggers /api/stop and lands the drone. Default '@'. Comparison is case-insensitive; modifier keys (Ctrl/Cmd/Alt) are excluded so browser shortcuts still work.",
     },
 
+    "aruco_detector_profile": {
+        "label": "ArUco detector profile", "kind": "str",
+        "choices": ["sensitive", "balanced", "strict"],
+        "desc": "Detector tuning preset. 'sensitive' (default) uses APRILTAG corner refinement, low minMarkerPerimeterRate, and high errorCorrectionRate -- meaningfully better detection of small target-box markers, at the cost of ~2-3x detector CPU and a higher false-positive rate (filtered downstream by dict + ID). 'balanced' = SUBPIX refinement + default thresholds (the pre-2026-05-23 behaviour). 'strict' = fewer false positives, may miss small/far markers. Applied live via vision_worker on the next frame.",
+    },
+
     "enable_ippe_mirror_collapse": {
         "label": "Mirror collapse", "kind": "bool",
         "desc": "Truly-frontal blind window only (max|hdg| < 10 deg AND heading sum ~0 AND similar reproj-err): collapse the per-marker world-position vote to the midpoint of the two IPPE candidates. Disabling reverts to whichever branch IPPE picked, which flips on noise at <3 deg tilt. Default ON.",
@@ -893,6 +905,8 @@ TUNING_GROUPS = [
         ["pose_smoothing_alpha", "pose_max_age_s"]),
     ("Operator UX",
         ["killswitch_key"]),
+    ("Vision / detector",
+        ["aruco_detector_profile"]),
     ("IPPE branch picker (advanced)",
         ["enable_ippe_mirror_collapse",
          "mirror_collapse_sum_hdg_deg",
@@ -925,7 +939,7 @@ def tuning_view(cfg: MissionConfig) -> dict:
         items = []
         for f in fields:
             meta = TUNING_FIELDS.get(f, {})
-            items.append({
+            entry = {
                 "name":    f,
                 "label":   meta.get("label", f),
                 "kind":    meta.get("kind", "float"),
@@ -934,6 +948,9 @@ def tuning_view(cfg: MissionConfig) -> dict:
                 "desc":    meta.get("desc", ""),
                 "value":   getattr(cfg, f),
                 "default": getattr(defaults, f),
-            })
+            }
+            if "choices" in meta:
+                entry["choices"] = list(meta["choices"])
+            items.append(entry)
         groups.append({"name": group_name, "items": items})
     return {"groups": groups}

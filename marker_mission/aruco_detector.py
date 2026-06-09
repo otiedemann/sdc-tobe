@@ -149,18 +149,18 @@ class ArucoDetector:
 
     def __init__(self, calibration: Calibration,
                  marker_size_m: float,
-                 dict_name: str = "DICT_4X4_50"):
+                 dict_name: str = "DICT_4X4_50",
+                 profile: str = "sensitive"):
         if dict_name not in _ARUCO_DICTS:
             raise ValueError(f"unknown aruco dict: {dict_name}")
         self.calibration = calibration
         self.marker_size = float(marker_size_m)
         self.dict_id = _ARUCO_DICTS[dict_name]
         self._aruco_dict = cv2.aruco.getPredefinedDictionary(self.dict_id)
+        self.profile = ""  # populated by _apply_profile below
         self._params = cv2.aruco.DetectorParameters()
-        # Tighten the corner refinement for sub-pixel quality.
-        self._params.cornerRefinementMethod = cv2.aruco.CORNER_REFINE_SUBPIX
-        self._params.cornerRefinementWinSize = 5
-        self._detector = cv2.aruco.ArucoDetector(self._aruco_dict, self._params)
+        self._detector = None  # built in _apply_profile
+        self._apply_profile(profile)
         # Cache zoom-scaled camera matrices: zoom→K_eff. Avoids K.copy() +
         # scalar multiply on every frame when search zoom is active.
         self._K_zoom_cache: dict[float, np.ndarray] = {}
@@ -227,6 +227,59 @@ class ArucoDetector:
             return
         self.marker_size = new
         self._rebuild_obj_pts()
+
+    def _apply_profile(self, profile: str) -> None:
+        """Write the chosen profile into ``self._params`` and rebuild
+        the ``cv2.aruco.ArucoDetector`` so the new params take effect.
+        Numbers ported from aruco-position/controller-modular/
+        aruco_position.py."""
+        p = self._params
+        if profile == "sensitive":
+            # Small/far markers. APRILTAG refinement is ~2-3x SUBPIX
+            # CPU but materially better on markers spanning only a
+            # few tens of pixels. Lower perimeter floor + higher error
+            # correction trade false-positive rate for recall.
+            p.cornerRefinementMethod = cv2.aruco.CORNER_REFINE_APRILTAG
+            p.minMarkerPerimeterRate = 0.015
+            p.maxMarkerPerimeterRate = 4.0
+            p.adaptiveThreshWinSizeMin = 3
+            p.adaptiveThreshWinSizeMax = 31
+            p.adaptiveThreshWinSizeStep = 4
+            p.adaptiveThreshConstant = 7
+            p.polygonalApproxAccuracyRate = 0.05
+            p.errorCorrectionRate = 0.8
+            p.minCornerDistanceRate = 0.03
+            p.minDistanceToBorder = 3
+        elif profile == "strict":
+            p.cornerRefinementMethod = cv2.aruco.CORNER_REFINE_SUBPIX
+            p.cornerRefinementWinSize = 5
+            p.minMarkerPerimeterRate = 0.03
+            p.maxMarkerPerimeterRate = 4.0
+            p.adaptiveThreshWinSizeMin = 5
+            p.adaptiveThreshWinSizeMax = 31
+            p.adaptiveThreshWinSizeStep = 6
+            p.adaptiveThreshConstant = 10
+            p.polygonalApproxAccuracyRate = 0.04
+            p.errorCorrectionRate = 0.6
+            p.minCornerDistanceRate = 0.06
+            p.minDistanceToBorder = 8
+        else:
+            # "balanced" -- backwards-compatible default.
+            profile = "balanced"
+            p.cornerRefinementMethod = cv2.aruco.CORNER_REFINE_SUBPIX
+            p.cornerRefinementWinSize = 5
+        self.profile = profile
+        self._detector = cv2.aruco.ArucoDetector(self._aruco_dict, p)
+
+    def set_profile(self, profile: str) -> None:
+        """Live update of the detector tuning profile. Cheap when
+        unchanged (no-op); rebuilds the OpenCV ArucoDetector instance
+        when it actually changes. Called every tick from
+        ``vision_worker`` so a /tune flip propagates without a
+        restart."""
+        if profile == self.profile:
+            return
+        self._apply_profile(profile)
 
     def set_size_resolver(
         self, resolver: Optional[Callable[[int], float]],
