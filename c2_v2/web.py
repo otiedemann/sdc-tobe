@@ -323,6 +323,12 @@ function roleOpts(cur){
 // has it open, snapping the dropdown shut before they can pick — so the panel
 // is built once and the controls are never recreated (mirrors renderTune).
 const droneCards = {};  // name -> {el, refs}
+// Names whose role <select> the operator is currently interacting with. While a
+// name is in here we do NOT reconcile its <select>.value from the server: writing
+// select.value while the native dropdown popup is open CANCELS the operator's
+// pick (macOS/Chrome), so the change event never fires and the role never
+// switches — which is exactly why the dropdown appeared "stuck" on the old role.
+const editingRoles = new Set();
 function buildDroneCard(name){
   const el = document.createElement("div");
   el.className = "drone";
@@ -347,6 +353,14 @@ function buildDroneCard(name){
   el.querySelectorAll("[data-f]").forEach(n=>{ refs[n.getAttribute("data-f")] = n; });
   refs.role = el.querySelector("[data-role]");
   refs.enabled = el.querySelector("[data-enabled]");
+  // Mark the select as "being edited" the moment the operator touches it (the
+  // pointerdown/focus fire BEFORE the native popup opens), and keep it marked
+  // briefly after blur so the change->POST->refresh round-trip can land before
+  // the per-tick reconciliation resumes.
+  const hold = ()=> editingRoles.add(name);
+  refs.role.addEventListener("pointerdown", hold);
+  refs.role.addEventListener("focus", hold);
+  refs.role.addEventListener("blur", ()=> setTimeout(()=> editingRoles.delete(name), 600));
   return {el, refs};
 }
 function renderDrones(s){
@@ -361,12 +375,18 @@ function renderDrones(s){
     const el = card.el, r = card.refs;
     const cfg = cfgs[d.name]||{};
     el.className = "drone" + (d.connected? "":" off");
-    // role select: never clobber while the operator has it open/focused; in
-    // AUTO the coordinator owns roles so it is disabled (but kept, not rebuilt).
-    if(document.activeElement !== r.role) r.role.value = cfg.role || 'idle';
+    // role select: reconcile to the server value ONLY when the operator is not
+    // interacting with it AND it actually differs. The differs-check matters as
+    // much as the editing guard: in steady state value===want, so we never write
+    // and never disturb an open popup; in AUTO the coordinator owns roles so the
+    // select is disabled (and a disabled select fires no focus, so reconciliation
+    // still reflects coordinator changes).
+    const wantRole = cfg.role || 'idle';
+    if(!editingRoles.has(d.name) && r.role.value !== wantRole) r.role.value = wantRole;
     r.role.disabled = auto;
     r.role.title = auto? "AUTO assigns roles" : "";
-    if(document.activeElement !== r.enabled) r.enabled.checked = cfg.enabled !== false;
+    const wantOn = cfg.enabled !== false;
+    if(document.activeElement !== r.enabled && r.enabled.checked !== wantOn) r.enabled.checked = wantOn;
     r.dot.className = "dot " + (d.connected?'ok':'bad');
     r.pos.textContent = d.position_m ? d.position_m.map(x=>x.toFixed(1)).join(", ") : "—";
     r.height.textContent = d.height_m==null?'—':d.height_m+' m';
@@ -383,7 +403,7 @@ function renderDrones(s){
   }
   // drop cards for drones that vanished from the snapshot
   for(const name of Object.keys(droneCards)){
-    if(!seen.has(name)){ droneCards[name].el.remove(); delete droneCards[name]; }
+    if(!seen.has(name)){ droneCards[name].el.remove(); delete droneCards[name]; editingRoles.delete(name); }
   }
 }
 function renderBoxes(s){
