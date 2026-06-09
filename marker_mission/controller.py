@@ -317,6 +317,10 @@ MID_HA_MAX_S: float = 5.0
 # the drone simply cannot descend far enough). Force APPROACH after this many
 # seconds so the mission doesn't stall indefinitely.
 HEIGHT_ALIGN_MAX_S: float = 5.0
+# Hard timeout for the lost-box SEARCH "descend back to the approach-start
+# height" gate. Bounds the descend so a noisy altimeter (or a target below the
+# min-height floor) can never stall the search before the yaw sweep starts.
+SEARCH_DESCEND_MAX_S: float = 6.0
 
 # FB_BRAKE world-position fallback parameters. When vision can't see
 # the target marker (yaw drift, occlusion, marker outside FOV), the
@@ -516,6 +520,13 @@ class MissionState:
     # current radius (we don't want to close distance until heading is
     # centred). Cleared when leaving ALIGN.
     align_distance_m: Optional[float] = None
+    # Altimeter height (m) captured the FIRST time a capture-APPROACH onto a
+    # target box (ids target_marker_id_min..max) begins. A lost-box SEARCH
+    # descends back to this before yawing, so a brief HEIGHT_ALIGN to a high /
+    # oblique marker -- or a GO_HOME recovery anchor -- can't strand the drone
+    # above the (low) box where it would never re-enter the search FOV. None
+    # when the active target isn't a box or no telemetry was available.
+    approach_start_height_m: Optional[float] = None
 
     # Mission-script execution state. Set by trigger() -- the controller
     # walks the script one step at a time; _advance_script consumes it.
@@ -728,6 +739,7 @@ class MissionState:
             self.search_retreat_until = None
             self.last_marker_seen_at = 0.0
             self.align_distance_m = None
+            self.approach_start_height_m = None
             self.mission_script = []
             self.mission_step_idx = -1
             self.current_step_kind = None
@@ -940,8 +952,9 @@ class MissionController:
         self._search_visited_markers: set = set()
         self._goto_on_settle_phase = None
         self._goto_on_settle_restart_mission = False
-        # Set by the marker-lost GO_HOME recovery: restart the mission when the
-        # recovery APPROACH settles (vision-only, no TO). See _recover_via_gohome.
+        # Set by the marker-lost centre-marker recovery: restart the mission
+        # when the recovery APPROACH settles (vision-only, no TO).
+        # See _recover_via_central_marker.
         self._approach_on_settle_restart_mission = False
         # Bounded recovery budget: consecutive GO_HOME re-anchor hops without
         # re-acquiring the TARGET. Reset to 0 on real target re-acquisition.
@@ -1038,6 +1051,15 @@ class MissionController:
         self._search_prev_yaw = None
         self._search_esc_level: int = 0          # 0=1x/full, 1=2x/half, 2+=navigate
         self._search_visited_markers: set = set()  # wall-marker IDs already navigated to
+        # Lost-box "descend back to approach-start height" state.
+        # _box_height_marker remembers which box id approach_start_height_m was
+        # captured for, so a recovery-driven mission RESTART (which re-runs the
+        # APPROACH step from idx -1) cannot overwrite the original low altitude
+        # with the climbed one. _search_descend_active gates the descend that
+        # runs before the yaw sweep on each box SEARCH entry.
+        self._box_height_marker: Optional[int] = None
+        self._search_descend_active: bool = False
+        self._search_descend_deadline: float = 0.0
         self._goto_on_settle_phase: Optional[Phase] = None  # override post-GOTO transition
         self._goto_on_settle_restart_mission: bool = False  # restart mission from step 0 on GOTO settle
         self._approach_on_settle_restart_mission: bool = False  # restart mission on recovery-GO_HOME settle
@@ -1072,6 +1094,13 @@ class MissionController:
         # budget only resets on a genuinely new task or a real re-acquisition.
         self._recovery_count = 0
         self._approach_on_settle_restart_mission = False
+        # A new task re-snapshots the approach-start height per box. The
+        # recovery restart re-runs via _advance_script (NOT set_script), so the
+        # original (low) snapshot survives a restart -- the whole point of the
+        # per-marker guard below.
+        self._box_height_marker = None
+        with self.state.lock:
+            self.state.approach_start_height_m = None
 
     def splice_script(self, steps: List[Step]) -> tuple[bool, str]:
         """Live-replace the REMAINING mission steps WITHOUT landing.
@@ -1524,10 +1553,15 @@ class MissionController:
     _SEARCH_MIN_YAW_RC: int = 3
     # Maximum digital zoom (Anafi hardware cap).
     _SEARCH_MAX_ZOOM: float = 3.0
-    # Marker-lost recovery (NO absolute TO): GO_HOME onto whatever marker is
-    # visible, to this loose standoff, then restart the mission. Operator:
-    # "rotate at 70 until a marker is seen and approach it with GO_HOME 3 1".
-    _RECOVERY_STANDOFF_M: float = 3.0
+    # Marker-lost recovery (NO absolute TO): approach the most CENTRAL marker on
+    # whichever WALL is currently in view (up to four candidates, one per wall,
+    # all computed from the live arena at runtime -- never a hard-coded id),
+    # with a standoff computed so a head-on approach lands the drone
+    # approximately at the arena origin (0,0), then restart the mission. The
+    # standoff sits in the arena interior in FRONT of the centre marker, so the
+    # recovery never backs the drone toward a side/back net. Standoff bounds are
+    # derived from the arena's own width/depth (see _recovery_candidates), not
+    # fixed magic numbers.
     _RECOVERY_TOL_M: float = 1.0
     # Cap on consecutive recover->restart hops without re-acquiring the target.
     # Past this we stop the active-flight recovery and spin in place waiting for
@@ -1535,46 +1569,104 @@ class MissionController:
     # battery) forever.
     _MAX_RECOVERY_HOPS: int = 3
 
-    def _recover_via_gohome(self, now: float) -> bool:
-        """Marker-lost recovery WITHOUT any absolute TO. Pick a currently-VISIBLE
-        ArUco marker and GO_HOME onto it by vision (loose 3 m / ±1 m, holding
-        altitude), then RESTART the mission so the C2's task re-runs. Returns
-        False if nothing is visible (caller keeps rotating) OR the recovery
-        budget (_MAX_RECOVERY_HOPS) is exhausted — so the caller stops re-anchor
-        flight and spins in place. Replaces the old GOTO/TO ``_navigate_to_*``."""
+    def _recovery_candidates(self) -> list[tuple[int, float]]:
+        """Up to four marker-lost recovery targets -- the most CENTRAL marker on
+        EACH wall -- computed from the LIVE arena (no hard-coded ids). Returns a
+        list of ``(marker_id, standoff_m)``; the recovery approaches whichever is
+        in view, so a single unseen marker can never strand the drone.
+
+        Per wall: the marker closest to the origin in the horizontal plane (i.e.
+        nearest the wall's centre, where its inward normal passes through the
+        origin), preferring the LOWER of a high/low pair (easier to approach at
+        flight altitude). ``cfg.recovery_marker_id``, if set, forces a single
+        explicit candidate instead.
+
+        Standoff: the marker's horizontal distance to the origin. Arena markers
+        sit on the inside wall face with their normal pointing toward the origin
+        (see arena.py), so a head-on approach at this standoff lands the drone
+        approximately at (0,0). Bounded by the arena's OWN geometry -- a
+        wall-clearance floor (10% of the smaller span) and the arena
+        half-diagonal ceiling -- so the value scales with the arena instead of
+        fixed magic numbers."""
+        arena = self.get_arena() if callable(self.get_arena) else None
+        if arena is None or not arena.markers:
+            return []
+
+        width = float(getattr(arena, "width_m", 0.0) or 0.0)
+        depth = float(getattr(arena, "depth_m", 0.0) or 0.0)
+        clearance = 0.1 * min(width, depth) if (width > 0 and depth > 0) else 0.0
+        ceiling = math.hypot(width, depth) / 2.0 if (width > 0 or depth > 0) \
+            else float("inf")
+
+        def _bound(dist0: float) -> float:
+            return max(clearance, min(dist0, ceiling))
+
+        def _key(m) -> Optional[tuple[float, float]]:
+            # (horizontal distance to origin, height) -- most central, then
+            # lowest. None if the marker has no usable position.
+            try:
+                return (math.hypot(float(m.position_m[0]),
+                                   float(m.position_m[1])),
+                        float(m.position_m[2]))
+            except (TypeError, IndexError, ValueError):
+                return None
+
+        override = getattr(self.cfg, "recovery_marker_id", None)
+        if override is not None and int(override) in arena.markers:
+            k = _key(arena.markers[int(override)])
+            if k is not None:
+                return [(int(override), _bound(k[0]))]
+
+        # Most-central marker per wall -> at most one candidate per wall.
+        best_per_wall: dict[str, tuple[tuple[float, float], int]] = {}
+        for mid, m in arena.markers.items():
+            k = _key(m)
+            if k is None:
+                continue
+            wall = str(getattr(m, "wall", "")) or "?"
+            cur = best_per_wall.get(wall)
+            if cur is None or k < cur[0]:
+                best_per_wall[wall] = (k, int(mid))
+        return [(mid, _bound(k[0])) for k, mid in best_per_wall.values()]
+
+    def _recover_via_central_marker(self, now: float) -> bool:
+        """Marker-lost recovery (NO absolute TO): approach the most CENTRAL
+        marker on whichever wall is currently in view by vision (holding
+        altitude), then RESTART the mission so the C2's task re-runs.
+
+        Unlike the old "anchor on whatever marker is visible" recovery -- which
+        could repeatedly pick the same corner marker (drone stuck in a corner)
+        and back the drone toward a side net to reach standoff -- this homes
+        onto a wall-centre marker, whose standoff sits in the arena interior in
+        FRONT of it (~origin). It considers all four walls, so an unseen marker
+        on one wall doesn't strand the drone -- another wall's centre marker is
+        used instead.
+
+        Returns False (caller keeps rotating + zoom-escalating) when: the hop
+        budget is exhausted, no arena candidate is known, or NONE of the
+        candidates are in view yet. We only COMMIT (and spend a hop) once a
+        centre marker is actually visible, so the approach is never open-loop."""
         if self._recovery_count >= self._MAX_RECOVERY_HOPS:
             return False
-        with self.state.lock:
-            visible_ids = list(self.state.visible_marker_ids)
-            last_pose = self.state.last_pose
-        if not visible_ids:
+        candidates = self._recovery_candidates()
+        if not candidates:
             return False
-        # Prefer the marker we already have a fresh pose for; else an arena wall
-        # marker (stable reference); else just the first visible id. Any marker
-        # works — we only need a vision anchor to re-establish position.
-        best: Optional[int] = None
-        if last_pose is not None:
-            try:
-                lp_id = int(last_pose.marker_id)
-            except (TypeError, ValueError, AttributeError):
-                lp_id = None
-            if lp_id is not None and lp_id in visible_ids:
-                best = lp_id
-        if best is None:
-            arena = self.get_arena() if callable(self.get_arena) else None
-            if arena is not None:
-                for mid in visible_ids:
-                    if mid in arena.markers:
-                        best = int(mid)
-                        break
-        if best is None:
-            best = int(visible_ids[0])
+        with self.state.lock:
+            visible_ids = set(self.state.visible_marker_ids)
+        visible = [(mid, so) for (mid, so) in candidates if mid in visible_ids]
+        if not visible:
+            # No wall-centre marker in the current FOV -- let the caller keep
+            # sweeping and escalating zoom until one rotates into view.
+            return False
+        # Prefer the nearest candidate (smallest standoff): it's the easiest to
+        # detect and approach, and still lands ~at the origin.
+        central, standoff = min(visible, key=lambda c: c[1])
         # Reset the smoother so it doesn't blend the OLD target's pose with the
-        # new anchor marker's pose across the switch.
+        # centre marker's pose across the switch.
         self.smoother.reset()
         with self.state.lock:
-            self.state.active_marker_id = best
-            self.state.target_distance_m = self._RECOVERY_STANDOFF_M
+            self.state.active_marker_id = central
+            self.state.target_distance_m = standoff
             self.state.target_distance_tol_m = self._RECOVERY_TOL_M
             self.state.approach_positioning = True    # vision-home, hold altitude
             self.state.arrive_hdg_tol_deg = None
@@ -1586,12 +1678,12 @@ class MissionController:
         self._set_phase(
             Phase.SEARCH,
             f"recovery {self._recovery_count}/{self._MAX_RECOVERY_HOPS}: "
-            f"GO_HOME visible marker {best} "
-            f"({self._RECOVERY_STANDOFF_M:g}m) then restart mission")
+            f"approach CENTRE marker {central} @ {standoff:.1f}m (~origin) "
+            f"then restart mission")
         print(f"[ctrl] marker-lost recovery "
-              f"{self._recovery_count}/{self._MAX_RECOVERY_HOPS} → GO_HOME "
-              f"visible marker {best} ({self._RECOVERY_STANDOFF_M:g}m, vision, "
-              f"no TO) then restart")
+              f"{self._recovery_count}/{self._MAX_RECOVERY_HOPS} → approach "
+              f"CENTRE marker {central} @ {standoff:.1f}m (~origin, vision) "
+              f"then restart")
         return True
 
     def _step_search(self, now: float) -> None:
@@ -1660,6 +1752,54 @@ class MissionController:
                 self.api.camera_config_set(zoom=1.25)
             except Exception:
                 pass
+            # Arm the descend-to-approach-height for a lost TARGET BOX: a brief
+            # HEIGHT_ALIGN to a high/oblique marker -- or a GO_HOME recovery
+            # anchor -- can strand the drone above the (low) box, out of the
+            # search FOV. Only for a capture APPROACH (not a loose GO_HOME,
+            # which holds altitude by design) onto a box id, and only when we
+            # have a snapshot to return to.
+            self._search_descend_active = False
+            self._search_descend_deadline = now + SEARCH_DESCEND_MAX_S
+            if getattr(cfg, "search_descend_to_start_height", True):
+                with self.state.lock:
+                    _h_start = self.state.approach_start_height_m
+                    _amid = self.state.active_marker_id
+                    _loose = self.state.approach_positioning
+                if (_h_start is not None and _amid is not None and not _loose
+                        and cfg.target_marker_id_min
+                        <= _amid <= cfg.target_marker_id_max):
+                    self._search_descend_active = True
+
+        # Descend back to the approach-start height BEFORE the retreat/yaw sweep
+        # so a lost box is back in the camera's vertical FOV. Descend-only (it
+        # never climbs back up); the _send_rc min-height floor still applies, and
+        # the target is clamped to that floor so e_h can always reach the
+        # deadband. Bounded by SEARCH_DESCEND_MAX_S against a noisy altimeter.
+        if self._search_descend_active:
+            if now >= self._search_descend_deadline:
+                self._search_descend_active = False
+            else:
+                with self.state.lock:
+                    tel = self.state.last_telemetry
+                    _h_start = self.state.approach_start_height_m
+                drone_h = (tel.height_cm / 100.0
+                           if tel is not None and tel.height_cm is not None
+                           else None)
+                if drone_h is None or _h_start is None:
+                    self._search_descend_active = False
+                else:
+                    _tgt = max(_h_start, cfg.min_height_m)
+                    e_h = drone_h - _tgt              # > 0 => too high
+                    if e_h > cfg.height_deadband_m:
+                        ud = -max(0, min(int(e_h * cfg.height_kp),
+                                         cfg.ud_rc_max))
+                        self._send_rc(0, 0, ud, 0)
+                        with self.state.lock:
+                            self.state.note = (
+                                f"SEARCH descend {drone_h:.2f}->{_tgt:.2f}m "
+                                f"ud={ud}")
+                        return
+                    self._search_descend_active = False
 
         # Retreat-then-yaw: when we entered SEARCH after losing a
         # marker the controller was actively tracking, _set_phase
@@ -1706,18 +1846,19 @@ class MissionController:
                     self._search_swept = 0.0
                     self._search_esc_level += 1
 
-                    # RECOVERY (operator-specified, NO absolute TO): after a full
-                    # rotation without re-acquiring the target, if ANY marker is
-                    # now visible, GO_HOME onto it (vision, 3 m) to re-establish a
-                    # position anchor, then restart the mission. This replaces the
-                    # old GOTO/TO-based nav-to-wall recoveries entirely (which
-                    # drove the drone toward walls and risked crashes). It is safe
-                    # for any target — GO_HOME stops a standoff short of a marker
-                    # it can SEE, so it never open-loops into a wall.
-                    if self._recover_via_gohome(now):
+                    # RECOVERY (NO absolute TO): after a full rotation without
+                    # re-acquiring the target, approach the fixed CENTRE marker
+                    # (vision, 3 m) to re-establish a position anchor, then
+                    # restart the mission. Always homing onto the centre marker
+                    # -- rather than whatever happens to be visible -- stops the
+                    # drone getting stuck on a corner marker and keeps the
+                    # standoff in the arena interior (never backs toward a net).
+                    # It only commits once the centre marker is in view, so it
+                    # never open-loops into a wall.
+                    if self._recover_via_central_marker(now):
                         return
-                    # Recovery returned False -> either nothing visible OR the
-                    # hop budget is exhausted. If exhausted, STOP looping: end
+                    # Recovery returned False -> centre marker not yet visible OR
+                    # the hop budget is exhausted. If exhausted, STOP looping: end
                     # the mission so the FC goes idle and the C2 can re-task
                     # (its decide() only pushes a new script when the FC is
                     # idle, so an in-place spin would never get re-tasked). This
@@ -1725,8 +1866,9 @@ class MissionController:
                     if self._recovery_count >= self._MAX_RECOVERY_HOPS:
                         self._terminate_script(
                             f"marker-lost recovery exhausted "
-                            f"({self._MAX_RECOVERY_HOPS} GO_HOME hops, target "
-                            f"unrecoverable) — ending mission, yielding to C2")
+                            f"({self._MAX_RECOVERY_HOPS} centre-marker hops, "
+                            f"target unrecoverable) — ending mission, yielding "
+                            f"to C2")
                         return
                     # Nothing visible yet — keep rotating at the search speed and
                     # escalate zoom (1.25 -> 2 -> 3x) to spot a distant marker.
@@ -3778,7 +3920,8 @@ class MissionController:
             # parse-time defaults (defaults_from_cfg) and the user's
             # tune-page values. Phases read from state.target_*.
             # A real mission APPROACH/GO_HOME step: never the recovery hop, so
-            # clear the recovery restart hook (only _recover_via_gohome sets it).
+            # clear the recovery restart hook (only _recover_via_central_marker
+            # sets it).
             self._approach_on_settle_restart_mission = False
             with self.state.lock:
                 self.state.active_marker_id = int(step.marker_id)
@@ -3814,6 +3957,30 @@ class MissionController:
                     float(step.arrive_yaw_tol_deg)
                     if getattr(step, "arrive_yaw_tol_deg", None) is not None
                     else None)
+                # Snapshot the altitude this capture-APPROACH onto a target box
+                # begins at, so a lost-box SEARCH can descend back to it instead
+                # of yawing from whatever height a brief HEIGHT_ALIGN or a
+                # GO_HOME recovery anchor dragged us up to. Capture ONCE per
+                # distinct box id: a recovery restart re-runs this branch from
+                # mission_step_idx=-1, and must NOT overwrite the original (low)
+                # height with the already-climbed one. arrive_tol_m is None for a
+                # capture APPROACH (a loose GO_HOME carries it) -- GO_HOME homes
+                # at the current altitude anyway, so it never needs this.
+                _mid = int(step.marker_id)
+                _is_box = (step.arrive_tol_m is None
+                           and self.cfg.target_marker_id_min
+                           <= _mid <= self.cfg.target_marker_id_max)
+                if _is_box:
+                    if self._box_height_marker != _mid:
+                        _tel0 = self.state.last_telemetry
+                        self._box_height_marker = _mid
+                        self.state.approach_start_height_m = (
+                            _tel0.height_cm / 100.0
+                            if _tel0 is not None
+                            and _tel0.height_cm is not None else None)
+                else:
+                    self._box_height_marker = None
+                    self.state.approach_start_height_m = None
             self._set_phase(Phase.SEARCH,
                             note + f" id={int(step.marker_id)}"
                                    f" d={float(step.distance):g}m"

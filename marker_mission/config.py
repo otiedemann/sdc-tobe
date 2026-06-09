@@ -291,6 +291,21 @@ class MissionConfig:
                                             # (always applied as -fb stick)
     search_backrotate_deg: int = 10        # TUNE  degrees CCW to step back when
                                             # marker is first detected mid-sweep
+    # When a capture-APPROACH onto a target box (id target_marker_id_min..max)
+    # loses the marker and re-enters SEARCH, first descend back to the altitude
+    # the APPROACH began at before yawing. Stops a brief HEIGHT_ALIGN to a high
+    # marker -- or a GO_HOME recovery anchor at a high wall marker -- from
+    # stranding the drone above the (low) box where it never re-enters the
+    # search FOV. Descend-only; bounded by SEARCH_DESCEND_MAX_S in controller.py.
+    search_descend_to_start_height: bool = True
+    # Marker the marker-lost recovery homes onto. The recovery no longer
+    # anchors on "whatever marker is visible" (which could repeatedly pick the
+    # same corner marker -- drone stuck in a corner -- and back the drone toward
+    # a side net to reach standoff). Instead it approaches a fixed CENTRAL
+    # marker, whose 3 m standoff sits in the arena interior in FRONT of it.
+    # None -> auto-pick the arena marker closest to the origin (0,0), preferring
+    # the lower of a high/low pair. Set an explicit id to override.
+    recovery_marker_id: Optional[int] = None
 
     # --- SCOUT step (operator-facing slow 360° look-around) -----------------
     # Yaw stick value held during the SCOUT step. Default 15 is gentle
