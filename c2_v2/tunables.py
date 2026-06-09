@@ -32,7 +32,10 @@ class Tunables:
     defender_standoff_m: float = 2.50
     # offense persistence + strategy bias
     attack_passes: int = 30
-    baseline_defenders: int = 1
+    # Baseline home defenders (the simplified strategy: 3 attackers + 2
+    # defenders). In AUTO this is the default defender count when no own box is
+    # threatened; more defenders are added per threatened box.
+    baseline_defenders: int = 2
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)

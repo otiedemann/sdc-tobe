@@ -62,17 +62,17 @@ class Coordinator:
         if not live:
             return Plan(roles={}, summary="no live drones")
 
-        # 1) Always keep exactly one SCOUT — prefer the drone already scouting
-        #    (no needless re-task), else the lowest-named live drone.
+        # 1) SCOUT is OPTIONAL in the simplified strategy. Keep a scout ONLY if
+        #    the operator currently has one assigned (don't force one onto a
+        #    scout-less fleet); attackers + defenders do their own scouting.
         live_sorted = sorted(live, key=lambda v: v.fc)
         scout = next((v for v in live_sorted if v.current_role == "scout"), None)
-        if scout is None:
-            scout = live_sorted[0]
-        roles[scout.fc] = "scout"
-        movers = [v for v in live_sorted if v.fc != scout.fc]
+        if scout is not None:
+            roles[scout.fc] = "scout"
+        movers = [v for v in live_sorted if scout is None or v.fc != scout.fc]
         M = len(movers)
         if M == 0:
-            return Plan(roles=roles, summary="1 drone -> scout only")
+            return Plan(roles=roles, summary="scout only")
 
         # 2) Read the board.
         our = _our_slots(our_team)
@@ -115,7 +115,8 @@ class Coordinator:
             roles[v.fc] = r
             want[r] -= 1
 
-        summary = (f"{atk_n} atk · {def_n} def · scout {scout.fc.replace('flightctrl','fc')} "
+        scout_lbl = scout.fc.replace("flightctrl", "fc") if scout else "none"
+        summary = (f"{atk_n} atk · {def_n} def · scout {scout_lbl} "
                    f"| ours {boxes_ours}/6"
                    + (f" · threatened {sorted(our_threatened)}" if our_threatened else "")
                    + (" · ONE OFF SPECIAL — all-out" if special_push else "")

@@ -30,9 +30,10 @@ VALID_TEAMS = ("red", "blue")
 VALID_ROLES = ("idle", "scout", "attacker", "defender")
 _STATE_PATH = Path(__file__).resolve().parent / "c2v2_state.json"
 
-# Sensible default roles for a 5-drone fleet (operator can change live):
-# one scout, two attackers, two defenders.
-_DEFAULT_ROLE_BY_LANE = ("scout", "attacker", "attacker", "defender", "defender")
+# Default roles for a 5-drone fleet (operator can change live): the simplified
+# scout-less strategy — 3 fixed-lane attackers + 2 neutral-zone defenders. The
+# attackers + defenders do their own scouting (each watches the boxes it works).
+_DEFAULT_ROLE_BY_LANE = ("attacker", "attacker", "attacker", "defender", "defender")
 
 
 class MatchState:
