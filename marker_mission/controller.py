@@ -1937,10 +1937,57 @@ class MissionController:
                       "spinning at zoom 1.25x")
             return
 
-        # ── Stage 1: yaw spin at zoom 1.25x ──────────────────────────
-        # Yaw in place at the operator-tunable search rate. One full
-        # revolution without acquisition → central-marker recovery, then
-        # either commit or terminate.
+        # ── Stage 1: yaw spin at zoom 1.25x (target-only) ────────────
+        # Look for the active marker for one full revolution. NO
+        # recovery polling here: the target may be visible mid-rotation
+        # and we don't want to bail out to a wall-marker hop while still
+        # actively hunting the script's intended target. The smoother
+        # acquisition check at the top of _step_search exits SEARCH the
+        # instant the active marker is detected.
+        if getattr(self, "_search_stage", 1) == 1:
+            self._send_rc(0, 0, 0, int(self._search_yaw_rc),
+                          enforce_cfg_caps=False)
+            with self.state.lock:
+                tel = self.state.last_telemetry
+            if tel and tel.yaw_deg is not None:
+                if self._search_start_yaw is None:
+                    self._search_start_yaw = tel.yaw_deg
+                    self._search_swept = 0.0
+                    self._search_prev_yaw = tel.yaw_deg
+                else:
+                    delta = (tel.yaw_deg - self._search_prev_yaw + 540.0) % 360.0 - 180.0
+                    self._search_swept += abs(delta)
+                    self._search_prev_yaw = tel.yaw_deg
+                    with self.state.lock:
+                        self.state.search_yaw_swept_deg = self._search_swept
+                    if self._search_swept >= cfg.search_total_deg:
+                        # One full revolution at zoom 1.25x without
+                        # acquiring the target. Hand off to stage 2.
+                        self._search_stage = 2
+                        self._search_stage_started = now
+                        self._search_start_yaw = None
+                        self._search_swept = 0.0
+                        self._search_prev_yaw = None
+                        print("[ctrl] SEARCH stage 1 → stage 2: full "
+                              "rotation at zoom 1.25x yielded no target, "
+                              "scanning for central-marker recovery")
+            elif now - phase_entry > 30.0:
+                self._terminate_script("search timed out (no telemetry yaw)")
+            return
+
+        # ── Stage 2: yaw spin at zoom 1.25x (recovery scan) ──────────
+        # Same rotation as stage 1, but every tick we poll
+        # _recover_via_central_marker. As soon as a centre-wall
+        # candidate is in view (and the hop budget allows), commit:
+        # the recovery's APPROACH→settle→mission-restart re-runs the
+        # operator's script from step 0. ~60 polling chances per
+        # rotation — vs the single end-of-sweep window that landed the
+        # drone on fc1 because the timing was off.
+        if self._recover_via_central_marker(now):
+            self._search_start_yaw = None
+            self._search_swept = 0.0
+            self._search_prev_yaw = None
+            return
         self._send_rc(0, 0, 0, int(self._search_yaw_rc),
                       enforce_cfg_caps=False)
         with self.state.lock:
@@ -1951,36 +1998,20 @@ class MissionController:
                 self._search_swept = 0.0
                 self._search_prev_yaw = tel.yaw_deg
             else:
-                # Accumulate signed delta, handling wrap.
                 delta = (tel.yaw_deg - self._search_prev_yaw + 540.0) % 360.0 - 180.0
                 self._search_swept += abs(delta)
                 self._search_prev_yaw = tel.yaw_deg
                 with self.state.lock:
                     self.state.search_yaw_swept_deg = self._search_swept
                 if self._search_swept >= cfg.search_total_deg:
-                    # One full revolution at zoom 1.25x without
-                    # acquisition. Try the central-marker recovery
-                    # (approach a known wall-centre marker, then restart
-                    # the mission on settle). _recover_via_central_marker
-                    # only commits when a candidate is currently in view
-                    # AND the recovery-hop budget isn't exhausted; in
-                    # both failure cases we terminate so the FC goes
-                    # idle and the C2 can re-task. We reset the sweep
-                    # counter on a successful commit so the new search
-                    # (for the centre marker) gets a fresh budget.
-                    if self._recover_via_central_marker(now):
-                        self._search_start_yaw = None
-                        self._search_swept = 0.0
-                        self._search_prev_yaw = None
-                        return
+                    # One full revolution at zoom 1.25x AND not a single
+                    # tick saw a centre-wall recovery candidate. Yield
+                    # to C2 so the strategy can re-task with new context.
                     self._terminate_script(
-                        "marker-lost: stationary zoom 2.0x check + one "
-                        "sweep at 1.25x yielded nothing, and "
-                        "central-marker recovery could not commit "
-                        "(no visible candidate or hop budget exhausted) "
-                        "— ending mission, yielding to C2")
+                        "marker-lost: zoom 2.0x check + target sweep at "
+                        "1.25x + recovery-scan sweep at 1.25x all "
+                        "yielded nothing — ending mission, yielding to C2")
                     return
-        # Fallback timeout if no telemetry yaw is ever reported.
         elif now - phase_entry > 30.0:
             self._terminate_script("search timed out (no telemetry yaw)")
             return
