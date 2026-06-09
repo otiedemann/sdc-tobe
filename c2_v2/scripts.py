@@ -58,6 +58,19 @@ CENTER_TOL_M = 0.6
 DEFENDER_SIDE_STANDOFF_M = 2.5
 DEFENDER_SIDE_TOL_M = 0.5
 
+# A never-land HOVER/SCAN must be a CHAIN of SHORT RC steps, not one long
+# ``RC .. 3600``. Reason: a mission SPLICE (live re-target, no land) KEEPS the
+# currently-executing step and appends the new tail; the FC only walks into that
+# tail once the current step COMPLETES. A single 3600 s RC step would make the FC
+# sit out the whole timer (~1 h) before a spliced attack/recapture ever runs — so
+# the attacker would never strike within a match. Short steps complete every few
+# seconds, so a splice engages within ~RC_HOLD_TICK_S. The chain still outlasts a
+# match by a wide margin (matches the old single-step 3600 s horizon) so the drone
+# never lands on its own — if it were exhausted the FC safety-lands, so keep the
+# total well above any match incl. overtime/pauses.
+RC_HOLD_TICK_S = 5
+RC_HOLD_REPEATS = 720        # 720 x 5 s = 3600 s (~60 min) >> any match
+
 # Centre side-wall markers (y≈0), present in both real + gvz arenas.
 CENTER_MARKERS = (11, 15)
 
@@ -68,6 +81,14 @@ ATTACK_CHAIN_PASSES = 30
 
 def _fmt(lines: List[str]) -> str:
     return "\n".join(l for l in lines if l) + "\n"
+
+
+def _rc_hold(lr: int, fb: int, ud: int, yaw: int) -> List[str]:
+    """A never-land hover (yaw=0) or slow scan (yaw>0) built as a CHAIN of SHORT
+    RC steps so a mission SPLICE walks into its tail within ~RC_HOLD_TICK_S
+    instead of waiting out a single long RC timer (~1 h). See RC_HOLD_* above."""
+    step = f"RC {int(lr)} {int(fb)} {int(ud)} {int(yaw)} {RC_HOLD_TICK_S}"
+    return [step] * RC_HOLD_REPEATS
 
 
 # All builders take a live ``Tunables`` (operator-editable). Defaults equal the
@@ -120,7 +141,7 @@ def defender_script(side_marker: int, alt_m: float, t: Tunables) -> str:
         "TAKEOFF",
         f"HEIGHT {alt_m:.2f}",
         f"GO_HOME {int(side_marker)} {t.defender_standoff_m:.2f} {DEFENDER_SIDE_TOL_M:g} 0",
-        f"RC 0 0 0 {int(t.defender_yaw_stick)} {ROTATE_FOREVER_S}",
+        *_rc_hold(0, 0, 0, int(t.defender_yaw_stick)),     # slow scan (short-RC chain)
     ])
 
 
@@ -224,6 +245,51 @@ def attacker_lane_script(enemy_face: int, wall_marker: int, cruise_alt_m: float,
                                 rth_hdg_deg, t)
 
 
+def enemy_face_for_slot(slot: int, our_team: str) -> int:
+    """The ArUco face this ENEMY box shows when the enemy holds it (what an
+    attacker APPROACHes). Red attacking blue slot 4 -> 34; blue attacking red
+    slot 1 -> 41."""
+    enemy = "blue" if our_team == "red" else "red"
+    return face_id(int(slot), enemy)
+
+
+def attacker_park_script(wall_marker: int, cruise_alt_m: float,
+                         rth_hdg_deg: float, t: Tunables) -> str:
+    """Initial attacker mission: take off, settle in our HOME zone, and HOVER
+    forever (never lands). The runner splices one straight out-and-back capture
+    leg per strike (``attacker_attack_splice``) whenever this attacker's single
+    fixed target box is enemy-held — so each attacker just shuttles its own
+    straight lane home<->box, returning home to score between strikes."""
+    cruise = f"HEIGHT {cruise_alt_m:.2f}"
+    return _fmt([
+        "TAKEOFF",
+        cruise,
+        f"GO_HOME {int(wall_marker)} {t.rth_standoff_m:.2f} {RTH_ARRIVE_TOL_M:g} {rth_hdg_deg:g}",
+        cruise,
+        *_rc_hold(0, 0, 0, 0),                # hover at home (short-RC chain), never land
+    ])
+
+
+def attacker_attack_splice(enemy_face: int, wall_marker: int, cruise_alt_m: float,
+                           rth_hdg_deg: float, t: Tunables) -> str:
+    """ONE capture-and-return leg with NO TAKEOFF, for live-splicing into an
+    attacker that is hovering at home: straight out to its target box, slide
+    up+over to flip it, turn, straight back home to score, then HOVER again.
+    Spliced only when the drone is home + the target is enemy-held, so it never
+    cuts a leg short and never lands between strikes."""
+    cruise = f"HEIGHT {cruise_alt_m:.2f}"
+    return _fmt([
+        cruise,
+        f"APPROACH {int(enemy_face)} {t.attack_standoff_m:.2f} {t.attack_dist_tol_m:.2f}",
+        f"FB_UD_IMU {t.over_box_forward_m:.2f} {t.capture_rise_m:.2f}",
+        "YAW_IMU 180",
+        cruise,
+        f"GO_HOME {int(wall_marker)} {t.rth_standoff_m:.2f} {RTH_ARRIVE_TOL_M:g} {rth_hdg_deg:g}",
+        cruise,
+        *_rc_hold(0, 0, 0, 0),                # back to hover at home (short-RC chain)
+    ])
+
+
 def defender_neutral_script(wall_marker: int, neutral_standoff_m: float,
                             alt_m: float, t: Tunables) -> str:
     """Wait JUST OUTSIDE our home zone in the neutral zone, facing our boxes, and
@@ -234,7 +300,7 @@ def defender_neutral_script(wall_marker: int, neutral_standoff_m: float,
         "TAKEOFF",
         f"HEIGHT {alt_m:.2f}",
         f"GO_HOME {int(wall_marker)} {neutral_standoff_m:.2f} {DEFENDER_SIDE_TOL_M:g} 0",
-        f"RC 0 0 0 {int(t.defender_yaw_stick)} {ROTATE_FOREVER_S}",
+        *_rc_hold(0, 0, 0, int(t.defender_yaw_stick)),     # neutral scan (short-RC chain)
     ])
 
 
@@ -252,5 +318,5 @@ def defender_recapture_splice(enemy_face: int, wall_marker: int,
         "YAW_IMU 180",
         cruise,
         f"GO_HOME {int(wall_marker)} {neutral_standoff_m:.2f} {DEFENDER_SIDE_TOL_M:g} 0",
-        f"RC 0 0 0 {int(t.defender_yaw_stick)} {ROTATE_FOREVER_S}",
+        *_rc_hold(0, 0, 0, int(t.defender_yaw_stick)),     # back to neutral scan
     ])

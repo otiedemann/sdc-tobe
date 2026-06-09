@@ -39,6 +39,11 @@ SPLICE_COOLDOWN_S = 10.0
 ROLE_HOLD_S = 12.0
 # FC phases that mean "idle, ready to start a new mission".
 _IDLE_PHASES = ("", "init", "done")
+# The mission verb of the terminal hover step in every attacker script. When an
+# attacker's current_step_kind is this, it has finished its GO_HOME return leg
+# and is hovering at home — the ONLY safe, position-independent moment to splice
+# the next strike. (Reliable FC mission state, not vision arena position.)
+HOVER_STEP_KIND = "RC"
 
 
 class Runner:
@@ -53,7 +58,7 @@ class Runner:
         self._last_retask: Dict[str, float] = {}  # fc -> monotonic ts of last stop
         self._last_splice: Dict[str, float] = {}  # fc -> monotonic ts of last splice
         self._desired_role: Dict[str, tuple] = {}  # fc -> (role, since) AUTO hysteresis
-        self._atk_face: Dict[str, int] = {}        # attacker fc -> its fixed enemy face
+        self._atk_target: Dict[str, int] = {}      # attacker fc -> its fixed enemy box slot
         self._defender_recapture: Dict[str, int] = {}  # defender fc -> own slot being recaptured
         self._last_action: Dict[str, str] = {}    # fc -> human reason (for UI)
 
@@ -120,12 +125,7 @@ class Runner:
         atk_hdg = {fc: fan[i] for i, fc in enumerate(attackers)}
         cruise_alt = {fc: S.attacker_alt(t) for fc in attackers}
         cruise_alt.update({fc: S.defender_alt(i, t) for i, fc in enumerate(defenders)})
-        # FIXED-LANE assignment: each attacker (by stable rank) owns one enemy
-        # box face, so it flies a constant straight lane home<->box. Round-robins
-        # if #attackers != #enemy boxes.
-        lane_faces = S.enemy_home_faces(self.match.our_team)
-        self._atk_face = {fc: lane_faces[i % len(lane_faces)]
-                          for i, fc in enumerate(attackers)} if lane_faces else {}
+        self._assign_targets(attackers)
 
         for fc, cfg in self.match.drones.items():
             w = worlds.get(fc)
@@ -160,10 +160,14 @@ class Runner:
                         self._defender_recapture.pop(fc, None)
                         self._last_action[fc] = f"re-task -> {role}"
                     continue
-                # Right role, still flying. An ATTACKER flies its fixed lane loop
-                # (nothing to do). A DEFENDER reactively recaptures one of our
-                # boxes the instant it flips — via a no-land mission splice.
-                if role == "defender":
+                # Right role, still flying — react with a no-land mission splice.
+                # ATTACKER: when home + its fixed target is enemy-held, splice one
+                # straight out-and-back capture leg. DEFENDER: recapture one of our
+                # boxes the instant it flips.
+                if role == "attacker":
+                    await self._maybe_attack(fc, now, cruise_alt.get(fc, S.attacker_alt(t)),
+                                             atk_hdg.get(fc, 0.0))
+                elif role == "defender":
                     await self._maybe_recapture(fc, now, cruise_alt.get(fc, S.defender_alt(0, t)))
                 continue
 
@@ -248,15 +252,81 @@ class Runner:
             wall = arena_state.home_wall_marker(team)
             if not wall:
                 return None
-            # FIXED LANE: this attacker owns one enemy box face for the whole
-            # match (fall back to the full enemy-box loop if unassigned).
-            face = self._atk_face.get(fc)
-            if face is not None:
-                return S.attacker_lane_script(int(face), int(wall[0]),
-                                              alt, rth_hdg, t)
-            faces = S.enemy_home_faces(team)
-            return S.attacker_loop_script(faces, int(wall[0]), alt, rth_hdg, t)
+            # Take off, settle at home, and HOVER. The runner splices one straight
+            # out-and-back capture leg per strike (_maybe_attack) on this
+            # attacker's single fixed target — it never lands between strikes.
+            return S.attacker_park_script(int(wall[0]), alt, rth_hdg, t)
         return None
+
+    def _assign_targets(self, attackers: List[str]) -> None:
+        """FIXED-TARGET assignment pinned to DRONE IDENTITY (not sort rank): each
+        attacker owns ONE distinct enemy box for the whole match. KEEP every
+        existing binding, free the boxes of drones that stopped attacking, and
+        give a freed box only to a newly-appeared attacker. So a drone dropping
+        out (disable / role change / disconnect) never reshuffles the other
+        attackers' lanes, and no two attackers ever share a box. Extras beyond the
+        3 enemy boxes get NO target (they just park + hover)."""
+        enemy_slots = (4, 5, 6) if self.match.our_team == "red" else (1, 2, 3)
+        attacker_set = set(attackers)
+        for old_fc in [f for f in self._atk_target if f not in attacker_set]:
+            del self._atk_target[old_fc]
+        taken = set(self._atk_target.values())
+        free = [s for s in enemy_slots if s not in taken]
+        for fc in sorted(attackers):         # deterministic fill order
+            if fc not in self._atk_target and free:
+                self._atk_target[fc] = free.pop(0)
+
+    async def _maybe_attack(self, fc: str, now: float, cruise_alt: float,
+                            rth_hdg: float) -> None:
+        """FIXED-TARGET attacker: when this attacker is back HOME and hovering (on
+        its terminal RC step), and its ONE assigned enemy box is not currently
+        held by us, splice a single straight out-and-back capture leg (no land).
+        Gating on the RC hover step guarantees it always RETURNS HOME (GO_HOME to
+        the back-wall marker) to score before the next strike and never cuts a leg
+        short; distinct targets guarantee no two attackers ever hit the same box."""
+        slot = self._atk_target.get(fc)
+        if slot is None:
+            return                                  # extra attacker, no target -> hover
+        team = self.match.our_team
+        holder = self.match.holders().get(slot)
+        # We positively hold it (freshly captured, still observed) -> wait at home
+        # until it flips back to enemy. A decayed/unknown holder reads != team, so
+        # the shuttle keeps running even when nobody is watching the far box.
+        if holder == team:
+            return
+        # Don't re-strike during the 5 s post-capture lock (avoid thrash / the
+        # continuous-hover-over-box DQ).
+        if self.match.tracker.slot_locked(slot):
+            return
+        # Only launch a new strike when the attacker is HOME and HOVERING. "Home"
+        # is NOT inferred from the (unreliable) vision arena position — it's the
+        # MISSION STATE: the drone is on its terminal RC hover step, reached only
+        # AFTER its GO_HOME back-marker return leg completes. While it's flying
+        # out / capturing / returning, current_step_kind is APPROACH/FB_UD_IMU/
+        # YAW_IMU/GO_HOME (not RC), so we never cut a leg short.
+        w = self.pool.worlds.get(fc)
+        if w is None or w.current_step_kind != HOVER_STEP_KIND:
+            return
+        if now - self._last_splice.get(fc, -1e9) < SPLICE_COOLDOWN_S:
+            return
+        wall = arena_state.home_wall_marker(team)
+        if wall is None:
+            return
+        face = S.enemy_face_for_slot(slot, team)
+        t = self.match.tunables
+        script = S.attacker_attack_splice(int(face), int(wall[0]), cruise_alt,
+                                          rth_hdg, t)
+        ok, payload = await self.pool.splice(fc, script)
+        self._last_splice[fc] = now
+        # Distinguish a confirmed flip-strike (we just saw it go enemy) from a
+        # speculative re-check (belief decayed to unknown -> fly out and look).
+        kind = "enemy" if holder == self.match.enemy_team else "re-check(stale)"
+        if ok:
+            self._last_action[fc] = f"attack box {slot} [{kind}] -> home (no land)"
+            logger.info("c2_v2: %s -> attack box %s [%s] (no land)", fc, slot, kind)
+        else:
+            self._last_action[fc] = f"attack splice rejected ({payload})"
+            logger.info("c2_v2: %s -> attack splice rejected (%s)", fc, payload)
 
     async def _maybe_recapture(self, fc: str, now: float, cruise_alt: float) -> None:
         """DEFENDER reactive recapture: if one of OUR boxes is enemy-held (and
