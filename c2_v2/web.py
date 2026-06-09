@@ -318,35 +318,72 @@ function roleOpts(cur){
   return ["idle","scout","attacker","defender"].map(r=>
     `<option value="${r}" ${r===cur?"selected":""}>${r}</option>`).join("");
 }
+// Build each drone card ONCE; on later ticks update fields in place. Rebuilding
+// innerHTML every second would tear down the role <select> while the operator
+// has it open, snapping the dropdown shut before they can pick — so the panel
+// is built once and the controls are never recreated (mirrors renderTune).
+const droneCards = {};  // name -> {el, refs}
+function buildDroneCard(name){
+  const el = document.createElement("div");
+  el.className = "drone";
+  el.innerHTML = `
+    <div class="name">${name}<span><span class="dot bad" data-f="dot"></span></span></div>
+    <div style="display:flex;gap:6px;align-items:center;margin-top:4px">
+      <select data-role="${name}">${roleOpts('idle')}</select>
+      <label class="small"><input type="checkbox" data-enabled="${name}"> on</label>
+    </div>
+    <div class="kv">
+      <div class="k">pos (x,y,z)</div><div class="v" data-f="pos">—</div>
+      <div class="k">height</div><div class="v" data-f="height">—</div>
+      <div class="k">battery</div><div class="v bat" data-f="bat">—</div>
+      <div class="k">drone link</div><div class="v" data-f="link">—</div>
+      <div class="k">markers</div><div class="v" data-f="markers">—</div>
+      <div class="k">wifi</div><div class="v small" data-f="wifi">—</div>
+    </div>
+    <div class="plan" data-f="plan"></div>
+    <div class="small" data-f="act" style="display:none"></div>
+    <div class="small" data-f="err" style="display:none;color:var(--red)"></div>`;
+  const refs = {};
+  el.querySelectorAll("[data-f]").forEach(n=>{ refs[n.getAttribute("data-f")] = n; });
+  refs.role = el.querySelector("[data-role]");
+  refs.enabled = el.querySelector("[data-enabled]");
+  return {el, refs};
+}
 function renderDrones(s){
-  const root = document.getElementById("drones"); root.innerHTML = "";
+  const root = document.getElementById("drones");
   const cfgs = (s.match&&s.match.drones)||{}; const acts=s.actions||{};
   const auto = !!(s.match&&s.match.auto);
+  const seen = new Set();
   for(const d of s.drones){
-    const el = document.createElement("div");
+    seen.add(d.name);
+    let card = droneCards[d.name];
+    if(!card){ card = droneCards[d.name] = buildDroneCard(d.name); root.appendChild(card.el); }
+    const el = card.el, r = card.refs;
     const cfg = cfgs[d.name]||{};
     el.className = "drone" + (d.connected? "":" off");
-    const pos = d.position_m ? d.position_m.map(x=>x.toFixed(1)).join(", ") : "—";
-    const bat = d.battery_pct==null? "—" : Math.round(d.battery_pct)+"%";
-    el.innerHTML = `
-      <div class="name">${d.name}<span><span class="dot ${d.connected?'ok':'bad'}"></span></span></div>
-      <div style="display:flex;gap:6px;align-items:center;margin-top:4px">
-        <select data-role="${d.name}" ${auto?'disabled title="AUTO assigns roles"':''}>${roleOpts(cfg.role||'idle')}</select>
-        <label class="small"><input type="checkbox" data-enabled="${d.name}" ${cfg.enabled!==false?'checked':''}> on</label>
-      </div>
-      <div class="kv">
-        <div class="k">pos (x,y,z)</div><div class="v">${pos}</div>
-        <div class="k">height</div><div class="v">${d.height_m==null?'—':d.height_m+' m'}</div>
-        <div class="k">battery</div><div class="v bat ${d.battery_low?'low':''}">${bat}</div>
-        <div class="k">drone link</div><div class="v">${d.drone_connected?'ok':'—'}${d.flying?' · flying':''}</div>
-        <div class="k">markers</div><div class="v">${(d.visible_marker_ids||[]).join(',')||'—'}</div>
-        <div class="k">wifi</div><div class="v small">${d.wifi_ssid||'—'}</div>
-      </div>
-      <div class="plan">${d.plan||''}</div>
-      ${acts[d.name]? `<div class="small">↳ ${acts[d.name]}</div>`:''}
-      ${d.last_error && !d.connected? `<div class="small" style="color:var(--red)">${d.last_error}</div>`:''}
-    `;
-    root.appendChild(el);
+    // role select: never clobber while the operator has it open/focused; in
+    // AUTO the coordinator owns roles so it is disabled (but kept, not rebuilt).
+    if(document.activeElement !== r.role) r.role.value = cfg.role || 'idle';
+    r.role.disabled = auto;
+    r.role.title = auto? "AUTO assigns roles" : "";
+    if(document.activeElement !== r.enabled) r.enabled.checked = cfg.enabled !== false;
+    r.dot.className = "dot " + (d.connected?'ok':'bad');
+    r.pos.textContent = d.position_m ? d.position_m.map(x=>x.toFixed(1)).join(", ") : "—";
+    r.height.textContent = d.height_m==null?'—':d.height_m+' m';
+    r.bat.textContent = d.battery_pct==null? "—" : Math.round(d.battery_pct)+"%";
+    r.bat.className = "v bat " + (d.battery_low?'low':'');
+    r.link.textContent = (d.drone_connected?'ok':'—') + (d.flying?' · flying':'');
+    r.markers.textContent = (d.visible_marker_ids||[]).join(',')||'—';
+    r.wifi.textContent = d.wifi_ssid||'—';
+    r.plan.textContent = d.plan||'';
+    const a = acts[d.name];
+    if(a){ r.act.style.display=""; r.act.textContent = "↳ " + a; } else { r.act.style.display="none"; }
+    if(d.last_error && !d.connected){ r.err.style.display=""; r.err.textContent = d.last_error; }
+    else { r.err.style.display="none"; }
+  }
+  // drop cards for drones that vanished from the snapshot
+  for(const name of Object.keys(droneCards)){
+    if(!seen.has(name)){ droneCards[name].el.remove(); delete droneCards[name]; }
   }
 }
 function renderBoxes(s){
