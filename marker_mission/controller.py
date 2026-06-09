@@ -322,6 +322,16 @@ HEIGHT_ALIGN_MAX_S: float = 5.0
 # min-height floor) can never stall the search before the yaw sweep starts.
 SEARCH_DESCEND_MAX_S: float = 6.0
 
+# SEARCH never auto-lands (only an explicit LAND step lands the drone). When a
+# full stage-2 recovery-scan revolution finds neither the target nor a
+# centre-marker anchor, we slow the yaw and sweep again: a slower spin holds
+# each marker in the camera longer, so a distant target / recovery anchor the
+# faster sweep skipped past gets more detector frames to lock on. The yaw rate
+# decays geometrically per fruitless revolution down to a floor that still
+# rotates against wind + the RC deadband.
+SEARCH_YAW_DECAY: float = 0.6          # multiply yaw RC by this each empty sweep
+SEARCH_YAW_RC_MIN: int = 8             # floor — always keeps rotating
+
 # HEIGHT_ALIGN uses a much shorter pose staleness limit than the general
 # pose_max_age_s (2 s). Flying on a 2-s-old pose during active altitude
 # control causes full-throttle blind descent: the smoother serves the last
@@ -1838,14 +1848,18 @@ class MissionController:
             self._search_swept = 0.0
             self._search_prev_yaw = None
             self._search_yaw_rc = float(cfg.search_yaw_rc)
+            self._search_revolutions = 0   # fruitless stage-2 sweeps so far
             # Two-stage SEARCH protocol:
             #   stage 0 = stationary at zoom 2.0x (cfg.search_zoom_check_s).
             #             Acquires distant markers without rotating, so a
             #             marker that's "there but too small" pops out before
             #             we change yaw.
             #   stage 1 = yaw spin at zoom 1.25x (one full revolution).
-            # After stage 1 without acquisition: _recover_via_central_marker;
-            # if recovery can't commit, _terminate_script (yield to C2).
+            #   stage 2 = yaw spin at zoom 1.25x polling
+            #             _recover_via_central_marker. When a revolution
+            #             finds nothing, the yaw slows and it sweeps AGAIN —
+            #             SEARCH never auto-lands (only an explicit LAND step
+            #             lands the drone).
             self._search_stage = 0
             # Initialise lazily on first stage-0 execution so descent /
             # retreat time doesn't count against the stationary window.
@@ -1989,7 +2003,17 @@ class MissionController:
                               "rotation at zoom 1.25x yielded no target, "
                               "scanning for central-marker recovery")
             elif now - phase_entry > 30.0:
-                self._terminate_script("search timed out (no telemetry yaw)")
+                # No telemetry yaw to count a revolution by — fall through to
+                # stage 2 (recovery scan) instead of landing. SEARCH never
+                # auto-lands; stage 2 polls _recover_via_central_marker every
+                # tick regardless of yaw telemetry.
+                self._search_stage = 2
+                self._search_stage_started = now
+                self._search_start_yaw = None
+                self._search_swept = 0.0
+                self._search_prev_yaw = None
+                print("[ctrl] SEARCH stage 1 → stage 2: no yaw telemetry, "
+                      "handing off to recovery scan (never auto-lands)")
             return
 
         # ── Stage 2: yaw spin at zoom 1.25x (recovery scan) ──────────
@@ -2021,16 +2045,39 @@ class MissionController:
                 with self.state.lock:
                     self.state.search_yaw_swept_deg = self._search_swept
                 if self._search_swept >= cfg.search_total_deg:
-                    # One full revolution at zoom 1.25x AND not a single
-                    # tick saw a centre-wall recovery candidate. Yield
-                    # to C2 so the strategy can re-task with new context.
-                    self._terminate_script(
-                        "marker-lost: zoom 2.0x check + target sweep at "
-                        "1.25x + recovery-scan sweep at 1.25x all "
-                        "yielded nothing — ending mission, yielding to C2")
+                    # One full revolution at zoom 1.25x AND not a single tick
+                    # saw the target or a centre-wall recovery candidate. We
+                    # NEVER auto-land from SEARCH — only an explicit LAND step
+                    # lands the drone. Slow the yaw and sweep again: a slower
+                    # spin keeps each marker in the camera longer, so a distant
+                    # target / recovery anchor that the faster sweep skipped
+                    # past gets more detector frames to lock on. Yaw decays to
+                    # SEARCH_YAW_RC_MIN and then holds, so it always keeps
+                    # rotating until a marker is found (or the operator stops).
+                    self._search_revolutions = getattr(
+                        self, "_search_revolutions", 0) + 1
+                    self._search_yaw_rc = max(
+                        float(SEARCH_YAW_RC_MIN),
+                        self._search_yaw_rc * SEARCH_YAW_DECAY)
+                    self._search_start_yaw = None
+                    self._search_swept = 0.0
+                    self._search_prev_yaw = None
+                    print(f"[ctrl] SEARCH stage 2: recovery sweep "
+                          f"#{self._search_revolutions} found nothing — "
+                          f"slowing yaw to {self._search_yaw_rc:.0f} and "
+                          f"sweeping again (never auto-lands)")
+                    with self.state.lock:
+                        self.state.note = (
+                            f"SEARCH recovery sweep #{self._search_revolutions}"
+                            f" — no marker, slowing yaw to "
+                            f"{self._search_yaw_rc:.0f} (never lands)")
                     return
         elif now - phase_entry > 30.0:
-            self._terminate_script("search timed out (no telemetry yaw)")
+            # No telemetry yaw to count revolutions by — keep spinning and
+            # polling recovery rather than landing (SEARCH never auto-lands).
+            with self.state.lock:
+                self.state.note = ("SEARCH recovery scan — no yaw telemetry, "
+                                   "spinning (never lands)")
             return
 
     # ----------------------------------------------------------------- align
