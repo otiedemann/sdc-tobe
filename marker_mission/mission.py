@@ -430,7 +430,10 @@ def cmd_fly(args: argparse.Namespace) -> int:
                 except Exception as e:
                     print(f"[mission] calibration refresh failed: {e}")
             new_dir = make_flight_dir(FLIGHTS_DIR, serial)
-            recorder_box[0] = FlightRecorder(new_dir, fps=cfg.record_fps)
+            recorder_box[0] = FlightRecorder(
+                new_dir, fps=cfg.record_fps,
+                codec=getattr(cfg, "record_codec", "mp4v"),
+                scale=getattr(cfg, "record_scale", 1.0))
             flight_dir_box[0] = new_dir
             # TEMP DEBUG: route arena estimator's per-frame log into the
             # per-flight artefact dir. Remove with the arena.py patch.
@@ -1428,11 +1431,14 @@ def cmd_fly(args: argparse.Namespace) -> int:
                                     0.45, color, 1, cv2.LINE_AA)
                 # ──────────────────────────────────────────────────────
                 latest_ann_frame.set(ann)
-                # Record both raw and annotated ----------------------------
-                if not recording_paused.is_set():
+                # Record video (TUNE-gated; CSV log is written regardless) -----
+                #  G record_enabled: master switch (off = no video encode at all)
+                #  A record_raw:     also write raw.mp4 (off = annotated only)
+                if not recording_paused.is_set() and getattr(cfg, "record_enabled", True):
                     rec = recorder_box[0]
                     if rec is not None:
-                        rec.push_raw_frame(frame)
+                        if getattr(cfg, "record_raw", True):
+                            rec.push_raw_frame(frame)
                         rec.push_annotated_frame(ann)
             except Exception as e:
                 print(f"[vision] error: {e}")
