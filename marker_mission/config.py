@@ -382,6 +382,10 @@ class MissionConfig:
     record_fps: int = 25                   # MJPEG frames are decoded -> we re-mux
     record_jpeg_quality: int = 90          # for any direct JPEG saves
 
+    # --- Camera / Video (applied at mission start via camera_config_set) -----
+    video_stream_mode: str = "low_latency"  # TUNE  "low_latency" / "high_reliability" / "high_reliability_low_framerate"
+    video_framerate_fps: int = 20           # TUNE  drone-side encoder fps (8/9/10/15/20/24/25/30)
+
     # --- IPPE branch picker layers ------------------------------------------
     # Each ``enable_ippe_*`` flag toggles one of the 2026-05-04 fixes
     # that together dampen the IPPE planar-pose mirror flip. They live
@@ -791,6 +795,15 @@ TUNING_FIELDS = {
         "desc": "If no marker detection in this window, the smoother reports None to the controller (= 'marker lost'). Pairs with search_marker_lost_grace_s.",
     },
 
+    "video_stream_mode": {
+        "label": "Stream mode", "kind": "str",
+        "desc": "Streaming transport applied at mission start. low_latency: minimal latency, no retransmit (default). high_reliability: ARQ/FEC, ~200ms extra latency, fewer dropped frames. high_reliability_low_framerate: same + drone-side frame decimation (~15fps).",
+    },
+    "video_framerate_fps": {
+        "label": "Video framerate", "kind": "int", "unit": "fps", "step": 1,
+        "desc": "Drone-side encoder framerate applied at mission start (set_recording_mode). Fewer fps = less WiFi load and FC CPU. Valid values: 8, 9, 10, 15, 20, 24, 25, 30. Does not affect stream transport reliability (see Stream mode).",
+    },
+
     "killswitch_key": {
         "label": "killswitch key", "kind": "str",
         "desc": "Single character. Pressing this key anywhere on the web UI (including inside textareas / number inputs) immediately triggers /api/stop and lands the drone. Default '@'. Comparison is case-insensitive; modifier keys (Ctrl/Cmd/Alt) are excluded so browser shortcuts still work.",
@@ -903,6 +916,8 @@ TUNING_GROUPS = [
          "search_retreat_s", "search_retreat_rc", "search_backrotate_deg"]),
     ("Pose smoothing",
         ["pose_smoothing_alpha", "pose_max_age_s"]),
+    ("Camera / Video",
+        ["video_stream_mode", "video_framerate_fps"]),
     ("Operator UX",
         ["killswitch_key"]),
     ("Vision / detector",

@@ -1000,6 +1000,20 @@ class MissionController:
         except Exception as e:
             print(f"[ctrl] zoom set failed: {e}")
 
+    def _apply_stream_settings(self) -> None:
+        """Apply stream mode and recording framerate from cfg once at mission start."""
+        fps_str = f"fps_{self.cfg.video_framerate_fps}"
+        try:
+            result = self.api.camera_config_set(
+                stream_mode={"mode": self.cfg.video_stream_mode},
+                recording={"mode": "standard", "resolution": "res_1080p",
+                           "framerate": fps_str, "hyperlapse": "ratio_15"},
+            )
+            print(f"[ctrl] stream settings: mode={self.cfg.video_stream_mode}"
+                  f" fps={self.cfg.video_framerate_fps} → {result}")
+        except Exception as e:
+            print(f"[ctrl] stream settings failed: {e}")
+
     def apply_config_changes(self) -> None:
         """Re-sync per-instance state that was copied out of cfg at
         construction. Call after the cfg dataclass has been mutated
@@ -1382,6 +1396,8 @@ class MissionController:
         if self._stop.is_set():
             print("[ctrl] stop received before takeoff -- exiting cleanly")
             return
+
+        self._apply_stream_settings()
 
         # Hand off to the mission script. The first step (typically
         # TAKEOFF) is loaded here; _apply_step_to_phase handles the
