@@ -985,6 +985,20 @@ class MissionController:
         self._approach_mid_ha_active: bool = False
         self._approach_mid_ha_settled_at: Optional[float] = None
         self._approach_mid_ha_started_at: Optional[float] = None
+        # Track last zoom applied so we skip redundant camera_config_set calls.
+        # Each set_zoom_target triggers an Olympe _media_removed stream restart
+        # (~2s freeze), so we only call when the level actually changes.
+        self._camera_zoom: float = 1.0
+
+    def _apply_zoom(self, zoom: float) -> None:
+        """Set digital zoom only when it differs from the last applied level."""
+        if abs(self._camera_zoom - zoom) < 0.01:
+            return
+        try:
+            self.api.camera_config_set(zoom=zoom)
+            self._camera_zoom = zoom
+        except Exception as e:
+            print(f"[ctrl] zoom set failed: {e}")
 
     def apply_config_changes(self) -> None:
         """Re-sync per-instance state that was copied out of cfg at
@@ -1764,12 +1778,12 @@ class MissionController:
             self._search_swept = 0.0
             self._search_prev_yaw = None
             self._search_yaw_rc = float(cfg.search_yaw_rc)
-            self._search_zoom = 1.0
+            self._search_zoom = 1.25
             self._search_esc_level = 0
-            # Do NOT call camera_config_set(zoom=1.0) here: TAKEOFF already
-            # set zoom=1.0 and any set_zoom_target call triggers an Olympe
-            # _media_removed stream restart (~2s freeze). Start search at 1x,
-            # escalate to 2x/3x only when needed.
+            # _apply_zoom skips the call if HEIGHT already set 1.25x (the
+            # common path). Only triggers a stream restart on re-entry when
+            # APPROACH has reset zoom to 1.0 in the meantime.
+            self._apply_zoom(1.25)
             # Arm the descend-to-approach-height for a lost TARGET BOX: a brief
             # HEIGHT_ALIGN to a high/oblique marker -- or a GO_HOME recovery
             # anchor -- can strand the drone above the (low) box, out of the
@@ -1897,10 +1911,7 @@ class MissionController:
                         new_yaw_rc = max(1, int(cfg.search_yaw_rc / (2 ** self._search_esc_level)))
                         self._search_zoom = new_zoom
                         self._search_yaw_rc = new_yaw_rc
-                        try:
-                            self.api.camera_config_set(zoom=new_zoom)
-                        except Exception as e:
-                            print(f"[ctrl] SEARCH zoom set failed: {e}")
+                        self._apply_zoom(new_zoom)
                         print(f"[ctrl] SEARCH esc→{self._search_esc_level}: "
                               f"zoom {new_zoom}x  yaw_rc {new_yaw_rc} "
                               f"(was {cfg.search_yaw_rc})")
@@ -1915,10 +1926,7 @@ class MissionController:
                         self._search_yaw_rc = float(cfg.search_yaw_rc)
                         if getattr(self, "_search_zoom", 1.0) != 1.0:
                             self._search_zoom = 1.0
-                            try:
-                                self.api.camera_config_set(zoom=1.0)
-                            except Exception as e:
-                                print(f"[ctrl] SEARCH zoom reset failed: {e}")
+                            self._apply_zoom(1.0)
                         print("[ctrl] SEARCH: no marker visible after 3 sweeps — "
                               "resetting zoom+speed, continuing in-place rotation")
                     return
@@ -2218,10 +2226,7 @@ class MissionController:
                 and d <= _lat_thr + 0.3
                 and getattr(self, "_search_zoom", 1.0) > 1.0):
             self._search_zoom = 1.0
-            try:
-                self.api.camera_config_set(zoom=1.0)
-            except Exception:
-                pass
+            self._apply_zoom(1.0)
         # Height error: VISION ONLY, never the altimeter (it's unreliable).
         # tvec[1] is the marker's downward offset in the gimbal-stabilised
         # camera frame; driving e_h = -tvec[1] -> 0 keeps the marker centred in
@@ -3287,9 +3292,17 @@ class MissionController:
         cfg = self.cfg
         with self.state.lock:
             target = self.state.height_target_m
+            phase_entry = self.state.phase_started_at
         if target is None:
             self._advance_script("height: no target set")
             return
+        # On first entry into this HEIGHT phase: pre-set zoom to 1.25x while
+        # the camera is not needed for barometer-based altitude control.
+        # This avoids the Olympe stream reconnect (~2s freeze) that would
+        # otherwise fire at the start of the subsequent SEARCH phase.
+        if getattr(self, '_height_zoom_phase_entry', None) != phase_entry:
+            self._height_zoom_phase_entry = phase_entry
+            self._apply_zoom(1.25)
         try:
             h_cm = (float(tel.raw.get("height_cm"))
                     if tel and tel.raw.get("height_cm") is not None
