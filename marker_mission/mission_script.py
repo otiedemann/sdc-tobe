@@ -98,14 +98,29 @@ AWAIT behaves like HOOVER (HOLD-style station-keeping if the previous
 step was APPROACH, otherwise IDLE) but exits early as soon as the
 named marker becomes visible. The timeout is a hard upper bound.
 
-WAIT_AND_ATTACK is the unbounded sibling of AWAIT, fused with APPROACH.
-The drone enters HOLD (if last step was APPROACH) or IDLE and waits --
-with no timeout -- until ``marker-id`` is visible. As soon as it is,
-the same step transitions in-place to APPROACH semantics with the
-given distance / dist_tol / yaw_tol. Use case: a target box is
-currently showing OUR team's face (so our team's marker id is visible
-but the opposing-team id we want to attack is not). Pass the opposing
-id; the drone hovers until the box flips, then closes in.
+WAIT_AND_ATTACK behaves like APPROACH on ``marker-id``, but with
+sibling-face awareness. SDC26 target boxes carry two opposing-team
+faces whose ids differ by ``cfg.target_marker_sibling_offset``
+(default 10, so 31↔41 ... 36↔46). The drone:
+
+  1. Enters SEARCH and yaw-spins looking for either the target id or
+     its sibling -- so the box is acquired even when its currently-
+     exposed face is the wrong one.
+  2. APPROACHes whichever face it sees first (target preferred when
+     both are visible) to the parsed standoff distance.
+  3. If parked on the SIBLING face (the box shows the wrong team),
+     the script-advance gate refuses to advance. The drone holds at
+     standoff. When the box flips and the target face becomes visible,
+     the per-tick swap routes active_marker_id = target, the PD
+     re-settles on the target face, the gate passes, and the script
+     advances to the next step.
+  4. If parked on the TARGET face directly, the script advances on
+     the first settle -- same observable behaviour as APPROACH.
+
+Use case: a target box is currently showing OUR team's face (so the
+opposing-team id is not yet visible). Pass the opposing id; the drone
+flies up to the box, hovers at standoff watching it, and attacks the
+instant the other team takes it back.
 
 REPEAT restarts the script from the first non-TAKEOFF step without
 landing in between. It must be the LAST step of the script and must

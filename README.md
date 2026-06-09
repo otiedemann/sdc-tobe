@@ -177,7 +177,7 @@ section so they can never run together).
 | `APPROACH` | `[marker-id] [dist]` | Fly to a marker, stop at `dist` m |
 | `HOOVER` | `[seconds]` | Station-keep |
 | `AWAIT` | `marker-id timeout-s` | Hold until marker visible (with timeout) |
-| `WAIT_AND_ATTACK` | `marker-id [dist] [dist_tol_m] [yaw_tol_deg]` | Wait unbounded until marker visible, then APPROACH in-place. Use when a target box currently shows our team's face — pass the opposing-team id. |
+| `WAIT_AND_ATTACK` | `marker-id [dist] [dist_tol_m] [yaw_tol_deg]` | APPROACH the box (acquired via either the target face or its sibling face, offset ±10 by default), hold at standoff while the wrong face is shown, attack the instant `marker-id` becomes visible. No timeout. |
 | `PAUSE` | `seconds` | Unconditional IDLE |
 | `REPEAT` | — | Last step only: loop back to the first non-`TAKEOFF` step without landing. Converts a one-shot mission into a continuous patrol. |
 | `LAND` | — | Land |

@@ -127,39 +127,60 @@ Done when the awaited marker is seen *or* the timeout expires.
 
 ### `WAIT_AND_ATTACK <marker-id> [<distance>] [<dist_tol_m>] [<yaw_tol_deg>]`
 
-> Unbounded wait until `marker-id` is visible, then transition in-place
-> to `APPROACH` semantics. The single-step fusion of `AWAIT` + `APPROACH`.
+> APPROACH the named target face, but if the box currently shows the
+> *sibling* (opposing-team) face, fly to it and hold at standoff until
+> the box flips — only then close in to attack.
 
-Behaviour during the wait phase matches `AWAIT`:
+SDC26 target boxes carry two opposing-team faces. Their ids differ by
+`cfg.target_marker_sibling_offset` (default 10), so the sibling of 46
+is 36 and the sibling of 31 is 41. `WAIT_AND_ATTACK` uses both ids.
 
-- **After `APPROACH`** — station-keeping HOLD on the previously
-  approached marker.
-- **Otherwise** — IDLE.
+Behaviour:
 
-There is no timeout. The drone hovers (or station-keeps) indefinitely
-until the named marker appears. As soon as it does, the same step
-re-enters `_apply_step_to_phase` with `kind="APPROACH"` so the rest of
-the script sees a normal approach: `SEARCH → ALIGN → APPROACH → HOLD`
-with the parsed `distance` / `dist_tol_m` / `yaw_tol_deg`, and a
-following `HOOVER` correctly routes to `HOLD` (the in-place transition
-also rewrites `current_step_kind` to `"APPROACH"` so `HOOVER`'s
-"`last == APPROACH`" check fires).
+1. **SEARCH** — the drone yaw-spins watching for *either* the target
+   id or the sibling id. So the box is acquired even when its
+   currently-exposed face is the wrong one. (This is the key
+   difference from a plain `APPROACH`, which would never trigger on
+   the sibling and the drone would spin past the box.)
+2. **APPROACH whichever face is seen first.** A per-tick swap in
+   `_wait_attack_pre_tick` routes `state.active_marker_id` to the
+   currently-visible id (target preferred when both are visible).
+   `SEARCH → HEIGHT_ALIGN → ALIGN → APPROACH` proceeds on the chosen
+   face to the parsed `distance` / `dist_tol_m` / `yaw_tol_deg`.
+3. **Hold on sibling** — when the drone settles at the parsed
+   distance but the active face is the *sibling* (target id not
+   visible), the approach-settle gate refuses to advance the script.
+   The drone stays in `APPROACH` (PD pinned to the parsed standoff)
+   until the per-tick swap puts `active = target` (i.e. the box has
+   flipped).
+4. **Attack target** — once the target face is visible, the swap
+   routes `active_marker_id = target`, the PD re-settles on the
+   target face, the gate passes, and
+   `_advance_script("approach settled")` moves on to the next step.
 
-Use case: a target box currently shows OUR team's marker face. Pass the
-opposing team's id (the face we want to attack) — the drone waits
-hovering until the box flips, then closes in.
+Use case: a target box currently shows OUR team's face. Pass the
+opposing-team id (the face we want to attack). The drone flies up to
+the box, hovers at standoff watching it, and attacks the instant the
+other team takes it back.
 
 Arguments mirror `APPROACH`:
 
-- `marker-id`: id to wait for and then attack. Required.
-- `distance`: final standoff [m]. Required (no parse-time default unless
-  one is configured).
+- `marker-id`: id to attack (the opposing-team face you want exposed).
+  Required.
+- `distance`: final standoff [m].
 - `dist_tol_m`: optional arrival distance tolerance (0.05..5 m).
 - `yaw_tol_deg`: optional yaw-settle tolerance (1..180 deg) — advance
-  the instant the distance is reached, from any angle within this band.
+  the instant the distance is reached, from any angle within this
+  band.
 
-Done when the `APPROACH` phase settles (same exit condition as a plain
-`APPROACH`).
+Done when the `APPROACH` phase settles **and** `active_marker_id ==
+target_id`. There is no timeout — the drone holds indefinitely if the
+sibling face never flips.
+
+Sibling derivation falls back gracefully: if `marker-id` lies outside
+the target-marker range (e.g. wall markers 1..16) or the matching
+sibling would lie outside the range, no sibling is set and
+`WAIT_AND_ATTACK` reduces to a plain `APPROACH` semantically.
 
 ---
 

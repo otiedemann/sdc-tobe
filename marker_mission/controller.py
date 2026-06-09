@@ -47,7 +47,7 @@ import math
 import random as _random
 import threading
 import time
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field
 from typing import List, Optional
 
 from .aruco_detector import MarkerPose
@@ -518,6 +518,19 @@ class MissionState:
     target_relative_heading_deg: float = 90.0
     active_marker_id: Optional[int] = None
     hold_time_s: float = 60.0
+    # WAIT_AND_ATTACK tracks two marker ids for the same physical target
+    # box: ``wait_attack_target_id`` is the face we actually want to
+    # attack (passed by the operator); ``wait_attack_sibling_id`` is the
+    # opposing-team face on the same box (derived as target ±
+    # cfg.target_marker_sibling_offset, default 10). The pre-tick swap
+    # in ``_wait_attack_pre_tick`` keeps ``active_marker_id`` pointing
+    # at whichever id is currently visible (preferring target when both
+    # are), and the approach-settle gate refuses to advance the script
+    # while ``active_marker_id != wait_attack_target_id`` — so the
+    # drone holds at standoff on the sibling face until the box flips.
+    # Both fields are cleared on the step transition out of WAIT_AND_ATTACK.
+    wait_attack_target_id: Optional[int] = None
+    wait_attack_sibling_id: Optional[int] = None
 
     settle_began_at: Optional[float] = None
     hold_began_at: Optional[float] = None
@@ -1443,6 +1456,11 @@ class MissionController:
 
                 # ── Enemy-drone threat check ─────────────────────────────────
                 self._check_drone_threat(now)
+
+                # WAIT_AND_ATTACK target/sibling swap. Runs BEFORE the
+                # phase dispatch so the per-phase code sees the freshly-
+                # routed active_marker_id on the same tick.
+                self._wait_attack_pre_tick()
 
                 # Dispatch on phase ------------------------------------------
                 phase = self.state.phase
@@ -2410,6 +2428,24 @@ class MissionController:
             else:
                 self.state.settle_began_at = None
         if settled:
+            # WAIT_AND_ATTACK gate: when we settle while parked on the
+            # SIBLING face (target face not yet exposed), DO NOT advance
+            # the script — the mission step expects an attack on the
+            # target. Stay in APPROACH; the next tick re-runs the PD on
+            # whatever active_marker_id the swap routes us to. When the
+            # box flips and target becomes visible, the swap puts
+            # active = target, the PD re-settles on target, this gate
+            # passes, and the script advances. The settle_began_at
+            # reset prevents an accidental flash-advance on the swap
+            # tick: the new active pose must re-satisfy the in-band
+            # condition AND the settle window before we move on.
+            with self.state.lock:
+                _wa_target = self.state.wait_attack_target_id
+                _wa_active = self.state.active_marker_id
+                if (_wa_target is not None
+                        and _wa_active != _wa_target):
+                    self.state.settle_began_at = None
+                    return
             # Marker-lost recovery (no TO): this APPROACH was a GO_HOME onto a
             # visible marker to re-establish a vision anchor. On settle, RESTART
             # the mission (re-run the operator's task from the top) rather than
@@ -2442,13 +2478,12 @@ class MissionController:
             await_id = self.state.await_marker_id
             visible_now = (set(self.state.visible_marker_ids)
                            if await_id is not None else None)
-        # AWAIT / WAIT_AND_ATTACK early-exit: the awaited marker is
-        # now in view. Advance the script (AWAIT) or transition the
-        # current step in-place to APPROACH (WAIT_AND_ATTACK) before
+        # AWAIT early-exit: an AWAIT step routed us here, and the
+        # awaited marker is now in view. Advance the script before
         # the timer expires.
         if await_id is not None and visible_now and await_id in visible_now:
             self._send_rc(0, 0, 0, 0)
-            self._on_await_marker_seen(int(await_id))
+            self._advance_script(f"AWAIT marker {await_id} seen")
             return
         if began is not None and (now - began) >= hold_time_s:
             self._send_rc(0, 0, 0, 0)
@@ -2536,7 +2571,7 @@ class MissionController:
             self.state.note = (f"IDLE: {(until - now):.1f}s remaining"
                                if until is not None else "IDLE")
         if await_id is not None and visible_now and await_id in visible_now:
-            self._on_await_marker_seen(int(await_id))
+            self._advance_script(f"AWAIT marker {await_id} seen")
             return
         if until is not None and now >= until:
             self._advance_script("idle complete")
@@ -3939,31 +3974,57 @@ class MissionController:
             self.state.last_completed_step_kind = None
         self._set_phase(Phase.LAND, reason)
 
-    def _on_await_marker_seen(self, await_id: int) -> None:
-        """Called from the HOLD / IDLE tick when state.await_marker_id is
-        visible. For a plain AWAIT step this advances the script; for
-        WAIT_AND_ATTACK the current step transitions in-place to
-        APPROACH semantics (same marker_id / distance / dist_tol /
-        yaw_tol) without advancing the index."""
+    def _wait_attack_sibling_of(self, target_id: int) -> Optional[int]:
+        """Compute the sibling face id for a WAIT_AND_ATTACK target.
+        SDC26 convention: each target box has two opposing-team faces
+        whose ids differ by ``cfg.target_marker_sibling_offset``
+        (default 10 -> 31↔41, 36↔46, ...). Returns None if no in-range
+        sibling exists (target is outside the target-marker range, or
+        both target±offset are out of range)."""
+        cfg = self.cfg
+        offset = int(getattr(cfg, "target_marker_sibling_offset", 10))
+        if offset <= 0:
+            return None
+        low, high = int(cfg.target_marker_id_min), int(cfg.target_marker_id_max)
+        if not (low <= target_id <= high):
+            return None
+        for cand in (target_id - offset, target_id + offset):
+            if low <= cand <= high:
+                return cand
+        return None
+
+    def _wait_attack_pre_tick(self) -> None:
+        """Per-tick swap of ``state.active_marker_id`` for a running
+        WAIT_AND_ATTACK step. Preference order:
+          1. If the target id is currently visible → active = target.
+          2. Else if the sibling id is visible → active = sibling.
+          3. Else: no change (the smoother carries the previous active
+             pose forward through brief marker losses).
+
+        Called from the main control loop BEFORE phase dispatch so
+        _step_search / _step_align / _step_approach / _step_hold all
+        see the freshly-routed active id on the same tick.
+
+        No-op when no WAIT_AND_ATTACK is active (wait_attack_target_id
+        is None)."""
         with self.state.lock:
-            cur_kind = self.state.current_step_kind
-            idx = self.state.mission_step_idx
-            script = list(self.state.mission_script)
-        if cur_kind == "WAIT_AND_ATTACK" and 0 <= idx < len(script):
-            approach_step = replace(script[idx], kind="APPROACH")
-            with self.state.lock:
-                # The transition is now an APPROACH for all downstream
-                # bookkeeping: a trailing HOOVER goes to HOLD (which
-                # keys on last_completed_step_kind == "APPROACH"), and
-                # the AWAIT-id hook is cleared so the next IDLE / HOLD
-                # tick doesn't fire the early-exit again.
-                self.state.current_step_kind = "APPROACH"
-                self.state.await_marker_id = None
-            self._apply_step_to_phase(
-                approach_step,
-                f"WAIT_AND_ATTACK marker {await_id} seen — attacking")
+            target = self.state.wait_attack_target_id
+            sibling = self.state.wait_attack_sibling_id
+            active = self.state.active_marker_id
+            visible = (set(self.state.visible_marker_ids)
+                       if self.state.visible_marker_ids else set())
+        if target is None:
             return
-        self._advance_script(f"AWAIT marker {await_id} seen")
+        if target in visible:
+            new_active = target
+        elif sibling is not None and sibling in visible:
+            new_active = sibling
+        else:
+            return  # neither visible; keep current active so smoother
+                    # can carry the previous pose through a brief loss
+        if new_active != active:
+            with self.state.lock:
+                self.state.active_marker_id = new_active
 
     def _advance_script(self, reason: str) -> None:
         """Consume the current script step and load the next one. If
@@ -3995,18 +4056,24 @@ class MissionController:
         call _set_phase with the appropriate initial phase."""
         cfg = self.cfg
         note = f"script[{step.line_no}] {step.kind} ({reason})"
-        # AWAIT and WAIT_AND_ATTACK install an early-exit marker id;
-        # every other step clears it so a previous one can't accidentally
-        # short-circuit subsequent IDLE / HOLD ticks. WAIT_AND_ATTACK
-        # piggybacks on the same hook -- when the id is seen, the
-        # _step_idle / _step_hold tick routes via _on_await_marker_seen
-        # which transitions in-place to APPROACH for WAIT_AND_ATTACK and
-        # advances the script for plain AWAIT.
+        # AWAIT installs an early-exit marker id; every other step
+        # clears it so a previous AWAIT can't accidentally short-circuit
+        # subsequent IDLE / HOLD ticks. WAIT_AND_ATTACK does NOT
+        # piggyback on this hook (the previous implementation did, but
+        # it skipped the search phase); see the WAIT_AND_ATTACK branch
+        # below for the SEARCH-entering + sibling-aware approach.
         with self.state.lock:
             self.state.await_marker_id = (int(step.marker_id)
-                                          if step.kind in (
-                                              "AWAIT", "WAIT_AND_ATTACK")
+                                          if step.kind == "AWAIT"
                                           else None)
+            # Clear wait_attack target/sibling tracking on transition
+            # OUT of WAIT_AND_ATTACK. The pre-tick swap consults these
+            # to route active_marker_id, and the approach-settle gate
+            # uses them to refuse advancement while we're parked on
+            # the sibling face.
+            if step.kind != "WAIT_AND_ATTACK":
+                self.state.wait_attack_target_id = None
+                self.state.wait_attack_sibling_id = None
         if step.kind == "TAKEOFF":
             self._set_phase(Phase.TAKEOFF, note)
             try:
@@ -4149,28 +4216,65 @@ class MissionController:
                             note + f" pause {step.seconds:g}s")
             return
         if step.kind == "WAIT_AND_ATTACK":
-            # Unbounded sibling of AWAIT, fused with APPROACH. Block in
-            # HOLD (if last was APPROACH) or IDLE until marker_id is
-            # visible; the await early-exit (_on_await_marker_seen)
-            # then transitions in-place to APPROACH semantics with the
-            # parsed distance / dist_tol / yaw_tol. Implementation: set
-            # the hold / idle timer to a far-future sentinel so only the
-            # marker-seen exit can advance us.
+            # Behaves like APPROACH on the target id, but with two
+            # additions:
+            #   1. The sibling-face id (target ± cfg.target_marker_sibling_offset,
+            #      clipped to the target-marker range) is also tracked.
+            #      The pre-tick swap in _wait_attack_pre_tick keeps
+            #      active_marker_id pointing at whichever id is
+            #      currently visible (preferring the target). So a
+            #      SEARCH yaw-spin acquires the box even when the wrong
+            #      face is shown, and the APPROACH chain proceeds on
+            #      the sibling face to bring the drone to standoff.
+            #   2. The approach-settle gate refuses to advance the
+            #      script while active_marker_id != wait_attack_target_id.
+            #      So when the drone settles at parsed-distance on the
+            #      sibling face, the script does NOT advance — instead
+            #      we hold the position. As soon as the box flips
+            #      (target id becomes visible, sibling id does not),
+            #      the swap puts active = target, the PD re-targets
+            #      the (now-target) face, the drone re-settles, and
+            #      the gate advances the script.
+            mid = int(step.marker_id)
+            sibling = self._wait_attack_sibling_of(mid)
+            self._approach_on_settle_restart_mission = False
             with self.state.lock:
-                last = self.state.last_completed_step_kind
-            sentinel_s = 365 * 24 * 3600.0  # 1 year ~ "no timeout"
-            if last == "APPROACH":
-                with self.state.lock:
-                    self.state.hold_time_s = sentinel_s
-                self._set_phase(Phase.HOLD,
-                                note + f" station-keep, await marker"
-                                       f" {int(step.marker_id)} (no timeout)")
-            else:
-                with self.state.lock:
-                    self.state.idle_until = (time.monotonic() + sentinel_s)
-                self._set_phase(Phase.IDLE,
-                                note + f" idle, await marker"
-                                       f" {int(step.marker_id)} (no timeout)")
+                self.state.active_marker_id = mid
+                self.state.wait_attack_target_id = mid
+                self.state.wait_attack_sibling_id = sibling
+                self.state.target_distance_m = float(step.distance)
+                _dist_tol = getattr(step, "approach_dist_tol_m", None)
+                self.state.target_distance_tol_m = (
+                    float(_dist_tol) if _dist_tol is not None else None)
+                self.state.approach_positioning = False
+                self.state.target_relative_heading_deg = 0.0
+                self.state.arrive_hdg_tol_deg = None
+                _yaw_tol = getattr(step, "arrive_yaw_tol_deg", None)
+                self.state.arrive_yaw_tol_deg = (
+                    float(_yaw_tol) if _yaw_tol is not None else None)
+                # Box-height capture mirrors the APPROACH branch so
+                # SEARCH's lost-box descent (which keys on
+                # active_marker_id being in the target-marker range)
+                # has a snapshot to descend back to. The sibling face
+                # sits at the same physical height by construction,
+                # so we don't need to re-capture on swap.
+                _is_box = (cfg.target_marker_id_min
+                           <= mid <= cfg.target_marker_id_max)
+                if _is_box and self._box_height_marker != mid:
+                    _tel0 = self.state.last_telemetry
+                    self._box_height_marker = mid
+                    self.state.approach_start_height_m = (
+                        _tel0.height_cm / 100.0
+                        if _tel0 is not None
+                        and _tel0.height_cm is not None else None)
+                elif not _is_box:
+                    self._box_height_marker = None
+                    self.state.approach_start_height_m = None
+            sibling_str = f", sibling {sibling}" if sibling is not None else ""
+            self._set_phase(Phase.SEARCH,
+                            note + f" id={mid}{sibling_str}"
+                                   f" d={float(step.distance):g}m"
+                                   f" (hold on sibling face)")
             return
         if step.kind == "REPEAT":
             # Loop back to the first non-TAKEOFF step in the script

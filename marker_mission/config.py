@@ -122,6 +122,14 @@ class MissionConfig:
     target_marker_size_m: float = 0.18
     target_marker_id_min: int = 31
     target_marker_id_max: int = 46
+    # WAIT_AND_ATTACK sibling-face offset: per-team face id difference
+    # on a single target box. SDC26 convention is 31..36 (team A) ↔
+    # 41..46 (team B), so the sibling of 46 is 36 (offset = 10). The
+    # parser-passed marker id (e.g. WAIT_AND_ATTACK 46 1.5) means
+    # "attack face 46"; the sibling is the face the OTHER team owns
+    # (face 36 in this example), which the drone treats as "the box
+    # but wrong face — hover until it flips" instead of attacking.
+    target_marker_sibling_offset: int = 10
 
     # --- Mission goals -------------------------------------------------------
     target_distance_m: float = 1.0         # final standoff distance from marker [m]
