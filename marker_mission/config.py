@@ -231,6 +231,17 @@ class MissionConfig:
     # drone has crossed this threshold.
     # 0.0 = lateral active from the start  |  0.5 = second half  |  1.0 = never
     approach_yaw_start_fraction: float = 0.5  # TUNE
+    # Skip the dedicated HEIGHT_ALIGN phase between SEARCH and APPROACH:
+    # APPROACH already runs the same vision-only height PD continuously
+    # (pd_height on -marker_y) while it closes distance, so the separate
+    # "stop and align altitude first" pause is redundant in the common
+    # case. APPROACH's mid-HA latch at d <= lat_thr still settles
+    # altitude before the FINAL close-in, so the safety net for big
+    # e_h corrections is preserved. Set False to restore the legacy
+    # SEARCH -> HEIGHT_ALIGN -> APPROACH chain (useful when the active
+    # marker is well above/below the drone and the combined motion
+    # pushes it out of FOV).
+    approach_skip_height_align: bool = True  # TUNE
     # Small yaw correction allowed BEFORE the angle-correction latch fires.
     # Keeps the marker roughly centred in frame during the straight-in phase.
     # 0.0 = no pre-latch yaw at all  |  10.0 = allow up to ±10° correction.
@@ -629,6 +640,10 @@ TUNING_FIELDS = {
         "label": "fwd RC max", "kind": "int", "step": 1,
         "desc": "Hard cap on the rc_fb command magnitude (Anafi PCMD range -100..+100). Roughly each unit ≈ 4 cm/s body-forward at level flight, so rc_max=3 caps approach to ~12 cm/s. Lower = slower + safer.",
     },
+    "approach_skip_height_align": {
+        "label": "Skip HEIGHT_ALIGN before APPROACH", "kind": "bool",
+        "desc": "When ON (default), SEARCH transitions straight to APPROACH after acquiring the marker, skipping the dedicated HEIGHT_ALIGN pause. APPROACH itself runs the same vision-only height PD continuously (pd_height on -marker_y, the marker's camera-frame vertical offset), so altitude is corrected concurrently with distance closure -- one motion instead of stop-then-climb-then-approach. The mid-HA latch at d <= lat_thr still settles altitude before the FINAL close-in, so the safety net for big e_h corrections is preserved. Turn OFF when the active marker is far above/below the drone and the combined motion pushes it out of FOV.",
+    },
 
     "lat_kp": {
         "label": "lat kp", "kind": "float", "step": 0.01,
@@ -907,7 +922,8 @@ TUNING_GROUPS = [
     ("Forward PD (closing distance)",
         ["fwd_kp", "fwd_kd", "fwd_kv", "fwd_ki", "fwd_i_clip",
          "fwd_rc_max", "approach_slow_zone_m", "approach_slow_rc_max",
-         "approach_mid_ha_brake_kv", "approach_yaw_start_fraction"]),
+         "approach_mid_ha_brake_kv", "approach_yaw_start_fraction",
+         "approach_skip_height_align"]),
     ("Lateral PD (orbiting / heading correction)",
         ["lat_kp", "lat_kd", "lat_kv", "lat_ki", "lat_i_clip", "lat_rc_max"]),
     ("Yaw PD (centring marker)",

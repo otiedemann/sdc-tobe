@@ -1806,6 +1806,19 @@ class MissionController:
                 self._set_phase(Phase.APPROACH,
                                 "marker acquired (recovery GO_HOME) -- homing at "
                                 "current altitude (no climb to marker)")
+            elif getattr(cfg, "approach_skip_height_align", True):
+                # APPROACH itself runs the same vision-only height PD
+                # (pd_height on -marker_y) that HEIGHT_ALIGN does, just
+                # concurrent with fb/lr/yaw closure. Skipping the
+                # dedicated HA pause shaves the "stop + climb + then
+                # approach" sequence into one motion. APPROACH's
+                # mid-HA latch at d <= lat_thr still pauses to settle
+                # altitude before final close-in, so the safety net
+                # for big e_h corrections is preserved.
+                self._set_phase(Phase.APPROACH,
+                                f"marker acquired -- stop + {back_deg}° back -- "
+                                "closing distance (skip HEIGHT_ALIGN, "
+                                "approach handles altitude continuously)")
             else:
                 self._set_phase(Phase.HEIGHT_ALIGN,
                                 f"marker acquired -- stop + {back_deg}° back -- aligning altitude")
