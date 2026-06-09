@@ -990,7 +990,9 @@ def cmd_fly(args: argparse.Namespace) -> int:
                 # marker, and even non-target markers in frame are
                 # useful situational context. The controller still gets
                 # only the active target via pose_holder.
-                poses = detector.detect(frame, wanted_id=None)
+                poses = detector.detect(
+                    frame, wanted_id=None,
+                    zoom=float(getattr(controller, "_camera_zoom", 1.0) or 1.0))
                 # state.active_marker_id is the runtime target -- a
                 # script's APPROACH step can change it without
                 # polluting cfg.target_marker_id. Fall back to cfg if

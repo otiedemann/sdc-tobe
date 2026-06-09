@@ -269,11 +269,19 @@ class ArucoDetector:
 
     # ------------------------------------------------------------------ scan
     def detect(self, frame_bgr: np.ndarray,
-               wanted_id: Optional[int] = None) -> list[MarkerPose]:
+               wanted_id: Optional[int] = None,
+               zoom: float = 1.0) -> list[MarkerPose]:
         """Return a list of :class:`MarkerPose` for every detected marker.
 
         If ``wanted_id`` is given only that marker is returned (or [] if
         not visible).
+
+        ``zoom`` is the digital zoom factor currently applied by the drone
+        (e.g. 1.25, 2.0, 3.0).  Digital zoom crops the sensor and scales
+        the image up, which multiplies the effective focal length by the
+        same factor.  The calibration is for zoom=1.0, so passing the live
+        zoom here scales f_x / f_y before solvePnP so that tvec values are
+        returned in real-world metres regardless of zoom level.
         """
         ts = time.monotonic()
         H, W = frame_bgr.shape[:2]
@@ -283,6 +291,10 @@ class ArucoDetector:
         if ids is None:
             return out
         K = self.calibration.camera_matrix
+        if zoom != 1.0:
+            K = K.copy()
+            K[0, 0] *= zoom  # f_x scales with effective focal length
+            K[1, 1] *= zoom  # f_y
         D = self.calibration.dist_coeffs
         for c, id_arr in zip(corners, ids):
             mid = int(id_arr[0])
