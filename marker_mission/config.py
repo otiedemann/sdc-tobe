@@ -407,6 +407,11 @@ class MissionConfig:
     # --- Recording -----------------------------------------------------------
     record_fps: int = 25                   # MJPEG frames are decoded -> we re-mux
     record_jpeg_quality: int = 90          # for any direct JPEG saves
+    # CPU-saving recording toggles (TUNE; applied at the next mission/flight start)
+    record_enabled: bool = True            # TUNE  master switch — off = no flight VIDEO (CSV log still written)
+    record_raw: bool = True                # TUNE  also write raw.mp4 (off = annotated only, ~halves the encode)
+    record_codec: str = "mp4v"             # TUNE  "mp4v" (small files) / "MJPG" (intra-only, much cheaper to encode)
+    record_scale: float = 1.0              # TUNE  downscale factor before encode (0.25-1.0); fewer pixels = less CPU
 
     # --- Camera / Video (applied at mission start via camera_config_set) -----
     video_stream_mode: str = "low_latency"  # TUNE  "low_latency" / "high_reliability" / "high_reliability_low_framerate"
@@ -834,6 +839,23 @@ TUNING_FIELDS = {
         "desc": "Drone-side encoder framerate applied at mission start (set_recording_mode). Fewer fps = less WiFi load and FC CPU. Valid values: 8, 9, 10, 15, 20, 24, 25, 30. Does not affect stream transport reliability (see Stream mode).",
     },
 
+    "record_enabled": {
+        "label": "Record video (G)", "kind": "bool",
+        "desc": "Master switch for flight VIDEO recording (raw.mp4 + annotated.mp4). OFF saves the most FC CPU during a match — no software video encode — while the flight_log.csv is still written for replay. Applied at the next mission start.",
+    },
+    "record_raw": {
+        "label": "Record raw video (A)", "kind": "bool",
+        "desc": "Also write raw.mp4 (the un-annotated frames) alongside annotated.mp4. OFF records only the annotated video and removes ~half of the live recording encode CPU (one software encoder instead of two). Applied at the next mission start.",
+    },
+    "record_codec": {
+        "label": "Record codec (B)", "kind": "str", "choices": ["mp4v", "MJPG"],
+        "desc": "Software codec for the live recording. 'mp4v' (MPEG-4, inter-frame motion estimation) = smaller files but more CPU per frame. 'MJPG' (motion-JPEG, intra-only — no motion search) = much cheaper to encode, larger files. Applied at the next mission start.",
+    },
+    "record_scale": {
+        "label": "Record downscale (D)", "kind": "float", "step": 0.05,
+        "desc": "Downscale factor applied to each frame BEFORE encoding (1.0 = full resolution, 0.5 = half each dimension = ~1/4 the pixels = ~1/4 the encode cost). Recordings come out lower-res but flight CPU drops. Range 0.25-1.0. Applied at the next mission start.",
+    },
+
     "killswitch_key": {
         "label": "killswitch key", "kind": "str",
         "desc": "Single character. Pressing this key anywhere on the web UI (including inside textareas / number inputs) immediately triggers /api/stop and lands the drone. Default '@'. Comparison is case-insensitive; modifier keys (Ctrl/Cmd/Alt) are excluded so browser shortcuts still work.",
@@ -949,6 +971,8 @@ TUNING_GROUPS = [
         ["pose_smoothing_alpha", "pose_max_age_s"]),
     ("Camera / Video",
         ["video_stream_mode", "video_framerate_fps"]),
+    ("Recording (saves FC CPU during a match)",
+        ["record_enabled", "record_raw", "record_codec", "record_scale"]),
     ("Operator UX",
         ["killswitch_key"]),
     ("Vision / detector",

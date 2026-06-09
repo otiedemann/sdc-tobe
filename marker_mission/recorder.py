@@ -105,10 +105,18 @@ _CSV_FIELDS = [
 class FlightRecorder:
     """Background thread that writes raw and annotated video plus a CSV log."""
 
-    def __init__(self, flight_dir: Path, fps: int = 25):
+    def __init__(self, flight_dir: Path, fps: int = 25,
+                 codec: str = "mp4v", scale: float = 1.0):
         self.dir = Path(flight_dir)
         self.dir.mkdir(parents=True, exist_ok=True)
         self.fps = fps
+        # CPU-saving knobs (TUNE): codec (mp4v inter-frame vs MJPG intra-only) +
+        # a pre-encode downscale factor. Clamped to safe ranges.
+        self.codec = "MJPG" if str(codec).upper() == "MJPG" else "mp4v"
+        try:
+            self.scale = max(0.1, min(1.0, float(scale)))
+        except (TypeError, ValueError):
+            self.scale = 1.0
         self._raw_writer: Optional[cv2.VideoWriter] = None
         self._ann_writer: Optional[cv2.VideoWriter] = None
         self._raw_size: Optional[tuple[int, int]] = None
@@ -442,6 +450,13 @@ class FlightRecorder:
                 print(f"[rec] write error: {e}")
 
     def _open_writer(self, path: Path, size: tuple[int, int]) -> cv2.VideoWriter:
+        # MJPG (intra-only) is much cheaper to encode than mp4v (inter-frame
+        # motion estimation); both are software here. MJPG writes into an .avi
+        # container (mp4 doesn't carry MJPG cleanly).
+        if self.codec == "MJPG":
+            avi_path = path.with_suffix(".avi")
+            return cv2.VideoWriter(str(avi_path),
+                                   cv2.VideoWriter_fourcc(*"MJPG"), self.fps, size)
         fourcc = cv2.VideoWriter_fourcc(*"mp4v")
         w = cv2.VideoWriter(str(path), fourcc, self.fps, size)
         if not w.isOpened():
@@ -451,7 +466,18 @@ class FlightRecorder:
                                 self.fps, size)
         return w
 
+    def _downscale(self, frame: np.ndarray) -> np.ndarray:
+        """Resize a frame down by ``self.scale`` BEFORE encoding (fewer pixels =
+        less encode CPU). INTER_AREA is the right filter for shrinking."""
+        if self.scale >= 0.999:
+            return frame
+        h, w = frame.shape[:2]
+        nw = max(2, int(round(w * self.scale)))
+        nh = max(2, int(round(h * self.scale)))
+        return cv2.resize(frame, (nw, nh), interpolation=cv2.INTER_AREA)
+
     def _write(self, kind: str, frame: np.ndarray) -> None:
+        frame = self._downscale(frame)
         h, w = frame.shape[:2]
         size = (w, h)
         if kind == "raw":
