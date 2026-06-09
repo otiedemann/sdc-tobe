@@ -2428,6 +2428,26 @@ class MissionController:
             else:
                 self.state.settle_began_at = None
         if settled:
+            # ORDER MATTERS. The marker-lost recovery restart check must
+            # run BEFORE the WAIT_AND_ATTACK sibling-hold gate: recovery
+            # parks the drone on a wall marker (state.active_marker_id =
+            # 11 or similar) which differs from wait_attack_target_id
+            # (e.g. 46), so the gate would otherwise refuse to advance
+            # AND the recovery's mission_step_idx = -1 restart would
+            # never fire — the drone would loop forever on the wall
+            # marker. Recovery restart re-enters _apply_step_to_phase
+            # from step 0; when the WAIT_AND_ATTACK step is reached
+            # again it re-seeds wait_attack_target_id and active so
+            # SEARCH for the box restarts cleanly.
+            if self._approach_on_settle_restart_mission:
+                self._approach_on_settle_restart_mission = False
+                print("[ctrl] recovery GO_HOME settled at visible marker — "
+                      "restarting mission")
+                with self.state.lock:
+                    self.state.mission_step_idx = -1
+                    self.state.last_completed_step_kind = None
+                self._advance_script("marker-lost recovery: mission restart")
+                return
             # WAIT_AND_ATTACK gate: when we settle while parked on the
             # SIBLING face (target face not yet exposed), DO NOT advance
             # the script — the mission step expects an attack on the
@@ -2446,21 +2466,7 @@ class MissionController:
                         and _wa_active != _wa_target):
                     self.state.settle_began_at = None
                     return
-            # Marker-lost recovery (no TO): this APPROACH was a GO_HOME onto a
-            # visible marker to re-establish a vision anchor. On settle, RESTART
-            # the mission (re-run the operator's task from the top) rather than
-            # advancing to the next step. Mirrors the GOTO restart hook but with
-            # NO absolute-position navigation.
-            if self._approach_on_settle_restart_mission:
-                self._approach_on_settle_restart_mission = False
-                print("[ctrl] recovery GO_HOME settled at visible marker — "
-                      "restarting mission")
-                with self.state.lock:
-                    self.state.mission_step_idx = -1
-                    self.state.last_completed_step_kind = None
-                self._advance_script("marker-lost recovery: mission restart")
-            else:
-                self._advance_script("approach settled")
+            self._advance_script("approach settled")
 
     # ------------------------------------------------------------------ hold
     def _step_hold(self, tel: Optional[TelemetrySnapshot],
@@ -4005,8 +4011,15 @@ class MissionController:
         _step_search / _step_align / _step_approach / _step_hold all
         see the freshly-routed active id on the same tick.
 
-        No-op when no WAIT_AND_ATTACK is active (wait_attack_target_id
-        is None)."""
+        No-ops when no WAIT_AND_ATTACK is active (wait_attack_target_id
+        is None) OR when a marker-lost recovery hop is in progress
+        (_approach_on_settle_restart_mission == True). The recovery
+        hook deliberately switches active_marker_id to a wall marker
+        for re-localisation; we must not yank it back to target/sibling
+        mid-hop, or the recovery's APPROACH would chase the wrong
+        marker and the mission-restart trigger would never fire."""
+        if self._approach_on_settle_restart_mission:
+            return
         with self.state.lock:
             target = self.state.wait_attack_target_id
             sibling = self.state.wait_attack_sibling_id
