@@ -108,10 +108,13 @@ def attacker_alt(t: Tunables) -> float:
 
 
 def defender_alt(rank: int, t: Tunables) -> float:
-    """Defender altitude: a HIGHER tier than the attackers (so the attackers can
-    cross beneath them), with a small per-defender step so the two defenders that
-    share a neutral station are vertically separated."""
-    return _clamp_alt(t.defender_base_alt_m + t.mover_alt_step_m * max(0, rank))
+    """Defender altitude = the attacker altitude PLUS a fixed offset
+    (``defender_alt_above_attacker_m``, default 0.80 m) so defenders always wait
+    well ABOVE the attackers and can never collide with them, plus a small
+    per-defender step so two defenders sharing a neutral station are vertically
+    separated. Clamped to the 0.73-2.50 m band."""
+    return _clamp_alt(attacker_alt(t) + t.defender_alt_above_attacker_m
+                      + t.mover_alt_step_m * max(0, rank))
 
 
 def mover_alt(lane: int, t: Tunables) -> float:  # back-compat (scout/legacy)
@@ -280,12 +283,63 @@ def enemy_face_for_slot(slot: int, our_team: str) -> int:
     return face_id(int(slot), enemy)
 
 
+# ── Swimlanes (3 attackers shuttle straight vertical lanes) ──────────────────
+# The 6 boxes mirror across the centre line at matching x: box 1<->4 (x=-3),
+# box 2<->5 (x=0), box 3<->6 (x=+3). Each swimlane pairs the two boxes at one x,
+# so an attacker shuttling that lane flies a STRAIGHT vertical path and the 3
+# lanes never cross. Lane L (0,1,2) = boxes (L+1) [red home] and (L+4) [blue home].
+NUM_SWIMLANES = 3
+
+
+def swimlane_faces(lane: int, our_team: str) -> tuple:
+    """``(enemy_box_face, our_box_face)`` for swimlane ``lane`` (0..2), from OUR
+    team's view. BOTH are the box's ENEMY-colour face, so a WAIT_AND_ATTACK on
+    each captures the enemy box / recaptures our box whenever it shows the enemy
+    colour (and holds at standoff awaiting the flip otherwise). The lane pairs box
+    (lane+1) [red home] with box (lane+4) [blue home]; which is "ours" vs "enemy"
+    flips with team."""
+    enemy = "blue" if our_team == "red" else "red"
+    red_slot = (lane % NUM_SWIMLANES) + 1          # 1,2,3
+    blue_slot = (lane % NUM_SWIMLANES) + 4         # 4,5,6
+    if our_team == "red":
+        our_slot, enemy_slot = red_slot, blue_slot
+    else:
+        our_slot, enemy_slot = blue_slot, red_slot
+    return face_id(enemy_slot, enemy), face_id(our_slot, enemy)
+
+
+def attacker_swimlane_script(enemy_box_face: int, our_box_face: int,
+                             cruise_alt_m: float, t: Tunables) -> str:
+    """SWIMLANE attacker — shuttles a straight vertical lane between an ENEMY box
+    and OUR box, capturing/recapturing each whenever it shows the enemy colour.
+
+    WAIT_AND_ATTACK at BOTH ends (acquires the box by EITHER face, holds at
+    standoff until it shows the ENEMY colour, then closes in to flip it);
+    FB_UD_IMU slides up+over to capture; YAW_IMU 180 turns toward the other end;
+    REPEAT loops back to the first non-TAKEOFF step forever (skipping TAKEOFF) so
+    the drone NEVER lands. Distinct lane per attacker => the 3 lanes never cross
+    (no fan-out / altitude ladder needed)."""
+    cruise = f"HEIGHT {cruise_alt_m:.2f}"
+    std = f"{t.attack_standoff_m:.2f} {t.attack_dist_tol_m:.2f}"
+    fbud = f"FB_UD_IMU {t.over_box_forward_m:.2f} {t.capture_rise_m:.2f}"
+    return _fmt([
+        "TAKEOFF",
+        cruise,
+        f"WAIT_AND_ATTACK {int(enemy_box_face)} {std}",   # enemy box: capture when enemy-held
+        fbud,
+        "YAW_IMU 180",
+        f"WAIT_AND_ATTACK {int(our_box_face)} {std}",      # our box: recapture when enemy-held
+        fbud,
+        "YAW_IMU 180",
+        "REPEAT",                                          # loop forever, skip TAKEOFF -> never lands
+    ])
+
+
 def attacker_park_script(wall_marker: int, cruise_alt_m: float,
                          rth_hdg_deg: float, t: Tunables) -> str:
-    """Fallback hover for an EXTRA attacker with no free enemy box (more attackers
-    than the 3 enemy boxes): take off, settle in our HOME zone, and hover forever
-    (never lands). Attackers that DO own a box fly the self-contained
-    ``attacker_lane_script`` loop instead."""
+    """Fallback hover for an EXTRA attacker with no free swimlane (more attackers
+    than the 3 lanes): take off, settle in our HOME zone, and hover forever (never
+    lands). Attackers that DO own a lane fly ``attacker_swimlane_script`` instead."""
     cruise = f"HEIGHT {cruise_alt_m:.2f}"
     return _fmt([
         "TAKEOFF",
@@ -298,10 +352,11 @@ def attacker_park_script(wall_marker: int, cruise_alt_m: float,
 
 def defender_neutral_script(wall_marker: int, neutral_standoff_m: float,
                             alt_m: float, t: Tunables) -> str:
-    """Wait JUST OUTSIDE our home zone in the neutral zone, facing our boxes, and
-    slow-rotate to scan them. GO_HOME onto our home-wall marker at a LOOSE neutral
-    standoff (so it stops ~0.5 m into neutral, not deep in home), then rotate
-    forever. The runner splices in a recapture the instant one of our boxes flips."""
+    """Wait ``neutral_standoff_m`` (operator: 5 m) off our home-wall marker, facing
+    our boxes, and slow-rotate to scan them. GO_HOME onto the home-wall marker at
+    that LOOSE standoff (5 m ~ the home/neutral boundary; raise it to ~5.5-6 m to
+    sit clearly in neutral), then rotate forever. The runner splices in a recapture
+    the instant one of our boxes flips."""
     return _fmt([
         "TAKEOFF",
         f"HEIGHT {alt_m:.2f}",
@@ -313,13 +368,16 @@ def defender_neutral_script(wall_marker: int, neutral_standoff_m: float,
 def defender_recapture_splice(enemy_face: int, wall_marker: int,
                               neutral_standoff_m: float, alt_m: float,
                               t: Tunables) -> str:
-    """NO-TAKEOFF splice: dash IN to the flipped own box, recapture it (APPROACH
-    the enemy face -> slide up+over to flip it back), then return to the neutral
-    scan station and rotate. Spliced into an airborne defender, so no landing."""
+    """NO-TAKEOFF splice: dash IN to the flipped own box and recapture it with
+    WAIT_AND_ATTACK (acquire by either face, attack the moment it shows the enemy
+    colour -> slide up+over to flip it back), then return to the neutral scan
+    station 5 m off our home marker and rotate. Spliced into an airborne defender,
+    so no landing. WAIT_AND_ATTACK (vs plain APPROACH) keeps the recapture from
+    searching-then-landing if the box momentarily flips during the dash-in."""
     cruise = f"HEIGHT {alt_m:.2f}"
     return _fmt([
         cruise,
-        f"APPROACH {int(enemy_face)} {t.attack_standoff_m:.2f} {t.attack_dist_tol_m:.2f}",
+        f"WAIT_AND_ATTACK {int(enemy_face)} {t.attack_standoff_m:.2f} {t.attack_dist_tol_m:.2f}",
         f"FB_UD_IMU {t.over_box_forward_m:.2f} {t.capture_rise_m:.2f}",
         "YAW_IMU 180",
         cruise,
