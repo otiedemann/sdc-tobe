@@ -865,9 +865,13 @@ def cmd_fly(args: argparse.Namespace) -> int:
         # Freeze detection: track last frame timestamp change and restart cooldown.
         _freeze_last_ts: float = 0.0
         _freeze_restart_after: float = 0.0   # monotonic cooldown (vision_worker local)
-        _FREEZE_TIMEOUT_S  = 3.0   # stale frame age that counts as frozen
-        _FREEZE_COOLDOWN_S = 3.0   # min seconds between auto-restarts
-        _MOVE_SPEED_CMS    = 5.0   # drone speed threshold (cm/s) for "moving"
+        _FREEZE_TIMEOUT_S       = 3.0   # stale frame age that counts as frozen
+        _FREEZE_COOLDOWN_S      = 3.0   # min seconds between auto-restarts
+        _MOVE_SPEED_CMS         = 5.0   # drone speed threshold (cm/s) for "moving"
+        _POST_TAKEOFF_WINDOW_S  = 15.0  # seconds after takeoff where freeze restarts
+        #                                 even without movement (camera often freezes
+        #                                 during the Anafi takeoff sequence at ~0 cm/s)
+        _takeoff_at: float = 0.0        # monotonic time of last transition to flying
         # Position Kalman filter state. Lives across loop iterations
         # (function-local closure variables persist). Reset on
         # disable -> enable transitions and on dt > kalman_reset_gap_s.
@@ -895,6 +899,10 @@ def cmd_fly(args: argparse.Namespace) -> int:
             if frame_age > _FREEZE_TIMEOUT_S and now_ft >= _freeze_restart_after:
                 tel_now = tel_holder.get()
                 if tel_now is not None and tel_now.flying:
+                    # Track first moment the drone became airborne so the
+                    # post-takeoff window can be checked below.
+                    if _takeoff_at == 0.0:
+                        _takeoff_at = now_ft
                     try:
                         spd = math.hypot(
                             float(tel_now.raw.get("vgx", 0) or 0),
@@ -902,15 +910,23 @@ def cmd_fly(args: argparse.Namespace) -> int:
                         )
                     except (TypeError, ValueError):
                         spd = 0.0
-                    if spd >= _MOVE_SPEED_CMS:
-                        print(f"[vision] frame frozen {frame_age:.1f}s while "
-                              f"moving ({spd:.0f} cm/s) — restarting camera")
+                    post_takeoff = (now_ft - _takeoff_at) < _POST_TAKEOFF_WINDOW_S
+                    if spd >= _MOVE_SPEED_CMS or post_takeoff:
+                        reason = (f"post-takeoff ({now_ft - _takeoff_at:.0f}s)"
+                                  if post_takeoff and spd < _MOVE_SPEED_CMS
+                                  else f"moving ({spd:.0f} cm/s)")
+                        print(f"[vision] frame frozen {frame_age:.1f}s "
+                              f"while {reason} — restarting camera")
                         errs = ui.restart_camera()
                         _freeze_restart_after = now_ft + _FREEZE_COOLDOWN_S
                         with state.lock:
                             state.camera_restart_count += 1
                         if errs:
                             print(f"[vision] camera restart errors: {errs}")
+                else:
+                    # Drone landed or not yet flying: reset takeoff timestamp
+                    # so the post-takeoff window fires fresh on next flight.
+                    _takeoff_at = 0.0
             # ────────────────────────────────────────────────────────────
 
             if frame is None or ts == last_seen_ts:
