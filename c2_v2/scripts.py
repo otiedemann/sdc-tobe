@@ -238,27 +238,31 @@ def _our_slots(our_team: str):
 def attacker_lane_script(enemy_face: int, wall_marker: int, cruise_alt_m: float,
                          rth_hdg_deg: float, t: Tunables) -> str:
     """FIXED-TARGET attacker — a SELF-CONTAINED never-land loop on ONE enemy box,
-    built with the FC's REPEAT verb. No C2 splice / box-state / FC mission-state
-    needed: the mission itself shuttles the straight lane home<->box. Each pass:
-    fly out and APPROACH the box face, slide up+over to flip it, turn, GO_HOME the
-    back-wall marker to score, then HOVER in our home zone for
-    ``attacker_home_dwell_s`` — then REPEAT loops back to the first non-TAKEOFF
-    step (the leg) forever, skipping TAKEOFF, so the drone NEVER lands on its own.
-    Distinct face per attacker => distinct boxes => collision-safe straight lanes.
+    built with the FC's WAIT_AND_ATTACK + REPEAT verbs. No C2 splice / box-state /
+    FC mission-state needed: the mission itself shuttles the straight lane
+    home<->box. Each pass: fly out and WAIT_AND_ATTACK the box (it acquires the box
+    by EITHER face — the enemy face OR our sibling face — so it never loses the
+    marker when the box is ours; it holds at standoff until the box shows the ENEMY
+    face, then closes in), slide up+over to flip it, turn, GO_HOME the back-wall
+    marker to score, then HOVER in our home zone for ``attacker_home_dwell_s`` —
+    then REPEAT loops back to the first non-TAKEOFF step (the leg) forever, skipping
+    TAKEOFF, so the drone NEVER lands on its own. Distinct face per attacker =>
+    distinct boxes => collision-safe straight lanes.
 
-    CAVEAT (FC-side, can't be fixed from c2_v2 per constraint #8): if the box is
-    currently OURS (just captured, shows OUR face -> the enemy face is physically
-    absent) the APPROACH searches for the enemy face and, after the FC's bounded
-    marker-lost recovery exhausts (~3 hops), the FC LANDS — the C2 then relaunches
-    it (DONE -> idle -> push). In a real match the enemy recaptures the box, so the
-    enemy face is up when the attacker returns and this doesn't trigger; it mainly
-    bites no-enemy bench testing. The home dwell gives the box time to flip back."""
+    Using WAIT_AND_ATTACK (not plain APPROACH) is what makes "attack only when the
+    target is enemy-held" robust AND never-land: a box that is currently OURS shows
+    the sibling face, which WAIT_AND_ATTACK still tracks, so the drone holds at
+    standoff awaiting the flip instead of searching for an absent marker and
+    eventually landing. The home dwell still returns it home to score between
+    strikes; it only holds forward at the box when it arrives before the flip."""
     cruise = f"HEIGHT {cruise_alt_m:.2f}"
     dwell = max(1, int(round(t.attacker_home_dwell_s)))
     return _fmt([
         "TAKEOFF",
         cruise,
-        f"APPROACH {int(enemy_face)} {t.attack_standoff_m:.2f} {t.attack_dist_tol_m:.2f}",
+        # Acquire the box by EITHER face; hold at standoff until it shows the ENEMY
+        # face, then close in. Never searches-then-lands when the box is ours.
+        f"WAIT_AND_ATTACK {int(enemy_face)} {t.attack_standoff_m:.2f} {t.attack_dist_tol_m:.2f}",
         f"FB_UD_IMU {t.over_box_forward_m:.2f} {t.capture_rise_m:.2f}",
         "YAW_IMU 180",
         cruise,
