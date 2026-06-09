@@ -33,8 +33,10 @@ Twenty commands. Suffix convention:
                                                        -80..+80 deg off the marker normal
     HOOVER   [<seconds>]
     AWAIT    <marker-id> <timeout-seconds>
+    WAIT_AND_ATTACK <marker-id> [<distance>] [<dist_tol_m>] [<yaw_tol_deg>]   wait until id seen, then APPROACH
     PAUSE    <seconds>
     LAND
+    REPEAT                                          loop to first non-TAKEOFF step (last step only)
     HEIGHT   [<height>]
     TO       <x> <y> [<z>]
     DANCE    [<seconds>] [<mode>]                  mode in {wobble, spin, random}
@@ -95,6 +97,23 @@ in [-100, +100].
 AWAIT behaves like HOOVER (HOLD-style station-keeping if the previous
 step was APPROACH, otherwise IDLE) but exits early as soon as the
 named marker becomes visible. The timeout is a hard upper bound.
+
+WAIT_AND_ATTACK is the unbounded sibling of AWAIT, fused with APPROACH.
+The drone enters HOLD (if last step was APPROACH) or IDLE and waits --
+with no timeout -- until ``marker-id`` is visible. As soon as it is,
+the same step transitions in-place to APPROACH semantics with the
+given distance / dist_tol / yaw_tol. Use case: a target box is
+currently showing OUR team's face (so our team's marker id is visible
+but the opposing-team id we want to attack is not). Pass the opposing
+id; the drone hovers until the box flips, then closes in.
+
+REPEAT restarts the script from the first non-TAKEOFF step without
+landing in between. It must be the LAST step of the script and must
+be preceded by at least one non-TAKEOFF step (otherwise the loop
+target would be REPEAT itself). The leading TAKEOFF (if any) is
+skipped because we're already airborne -- looping into TAKEOFF on a
+flying drone is an error path. Use REPEAT to convert a one-shot
+mission into a continuous patrol.
 
 PAUSE is unconditional IDLE for the given seconds (rc = 0 throughout).
 Useful for fixed pauses regardless of what came before.
@@ -362,6 +381,54 @@ def parse(text: str, defaults: dict) -> List[Step]:
             out.append(Step(kind="AWAIT",
                             marker_id=mid, seconds=sec,
                             line_no=raw_line_no))
+        elif cmd == "WAIT_AND_ATTACK":
+            # Same argument shape as APPROACH (id / dist / dist_tol / yaw_tol)
+            # but blocks indefinitely until ``marker-id`` is visible, then
+            # transitions in-place to APPROACH semantics. Use when a target
+            # box is currently showing OUR team's face (the opposing-team id
+            # is not visible) and we want to wait for the box to flip
+            # before attacking.
+            if len(args) > 4:
+                raise ScriptError(raw_line_no,
+                                  f"WAIT_AND_ATTACK takes 1-4 arguments "
+                                  f"(<marker-id> [<distance>] [<dist_tol_m>] "
+                                  f"[<yaw_tol_deg>]), got {len(args)}")
+            mid = (_parse_int(args[0], raw_line_no, "WAIT_AND_ATTACK marker-id")
+                   if len(args) >= 1
+                   else int(_required_default(defaults, "marker_id", raw_line_no)))
+            dist = (_parse_float(args[1], raw_line_no, "WAIT_AND_ATTACK distance")
+                    if len(args) >= 2
+                    else float(_required_default(defaults, "distance", raw_line_no)))
+            dist_tol = None
+            if len(args) >= 3:
+                dist_tol = _parse_float(args[2], raw_line_no,
+                                        "WAIT_AND_ATTACK dist_tol")
+                if not (0.05 <= dist_tol <= 5.0):
+                    raise ScriptError(raw_line_no,
+                                      f"WAIT_AND_ATTACK dist_tol must be "
+                                      f"0.05..5 m, got {dist_tol}")
+            yaw_tol = None
+            if len(args) >= 4:
+                yaw_tol = _parse_float(args[3], raw_line_no,
+                                       "WAIT_AND_ATTACK yaw_tol")
+                if not (1.0 <= yaw_tol <= 180.0):
+                    raise ScriptError(raw_line_no,
+                                      f"WAIT_AND_ATTACK yaw_tol must be "
+                                      f"1..180 deg, got {yaw_tol}")
+            out.append(Step(kind="WAIT_AND_ATTACK",
+                            marker_id=mid, distance=dist,
+                            approach_dist_tol_m=dist_tol,
+                            arrive_yaw_tol_deg=yaw_tol,
+                            line_no=raw_line_no))
+        elif cmd == "REPEAT":
+            # Loops back to the first non-TAKEOFF step without landing in
+            # between. Validated post-loop to be the last step and to have
+            # at least one non-TAKEOFF step preceding it (else looping
+            # would target REPEAT itself).
+            if args:
+                raise ScriptError(raw_line_no,
+                                  f"REPEAT takes no arguments, got {args}")
+            out.append(Step(kind="REPEAT", line_no=raw_line_no))
         elif cmd == "PAUSE":
             if len(args) != 1:
                 raise ScriptError(raw_line_no,
@@ -691,6 +758,23 @@ def parse(text: str, defaults: dict) -> List[Step]:
                             line_no=raw_line_no))
         else:
             raise ScriptError(raw_line_no, f"unknown command {cmd!r}")
+    # ---- Post-loop validations --------------------------------------------
+    # REPEAT: at most one, must be the last step, and must be preceded by at
+    # least one non-TAKEOFF step (otherwise looping to the first non-TAKEOFF
+    # step would land on REPEAT itself).
+    repeat_indices = [i for i, s in enumerate(out) if s.kind == "REPEAT"]
+    if repeat_indices:
+        if len(repeat_indices) > 1:
+            raise ScriptError(out[repeat_indices[1]].line_no,
+                              "REPEAT may only appear once in a script")
+        repeat_idx = repeat_indices[0]
+        if repeat_idx != len(out) - 1:
+            raise ScriptError(out[repeat_idx].line_no,
+                              "REPEAT must be the last step in the script")
+        if not any(s.kind != "TAKEOFF" for s in out[:repeat_idx]):
+            raise ScriptError(out[repeat_idx].line_no,
+                              "REPEAT requires at least one non-TAKEOFF step "
+                              "before it")
     return out
 
 
@@ -720,6 +804,15 @@ def format(steps: List[Step]) -> str:
             lines.append(f"HOOVER {s.seconds:g}")
         elif s.kind == "AWAIT":
             lines.append(f"AWAIT {s.marker_id} {s.seconds:g}")
+        elif s.kind == "WAIT_AND_ATTACK":
+            extra = ""
+            if s.approach_dist_tol_m is not None:
+                extra += f" {s.approach_dist_tol_m:g}"
+                if s.arrive_yaw_tol_deg is not None:
+                    extra += f" {s.arrive_yaw_tol_deg:g}"
+            lines.append(f"WAIT_AND_ATTACK {s.marker_id} {s.distance:g}{extra}")
+        elif s.kind == "REPEAT":
+            lines.append("REPEAT")
         elif s.kind == "PAUSE":
             lines.append(f"PAUSE {s.seconds:g}")
         elif s.kind == "LAND":

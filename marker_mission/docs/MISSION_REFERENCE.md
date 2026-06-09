@@ -125,6 +125,44 @@ Done when the awaited marker is seen *or* the timeout expires.
 
 ---
 
+### `WAIT_AND_ATTACK <marker-id> [<distance>] [<dist_tol_m>] [<yaw_tol_deg>]`
+
+> Unbounded wait until `marker-id` is visible, then transition in-place
+> to `APPROACH` semantics. The single-step fusion of `AWAIT` + `APPROACH`.
+
+Behaviour during the wait phase matches `AWAIT`:
+
+- **After `APPROACH`** — station-keeping HOLD on the previously
+  approached marker.
+- **Otherwise** — IDLE.
+
+There is no timeout. The drone hovers (or station-keeps) indefinitely
+until the named marker appears. As soon as it does, the same step
+re-enters `_apply_step_to_phase` with `kind="APPROACH"` so the rest of
+the script sees a normal approach: `SEARCH → ALIGN → APPROACH → HOLD`
+with the parsed `distance` / `dist_tol_m` / `yaw_tol_deg`, and a
+following `HOOVER` correctly routes to `HOLD` (the in-place transition
+also rewrites `current_step_kind` to `"APPROACH"` so `HOOVER`'s
+"`last == APPROACH`" check fires).
+
+Use case: a target box currently shows OUR team's marker face. Pass the
+opposing team's id (the face we want to attack) — the drone waits
+hovering until the box flips, then closes in.
+
+Arguments mirror `APPROACH`:
+
+- `marker-id`: id to wait for and then attack. Required.
+- `distance`: final standoff [m]. Required (no parse-time default unless
+  one is configured).
+- `dist_tol_m`: optional arrival distance tolerance (0.05..5 m).
+- `yaw_tol_deg`: optional yaw-settle tolerance (1..180 deg) — advance
+  the instant the distance is reached, from any angle within this band.
+
+Done when the `APPROACH` phase settles (same exit condition as a plain
+`APPROACH`).
+
+---
+
 ### `PAUSE <seconds>`
 
 > Unconditional IDLE for the given seconds.
@@ -395,6 +433,32 @@ If `LAND` is the last command, the script transitions to DONE. If you
 forgot to put `LAND` at the end, a safety LAND is appended automatically.
 A script with `LAND` followed by another command is legal — the drone
 takes off again.
+
+---
+
+### `REPEAT`
+
+> Loop back to the first non-`TAKEOFF` step without landing in between.
+> Converts a one-shot mission into a continuous patrol.
+
+Must be the **last** step of the script, and the script must contain at
+least one non-`TAKEOFF` step before it (otherwise the loop target would
+be `REPEAT` itself, which is rejected at parse time).
+
+When the controller reaches `REPEAT`, it rewinds `mission_step_idx` to
+just before the first non-`TAKEOFF` step and immediately calls
+`_advance_script`, so the next phase entry is the loop target. The
+leading `TAKEOFF` (if any) is skipped because the drone is already
+airborne — re-issuing `takeoff` on a flying drone is an error path.
+
+Use cases:
+
+- Continuous patrol: `TAKEOFF; APPROACH 1 2.0; APPROACH 2 2.0; APPROACH 3 2.0; REPEAT`
+- Forever-wait pattern: `TAKEOFF; HEIGHT 1.5; WAIT_AND_ATTACK 31 1.0; HOOVER 5; REPEAT` — fly to a hover, attack target 31 every time it shows enemy face, repeat indefinitely.
+
+No `LAND` will fire from `REPEAT` itself; if you want the patrol to end
+on a condition, route a separate `LAND` step from elsewhere in the
+script (e.g. via the splice / operator-stop path).
 
 ---
 

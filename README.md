@@ -177,7 +177,9 @@ section so they can never run together).
 | `APPROACH` | `[marker-id] [dist]` | Fly to a marker, stop at `dist` m |
 | `HOOVER` | `[seconds]` | Station-keep |
 | `AWAIT` | `marker-id timeout-s` | Hold until marker visible (with timeout) |
+| `WAIT_AND_ATTACK` | `marker-id [dist] [dist_tol_m] [yaw_tol_deg]` | Wait unbounded until marker visible, then APPROACH in-place. Use when a target box currently shows our team's face — pass the opposing-team id. |
 | `PAUSE` | `seconds` | Unconditional IDLE |
+| `REPEAT` | — | Last step only: loop back to the first non-`TAKEOFF` step without landing. Converts a one-shot mission into a continuous patrol. |
 | `LAND` | — | Land |
 | `HEIGHT` | `[height]` | Climb/descend to arena height (m) |
 | `TO` | `x y [z] [yaw\|auto]` | Drive to arena-frame coordinate |

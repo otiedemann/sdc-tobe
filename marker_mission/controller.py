@@ -47,7 +47,7 @@ import math
 import random as _random
 import threading
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import List, Optional
 
 from .aruco_detector import MarkerPose
@@ -2442,12 +2442,13 @@ class MissionController:
             await_id = self.state.await_marker_id
             visible_now = (set(self.state.visible_marker_ids)
                            if await_id is not None else None)
-        # AWAIT early-exit: an AWAIT step routed us here, and the
-        # awaited marker is now in view. Advance the script before
+        # AWAIT / WAIT_AND_ATTACK early-exit: the awaited marker is
+        # now in view. Advance the script (AWAIT) or transition the
+        # current step in-place to APPROACH (WAIT_AND_ATTACK) before
         # the timer expires.
         if await_id is not None and visible_now and await_id in visible_now:
             self._send_rc(0, 0, 0, 0)
-            self._advance_script(f"AWAIT marker {await_id} seen")
+            self._on_await_marker_seen(int(await_id))
             return
         if began is not None and (now - began) >= hold_time_s:
             self._send_rc(0, 0, 0, 0)
@@ -2535,7 +2536,7 @@ class MissionController:
             self.state.note = (f"IDLE: {(until - now):.1f}s remaining"
                                if until is not None else "IDLE")
         if await_id is not None and visible_now and await_id in visible_now:
-            self._advance_script(f"AWAIT marker {await_id} seen")
+            self._on_await_marker_seen(int(await_id))
             return
         if until is not None and now >= until:
             self._advance_script("idle complete")
@@ -3938,6 +3939,32 @@ class MissionController:
             self.state.last_completed_step_kind = None
         self._set_phase(Phase.LAND, reason)
 
+    def _on_await_marker_seen(self, await_id: int) -> None:
+        """Called from the HOLD / IDLE tick when state.await_marker_id is
+        visible. For a plain AWAIT step this advances the script; for
+        WAIT_AND_ATTACK the current step transitions in-place to
+        APPROACH semantics (same marker_id / distance / dist_tol /
+        yaw_tol) without advancing the index."""
+        with self.state.lock:
+            cur_kind = self.state.current_step_kind
+            idx = self.state.mission_step_idx
+            script = list(self.state.mission_script)
+        if cur_kind == "WAIT_AND_ATTACK" and 0 <= idx < len(script):
+            approach_step = replace(script[idx], kind="APPROACH")
+            with self.state.lock:
+                # The transition is now an APPROACH for all downstream
+                # bookkeeping: a trailing HOOVER goes to HOLD (which
+                # keys on last_completed_step_kind == "APPROACH"), and
+                # the AWAIT-id hook is cleared so the next IDLE / HOLD
+                # tick doesn't fire the early-exit again.
+                self.state.current_step_kind = "APPROACH"
+                self.state.await_marker_id = None
+            self._apply_step_to_phase(
+                approach_step,
+                f"WAIT_AND_ATTACK marker {await_id} seen — attacking")
+            return
+        self._advance_script(f"AWAIT marker {await_id} seen")
+
     def _advance_script(self, reason: str) -> None:
         """Consume the current script step and load the next one. If
         the script is exhausted, terminate with LAND (or DONE if the
@@ -3968,12 +3995,17 @@ class MissionController:
         call _set_phase with the appropriate initial phase."""
         cfg = self.cfg
         note = f"script[{step.line_no}] {step.kind} ({reason})"
-        # AWAIT installs an early-exit marker id; every other step
-        # clears it so a previous AWAIT can't accidentally short-circuit
-        # subsequent IDLE / HOLD ticks.
+        # AWAIT and WAIT_AND_ATTACK install an early-exit marker id;
+        # every other step clears it so a previous one can't accidentally
+        # short-circuit subsequent IDLE / HOLD ticks. WAIT_AND_ATTACK
+        # piggybacks on the same hook -- when the id is seen, the
+        # _step_idle / _step_hold tick routes via _on_await_marker_seen
+        # which transitions in-place to APPROACH for WAIT_AND_ATTACK and
+        # advances the script for plain AWAIT.
         with self.state.lock:
             self.state.await_marker_id = (int(step.marker_id)
-                                          if step.kind == "AWAIT"
+                                          if step.kind in (
+                                              "AWAIT", "WAIT_AND_ATTACK")
                                           else None)
         if step.kind == "TAKEOFF":
             self._set_phase(Phase.TAKEOFF, note)
@@ -4115,6 +4147,62 @@ class MissionController:
                                           + float(step.seconds))
             self._set_phase(Phase.IDLE,
                             note + f" pause {step.seconds:g}s")
+            return
+        if step.kind == "WAIT_AND_ATTACK":
+            # Unbounded sibling of AWAIT, fused with APPROACH. Block in
+            # HOLD (if last was APPROACH) or IDLE until marker_id is
+            # visible; the await early-exit (_on_await_marker_seen)
+            # then transitions in-place to APPROACH semantics with the
+            # parsed distance / dist_tol / yaw_tol. Implementation: set
+            # the hold / idle timer to a far-future sentinel so only the
+            # marker-seen exit can advance us.
+            with self.state.lock:
+                last = self.state.last_completed_step_kind
+            sentinel_s = 365 * 24 * 3600.0  # 1 year ~ "no timeout"
+            if last == "APPROACH":
+                with self.state.lock:
+                    self.state.hold_time_s = sentinel_s
+                self._set_phase(Phase.HOLD,
+                                note + f" station-keep, await marker"
+                                       f" {int(step.marker_id)} (no timeout)")
+            else:
+                with self.state.lock:
+                    self.state.idle_until = (time.monotonic() + sentinel_s)
+                self._set_phase(Phase.IDLE,
+                                note + f" idle, await marker"
+                                       f" {int(step.marker_id)} (no timeout)")
+            return
+        if step.kind == "REPEAT":
+            # Loop back to the first non-TAKEOFF step in the script
+            # without landing in between. The parser guarantees REPEAT
+            # is the last step AND has at least one non-TAKEOFF step
+            # before it, so loop_to < idx_now is always true on a
+            # well-formed script; the runtime guard below is
+            # belt-and-suspenders for the operator who hand-edits the
+            # in-memory script via the splice path.
+            with self.state.lock:
+                script = list(self.state.mission_script)
+                idx_now = self.state.mission_step_idx
+            loop_to = 0
+            while loop_to < len(script) and script[loop_to].kind == "TAKEOFF":
+                loop_to += 1
+            if loop_to >= idx_now or loop_to >= len(script):
+                self._set_phase(Phase.LAND,
+                                note + " (REPEAT with no viable loop target"
+                                       " — landing instead)")
+                return
+            with self.state.lock:
+                # _advance_script increments mission_step_idx by 1 then
+                # loads script[idx], so target idx = loop_to - 1.
+                self.state.mission_step_idx = loop_to - 1
+                # Clear last_completed_step_kind so the safety-LAND
+                # branch (last == LAND -> DONE) can't fire on the next
+                # advance just because the immediately-prior real step
+                # happened to be LAND.
+                self.state.last_completed_step_kind = None
+            self._advance_script(
+                f"REPEAT: looping to script[{loop_to}]"
+                f" (kind={script[loop_to].kind})")
             return
         if step.kind == "RC":
             # Raw RC step (LR / FB / UD / RC): pin sticks for `seconds`,
