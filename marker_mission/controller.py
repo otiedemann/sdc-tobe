@@ -1764,12 +1764,12 @@ class MissionController:
             self._search_swept = 0.0
             self._search_prev_yaw = None
             self._search_yaw_rc = float(cfg.search_yaw_rc)
-            self._search_zoom = 1.25
+            self._search_zoom = 1.0
             self._search_esc_level = 0
-            try:
-                self.api.camera_config_set(zoom=1.25)
-            except Exception:
-                pass
+            # Do NOT call camera_config_set(zoom=1.0) here: TAKEOFF already
+            # set zoom=1.0 and any set_zoom_target call triggers an Olympe
+            # _media_removed stream restart (~2s freeze). Start search at 1x,
+            # escalate to 2x/3x only when needed.
             # Arm the descend-to-approach-height for a lost TARGET BOX: a brief
             # HEIGHT_ALIGN to a high/oblique marker -- or a GO_HOME recovery
             # anchor -- can strand the drone above the (low) box, out of the
@@ -1888,7 +1888,7 @@ class MissionController:
                             f"target unrecoverable) — ending mission, yielding "
                             f"to C2")
                         return
-                    # Nothing visible yet — escalate zoom (1.25 -> 2 -> 3x) and
+                    # Nothing visible yet — escalate zoom (1x -> 2x -> 3x) and
                     # halve rotation speed per zoom level so the detector has
                     # more time per frame at higher magnification.
                     if self._search_esc_level in (1, 2):
