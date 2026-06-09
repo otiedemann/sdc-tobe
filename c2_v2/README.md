@@ -9,6 +9,24 @@ per-drone role state machines and a single swarm **coordinator** that actually
 plays for the 5 / 10 / Special scoring tiers and **never lands the drones except
 on the `?` emergency-land**. `marker_mission` (the FC) is never modified.
 
+## Current strategy (simplified — scout-less)
+
+Default fleet: **3 attackers + 2 defenders, no scout** (each role does its own
+scouting).
+
+- **Attackers** — each owns ONE enemy box for the whole match (a **fixed lane**).
+  It flies the straight home↔box lane, captures the box whenever the enemy face
+  is up, and holds it by presence; distinct boxes give spatially-separated lanes
+  (plus the altitude ladder + RTH fan-out) so attackers don't collide. *(Without
+  a scout an attacker can't see its box from home, so it patrols its lane rather
+  than waiting at home — a continuously-present attacker both captures and holds.)*
+- **Defenders** — wait just outside our home in the **neutral zone**, slow-rotate
+  to scan our 3 boxes, and the instant one flips to the enemy the runner **splices
+  in a recapture** (no landing) — dash in, flip it back, return to the scan.
+
+The earlier dynamic coordinator (AUTO) still exists and now treats the scout as
+optional; `baseline_defenders` (tunable, default 2) sets the AUTO defender count.
+
 ## Run
 
 ```bash

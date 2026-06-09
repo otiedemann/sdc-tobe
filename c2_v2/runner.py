@@ -50,10 +50,11 @@ class Runner:
         self._task: Optional[asyncio.Task] = None
         self._last_push: Dict[str, float] = {}    # fc -> monotonic ts of last start
         self._launched_role: Dict[str, str] = {}  # fc -> role of the running script
-        self._launched_targets: Dict[str, frozenset] = {}  # fc -> attacker's live target faces
         self._last_retask: Dict[str, float] = {}  # fc -> monotonic ts of last stop
-        self._last_splice: Dict[str, float] = {}  # fc -> monotonic ts of last live re-target
+        self._last_splice: Dict[str, float] = {}  # fc -> monotonic ts of last splice
         self._desired_role: Dict[str, tuple] = {}  # fc -> (role, since) AUTO hysteresis
+        self._atk_face: Dict[str, int] = {}        # attacker fc -> its fixed enemy face
+        self._defender_recapture: Dict[str, int] = {}  # defender fc -> own slot being recaptured
         self._last_action: Dict[str, str] = {}    # fc -> human reason (for UI)
 
     async def start(self) -> None:
@@ -114,6 +115,13 @@ class Runner:
             if c.get("enabled") and c.get("role") == "attacker")
         fan = _fan_out_angles(len(attackers))
         atk_hdg = {fc: fan[i] for i, fc in enumerate(attackers)}
+        # FIXED-LANE assignment: each attacker (by stable rank) owns one enemy
+        # box face, so it flies a constant straight lane home<->box (collision-
+        # safe with the altitude ladder + fan-out). Round-robins if #attackers
+        # != #enemy boxes.
+        lane_faces = S.enemy_home_faces(self.match.our_team)
+        self._atk_face = {fc: lane_faces[i % len(lane_faces)]
+                          for i, fc in enumerate(attackers)} if lane_faces else {}
 
         for fc, cfg in self.match.drones.items():
             w = worlds.get(fc)
@@ -130,7 +138,7 @@ class Runner:
                     await self.pool.stop_drone(fc)
                     self._last_retask[fc] = now
                     self._launched_role.pop(fc, None)
-                    self._launched_targets.pop(fc, None)
+                    self._defender_recapture.pop(fc, None)
                     self._last_action[fc] = "stand down (land)"
                 continue
 
@@ -145,15 +153,14 @@ class Runner:
                         await self.pool.stop_drone(fc)
                         self._last_retask[fc] = now
                         self._launched_role.pop(fc, None)
-                        self._launched_targets.pop(fc, None)
+                        self._defender_recapture.pop(fc, None)
                         self._last_action[fc] = f"re-task -> {role}"
                     continue
-                # Right role, still flying: an attacker can be LIVE re-targeted
-                # to the scout's current enemy-held boxes via a mission splice —
-                # no landing. (Other roles fly a fixed never-land script.)
-                if launched == "attacker" and role == "attacker":
-                    await self._maybe_retarget_attacker(
-                        fc, w, now, mover_rank.get(fc, 0), atk_hdg.get(fc, 0.0))
+                # Right role, still flying. An ATTACKER flies its fixed lane loop
+                # (nothing to do). A DEFENDER reactively recaptures one of our
+                # boxes the instant it flips — via a no-land mission splice.
+                if role == "defender":
+                    await self._maybe_recapture(fc, now, mover_rank.get(fc, 0))
                 continue
 
             # C) Idle -> launch the current role's never-land script.
@@ -168,12 +175,6 @@ class Runner:
             self._last_push[fc] = now
             if ok:
                 self._launched_role[fc] = role
-                # Record the attacker's launched target set so the live
-                # re-target path (section B) knows when the board has moved.
-                if role == "attacker":
-                    self._launched_targets[fc] = frozenset(
-                        S.enemy_target_faces(self.match.our_team,
-                                             self.match.holders()))
             self._last_action[fc] = (
                 f"launch {role}" if ok else f"launch {role} FAILED: {payload}")
             logger.info("c2_v2: %s -> launch %s (%s)", fc, role,
@@ -213,6 +214,17 @@ class Runner:
                 self._desired_role.pop(fc, None)
 
     # ------------------------------------------------------------------ scripts
+    def _neutral_standoff(self, team: str):
+        """(home_wall_marker_id, standoff_m) so a GO_HOME onto our home wall
+        stops the drone JUST OUTSIDE our home zone (in neutral). None if the wall
+        marker is unknown."""
+        wall = arena_state.home_wall_marker(team)
+        if not wall:
+            return None, None
+        wall_y = abs(float(wall[1][1]))
+        standoff = max(0.5, wall_y - arena_state.neutral_wait_y())   # ~10-4.5=5.5
+        return int(wall[0]), standoff
+
     def _build_role_script(self, fc: str, role: str, world,
                            mover_lane: int, rth_hdg: float) -> Optional[str]:
         team = self.match.our_team
@@ -221,59 +233,70 @@ class Runner:
             center = _pick_visible(world, S.CENTER_MARKERS) or S.CENTER_MARKERS[0]
             return S.scout_script(center, t)
         if role == "defender":
-            sides = arena_state.side_markers(team) or S.CENTER_MARKERS
-            side = _pick_visible(world, sides) or sides[0]
-            return S.defender_script(side, S.mover_alt(mover_lane, t), t)
+            wall_id, standoff = self._neutral_standoff(team)
+            if wall_id is None:
+                return None
+            # Wait just outside home in the neutral zone, scanning our 3 boxes;
+            # the runner splices a recapture in the instant one flips.
+            return S.defender_neutral_script(wall_id, standoff,
+                                             S.mover_alt(mover_lane, t), t)
         if role == "attacker":
             wall = arena_state.home_wall_marker(team)
             if not wall:
                 return None
-            wall_id = int(wall[0])
-            # Target only the enemy boxes the scout reports as not-ours (with a
-            # fall-back to all of them). The launch chain reflects the board at
-            # launch; section B then live-splices a new chain as the board moves.
-            faces = S.enemy_target_faces(team, self.match.holders())
-            return S.attacker_loop_script(faces, wall_id,
+            # FIXED LANE: this attacker owns one enemy box face for the whole
+            # match (fall back to the full enemy-box loop if unassigned).
+            face = self._atk_face.get(fc)
+            if face is not None:
+                return S.attacker_lane_script(int(face), int(wall[0]),
+                                              S.mover_alt(mover_lane, t), rth_hdg, t)
+            faces = S.enemy_home_faces(team)
+            return S.attacker_loop_script(faces, int(wall[0]),
                                           S.mover_alt(mover_lane, t), rth_hdg, t)
         return None
 
-    async def _maybe_retarget_attacker(self, fc: str, world, now: float,
-                                       mover_lane: int, rth_hdg: float) -> None:
-        """LIVE re-target an airborne attacker to the scout's current enemy-held
-        boxes, WITHOUT landing, via a mission splice. Only acts when the target
-        set has changed and the splice cooldown has elapsed. If the FC rejects
-        the splice (not airborne, or an older FC without the endpoint), falls
-        back to the stop->relaunch retask gated by RETASK_COOLDOWN_S."""
+    async def _maybe_recapture(self, fc: str, now: float, mover_lane: int) -> None:
+        """DEFENDER reactive recapture: if one of OUR boxes is enemy-held (and
+        not in its post-capture lock), splice a recapture leg into this airborne
+        defender (no land) — dash in, flip it back, return to the neutral scan.
+        Each defender handles one box at a time; a flip is assigned to at most
+        one defender so two don't pile on the same box."""
         team = self.match.our_team
-        faces = S.enemy_target_faces(team, self.match.holders())
-        want = frozenset(faces)
-        if self._launched_targets.get(fc) == want:
-            return                                    # board unchanged
+        enemy = self.match.enemy_team
+        holders = self.match.holders()
+        our_slots = (1, 2, 3) if team == "red" else (4, 5, 6)
+        # Boxes that need recapture, not already claimed by another defender.
+        claimed = {s for f, s in self._defender_recapture.items() if f != fc}
+        flipped = [s for s in our_slots
+                   if holders.get(s) == enemy
+                   and not self.match.tracker.slot_locked(s)
+                   and s not in claimed]
+        # Done with our current box? (recaptured or no longer flipped) -> release.
+        cur = self._defender_recapture.get(fc)
+        if cur is not None and holders.get(cur) != enemy:
+            self._defender_recapture.pop(fc, None)
+            cur = None
+        if cur is not None or not flipped:
+            return                                  # busy, or nothing to do
         if now - self._last_splice.get(fc, -1e9) < SPLICE_COOLDOWN_S:
             return
-        wall = arena_state.home_wall_marker(team)
-        if not wall:
+        slot = flipped[0]
+        face = S.our_box_enemy_faces(team).get(slot)
+        wall_id, standoff = self._neutral_standoff(team)
+        if face is None or wall_id is None:
             return
         t = self.match.tunables
-        script = S.attacker_splice_script(faces, int(wall[0]),
-                                          S.mover_alt(mover_lane, t), rth_hdg, t)
+        script = S.defender_recapture_splice(int(face), wall_id, standoff,
+                                             S.mover_alt(mover_lane, t), t)
         ok, payload = await self.pool.splice(fc, script)
         self._last_splice[fc] = now
         if ok:
-            self._launched_targets[fc] = want
-            self._last_action[fc] = f"re-target {sorted(faces)} (no land)"
-            logger.info("c2_v2: %s -> splice re-target %s (ok)", fc,
-                        sorted(faces))
-            return
-        # Splice not possible -> fall back to the landing retask.
-        if now - self._last_retask.get(fc, -1e9) >= RETASK_COOLDOWN_S:
-            await self.pool.stop_drone(fc)
-            self._last_retask[fc] = now
-            self._launched_role.pop(fc, None)
-            self._launched_targets.pop(fc, None)
-            self._last_action[fc] = f"re-target via relaunch ({payload})"
-            logger.info("c2_v2: %s -> splice rejected (%s); relaunch", fc,
-                        payload)
+            self._defender_recapture[fc] = slot
+            self._last_action[fc] = f"recapture box {slot} (no land)"
+            logger.info("c2_v2: %s -> defender recapture box %s", fc, slot)
+        else:
+            self._last_action[fc] = f"recapture splice rejected ({payload})"
+            logger.info("c2_v2: %s -> recapture splice rejected (%s)", fc, payload)
 
 
 def _fan_out_angles(n: int) -> List[float]:

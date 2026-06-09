@@ -5,13 +5,15 @@ too. So to keep a drone airborne for the whole match (operator requirement: only
 the '?' emergency-land ever puts a drone down), every role must run an
 effectively-INFINITE script that never reaches "mission complete":
 
-  * scout    — centre, then rotate in place for ~1 h (one RC yaw drive).
-  * defender — park in front of a side marker near our boxes, slow-rotate ~1 h
-               (presence blocks enemy capture; the slow rotation keeps it
-               "actively flying", not a sitting dead duck).
-  * attacker — a long CHAIN of capture legs over the enemy boxes (capture →
-               return home to score → turn → next), repeated far more times
-               than a 10-min match allows, so it loops without ever landing.
+  * attacker — FIXED LANE: a never-land loop on ONE enemy box (fly the straight
+               home<->box lane, capture it whenever the enemy face is up, hold it
+               by presence). 3 attackers on 3 distinct boxes => collision-safe
+               spatially-separated lanes (plus the altitude ladder + RTH fan-out).
+  * defender — wait JUST OUTSIDE our home in the NEUTRAL zone, slow-rotate to
+               scan our 3 boxes; the runner splices in a recapture (no landing)
+               the instant one of our boxes flips, then it returns to the scan.
+  * scout    — (optional) centre + rotate ~1 h. The simplified strategy runs
+               SCOUT-LESS (3 attackers + 2 defenders do their own scouting).
 
 All movement is VISION-based (APPROACH / GO_HOME home on ArUco markers; no
 absolute coordinates), reusing the operator's PROVEN capture geometry:
@@ -180,3 +182,59 @@ def attacker_splice_script(enemy_faces: List[int], wall_marker: int,
             lines.extend(attack_leg(int(f), wall_marker, cruise_alt_m,
                                     rth_hdg_deg, t))
     return _fmt(lines)
+
+
+# ── Simplified fixed-lane strategy (3 attackers + 2 neutral defenders) ───────
+
+def our_box_enemy_faces(our_team: str) -> dict:
+    """{our_slot -> the ArUco face it shows WHEN THE ENEMY HOLDS IT} — what a
+    defender APPROACHes to recapture it. Red's boxes 1-3 show 31/32/33 when blue
+    holds them; blue's boxes 4-6 show 44/45/46 when red holds them."""
+    enemy = "blue" if our_team == "red" else "red"
+    return {s: face_id(s, enemy) for s in _our_slots(our_team)}
+
+
+def _our_slots(our_team: str):
+    return (1, 2, 3) if our_team == "red" else (4, 5, 6)
+
+
+def attacker_lane_script(enemy_face: int, wall_marker: int, cruise_alt_m: float,
+                         rth_hdg_deg: float, t: Tunables) -> str:
+    """FIXED-LANE attacker: a never-land loop on ONE enemy box. Fly the straight
+    lane home<->box, capturing it whenever the enemy face is up and holding it by
+    presence; the loop re-attacks the instant the enemy flips it back. Distinct
+    boxes give the 3 attackers spatially-separated lanes."""
+    return attacker_loop_script([int(enemy_face)], wall_marker, cruise_alt_m,
+                                rth_hdg_deg, t)
+
+
+def defender_neutral_script(wall_marker: int, neutral_standoff_m: float,
+                            alt_m: float, t: Tunables) -> str:
+    """Wait JUST OUTSIDE our home zone in the neutral zone, facing our boxes, and
+    slow-rotate to scan them. GO_HOME onto our home-wall marker at a LOOSE neutral
+    standoff (so it stops ~0.5 m into neutral, not deep in home), then rotate
+    forever. The runner splices in a recapture the instant one of our boxes flips."""
+    return _fmt([
+        "TAKEOFF",
+        f"HEIGHT {alt_m:.2f}",
+        f"GO_HOME {int(wall_marker)} {neutral_standoff_m:.2f} {DEFENDER_SIDE_TOL_M:g} 0",
+        f"RC 0 0 0 {int(t.defender_yaw_stick)} {ROTATE_FOREVER_S}",
+    ])
+
+
+def defender_recapture_splice(enemy_face: int, wall_marker: int,
+                              neutral_standoff_m: float, alt_m: float,
+                              t: Tunables) -> str:
+    """NO-TAKEOFF splice: dash IN to the flipped own box, recapture it (APPROACH
+    the enemy face -> slide up+over to flip it back), then return to the neutral
+    scan station and rotate. Spliced into an airborne defender, so no landing."""
+    cruise = f"HEIGHT {alt_m:.2f}"
+    return _fmt([
+        cruise,
+        f"APPROACH {int(enemy_face)} {t.attack_standoff_m:.2f} {t.attack_dist_tol_m:.2f}",
+        f"FB_UD_IMU {t.over_box_forward_m:.2f} {t.capture_rise_m:.2f}",
+        "YAW_IMU 180",
+        cruise,
+        f"GO_HOME {int(wall_marker)} {neutral_standoff_m:.2f} {DEFENDER_SIDE_TOL_M:g} 0",
+        f"RC 0 0 0 {int(t.defender_yaw_stick)} {ROTATE_FOREVER_S}",
+    ])
