@@ -322,6 +322,19 @@ HEIGHT_ALIGN_MAX_S: float = 5.0
 # min-height floor) can never stall the search before the yaw sweep starts.
 SEARCH_DESCEND_MAX_S: float = 6.0
 
+# HEIGHT_ALIGN uses a much shorter pose staleness limit than the general
+# pose_max_age_s (2 s). Flying on a 2-s-old pose during active altitude
+# control causes full-throttle blind descent: the smoother serves the last
+# bad estimate and the drone sinks until the barometric floor guard fires.
+# 0.3 s gives one missed frame at 10 Hz before HEIGHT_ALIGN calls marker_lost.
+HEIGHT_ALIGN_POSE_MAX_AGE_S: float = 0.3
+
+# During HEIGHT_ALIGN, stop any downward correction when the barometer reads
+# at or below this altitude. The standard min_height_m (0.20 m) only fires
+# when the drone is nearly on the ground; this earlier guard (default 0.40 m)
+# prevents a bad pose estimate from driving the drone into the floor.
+HEIGHT_ALIGN_DESCENT_FLOOR_M: float = 0.40
+
 # FB_BRAKE world-position fallback parameters. When vision can't see
 # the target marker (yaw drift, occlusion, marker outside FOV), the
 # brake uses the drone's positioning-subsystem estimate of its own
@@ -1719,18 +1732,23 @@ class MissionController:
             # Keep zoom as-is; _step_approach resets to 1x at the
             # angle-correction-start threshold.
             #
-            # A loose GO_HOME (state.approach_positioning) is positioning, NOT a
-            # capture: it must NOT climb to the marker's mounted height (e.g. a
-            # 1.7-2.0 m centre/wall marker would drag a 1.0 m scout up to the
-            # marker). Skip HEIGHT_ALIGN and home horizontally at the current
-            # altitude. A capture APPROACH still aligns to the marker -- even one
-            # carrying a loose approach_dist_tol_m band (positioning stays False).
+            # Real mission GO_HOME steps now go through HEIGHT_ALIGN, same as
+            # capture APPROACHes: the drone aligns to the home marker's altitude
+            # before closing distance.
+            #
+            # Exception: marker-lost RECOVERY hops (_approach_on_settle_restart_mission
+            # True) still skip HEIGHT_ALIGN and home at the current altitude.
+            # Recovery hops use whatever marker happens to be visible (could be
+            # a high centre/wall marker) and their only goal is re-establishing a
+            # known position cheaply — climbing to a 2 m marker during recovery
+            # would be undesirable.
             with self.state.lock:
                 loose_home = self.state.approach_positioning
-            if loose_home:
+            is_recovery_hop = self._approach_on_settle_restart_mission
+            if loose_home and is_recovery_hop:
                 self._set_phase(Phase.APPROACH,
-                                "marker acquired (GO_HOME) -- homing at current "
-                                "altitude (no climb to marker)")
+                                "marker acquired (recovery GO_HOME) -- homing at "
+                                "current altitude (no climb to marker)")
             else:
                 self._set_phase(Phase.HEIGHT_ALIGN,
                                 f"marker acquired -- stop + {back_deg}° back -- aligning altitude")
@@ -1870,27 +1888,31 @@ class MissionController:
                             f"target unrecoverable) — ending mission, yielding "
                             f"to C2")
                         return
-                    # Nothing visible yet — keep rotating at the search speed and
-                    # escalate zoom (1.25 -> 2 -> 3x) to spot a distant marker.
+                    # Nothing visible yet — escalate zoom (1.25 -> 2 -> 3x) and
+                    # halve rotation speed per zoom level so the detector has
+                    # more time per frame at higher magnification.
                     if self._search_esc_level in (1, 2):
                         new_zoom = 2.0 if self._search_esc_level == 1 else 3.0
+                        # Halve speed once per zoom step: level1 → /2, level2 → /4
+                        new_yaw_rc = max(1, int(cfg.search_yaw_rc / (2 ** self._search_esc_level)))
                         self._search_zoom = new_zoom
+                        self._search_yaw_rc = new_yaw_rc
                         try:
                             self.api.camera_config_set(zoom=new_zoom)
                         except Exception as e:
                             print(f"[ctrl] SEARCH zoom set failed: {e}")
                         print(f"[ctrl] SEARCH esc→{self._search_esc_level}: "
-                              f"zoom {new_zoom}x (no marker visible, still "
-                              f"rotating at {self._search_yaw_rc:.0f})")
+                              f"zoom {new_zoom}x  yaw_rc {new_yaw_rc} "
+                              f"(was {cfg.search_yaw_rc})")
                         with self.state.lock:
                             self.state.note = (
                                 f"SEARCH: no marker visible, zoom={new_zoom}x "
-                                f"rotating @{self._search_yaw_rc:.0f}")
+                                f"rotating @{new_yaw_rc}")
                     else:
                         # 3+ revolutions, still nothing visible: reset zoom and
-                        # keep rotating in place at the search speed. Do NOT fly
-                        # anywhere (no TO). The operator/C2 can intervene.
+                        # speed, keep rotating in place. Do NOT fly anywhere.
                         self._search_esc_level = 0
+                        self._search_yaw_rc = float(cfg.search_yaw_rc)
                         if getattr(self, "_search_zoom", 1.0) != 1.0:
                             self._search_zoom = 1.0
                             try:
@@ -1898,7 +1920,7 @@ class MissionController:
                             except Exception as e:
                                 print(f"[ctrl] SEARCH zoom reset failed: {e}")
                         print("[ctrl] SEARCH: no marker visible after 3 sweeps — "
-                              "continuing in-place rotation (no TO)")
+                              "resetting zoom+speed, continuing in-place rotation")
                     return
         # Fallback timeout if no telemetry yaw is ever reported.
         elif now - phase_entry > 30.0:
@@ -2005,6 +2027,12 @@ class MissionController:
         pose = self.state.last_pose
         if meas is None or pose is None:
             self._marker_lost(now); return
+        # Reject stale poses: a 2-s-old estimate from the general smoother is
+        # fine for position navigation but not for active altitude control.
+        # A bad ippe_temporal/ippe_collapsed pose held for 2 s causes full-
+        # throttle blind descent until the barometric floor fires at ~0.2 m.
+        if now - self.smoother.last_seen > HEIGHT_ALIGN_POSE_MAX_AGE_S:
+            self._marker_lost(now); return
         d, yaw_to_marker, hdg = meas
 
         # Barometric height — used only for safety floor/ceiling guards and the
@@ -2026,13 +2054,20 @@ class MissionController:
         # is level with the drone. Positive e_h = need to rise; negative = descend.
         # This is used instead of the altimeter-derived (target_h - drone_h) so
         # that barometer drift/offset cannot cause a premature "settled" verdict.
-        e_h = -marker_y
+        e_h_raw = -marker_y  # unclamped; used for the settle check below
+        e_h = e_h_raw
 
         # Safety floor (altimeter only): if the barometer says we are already
         # at or below min_height, do not command further descent regardless of
         # what the camera says — the altimeter may be wrong but we keep this as
         # a hard lower bound to avoid hitting the ground.
         if drone_h is not None and drone_h <= cfg.min_height_m and e_h < 0:
+            e_h = 0.0
+        # Early descent guard: stop downward correction at HEIGHT_ALIGN_DESCENT_FLOOR_M
+        # (default 0.40 m) — well above min_height_m. This catches the failure mode
+        # where a bad/stale pose (e.g. ippe_temporal holding +1.75 m) drives the
+        # drone to the floor before the smoother staleness check can fire.
+        if drone_h is not None and drone_h <= HEIGHT_ALIGN_DESCENT_FLOOR_M and e_h < 0:
             e_h = 0.0
         # Safety ceiling: symmetric guard.
         if drone_h is not None and drone_h >= cfg.max_height_m and e_h > 0:
@@ -2056,9 +2091,13 @@ class MissionController:
                                f"e={e_h:+.2f}m")
 
         # Settle: both height and yaw inside their deadbands for the
-        # configured time -> transition to ALIGN.
-        # e_h is camera-derived so this settle is independent of the altimeter.
-        in_band = (abs(e_h)   < cfg.height_deadband_m
+        # configured time -> transition to APPROACH.
+        # Use e_h_raw (the unclamped camera error) so that a floor/ceiling guard
+        # clamping e_h to 0 cannot produce a false "settled" verdict while the
+        # marker is still significantly off-centre. If the drone has hit the
+        # descent floor but the marker is still below, the settle timer must not
+        # run — the height-align timeout will force APPROACH after HEIGHT_ALIGN_MAX_S.
+        in_band = (abs(e_h_raw) < cfg.height_deadband_m
                    and abs(e_yaw) < cfg.yaw_deadband_deg)
         settled = False
         with self.state.lock:
