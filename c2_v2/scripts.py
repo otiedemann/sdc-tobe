@@ -42,10 +42,11 @@ CAPTURE_RISE_M = 0.50        # FB_UD_IMU rise (into the 1-2 m RFID band)
 RTH_WALL_STANDOFF_M = 3.50   # GO_HOME standoff -> shallow inside home zone
 RTH_ARRIVE_TOL_M = 0.50      # GO_HOME loose arrival band
 
-# ── Altitudes (deconflicted: scout low, movers above it, ≥30 cm apart) ──────
+# ── Altitudes (deconflicted: launch low ~1 m; never below the box top) ──────
 SCOUT_ALT_M = 1.0            # operator: scout ~1 m
 ABOVE_SCOUT_ALT_M = 1.30     # mover cruise floor (above the scout)
 MOVER_ALT_STEP_M = 0.30      # ≥30 cm between movers
+BOX_TOP_M = 0.73             # hard floor — never command below the 0.73 m box top
 MAX_MOVER_ALT_M = 2.50
 
 # ── Scout / defender rotation ───────────────────────────────────────────────
@@ -75,10 +76,11 @@ from .tunables import Tunables   # noqa: E402  (after the constants, by design)
 
 
 def mover_alt(lane: int, t: Tunables) -> float:
-    """Distinct cruise altitude for mover ``lane`` (0-based), ≥step apart and
-    above the scout, capped."""
-    return min(MAX_MOVER_ALT_M,
-               t.mover_base_alt_m + t.mover_alt_step_m * max(0, lane))
+    """Cruise altitude for mover ``lane`` (0-based): base + step*lane, floored at
+    the 0.73 m box top (never command below it) and capped at MAX_MOVER_ALT_M."""
+    return max(BOX_TOP_M,
+               min(MAX_MOVER_ALT_M,
+                   t.mover_base_alt_m + t.mover_alt_step_m * max(0, lane)))
 
 
 # ── Scout ───────────────────────────────────────────────────────────────────
