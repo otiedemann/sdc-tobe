@@ -21,10 +21,13 @@ class Tunables:
     over_box_forward_m: float = 1.50
     capture_rise_m: float = 0.50
     rth_standoff_m: float = 3.50
-    # altitudes (deconfliction)
+    # altitudes (deconfliction). Operator: launch/cruise LOW (~1 m) so the camera
+    # sees the low (~0.4-0.73 m) box markers; never below the 0.73 m box top.
     scout_alt_m: float = 1.00
-    mover_base_alt_m: float = 1.30
-    mover_alt_step_m: float = 0.30
+    mover_base_alt_m: float = 1.00     # lowest mover ~1 m (was 1.30)
+    mover_alt_step_m: float = 0.20     # small step — fixed lanes separate movers
+                                       # spatially; the step only stacks the two
+                                       # defenders that share a neutral station
     # rotation speeds (RC yaw stick 1..100)
     scout_yaw_stick: int = 70
     defender_yaw_stick: int = 35
@@ -48,9 +51,9 @@ TUNE_SPEC = [
     ("over_box_forward_m", "FB_UD_IMU forward (m)", 0.5, 3.0, 0.05),
     ("capture_rise_m", "FB_UD_IMU rise (m)", 0.2, 1.5, 0.05),
     ("rth_standoff_m", "RTH wall standoff (m)", 1.0, 6.0, 0.1),
-    ("scout_alt_m", "Scout altitude (m)", 0.6, 2.5, 0.1),
-    ("mover_base_alt_m", "Mover base altitude (m)", 0.8, 3.0, 0.1),
-    ("mover_alt_step_m", "Mover altitude step (m)", 0.2, 1.0, 0.05),
+    ("scout_alt_m", "Scout altitude (m)", 0.73, 2.5, 0.05),
+    ("mover_base_alt_m", "Mover base altitude (m)", 0.73, 3.0, 0.05),
+    ("mover_alt_step_m", "Mover altitude step (m)", 0.0, 1.0, 0.05),
     ("scout_yaw_stick", "Scout rotate speed", 5, 100, 5),
     ("defender_yaw_stick", "Defender rotate speed", 5, 100, 5),
     ("defender_standoff_m", "Defender standoff (m)", 1.0, 5.0, 0.1),
