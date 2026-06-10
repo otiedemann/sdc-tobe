@@ -992,7 +992,7 @@ class MissionController:
         self._search_prev_yaw = None
         # Two-stage SEARCH protocol state (see _step_search):
         #   0 = stationary check at zoom 2.0x for cfg.search_zoom_check_s
-        #   1 = yaw spin at zoom 1.25x for one full revolution
+        #   1 = yaw spin at zoom 2.0x for one full revolution
         # After stage 1 without acquisition -> _recover_via_central_marker.
         self._search_stage: int = 0
         self._search_stage_started: float = 0.0
@@ -1131,7 +1131,7 @@ class MissionController:
         self._search_prev_yaw = None
         # Two-stage SEARCH protocol state (see _step_search):
         #   0 = stationary check at zoom 2.0x for cfg.search_zoom_check_s
-        #   1 = yaw spin at zoom 1.25x for one full revolution
+        #   1 = yaw spin at zoom 2.0x for one full revolution
         self._search_stage: int = 0
         self._search_stage_started: float = 0.0
         self._search_visited_markers: set = set()  # wall-marker IDs already navigated to
@@ -1877,8 +1877,8 @@ class MissionController:
             #             Acquires distant markers without rotating, so a
             #             marker that's "there but too small" pops out before
             #             we change yaw.
-            #   stage 1 = yaw spin at zoom 1.25x (one full revolution).
-            #   stage 2 = yaw spin at zoom 1.25x polling
+            #   stage 1 = yaw spin at zoom 2.0x (one full revolution).
+            #   stage 2 = yaw spin at zoom 2.0x (inherits stage 1) polling
             #             _recover_via_central_marker. When a revolution
             #             finds nothing, the yaw slows and it sweeps AGAIN —
             #             SEARCH never auto-lands (only an explicit LAND step
@@ -1977,21 +1977,23 @@ class MissionController:
                     f"SEARCH stage 0 (stationary zoom 2.0x) "
                     f"{elapsed:.1f}/{cfg.search_zoom_check_s:.1f}s")
             if elapsed >= float(cfg.search_zoom_check_s):
-                # No acquisition at zoom 2.0x — drop to 1.25x and start
-                # the one-revolution yaw sweep.
+                # No acquisition during the stationary check — start the
+                # one-revolution yaw sweep, KEEPING zoom at 2.0x (better
+                # small/distant-marker detection; the slow sweep keeps each
+                # marker in frame long enough despite the narrower FOV).
                 self._search_stage = 1
                 self._search_stage_started = now
-                self._search_zoom = 1.25
-                self._apply_zoom(1.25)
+                self._search_zoom = 2.0
+                self._apply_zoom(2.0)
                 self._search_start_yaw = None
                 self._search_swept = 0.0
                 self._search_prev_yaw = None
                 print("[ctrl] SEARCH stage 0 → stage 1: zoom 2.0x check "
                       f"({cfg.search_zoom_check_s:.1f}s) yielded nothing, "
-                      "spinning at zoom 1.25x")
+                      "spinning at zoom 2.0x")
             return
 
-        # ── Stage 1: yaw spin at zoom 1.25x (target-only) ────────────
+        # ── Stage 1: yaw spin at zoom 2.0x (target-only) ─────────────
         # Look for the active marker for one full revolution. NO
         # recovery polling here: the target may be visible mid-rotation
         # and we don't want to bail out to a wall-marker hop while still
@@ -2015,7 +2017,7 @@ class MissionController:
                     with self.state.lock:
                         self.state.search_yaw_swept_deg = self._search_swept
                     if self._search_swept >= cfg.search_total_deg:
-                        # One full revolution at zoom 1.25x without
+                        # One full revolution at zoom 2.0x without
                         # acquiring the target. Hand off to stage 2.
                         self._search_stage = 2
                         self._search_stage_started = now
@@ -2023,7 +2025,7 @@ class MissionController:
                         self._search_swept = 0.0
                         self._search_prev_yaw = None
                         print("[ctrl] SEARCH stage 1 → stage 2: full "
-                              "rotation at zoom 1.25x yielded no target, "
+                              "rotation at zoom 2.0x yielded no target, "
                               "scanning for central-marker recovery")
             elif now - phase_entry > 30.0:
                 # No telemetry yaw to count a revolution by — fall through to
@@ -2039,7 +2041,7 @@ class MissionController:
                       "handing off to recovery scan (never auto-lands)")
             return
 
-        # ── Stage 2: yaw spin at zoom 1.25x (recovery scan) ──────────
+        # ── Stage 2: yaw spin at zoom 2.0x (recovery scan) ───────────
         # Same rotation as stage 1, but every tick we poll
         # _recover_via_central_marker. As soon as a centre-wall
         # candidate is in view (and the hop budget allows), commit:
@@ -2068,7 +2070,7 @@ class MissionController:
                 with self.state.lock:
                     self.state.search_yaw_swept_deg = self._search_swept
                 if self._search_swept >= cfg.search_total_deg:
-                    # One full revolution at zoom 1.25x AND not a single tick
+                    # One full revolution at zoom 2.0x AND not a single tick
                     # saw the target or a centre-wall recovery candidate. We
                     # NEVER auto-land from SEARCH — only an explicit LAND step
                     # lands the drone. Slow the yaw and sweep again: a slower
