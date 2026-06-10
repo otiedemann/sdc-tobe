@@ -34,6 +34,7 @@ Twenty commands. Suffix convention:
     HOOVER   [<seconds>]
     AWAIT    <marker-id> <timeout-seconds>
     WAIT_AND_ATTACK <marker-id> [<distance>] [<dist_tol_m>] [<yaw_tol_deg>]   wait until id seen, then APPROACH
+    ATTACK   <marker-id> [<distance>] [<dist_tol_m>] [<yaw_tol_deg>]   like WAIT_AND_ATTACK but no wait — attack now
     PAUSE    <seconds>
     LAND
     REPEAT                                          loop to first non-TAKEOFF step (last step only)
@@ -435,6 +436,43 @@ def parse(text: str, defaults: dict) -> List[Step]:
                             approach_dist_tol_m=dist_tol,
                             arrive_yaw_tol_deg=yaw_tol,
                             line_no=raw_line_no))
+        elif cmd == "ATTACK":
+            # Same argument shape + acquisition as WAIT_AND_ATTACK (id / dist /
+            # dist_tol / yaw_tol; the sibling face is tracked so the box is
+            # acquired by EITHER face), but does NOT wait for the box to flip:
+            # it advances to the capture move the instant it reaches standoff,
+            # whatever face is shown. Use when we want to attack now regardless
+            # of which team currently holds the box.
+            if len(args) > 4:
+                raise ScriptError(raw_line_no,
+                                  f"ATTACK takes 1-4 arguments "
+                                  f"(<marker-id> [<distance>] [<dist_tol_m>] "
+                                  f"[<yaw_tol_deg>]), got {len(args)}")
+            mid = (_parse_int(args[0], raw_line_no, "ATTACK marker-id")
+                   if len(args) >= 1
+                   else int(_required_default(defaults, "marker_id", raw_line_no)))
+            dist = (_parse_float(args[1], raw_line_no, "ATTACK distance")
+                    if len(args) >= 2
+                    else float(_required_default(defaults, "distance", raw_line_no)))
+            dist_tol = None
+            if len(args) >= 3:
+                dist_tol = _parse_float(args[2], raw_line_no, "ATTACK dist_tol")
+                if not (0.05 <= dist_tol <= 5.0):
+                    raise ScriptError(raw_line_no,
+                                      f"ATTACK dist_tol must be "
+                                      f"0.05..5 m, got {dist_tol}")
+            yaw_tol = None
+            if len(args) >= 4:
+                yaw_tol = _parse_float(args[3], raw_line_no, "ATTACK yaw_tol")
+                if not (1.0 <= yaw_tol <= 180.0):
+                    raise ScriptError(raw_line_no,
+                                      f"ATTACK yaw_tol must be "
+                                      f"1..180 deg, got {yaw_tol}")
+            out.append(Step(kind="ATTACK",
+                            marker_id=mid, distance=dist,
+                            approach_dist_tol_m=dist_tol,
+                            arrive_yaw_tol_deg=yaw_tol,
+                            line_no=raw_line_no))
         elif cmd == "REPEAT":
             # Loops back to the first non-TAKEOFF step without landing in
             # between. Validated post-loop to be the last step and to have
@@ -826,6 +864,13 @@ def format(steps: List[Step]) -> str:
                 if s.arrive_yaw_tol_deg is not None:
                     extra += f" {s.arrive_yaw_tol_deg:g}"
             lines.append(f"WAIT_AND_ATTACK {s.marker_id} {s.distance:g}{extra}")
+        elif s.kind == "ATTACK":
+            extra = ""
+            if s.approach_dist_tol_m is not None:
+                extra += f" {s.approach_dist_tol_m:g}"
+                if s.arrive_yaw_tol_deg is not None:
+                    extra += f" {s.arrive_yaw_tol_deg:g}"
+            lines.append(f"ATTACK {s.marker_id} {s.distance:g}{extra}")
         elif s.kind == "REPEAT":
             lines.append("REPEAT")
         elif s.kind == "PAUSE":

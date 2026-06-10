@@ -328,8 +328,10 @@ def attacker_swimlane_script(enemy_box_face: int, our_box_face: int,
     """SWIMLANE attacker — shuttles a straight vertical lane between an ENEMY box
     and OUR box, capturing/recapturing each whenever it shows the enemy colour.
 
-    WAIT_AND_ATTACK at BOTH ends (acquires the box by EITHER face, holds at
-    standoff until it shows the ENEMY colour, then closes in to flip it);
+    The ENEMY box uses WAIT_AND_ATTACK (acquire by EITHER face, hold at standoff
+    until it shows the ENEMY colour, then close in to flip it). OUR box uses
+    ATTACK (same sibling acquisition, but NO wait — attacks on whichever face is
+    shown) so the lane never stalls waiting for our box to be enemy-held.
     FB_UD_IMU slides up+over to capture; YAW_IMU 180 turns toward the other end;
     REPEAT loops back to the first non-TAKEOFF step forever (skipping TAKEOFF) so
     the drone NEVER lands. Distinct lane per attacker => the 3 lanes never cross
@@ -340,10 +342,10 @@ def attacker_swimlane_script(enemy_box_face: int, our_box_face: int,
     return _fmt([
         "TAKEOFF",
         cruise,
-        f"WAIT_AND_ATTACK {int(enemy_box_face)} {std}",   # enemy box: capture when enemy-held
+        f"WAIT_AND_ATTACK {int(enemy_box_face)} {std}",   # enemy box: WAIT until enemy-held, then capture
         fbud,
         "YAW_IMU 180",
-        f"WAIT_AND_ATTACK {int(our_box_face)} {std}",      # our box: recapture when enemy-held
+        f"ATTACK {int(our_box_face)} {std}",               # our box: attack NOW (no wait for switch) -> never stalls
         fbud,
         "YAW_IMU 180",
         "REPEAT",                                          # loop forever, skip TAKEOFF -> never lands

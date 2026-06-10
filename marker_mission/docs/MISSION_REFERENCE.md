@@ -184,6 +184,37 @@ sibling would lie outside the range, no sibling is set and
 
 ---
 
+### `ATTACK <marker-id> [<distance>] [<dist_tol_m>] [<yaw_tol_deg>]`
+
+> Like `WAIT_AND_ATTACK`, but does **not** wait for the box to flip —
+> it attacks immediately on whichever face is shown.
+
+Same arguments and the same sibling-aware acquisition as
+`WAIT_AND_ATTACK` (steps 1–2 above): the drone yaw-spins for *either*
+the target or the sibling id, then `APPROACH`es whichever face it sees
+to the parsed standoff. The only difference is that it **drops the
+hold-on-sibling gate** (steps 3–4): the instant the drone settles at
+standoff, the script advances to the next step (e.g. `FB_UD_IMU` over
+the box) — regardless of which face is currently exposed.
+
+Use case: attack the box *now*, no matter which team holds it — e.g. a
+swimlane attacker that should keep cycling rather than stall waiting for
+its box to be enemy-held. Acquisition still works when the box shows the
+sibling face (unlike a plain `APPROACH`, which would spin past it).
+
+Arguments are identical to `WAIT_AND_ATTACK`:
+
+- `marker-id`: id to attack. Required.
+- `distance`: final standoff [m].
+- `dist_tol_m`: optional arrival distance tolerance (0.05..5 m).
+- `yaw_tol_deg`: optional yaw-settle tolerance (1..180 deg).
+
+Done when the `APPROACH` phase settles at standoff (no target-face
+condition, no wait). Same graceful sibling fallback as
+`WAIT_AND_ATTACK` for non-target marker ids.
+
+---
+
 ### `PAUSE <seconds>`
 
 > Unconditional IDLE for the given seconds.

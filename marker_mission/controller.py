@@ -541,6 +541,12 @@ class MissionState:
     # Both fields are cleared on the step transition out of WAIT_AND_ATTACK.
     wait_attack_target_id: Optional[int] = None
     wait_attack_sibling_id: Optional[int] = None
+    # The ATTACK command shares the WAIT_AND_ATTACK acquisition path (sibling
+    # tracking + pre-tick swap) but skips the hold gate: when True the
+    # approach-settle gate advances the script the instant the drone reaches
+    # standoff, whatever face is shown (no wait for the box to flip). Set by the
+    # ATTACK step, cleared (with target/sibling) on the transition out.
+    wait_attack_immediate: bool = False
 
     settle_began_at: Optional[float] = None
     hold_began_at: Optional[float] = None
@@ -2640,7 +2646,11 @@ class MissionController:
             with self.state.lock:
                 _wa_target = self.state.wait_attack_target_id
                 _wa_active = self.state.active_marker_id
+                _wa_immediate = self.state.wait_attack_immediate
+                # ATTACK (wait_attack_immediate) skips this hold: advance the
+                # instant we're settled at standoff, whatever face is shown.
                 if (_wa_target is not None
+                        and not _wa_immediate
                         and _wa_active != _wa_target):
                     self.state.settle_began_at = None
                     return
@@ -4258,13 +4268,15 @@ class MissionController:
                                           if step.kind == "AWAIT"
                                           else None)
             # Clear wait_attack target/sibling tracking on transition
-            # OUT of WAIT_AND_ATTACK. The pre-tick swap consults these
-            # to route active_marker_id, and the approach-settle gate
-            # uses them to refuse advancement while we're parked on
-            # the sibling face.
-            if step.kind != "WAIT_AND_ATTACK":
+            # OUT of WAIT_AND_ATTACK / ATTACK. The pre-tick swap consults
+            # these to route active_marker_id, and the approach-settle gate
+            # uses them to refuse advancement while we're parked on the
+            # sibling face (WAIT_AND_ATTACK only — ATTACK clears the gate via
+            # wait_attack_immediate, also reset here so it can't leak).
+            if step.kind not in ("WAIT_AND_ATTACK", "ATTACK"):
                 self.state.wait_attack_target_id = None
                 self.state.wait_attack_sibling_id = None
+                self.state.wait_attack_immediate = False
         if step.kind == "TAKEOFF":
             self._set_phase(Phase.TAKEOFF, note)
             try:
@@ -4406,7 +4418,7 @@ class MissionController:
             self._set_phase(Phase.IDLE,
                             note + f" pause {step.seconds:g}s")
             return
-        if step.kind == "WAIT_AND_ATTACK":
+        if step.kind in ("WAIT_AND_ATTACK", "ATTACK"):
             # Behaves like APPROACH on the target id, but with two
             # additions:
             #   1. The sibling-face id (target ± cfg.target_marker_sibling_offset,
@@ -4426,13 +4438,20 @@ class MissionController:
             #      the swap puts active = target, the PD re-targets
             #      the (now-target) face, the drone re-settles, and
             #      the gate advances the script.
+            #
+            # ATTACK shares addition #1 (sibling acquisition) but DROPS
+            # addition #2: it sets wait_attack_immediate, so the gate
+            # advances the script the instant the drone reaches standoff,
+            # whatever face is shown (no wait for the box to flip).
             mid = int(step.marker_id)
             sibling = self._wait_attack_sibling_of(mid)
             self._approach_on_settle_restart_mission = False
+            immediate = (step.kind == "ATTACK")
             with self.state.lock:
                 self.state.active_marker_id = mid
                 self.state.wait_attack_target_id = mid
                 self.state.wait_attack_sibling_id = sibling
+                self.state.wait_attack_immediate = immediate
                 self.state.target_distance_m = float(step.distance)
                 _dist_tol = getattr(step, "approach_dist_tol_m", None)
                 self.state.target_distance_tol_m = (
@@ -4462,10 +4481,12 @@ class MissionController:
                     self._box_height_marker = None
                     self.state.approach_start_height_m = None
             sibling_str = f", sibling {sibling}" if sibling is not None else ""
+            mode_str = ("attack now — no wait for switch" if immediate
+                        else "hold on sibling face")
             self._set_phase(Phase.SEARCH,
                             note + f" id={mid}{sibling_str}"
                                    f" d={float(step.distance):g}m"
-                                   f" (hold on sibling face)")
+                                   f" ({mode_str})")
             return
         if step.kind == "REPEAT":
             # Loop back to the first non-TAKEOFF step in the script
