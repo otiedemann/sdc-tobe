@@ -1878,7 +1878,7 @@ class MissionController:
             #             marker that's "there but too small" pops out before
             #             we change yaw.
             #   stage 1 = yaw spin at zoom 2.0x (one full revolution).
-            #   stage 2 = yaw spin at zoom 2.0x (inherits stage 1) polling
+            #   stage 2 = yaw spin at zoom 1.25x (recovery scan) polling
             #             _recover_via_central_marker. When a revolution
             #             finds nothing, the yaw slows and it sweeps AGAIN —
             #             SEARCH never auto-lands (only an explicit LAND step
@@ -2041,7 +2041,15 @@ class MissionController:
                       "handing off to recovery scan (never auto-lands)")
             return
 
-        # ── Stage 2: yaw spin at zoom 2.0x (recovery scan) ───────────
+        # ── Stage 2: yaw spin at zoom 1.25x (recovery scan) ──────────
+        # Drop back to 1.25x for the recovery scan: it hunts the larger
+        # CENTRE-WALL markers, where the wider FOV catches more of them per
+        # rotation (the narrower stage-1 2.0x is tuned for the small target box).
+        # Idempotent: _apply_zoom skips when the level is unchanged, so this
+        # restarts the stream once on stage-2 entry, then no-ops.
+        if getattr(self, "_search_zoom", 1.0) != 1.25:
+            self._search_zoom = 1.25
+            self._apply_zoom(1.25)
         # Same rotation as stage 1, but every tick we poll
         # _recover_via_central_marker. As soon as a centre-wall
         # candidate is in view (and the hop budget allows), commit:
@@ -2070,7 +2078,7 @@ class MissionController:
                 with self.state.lock:
                     self.state.search_yaw_swept_deg = self._search_swept
                 if self._search_swept >= cfg.search_total_deg:
-                    # One full revolution at zoom 2.0x AND not a single tick
+                    # One full revolution at zoom 1.25x AND not a single tick
                     # saw the target or a centre-wall recovery candidate. We
                     # NEVER auto-land from SEARCH — only an explicit LAND step
                     # lands the drone. Slow the yaw and sweep again: a slower
