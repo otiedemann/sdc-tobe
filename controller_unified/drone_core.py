@@ -54,6 +54,8 @@ def do_takeoff() -> tuple[dict, int]:
     """Discrete takeoff command. Mirrors the previous /api/takeoff
     handler exactly, including the auto-record side thread."""
     import unified_api_server as _srv  # sibling import; see header note
+    _t0 = time.monotonic()
+    print(f"[TKOFF-T] {_t0:.3f} do_takeoff: ENTER")
     b = _srv.backend
     with _srv.conn_lock:
         connected = _srv.conn_state["connected"]
@@ -64,7 +66,11 @@ def do_takeoff() -> tuple[dict, int]:
             hold_s = _srv.SAFE_TAKEOFF_S if _srv.safe_takeoff_enabled else 3.0
             _srv.start_discrete_window(hold_s)
             b.before_discrete_command()
+            print(f"[TKOFF-T] {time.monotonic():.3f} do_takeoff: calling "
+                  f"backend.takeoff() (+{time.monotonic() - _t0:.3f}s)")
             ok, msg = b.takeoff()
+            print(f"[TKOFF-T] {time.monotonic():.3f} do_takeoff: backend.takeoff()"
+                  f" returned ok={ok} (+{time.monotonic() - _t0:.3f}s)")
             b.after_discrete_command()
             if ok:
                 _srv.flying = True

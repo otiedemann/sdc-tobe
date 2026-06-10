@@ -1453,17 +1453,33 @@ class MissionController:
             print("[ctrl] stop received before takeoff -- exiting cleanly")
             return
 
+        # ── press→rotor latency probe ───────────────────────────────────────
+        # Wall-clock + monotonic at GO so the timeline can be stitched across
+        # controller / drone_core / backend (all share this process via the
+        # in-proc API). grep '[TKOFF-T]' on the FC to read the breakdown.
+        _go_mono = time.monotonic()
+        print(f"[TKOFF-T] {_go_mono:.3f} ctrl: GO received "
+              f"(stream_pre_applied={stream_applied})")
+
         # GO-time fallback: only if pre-flight never managed to apply it (e.g. the
         # operator armed within the first moment). Normally a no-op -> fast takeoff.
         if not stream_applied:
+            print(f"[TKOFF-T] {time.monotonic():.3f} ctrl: GO-time stream "
+                  f"fallback START (ON CRITICAL PATH — restarts video stream)")
             self._apply_stream_settings()
+            print(f"[TKOFF-T] {time.monotonic():.3f} ctrl: stream fallback DONE "
+                  f"(+{time.monotonic() - _go_mono:.3f}s since GO)")
 
+        print(f"[TKOFF-T] {time.monotonic():.3f} ctrl: handing off to script "
+              f"(api.takeoff blocks here) (+{time.monotonic() - _go_mono:.3f}s since GO)")
         # Hand off to the mission script. The first step (typically
         # TAKEOFF) is loaded here; _apply_step_to_phase handles the
         # api.takeoff() call so a script that opens with a non-TAKEOFF
         # step (e.g., DANCE while already airborne, in some testing
         # scenario) doesn't unconditionally request takeoff.
         self._advance_script("mission start")
+        print(f"[TKOFF-T] {time.monotonic():.3f} ctrl: script handoff returned "
+              f"(takeoff API call complete) (+{time.monotonic() - _go_mono:.3f}s since GO)")
 
         next_tick = time.monotonic()
         while not self._stop.is_set():

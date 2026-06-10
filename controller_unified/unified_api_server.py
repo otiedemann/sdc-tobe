@@ -2436,6 +2436,8 @@ class OlympeBackend(DroneBackend):
 
     # --- Flight ---
     def takeoff(self) -> Tuple[bool, str]:
+        _tk0 = time.monotonic()
+        print(f"[TKOFF-T] {_tk0:.3f} backend.takeoff: ENTER")
         d = self._d()
         if d is None:
             return False, "not_ready"
@@ -2443,6 +2445,9 @@ class OlympeBackend(DroneBackend):
         # Without this, a takeoff attempt immediately post-reconnect sees
         # state=None and is silently refused by the drone firmware.
         fs = self._get_state(FlyingStateChanged)
+        print(f"[TKOFF-T] {time.monotonic():.3f} backend.takeoff: initial "
+              f"FlyingStateChanged={'None (will settle-wait!)' if fs is None else 'present'}"
+              f" (+{time.monotonic() - _tk0:.3f}s)")
         if fs is None:
             print("[ANAFI] /api/takeoff — state not ready, waiting up to 10 s...")
             for _ in range(20):
@@ -2489,6 +2494,8 @@ class OlympeBackend(DroneBackend):
         self._stop_piloting()
         time.sleep(0.2)
         print("[ANAFI] Sending TakeOff command...")
+        print(f"[TKOFF-T] {time.monotonic():.3f} backend.takeoff: sending TakeOff()"
+              f" — ROTORS SHOULD SPIN NOW (+{time.monotonic() - _tk0:.3f}s since enter)")
         with command_lock:
             result = d(TakeOff()).wait(_timeout=10)
         ok = False
@@ -2497,6 +2504,8 @@ class OlympeBackend(DroneBackend):
         except Exception:
             pass
         print(f"[ANAFI] TakeOff result: ok={ok}")
+        print(f"[TKOFF-T] {time.monotonic():.3f} backend.takeoff: TakeOff() acked "
+              f"ok={ok} (drone reached hovering) (+{time.monotonic() - _tk0:.3f}s since enter)")
 
         if ok:
             self._start_piloting()
