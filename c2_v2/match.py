@@ -61,6 +61,26 @@ def _parse_swimlane(value, allow_clear: bool = False):
     return slots
 
 
+def _parse_spotter(value):
+    """Parse a spotter target into ``[marker_id, distance_m]`` or ``None`` (use
+    the default centre marker), or ``False`` if unparseable. Accepts an [id, dist]
+    list or a string of two numbers ("11 2.5" / "11,2.5"). id is any marker id;
+    distance is the APPROACH standoff in metres (0.3..8)."""
+    if value is None or value == [] or (isinstance(value, str) and not value.strip()):
+        return None
+    nums = re.findall(r"\d+\.?\d*", str(value))
+    if len(nums) != 2:
+        return False
+    try:
+        mid = int(float(nums[0]))
+        dist = float(nums[1])
+    except ValueError:
+        return False
+    if mid < 0 or not (0.3 <= dist <= 8.0):
+        return False
+    return [mid, round(dist, 2)]
+
+
 class MatchState:
     def __init__(self, our_team: str = "red",
                  arena_name: Optional[str] = None,
@@ -105,6 +125,9 @@ class MatchState:
                 # Operator-bound swimlane: [slot_a, slot_b] (e.g. [3, 6]) or None
                 # for auto-assignment. Only used while the drone is an attacker.
                 "swimlane": _parse_swimlane(saved.get("swimlane")),
+                # Spotter target: [marker_id, distance_m] or None (use the default
+                # centre marker). Only used while the drone is a scout/spotter.
+                "spotter": _parse_spotter(saved.get("spotter")),
             }
 
     # ------------------------------------------------------------------ setters
@@ -151,6 +174,21 @@ class MatchState:
             if d is None:
                 return False
             d["swimlane"] = slots                 # [a,b] or None
+            self._save()
+        return True
+
+    def set_spotter(self, fc_name: str, value) -> bool:
+        """Set the scout/spotter target: marker id + APPROACH distance. ``value``
+        may be a string ("11 2.5"), an [id, dist] list, or empty/None to clear
+        (use the default centre marker). False on unknown fc / unparseable value."""
+        parsed = _parse_spotter(value)
+        if parsed is False:
+            return False
+        with self._lock:
+            d = self.drones.get(fc_name)
+            if d is None:
+                return False
+            d["spotter"] = parsed                 # [id, dist] or None
             self._save()
         return True
 
@@ -247,7 +285,8 @@ class MatchState:
                 # NOTE: armed is deliberately NOT persisted — every restart comes
                 # up DISARMED for safety.
                 "drones": {k: {"role": v["role"], "enabled": v["enabled"],
-                               "swimlane": v.get("swimlane")}
+                               "swimlane": v.get("swimlane"),
+                               "spotter": v.get("spotter")}
                            for k, v in self.drones.items()},
             }, indent=2))
         except OSError as exc:

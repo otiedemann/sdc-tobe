@@ -121,18 +121,24 @@ def mover_alt(lane: int, t: Tunables) -> float:  # back-compat (scout/legacy)
     return _clamp_alt(t.mover_base_alt_m + t.mover_alt_step_m * max(0, lane))
 
 
-# ── Scout ───────────────────────────────────────────────────────────────────
-def scout_script(center_marker: int, t: Tunables) -> str:
-    """Fly to the arena centre via a side marker, then rotate in place forever.
+# ── Scout / Spotter ─────────────────────────────────────────────────────────
+SPOTTER_DEFAULT_DISTANCE_M = 5.0    # APPROACH standoff when the operator gives none
 
-    GO_HOME (loose, holds altitude) onto the centre marker -> ~arena centre at
-    the set altitude; then one long RC yaw drive scans every box. Never lands."""
+
+def scout_script(marker_id: int, distance_m: float, t: Tunables) -> str:
+    """SPOTTER: approach a fixed marker at a set standoff, spin a full turn to
+    scan every box, and repeat forever (never lands). The APPROACH re-homes on
+    the marker each loop so any drift during the spin is corrected.
+
+    The FC caps YAW_IMU at ±180°, so a full 360° scan is two YAW_IMU 180 steps.
+    REPEAT loops back to the first non-TAKEOFF step (HEIGHT) so it never ends."""
     return _fmt([
         "TAKEOFF",
         f"HEIGHT {t.scout_alt_m:.2f}",
-        f"GO_HOME {int(center_marker)} {CENTER_STANDOFF_M:.2f} {CENTER_TOL_M:g} 0",
-        f"HEIGHT {t.scout_alt_m:.2f}",
-        f"RC 0 0 0 {int(t.scout_yaw_stick)} {ROTATE_FOREVER_S}",
+        f"APPROACH {int(marker_id)} {float(distance_m):.2f}",
+        "YAW_IMU 180",          # 2 x 180 = a full 360° scan (FC caps yaw at 180)
+        "YAW_IMU 180",
+        "REPEAT",
     ])
 
 

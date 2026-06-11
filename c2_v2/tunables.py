@@ -49,6 +49,14 @@ class Tunables:
     # defenders). In AUTO this is the default defender count when no own box is
     # threatened; more defenders are added per threatened box.
     baseline_defenders: int = 2
+    # --- attacker watchdog (hand a STUCK attacker's lane to a healthy spare) ---
+    watchdog_enabled: int = 1          # 0 = off, 1 = on
+    watchdog_unreach_s: float = 4.0    # FC/drone link lost this long -> stuck
+    watchdog_landed_s: float = 10.0    # connected but not flying this long -> stuck
+    watchdog_frozen_s: float = 10.0    # ~zero ground speed during a MOVE step -> stuck
+    watchdog_frozen_speed_cms: float = 8.0  # |ground velocity| below this = "not moving"
+    watchdog_camera_stall_s: float = 20.0   # FC vision frame frozen this long (despite
+    #                                         the FC's own ~3s camera restarts) -> land+reboot
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -72,10 +80,16 @@ TUNE_SPEC = [
     ("attack_passes", "Attack chain passes", 5, 100, 1),
     ("attacker_home_dwell_s", "Attacker home dwell (s)", 0.0, 30.0, 0.5),
     ("baseline_defenders", "Baseline defenders", 0, 4, 1),
+    ("watchdog_enabled", "Watchdog on (0/1)", 0, 1, 1),
+    ("watchdog_unreach_s", "Watchdog: unreachable (s)", 1.0, 30.0, 0.5),
+    ("watchdog_landed_s", "Watchdog: landed (s)", 2.0, 60.0, 1.0),
+    ("watchdog_frozen_s", "Watchdog: frozen (s)", 2.0, 60.0, 1.0),
+    ("watchdog_frozen_speed_cms", "Watchdog: frozen speed (cm/s)", 1.0, 50.0, 1.0),
+    ("watchdog_camera_stall_s", "Watchdog: camera stall (s)", 3.0, 120.0, 1.0),
 ]
 _SPEC_BY_KEY = {k: (lo, hi, st) for k, _l, lo, hi, st in TUNE_SPEC}
 _INT_KEYS = {"scout_yaw_stick", "defender_yaw_stick", "attack_passes",
-             "baseline_defenders"}
+             "baseline_defenders", "watchdog_enabled"}
 
 
 def coerce(key: str, value: Any):
