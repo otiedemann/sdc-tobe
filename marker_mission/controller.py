@@ -716,6 +716,8 @@ class MissionState:
     # offline replay.
     world_velocity_m_kf: Optional[tuple[float, float, float]] = None
     camera_restart_count: int = 0   # auto-restarts triggered by freeze detection
+    camera_stalled: bool = False    # vision frame frozen >timeout while flying;
+    #                                 _send_rc holds neutral while True, C2 escalates
     world_position_confidence: float = 0.0   # base confidence from last estimate
     arena_validation_map: dict = field(default_factory=dict)  # marker validator map
     # solvePnP method for the controller's active TARGET marker
@@ -877,6 +879,7 @@ class MissionState:
                                         if self.world_velocity_m_kf is not None
                                         else None),
                 "camera_restart_count": self.camera_restart_count,
+                "camera_stalled": bool(self.camera_stalled),
                 "arena_validation_map": dict(self.arena_validation_map),
                 "world_position_confidence": round(
                     self.world_position_confidence
@@ -1453,17 +1456,33 @@ class MissionController:
             print("[ctrl] stop received before takeoff -- exiting cleanly")
             return
 
+        # ── press→rotor latency probe ───────────────────────────────────────
+        # Wall-clock + monotonic at GO so the timeline can be stitched across
+        # controller / drone_core / backend (all share this process via the
+        # in-proc API). grep '[TKOFF-T]' on the FC to read the breakdown.
+        _go_mono = time.monotonic()
+        print(f"[TKOFF-T] {_go_mono:.3f} ctrl: GO received "
+              f"(stream_pre_applied={stream_applied})")
+
         # GO-time fallback: only if pre-flight never managed to apply it (e.g. the
         # operator armed within the first moment). Normally a no-op -> fast takeoff.
         if not stream_applied:
+            print(f"[TKOFF-T] {time.monotonic():.3f} ctrl: GO-time stream "
+                  f"fallback START (ON CRITICAL PATH — restarts video stream)")
             self._apply_stream_settings()
+            print(f"[TKOFF-T] {time.monotonic():.3f} ctrl: stream fallback DONE "
+                  f"(+{time.monotonic() - _go_mono:.3f}s since GO)")
 
+        print(f"[TKOFF-T] {time.monotonic():.3f} ctrl: handing off to script "
+              f"(api.takeoff blocks here) (+{time.monotonic() - _go_mono:.3f}s since GO)")
         # Hand off to the mission script. The first step (typically
         # TAKEOFF) is loaded here; _apply_step_to_phase handles the
         # api.takeoff() call so a script that opens with a non-TAKEOFF
         # step (e.g., DANCE while already airborne, in some testing
         # scenario) doesn't unconditionally request takeoff.
         self._advance_script("mission start")
+        print(f"[TKOFF-T] {time.monotonic():.3f} ctrl: script handoff returned "
+              f"(takeoff API call complete) (+{time.monotonic() - _go_mono:.3f}s since GO)")
 
         next_tick = time.monotonic()
         while not self._stop.is_set():
@@ -4974,6 +4993,19 @@ class MissionController:
             with self.state.lock:
                 self.state.telemetry_stalled = self._stall_detect_active
                 self.state.telemetry_rc_gated = self._stall_gate_active
+        # ── Camera stall: hold position while the vision frame is frozen ──
+        # If the freeze detector (vision_worker) has flagged the camera as
+        # stalled, the marker-derived RC was computed against a frozen view --
+        # so hover in place (neutral RC) rather than flying blind. The
+        # vision_worker concurrently restarts the camera; C2's watchdog
+        # escalates to land+reboot if it stays stalled past its threshold.
+        # Mirrors the telemetry-stall gate above (deliberate, requested hold;
+        # neutral sticks = onboard hover-hold, not a motor cut).
+        if not dry_run:
+            with self.state.lock:
+                cam_stalled = bool(self.state.camera_stalled)
+            if cam_stalled:
+                lr = fb = ud = yaw = 0
         with self.state.lock:
             self.state.last_rc = (lr, fb, ud, yaw)
         if dry_run:

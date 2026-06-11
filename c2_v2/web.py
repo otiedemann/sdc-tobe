@@ -111,6 +111,13 @@ def build_app(pool: FCPool, match: Any = None, runner: Any = None,
             return _no_cache(jsonify({"ok": False, "error": "bad fc/swimlane"})), 400
         return _no_cache(jsonify({"ok": True}))
 
+    @app.route("/api/drone/<fc>/spotter", methods=["POST"])
+    def api_spotter(fc):
+        body = request.get_json(silent=True) or {}
+        if match is None or not match.set_spotter(fc, body.get("spotter")):
+            return _no_cache(jsonify({"ok": False, "error": "bad fc/spotter"})), 400
+        return _no_cache(jsonify({"ok": True}))
+
     @app.route("/api/tune", methods=["POST"])
     def api_tune():
         body = request.get_json(silent=True) or {}
@@ -357,6 +364,10 @@ function buildDroneCard(name){
       <input data-swim="${name}" class="small" placeholder="auto" style="width:4.5em">
       <span class="small" data-f="swimres" style="color:var(--muted)"></span>
     </div>
+    <div style="display:flex;gap:6px;align-items:center;margin-top:3px" title="Spotter target: marker id + APPROACH distance in metres, e.g. '11 2.5'. Empty = default centre marker. Only used while this drone is a scout/spotter — it approaches the marker, spins 360°, and repeats.">
+      <span class="small" style="color:var(--muted)">spotter</span>
+      <input data-spot="${name}" class="small" placeholder="id dist" style="width:4.5em">
+    </div>
     <div class="kv">
       <div class="k">pos (x,y,z)</div><div class="v" data-f="pos">—</div>
       <div class="k">height</div><div class="v" data-f="height">—</div>
@@ -373,6 +384,7 @@ function buildDroneCard(name){
   refs.role = el.querySelector("[data-role]");
   refs.enabled = el.querySelector("[data-enabled]");
   refs.swim = el.querySelector("[data-swim]");
+  refs.spot = el.querySelector("[data-spot]");
   // Mark the select as "being edited" the moment the operator touches it (the
   // pointerdown/focus fire BEFORE the native popup opens), and keep it marked
   // briefly after blur so the change->POST->refresh round-trip can land before
@@ -410,6 +422,9 @@ function renderDrones(s){
     // swimlane binding: 2 box slots (e.g. "3 6") -> enemy-colour target markers.
     const sw = cfg.swimlane; const wantSwim = (sw&&sw.length===2)? (sw[0]+" "+sw[1]) : "";
     if(document.activeElement !== r.swim && r.swim.value.trim() !== wantSwim) r.swim.value = wantSwim;
+    // spotter target: marker id + APPROACH distance (e.g. "11 2.5").
+    const sp = cfg.spotter; const wantSpot = (sp&&sp.length===2)? (sp[0]+" "+sp[1]) : "";
+    if(r.spot && document.activeElement !== r.spot && r.spot.value.trim() !== wantSpot) r.spot.value = wantSpot;
     if(r.swimres){
       if(sw&&sw.length===2){
         const base = (s.match&&s.match.our_team==='red') ? 30 : 40;  // enemy colour
@@ -527,6 +542,7 @@ document.addEventListener("change", async (e)=>{
   if(t.matches("[data-role]")){ await api(`/api/drone/${encodeURIComponent(t.getAttribute("data-role"))}/role`, {role:t.value}); tick(); }
   if(t.matches("[data-enabled]")){ await api(`/api/drone/${encodeURIComponent(t.getAttribute("data-enabled"))}/enabled`, {enabled:t.checked}); tick(); }
   if(t.matches("[data-swim]")){ await api(`/api/drone/${encodeURIComponent(t.getAttribute("data-swim"))}/swimlane`, {swimlane:t.value}); tick(); }
+  if(t.matches("[data-spot]")){ await api(`/api/drone/${encodeURIComponent(t.getAttribute("data-spot"))}/spotter`, {spotter:t.value}); tick(); }
   if(t.matches("[data-tune]")){ await api("/api/tune", {key:t.getAttribute("data-tune"), value:parseFloat(t.value)}); tick(); }
 });
 tick(); setInterval(tick, 1000);

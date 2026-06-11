@@ -40,6 +40,21 @@ ROLE_HOLD_S = 12.0
 # FC phases that mean "idle, ready to start a new mission".
 _IDLE_PHASES = ("", "init", "done")
 
+# Watchdog (stuck-drone detection + recovery, all roles) — see _watchdog.
+# current_step_kind values where the drone is TRANSLATING (so a ~zero ground
+# speed means it's stuck). Hover/wait/rotate steps (WAIT_AND_ATTACK, YAW, HEIGHT,
+# RC, HOOVER, TAKEOFF, REPEAT, ...) are deliberately EXCLUDED so a legitimately
+# holding attacker (e.g. WAIT_AND_ATTACK waiting for its box to flip) is never
+# mistaken for frozen.
+_TRANSLATING_STEP_KINDS = (
+    "ATTACK", "APPROACH", "GO_HOME", "MOVE_FBUD", "MOVE_FB", "MOVE_LR", "TO")
+# After handing off a LANDED attacker, give its replacement-role relaunch this
+# long to get airborne before escalating to a firmware reboot.
+WD_RECOVER_TAKEOFF_S = 15.0
+# After a reboot, wait this long for the drone to come back + take off before
+# giving up (drone returns in ~30-60 s).
+WD_REBOOT_WAIT_S = 80.0
+
 
 class Runner:
     def __init__(self, pool, match) -> None:
@@ -56,6 +71,10 @@ class Runner:
         self._atk_lane: Dict[str, int] = {}        # attacker fc -> its fixed swimlane (0,1,2)
         self._defender_recapture: Dict[str, int] = {}  # defender fc -> own slot being recaptured
         self._last_action: Dict[str, str] = {}    # fc -> human reason (for UI)
+        # Watchdog state:
+        self._wd_bad_since: Dict[str, tuple] = {}   # fc -> (reason, since_monotonic)
+        self._wd_recover: Dict[str, dict] = {}      # fc -> recovery state machine
+        self._wd_no_spare_at: Dict[str, float] = {}  # fc -> last "no spare" log ts (throttle)
         # Wake signal: arming (or any operator action that wants an immediate
         # launch) sets this so the loop ticks NOW instead of waiting out the 1 Hz
         # period — cuts up to ~1 s off press-to-takeoff. Set thread-safely via
@@ -127,6 +146,11 @@ class Runner:
         elif self._desired_role:
             self._desired_role.clear()
 
+        # WATCHDOG: detect stuck attackers and hand their lane to a healthy
+        # spare (runs before the role/lane computation below so the swap takes
+        # effect THIS tick — the re-task loop then relaunches both drones).
+        await self._watchdog(worlds, now)
+
         # Role-based ALTITUDE + attacker fan-out, recomputed from current roles.
         # Attackers fly fixed lanes that never cross -> they all share ONE flat
         # altitude. Defenders fly a higher tier (so attackers cross beneath them),
@@ -147,6 +171,11 @@ class Runner:
         for fc, cfg in self.match.drones.items():
             w = worlds.get(fc)
             if w is None or not w.connected:
+                continue
+            # The watchdog OWNS a drone it's rebooting — don't relaunch it (it
+            # must stay landed for the firmware reboot to take).
+            rec = self._wd_recover.get(fc)
+            if rec is not None and rec.get("hold"):
                 continue
             role = cfg.get("role", "idle")
             enabled = bool(cfg.get("enabled"))
@@ -266,8 +295,15 @@ class Runner:
         t = self.match.tunables
         alt = cruise_alt if cruise_alt is not None else S.attacker_alt(t)
         if role == "scout":
-            center = _pick_visible(world, S.CENTER_MARKERS) or S.CENTER_MARKERS[0]
-            return S.scout_script(center, t)
+            # Operator-set spotter target [marker_id, distance_m] overrides the
+            # default (a visible centre marker at the default standoff).
+            spot = (self.match.drones.get(fc) or {}).get("spotter")
+            if spot and len(spot) == 2:
+                mid, dist = int(spot[0]), float(spot[1])
+            else:
+                mid = _pick_visible(world, S.CENTER_MARKERS) or S.CENTER_MARKERS[0]
+                dist = S.SPOTTER_DEFAULT_DISTANCE_M
+            return S.scout_script(mid, dist, t)
         if role == "defender":
             wall_id, standoff = self._neutral_standoff(team)
             if wall_id is None:
@@ -299,8 +335,9 @@ class Runner:
 
     def _assign_lanes(self, attackers: List[str]) -> None:
         """SWIMLANE assignment pinned to DRONE IDENTITY (not sort rank): each
-        attacker owns ONE distinct vertical swimlane (0,1,2 = box 1<->4, 2<->5,
-        3<->6). KEEP every existing binding, free the lane of a drone that stopped
+        attacker owns ONE distinct vertical swimlane (0,1,2 = box 1<->6, 2<->5,
+        3<->4, the clockwise corridors). KEEP every existing binding, free the
+        lane of a drone that stopped
         attacking, and give a freed lane only to a newly-appeared attacker (e.g. a
         defender PROMOTED to attacker takes the dropped attacker's lane). So a
         dropout never reshuffles the other attackers' lanes, and no two attackers
@@ -324,6 +361,223 @@ class Runner:
         for fc in sorted(attackers):         # deterministic fill order
             if fc not in manual and fc not in self._atk_lane and free:
                 self._atk_lane[fc] = free.pop(0)
+
+    # ------------------------------------------------------------------ watchdog
+    async def _watchdog(self, worlds, now: float) -> None:
+        """Detect a STUCK drone in ANY active role (unreachable / landed /
+        stale-camera / frozen) and recover it:
+          * a stuck ATTACKER with a healthy spare -> hand its swimlane to the
+            spare (role swap), then recover the stuck drone in its new role;
+          * any other stuck drone (scout/defender, or attacker with no spare) ->
+            recover IN PLACE: stop -> relaunch, escalating to a firmware reboot
+            (then relaunch) if it won't come back healthy."""
+        t = self.match.tunables
+        if int(getattr(t, "watchdog_enabled", 1)) <= 0:
+            self._wd_bad_since.clear()
+            self._wd_recover.clear()
+            return
+
+        thresh = {
+            "unreachable": float(t.watchdog_unreach_s),
+            "radio-lost": float(t.watchdog_unreach_s),
+            "landed": float(t.watchdog_landed_s),
+            "stale": float(t.watchdog_frozen_s),          # telemetry callback stalled
+            "frozen": float(t.watchdog_frozen_s),
+            "camera-stall": float(t.watchdog_camera_stall_s),  # FC self-heals first
+        }
+        for fc, cfg in list(self.match.drones.items()):
+            role = cfg.get("role")
+            # Watch every ENABLED, ACTIVE-role drone. Skip idle/off, and skip a
+            # drone already in active recovery (don't re-trigger mid-recovery).
+            if (not cfg.get("enabled") or role in (None, "idle")
+                    or fc in self._wd_recover):
+                self._wd_bad_since.pop(fc, None)
+                continue
+            reason = self._drone_unhealthy_reason(fc, worlds.get(fc), role, t)
+            if reason is None:
+                self._wd_bad_since.pop(fc, None)
+                continue
+            prev = self._wd_bad_since.get(fc)
+            if prev is None or prev[0] != reason:
+                self._wd_bad_since[fc] = (reason, now)     # (re)start confirm timer
+                continue
+            if now - prev[1] < thresh.get(reason, 10.0):
+                continue                                   # not sustained yet
+            self._wd_bad_since.pop(fc, None)
+            await self._handle_stuck(fc, role, reason, worlds, now)
+
+        # Drive the recovery escalation (relaunch -> reboot -> relaunch).
+        await self._process_recovery(worlds, now)
+
+    def _drone_unhealthy_reason(self, fc: str, w, role: str, t) -> Optional[str]:
+        """Why this drone looks stuck, or None if healthy. Role-agnostic. Order:
+        unreachable > radio-lost > landed > stale > camera-stall > frozen."""
+        if w is None or not w.connected:
+            return "unreachable"          # FC/host unreachable (or crashed)
+        if not w.drone_connected:
+            return "radio-lost"           # FC up, but the drone link dropped
+        # Don't judge flying/stale/frozen until the drone is actually flying its
+        # CURRENT role (so a drone still mid-(re)launch isn't falsely flagged).
+        if self._launched_role.get(fc) != role:
+            return None
+        if not w.flying:
+            return "landed"               # landed / crashed / beep-mode motor cut
+        if w.telemetry_stalled:
+            return "stale"                # drone telemetry callback not updating
+        # CAMERA-STALL = vision frame frozen in flight. The FC restarts the
+        # camera locally (~every 3s) and holds neutral RC meanwhile; this only
+        # fires (after watchdog_camera_stall_s) if those restarts DON'T clear
+        # it, escalating to the land+reboot recovery ladder.
+        if w.camera_stalled:
+            return "camera-stall"
+        # FROZEN = ~zero IMU ground speed during a TRANSLATING step. A
+        # legitimately hovering/rotating step (WAIT_AND_ATTACK, YAW, RC hold) is
+        # excluded by the step filter so a waiting drone isn't flagged.
+        #
+        # The ATTACK step also wraps a SEARCH sub-phase: before it can translate
+        # toward a target the drone hovers and yaws in place to acquire the
+        # marker, so its ground speed is ~zero BY DESIGN there. That hover can
+        # easily outlast watchdog_frozen_s, so the confirm timer alone won't save
+        # us -> we'd false-flag a searching attacker as frozen and hand its lane
+        # to a spare. Skip the frozen verdict while searching; a truly dead drone
+        # is still caught by unreachable/radio-lost/landed/stale above (none of
+        # which depend on ground speed).
+        if (w.current_step_kind in _TRANSLATING_STEP_KINDS
+                and w.phase != "search"):
+            spd = w.ground_speed_cms
+            if spd is not None and spd < float(t.watchdog_frozen_speed_cms):
+                return "frozen"
+        return None
+
+    def _pick_takeover(self, worlds) -> Optional[str]:
+        """Best healthy NON-attacker to take over a lane: prefer a currently
+        FLYING drone (fastest to re-task), then by role (defender/scout before
+        idle, to avoid waiting out a takeoff). Requires a live FC + drone link."""
+        cands = []
+        for fc, cfg in self.match.drones.items():
+            if not cfg.get("enabled"):
+                continue
+            role = cfg.get("role", "idle")
+            if role == "attacker":
+                continue
+            w = worlds.get(fc)
+            if w is None or not w.connected or not w.drone_connected:
+                continue
+            flying_rank = 0 if w.flying else 1
+            role_rank = {"defender": 0, "scout": 1, "idle": 2}.get(role, 3)
+            cands.append((flying_rank, role_rank, fc))
+        if not cands:
+            return None
+        cands.sort()
+        return cands[0][2]
+
+    def _attacker_lane_params(self, fc: str) -> Optional[list]:
+        """The two box slots this attacker shuttles — its manual swimlane, or its
+        auto-lane's clockwise corridor pair. None if it holds no lane."""
+        manual = (self.match.drones.get(fc) or {}).get("swimlane")
+        if manual and len(manual) == 2:
+            return [int(manual[0]), int(manual[1])]
+        lane = self._atk_lane.get(fc)
+        return [lane + 1, 7 - (lane + 1)] if lane is not None else None
+
+    async def _handle_stuck(self, fc: str, role: str, reason: str,
+                            worlds, now: float) -> None:
+        """Recover a confirmed-stuck drone. A stuck ATTACKER with a healthy spare
+        hands its lane to the spare (role swap) so the lane stays covered, then
+        recovers in its new role. Everyone else recovers IN PLACE."""
+        if role == "attacker":
+            params = self._attacker_lane_params(fc)
+            takeover = self._pick_takeover(worlds) if params else None
+            if params and takeover is not None:
+                old_role = self.match.drones.get(takeover, {}).get("role", "idle")
+                self.match.set_swimlane(takeover, params)
+                self.match.set_role(takeover, "attacker")
+                self.match.set_swimlane(fc, None)
+                self.match.set_role(fc, old_role)
+                self._atk_lane.pop(fc, None)
+                tos = takeover.replace("flightctrl", "fc")
+                self._last_action[takeover] = (
+                    f"WATCHDOG takeover: attacker lane {params} "
+                    f"(from {fc.replace('flightctrl', 'fc')})")
+                self._last_action[fc] = (
+                    f"WATCHDOG: stuck ({reason}) -> {tos} took lane {params}; "
+                    f"now {old_role}, recovering")
+                logger.warning("c2_v2 watchdog: %s stuck (%s) -> %s takes lane %s; "
+                               "%s -> %s + recover", fc, reason, takeover, params,
+                               fc, old_role)
+                # Role changed -> the main loop re-tasks it (stop -> relaunch).
+                # Register it for the reboot escalation in its new role.
+                self._wd_recover[fc] = {"since": now, "stage": "relaunch",
+                                        "hold": False, "reason": reason,
+                                        "role": old_role}
+                return
+            if takeover is None and now - self._wd_no_spare_at.get(fc, -1e9) > 10.0:
+                logger.warning("c2_v2 watchdog: %s attacker stuck (%s); no spare "
+                               "-> in-place recovery", fc, reason)
+                self._wd_no_spare_at[fc] = now
+        # In-place recovery (scout/defender, or attacker with no spare).
+        await self._kick_and_recover(fc, role, reason, worlds, now)
+
+    async def _kick_and_recover(self, fc: str, role: str, reason: str,
+                                worlds, now: float) -> None:
+        """Force a fresh relaunch of a stuck drone's CURRENT role: if it's still
+        flying (stale/frozen), stop it so the main loop relaunches from idle; then
+        register it for the reboot escalation."""
+        w = worlds.get(fc)
+        if w is not None and w.connected and w.flying:
+            await self.pool.stop_drone(fc)        # lands -> main loop relaunches role
+            self._launched_role.pop(fc, None)
+            self._last_retask[fc] = now
+        self._wd_recover[fc] = {"since": now, "stage": "relaunch",
+                                "hold": False, "reason": reason, "role": role}
+        self._last_action[fc] = f"WATCHDOG: {role} stuck ({reason}) -> recovering in place"
+        logger.warning("c2_v2 watchdog: %s %s stuck (%s) -> in-place recovery "
+                       "(relaunch, reboot if needed)", fc, role, reason)
+
+    async def _process_recovery(self, worlds, now: float) -> None:
+        """Recovery state machine for any drone the watchdog benched/kicked:
+          * relaunch  — wait for the main loop's relaunch to restore it; if not
+                        healthy after WD_RECOVER_TAKEOFF_S, escalate to reboot.
+          * reboot    — take ownership (hold the main loop off it): land it if
+                        airborne (a firmware reboot mid-air = it falls), then
+                        /api/reboot once on the ground.
+          * post_reboot — release the hold; the main loop relaunches once it's
+                        back. Give up after WD_REBOOT_WAIT_S.
+        'Healthy' = reachable + drone link + flying + telemetry no longer stalled."""
+        for fc in list(self._wd_recover):
+            rec = self._wd_recover[fc]
+            w = worlds.get(fc)
+            healthy = (w is not None and w.connected and w.drone_connected
+                       and w.flying and not w.telemetry_stalled
+                       and not w.camera_stalled)
+            if healthy and not rec.get("hold"):
+                self._wd_recover.pop(fc, None)
+                self._last_action[fc] = "WATCHDOG: recovered (healthy again)"
+                continue
+            elapsed = now - rec["since"]
+            stage = rec["stage"]
+            if stage == "relaunch":
+                if elapsed >= WD_RECOVER_TAKEOFF_S:
+                    rec.update(stage="reboot", hold=True, since=now)   # take ownership
+            elif stage == "reboot":
+                if w is None or not w.connected:
+                    continue                          # offline (maybe rebooting) — wait
+                if w.flying:
+                    await self.pool.stop_drone(fc)    # land first; can't reboot mid-air
+                    self._launched_role.pop(fc, None)
+                    self._last_action[fc] = "WATCHDOG: still stuck -> landing to reboot"
+                else:
+                    ok, payload = await self.pool.reboot_drone(fc)
+                    rec.update(stage="post_reboot", hold=False, since=now)
+                    self._last_action[fc] = ("WATCHDOG: relaunch failed -> rebooting drone"
+                                             if ok else f"WATCHDOG: reboot rejected ({payload})")
+                    logger.warning("c2_v2 watchdog: %s reboot -> %s", fc,
+                                   "sent" if ok else payload)
+            elif stage == "post_reboot":
+                if elapsed >= WD_REBOOT_WAIT_S:
+                    self._wd_recover.pop(fc, None)
+                    self._last_action[fc] = "WATCHDOG: reboot+relaunch failed — needs manual"
+                    logger.error("c2_v2 watchdog: %s did not recover after reboot", fc)
 
     async def _maybe_recapture(self, fc: str, now: float, cruise_alt: float) -> None:
         """DEFENDER reactive recapture: if one of OUR boxes is enemy-held (and
@@ -371,12 +625,13 @@ class Runner:
 
 def _swimlane_std_lane(swimlane) -> Optional[int]:
     """The standard vertical lane (0,1,2) a manual swimlane occupies, or None if
-    it isn't a standard pair (box i <-> box i+3). Used to reserve the lane so
-    auto-assignment can't double up on it."""
+    it isn't a standard clockwise pair. The clockwise corridors pair red slot r
+    (1,2,3) with blue slot (7-r): 1<->6, 2<->5, 3<->4 -> lanes 0,1,2. Used to
+    reserve the lane so auto-assignment can't double up on it."""
     if not swimlane or len(swimlane) != 2:
         return None
     lo, hi = sorted(int(s) for s in swimlane)
-    return (lo - 1) if (lo in (1, 2, 3) and hi == lo + 3) else None
+    return (lo - 1) if (lo in (1, 2, 3) and hi == 7 - lo) else None
 
 
 def _fan_out_angles(n: int) -> List[float]:

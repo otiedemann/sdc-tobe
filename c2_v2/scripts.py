@@ -121,18 +121,24 @@ def mover_alt(lane: int, t: Tunables) -> float:  # back-compat (scout/legacy)
     return _clamp_alt(t.mover_base_alt_m + t.mover_alt_step_m * max(0, lane))
 
 
-# ── Scout ───────────────────────────────────────────────────────────────────
-def scout_script(center_marker: int, t: Tunables) -> str:
-    """Fly to the arena centre via a side marker, then rotate in place forever.
+# ── Scout / Spotter ─────────────────────────────────────────────────────────
+SPOTTER_DEFAULT_DISTANCE_M = 5.0    # APPROACH standoff when the operator gives none
 
-    GO_HOME (loose, holds altitude) onto the centre marker -> ~arena centre at
-    the set altitude; then one long RC yaw drive scans every box. Never lands."""
+
+def scout_script(marker_id: int, distance_m: float, t: Tunables) -> str:
+    """SPOTTER: approach a fixed marker at a set standoff, spin a full turn to
+    scan every box, and repeat forever (never lands). The APPROACH re-homes on
+    the marker each loop so any drift during the spin is corrected.
+
+    The FC caps YAW_IMU at ±180°, so a full 360° scan is two YAW_IMU 180 steps.
+    REPEAT loops back to the first non-TAKEOFF step (HEIGHT) so it never ends."""
     return _fmt([
         "TAKEOFF",
         f"HEIGHT {t.scout_alt_m:.2f}",
-        f"GO_HOME {int(center_marker)} {CENTER_STANDOFF_M:.2f} {CENTER_TOL_M:g} 0",
-        f"HEIGHT {t.scout_alt_m:.2f}",
-        f"RC 0 0 0 {int(t.scout_yaw_stick)} {ROTATE_FOREVER_S}",
+        f"APPROACH {int(marker_id)} {float(distance_m):.2f}",
+        "YAW_IMU 180",          # 2 x 180 = a full 360° scan (FC caps yaw at 180)
+        "YAW_IMU 180",
+        "REPEAT",
     ])
 
 
@@ -284,10 +290,11 @@ def enemy_face_for_slot(slot: int, our_team: str) -> int:
 
 
 # ── Swimlanes (3 attackers shuttle straight vertical lanes) ──────────────────
-# The 6 boxes mirror across the centre line at matching x: box 1<->4 (x=-3),
-# box 2<->5 (x=0), box 3<->6 (x=+3). Each swimlane pairs the two boxes at one x,
-# so an attacker shuttling that lane flies a STRAIGHT vertical path and the 3
-# lanes never cross. Lane L (0,1,2) = boxes (L+1) [red home] and (L+4) [blue home].
+# The 6 boxes are numbered CLOCKWISE, so a red-home box pairs with the blue-home
+# box at the SAME x corridor as: box 1<->6 (x=-3), box 2<->5 (x=0), box 3<->4
+# (x=+3). Each swimlane pairs the two boxes at one x, so an attacker shuttling
+# that lane flies a STRAIGHT vertical path and the 3 lanes never cross. Lane L
+# (0,1,2) = boxes (L+1) [red home] and (7-(L+1)) [blue home].
 NUM_SWIMLANES = 3
 
 
@@ -295,12 +302,12 @@ def swimlane_faces(lane: int, our_team: str) -> tuple:
     """``(enemy_box_face, our_box_face)`` for swimlane ``lane`` (0..2), from OUR
     team's view. BOTH are the box's ENEMY-colour face, so a WAIT_AND_ATTACK on
     each captures the enemy box / recaptures our box whenever it shows the enemy
-    colour (and holds at standoff awaiting the flip otherwise). The lane pairs box
-    (lane+1) [red home] with box (lane+4) [blue home]; which is "ours" vs "enemy"
-    flips with team."""
+    colour (and holds at standoff awaiting the flip otherwise). The boxes are
+    numbered CLOCKWISE, so red slot r pairs with blue slot (7-r): 1<->6, 2<->5,
+    3<->4 (same x corridor); which is "ours" vs "enemy" flips with team."""
     enemy = "blue" if our_team == "red" else "red"
     red_slot = (lane % NUM_SWIMLANES) + 1          # 1,2,3
-    blue_slot = (lane % NUM_SWIMLANES) + 4         # 4,5,6
+    blue_slot = 7 - red_slot                        # 6,5,4 (clockwise: 1<->6,2<->5,3<->4)
     if our_team == "red":
         our_slot, enemy_slot = red_slot, blue_slot
     else:

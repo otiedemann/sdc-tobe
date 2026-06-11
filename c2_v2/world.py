@@ -49,6 +49,13 @@ class DroneWorld:
     height_cm: Optional[float] = None
     drone_yaw_deg: Optional[float] = None
     serial: str = ""
+    # Body-frame ground velocity from the drone IMU (Olympe SpeedChanged), cm/s.
+    # Used by the attacker watchdog to detect a frozen/stuck drone WITHOUT relying
+    # on (possibly-frozen) vision position.
+    vg_x_cms: Optional[float] = None
+    vg_y_cms: Optional[float] = None
+    telemetry_stalled: bool = False  # FC's own "telemetry not updating" flag
+    camera_stalled: bool = False     # FC's own "vision frame frozen in flight" flag
 
     # --- mission / what it's doing ---
     phase: str = ""                 # FC phase: init/takeoff/search/approach/...
@@ -65,6 +72,13 @@ class DroneWorld:
     @property
     def battery_low(self) -> bool:
         return self.battery_pct is not None and self.battery_pct <= 15.0
+
+    @property
+    def ground_speed_cms(self) -> Optional[float]:
+        """Horizontal ground speed (cm/s) from the IMU, or None if unknown."""
+        if self.vg_x_cms is None or self.vg_y_cms is None:
+            return None
+        return (self.vg_x_cms ** 2 + self.vg_y_cms ** 2) ** 0.5
 
     def plan_text(self) -> str:
         """Short human summary of what the drone is currently doing (Phase 1
@@ -101,6 +115,9 @@ class DroneWorld:
             "height_cm": self.height_cm,
             "height_m": round(self.height_cm / 100.0, 2) if self.height_cm is not None else None,
             "drone_yaw_deg": self.drone_yaw_deg,
+            "ground_speed_cms": round(self.ground_speed_cms, 1) if self.ground_speed_cms is not None else None,
+            "telemetry_stalled": self.telemetry_stalled,
+            "camera_stalled": self.camera_stalled,
             "serial": self.serial,
             "phase": self.phase,
             "current_step_kind": self.current_step_kind,
@@ -145,6 +162,10 @@ class DroneWorld:
         self.battery_pct = _f(tel, "battery") if "battery" in tel else _f(state, "telemetry", "battery")
         self.height_cm = _f(tel, "height_cm")
         self.drone_yaw_deg = _f(tel, "yaw")
+        self.vg_x_cms = _f(tel, "vgx")
+        self.vg_y_cms = _f(tel, "vgy")
+        self.telemetry_stalled = bool(state.get("telemetry_stalled"))
+        self.camera_stalled = bool(state.get("camera_stalled"))
         sn = tel.get("serial_number")
         if sn:
             self.serial = str(sn)

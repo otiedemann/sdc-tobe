@@ -140,6 +140,15 @@ class FCPool:
             return False, "unknown fc"
         return await client.splice_mission(script)
 
+    async def reboot_drone(self, name: str) -> tuple[bool, Any]:
+        """Firmware-reboot one drone (POST /api/reboot). Only call on a LANDED
+        drone — the FC refuses an airborne reboot (it would fall). The drone
+        drops its link and returns in ~30-60 s."""
+        client = self.clients.get(name)
+        if client is None:
+            return False, "unknown fc"
+        return await client.reboot()
+
     async def emergency_land_all(self) -> Dict[str, bool]:
         """Land EVERY drone immediately (stop each mission -> rc_zero + land).
         409 'not running' is treated as success (already idle)."""

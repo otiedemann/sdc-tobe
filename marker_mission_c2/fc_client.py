@@ -142,6 +142,16 @@ class AsyncFCClient:
         return await self._post(
             "/api/stop", timeout=5.0, ok_status=(200, 409))
 
+    async def reboot(self, force: bool = False) -> Result:
+        """Firmware-reboot the drone (POST /api/reboot). The FC refuses a reboot
+        while flying (the drone would FALL) unless ``force`` is set, so callers
+        only reboot a LANDED drone. The drone drops its link and comes back in
+        ~30-60 s. A dropped connection mid-request is expected; the FC also
+        returns 409 when it declines (e.g. airborne without force)."""
+        return await self._post(
+            "/api/reboot", json_body={"force": bool(force)},
+            timeout=5.0, ok_status=(200, 202, 204, 409))
+
     # ------------------------------------------------------------- arena
     async def get_active_arena(self) -> Result:
         return await self._get("/api/arena/active")

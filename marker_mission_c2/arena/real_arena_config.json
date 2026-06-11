@@ -140,8 +140,8 @@
     { "id": 1, "team": "red",  "label": "Box 1 — shallow flank (-x)",      "x": -3.0, "y": -6.5, "z": 1.0, "enabled": true },
     { "id": 2, "team": "red",  "label": "Box 2 — deep centre (back wall)", "x":  0.0, "y": -9.0, "z": 1.0, "enabled": true },
     { "id": 3, "team": "red",  "label": "Box 3 — shallow flank (+x)",      "x":  3.0, "y": -6.5, "z": 1.0, "enabled": true },
-    { "id": 4, "team": "blue", "label": "Box 4 — shallow flank (-x)",      "x": -3.0, "y":  6.5, "z": 1.0, "enabled": true },
+    { "id": 4, "team": "blue", "label": "Box 4 — shallow flank (+x)",      "x":  3.0, "y":  6.5, "z": 1.0, "enabled": true },
     { "id": 5, "team": "blue", "label": "Box 5 — deep centre (back wall)", "x":  0.0, "y":  9.0, "z": 1.0, "enabled": true },
-    { "id": 6, "team": "blue", "label": "Box 6 — shallow flank (+x)",      "x":  3.0, "y":  6.5, "z": 1.0, "enabled": true }
+    { "id": 6, "team": "blue", "label": "Box 6 — shallow flank (-x)",      "x": -3.0, "y":  6.5, "z": 1.0, "enabled": true }
   ]
 }
