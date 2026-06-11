@@ -873,11 +873,6 @@ def cmd_fly(args: argparse.Namespace) -> int:
         _freeze_restart_after: float = 0.0   # monotonic cooldown (vision_worker local)
         _FREEZE_TIMEOUT_S       = 3.0   # stale frame age that counts as frozen
         _FREEZE_COOLDOWN_S      = 3.0   # min seconds between auto-restarts
-        _MOVE_SPEED_CMS         = 5.0   # drone speed threshold (cm/s) for "moving"
-        _POST_TAKEOFF_WINDOW_S  = 15.0  # seconds after takeoff where freeze restarts
-        #                                 even without movement (camera often freezes
-        #                                 during the Anafi takeoff sequence at ~0 cm/s)
-        _takeoff_at: float = 0.0        # monotonic time of last transition to flying
         # Position Kalman filter state. Lives across loop iterations
         # (function-local closure variables persist). Reset on
         # disable -> enable transitions and on dt > kalman_reset_gap_s.
@@ -902,37 +897,33 @@ def cmd_fly(args: argparse.Namespace) -> int:
             now_ft = time.monotonic()
             stats = reader.stats
             frame_age = stats.get("age_s") or 0.0
-            if frame_age > _FREEZE_TIMEOUT_S and now_ft >= _freeze_restart_after:
-                tel_now = tel_holder.get()
-                if tel_now is not None and tel_now.flying:
-                    # Track first moment the drone became airborne so the
-                    # post-takeoff window can be checked below.
-                    if _takeoff_at == 0.0:
-                        _takeoff_at = now_ft
-                    try:
-                        spd = math.hypot(
-                            float(tel_now.raw.get("vgx", 0) or 0),
-                            float(tel_now.raw.get("vgy", 0) or 0),
-                        )
-                    except (TypeError, ValueError):
-                        spd = 0.0
-                    post_takeoff = (now_ft - _takeoff_at) < _POST_TAKEOFF_WINDOW_S
-                    if spd >= _MOVE_SPEED_CMS or post_takeoff:
-                        reason = (f"post-takeoff ({now_ft - _takeoff_at:.0f}s)"
-                                  if post_takeoff and spd < _MOVE_SPEED_CMS
-                                  else f"moving ({spd:.0f} cm/s)")
-                        print(f"[vision] frame frozen {frame_age:.1f}s "
-                              f"while {reason} — restarting camera")
-                        errs = ui.restart_camera()
-                        _freeze_restart_after = now_ft + _FREEZE_COOLDOWN_S
-                        with state.lock:
-                            state.camera_restart_count += 1
-                        if errs:
-                            print(f"[vision] camera restart errors: {errs}")
-                else:
-                    # Drone landed or not yet flying: reset takeoff timestamp
-                    # so the post-takeoff window fires fresh on next flight.
-                    _takeoff_at = 0.0
+            tel_now = tel_holder.get()
+            flying_now = bool(tel_now is not None and tel_now.flying)
+            # Camera is "stalled" when the frame has been frozen past the
+            # timeout while airborne. Publish it EVERY loop (this block runs
+            # even with no new frame) so it clears the instant frames resume:
+            # the controller holds neutral RC while True (hover, don't fly
+            # blind) and C2's watchdog escalates to land+reboot if the local
+            # restarts below don't clear it.
+            cam_frozen = flying_now and frame_age > _FREEZE_TIMEOUT_S
+            with state.lock:
+                if state.camera_stalled != cam_frozen:
+                    state.camera_stalled = cam_frozen
+            # Restart the camera whenever it's frozen in flight. No longer
+            # gated on ground speed: a >timeout frozen frame is a real fault
+            # whether the drone is translating OR hovering to search (the old
+            # moving/post-takeoff gate left a stationary search frozen forever).
+            # The cooldown spaces out attempts; the watchdog takes over if they
+            # don't help.
+            if cam_frozen and now_ft >= _freeze_restart_after:
+                print(f"[vision] frame frozen {frame_age:.1f}s in flight "
+                      f"— restarting camera")
+                errs = ui.restart_camera()
+                _freeze_restart_after = now_ft + _FREEZE_COOLDOWN_S
+                with state.lock:
+                    state.camera_restart_count += 1
+                if errs:
+                    print(f"[vision] camera restart errors: {errs}")
             # ────────────────────────────────────────────────────────────
 
             if frame is None or ts == last_seen_ts:
