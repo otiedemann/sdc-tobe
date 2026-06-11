@@ -284,10 +284,11 @@ def enemy_face_for_slot(slot: int, our_team: str) -> int:
 
 
 # ── Swimlanes (3 attackers shuttle straight vertical lanes) ──────────────────
-# The 6 boxes mirror across the centre line at matching x: box 1<->4 (x=-3),
-# box 2<->5 (x=0), box 3<->6 (x=+3). Each swimlane pairs the two boxes at one x,
-# so an attacker shuttling that lane flies a STRAIGHT vertical path and the 3
-# lanes never cross. Lane L (0,1,2) = boxes (L+1) [red home] and (L+4) [blue home].
+# The 6 boxes are numbered CLOCKWISE, so a red-home box pairs with the blue-home
+# box at the SAME x corridor as: box 1<->6 (x=-3), box 2<->5 (x=0), box 3<->4
+# (x=+3). Each swimlane pairs the two boxes at one x, so an attacker shuttling
+# that lane flies a STRAIGHT vertical path and the 3 lanes never cross. Lane L
+# (0,1,2) = boxes (L+1) [red home] and (7-(L+1)) [blue home].
 NUM_SWIMLANES = 3
 
 
@@ -295,12 +296,12 @@ def swimlane_faces(lane: int, our_team: str) -> tuple:
     """``(enemy_box_face, our_box_face)`` for swimlane ``lane`` (0..2), from OUR
     team's view. BOTH are the box's ENEMY-colour face, so a WAIT_AND_ATTACK on
     each captures the enemy box / recaptures our box whenever it shows the enemy
-    colour (and holds at standoff awaiting the flip otherwise). The lane pairs box
-    (lane+1) [red home] with box (lane+4) [blue home]; which is "ours" vs "enemy"
-    flips with team."""
+    colour (and holds at standoff awaiting the flip otherwise). The boxes are
+    numbered CLOCKWISE, so red slot r pairs with blue slot (7-r): 1<->6, 2<->5,
+    3<->4 (same x corridor); which is "ours" vs "enemy" flips with team."""
     enemy = "blue" if our_team == "red" else "red"
     red_slot = (lane % NUM_SWIMLANES) + 1          # 1,2,3
-    blue_slot = (lane % NUM_SWIMLANES) + 4         # 4,5,6
+    blue_slot = 7 - red_slot                        # 6,5,4 (clockwise: 1<->6,2<->5,3<->4)
     if our_team == "red":
         our_slot, enemy_slot = red_slot, blue_slot
     else:

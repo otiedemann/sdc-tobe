@@ -299,8 +299,9 @@ class Runner:
 
     def _assign_lanes(self, attackers: List[str]) -> None:
         """SWIMLANE assignment pinned to DRONE IDENTITY (not sort rank): each
-        attacker owns ONE distinct vertical swimlane (0,1,2 = box 1<->4, 2<->5,
-        3<->6). KEEP every existing binding, free the lane of a drone that stopped
+        attacker owns ONE distinct vertical swimlane (0,1,2 = box 1<->6, 2<->5,
+        3<->4, the clockwise corridors). KEEP every existing binding, free the
+        lane of a drone that stopped
         attacking, and give a freed lane only to a newly-appeared attacker (e.g. a
         defender PROMOTED to attacker takes the dropped attacker's lane). So a
         dropout never reshuffles the other attackers' lanes, and no two attackers
