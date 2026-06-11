@@ -1682,11 +1682,14 @@ class MissionController:
         list of ``(marker_id, standoff_m)``; the recovery approaches whichever is
         in view, so a single unseen marker can never strand the drone.
 
-        Per wall: the marker closest to the origin in the horizontal plane (i.e.
-        nearest the wall's centre, where its inward normal passes through the
-        origin), preferring the LOWER of a high/low pair (easier to approach at
-        flight altitude). ``cfg.recovery_marker_id``, if set, forces a single
-        explicit candidate instead.
+        Per wall: prefer the LOWEST marker (bottom ring), then the one closest to
+        the origin in the horizontal plane (nearest the wall's centre). Height is
+        the PRIMARY key on purpose: a high marker (z=4) sits out of the gimbal's
+        horizontal frame below ~3 m flight altitude — the drone cruises ~1 m — so
+        a top marker can't be re-found during recovery. Picking the bottom ring
+        first guarantees the recovery target is actually visible at flight
+        altitude. ``cfg.recovery_marker_id``, if set, forces a single explicit
+        candidate instead.
 
         Standoff: the marker's horizontal distance to the origin. Arena markers
         sit on the inside wall face with their normal pointing toward the origin
@@ -1709,12 +1712,13 @@ class MissionController:
             return max(clearance, min(dist0, ceiling))
 
         def _key(m) -> Optional[tuple[float, float]]:
-            # (horizontal distance to origin, height) -- most central, then
-            # lowest. None if the marker has no usable position.
+            # (height, horizontal distance to origin) -- LOWEST ring FIRST (a
+            # z=4 top marker is out of frame below ~3 m flight altitude), then
+            # most central. None if the marker has no usable position.
             try:
-                return (math.hypot(float(m.position_m[0]),
-                                   float(m.position_m[1])),
-                        float(m.position_m[2]))
+                return (float(m.position_m[2]),
+                        math.hypot(float(m.position_m[0]),
+                                   float(m.position_m[1])))
             except (TypeError, IndexError, ValueError):
                 return None
 
@@ -1722,7 +1726,7 @@ class MissionController:
         if override is not None and int(override) in arena.markers:
             k = _key(arena.markers[int(override)])
             if k is not None:
-                return [(int(override), _bound(k[0]))]
+                return [(int(override), _bound(k[1]))]   # k[1] = horizontal dist
 
         # Most-central marker per wall -> at most one candidate per wall.
         best_per_wall: dict[str, tuple[tuple[float, float], int]] = {}
@@ -1734,7 +1738,7 @@ class MissionController:
             cur = best_per_wall.get(wall)
             if cur is None or k < cur[0]:
                 best_per_wall[wall] = (k, int(mid))
-        return [(mid, _bound(k[0])) for k, mid in best_per_wall.values()]
+        return [(mid, _bound(k[1])) for k, mid in best_per_wall.values()]
 
     def _recover_via_central_marker(self, now: float) -> bool:
         """Marker-lost recovery (NO absolute TO): approach the most CENTRAL
