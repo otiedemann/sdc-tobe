@@ -1,0 +1,1092 @@
+
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Drone Remote Controller</title>
+  <!-- Three.js for optional 3D arena view. Loaded up-front so the 3D
+       checkbox handler can init the scene the first time it's ticked.
+       Uses ES module imports via importmap, which works in Chrome/Safari
+       desktop. Falls back gracefully — if the module fails to load, the
+       3D checkbox will log an error and the 2D view still works. -->
+  <script type="importmap">
+  {
+    "imports": {
+      "three": "https://unpkg.com/three@0.161.0/build/three.module.js",
+      "three/addons/": "https://unpkg.com/three@0.161.0/examples/jsm/"
+    }
+  }
+  </script>
+  
+  <link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}">
+</head>
+<body>
+  <!-- Shared parameter-info popup. Any .info-icon click populates and
+       shows this modal via window.showParamInfo(key, event). -->
+  <div id="param_info_modal" onclick="if(event.target===this) this.style.display='none';">
+    <div class="box">
+      <div class="title"    id="pim_title">parameter</div>
+      <div class="subtitle" id="pim_key">key</div>
+      <div class="body"     id="pim_body">explanation</div>
+      <div class="range"    id="pim_range"></div>
+      <div style="text-align:right;">
+        <button class="close" onclick="document.getElementById('param_info_modal').style.display='none';">Close</button>
+      </div>
+    </div>
+  </div>
+  <div style="display:flex;align-items:center;gap:14px;margin:0 0 6px 0;">
+    <h2 style="margin:0;flex:1;">Drone Remote Controller</h2>
+    <button id="theme_toggle" title="Toggle light / dark theme"
+            style="height:34px;padding:0 12px;font-size:12px;font-weight:600;
+                   background:transparent;">&#127769; Dark</button>
+    <img id="team_logo" src="/logo.png?v=2" alt="Team logo"
+         title="Team To Be Defined — SDC26"
+         style="width:110px;height:auto;background:transparent;
+                filter:drop-shadow(0 2px 6px rgba(0,0,0,0.45));"
+         onerror="this.style.display='none'" />
+  </div>
+  <div style="display:flex;align-items:center;gap:8px;">
+    <div class="drone-bar" id="drone_bar" style="flex:1;"></div>
+    <button id="pause_all_btn" style="padding:6px 14px;font-size:13px;font-weight:700;background:#78350f;border-color:#f59e0b;color:#fde68a;letter-spacing:0.4px;" title="Override any command and freeze every drone in place. Autonomous missions abort; drones hover with zero RC. Keyboard shortcut: 9">&#9208;&#65039; PAUSE ALL (9)</button>
+    <button id="resume_all_btn" style="padding:6px 14px;font-size:13px;font-weight:700;background:#065f46;border-color:#10b981;color:#d1fae5;letter-spacing:0.4px;display:none;" title="Clear the pause — operators may re-arm missions manually. Keyboard shortcut: 9">&#9654;&#65039; CONTINUE MISSION</button>
+    <button id="land_all_btn" style="padding:6px 14px;font-size:13px;font-weight:700;background:#7f1d1d;border-color:#ef4444;color:#fee2e2;letter-spacing:0.4px;" title="Land every drone in the fleet safely. Keyboard shortcut: 0 (zero)">&#11088; LAND ALL (0)</button>
+    <button id="edit_drones_btn" style="padding:4px 12px;font-size:12px;background:#1e3a5f;border-color:#3b82f6;" title="Edit drone fleet config">Config</button>
+  </div>
+  <!-- Global PAUSE banner — sits just below the drone bar, hidden until
+       the fleet is paused. Amber bg + animated pulse to make it impossible
+       to miss. Reminds the operator that WASD is the only active control. -->
+  <div id="global_pause_banner" style="display:none;background:#ca8a04;color:#1c1917;padding:8px 14px;margin-top:6px;border-radius:6px;font-weight:700;letter-spacing:0.04em;text-align:center;box-shadow:0 0 0 2px #facc15 inset;animation:pausepulse 1.4s ease-in-out infinite;">
+    &#9208;&#65039; PAUSED &mdash; autonomous control is disabled. Drones hover at current position. Only WASD / manual RC is live. Press <b>CONTINUE MISSION</b> or <b>9</b> to resume.
+  </div>
+  <!-- Ceiling guard — the C2 UI sets the value, but the enforcement
+       runs ENTIRELY on each drone's flight-controller Pi (its 20 Hz
+       rc_loop using its own height_cm telemetry). If the C2 crashes,
+       disconnects, or even shuts down, the Pi keeps clamping upward
+       RC. The value persists to flight_config.json on the Pi so a
+       Pi restart also retains the ceiling. This is the last-line
+       safety — independent of C2 connection. -->
+  <div style="display:flex;align-items:center;gap:10px;margin-top:6px;padding:4px 10px;background:#0b1424;border:1px solid #1e293b;border-radius:5px;font-size:12px;">
+    <span style="color:#fca5a5;font-weight:600;letter-spacing:0.04em;"
+          title="Safety ceiling — set here, enforced on every Pi independently">
+      &#128737;&#65039; Ceiling
+    </span>
+    <label style="color:#94a3b8;display:flex;align-items:center;gap:4px;cursor:pointer;"
+           title="Hard maximum altitude above ground. Stored and enforced LOCALLY on each drone's Pi (no C2 dependency). Proportional clamp within 50cm, hard stop at ceiling, forced descent above. Persists across Pi restarts via flight_config.json.">
+      max
+      <input id="ceiling_input" type="number" min="0.5" max="20" step="0.1" value="5.0" style="width:64px;height:26px;font-size:12px;" />
+      m
+      <span class="info-icon" data-info="ceiling_m">i</span>
+    </label>
+    <button id="ceiling_apply_btn"
+            style="height:26px;font-size:11px;padding:0 10px;background:#7f1d1d;border-color:#ef4444;color:#fee2e2;"
+            title="POST the new value to every drone's /api/config/ceiling. Each Pi then: (1) stores it in MAX_ALTITUDE_M for its local RC tick, (2) writes it to flight_config.json for persistence, (3) pushes it to the Anafi firmware MaxAltitude as a second-line guard.">Apply to fleet</button>
+    <span id="ceiling_status" class="small" style="color:#64748b;"></span>
+    <span id="ceiling_engaged_badge" class="small" style="display:none;color:#fde68a;background:#7f1d1d;padding:2px 8px;border-radius:4px;font-weight:700;letter-spacing:0.04em;animation:pausepulse 1.0s ease-in-out infinite;">
+      &#128680; CEILING ENGAGED
+    </span>
+    <span class="small" style="color:#64748b;margin-left:auto;"
+          title="The Pi enforces this ceiling on every RC tick regardless of C2 state — no remote connection required.">
+      &#128274; Pi-enforced
+    </span>
+  </div>
+  <!-- Flight safety guards — axis-lock (autonomous only), arena
+       boundary (BOTH manual + autonomous when 'Manual guard' is on),
+       and safety margin. The arena guard is enforced on each Pi in
+       the RC tick loop so it works independently of the C2. -->
+  <div style="display:flex;align-items:center;gap:14px;margin-top:4px;padding:4px 10px;background:#0b1424;border:1px solid #1e293b;border-radius:5px;font-size:12px;flex-wrap:wrap;">
+    <span style="color:#fbbf24;font-weight:600;letter-spacing:0.04em;">&#129517; Flight guards</span>
+    <label style="color:#94a3b8;display:flex;align-items:center;gap:4px;cursor:pointer;"
+           title="When ON: during missions and autonomous flight the drone only flies parallel to arena walls — yaw snaps to nearest 90°, lateral motion is strafe OR forward/back but never diagonal. Manual WASD is unchanged.">
+      <input type="checkbox" id="axis_locked_toggle" style="accent-color:#fbbf24;" />
+      Axis-lock (autonomous)
+      <span class="info-icon" data-info="axis_locked">i</span>
+    </label>
+    <label style="color:#94a3b8;display:flex;align-items:center;gap:4px;cursor:pointer;"
+           title="When ON: every RC command on the Pi — manual WASD, keystroke, autonomous mission, everything — is clamped so the drone never approaches an arena wall closer than the margin. Enforced by the Pi's own RC tick at 20 Hz, independent of C2 connection. Falls back silently when position is unknown (operator is responsible).">
+      <input type="checkbox" id="arena_guard_toggle" checked style="accent-color:#f87171;" />
+      Arena guard (manual+auto)
+      <span class="info-icon" data-info="arena_guard_enabled">i</span>
+    </label>
+    <label style="color:#94a3b8;display:flex;align-items:center;gap:4px;cursor:pointer;"
+           title="Minimum distance from any arena wall. The Pi-side RC tick clamps any command that would push the drone closer than this.">
+      margin
+      <input id="safety_margin_input" type="number" min="0.1" max="5.0" step="0.1" value="1.5" style="width:54px;height:24px;font-size:12px;" />
+      m
+      <span class="info-icon" data-info="safety_margin_m">i</span>
+    </label>
+    <button id="safety_margin_apply" style="height:24px;font-size:11px;padding:0 8px;background:#78350f;border-color:#f59e0b;color:#fde68a;"
+            title="Push margin to every drone's Pi (arena guard) + every observer (autonomous guard)">Apply</button>
+    <span id="arena_guard_engaged_badge" class="small" style="display:none;color:#fde68a;background:#7f1d1d;padding:2px 8px;border-radius:4px;font-weight:700;letter-spacing:0.04em;">
+      &#128680; ARENA GUARD ENGAGED
+    </span>
+    <label style="color:#94a3b8;display:flex;align-items:center;gap:4px;cursor:pointer;"
+           title="When ON: during ANY autonomous mission, the drone's camera aims at the arena centre (default x=0, y=5.4) regardless of which direction it's flying. This keeps the maximum number of ArUco markers in view at once, which in turn gives the position processor more references and a more accurate fused pose.">
+      <input type="checkbox" id="cam_face_center_toggle" style="accent-color:#22d3ee;" />
+      &#128247; Cam → arena centre
+      <span class="info-icon" data-info="camera_face_center">i</span>
+    </label>
+    <span id="autonomous_guards_status" class="small" style="color:#64748b;"></span>
+  </div>
+  <div id="drone_config_modal" style="display:none;position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,0.7);z-index:1000;justify-content:center;align-items:center;">
+    <div style="background:#1e293b;border:1px solid #334155;border-radius:8px;padding:20px;max-width:700px;width:90%;max-height:80vh;overflow-y:auto;">
+      <h3 style="margin:0 0 12px 0;color:#e2e8f0;">Drone Fleet Configuration</h3>
+      <div id="drone_config_fields"></div>
+      <div style="margin-top:12px;display:flex;gap:8px;">
+        <button id="drone_config_add" style="background:#065f46;border-color:#10b981;padding:6px 16px;">Add Drone</button>
+        <button id="drone_config_save" style="background:#1e3a5f;border-color:#3b82f6;padding:6px 16px;">Save</button>
+        <button id="drone_config_cancel" style="background:#374151;border-color:#6b7280;padding:6px 16px;">Cancel</button>
+        <span id="drone_config_status" class="small" style="color:#94a3b8;align-self:center;"></span>
+      </div>
+    </div>
+  </div>
+  <div id="mag_modal" role="dialog" aria-labelledby="mag_title">
+    <div class="card">
+      <h3 id="mag_title">Magnetometer Recalibration</h3>
+      <div class="sub">
+        Anafi requires a figure-8 dance around each axis whenever it is moved
+        between locations or power-cycled. Keep the drone on a flat,
+        non-metallic surface; no cables or phones nearby.
+      </div>
+      <div class="steps" id="mag_steps">
+        <div class="mag-step" data-step="heartbeat">
+          <div class="num">1</div>
+          <div class="title">Pre-check — drone connected &amp; on the ground</div>
+          <div class="info" data-role="info"></div>
+        </div>
+        <div class="mag-step" data-step="pre_status">
+          <div class="num">2</div>
+          <div class="title">Read current magnetometer status</div>
+          <div class="info" data-role="info"></div>
+        </div>
+        <div class="mag-step" data-step="start">
+          <div class="num">3</div>
+          <div class="title">Start calibration command</div>
+          <div class="info" data-role="info"></div>
+        </div>
+        <div class="mag-step" data-step="poll">
+          <div class="num">4</div>
+          <div class="title">Figure-8 around each axis until all axes confirm</div>
+          <div class="info" data-role="info"></div>
+        </div>
+      </div>
+      <div id="mag_instructions">
+        <b>How to perform the dance:</b> hold the drone firmly and rotate it
+        slowly (~2 s per full turn) around each body axis in turn — roll (X),
+        pitch (Y), yaw (Z) — tracing a smooth figure-8. Each axis panel below
+        lights green once its bit flips.
+      </div>
+      <div id="mag_axes">
+        <div class="mag-axis" data-axis="x">
+          <div class="ax-name">X (roll)</div>
+          <div class="ax-hint">tilt left/right repeatedly</div>
+          <div class="ax-state" data-role="state">&#9675;</div>
+        </div>
+        <div class="mag-axis" data-axis="y">
+          <div class="ax-name">Y (pitch)</div>
+          <div class="ax-hint">tilt nose up/down</div>
+          <div class="ax-state" data-role="state">&#9675;</div>
+        </div>
+        <div class="mag-axis" data-axis="z">
+          <div class="ax-name">Z (yaw)</div>
+          <div class="ax-hint">rotate around vertical</div>
+          <div class="ax-state" data-role="state">&#9675;</div>
+        </div>
+      </div>
+      <div id="mag_result"></div>
+      <div id="mag_log">ready.</div>
+      <div class="btnrow">
+        <button id="mag_start_btn">Start Recalibration</button>
+        <button id="mag_retry_btn">Retry</button>
+        <button id="mag_close_btn">Close</button>
+      </div>
+    </div>
+  </div>
+  <div class="small">Active: <span id="pi"></span></div>
+  <div class="small">API status: <span id="api_status">checking...</span></div>
+  <div class="small">Drone telemetry status: <span id="drone_status">checking...</span></div>
+  <!-- Latency indicator (live ms). Click the toggle to auto-push the total
+       into the position-tracker's latency_ms slider. Video-decode offset
+       slider lets the operator add the C2-side processing time that isn't
+       captured by either ping. -->
+  <div class="small" id="latency_widget" style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-top:4px;padding:4px 8px;background:#0f172a;border:1px solid #1e293b;border-radius:4px;">
+    <b style="color:#e2e8f0;">Latency:</b>
+    <span id="lat_total" style="font-weight:700;color:#22c55e;min-width:60px;">—</span>
+    <span class="small" style="color:#64748b;">=
+      c2→fc <span id="lat_c2fc" style="color:#93c5fd;">—</span> +
+      fc→drone <span id="lat_fcdr" style="color:#fbbf24;">—</span> +
+      video <span id="lat_vid" style="color:#c4b5fd;">—</span>
+    </span>
+    <label style="display:flex;align-items:center;gap:4px;color:#94a3b8;cursor:pointer;" title="Add this many ms for local video-frame processing/decoding on the C2. Not measured by either ping.">
+      video +<input id="lat_video_offset" type="number" min="0" max="500" step="5" value="30" style="width:55px;" /> ms
+    </label>
+    <label style="display:flex;align-items:center;gap:4px;color:#94a3b8;cursor:pointer;" title="Auto-push the total into the Position Tracker latency slider every poll.">
+      <input type="checkbox" id="lat_auto_apply" checked /> auto-set latency
+    </label>
+    <span id="ws_status_badge" class="small" title="WebSocket channel between C2 and flight controller. Tel/Pos/RC are pushed on a persistent connection — no per-call HTTP framing overhead." style="padding:2px 8px;border-radius:3px;font-family:monospace;font-size:10.5px;letter-spacing:0.03em;font-weight:700;background:#334155;color:#94a3b8;">WS —</span>
+  </div>
+  <!-- ── Transport selector — per-subsystem WS ↔ HTTP switches ──
+       auto = prefer WS, fall back to HTTP when WS is down (default)
+       ws   = force WS only (503 if WS disconnected)
+       http = force HTTP only (never use WS)
+       Persisted on the server + mirrored in localStorage so every tab
+       reflects the same choice. -->
+  <div id="transport_widget" class="small" style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-top:4px;padding:4px 8px;background:#0f172a;border:1px solid #1e293b;border-radius:4px;">
+    <b style="color:#e2e8f0;">Transport:</b>
+    <span style="color:#64748b;">Controls (RC/WASD)</span>
+    <select id="transport_rc" class="transport-sel" data-subsys="rc" style="height:22px;font-size:11px;padding:0 4px;">
+      <option value="auto">auto</option>
+      <option value="ws">ws</option>
+      <option value="http">http</option>
+    </select>
+    <span style="color:#64748b;">Telemetry</span>
+    <select id="transport_telemetry" class="transport-sel" data-subsys="telemetry" style="height:22px;font-size:11px;padding:0 4px;">
+      <option value="auto">auto</option>
+      <option value="ws">ws</option>
+      <option value="http">http</option>
+    </select>
+    <span style="color:#64748b;">Position</span>
+    <select id="transport_position" class="transport-sel" data-subsys="position" style="height:22px;font-size:11px;padding:0 4px;">
+      <option value="auto">auto</option>
+      <option value="ws">ws</option>
+      <option value="http">http</option>
+    </select>
+    <button id="transport_all_http" style="height:22px;font-size:11px;padding:0 8px;background:#1e293b;border-color:#475569;" title="Force every subsystem to HTTP (legacy transport). Useful for diagnosing WS as the source of latency.">All HTTP</button>
+    <button id="transport_all_auto" style="height:22px;font-size:11px;padding:0 8px;background:#1e293b;border-color:#475569;" title="Reset: prefer WS with HTTP fallback">All auto</button>
+    <span id="transport_status" class="small" style="color:#64748b;"></span>
+  </div>
+  <!-- ── Tuning Parameters — one place for all live-tunable knobs ──
+       The Observer PD gains (approach speed, skew correction, IMU damping,
+       clamps, etc.) AND the Position Tracker config (profile, FOV, latency,
+       IMU/ArUco blend, Kalman, marker size, top-K, outlier) all live here
+       so operators don't have to hunt for the right slider. Content is
+       relocated at runtime from the ArUco Seek and Position Tracker panels
+       via JS to keep existing IDs and handlers intact. -->
+  <div id="tuning_panel" class="panel" style="margin-top:10px;">
+    <h3 style="margin:0 0 8px 0;color:#38bdf8;">Tuning Parameters <span class="small" style="color:#64748b;font-weight:400;">— all live-adjustable knobs in one place</span></h3>
+    <div style="display:flex;flex-wrap:wrap;gap:16px;align-items:flex-start;">
+      <div style="flex:1;min-width:360px;">
+        <div class="small" style="color:#a78bfa;margin-bottom:4px;font-weight:600;">
+          Observer PD — visual-servo gains (hover in front of markers, used by missions)
+        </div>
+        <div id="tuning_observer_slot" style="min-height:10px;"></div>
+      </div>
+      <div style="flex:1;min-width:360px;">
+        <div class="small" style="color:#22d3ee;margin-bottom:4px;font-weight:600;">
+          Position Tracker — absolute arena-frame pose fusion (all missions + boundary guard)
+        </div>
+        <div id="tuning_position_slot" style="min-height:10px;"></div>
+      </div>
+    </div>
+  </div>
+
+  <div class="row" style="margin-top:10px;">
+    <div class="panel">
+      <div class="grid" id="grid">
+        <button data-k="q">Q</button><button data-k="w">W</button><button data-k="e">E</button>
+        <button data-k="a">A</button><button data-k="x">STOP</button><button data-k="d">D</button>
+        <button data-k="r">R</button><button data-k="s">S</button><button data-k="f">F</button>
+      </div>
+      <div style="margin-top:8px; display:flex; gap:8px; flex-wrap:wrap;">
+        <button id="takeoff">Takeoff (T)</button>
+        <button id="land">Land (L)</button>
+        <button id="recover">Recover</button>
+        <button id="safe_takeoff">Safe Takeoff: OFF</button>
+      </div>
+      <!-- FC/C2 version mismatch warning — shown only when /proxy/fc_version
+           reports match:false. Catches the single most common cause of
+           "my fix isn't working": the C2 was updated but the FC wasn't
+           restarted (or vice-versa). -->
+      <div id="version_mismatch_banner" role="alert"
+           style="display:none;margin-top:8px;padding:8px 12px;background:#7f1d1d;border:1px solid #ef4444;border-radius:6px;color:#fecaca;font-size:13px;">
+        <b style="color:#fff;">⚠️ Version mismatch</b>
+        — the flight controller is running an older build than this
+        web UI. Fixes you deployed to the C2 may not be active yet.
+        <div id="version_mismatch_detail" style="margin-top:4px;font-family:monospace;font-size:11px;opacity:0.85;"></div>
+        <div style="margin-top:4px;font-size:12px;">
+          Restart the flight-controller's unified_api_server process
+          (<code>systemctl restart sdc-fc</code> on the FC box, or
+          re-run <code>python3 unified_api_server.py</code>) and reload
+          this page. You can also click
+          <a href="/proxy/fc_version" target="_blank" style="color:#fde68a;">/proxy/fc_version</a>
+          to see the exact versions.
+        </div>
+      </div>
+
+      <div id="takeoff_err" role="alert">
+        <div class="hdr">&#9888; Cannot take off</div>
+        <div class="reason" id="takeoff_err_reason">—</div>
+        <div class="small" id="takeoff_err_hint" style="color:#fecaca;"></div>
+        <div class="actions">
+          <button class="magneto" id="takeoff_err_mag" style="display:none;">Recalibrate Magnetometer</button>
+          <button class="dismiss" id="takeoff_err_dismiss">Dismiss</button>
+        </div>
+      </div>
+      <div style="margin-top:8px; display:flex; gap:8px; flex-wrap:wrap;">
+        <button id="toggle_log">Enable Telemetry Log</button>
+        <button id="download_log">Download Telemetry Log</button>
+        <button id="clear_log">Clear Telemetry Log</button>
+      </div>
+      <div style="margin-top:8px; display:flex; gap:8px; flex-wrap:wrap;">
+        <button id="toggle_cmd_log">Command Logging: OFF</button>
+        <button id="download_cmd_log">Download Command Log</button>
+        <button id="clear_cmd_log">Clear Command Log</button>
+      </div>
+      <!-- Automatic per-flight logs — a fresh JSONL file per takeoff → land
+           pair, containing telemetry + commands + arena position + visible
+           ArUco markers. Archived list below; click a row to download. -->
+      <div class="adv" style="margin-top:10px;">
+        <div class="small" style="margin-bottom:6px;">
+          <b>Flight Logs</b> <span style="color:#64748b;">— auto-recorded per takeoff</span>
+          <button id="flight_logs_refresh" style="height:24px;font-size:11px;padding:0 8px;margin-left:10px;background:#1e293b;">Refresh</button>
+        </div>
+        <div id="flight_logs_list" class="small"
+             style="font-family:monospace;font-size:11px;max-height:180px;overflow-y:auto;border:1px solid #334155;border-radius:4px;padding:6px;background:#0b1220;color:#cbd5e1;">
+          <i style="color:#64748b;">loading…</i>
+        </div>
+      </div>
+      <div class="adv">
+        <div class="small" style="margin-bottom:6px;">Advanced SDK controls</div>
+        <div class="adv-grid">
+          <button id="rotate_cw">Rotate CW 45°</button>
+          <button id="rotate_ccw">Rotate CCW 45°</button>
+          <button id="move_up">Up 30cm</button>
+          <button id="move_down">Down 30cm</button>
+          <button id="move_fwd">Forward 30cm</button>
+          <button id="move_back">Back 30cm</button>
+          <button id="move_left">Left 30cm</button>
+          <button id="move_right">Right 30cm</button>
+          <button id="stream_on">Stream ON</button>
+          <button id="stream_off">Stream OFF</button>
+          <button id="set_speed">Set Speed</button>
+        </div>
+        <div class="row" style="margin-top:8px;">
+          <input id="speed_val" type="number" min="10" max="100" value="30" placeholder="speed 10..100" />
+          <input id="sdk_cmd" type="text" placeholder="raw sdk cmd (e.g. speed? or battery?)" style="min-width:320px;flex:1;" />
+          <button id="sdk_send">Send SDK Command</button>
+        </div>
+      </div>
+      <div class="adv" id="anafi_panel">
+        <div class="small" style="margin-bottom:6px;">Anafi / Olympe controls</div>
+        <div class="row" style="margin-top:8px; align-items:center;">
+          <span class="small" style="min-width:80px;">Gimbal tilt</span>
+          <input id="gimbal_tilt" type="range" min="-90" max="30" value="0" style="flex:1;" />
+          <span id="gimbal_tilt_val" class="small" style="min-width:40px;">0°</span>
+          <button id="gimbal_set">Set</button>
+          <button id="gimbal_down">Down (-90)</button>
+          <button id="gimbal_fwd">Forward (0)</button>
+        </div>
+        <div class="row" style="margin-top:8px; align-items:center; padding-top:8px; border-top:1px solid #1e293b;">
+          <span class="small" style="min-width:80px;">Magnetometer</span>
+          <span id="mag_status" class="small" style="color:#94a3b8;font-family:monospace;flex:1;">—</span>
+          <button id="mag_open" style="background:#1e3a5f;border-color:#3b82f6;height:32px;padding:0 12px;font-size:12px;" title="Walk through the figure-8 recalibration wizard">Recalibrate Magnetometer</button>
+        </div>
+        <div class="row" style="margin-top:8px; align-items:center;">
+          <span class="small" style="min-width:80px;">Max altitude (m)</span>
+          <input id="set_alt" type="number" min="0.5" max="150" step="0.5" value="5" style="width:70px;" />
+          <span class="small" style="min-width:80px;">Max vert spd</span>
+          <input id="set_vspd" type="number" min="0.1" max="4" step="0.1" value="0.5" style="width:70px;" />
+          <span class="small" style="min-width:80px;">Max tilt (°)</span>
+          <input id="set_tilt" type="number" min="1" max="35" step="1" value="15" style="width:70px;" />
+          <button id="apply_settings">Apply Settings</button>
+        </div>
+        <!-- ── Environment (indoor/outdoor) ─────────────────────── -->
+        <div class="row" style="margin-top:10px; align-items:center; padding-top:8px; border-top:1px solid #1e293b;">
+          <span class="small" style="min-width:80px;">Environment</span>
+          <select id="env_mode" style="background:#0f172a;color:#e2e8f0;border:1px solid #334155;border-radius:4px;padding:4px 6px;font-size:12px;">
+            <option value="indoor">Indoor (GPS-less, relaxed checks)</option>
+            <option value="outdoor">Outdoor (GPS-required, default)</option>
+          </select>
+          <button id="env_apply" style="background:#1e3a5f;border-color:#3b82f6;">Apply</button>
+          <span id="env_status" class="small" style="color:#94a3b8;">—</span>
+        </div>
+        <!-- ── Wi-Fi band + channel ─────────────────────────────── -->
+        <div class="row" style="margin-top:8px; align-items:center;">
+          <span class="small" style="min-width:80px;">Wi-Fi band</span>
+          <select id="wifi_band" style="background:#0f172a;color:#e2e8f0;border:1px solid #334155;border-radius:4px;padding:4px 6px;font-size:12px;">
+            <option value="5_GHz">5 GHz (recommended)</option>
+            <option value="2_4_GHz">2.4 GHz</option>
+          </select>
+          <span class="small" style="min-width:56px;">Channel</span>
+          <select id="wifi_channel" style="background:#0f172a;color:#e2e8f0;border:1px solid #334155;border-radius:4px;padding:4px 6px;font-size:12px;min-width:130px;">
+            <option value="auto">Auto (drone picks)</option>
+            <!-- 5 GHz non-DFS -->
+            <option value="36">36 (5 GHz UNII-1)</option>
+            <option value="40">40 (5 GHz UNII-1)</option>
+            <option value="44">44 (5 GHz UNII-1)</option>
+            <option value="48">48 (5 GHz UNII-1)</option>
+            <option value="149">149 (5 GHz UNII-3)</option>
+            <option value="153">153 (5 GHz UNII-3)</option>
+            <option value="157">157 (5 GHz UNII-3)</option>
+            <option value="161">161 (5 GHz UNII-3)</option>
+            <option value="165">165 (5 GHz UNII-3)</option>
+            <!-- 2.4 GHz -->
+            <option value="1">1 (2.4 GHz)</option>
+            <option value="6">6 (2.4 GHz)</option>
+            <option value="11">11 (2.4 GHz)</option>
+          </select>
+          <button id="wifi_apply" style="background:#1e3a5f;border-color:#3b82f6;" title="Apply band+channel. Drone on ground only. Wi-Fi link drops briefly while re-associating.">Apply Wi-Fi</button>
+          <button id="wifi_scan" style="background:#374151;border-color:#6b7280;" title="Scan the selected band for in-use channels">Scan</button>
+          <span id="wifi_status" class="small" style="color:#94a3b8;margin-left:6px;">—</span>
+        </div>
+      </div>
+      <div class="adv" id="mission_panel">
+        <div class="small" style="margin-bottom:6px;"><b>Mission Planner</b> — enter one command per line</div>
+        <textarea id="mission_cmds" rows="8" style="width:100%;font-family:monospace;font-size:12px;background:#0f172a;color:#e2e8f0;border:1px solid #334155;border-radius:4px;padding:6px;resize:vertical;" placeholder="Examples:
+100 forward
+90 cw
+50 back
+45 ccw
+80 up
+60 down
+30 left
+40 right
+wait 2
+hover 3
+land
+takeoff"></textarea>
+        <div style="margin-top:6px;display:flex;gap:8px;align-items:center;">
+          <button id="mission_run" style="background:#065f46;border-color:#10b981;">Run Mission</button>
+          <button id="mission_stop" style="background:#7f1d1d;border-color:#dc2626;display:none;">Abort Mission</button>
+          <span id="mission_status" class="small" style="color:#94a3b8;">idle</span>
+        </div>
+        <div id="mission_log" class="small" style="margin-top:6px;max-height:120px;overflow-y:auto;white-space:pre-wrap;color:#94a3b8;"></div>
+      </div>
+      <div class="small" style="margin-top:8px;">Keyboard in browser: W/A/S/D R/F Q/E, T, L, Space stop</div>
+    </div>
+
+    <div style="display:flex; flex-direction:column; gap:12px;">
+      <div class="panel" id="video_panel">
+        <div><b>Video Stream</b></div>
+        <div class="video-controls">
+          <select id="video_mode">
+            <option value="off">Off</option>
+            <option value="mjpeg">Way 1: MJPEG (decoded on Pi)</option>
+            <option value="forward">Way 2: UDP Forward (decoded on C2)</option>
+          </select>
+          <button id="video_toggle">Start Video</button>
+        </div>
+        <div class="video-status" id="video_status">Mode: off</div>
+        <div class="video-url" id="video_url" style="display:none;"></div>
+        <!-- Anafi camera zoom. Digital zoom 1.0–3.0×. Slider writes to
+             /proxy/camera/zoom, which forwards to Olympe's set_zoom_target
+             on the Pi. Value updates live as you drag. -->
+        <div class="video-controls" style="margin-top:8px;">
+          <span class="small" style="min-width:52px;">Zoom</span>
+          <input id="video_zoom" type="range" min="1.0" max="3.0" step="0.05" value="1.0" style="flex:1;max-width:200px;" />
+          <span id="video_zoom_val" class="small" style="min-width:40px;">1.00×</span>
+          <button id="video_zoom_reset" style="padding:2px 8px;font-size:11px;">Reset</button>
+        </div>
+        <div id="video_container" style="margin-top:8px;display:none;">
+          <img id="video_img" src="" alt="video stream" style="width:480px;height:auto;" />
+        </div>
+      </div>
+      <div class="panel">
+        <div><b>Telemetry</b></div>
+        <div class="status-wrap">
+          <div class="meter">
+            <div class="meter-label">Battery SoC: <span id="battery_val">-</span></div>
+            <div class="meter-track"><div id="battery_bar" class="meter-fill"></div></div>
+          </div>
+        </div>
+        <div id="compass_wrap" style="display:flex;gap:12px;align-items:center;margin-top:10px;padding:8px;background:#0f172a;border:1px solid #1e293b;border-radius:4px;">
+          <canvas id="compass_canvas" width="96" height="96" style="flex:0 0 96px;display:block;"></canvas>
+          <div class="small" style="flex:1;line-height:1.55;">
+            <div>Heading: <b style="color:#e2e8f0;"><span id="compass_abs">--</span>°</b> <span style="color:#64748b;font-size:11px;">(mag)</span></div>
+            <div>Takeoff ref: <span id="compass_ref" style="color:#94a3b8;">—</span></div>
+            <div>Relative: <b style="color:#3b82f6;"><span id="compass_rel">--</span>°</b></div>
+            <button id="compass_reset" title="Re-capture takeoff heading from current yaw" style="margin-top:4px;height:22px;font-size:11px;padding:0 8px;background:#1e3a5f;border-color:#3b82f6;">Reset ref</button>
+          </div>
+        </div>
+        <div id="telemetry" class="small" style="white-space:pre-wrap; margin-top:10px;">loading...</div>
+        <button id="graphs_toggle" onclick="window.toggleGraphs && window.toggleGraphs()" style="margin-top:8px;height:32px;font-size:12px;padding:0 14px;background:#1e3a5f;border-color:#3b82f6;">Show Graphs</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="graphs_panel" style="display:none;margin-top:12px;padding:0 16px 16px;">
+    <div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(340px,1fr));gap:8px;" id="graphs_container"></div>
+  </div>
+
+  <!-- ── ArUco Seek — hover in front of a marker (per active drone) ── -->
+  <div id="aruco_panel">
+    <h3>ArUco Seek &mdash; hover in front of marker
+      <span id="arc_status" class="small" style="margin-left:8px;color:#94a3b8;font-weight:400;">stopped</span>
+      <span id="arc_drone_label" class="small" style="margin-left:8px;color:#64748b;font-weight:400;"></span>
+    </h3>
+
+    <div id="arc_live_banner">&#9888; LIVE MODE &mdash; DRONE WILL MOVE &mdash; RC commands are being sent</div>
+
+    <div class="mis-row" style="margin-bottom:10px;">
+      <button id="arc_start" style="background:#065f46;border-color:#10b981;">&#9654; Start</button>
+      <button id="arc_stop" style="background:#7f1d1d;border-color:#ef4444;">&#9632; Stop</button>
+      <span style="margin-left:8px;color:#94a3b8;font-size:11px;">Mode:</span>
+      <span class="mode-seg">
+        <button id="arc_mode_observe" class="active observe" data-mode="observe">OBSERVE</button>
+        <button id="arc_mode_live" data-mode="live">LIVE</button>
+      </span>
+      <span id="arc_mode_gate" style="font-size:11px;color:#fbbf24;display:none;">LIVE disabled (REMOTE_NO_LIVE=1)</span>
+      <span id="arc_mode_err" style="display:none;margin-left:10px;padding:4px 10px;font-size:11px;background:#7f1d1d;color:#fecaca;border:1px solid #ef4444;border-radius:4px;font-weight:600;"></span>
+      <span id="arc_manual" class="arc-manual">
+        <button id="arc_takeoff" style="background:#065f46;border-color:#10b981;">&uarr; Takeoff</button>
+        <button id="arc_land">&darr; Land</button>
+        <button id="arc_rc_stop">RC Stop</button>
+        <button id="arc_emergency" style="background:#7f1d1d;border-color:#ef4444;">&#9940; EMERGENCY</button>
+      </span>
+      <span style="margin-left:12px;color:#94a3b8;font-size:11px;">Target marker:</span>
+      <input id="arc_target_input" type="number" min="0" placeholder="auto" style="width:70px;" />
+      <button id="arc_target_lock">Lock</button>
+      <button id="arc_target_auto">Auto</button>
+    </div>
+
+    <div class="arc-grid">
+      <div>
+        <div class="small" style="color:#94a3b8;margin-bottom:4px;">Video feed (drone camera)</div>
+        <img id="arc_video" class="arc-video" alt="(press Start to load video)" />
+        <div class="small" style="color:#94a3b8;margin:8px 0 4px 0;">Top-down &mdash; drone &harr; marker</div>
+        <canvas id="arc_topdown" class="arc-topdown" width="420" height="380"></canvas>
+        <div id="arc_readout" class="arc-readout" style="margin-top:8px;">&mdash;</div>
+      </div>
+      <div>
+        <div class="small" style="color:#94a3b8;margin-bottom:4px;">Live tuning parameters &mdash; applied immediately</div>
+        <div id="arc_params" class="arc-params"></div>
+        <div style="margin-top:6px;"><button id="arc_reload" style="font-size:11px;">&#x21bb; Reload params from server</button></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ── Special Missions — coordinated multi-drone flights ───────── -->
+  <div id="missions_panel">
+    <h3>Special Missions
+      <span id="mis_title_status" class="small" style="margin-left:8px;color:#94a3b8;font-weight:400;">idle</span>
+    </h3>
+
+    <div class="mis-row">
+      <label style="color:#94a3b8;">Mission:</label>
+      <select id="mis_type">
+        <option value="scan_all">Scan all ArUco markers (sequential, collision-aware)</option>
+        <option value="capture_targets">Capture enemy targets (SDC26 — box-capture, camera on arena centre)</option>
+      </select>
+    </div>
+
+    <!-- Capture-Targets specific inputs — hidden unless that mission is selected. -->
+    <div id="mis_capture_rows" style="display:none;">
+      <div class="mis-row">
+        <label style="color:#94a3b8;" title="One JSON object per target box. Use the Blue team's 3 enemy boxes (the red-home boxes) for standard play.">Target boxes (JSON):</label>
+        <textarea id="mis_boxes_json" rows="8" style="width:100%;max-width:520px;background:#0f172a;color:#e2e8f0;border:1px solid #334155;border-radius:4px;padding:6px;font-family:monospace;font-size:11px;">[
+  {"id": 1, "x": -7.0, "y": 2.5, "home_team": "red"},
+  {"id": 2, "x": -5.0, "y": 5.4, "home_team": "red"},
+  {"id": 3, "x": -7.0, "y": 8.3, "home_team": "red"},
+  {"id": 4, "x":  7.0, "y": 2.5, "home_team": "blue"},
+  {"id": 5, "x":  5.0, "y": 5.4, "home_team": "blue"},
+  {"id": 6, "x":  7.0, "y": 8.3, "home_team": "blue"}
+]</textarea>
+      </div>
+      <div class="mis-row">
+        <label style="color:#94a3b8;" title="World-frame XY the drone returns to after all captures. Typically your team's home-zone centre.">Home XY:</label>
+        <input id="mis_home_x" type="number" step="0.1" value="0.0" style="width:70px;" />
+        <input id="mis_home_y" type="number" step="0.1" value="9.0" style="width:70px;" />
+        <label style="color:#94a3b8;margin-left:12px;" title="World-frame XY the drone's camera aims at while moving (typically arena centre so many markers stay in view for triangulation).">Face XY:</label>
+        <input id="mis_face_x" type="number" step="0.1" value="0.0" style="width:70px;" />
+        <input id="mis_face_y" type="number" step="0.1" value="5.4" style="width:70px;" />
+        <label style="color:#94a3b8;margin-left:12px;" title="Height in metres that the drone hovers ABOVE each target marker. Waypoint Z = box.z + this value — so a box sticker at z=0.5 m with hover height 1.5 m puts the drone at z=2.0 m. If the box's z field is missing, it's treated as 0 (floor level) so this becomes the absolute hover altitude.">Hover height above target (m):</label>
+        <input id="mis_alt" type="number" step="0.1" min="0.3" max="5.0" value="1.5" style="width:80px;" />
+        <label style="color:#94a3b8;margin-left:12px;" title="Hover duration above each box. Must be ≥ the 2s capture-hold from SDC26 rules.">Hover s:</label>
+        <input id="mis_cap_hover_s" type="number" step="0.5" min="2.0" value="4.0" style="width:70px;" />
+      </div>
+    </div>
+
+    <div class="mis-row">
+      <label style="color:#94a3b8;">Drones:</label>
+      <span id="mis_drones" style="display:flex;gap:10px;flex-wrap:wrap;"></span>
+    </div>
+
+    <div class="mis-row">
+      <label style="color:#94a3b8;">Target markers:</label>
+      <input id="mis_markers" type="text" value="1-12" placeholder="e.g. 1-12 or 1,2,3,7" style="width:220px;" />
+      <label style="color:#94a3b8;margin-left:12px;">Hover s:</label>
+      <input id="mis_hover_s" type="number" min="0.5" step="0.5" value="1.5" style="width:70px;" title="How long the drone hovers in front of each marker before moving on. 1.5s scans cleanly; raise if the score validation needs longer." />
+      <label style="color:#94a3b8;margin-left:12px;">Approach tol (m):</label>
+      <input id="mis_tol_m" type="number" min="0.1" step="0.05" value="0.30" style="width:70px;" title="Drone transitions from APPROACH to HOVER once within this many metres of the hover distance AND sufficiently perpendicular (see Skew tol)." />
+      <label style="color:#94a3b8;margin-left:12px;" title="Max skew before declaring the drone perpendicular. 0.08 ≈ 6° off the marker normal. Lower values force the drone to align straight-on before hovering.">Skew tol:</label>
+      <input id="mis_skew_tol" type="number" min="0.02" max="0.50" step="0.01" value="0.12" style="width:70px;" title="Max perspective skew to accept for HOVER. 0.12 ≈ 9° off the marker normal. Lower = stricter perpendicular (longer to converge)." />
+      <label style="color:#94a3b8;margin-left:12px;display:flex;align-items:center;gap:4px;">
+        <input id="mis_auto_takeoff" type="checkbox" />
+        auto-takeoff
+      </label>
+    </div>
+
+    <!-- ── Mission-as-code + presets ──────────────────────────────────
+         Every mission type has its own JSON parameter block. The
+         editor below is the canonical source of truth; the form
+         fields above auto-sync into it when you click "From form".
+         Presets are saved server-side in controller/mission_presets.json
+         so they survive server restarts and are shared across browser
+         tabs. -->
+    <div class="mis-row" style="margin-top:8px;">
+      <label style="color:#94a3b8;">Preset:</label>
+      <select id="mis_preset_sel" style="min-width:180px;"></select>
+      <button id="mis_preset_load" style="background:#1e293b;border-color:#475569;" title="Load the selected preset's JSON into the editor">Load</button>
+      <input id="mis_preset_name" type="text" placeholder="preset name" style="width:140px;" />
+      <button id="mis_preset_save" style="background:#1e293b;border-color:#475569;" title="Save the current JSON as a named preset (overwrites if name exists)">Save</button>
+      <button id="mis_preset_delete" style="background:#450a0a;border-color:#b91c1c;color:#fecaca;" title="Delete the selected preset">Delete</button>
+      <span id="mis_preset_status" class="small" style="color:#64748b;"></span>
+    </div>
+    <div class="mis-row">
+      <label style="color:#94a3b8;align-self:flex-start;">Code (JSON):</label>
+      <textarea id="mis_code" rows="10" spellcheck="false"
+                style="width:100%;max-width:680px;background:#0f172a;color:#e2e8f0;border:1px solid #334155;border-radius:4px;padding:6px;font-family:monospace;font-size:11px;line-height:1.4;"
+                placeholder="JSON parameters for the selected mission…"></textarea>
+    </div>
+    <div class="mis-row">
+      <button id="mis_code_from_form" style="background:#1e293b;border-color:#475569;" title="Rebuild the JSON from the form fields above">&#8689; From form</button>
+      <button id="mis_code_to_form" style="background:#1e293b;border-color:#475569;" title="Apply the JSON values to the form fields (where possible)">&#8690; To form</button>
+      <button id="mis_code_run" style="background:#065f46;border-color:#10b981;" title="Parse the JSON and start the mission using those parameters — bypasses the form">&#9654; Run from code</button>
+      <span id="mis_code_status" class="small" style="color:#64748b;"></span>
+    </div>
+
+    <div class="mis-row" style="margin-top:8px;">
+      <button id="mis_start" style="background:#065f46;border-color:#10b981;">&#9654; Start mission</button>
+      <button id="mis_stop" style="background:#7f1d1d;border-color:#ef4444;">&#9632; Stop</button>
+      <button id="mis_stop_land" style="background:#7f1d1d;border-color:#ef4444;">&#9632; Stop + Land</button>
+      <a id="mis_trace_download" href="/proxy/missions/trace" download style="margin-left:10px;color:#93c5fd;text-decoration:underline;font-size:12px;" title="Download the JSONL trace log of the current (or most recent) mission">⤓ Download trace</a>
+      <span id="mis_err" style="display:none;margin-left:10px;padding:4px 10px;font-size:11px;background:#7f1d1d;color:#fecaca;border:1px solid #ef4444;border-radius:4px;font-weight:600;"></span>
+      <span id="mis_ok"  style="display:none;margin-left:10px;padding:4px 10px;font-size:11px;background:#064e3b;color:#a7f3d0;border:1px solid #22c55e;border-radius:4px;font-weight:600;"></span>
+      <span id="mis_progress" style="margin-left:12px;color:#38bdf8;font-weight:600;">—</span>
+    </div>
+
+    <div class="mis-row" style="margin-top:6px;">
+      <label style="color:#94a3b8;">Scanned:</label>
+      <span id="mis_scanned" style="color:#4ade80;font-family:monospace;">—</span>
+      <label style="color:#94a3b8;margin-left:12px;">Remaining:</label>
+      <span id="mis_remaining" style="color:#fbbf24;font-family:monospace;">—</span>
+    </div>
+
+    <div class="small" style="color:#94a3b8;margin:10px 0 4px 0;">Per-drone status</div>
+    <div id="mis_status" class="mis-status">idle — no mission running</div>
+  </div>
+
+  <script src="{{ url_for('static', filename='controller.01.js') }}"></script>
+
+  <!-- ── ArUco Seek client JS ─────────────────────────────────────── -->
+  <script src="{{ url_for('static', filename='controller.02.js') }}"></script>
+
+  <!-- ── Special Missions client JS ───────────────────────────────── -->
+  <script src="{{ url_for('static', filename='controller.03.js') }}"></script>
+
+  <div class="row" style="margin-top:12px;">
+    <div class="panel pos-panel">
+      <div style="display:flex;align-items:center;gap:10px;margin-bottom:8px;">
+        <b>Position Tracker</b>
+        <label style="display:flex;align-items:center;gap:5px;font-size:12px;color:#94a3b8;cursor:pointer;">
+          <input type="checkbox" id="pos_enabled" style="accent-color:#0ea5e9;" />
+          Enable
+        </label>
+        <span id="pos_status_badge" class="small" style="color:#64748b;">disabled</span>
+      </div>
+      <!-- Auto Positioning: single master toggle that overrides every user
+           filter/precision knob with the built-in Claude preset on the FC.
+           When ON, sliders below are greyed out and the operator can't
+           accidentally dial the pose into garbage. When OFF, full manual
+           tuning returns. Default ON for "just works" out of the box. -->
+      <div id="pos_auto_bar" style="display:flex;align-items:center;gap:10px;margin-bottom:8px;padding:7px 10px;background:#052e16;border:1px solid #10b981;border-radius:6px;">
+        <label style="display:flex;align-items:center;gap:6px;cursor:pointer;font-weight:600;">
+          <input type="checkbox" id="pos_auto_toggle" checked style="accent-color:#10b981;transform:scale(1.3);" />
+          <span style="color:#d1fae5;">Auto Positioning (Claude algorithm)</span>
+        </label>
+        <span class="small" style="color:#86efac;">recommended · uses a field-log-tuned preset + pose-jump gate</span>
+        <span id="pos_auto_status" class="small" style="color:#64748b;margin-left:auto;"></span>
+      </div>
+      <div style="display:flex;gap:8px;align-items:center;margin-bottom:6px;">
+        <label class="small" style="color:#94a3b8;display:flex;align-items:center;gap:4px;cursor:pointer;">
+          <input type="checkbox" id="arena_show_3d" checked style="accent-color:#0ea5e9;" />
+          3D view (Three.js)
+        </label>
+        <label class="small" style="color:#94a3b8;display:flex;align-items:center;gap:4px;cursor:pointer;">
+          <input type="checkbox" id="arena_show_all_drones" checked style="accent-color:#10b981;" />
+          Show all drones
+        </label>
+        <span class="small" style="color:#64748b;margin-left:12px;">Grid: 1 m</span>
+      </div>
+      <canvas id="arena_canvas" class="arena-canvas" width="960" height="560" style="max-width:100%;"></canvas>
+      <div id="arena3d_wrap" style="display:block;margin-top:8px;position:relative;">
+        <div id="arena3d_container" style="width:960px;max-width:100%;height:520px;background:#0f172a;border:1px solid #334155;border-radius:6px;"></div>
+        <div class="small" style="color:#64748b;margin-top:4px;">Drag to orbit · scroll to zoom · right-drag to pan</div>
+      </div>
+      <div class="pos-coords" style="margin-top:6px;">
+        <span class="pos-x">X: <span id="pos_x">—</span></span>&nbsp;&nbsp;
+        <span class="pos-y">Y: <span id="pos_y">—</span></span>&nbsp;&nbsp;
+        <span class="pos-z">Z: <span id="pos_z">—</span></span>
+      </div>
+      <div class="small" style="color:#94a3b8;">
+        Hdg: <span id="pos_hdg">—</span>°&nbsp;&nbsp;
+        Vel: <span id="pos_vel">—</span>&nbsp;&nbsp;
+        Refs: <span id="pos_refs">—</span>&nbsp;&nbsp;
+        FPS: <span id="pos_fps">—</span>
+        <span id="pos_stale" class="pos-stale" style="display:none;"> ⚠ STALE</span>
+      </div>
+      <div class="small" style="color:#94a3b8;margin-top:2px;">
+        Vx:&nbsp;<span id="tel_vx">—</span>&nbsp;
+        Vy:&nbsp;<span id="tel_vy">—</span>&nbsp;
+        Vz:&nbsp;<span id="tel_vz">—</span>&nbsp;cm/s&nbsp;&nbsp;&nbsp;
+        Ax:&nbsp;<span id="tel_ax">—</span>&nbsp;
+        Ay:&nbsp;<span id="tel_ay">—</span>&nbsp;
+        Az:&nbsp;<span id="tel_az">—</span>&nbsp;cm/s²
+      </div>
+      <!-- Safety distance readout — shows how far the active drone is from
+           the nearest safety boundary. Green when inside the safe zone,
+           amber when approaching, red when outside the margin. Updated on
+           every SSE position event. -->
+      <div class="small" style="margin-top:2px;font-family:monospace;">
+        <span style="color:#94a3b8;">Safety:</span>
+        <span id="pos_safety_readout" style="color:#64748b;">—</span>
+      </div>
+      <div class="pos-cfg">
+        <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:6px;">
+          <label>Profile <span class="info-icon" data-info="detect_profile">i</span>:
+            <select id="pos_profile" class="pos-cfg">
+              <option value="balanced">Balanced</option>
+              <option value="sensitive">Sensitive</option>
+              <option value="strict">Strict</option>
+            </select>
+          </label>
+          <label>FOV° <span class="info-icon" data-info="fov_deg">i</span>:
+            <input id="pos_fov" type="number" min="40" max="120" value="69" style="width:60px;" />
+          </label>
+          <label>Latency ms <span class="info-icon" data-info="latency_ms">i</span>:
+            <input id="pos_latency" type="range" min="0" max="800" value="200" style="width:90px;vertical-align:middle;" />
+            <span id="pos_latency_val" style="font-size:11px;color:#94a3b8;">200</span>
+          </label>
+          <label title="0 = pure ArUco (vision only), 1 = pure IMU dead-reckoning. Higher = more IMU smoothing, less vision jitter." style="display:inline-flex;align-items:center;gap:4px;">
+            <span style="font-size:11px;color:#94a3b8;">ArUco</span>
+            <input id="pos_imu_weight" type="range" min="0" max="100" value="30" style="width:110px;vertical-align:middle;accent-color:#06b6d4;" />
+            <span style="font-size:11px;color:#94a3b8;">IMU</span>
+            <span id="pos_imu_weight_val" style="font-size:11px;color:#06b6d4;font-weight:bold;min-width:32px;">30%</span>
+            <span class="info-icon" data-info="imu_weight">i</span>
+          </label>
+        </div>
+        <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:6px;padding:6px;background:#0f172a;border:1px solid #1e293b;border-radius:4px;">
+          <span class="small" style="color:#64748b;min-width:70px;">Filters:</span>
+          <label style="display:flex;align-items:center;gap:4px;cursor:pointer;">
+            <input type="checkbox" id="pos_kalman" style="accent-color:#3b82f6;" />
+            <span class="small" style="color:#e2e8f0;">Kalman filter <span class="info-icon" data-info="enable_kalman_filter">i</span></span>
+          </label>
+          <label class="small" style="color:#94a3b8;">Marker size (m) <span class="info-icon" data-info="marker_size_m">i</span>:
+            <input id="pos_marker_size" type="number" min="0.05" max="2.0" step="0.01" value="0.5" style="width:64px;" />
+          </label>
+          <label class="small" style="color:#94a3b8;">Top-K <span class="info-icon" data-info="top_k_markers">i</span>:
+            <input id="pos_top_k" type="number" min="0" max="10" step="1" value="0" style="width:50px;" title="0 = auto (4)" />
+          </label>
+          <label class="small" style="color:#94a3b8;">Outlier (m) <span class="info-icon" data-info="outlier_reject_m">i</span>:
+            <input id="pos_outlier" type="number" min="0.1" max="20" step="0.1" value="2.5" style="width:60px;" />
+          </label>
+          <label class="small" style="color:#fbbf24;" title="Multiplicative correction on camera↔marker distance from solvePnP. 1.0 = no correction. If the UI shows 7 m but actual is 9 m → set 9/7 ≈ 1.286.">dist × <span class="info-icon" data-info="distance_scale">i</span>:
+            <input id="pos_distance_scale" type="number" min="0.1" max="5.0" step="0.001" value="1.000" style="width:70px;" />
+          </label>
+          <button id="pos_filters_apply" class="pos-cfg" style="height:26px;font-size:11px;padding:0 10px;">Apply filters</button>
+          <button id="pos_filters_reset" class="pos-cfg" style="height:26px;font-size:11px;padding:0 10px;background:#1e2a3a;" title="Restore defaults: Kalman on, marker 0.5m, top-K auto, outlier 2.5m, dist scale 1.0">Defaults</button>
+          <span id="pos_filters_status" class="small" style="color:#64748b;"></span>
+        </div>
+        <!-- ── Precision tuning (advanced) ───────────────────────────
+             These parameters control multi-marker fusion, IMU blend,
+             the pose-coast window, and per-axis Kalman variances. They
+             apply immediately to the running positioner and also to
+             Aruco Seek / mission boundary guard since they read the
+             same global arena-frame pose.                             -->
+        <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:6px;padding:6px;background:#0f172a;border:1px solid #1e293b;border-radius:4px;">
+          <span class="small" style="color:#a78bfa;min-width:70px;font-weight:600;">Precision:</span>
+          <label class="small" style="color:#94a3b8;">pose hold (s) <span class="info-icon" data-info="pose_hold_sec">i</span>:
+            <input id="pos_pose_hold" type="number" min="0" max="10" step="0.1" value="0.8" style="width:60px;" />
+          </label>
+          <label class="small" style="color:#94a3b8;">min refs <span class="info-icon" data-info="min_ref_count">i</span>:
+            <input id="pos_min_refs" type="number" min="1" max="12" step="1" value="1" style="width:50px;" />
+          </label>
+          <label class="small" style="color:#94a3b8;">min ref w <span class="info-icon" data-info="min_ref_weight">i</span>:
+            <input id="pos_min_ref_w" type="number" min="0" max="1" step="0.01" value="0" style="width:56px;" />
+          </label>
+          <label class="small" style="color:#94a3b8;">blend min <span class="info-icon" data-info="meas_blend_min">i</span>:
+            <input id="pos_blend_min" type="number" min="0" max="1" step="0.05" value="0.35" style="width:56px;" />
+          </label>
+          <label class="small" style="color:#94a3b8;">blend max <span class="info-icon" data-info="meas_blend_max">i</span>:
+            <input id="pos_blend_max" type="number" min="0" max="1" step="0.05" value="0.85" style="width:56px;" />
+          </label>
+          <label class="small" style="color:#94a3b8;">vel blend <span class="info-icon" data-info="vel_blend">i</span>:
+            <input id="pos_vel_blend" type="number" min="0" max="1" step="0.05" value="0.25" style="width:56px;" />
+          </label>
+          <label class="small" style="color:#94a3b8;">max Δt (s) <span class="info-icon" data-info="max_state_dt">i</span>:
+            <input id="pos_max_dt" type="number" min="0.05" max="10" step="0.05" value="1.0" style="width:60px;" />
+          </label>
+          <label class="small" style="color:#94a3b8;">Q proc <span class="info-icon" data-info="kalman_process_var">i</span>:
+            <input id="pos_kf_q" type="number" min="1e-6" max="10" step="1e-5" value="1e-3" style="width:74px;" />
+          </label>
+          <label class="small" style="color:#94a3b8;">R meas <span class="info-icon" data-info="kalman_meas_var">i</span>:
+            <input id="pos_kf_r" type="number" min="1e-6" max="10" step="1e-3" value="0.1" style="width:74px;" />
+          </label>
+          <label class="small" style="color:#94a3b8;" title="First-order low-pass cut-off frequency applied to IMU velocity (vgx/vgy/vgz) at telemetry ingestion. 0 disables. Lower = more smoothing.">IMU LPF (Hz) <span class="info-icon" data-info="imu_lowpass_hz">i</span>:
+            <input id="pos_imu_lpf" type="range" min="0" max="30" step="0.5" value="5" style="width:90px;vertical-align:middle;accent-color:#a78bfa;" />
+            <span id="pos_imu_lpf_val" style="font-size:11px;color:#a78bfa;font-weight:bold;min-width:42px;display:inline-block;">5.0 Hz</span>
+          </label>
+          <label class="small" style="color:#fbbf24;" title="Pose-jump gate. Reject a fresh fix if it disagrees with the Kalman-predicted state by more than this many metres. Kills catastrophic single-marker solvePnP mirror-pose glitches (the 10+ m jumps). 0 disables.">gate (m) <span class="info-icon" data-info="max_pose_jump_m">i</span>:
+            <input id="pos_max_jump" type="number" min="0" max="20" step="0.1" value="0" style="width:56px;" title="0 = disabled, 3.0 is a good default" />
+          </label>
+          <label class="small" style="color:#f97316;" title="SDC26 target-box marker side length in metres. Wall markers use the \"Marker size\" field above. Target markers (ID ≥ 30) solvePnP against THIS size instead, so target world positions don't get over-reported by 50/19 ≈ 2.6×.">target size (m) <span class="info-icon" data-info="target_marker_size_m">i</span>:
+            <input id="pos_target_size" type="number" min="0.02" max="2.0" step="0.01" value="0.19" style="width:60px;" />
+          </label>
+          <label class="small" style="color:#06b6d4;" title="Zero-Velocity Update. When IMU speed stays below this threshold for &quot;hold&quot; frames, the positioner snaps to the last valid pose instead of integrating noisy ArUco fixes — eliminates the parked-drone drift. 0 disables.">ZUPT &lt; (m/s) <span class="info-icon" data-info="zupt_speed_m_s">i</span>:
+            <input id="pos_zupt_speed" type="number" min="0" max="1" step="0.01" value="0.05" style="width:56px;" />
+          </label>
+          <label class="small" style="color:#06b6d4;" title="Consecutive slow frames needed before ZUPT engages. Higher = more robust (fewer false engagements during slow moves), lower = quicker to freeze when parked. 3 frames ≈ 0.6s at 5Hz is a reasonable default.">hold <span class="info-icon" data-info="zupt_hold_frames">i</span>:
+            <input id="pos_zupt_hold" type="number" min="0" max="30" step="1" value="3" style="width:50px;" />
+          </label>
+          <button id="pos_precision_apply" class="pos-cfg" style="height:26px;font-size:11px;padding:0 10px;">Apply precision</button>
+          <button id="pos_precision_reset" class="pos-cfg" style="height:26px;font-size:11px;padding:0 10px;background:#1e2a3a;" title="Restore precision defaults">Defaults</button>
+          <span id="pos_precision_status" class="small" style="color:#64748b;"></span>
+        </div>
+        <!-- ── Position-tracker presets ─────────────────────────────
+             Stored server-side in controller/position_presets.json.
+             Loading a preset fans out to every drone via
+             /proxy/position/config so the whole fleet gets the new
+             tuning in one click. -->
+        <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:6px;padding:6px;background:#0f172a;border:1px solid #1e293b;border-radius:4px;">
+          <span class="small" style="color:#4ade80;min-width:70px;font-weight:600;">Presets:</span>
+          <select id="pos_preset_sel" style="min-width:140px;height:22px;font-size:11px;"></select>
+          <button id="pos_preset_apply" style="height:22px;font-size:11px;padding:0 8px;background:#065f46;border-color:#10b981;color:#d1fae5;" title="Apply the selected preset to every drone in the fleet">Apply to fleet</button>
+          <input id="pos_preset_name" type="text" placeholder="preset name" style="width:120px;height:22px;font-size:11px;" />
+          <button id="pos_preset_save" style="height:22px;font-size:11px;padding:0 8px;background:#1e293b;border-color:#475569;" title="Save the current values as a named preset (overwrites if name exists)">Save</button>
+          <button id="pos_preset_delete" style="height:22px;font-size:11px;padding:0 8px;background:#450a0a;border-color:#b91c1c;color:#fecaca;" title="Delete the selected preset">Delete</button>
+          <span id="pos_preset_status" class="small" style="color:#64748b;"></span>
+        </div>
+        <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;">
+          <button id="pos_cfg_save" class="pos-cfg">Apply Config</button>
+          <label style="cursor:pointer;">
+            <button id="pos_calib_btn" class="pos-cfg" onclick="document.getElementById('pos_calib_file').click()">Upload Calibration (.npz)</button>
+            <input type="file" id="pos_calib_file" accept=".npz" style="display:none;" />
+          </label>
+          <span id="pos_calib_status" class="small" style="color:#94a3b8;"></span>
+        </div>
+        <!-- ── Claude Automatic Calibration ────────────────────────────
+             Autonomous arena-scanning flight that generates a log + video
+             the operator can upload to Claude for analysis. Claude returns
+             a tuned preset JSON which the operator pastes into "Import"
+             below; it's saved as a named preset and can be applied to the
+             fleet from the Presets dropdown above. -->
+        <div style="margin-top:8px;padding:8px 10px;background:#0c1a2e;border:1px solid #334155;border-radius:6px;">
+          <div style="display:flex;align-items:center;gap:10px;margin-bottom:6px;">
+            <b style="color:#fbbf24;">🎯 Claude Automatic Calibration</b>
+            <span class="small" style="color:#94a3b8;">
+              Place drone in arena centre → Start → upload log+video → paste returned preset
+            </span>
+          </div>
+          <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;">
+            <button id="calib_start_btn"
+                    style="background:#713f12;border:1px solid #fbbf24;color:#fef3c7;padding:4px 12px;border-radius:4px;cursor:pointer;font-weight:600;"
+                    title="Drone takes off, flies a ~90 s scan pattern (two 360° sweeps + translation cross + altitude change), then lands. Flight log + video are recorded automatically.">
+              ▶ Start Calibration Flight
+            </button>
+            <button id="calib_abort_btn"
+                    style="display:none;background:#450a0a;border:1px solid #b91c1c;color:#fecaca;padding:4px 12px;border-radius:4px;cursor:pointer;font-weight:600;"
+                    title="Abort the running calibration — the drone will land at the next safe point.">
+              ✕ Abort
+            </button>
+            <span id="calib_status_txt" class="small" style="color:#64748b;">idle</span>
+          </div>
+          <div id="calib_progress_wrap" style="display:none;margin-top:6px;">
+            <div style="height:8px;background:#1e293b;border-radius:4px;overflow:hidden;">
+              <div id="calib_progress_bar" style="height:100%;width:0%;background:linear-gradient(90deg,#fbbf24,#f59e0b);transition:width 0.3s;"></div>
+            </div>
+            <div class="small" style="color:#94a3b8;margin-top:4px;">
+              Step <span id="calib_step_num">0</span>/<span id="calib_step_total">0</span>:
+              <span id="calib_step_name" style="color:#fbbf24;">—</span>
+              <span style="color:#64748b;margin-left:8px;">elapsed <span id="calib_elapsed">0</span>s</span>
+            </div>
+          </div>
+          <div id="calib_download_hint" style="display:none;margin-top:8px;padding:6px 8px;background:#052e16;border:1px solid #10b981;border-radius:4px;font-size:12px;color:#d1fae5;">
+            ✓ Calibration flight complete. Download the matching log + video from the
+            <b>Flight Logs</b> panel below (newest entry), then upload both files to Claude.
+            Claude will return a preset JSON that you can paste into the <b>Import Preset</b>
+            box below to apply it to the fleet.
+          </div>
+          <!-- Import preset: paste a JSON blob (e.g. Claude's tuned output)
+               and save it as a named preset. -->
+          <div style="margin-top:8px;display:flex;gap:6px;align-items:flex-start;flex-wrap:wrap;">
+            <input id="calib_preset_name" type="text" placeholder="preset name (e.g. Claude calibrated 2026-04-24)"
+                   style="flex:1;min-width:260px;height:26px;font-size:12px;" />
+            <button id="calib_import_btn"
+                    style="background:#1e293b;border:1px solid #475569;color:#e2e8f0;padding:3px 10px;border-radius:4px;cursor:pointer;font-size:12px;"
+                    title="Paste a preset JSON below and save it under the name above.">
+              Import from JSON ↓
+            </button>
+          </div>
+          <textarea id="calib_preset_json" rows="3" placeholder='{"detect_profile":"balanced","distance_scale":1.0,...}'
+                    style="display:none;width:100%;margin-top:6px;font-family:monospace;font-size:11px;background:#0f172a;color:#e2e8f0;border:1px solid #334155;border-radius:4px;padding:6px;"></textarea>
+          <div id="calib_preset_status" class="small" style="color:#64748b;margin-top:4px;"></div>
+        </div>
+        <div style="margin-top:6px;display:flex;gap:8px;align-items:center;">
+          <button id="pos_video_toggle" class="pos-cfg">Show ArUco Video</button>
+          <button id="rec_btn" class="pos-cfg" style="background:#1e3a2e;border-color:#22c55e;color:#22c55e;">&#9679; Record</button>
+          <label style="display:flex;align-items:center;gap:4px;font-size:12px;color:#94a3b8;cursor:pointer;">
+            <input type="checkbox" id="rec_raw" style="accent-color:#22c55e;" /> Raw
+          </label>
+          <span id="rec_status" class="small" style="color:#64748b;"></span>
+          <a id="pos_tracker_link" href="#" target="_blank" class="small" style="color:#38bdf8;display:none;">Open full arena tracker ↗</a>
+        </div>
+        <div id="pos_video_container" style="display:none;margin-top:6px;">
+          <img id="pos_video_img" src="" style="max-width:100%;border-radius:6px;background:#000;" />
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ══════════════════════════════════════════════════════════════
+       Target Boxes — identified SDC26 target markers (IDs ≥ 30) with
+       team/colour assignment and arena-frame position. Driven by the
+       FC's /proxy/ui_state → _pos_st.targets stream. Team & colour
+       are resolved from arena_config.target_teams (ID ranges) +
+       target_overrides (per-ID override table).
+       ══════════════════════════════════════════════════════════════ -->
+  <div class="row" style="margin-top:12px;">
+    <div class="panel" style="min-width:340px;flex:1;">
+      <div style="display:flex;align-items:center;gap:10px;margin-bottom:8px;">
+        <b>🎯 Target Boxes</b>
+        <span class="small" style="color:#94a3b8;">detected SDC target markers (ID ≥ 30, 19 cm stickers)</span>
+        <span id="targets_badge" class="small" style="margin-left:auto;color:#64748b;">0 visible</span>
+      </div>
+      <div id="targets_empty" class="small" style="color:#64748b;font-style:italic;">
+        No target boxes detected yet. Fly the drone so its camera points at a box.
+      </div>
+      <table id="targets_table" style="display:none;width:100%;border-collapse:collapse;font-size:13px;">
+        <thead>
+          <tr style="text-align:left;color:#94a3b8;border-bottom:1px solid #334155;">
+            <th style="padding:4px 6px;">ID</th>
+            <th style="padding:4px 6px;">Team</th>
+            <th style="padding:4px 6px;">X (m)</th>
+            <th style="padding:4px 6px;">Y (m)</th>
+            <th style="padding:4px 6px;">Z (m)</th>
+            <th style="padding:4px 6px;">Age</th>
+            <th style="padding:4px 6px;">Status</th>
+          </tr>
+        </thead>
+        <tbody id="targets_tbody"></tbody>
+      </table>
+      <div class="small" style="color:#64748b;margin-top:6px;">
+        Team/colour assignments come from <b>Arena Configuration → Target Teams</b>
+        (ID ranges) with optional per-ID overrides. SDC26 convention:
+        IDs 31-36 = Blue (box 1-6), IDs 41-46 = Red (box 1-6).
+      </div>
+
+      <!-- ── Scan & Capture Targets mission ─────────────────────────
+           Autonomous: drone takes off (if grounded), rotates 360° to
+           discover the boxes via ArUco, then hands off to the standard
+           CaptureAllTargetsMission which flies over each box for the
+           configured hover time. -->
+      <div style="margin-top:10px;padding:8px 10px;background:#0c1a2e;border:1px solid #334155;border-radius:6px;">
+        <div style="display:flex;align-items:center;gap:10px;margin-bottom:6px;">
+          <b style="color:#fbbf24;">🎯 Scan &amp; Capture Targets</b>
+          <span class="small" style="color:#94a3b8;">
+            rotate to discover, then fly exactly over each box for N seconds
+          </span>
+        </div>
+        <!-- Drone selection — one checkbox per known drone. Multi-select:
+             each selected drone gets an altitude layer (1.0 m stacks) so
+             they can work concurrently without colliding. Target
+             claiming in CaptureAllTargetsMission already prevents two
+             drones from visiting the same box. -->
+        <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-bottom:6px;">
+          <span class="small" style="color:#94a3b8;min-width:60px;">Drones:</span>
+          <span id="scan_cap_drones" style="display:flex;gap:10px;flex-wrap:wrap;"></span>
+          <label class="small" style="color:#94a3b8;margin-left:auto;" title="When multiple drones are selected, each gets an extra altitude offset of N × this value (N = selection order). Keeps 3-D paths separated. Set 0 to disable altitude layering (rely on target claiming + XY separation only).">
+            alt stack <input id="scan_cap_stack" type="number" min="0" max="3" step="0.1" value="1.0" style="width:50px;height:22px;font-size:11px;" /> m
+          </label>
+          <label class="small" style="color:#94a3b8;" title="Minimum 3-D separation between drones during capture. If another drone comes closer than this, the second drone pauses in place until it's clear.">
+            sep &gt; <input id="scan_cap_sep" type="number" min="0" max="5" step="0.1" value="1.2" style="width:50px;height:22px;font-size:11px;" /> m
+          </label>
+        </div>
+        <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;">
+          <button id="scan_cap_start_btn"
+                  style="background:#713f12;border:1px solid #fbbf24;color:#fef3c7;padding:4px 12px;border-radius:4px;cursor:pointer;font-weight:600;"
+                  title="Drone takes off (if needed), rotates 6×60° scanning for target markers, then visits each box in nearest-neighbour order. With multiple drones selected: the first drone scans, then all selected drones capture concurrently at stacked altitudes.">
+            ▶ Start Scan &amp; Capture
+          </button>
+          <button id="scan_cap_abort_btn"
+                  style="display:none;background:#450a0a;border:1px solid #b91c1c;color:#fecaca;padding:4px 12px;border-radius:4px;cursor:pointer;font-weight:600;"
+                  title="Abort the scan/capture — drone continues its current moveBy command, then stays airborne.">
+            ✕ Abort
+          </button>
+          <label class="small" style="color:#94a3b8;" title="How long the drone hovers above each target box before moving on. SDC26 rules require \u22652 s of steady hover for a capture to count.">
+            hover <input id="scan_cap_hover" type="number" min="1" max="20" step="0.5" value="3" style="width:50px;height:22px;font-size:11px;" /> s
+          </label>
+          <label class="small" style="color:#94a3b8;" title="Hover HEIGHT above the target marker (metres). Drone flies to z = marker_z + this value. Typical: 1.5 m clears most boxes while keeping the marker inside the camera FOV for confirmation.">
+            hover height <input id="scan_cap_above" type="number" min="0.3" max="5" step="0.1" value="1.5" style="width:50px;height:22px;font-size:11px;" /> m above target
+          </label>
+          <span id="scan_cap_status_txt" class="small" style="color:#64748b;">idle</span>
+        </div>
+        <div id="scan_cap_progress" style="display:none;margin-top:6px;">
+          <div style="height:8px;background:#1e293b;border-radius:4px;overflow:hidden;">
+            <div id="scan_cap_progress_bar" style="height:100%;width:0%;background:linear-gradient(90deg,#fbbf24,#f59e0b);transition:width 0.3s;"></div>
+          </div>
+          <div class="small" style="color:#94a3b8;margin-top:4px;">
+            <span id="scan_cap_phase" style="color:#fbbf24;">—</span>:
+            <span id="scan_cap_step">—</span>
+            <span style="color:#64748b;margin-left:8px;">
+              <span id="scan_cap_ndet">0</span> target(s) found
+              &nbsp;·&nbsp; elapsed <span id="scan_cap_elapsed">0.0</span>s
+            </span>
+          </div>
+          <!-- Per-drone pursuit state — populated from /proxy/missions/status
+               whenever the DirectTargetPursuitMission is running. Shows
+               exactly which VALID SDC26 target each drone is chasing
+               (IDs 31-36 Blue, 41-46 Red — never anything else). -->
+          <div id="scan_cap_drones_state" class="small"
+               style="margin-top:6px;padding:6px 8px;background:#0b1324;border:1px solid #1e293b;border-radius:4px;display:none;">
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="row" style="margin-top:12px;">
+    <div class="panel" style="min-width:340px;flex:1;">
+      <div style="display:flex;align-items:center;gap:10px;margin-bottom:8px;">
+        <b>Arena Configuration</b>
+        <span class="small" style="color:#94a3b8;">marker layout &amp; physical dimensions</span>
+        <button id="arena_cfg_toggle" style="margin-left:auto;padding:2px 10px;font-size:11px;background:#1e293b;">Show</button>
+      </div>
+      <div id="arena_cfg_body" style="display:none;">
+        <div style="display:flex;gap:12px;flex-wrap:wrap;margin-bottom:8px;">
+          <label class="small">Arena width (m):
+            <input id="ac_width" type="number" step="0.5" value="20" style="width:70px;height:30px;border-radius:5px;border:1px solid #475569;background:#0f172a;color:#e2e8f0;padding:0 6px;" />
+          </label>
+          <label class="small">Arena depth (m):
+            <input id="ac_depth" type="number" step="0.5" value="10" style="width:70px;height:30px;border-radius:5px;border:1px solid #475569;background:#0f172a;color:#e2e8f0;padding:0 6px;" />
+          </label>
+          <label class="small">Height min (m):
+            <input id="ac_hmin" type="number" step="0.1" value="-1" style="width:60px;height:30px;border-radius:5px;border:1px solid #475569;background:#0f172a;color:#e2e8f0;padding:0 6px;" />
+          </label>
+          <label class="small">Height max (m):
+            <input id="ac_hmax" type="number" step="0.1" value="1" style="width:60px;height:30px;border-radius:5px;border:1px solid #475569;background:#0f172a;color:#e2e8f0;padding:0 6px;" />
+          </label>
+          <label class="small">Marker size (m):
+            <input id="ac_msize" type="number" step="0.05" value="0.5" style="width:65px;height:30px;border-radius:5px;border:1px solid #475569;background:#0f172a;color:#e2e8f0;padding:0 6px;" />
+          </label>
+        </div>
+        <div class="small" style="margin-bottom:4px;color:#94a3b8;">Marker positions (ID · X · Y · Z · Wall)</div>
+        <div id="arena_marker_table" style="max-height:280px;overflow-y:auto;font-size:11px;"></div>
+        <div style="margin-top:6px;display:flex;gap:8px;flex-wrap:wrap;align-items:center;">
+          <label class="small" style="color:#94a3b8;display:flex;align-items:center;gap:4px;">ID:
+            <input id="arena_new_marker_id" type="number" min="0" step="1" placeholder="auto" style="width:60px;height:26px;border-radius:4px;border:1px solid #475569;background:#0f172a;color:#e2e8f0;padding:0 6px;" title="Marker ID to add (leave blank for next free)" />
+          </label>
+          <button id="arena_add_marker" style="padding:4px 10px;font-size:11px;background:#065f46;border-color:#10b981;">+ Add Marker</button>
+          <button id="arena_save" style="padding:4px 10px;font-size:11px;background:#1e3a5f;border-color:#3b82f6;">Save Config</button>
+          <button id="arena_reset" style="padding:4px 10px;font-size:11px;background:#374151;border-color:#6b7280;">Reset to Defaults</button>
+          <span id="arena_cfg_status" class="small" style="color:#94a3b8;"></span>
+        </div>
+      </div>
+    </div>
+  </div>
+<script src="{{ url_for('static', filename='controller.04.js') }}"></script>
+
+<!-- ── Optional 3D arena view via Three.js ─────────────────────────── -->
+
+<script type="module" src="{{ url_for('static', filename='controller.module.js') }}"></script>
+</body>
+</html>

@@ -1,0 +1,280 @@
+    body { background:#0f172a; color:#e2e8f0; font-family:Arial,sans-serif; margin:0; padding:16px; }
+    .row { display:flex; gap:16px; flex-wrap:wrap; align-items:flex-start; }
+    .panel { background:#111827; border:1px solid #334155; border-radius:8px; padding:12px; }
+    .grid { display:grid; grid-template-columns:repeat(3,70px); gap:8px; }
+    button { height:52px; border-radius:8px; border:1px solid #475569; background:#1e293b; color:#e2e8f0; font-weight:700; cursor:pointer; }
+    button:active, .active { background:#0ea5e9; color:#001018; }
+    .small { color:#94a3b8; font-size:12px; }
+    .status-wrap { margin-top:8px; display:flex; gap:16px; flex-wrap:wrap; align-items:center; }
+    .meter { min-width:220px; }
+    .meter-label { font-size:12px; color:#94a3b8; margin-bottom:4px; }
+    .meter-track { height:12px; border-radius:999px; background:#1f2937; border:1px solid #334155; overflow:hidden; }
+    .meter-fill { height:100%; width:0%; background:#22c55e; transition:width .2s ease, background .2s ease; }
+    .adv { margin-top:8px; border-top:1px solid #334155; padding-top:8px; }
+    .adv-grid { display:grid; grid-template-columns:repeat(3,minmax(100px,1fr)); gap:8px; }
+    .adv input { height:36px; border-radius:8px; border:1px solid #475569; background:#0f172a; color:#e2e8f0; padding:0 8px; }
+    .drone-bar { display:flex; gap:8px; margin-bottom:12px; }
+    .drone-btn { height:44px; padding:0 18px; border-radius:8px; border:2px solid #475569; background:#1e293b; color:#e2e8f0; font-weight:700; cursor:pointer; font-size:14px; transition:all .15s; }
+    .drone-btn.selected { background:#0ea5e9; color:#001018; border-color:#0ea5e9; }
+    .drone-btn:hover:not(.selected) { border-color:#94a3b8; }
+    .drone-type { font-size:10px; font-weight:400; opacity:.7; display:block; line-height:1; }
+    .video-panel { margin-top:12px; }
+    .video-panel img { max-width:100%; border-radius:8px; background:#000; }
+    .video-controls { display:flex; gap:8px; align-items:center; flex-wrap:wrap; margin-bottom:8px; }
+    .video-controls button { height:36px; font-size:12px; padding:0 12px; }
+    .video-controls select, .video-controls input { height:36px; border-radius:8px; border:1px solid #475569; background:#0f172a; color:#e2e8f0; padding:0 8px; }
+    .video-status { font-size:11px; color:#94a3b8; margin-top:4px; }
+    .video-url { font-size:11px; color:#38bdf8; word-break:break-all; }
+    .pos-panel { min-width:260px; }
+    .pos-coords { font-family:monospace; font-size:14px; letter-spacing:0.05em; margin:8px 0; }
+    .pos-x { color:#38bdf8; } .pos-y { color:#4ade80; } .pos-z { color:#fb923c; }
+    .pos-stale { color:#f59e0b; font-size:11px; }
+    .arena-canvas { display:block; border-radius:6px; background:#0f172a; border:1px solid #334155; }
+    .pos-cfg { margin-top:8px; border-top:1px solid #334155; padding-top:8px; }
+    .pos-cfg label { font-size:12px; color:#94a3b8; }
+    .pos-cfg input, .pos-cfg select { height:32px; border-radius:6px; border:1px solid #475569; background:#0f172a; color:#e2e8f0; padding:0 6px; }
+    .pos-cfg button { height:32px; font-size:12px; padding:0 10px; }
+    /* ── Info-icon (ⓘ) system for tuning parameters ──────────────── */
+    .info-icon {
+      display:inline-flex; align-items:center; justify-content:center;
+      width:13px; height:13px; margin-left:4px;
+      border:1px solid #64748b; border-radius:50%;
+      color:#94a3b8; background:transparent;
+      font: italic 700 9px/1 Georgia, 'Times New Roman', serif;
+      cursor:pointer; user-select:none; vertical-align:middle;
+      transition: border-color .12s, color .12s, background .12s;
+    }
+    .info-icon:hover { border-color:#38bdf8; color:#38bdf8; background:#0b1424; }
+    #param_info_modal {
+      display:none; position:fixed; inset:0;
+      background:rgba(0,0,0,0.6); z-index:2000;
+      justify-content:center; align-items:center;
+    }
+    #param_info_modal .box {
+      background:#111827; border:1px solid #38bdf8; border-radius:8px;
+      padding:16px 20px; max-width:520px; width:90%;
+      color:#e2e8f0; box-shadow:0 12px 44px rgba(0,0,0,0.7);
+    }
+    #param_info_modal .title   { color:#38bdf8; font-weight:700; font-size:14px; margin-bottom:4px; }
+    #param_info_modal .subtitle{ color:#64748b; font-size:11px; font-family:monospace; margin-bottom:10px; }
+    #param_info_modal .body    { font-size:13px; line-height:1.55; white-space:pre-wrap; }
+    #param_info_modal .range   { font-size:11px; color:#94a3b8; margin-top:10px; font-family:monospace; }
+    #param_info_modal .close {
+      margin-top:12px; padding:6px 14px; background:#334155;
+      border:1px solid #64748b; color:#e2e8f0; border-radius:5px;
+      cursor:pointer; font-size:12px;
+    }
+    #param_info_modal .close:hover { background:#475569; }
+    /* ── ArUco Seek panel ─────────────────────────────────────────── */
+    #aruco_panel { margin-top:16px; padding:12px; background:#0b1220; border:1px solid #334155; border-radius:8px; }
+    #aruco_panel h3 { margin:0 0 10px 0; color:#38bdf8; font-size:15px; }
+    #aruco_panel .arc-grid { display:grid; grid-template-columns:minmax(360px,1fr) minmax(420px,1fr); gap:12px; align-items:flex-start; }
+    #aruco_panel canvas.arc-topdown { background:#0b1220; border:1px solid #1e293b; border-radius:4px; display:block; width:100%; max-width:420px; height:auto; }
+    #aruco_panel img.arc-video { width:100%; max-width:480px; background:#0f172a; border-radius:4px; min-height:180px; }
+    #aruco_panel .arc-readout { font-family:'SF Mono','Menlo',monospace; font-size:11px; line-height:1.55; color:#cbd5e1; }
+    #aruco_panel .arc-readout .k { color:#94a3b8; display:inline-block; min-width:80px; }
+    #aruco_panel .arc-readout .pd { color:#64748b; font-size:10px; }
+    #aruco_panel .arc-readout b { color:#38bdf8; font-weight:600; }
+    #aruco_panel .arc-params { max-height:360px; overflow-y:auto; padding-right:6px; }
+    #aruco_panel .arc-row { display:flex; align-items:center; gap:6px; margin-bottom:3px; font-size:11px; }
+    #aruco_panel .arc-row label { width:150px; color:#cbd5e1; flex-shrink:0; font-size:10px; }
+    #aruco_panel .arc-row input[type=range] { flex:1; min-width:80px; }
+    #aruco_panel .arc-row input[type=number] { width:60px; background:#0f172a; color:#e2e8f0; border:1px solid #334155; border-radius:3px; padding:2px 4px; font-size:10px; }
+    #aruco_panel .arc-pgroup { border-top:1px dashed #334155; margin-top:6px; padding-top:4px; }
+    #aruco_panel .arc-pgroup-label { font-size:9px; color:#64748b; text-transform:uppercase; letter-spacing:0.08em; margin-bottom:3px; }
+    #aruco_panel .mode-seg { display:inline-flex; border:1px solid #334155; border-radius:4px; overflow:hidden; vertical-align:middle; }
+    #aruco_panel .mode-seg button { background:transparent; border:0; border-radius:0; padding:5px 12px; font-weight:600; color:#94a3b8; font-size:11px; }
+    #aruco_panel .mode-seg button.active.observe { background:#065f46; color:#ecfdf5; }
+    #aruco_panel .mode-seg button.active.live    { background:#b91c1c; color:#fee2e2; }
+    #aruco_panel .mode-seg button:disabled { opacity:0.45; cursor:not-allowed; }
+    #aruco_panel .arc-manual { display:none; gap:6px; align-items:center; padding:4px 6px; background:#450a0a; border:1px solid #ef4444; border-radius:4px; }
+    #aruco_panel .arc-manual.show { display:inline-flex; }
+    #aruco_panel .arc-manual button { font-size:11px; padding:4px 8px; }
+    #arc_live_banner { display:none; background:#b91c1c; color:#fee2e2; padding:6px 10px; border-radius:4px; font-weight:700; letter-spacing:0.04em; margin-bottom:8px; box-shadow:0 0 0 2px #fbbf24 inset; text-align:center; font-size:12px; }
+    #arc_live_banner.show { display:block; animation:arcpulse 1.6s ease-in-out infinite; }
+    @keyframes arcpulse { 0%,100% { box-shadow:0 0 0 2px #fbbf24 inset; } 50% { box-shadow:0 0 0 4px #fbbf24 inset; } }
+    /* PAUSED banner pulse (stronger, so it can't be missed) */
+    @keyframes pausepulse { 0%,100% { box-shadow:0 0 0 2px #facc15 inset; } 50% { box-shadow:0 0 0 5px #fde68a inset; } }
+    /* Dim autonomous-mode controls while paused to make the blocked
+       state obvious — operator can still see them, but they're clearly
+       disabled. Manual (WASD) controls remain at full opacity. */
+    body.paused-mode #mission_panel,
+    body.paused-mode #missions_panel,
+    body.paused-mode #aruco_panel { opacity:0.45; filter:grayscale(0.6); pointer-events:none; }
+
+    /* Collapsible panels — click the header to toggle. State persists in
+       localStorage so each operator keeps their preferred layout. */
+    .collapsible-toggle {
+      cursor: pointer; user-select: none;
+      display: flex; align-items: center; gap: 8px;
+      padding: 2px 0;
+    }
+    .collapsible-toggle:hover { color: #60a5fa; }
+    .collapsible-toggle:before {
+      content: '▾'; transition: transform 0.15s;
+      display: inline-block; font-size: 11px; color: #94a3b8; width: 10px;
+    }
+    .collapsible.collapsed > .collapsible-toggle:before {
+      transform: rotate(-90deg);
+    }
+    .collapsible.collapsed > .collapsible-body {
+      display: none !important;
+    }
+    /* Video panel special case: keep the <img> alive (= still decoding
+       MJPEG) but not visually rendered when the panel is collapsed. */
+    #video_panel.collapsible.collapsed > .collapsible-body {
+      display: block !important;
+      height: 0; overflow: hidden; margin: 0; padding: 0;
+    }
+    body.arc-live-mode { box-shadow:0 0 0 4px #b91c1c inset; }
+    .arc-rc-sent { color:#f87171; font-weight:600; }
+    /* ── Special Missions panel ──────────────────────────────────── */
+    #missions_panel { margin-top:16px; padding:12px; background:#0b1220; border:1px solid #334155; border-radius:8px; }
+    #missions_panel h3 { margin:0 0 10px 0; color:#a78bfa; font-size:15px; }
+    #missions_panel .mis-row { display:flex; gap:8px; align-items:center; flex-wrap:wrap; font-size:12px; margin-bottom:6px; }
+    #missions_panel select, #missions_panel input { background:#0f172a; color:#e2e8f0; border:1px solid #334155; border-radius:4px; padding:4px 6px; font-size:12px; }
+    #missions_panel .mis-status { font-family:monospace; font-size:11px; color:#cbd5e1; background:#0f172a; border:1px solid #1e293b; border-radius:4px; padding:8px; max-height:200px; overflow-y:auto; white-space:pre-wrap; }
+    #missions_panel .mis-drone-line { padding:2px 0; border-bottom:1px solid #1e293b; }
+    #missions_panel .mis-drone-line b { color:#38bdf8; }
+    #missions_panel .mis-badge { display:inline-block; padding:1px 6px; border-radius:3px; font-size:10px; font-weight:600; margin-left:6px; }
+    #missions_panel .mis-badge.idle { background:#1e293b; color:#94a3b8; }
+    #missions_panel .mis-badge.scan { background:#1e3a5f; color:#60a5fa; }
+    #missions_panel .mis-badge.approach { background:#164e63; color:#22d3ee; }
+    #missions_panel .mis-badge.hover { background:#065f46; color:#4ade80; }
+    #missions_panel .mis-badge.wait { background:#451a03; color:#fbbf24; }
+    #missions_panel .mis-badge.done { background:#14532d; color:#86efac; }
+    #missions_panel .mis-badge.error { background:#7f1d1d; color:#fca5a5; }
+    /* ── Takeoff error banner ───────────────────────────────────── */
+    #takeoff_err { display:none; background:#7f1d1d; border:1px solid #ef4444; color:#fee2e2;
+                   padding:10px 14px; border-radius:8px; margin-top:10px; font-size:13px; line-height:1.5; }
+    #takeoff_err.show { display:block; animation:takeoffpulse 1.2s ease-in-out 2; }
+    #takeoff_err .hdr { font-weight:700; letter-spacing:0.02em; margin-bottom:4px; font-size:14px; }
+    #takeoff_err .reason { font-family:monospace; font-size:12px; color:#fecaca; margin-bottom:6px; word-break:break-word; }
+    #takeoff_err .actions { display:flex; gap:8px; flex-wrap:wrap; margin-top:6px; }
+    #takeoff_err .actions button { height:32px; padding:0 12px; font-size:12px; font-weight:600; }
+    #takeoff_err .actions .magneto { background:#1e3a5f; border-color:#3b82f6; color:#dbeafe; }
+    #takeoff_err .actions .dismiss { background:#374151; border-color:#6b7280; }
+    @keyframes takeoffpulse { 0%,100% { box-shadow:0 0 0 2px #fbbf24 inset; } 50% { box-shadow:0 0 0 4px #fbbf24 inset; } }
+    /* ── Magnetometer recalibration wizard ──────────────────────── */
+    #mag_modal { display:none; position:fixed; inset:0; background:rgba(0,0,0,0.78); z-index:1100;
+                 justify-content:center; align-items:center; }
+    #mag_modal.show { display:flex; }
+    #mag_modal .card { background:#0b1220; border:1px solid #334155; border-radius:10px;
+                       padding:18px; width:min(720px,95vw); max-height:92vh; overflow-y:auto;
+                       box-shadow:0 10px 40px rgba(0,0,0,0.5); }
+    #mag_modal h3 { margin:0 0 4px 0; color:#60a5fa; font-size:18px; }
+    #mag_modal .sub { color:#94a3b8; font-size:12px; margin-bottom:12px; }
+    #mag_modal .steps { display:grid; grid-template-columns:1fr; gap:6px; margin-bottom:12px; }
+    .mag-step { display:flex; align-items:center; gap:10px; padding:8px 10px; background:#0f172a;
+                border:1px solid #1e293b; border-radius:6px; transition:all .2s ease; }
+    .mag-step.active { border-color:#3b82f6; background:#0f1e33; box-shadow:0 0 0 1px #3b82f6 inset; }
+    .mag-step.ok { border-color:#10b981; background:#052e1b; }
+    .mag-step.fail { border-color:#ef4444; background:#2a0a0a; }
+    .mag-step .num { flex:0 0 26px; height:26px; border-radius:50%; background:#1e293b;
+                     color:#94a3b8; font-weight:700; font-size:13px; display:flex;
+                     align-items:center; justify-content:center; border:1px solid #334155; }
+    .mag-step.active .num { background:#3b82f6; color:#eff6ff; border-color:#3b82f6; }
+    .mag-step.ok .num { background:#10b981; color:#052e1b; border-color:#10b981; }
+    .mag-step.fail .num { background:#ef4444; color:#450a0a; border-color:#ef4444; }
+    .mag-step .title { flex:1; font-size:13px; color:#e2e8f0; }
+    .mag-step .info { font-size:11px; color:#94a3b8; font-family:monospace; }
+    #mag_axes { display:grid; grid-template-columns:repeat(3,1fr); gap:8px; margin:10px 0; }
+    .mag-axis { background:#0f172a; border:1px solid #1e293b; border-radius:6px; padding:10px;
+                text-align:center; transition:all .2s ease; }
+    .mag-axis.active { border-color:#fbbf24; box-shadow:0 0 0 1px #fbbf24 inset;
+                       animation:magpulse 1s ease-in-out infinite; }
+    .mag-axis.ok { border-color:#10b981; background:#052e1b; }
+    .mag-axis .ax-name { font-weight:700; font-size:13px; color:#e2e8f0; letter-spacing:0.04em; }
+    .mag-axis .ax-hint { font-size:10px; color:#94a3b8; margin-top:2px; }
+    .mag-axis .ax-state { font-size:18px; margin-top:4px; }
+    @keyframes magpulse { 0%,100% { background:#0f172a; } 50% { background:#1a2740; } }
+    #mag_instructions { background:#0f172a; border:1px solid #334155; border-radius:6px;
+                        padding:10px; margin:10px 0; font-size:12px; color:#cbd5e1; line-height:1.55; }
+    #mag_instructions b { color:#fbbf24; }
+    #mag_log { max-height:140px; overflow-y:auto; background:#0f172a; border:1px solid #1e293b;
+               border-radius:6px; padding:8px; font-family:monospace; font-size:11px;
+               color:#94a3b8; white-space:pre-wrap; margin-bottom:10px; }
+    #mag_result { display:none; padding:10px; border-radius:6px; margin-bottom:10px;
+                  font-weight:600; font-size:13px; }
+    #mag_result.ok { display:block; background:#052e1b; border:1px solid #10b981; color:#86efac; }
+    #mag_result.fail { display:block; background:#2a0a0a; border:1px solid #ef4444; color:#fca5a5; }
+    #mag_modal .btnrow { display:flex; gap:8px; flex-wrap:wrap; justify-content:flex-end; }
+    #mag_modal .btnrow button { height:36px; padding:0 14px; font-size:12px; font-weight:600; }
+    #mag_start_btn { background:#065f46; border-color:#10b981; }
+    #mag_retry_btn { background:#1e3a5f; border-color:#3b82f6; display:none; }
+    #mag_close_btn { background:#374151; border-color:#6b7280; }
+
+    /* ── Light theme ───────────────────────────────────────────────
+       Activated by setting <html data-theme="light">. Uses !important
+       selectively to defeat the many hard-coded inline style=""
+       colors scattered through this single-file UI. Inline attribute
+       selectors (e.g. [style*="background:#0f172a"]) catch the most
+       common dark hex values without rewriting every element. */
+    html[data-theme="light"]            { color-scheme: light; }
+    html[data-theme="light"] body       { background:#f1f5f9 !important; color:#0f172a !important; }
+    html[data-theme="light"] .panel     { background:#ffffff !important; border-color:#cbd5e1 !important; color:#0f172a !important; }
+    html[data-theme="light"] button     { background:#e2e8f0 !important; color:#0f172a !important; border-color:#94a3b8 !important; }
+    html[data-theme="light"] button:active,
+    html[data-theme="light"] .active    { background:#0ea5e9 !important; color:#001018 !important; }
+    html[data-theme="light"] input,
+    html[data-theme="light"] select,
+    html[data-theme="light"] textarea   { background:#ffffff !important; color:#0f172a !important; border-color:#cbd5e1 !important; }
+    html[data-theme="light"] h2,
+    html[data-theme="light"] h3         { color:#0369a1 !important; }
+    html[data-theme="light"] .small     { color:#475569 !important; }
+    html[data-theme="light"] #aruco_panel,
+    html[data-theme="light"] #tuning_panel,
+    html[data-theme="light"] #mission_panel,
+    html[data-theme="light"] #anafi_panel,
+    html[data-theme="light"] #missions_panel,
+    html[data-theme="light"] #video_panel { background:#f8fafc !important; border-color:#cbd5e1 !important; color:#0f172a !important; }
+    html[data-theme="light"] .arena-canvas { background:#f8fafc !important; border-color:#cbd5e1 !important; }
+    html[data-theme="light"] .info-icon   { border-color:#94a3b8 !important; color:#475569 !important; }
+    html[data-theme="light"] .info-icon:hover { border-color:#0369a1 !important; color:#0369a1 !important; background:#e0f2fe !important; }
+    html[data-theme="light"] #param_info_modal { background:rgba(15,23,42,0.45) !important; }
+    html[data-theme="light"] #param_info_modal .box { background:#ffffff !important; color:#0f172a !important; border-color:#0ea5e9 !important; }
+    html[data-theme="light"] #param_info_modal .title { color:#0369a1 !important; }
+    html[data-theme="light"] #param_info_modal .subtitle { color:#64748b !important; }
+    html[data-theme="light"] #param_info_modal .body { color:#1e293b !important; }
+    html[data-theme="light"] #param_info_modal .close { background:#e2e8f0 !important; color:#0f172a !important; border-color:#94a3b8 !important; }
+    html[data-theme="light"] .collapsible-toggle { color:#0369a1 !important; }
+    html[data-theme="light"] #aruco_panel .arc-readout   { color:#334155 !important; }
+    html[data-theme="light"] #aruco_panel .arc-readout .k { color:#64748b !important; }
+    html[data-theme="light"] #aruco_panel .arc-readout b  { color:#0284c7 !important; }
+    html[data-theme="light"] #aruco_panel .arc-row label  { color:#334155 !important; }
+    html[data-theme="light"] #aruco_panel .arc-pgroup-label { color:#64748b !important; }
+    html[data-theme="light"] .drone-btn { background:#f1f5f9 !important; color:#1e293b !important; border-color:#94a3b8 !important; }
+    html[data-theme="light"] .drone-btn.selected { background:#0ea5e9 !important; color:#001018 !important; border-color:#0ea5e9 !important; }
+    html[data-theme="light"] .pos-cfg input,
+    html[data-theme="light"] .pos-cfg select { background:#ffffff !important; color:#0f172a !important; border-color:#cbd5e1 !important; }
+    html[data-theme="light"] .pos-cfg label { color:#475569 !important; }
+    html[data-theme="light"] .meter-track { background:#e2e8f0 !important; border-color:#94a3b8 !important; }
+    html[data-theme="light"] .meter-label { color:#475569 !important; }
+    html[data-theme="light"] #arc_live_banner { background:#fecaca !important; color:#7f1d1d !important; }
+    html[data-theme="light"] #takeoff_err { background:#fef2f2 !important; color:#7f1d1d !important; border-color:#f87171 !important; }
+    /* Catch common inline-styled dark backgrounds/colors */
+    html[data-theme="light"] [style*="background:#0f172a"],
+    html[data-theme="light"] [style*="background: #0f172a"],
+    html[data-theme="light"] [style*="background:#111827"],
+    html[data-theme="light"] [style*="background:#0b1220"],
+    html[data-theme="light"] [style*="background:#0b1424"] { background:#ffffff !important; }
+    html[data-theme="light"] [style*="background:#1e293b"],
+    html[data-theme="light"] [style*="background:#1e2a3a"] { background:#e2e8f0 !important; }
+    html[data-theme="light"] [style*="background:#1f2937"] { background:#e2e8f0 !important; }
+    html[data-theme="light"] [style*="color:#e2e8f0"] { color:#0f172a !important; }
+    html[data-theme="light"] [style*="color:#94a3b8"],
+    html[data-theme="light"] [style*="color:#cbd5e1"],
+    html[data-theme="light"] [style*="color:#64748b"] { color:#475569 !important; }
+    html[data-theme="light"] [style*="border-color:#334155"],
+    html[data-theme="light"] [style*="border:1px solid #334155"],
+    html[data-theme="light"] [style*="border:1px solid #475569"],
+    html[data-theme="light"] [style*="border:1px solid #1e293b"],
+    html[data-theme="light"] [style*="border-top:1px solid #1e293b"] { border-color:#cbd5e1 !important; }
+    /* Keep accent-coloured status badges vibrant (keep dark text on the accent) */
+    html[data-theme="light"] [style*="color:#22c55e"] { color:#15803d !important; }
+    html[data-theme="light"] [style*="color:#f59e0b"] { color:#b45309 !important; }
+    html[data-theme="light"] [style*="color:#38bdf8"] { color:#0369a1 !important; }
+    html[data-theme="light"] [style*="color:#a78bfa"] { color:#7c3aed !important; }
+    html[data-theme="light"] [style*="color:#06b6d4"] { color:#0e7490 !important; }
+    html[data-theme="light"] #theme_toggle { color:#0369a1 !important; border-color:#94a3b8 !important; }
+  
